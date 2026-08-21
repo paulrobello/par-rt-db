@@ -53,6 +53,7 @@ fn vector_schema_with_metric(dim: u32, with_filter: bool, metric: DistanceMetric
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
             soft_delete: false,
         },

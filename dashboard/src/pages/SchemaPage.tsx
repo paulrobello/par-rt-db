@@ -184,6 +184,9 @@ export function SchemaPage() {
                   {table.updatedAtField && (
                     <span className={s.owner}>updatedAt: {table.updatedAtField}</span>
                   )}
+                  {table.autoIncrementField && (
+                    <span className={s.owner}>autoIncrement: {table.autoIncrementField}</span>
+                  )}
                 </div>
                 <table className={s.fields}>
                   <tbody>

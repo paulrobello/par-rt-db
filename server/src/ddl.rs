@@ -41,6 +41,79 @@ pub fn pg_schema(db: &str) -> String {
     format!("db_{db}")
 }
 
+/// Physical name of a table's auto-increment `SEQUENCE` (one per table that
+/// declares `autoIncrementField`). `seq_` + the lowercased table name (capped
+/// at 30 chars by `MAX_TABLE_NAME_LEN`) stays well within the 63-byte limit.
+/// Standalone (not `OWNED BY` a column): the counter field needs no typed
+/// column unless indexed, so the sequence outlives column changes and is
+/// dropped explicitly by the destructive reconcile / migrate drop-table.
+pub fn pg_sequence(table: &str) -> String {
+    format!("seq_{}", table.to_lowercase())
+}
+
+/// Creates the table's sequence when `autoIncrementField` is newly declared
+/// (fresh table, declaration added, or declaration changed), then
+/// repositions it past any stored values — an existing populated table that
+/// gains a counter, or a re-added declaration after a migrate rename, must
+/// not restart at 1 and collide with stored docs. Runs inside the caller's
+/// transaction. No-op for tables without a declaration.
+async fn apply_sequence(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pg_schema_name: &str,
+    table_name: &str,
+    old_table: Option<&TableDef>,
+    new_table: &TableDef,
+) -> Result<(), RtDbError> {
+    let Some(field) = &new_table.auto_increment_field else {
+        return Ok(());
+    };
+    let unchanged = old_table.is_some_and(|old| {
+        old.auto_increment_field.as_deref() == new_table.auto_increment_field.as_deref()
+    });
+    if unchanged {
+        return Ok(());
+    }
+    let seq_ident = pg_sequence(table_name);
+    sqlx::query(&format!(
+        "CREATE SEQUENCE IF NOT EXISTS \"{pg_schema_name}\".\"{seq_ident}\""
+    ))
+    .execute(&mut **tx)
+    .await?;
+    reposition_sequence(tx, pg_schema_name, table_name, field).await?;
+    Ok(())
+}
+
+/// Repositions the table's sequence so the next `nextval` is strictly past
+/// every stored counter value AND strictly past the sequence's current next
+/// value — forward-only, so importing an old snapshot into a database whose
+/// sequence has consumed higher numbers can never hand out a value the
+/// database already stores. `is_called` distinguishes a fresh sequence
+/// (`last_value` = 1, never handed out) from one parked ON its last value.
+pub(crate) async fn reposition_sequence(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pg_schema_name: &str,
+    table_name: &str,
+    field: &str,
+) -> Result<(), RtDbError> {
+    let table_ident = pg_table(table_name);
+    let seq_ident = pg_sequence(table_name);
+    // `field` is a validated identifier interpolated into a string literal
+    // (same pattern as `backfill_expr`); the sequence/table idents come from
+    // the validated `pg_*` helpers. `setval` takes the sequence name as a
+    // regclass — a string literal of the double-quoted ident, NOT a quoted
+    // identifier (which SQL would read as a table reference).
+    let sql = format!(
+        "SELECT setval('\"{pg_schema_name}\".\"{seq_ident}\"'::regclass, GREATEST( \
+             COALESCE((SELECT max((doc->>'{field}')::bigint) \
+                       FROM \"{pg_schema_name}\".\"{table_ident}\"), 0) + 1, \
+             (SELECT last_value + CASE WHEN is_called THEN 1 ELSE 0 END \
+              FROM \"{pg_schema_name}\".\"{seq_ident}\") \
+         ), false)"
+    );
+    sqlx::query(&sql).execute(&mut **tx).await?;
+    Ok(())
+}
+
 /// Union of every field referenced by any index on `table` that should get a
 /// typed `f_` column. A btree or search index contributes all of its `fields`;
 /// a vector index contributes only its `filter_fields` — its single vector
@@ -353,6 +426,13 @@ async fn apply_schema_additive(
             }
         }
 
+        // Auto-increment sequence: created (and repositioned past any stored
+        // values) whenever the declaration is newly present — new table,
+        // declaration added to an existing table, or declaration changed.
+        // Unchanged declarations skip this so a routine re-push never
+        // disturbs the sequence's position.
+        apply_sequence(tx, pg_schema_name, table_name, old_table, new_table).await?;
+
         let old_index_names: HashSet<&str> = old_table
             .map(|t| t.indexes.iter().map(|index| index.name.as_str()).collect())
             .unwrap_or_default();
@@ -601,6 +681,11 @@ pub(crate) struct ReconcileDiff {
     /// column removed (the `v_<index>` column; the vector field itself is NOT a
     /// typed `f_` column — it lives only in `doc` jsonb and the `v_` column).
     pub drop_vector_cols: Vec<(String, String)>,
+    /// tables whose auto-increment sequence must be dropped — the table is
+    /// going away, or its `autoIncrementField` declaration is removed/changed.
+    /// Sequences are standalone (not OWNED BY a column), so nothing else
+    /// cascades to them.
+    pub drop_sequences: Vec<String>,
 }
 
 pub(crate) fn reconcile_diff(current: &SchemaDef, target: &SchemaDef) -> ReconcileDiff {
@@ -609,11 +694,22 @@ pub(crate) fn reconcile_diff(current: &SchemaDef, target: &SchemaDef) -> Reconci
     let mut drop_columns = Vec::new();
     let mut drop_search_cols = Vec::new();
     let mut drop_vector_cols = Vec::new();
+    let mut drop_sequences = Vec::new();
 
     for (table_name, cur_table) in &current.tables {
         match target.tables.get(table_name) {
-            None => drop_tables.push(table_name.clone()),
+            None => {
+                drop_tables.push(table_name.clone());
+                if cur_table.auto_increment_field.is_some() {
+                    drop_sequences.push(table_name.clone());
+                }
+            }
             Some(tgt_table) => {
+                if cur_table.auto_increment_field.as_deref()
+                    != tgt_table.auto_increment_field.as_deref()
+                {
+                    drop_sequences.push(table_name.clone());
+                }
                 let cur_indexed_set = indexed_fields(cur_table);
                 let tgt_indexed_set = indexed_fields(tgt_table);
                 let cur_indexed: HashSet<&str> =
@@ -645,6 +741,7 @@ pub(crate) fn reconcile_diff(current: &SchemaDef, target: &SchemaDef) -> Reconci
         drop_columns,
         drop_search_cols,
         drop_vector_cols,
+        drop_sequences,
     }
 }
 
@@ -671,6 +768,17 @@ pub async fn reconcile_schema_destructive(
     let pg_schema_name = pg_schema(db);
     let diff = reconcile_diff(current, target);
     let mut touched: HashSet<String> = HashSet::new();
+
+    // Standalone sequences (no column dependency), so they can go first.
+    for table in &diff.drop_sequences {
+        let seq_ident = pg_sequence(table);
+        sqlx::query(&format!(
+            "DROP SEQUENCE IF EXISTS \"{pg_schema_name}\".\"{seq_ident}\""
+        ))
+        .execute(&mut **tx)
+        .await?;
+        touched.insert(table.clone());
+    }
 
     for (table, index_name) in &diff.drop_indexes {
         let index_ident = format!("i_{}_{}", table.to_lowercase(), index_name.to_lowercase());
@@ -770,6 +878,7 @@ mod tests {
                 collaborators_field: None,
                 ttl: None,
                 updated_at_field: None,
+                auto_increment_field: None,
                 authorize: None,
 
                 soft_delete: false,

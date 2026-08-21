@@ -1,0 +1,27 @@
+{
+  "name": "error-patch-auto-increment-change",
+  "$comment": "autoIncrementField is server-assigned and immutable after insert: a patch (or patchByQuery / upsert-update patch / replace) that supplies a DIFFERENT value than the stored one is rejected with BAD_REQUEST. Round-tripping the stored value unchanged is allowed (pinned by the sibling positive case).",
+  "schema": {
+    "tables": {
+      "tickets": {
+        "fields": {
+          "title": { "type": "string" },
+          "num": { "type": "int64" }
+        },
+        "indexes": [{ "name": "by_title", "fields": ["title"] }],
+        "autoIncrementField": "num"
+      }
+    }
+  },
+  "seed": [
+    { "$id": "t1", "doc": { "title": "A" } }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        { "op": "patch", "table": "tickets", "id": { "$idRef": "t1" }, "fields": { "num": "99" } }
+      ]
+    }
+  },
+  "expect": { "error": { "code": "BAD_REQUEST" } }
+}

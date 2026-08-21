@@ -245,6 +245,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,

@@ -25,7 +25,7 @@ use tracing::Instrument;
 
 use crate::auth::{PrincipalCtx, authorize_table};
 use crate::db::{new_id, now_ms, validate_db_name};
-use crate::ddl::{pg_col, pg_schema, pg_table};
+use crate::ddl::{pg_col, pg_schema, pg_sequence, pg_table};
 use crate::dsl::{FilterExpr, filter_matches};
 use crate::error::RtDbError;
 use crate::scheduler;
@@ -427,6 +427,19 @@ fn apply_patch(
     mut doc: serde_json::Map<String, serde_json::Value>,
     fields: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<serde_json::Map<String, serde_json::Value>, RtDbError> {
+    // The auto-increment field is server-assigned and immutable after insert.
+    // A patch may carry it back unchanged (round-trip friendly), but any
+    // different value — including a type-shifted form of the same number —
+    // is rejected. Covers `Patch`, upsert's update branch, and `PatchByQuery`
+    // (every patch-shaped path funnels through here).
+    if let Some(auto) = &table.auto_increment_field
+        && let Some(value) = fields.get(auto)
+        && doc.get(auto) != Some(value)
+    {
+        return Err(RtDbError::bad_request(format!(
+            "autoIncrementField '{auto}' cannot be changed"
+        )));
+    }
     for (field_name, field_value) in fields {
         let field_type = table
             .fields
@@ -681,8 +694,32 @@ async fn do_replace(
         _ => return Err(RtDbError::internal("stored doc is not a JSON object")),
     };
 
-    validate_doc(table_def, new_doc)?;
-    let new_doc = strip_unset_optionals(table_def, new_doc.clone());
+    // A replace validates as a complete document, so the server-stamped
+    // auto-increment value must be present: an omitted field is filled from
+    // the stored row (preserved, never re-assigned), and a supplied value
+    // must equal the stored one — round-trip replace works, changing the
+    // counter does not. A stored doc that PREDATES the declaration (written
+    // before the counter was added) has no value to preserve, so a replace
+    // may set one — first-set, like an insert.
+    let mut new_doc = new_doc.clone();
+    if let Some(auto) = &table_def.auto_increment_field
+        && let Some(stored) = old_doc.get(auto)
+    {
+        match new_doc.get(auto) {
+            None | Some(serde_json::Value::Null) => {
+                new_doc.insert(auto.clone(), stored.clone());
+            }
+            Some(value) if value != stored => {
+                return Err(RtDbError::bad_request(format!(
+                    "autoIncrementField '{auto}' cannot be changed"
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+
+    validate_doc(table_def, &new_doc)?;
+    let new_doc = strip_unset_optionals(table_def, new_doc);
     apply_update(conn, pg_schema_name, table_def, table_name, id, &new_doc).await?;
     Ok((old_doc, new_doc, created_at))
 }
@@ -1029,6 +1066,38 @@ fn stamp_updated_at(
         doc.insert(field.clone(), value);
     }
     doc
+}
+
+/// Stamps the table's `autoIncrementField` with the next value of the table's
+/// Postgres sequence, overwriting any client-supplied value — the same
+/// authority model as `stamp_updated_at`. Runs on the two insert paths only
+/// (`Insert` and upsert's insert branch); after insert the field is
+/// immutable (`apply_patch` / `do_replace` reject changes). The value is a
+/// decimal string, matching the int64 wire convention (`validate_value` /
+/// `scalar_bind`). `nextval` is non-transactional: a rolled-back txn still
+/// consumes its number, so sequences are monotonic but not gap-free.
+/// Snapshot replay (`insert_snapshot_row`) is not a step path and preserves
+/// the stored value verbatim — import never re-stamps.
+async fn stamp_auto_increment(
+    conn: &mut PgConnection,
+    pg_schema_name: &str,
+    table_def: &TableDef,
+    table_name: &str,
+    mut doc: serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Map<String, serde_json::Value>, RtDbError> {
+    if let Some(field) = &table_def.auto_increment_field {
+        let seq_ident = pg_sequence(table_name);
+        // `nextval` takes the sequence name as a regclass — a string literal
+        // of the double-quoted ident (a bare quoted identifier would be read
+        // as a table reference).
+        let next: i64 = sqlx::query_scalar(&format!(
+            "SELECT nextval('\"{pg_schema_name}\".\"{seq_ident}\"'::regclass)"
+        ))
+        .fetch_one(&mut *conn)
+        .await?;
+        doc.insert(field.clone(), serde_json::Value::String(next.to_string()));
+    }
+    Ok(doc)
 }
 
 /// Applies the table's push-time-validated `defaults` (FM-32) to a NEW
@@ -1414,6 +1483,7 @@ async fn step_insert(
     let doc = apply_defaults(table_def, doc);
     let doc = stamp_owner(table_def, doc, sctx.owner);
     let doc = stamp_authorize(table_def, doc, sctx.ctx);
+    let doc = stamp_auto_increment(sctx.tx, sctx.pg_schema_name, table_def, table, doc).await?;
     verify_authorize_doc(table_def, &doc, sctx.ctx)?;
     let (id, stored, created_at) =
         do_insert(sctx.tx, sctx.pg_schema_name, table_def, table, &doc).await?;
@@ -1588,6 +1658,9 @@ async fn step_upsert(
             let insert = apply_defaults(table_def, insert);
             let insert = stamp_owner(table_def, insert, sctx.owner);
             let insert = stamp_authorize(table_def, insert, sctx.ctx);
+            let insert =
+                stamp_auto_increment(sctx.tx, sctx.pg_schema_name, table_def, table, insert)
+                    .await?;
             verify_authorize_doc(table_def, &insert, sctx.ctx)?;
             let (id, stored, created_at) =
                 do_insert(sctx.tx, sctx.pg_schema_name, table_def, table, &insert).await?;

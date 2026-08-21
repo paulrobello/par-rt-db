@@ -1,0 +1,34 @@
+{
+  "name": "auto-increment-assigns-on-insert",
+  "$comment": "autoIncrementField (server-assigned per-table counter): an insert that supplies a client value has it overwritten by the next sequence value, and an insert that omits the field gets the next value — both as int64 decimal strings. Assignment is strictly increasing in insert order; upsert's insert branch assigns the same way. The follow-up collect reads both rows back with the assigned counters.",
+  "schema": {
+    "tables": {
+      "tickets": {
+        "fields": {
+          "title": { "type": "string" },
+          "num": { "type": "int64" }
+        },
+        "indexes": [{ "name": "by_title", "fields": ["title"] }],
+        "autoIncrementField": "num"
+      }
+    }
+  },
+  "seed": [],
+  "op": {
+    "txn": {
+ "steps": [
+        { "op": "insert", "table": "tickets", "doc": { "title": "A", "num": "999" } },
+        { "op": "insert", "table": "tickets", "doc": { "title": "B" } }
+      ]
+    }
+  },
+  "expect": [{}, {}],
+  "normalize": ["_id", "_creationTime", "_version", "id"],
+  "then": {
+    "query": { "table": "tickets", "index": "by_title", "order": "asc" },
+    "expect": [
+      { "title": "A", "num": "1" },
+      { "title": "B", "num": "2" }
+    ]
+  }
+}

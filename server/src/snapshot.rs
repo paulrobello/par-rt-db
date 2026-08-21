@@ -8,7 +8,7 @@
 use sqlx::PgPool;
 
 use crate::db::validate_db_name;
-use crate::ddl::{pg_schema, pg_table, push_schema};
+use crate::ddl::{pg_schema, pg_table, push_schema, reposition_sequence};
 use crate::error::RtDbError;
 use crate::schema::SchemaDef;
 use crate::txn::insert_snapshot_row;
@@ -144,6 +144,17 @@ pub async fn import_database(pool: &PgPool, db: &str, jsonl: &str) -> Result<Sch
             version,
         )
         .await?;
+    }
+
+    // Imported docs replay their counter values verbatim; reposition each
+    // declared table's sequence past the imported max so post-restore inserts
+    // continue the numbering instead of restarting at 1 (and colliding with
+    // restored rows under a unique index). Forward-only — see
+    // `reposition_sequence`.
+    for (table_name, table_def) in &applied.tables {
+        if let Some(field) = &table_def.auto_increment_field {
+            reposition_sequence(&mut tx, &pg_schema_name, table_name, field).await?;
+        }
     }
 
     tx.commit().await?;

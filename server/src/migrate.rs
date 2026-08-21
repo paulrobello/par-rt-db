@@ -2,7 +2,8 @@
 //! applies transactionally to transform a database's schema and documents.
 //! See docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md.
 use crate::ddl::{
-    backfill_expr, indexed_fields, pg_col, pg_schema, pg_search_col, pg_table, pg_vector_col,
+    backfill_expr, indexed_fields, pg_col, pg_schema, pg_search_col, pg_sequence, pg_table,
+    pg_vector_col,
 };
 use crate::error::RtDbError;
 use crate::schema::{
@@ -296,6 +297,9 @@ fn validate_one(schema: &mut SchemaDef, d: &Directive) -> Result<(), RtDbError> 
             if t.collaborators_field.as_deref() == Some(from.as_str()) {
                 t.collaborators_field = Some(to.clone());
             }
+            if t.auto_increment_field.as_deref() == Some(from.as_str()) {
+                t.auto_increment_field = Some(to.clone());
+            }
             if let Some(expr) = t.authorize.as_mut() {
                 rename_filter_fields(expr, from, to);
             }
@@ -382,6 +386,9 @@ fn validate_one(schema: &mut SchemaDef, d: &Directive) -> Result<(), RtDbError> 
             }
             if t.collaborators_field.as_deref() == Some(field.as_str()) {
                 t.collaborators_field = None;
+            }
+            if t.auto_increment_field.as_deref() == Some(field.as_str()) {
+                t.auto_increment_field = None;
             }
             t.defaults.remove(field);
         }
@@ -721,6 +728,16 @@ async fn apply_rename_table(
     ))
     .execute(&mut **tx)
     .await?;
+    // The auto-increment sequence is standalone and named after the table
+    // (`seq_<table>`); it must follow the rename or the next insert's
+    // `nextval` targets a missing relation.
+    sqlx::query(&format!(
+        "ALTER SEQUENCE IF EXISTS \"{schema_name}\".\"{}\" RENAME TO \"{}\"",
+        pg_sequence(from),
+        pg_sequence(to)
+    ))
+    .execute(&mut **tx)
+    .await?;
     fx.touched.insert(to.to_string());
     Ok(DirectiveReport {
         op: "renameTable".into(),
@@ -802,6 +819,14 @@ async fn apply_drop_table(
     sqlx::query(&format!("DROP TABLE \"{schema_name}\".\"{t}\""))
         .execute(&mut **tx)
         .await?;
+    // Standalone auto-increment sequence: nothing cascades to it, so it is
+    // dropped explicitly (guarded — tables without a counter are unaffected).
+    sqlx::query(&format!(
+        "DROP SEQUENCE IF EXISTS \"{schema_name}\".\"{}\"",
+        pg_sequence(name)
+    ))
+    .execute(&mut **tx)
+    .await?;
     fx.touched.insert(name.to_string());
     push_ops(&mut fx.ops, name, &ids, OpKind::Delete);
     Ok(DirectiveReport {
@@ -1645,6 +1670,7 @@ mod tests {
                 collaborators_field: None,
                 ttl: None,
                 updated_at_field: None,
+                auto_increment_field: None,
                 authorize: None,
 
                 soft_delete: false,
@@ -1664,6 +1690,31 @@ mod tests {
         let got = plan_migration(&old, &d).unwrap();
         assert!(got.tables["users"].fields.contains_key("fullName"));
         assert!(!got.tables["users"].fields.contains_key("name"));
+    }
+
+    #[test]
+    fn plan_rename_field_follows_auto_increment_declaration() {
+        let mut old = one_table_schema();
+        old.tables
+            .get_mut("users")
+            .expect("users")
+            .fields
+            .insert("ticketNum".into(), FieldType::Int64);
+        old.tables
+            .get_mut("users")
+            .expect("users")
+            .auto_increment_field = Some("ticketNum".into());
+        let d = vec![Directive::RenameField {
+            table: "users".into(),
+            from: "ticketNum".into(),
+            to: "number".into(),
+        }];
+        let got = plan_migration(&old, &d).unwrap();
+        assert_eq!(
+            got.tables["users"].auto_increment_field,
+            Some("number".to_string()),
+            "the declaration follows the renamed field"
+        );
     }
 
     #[test]
@@ -1750,6 +1801,7 @@ mod tests {
                 collaborators_field: None,
                 ttl: None,
                 updated_at_field: None,
+                auto_increment_field: None,
                 authorize: None,
 
                 soft_delete: false,
@@ -1832,6 +1884,7 @@ mod tests {
                 collaborators_field: Some("collabs".into()),
                 ttl: None,
                 updated_at_field: None,
+                auto_increment_field: None,
                 authorize: None,
 
                 soft_delete: false,
@@ -2024,6 +2077,7 @@ mod tests {
                 collaborators_field: None,
                 ttl: None,
                 updated_at_field: None,
+                auto_increment_field: None,
                 authorize: None,
 
                 soft_delete: false,
@@ -2071,6 +2125,7 @@ mod tests {
                 collaborators_field: None,
                 ttl: None,
                 updated_at_field: None,
+                auto_increment_field: None,
                 authorize: None,
 
                 soft_delete: false,
@@ -2086,6 +2141,7 @@ mod tests {
                 collaborators_field: None,
                 ttl: None,
                 updated_at_field: None,
+                auto_increment_field: None,
                 authorize: None,
 
                 soft_delete: false,

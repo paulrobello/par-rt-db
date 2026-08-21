@@ -285,6 +285,25 @@ graph LR
   snapshot replay (`insert_snapshot_row` preserves the stored value verbatim)
   and the anon→real merge restamp (an administrative ownership rewrite, not a
   content write).
+- **Server-assigned `autoIncrementField`** (FM-37): a table may name a declared
+  `int64` field (additive wire key, omitted when unset; push-validated —
+  declared, exactly `int64`, and distinct from `ttl.field` and
+  `updatedAtField`) that the server stamps from a per-table standalone
+  Postgres sequence (`seq_<table>`, created by `ddl::apply_sequence` when the
+  declaration is new) on the two insert paths — `Insert` and upsert's insert
+  branch — overwriting any client-supplied value. `nextval` is
+  non-transactional, so rolled-back txns leave gaps (sequences are monotonic,
+  not gap-free). Immutable after insert: `apply_patch` (the one seam behind
+  patch, upsert-update, and patchByQuery) and `do_replace` reject a changed
+  value with `BAD_REQUEST`; an omitted replace field is filled from the stored
+  row, and round-tripping the stored value is allowed. A replace of a doc that
+  predates the declaration may set the value once (first-set). Snapshot import
+  replays values verbatim then repositions each sequence past the imported max
+  (`ddl::reposition_sequence`, forward-only — it also runs when a declaration
+  is added to a populated table); the destructive reconcile drops sequences
+  for dropped tables / removed declarations, and migrate's `renameTable` /
+  `dropTable` rename / drop the sequence physically while `renameField` /
+  `dropField` follow / clear the declaration.
 - **Cascade delete + soft delete** (FM-33): an `id` field may declare
   `onDelete: cascade|restrict|setNull` (legal top-level or one `optional`
   deep) and a table may declare `softDelete` — both enforced **in the app layer

@@ -227,6 +227,22 @@ pub struct TableDef {
         rename = "updatedAtField"
     )]
     pub updated_at_field: Option<String>,
+    /// Server-assigned per-table monotonic counter: names a declared `int64`
+    /// field stamped from a per-table Postgres sequence on insert (and
+    /// upsert's insert branch), overwriting any client-supplied value (the
+    /// `ownerField` authority model). Immutable after insert — a patch or
+    /// replace that changes the stored value is rejected. Legal in a unique
+    /// index (the ticket-number guarantee). Gaps are possible on rolled-back
+    /// transactions: sequences are not gap-free. Snapshot import replays
+    /// stored values verbatim and repositions each sequence past the imported
+    /// max, so numbering continues after a restore. Additive — schemas
+    /// without it deserialize unchanged.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "autoIncrementField"
+    )]
+    pub auto_increment_field: Option<String>,
     /// Opt-in per-row authorization predicate (Model C). A general
     /// `FilterExpr` over this table's declared doc fields and the principal's
     /// markers (`{"$user":true}` / `{"$email":true}`). Enforced on the same
@@ -630,6 +646,7 @@ impl TableDef {
         self.validate_indexes(table_name)?;
         self.validate_ttl()?;
         self.validate_updated_at()?;
+        self.validate_auto_increment()?;
         self.validate_defaults(table_name)?;
         self.validate_on_delete(table_name)?;
         Ok(())
@@ -905,6 +922,44 @@ impl TableDef {
             if self.ttl.as_ref().is_some_and(|ttl| &ttl.field == field) {
                 return Err(RtDbError::schema(format!(
                     "updatedAtField '{field}' must differ from ttl.field (both stamps write unconditionally; a shared field would drop the expiry)"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// `autoIncrementField` push validation: the field must be declared
+    /// `int64` exactly (the sequence produces int64; a `number` would lose
+    /// precision, an `optional` would admit a missing counter) and must
+    /// differ from `ttl.field` and `updatedAtField` (both stamp
+    /// unconditionally on writes the counter must survive verbatim). A
+    /// `defaults` entry on the field is allowed but always loses to the
+    /// stamp — same authority family as the ttl default.
+    fn validate_auto_increment(&self) -> Result<(), RtDbError> {
+        if let Some(field) = &self.auto_increment_field {
+            if !is_valid_identifier(field, MAX_FIELD_NAME_LEN) {
+                return Err(RtDbError::schema(format!(
+                    "autoIncrementField '{field}' is not a valid identifier"
+                )));
+            }
+            let fty = self.fields.get(field).ok_or_else(|| {
+                RtDbError::schema(format!(
+                    "autoIncrementField '{field}' is not a declared field"
+                ))
+            })?;
+            if !matches!(fty, FieldType::Int64) {
+                return Err(RtDbError::schema(format!(
+                    "autoIncrementField '{field}' must be an int64 field"
+                )));
+            }
+            if self.ttl.as_ref().is_some_and(|ttl| &ttl.field == field) {
+                return Err(RtDbError::schema(format!(
+                    "autoIncrementField '{field}' must differ from ttl.field (the ttl reaper would delete counter rows)"
+                )));
+            }
+            if self.updated_at_field.as_ref().is_some_and(|at| at == field) {
+                return Err(RtDbError::schema(format!(
+                    "autoIncrementField '{field}' must differ from updatedAtField (the timestamp would overwrite the counter on every write)"
                 )));
             }
         }
@@ -1245,6 +1300,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1298,6 +1354,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1337,6 +1394,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1358,6 +1416,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1387,6 +1446,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1416,6 +1476,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1439,6 +1500,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1478,6 +1540,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1498,6 +1561,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1544,6 +1608,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1572,6 +1637,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1600,6 +1666,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1639,6 +1706,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1667,6 +1735,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1695,6 +1764,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1720,6 +1790,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1740,6 +1811,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1767,6 +1839,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -1977,6 +2050,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2082,6 +2156,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2145,6 +2220,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2178,6 +2254,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2281,6 +2358,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2313,6 +2391,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2344,6 +2423,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2377,6 +2457,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2409,6 +2490,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2440,6 +2522,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2471,6 +2554,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2508,6 +2592,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2754,6 +2839,7 @@ mod tests {
             collaborators_field: None,
             ttl,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
@@ -2889,6 +2975,7 @@ mod tests {
             collaborators_field: None,
             ttl: None,
             updated_at_field: None,
+            auto_increment_field: None,
             authorize: None,
 
             soft_delete: false,
