@@ -317,6 +317,8 @@ pub async fn next_due(pool: &PgPool, db: &str) -> Result<Option<i64>, RtDbError>
 
 /// Per-step-boundary write while the row stays `running` (the scheduler only
 /// claims `pending`, so the committer's in-turn loop cannot be double-claimed).
+/// The `status = 'running'` guard makes a cancel that lands mid-advance win
+/// the race — the boundary write silently misses.
 pub async fn record_step_success(
     pool: &PgPool,
     db: &str,
@@ -332,7 +334,7 @@ pub async fn record_step_success(
         "UPDATE \"{schema}\".workflows
          SET current_step = $2, attempts = 0,
              step_outcomes = step_outcomes || $3::jsonb, updated_at = $4
-         WHERE id = $1"
+         WHERE id = $1 AND status = 'running'"
     ))
     .bind(id)
     .bind(current_step as i32)
@@ -343,7 +345,9 @@ pub async fn record_step_success(
     Ok(())
 }
 
-/// Release a `running` row back to claimable with a future gate.
+/// Release a `running` row back to claimable with a future gate. The
+/// `status = 'running'` guard makes a cancel that lands mid-advance win the
+/// race — a cancelled row never resurrects as `pending`.
 pub async fn set_pending(
     pool: &PgPool,
     db: &str,
@@ -355,7 +359,7 @@ pub async fn set_pending(
     sqlx::query(&format!(
         "UPDATE \"{schema}\".workflows
          SET status = 'pending', sleep_until = $2, updated_at = $3
-         WHERE id = $1"
+         WHERE id = $1 AND status = 'running'"
     ))
     .bind(id)
     .bind(sleep_until)
@@ -367,7 +371,9 @@ pub async fn set_pending(
 
 /// A failed attempt that has retries left: bump attempts, schedule the
 /// backoff gate, release to `pending`. Does NOT append an outcome (retries
-/// are carried by the attempts counters).
+/// are carried by the attempts counters). The `status = 'running'` guard
+/// makes a cancel that lands mid-advance win the race — a cancelled row
+/// never resurrects as `pending`.
 pub async fn schedule_retry(
     pool: &PgPool,
     db: &str,
@@ -380,7 +386,7 @@ pub async fn schedule_retry(
     sqlx::query(&format!(
         "UPDATE \"{schema}\".workflows
          SET status = 'pending', attempts = $2, sleep_until = $3, updated_at = $4
-         WHERE id = $1"
+         WHERE id = $1 AND status = 'running'"
     ))
     .bind(id)
     .bind(attempts as i32)
@@ -533,6 +539,8 @@ pub async fn deliver_signal(
     }
 }
 
+/// Terminal success. The `status = 'running'` guard makes a cancel that
+/// lands mid-advance win the race — a cancelled row never flips to `success`.
 pub async fn finalize_success(
     pool: &PgPool,
     db: &str,
@@ -548,7 +556,7 @@ pub async fn finalize_success(
          SET status = 'success', attempts = 0, last_error = NULL,
              step_outcomes = step_outcomes || $2::jsonb, finished_at = $3, updated_at = $3,
              wait_name = NULL, waited_since = NULL, signal_payload = NULL
-         WHERE id = $1"
+         WHERE id = $1 AND status = 'running'"
     ))
     .bind(id)
     .bind(&outcome_json)
@@ -560,7 +568,9 @@ pub async fn finalize_success(
 
 /// Terminal failure: `status = failed` with the final attempt count (bound
 /// from `outcome.attempts`, so `WorkflowInfo.attempts` matches the trail's
-/// last entry — `schedule_retry` carried the pre-terminal value).
+/// last entry — `schedule_retry` carried the pre-terminal value). The
+/// `status = 'running'` guard makes a cancel that lands mid-advance win the
+/// race — a cancelled row never flips to `failed`.
 pub async fn mark_failed(
     pool: &PgPool,
     db: &str,
@@ -577,7 +587,7 @@ pub async fn mark_failed(
          SET status = 'failed', last_error = $2, attempts = $5,
              step_outcomes = step_outcomes || $3::jsonb, finished_at = $4, updated_at = $4,
              wait_name = NULL, waited_since = NULL, signal_payload = NULL
-         WHERE id = $1"
+         WHERE id = $1 AND status = 'running'"
     ))
     .bind(id)
     .bind(error)
@@ -611,9 +621,8 @@ pub async fn cancel(pool: &PgPool, db: &str, id: &str) -> Result<bool, RtDbError
 
 /// Connection-bound variant of [`cancel`] for `Step::CancelWorkflow` — the
 /// UPDATE rides the caller's open sqlx transaction. Covers `waiting` rows
-/// like [`cancel`] (cancel is the escape for a wait without a timeout); the
-/// wait columns stay put — inert on a terminal row (`info_from_row`
-/// projects them only while `waiting`).
+/// like [`cancel`] and clears the wait columns with the flip (the
+/// leave-`waiting` rule).
 pub(crate) async fn cancel_on(
     conn: &mut PgConnection,
     db: &str,
@@ -623,7 +632,8 @@ pub(crate) async fn cancel_on(
     let schema = pg_schema(db);
     let res = sqlx::query(&format!(
         "UPDATE \"{schema}\".workflows
-         SET status = 'cancelled', finished_at = $2, updated_at = $2
+         SET status = 'cancelled', finished_at = $2, updated_at = $2,
+             wait_name = NULL, waited_since = NULL, signal_payload = NULL
          WHERE id = $1 AND status IN ('pending', 'running', 'waiting')"
     ))
     .bind(id)
