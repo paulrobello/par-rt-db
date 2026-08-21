@@ -8,7 +8,7 @@
 //!
 //! Admin subcommands (`list-dbs`, `create-db`, `clone-db`, `push-schema`,
 //! `mint-token`, `revoke-token`, `sessions list|revoke`, `merge-users`,
-//! `workflows list|get|start|cancel`) send the instance admin key as the
+//! `workflows list|get|start|cancel|signal`) send the instance admin key as the
 //! bearer. Data-plane subcommands (`query`, `mutate`) send a machine token
 //! scoped to `--db`.
 //!
@@ -287,6 +287,11 @@ mod tests {
                 file: "spec.json".into(),
             },
             WorkflowsCommand::Cancel { id: "run1".into() },
+            WorkflowsCommand::Signal {
+                id: "run1".into(),
+                name: "approve".into(),
+                payload_json: None,
+            },
         ] {
             let err = dispatch(&cli_with_command(Command::Workflows { command }))
                 .await
@@ -343,5 +348,46 @@ mod tests {
 
         std::fs::remove_file(&bad_path).ok();
         std::fs::remove_file(&good_path).ok();
+    }
+
+    #[tokio::test]
+    async fn dispatch_workflows_signal_parses_payload_before_credentials() {
+        // The payload is parsed before the credential gate (the `start` spec
+        // pattern): invalid JSON surfaces its parse error without a key; valid
+        // JSON proceeds to the credential gate and errors there instead.
+        let mk = |payload_json: Option<String>| Cli {
+            url: "http://x".into(),
+            db: Some("d".into()),
+            token: None,
+            admin_key: None,
+            command: Command::Workflows {
+                command: WorkflowsCommand::Signal {
+                    id: "run1".into(),
+                    name: "approve".into(),
+                    payload_json,
+                },
+            },
+        };
+
+        let err = dispatch(&mk(Some("{not json".into())))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("parsing payload JSON"), "got: {err}");
+
+        let err = dispatch(&mk(Some(r#"{"approvedBy":"u1"}"#.into())))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--admin-key"),
+            "expected the credential-gate error, got: {err}"
+        );
+
+        let err = dispatch(&mk(None)).await.unwrap_err().to_string();
+        assert!(
+            err.contains("--admin-key"),
+            "expected the credential-gate error, got: {err}"
+        );
     }
 }

@@ -144,7 +144,8 @@ pub(crate) enum Command {
 pub(crate) enum WorkflowsCommand {
     /// List workflow runs in `--db`, newest first.
     List {
-        /// Filter by run status: pending|running|success|failed|cancelled.
+        /// Filter by run status:
+        /// pending|running|waiting|success|failed|cancelled.
         #[arg(long)]
         status: Option<String>,
         /// Cap the result count (server default 100, capped at 500).
@@ -170,6 +171,19 @@ pub(crate) enum WorkflowsCommand {
         /// Workflow run id to cancel.
         #[arg(long)]
         id: String,
+    },
+    /// Deliver a named signal to a waiting run (releases an `awaitSignal`
+    /// step).
+    Signal {
+        /// Workflow run id to signal.
+        #[arg(long)]
+        id: String,
+        /// Signal name (must match the parked step's `awaitSignal.name`).
+        #[arg(long)]
+        name: String,
+        /// Optional JSON payload for the signal, e.g. `'{"approvedBy":"u1"}'`.
+        #[arg(long)]
+        payload_json: Option<String>,
     },
 }
 
@@ -601,6 +615,72 @@ mod tests {
             panic!("expected WorkflowsCommand::Cancel");
         };
         assert_eq!(id, "run1");
+
+        // `workflows signal --id --name [--payload-json]`.
+        let cli = Cli::try_parse_from([
+            "rtdb",
+            "--url",
+            "http://x",
+            "--db",
+            "d",
+            "--admin-key",
+            "k",
+            "workflows",
+            "signal",
+            "--id",
+            "run1",
+            "--name",
+            "approve",
+            "--payload-json",
+            r#"{"approvedBy":"u1"}"#,
+        ])
+        .unwrap();
+        let Command::Workflows { command } = cli.command else {
+            panic!("expected Workflows");
+        };
+        let WorkflowsCommand::Signal {
+            id,
+            name,
+            payload_json,
+        } = command
+        else {
+            panic!("expected WorkflowsCommand::Signal");
+        };
+        assert_eq!(id, "run1");
+        assert_eq!(name, "approve");
+        assert_eq!(payload_json.as_deref(), Some(r#"{"approvedBy":"u1"}"#));
+
+        // payload is optional.
+        let cli = Cli::try_parse_from([
+            "rtdb",
+            "--url",
+            "http://x",
+            "--db",
+            "d",
+            "--admin-key",
+            "k",
+            "workflows",
+            "signal",
+            "--id",
+            "run1",
+            "--name",
+            "approve",
+        ])
+        .unwrap();
+        let Command::Workflows { command } = cli.command else {
+            panic!("expected Workflows");
+        };
+        let WorkflowsCommand::Signal {
+            id,
+            name,
+            payload_json,
+        } = command
+        else {
+            panic!("expected WorkflowsCommand::Signal");
+        };
+        assert_eq!(id, "run1");
+        assert_eq!(name, "approve");
+        assert_eq!(payload_json, None);
     }
 
     #[test]
