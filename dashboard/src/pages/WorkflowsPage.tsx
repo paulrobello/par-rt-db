@@ -21,6 +21,7 @@ const STATUS_FILTERS = [
   "stuck",
   "pending",
   "running",
+  "waiting",
   "success",
   "failed",
   "cancelled",
@@ -54,6 +55,7 @@ function isTerminal(w: WorkflowInfo): boolean {
 function statusClass(w: WorkflowInfo): string {
   let extra = "";
   if (w.status === "running") extra = s.statusRunning;
+  else if (w.status === "waiting") extra = s.statusWaiting;
   else if (w.status === "failed") extra = s.statusFailed;
   else if (w.status === "success") extra = s.statusSuccess;
   else if (w.status === "cancelled") extra = s.statusCancelled;
@@ -76,6 +78,15 @@ function sleepLabel(w: WorkflowInfo, now: number): string {
   if (w.sleepUntil === undefined) return "—";
   const remaining = w.sleepUntil - now;
   return remaining > 0 ? `in ${formatDuration(remaining / 1000)}` : "due";
+}
+
+/** Detail line under a `waiting` status: what the run is parked on and for
+ * how long (`waitedSince` rides `waitingFor` — both clear on any leave-
+ * `waiting` transition). */
+function waitLabel(w: WorkflowInfo, now: number): string {
+  return `waiting on ${w.waitingFor ?? "?"} · ${formatDuration(
+    (now - (w.waitedSince ?? now)) / 1000,
+  )}`;
 }
 
 /** Label for the current (not-yet-finished) step of a non-terminal run. */
@@ -111,6 +122,14 @@ export function WorkflowsPage() {
   const [startError, setStartError] = useState<string | null>(null);
   const [startOk, setStartOk] = useState<string | null>(null);
 
+  // Send-signal state: one inline form at a time, on a waiting row. The name
+  // prefills from the row's `waitingFor`; the payload is optional JSON.
+  const [signalFor, setSignalFor] = useState<string | null>(null);
+  const [signalName, setSignalName] = useState("");
+  const [signalPayload, setSignalPayload] = useState("");
+  const [signaling, setSignaling] = useState(false);
+  const [signalError, setSignalError] = useState<string | null>(null);
+
   // Auto-select the first database once the list arrives.
   useEffect(() => {
     if (!db && databases.length > 0) setDb(databases[0]);
@@ -142,6 +161,8 @@ export function WorkflowsPage() {
     setExpandedId(null);
     setDetail(null);
     setDetailError(null);
+    setSignalFor(null);
+    setSignalError(null);
     if (db) void refresh();
   }, [db, refresh]);
   useEffect(() => {
@@ -217,6 +238,44 @@ export function WorkflowsPage() {
       setStartError(toErrorMessage(e));
     } finally {
       setStarting(false);
+    }
+  }
+
+  function toggleSignal(w: WorkflowInfo) {
+    if (signalFor === w.id) {
+      setSignalFor(null);
+      setSignalError(null);
+      return;
+    }
+    setSignalFor(w.id);
+    setSignalName(w.waitingFor ?? "");
+    setSignalPayload("");
+    setSignalError(null);
+  }
+
+  async function sendSignal(id: string) {
+    if (!db) return;
+    let payload: unknown;
+    const trimmed = signalPayload.trim();
+    if (trimmed !== "") {
+      try {
+        payload = JSON.parse(trimmed) as unknown;
+      } catch (e) {
+        setSignalError(`invalid payload JSON — ${toErrorMessage(e)}`);
+        return;
+      }
+    }
+    setSignaling(true);
+    setSignalError(null);
+    try {
+      await client.adminSignalWorkflow(db, id, signalName, payload);
+      setSignalFor(null);
+      await refresh();
+      if (expandedId === id) await refreshDetail(id);
+    } catch (e) {
+      setSignalError(toErrorMessage(e));
+    } finally {
+      setSignaling(false);
     }
   }
 
@@ -306,7 +365,15 @@ export function WorkflowsPage() {
                         <br />
                         <span className={s.hint}>{w.id.slice(0, 8)}</span>
                       </td>
-                      <td className={statusClass(w)}>{statusLabel(w)}</td>
+                      <td className={statusClass(w)}>
+                        {statusLabel(w)}
+                        {w.status === "waiting" && (
+                          <>
+                            <br />
+                            <span className={s.hint}>{waitLabel(w, now)}</span>
+                          </>
+                        )}
+                      </td>
                       <td className="tnum">{stepLabel(w)}</td>
                       <td className="tnum">{w.attempts}</td>
                       <td>{sleepLabel(w, now)}</td>
@@ -318,6 +385,11 @@ export function WorkflowsPage() {
                           <Button onClick={() => toggleExpand(w.id)} disabled={busy}>
                             {expanded ? "hide" : "steps"}
                           </Button>
+                          {w.status === "waiting" && (
+                            <Button onClick={() => toggleSignal(w)} disabled={busy || signaling}>
+                              signal
+                            </Button>
+                          )}
                           {confirmingThis ? (
                             <span className={s.confirmInline}>
                               <span className={s.confirmLabel}>{confirmingThis}?</span>
@@ -359,6 +431,47 @@ export function WorkflowsPage() {
                         </div>
                       </td>
                     </tr>
+                    {signalFor === w.id && (
+                      <tr className={s.detailRow}>
+                        <td colSpan={7}>
+                          <div className={s.signalForm}>
+                            <label className={s.signalField}>
+                              <span className={s.fieldLabel}>signal name</span>
+                              <input
+                                className={s.signalName}
+                                value={signalName}
+                                onChange={(e) => setSignalName(e.target.value)}
+                                spellCheck={false}
+                                aria-label="signal name"
+                              />
+                            </label>
+                            <label className={s.signalField}>
+                              <span className={s.fieldLabel}>payload (JSON, optional)</span>
+                              <textarea
+                                className={s.signalPayload}
+                                value={signalPayload}
+                                onChange={(e) => setSignalPayload(e.target.value)}
+                                spellCheck={false}
+                                rows={3}
+                                aria-label="signal payload"
+                              />
+                            </label>
+                            <div className={s.signalActions}>
+                              <Button
+                                variant="primary"
+                                onClick={() => void sendSignal(w.id)}
+                                disabled={signaling}
+                              >
+                                {signaling ? "sending…" : "send signal"}
+                              </Button>
+                            </div>
+                            {signalError && (
+                              <p className={`${s.error} ${s.signalError}`}>{signalError}</p>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    )}
                     {expanded && (
                       <tr className={s.detailRow}>
                         <td colSpan={7}>

@@ -13,6 +13,7 @@ const adminClientMock = vi.hoisted(() => ({
   adminStartWorkflow: vi.fn(),
   adminCancelWorkflow: vi.fn(),
   adminDeleteWorkflow: vi.fn(),
+  adminSignalWorkflow: vi.fn(),
 }));
 
 vi.mock("../lib/admin", () => ({
@@ -55,6 +56,14 @@ const retryingRun = run({
   currentStep: 1,
   attempts: 2,
   sleepUntil: now + 30_000,
+});
+const waitingRun = run({
+  id: "run00005-eeee",
+  name: "approval-flow",
+  status: "waiting",
+  currentStep: 1,
+  waitingFor: "approve",
+  waitedSince: now - 90_000,
 });
 
 const fullRun: WorkflowInfoFull = {
@@ -188,5 +197,65 @@ describe("WorkflowsPage", () => {
     expect(await screen.findByText("poll blew up")).toBeInTheDocument();
     // The start editor still renders — the page did not crash.
     expect(screen.getByRole("button", { name: "start" })).toBeInTheDocument();
+  });
+
+  it("renders a waiting run with its wait detail and a signal action", async () => {
+    adminClientMock.adminListWorkflows.mockResolvedValue([waitingRun]);
+    render(<WorkflowsPage />);
+    const row = (await screen.findByText("approval-flow")).closest("tr");
+    if (!row) throw new Error("row not found");
+
+    // The status chip plus the waitingFor/waitedSince detail line (90s ago).
+    expect(within(row).getByText("waiting")).toBeInTheDocument();
+    expect(within(row).getByText(/waiting on approve · /)).toBeInTheDocument();
+    expect(within(row).getByRole("button", { name: "signal" })).toBeInTheDocument();
+  });
+
+  it("sends a signal from a waiting row, surfacing errors, then refetches", async () => {
+    adminClientMock.adminListWorkflows.mockResolvedValue([waitingRun]);
+    adminClientMock.adminSignalWorkflow.mockResolvedValue({ ok: true });
+    const user = userEvent.setup();
+    render(<WorkflowsPage />);
+    const row = (await screen.findByText("approval-flow")).closest("tr");
+    if (!row) throw new Error("row not found");
+
+    await user.click(within(row).getByRole("button", { name: "signal" }));
+
+    // The name prefills from the row's waitingFor.
+    expect(screen.getByLabelText("signal name")).toHaveValue("approve");
+
+    // Invalid payload JSON is rejected inline before any request goes out.
+    fireEvent.change(screen.getByLabelText("signal payload"), {
+      target: { value: "{not json" },
+    });
+    await user.click(screen.getByRole("button", { name: "send signal" }));
+    expect(adminClientMock.adminSignalWorkflow).not.toHaveBeenCalled();
+    expect(screen.getByText(/invalid payload JSON/)).toBeInTheDocument();
+
+    // A typed rejection (404/409 envelope) surfaces next to the form.
+    adminClientMock.adminSignalWorkflow.mockRejectedValueOnce(
+      new Error("CONFLICT: workflow is not waiting for a signal"),
+    );
+    fireEvent.change(screen.getByLabelText("signal payload"), {
+      target: { value: '{"approvedBy":"u1"}' },
+    });
+    await user.click(screen.getByRole("button", { name: "send signal" }));
+    expect(await screen.findByText(/CONFLICT/)).toBeInTheDocument();
+
+    // A valid send posts name + parsed payload, closes the form, refetches.
+    const listsBefore = adminClientMock.adminListWorkflows.mock.calls.length;
+    await user.click(screen.getByRole("button", { name: "send signal" }));
+    await waitFor(() => {
+      expect(adminClientMock.adminSignalWorkflow).toHaveBeenCalledWith(
+        "db1",
+        "run00005-eeee",
+        "approve",
+        { approvedBy: "u1" },
+      );
+    });
+    expect(screen.queryByLabelText("signal payload")).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(adminClientMock.adminListWorkflows.mock.calls.length).toBeGreaterThan(listsBefore);
+    });
   });
 });
