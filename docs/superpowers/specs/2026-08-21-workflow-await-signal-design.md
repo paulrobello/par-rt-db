@@ -1,7 +1,7 @@
 # Workflow `awaitSignal` — external/human approval gates
 
 Date: 2026-08-21
-Status: design (awaiting user approval — card criterion 3)
+Status: approved design (user-approved 2026-08-21)
 Board card: `Workflow awaitSignal step — external/human approval gates`
 Depends on: FM-29 durable declarative workflows (shipped 2026-08-15,
 `2026-08-15-workflows-design.md`) — the side table, scheduler claim loop,
