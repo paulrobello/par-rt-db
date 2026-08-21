@@ -159,10 +159,22 @@ export interface StepRetry {
   maxRetryMs?: number;
 }
 
-/** One workflow step: an ordinary `Transaction` plus policy. The txn may
- * itself carry `schedule`/`cancelSchedule` steps (FM-28 rules apply). */
+/** An `awaitSignal` step's wait declaration: park the run until a signal
+ * named `name` is delivered; `timeoutMs` bounds each wait attempt (omitted =
+ * wait indefinitely, cancel is the escape). Mirrors server
+ * `protocol::AwaitSignalSpec`. */
+export interface AwaitSignalSpec {
+  name: string;
+  timeoutMs?: number;
+}
+
+/** One workflow step: either an ordinary `Transaction` or an
+ * {@link AwaitSignalSpec} wait (exactly one — the server's `validate_spec`
+ * enforces it), plus policy. The txn may itself carry `schedule`/
+ * `cancelSchedule` steps (FM-28 rules apply). */
 export interface WorkflowStepSpec {
-  txn: TransactionJson;
+  txn?: TransactionJson;
+  awaitSignal?: AwaitSignalSpec;
   retry?: StepRetry;
   sleepBeforeMs?: number;
 }
@@ -174,22 +186,28 @@ export interface WorkflowSpec {
   steps: WorkflowStepSpec[];
 }
 
-/** Run lifecycle, snake_case on the wire (mirrors server `WorkflowStatus`). */
-export type WorkflowStatus = "pending" | "running" | "success" | "failed" | "cancelled";
+/** Run lifecycle, snake_case on the wire (mirrors server `WorkflowStatus`).
+ * `waiting` marks a run parked at an `awaitSignal` step. */
+export type WorkflowStatus = "pending" | "running" | "success" | "failed" | "cancelled" | "waiting";
 
 /** Terminal record for one step: completed successfully, or exhausted its
  * retries (`status: "failed"`). Individual retried attempts are NOT recorded —
- * the `attempts` count carries them. `error` omitted unless failed. */
+ * the `attempts` count carries them. `error` omitted unless failed. `signal`
+ * carries the delivered payload verbatim, present only on a signal-satisfied
+ * success outcome. */
 export interface StepOutcome {
   stepIndex: number;
   status: "success" | "failed";
   attempts: number;
   at: number;
   error?: string;
+  signal?: unknown;
 }
 
 /** List/get projection of one run. `sleepUntil`/`lastError`/`startedAt`/
- * `finishedAt` omitted on the wire when absent. */
+ * `finishedAt` omitted on the wire when absent, as are `waitingFor`/
+ * `waitedSince` (present only while `status === "waiting"` — every leave-
+ * `waiting` transition clears them). */
 export interface WorkflowInfo {
   id: string;
   name: string;
@@ -199,6 +217,8 @@ export interface WorkflowInfo {
   attempts: number;
   sleepUntil?: number;
   lastError?: string;
+  waitingFor?: string;
+  waitedSince?: number;
   createdAt: number;
   updatedAt: number;
   startedAt?: number;
@@ -467,6 +487,7 @@ export type ClientMessage =
   | { type: "listSchedules"; scheduleId: string }
   | { type: "startWorkflow"; workflowId: string; spec: WorkflowSpec }
   | { type: "cancelWorkflow"; workflowId: string; id: string }
+  | { type: "signalWorkflow"; workflowId: string; id: string; name: string; payload?: unknown }
   | { type: "listWorkflows"; workflowId: string; status?: WorkflowStatus }
   | { type: "presence"; room: string; state?: unknown }
   | { type: "presenceState"; room: string; state: unknown; ttlMs?: number }

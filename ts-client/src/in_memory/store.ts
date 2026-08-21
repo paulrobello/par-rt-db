@@ -176,7 +176,7 @@ function countSteps(txn: TransactionJson): number {
   for (const step of txn.steps) {
     if (step.op === "schedule") total += countSteps(step.txn);
     if (step.op === "startWorkflow") {
-      for (const s of step.spec.steps) total += countSteps(s.txn);
+      for (const s of step.spec.steps) total += s.txn ? countSteps(s.txn) : 0;
     }
   }
   return total;
@@ -251,6 +251,18 @@ function backoffMs(retry: Required<StepRetry>, attempts: number): number {
   return Math.min(retry.initialRetryMs * 2 ** shift, retry.maxRetryMs);
 }
 
+/** FM-29: the effective retry policy for a step — the spec's partial policy
+ * with server `StepRetry::default` filling the gaps. */
+function resolveStepRetry(retry?: StepRetry): Required<StepRetry> {
+  return retry
+    ? {
+        maxAttempts: retry.maxAttempts,
+        initialRetryMs: retry.initialRetryMs ?? DEFAULT_STEP_RETRY.initialRetryMs,
+        maxRetryMs: retry.maxRetryMs ?? DEFAULT_STEP_RETRY.maxRetryMs,
+      }
+    : DEFAULT_STEP_RETRY;
+}
+
 /** FM-29: submit-time spec validation. Mirrors server `workflows::validate_spec`
  * (same checks, same BAD_REQUEST messages, including the recursive
  * `MAX_STEPS` gate over the spec's step txns). */
@@ -262,6 +274,25 @@ function validateWorkflowSpec(spec: WorkflowSpec): void {
     throw new RtDbError("BAD_REQUEST", `workflow exceeds ${MAX_WORKFLOW_STEPS} steps`);
   }
   for (const [i, step] of spec.steps.entries()) {
+    // awaitSignal parity: exactly one of txn/awaitSignal per step, and the
+    // wait declaration is bounded (name 1..=256 chars, timeoutMs > 0).
+    const hasTxn = step.txn !== undefined;
+    const hasSig = step.awaitSignal !== undefined;
+    if (hasTxn === hasSig) {
+      throw new RtDbError(
+        "BAD_REQUEST",
+        `steps[${i}] must carry exactly one of txn or awaitSignal`,
+      );
+    }
+    if (step.awaitSignal !== undefined) {
+      const sig = step.awaitSignal;
+      if (sig.name.length === 0 || sig.name.length > 256) {
+        throw new RtDbError("BAD_REQUEST", `steps[${i}].awaitSignal.name must be 1..=256 chars`);
+      }
+      if (sig.timeoutMs === 0) {
+        throw new RtDbError("BAD_REQUEST", `steps[${i}].awaitSignal.timeoutMs must be > 0`);
+      }
+    }
     if (step.retry) {
       if (step.retry.maxAttempts === 0) {
         throw new RtDbError("BAD_REQUEST", `steps[${i}].retry.maxAttempts must be >= 1`);
@@ -276,7 +307,7 @@ function validateWorkflowSpec(spec: WorkflowSpec): void {
       }
     }
   }
-  const total = spec.steps.reduce((sum, s) => sum + countSteps(s.txn), 0);
+  const total = spec.steps.reduce((sum, s) => sum + (s.txn ? countSteps(s.txn) : 0), 0);
   if (total > MAX_STEPS) {
     throw new RtDbError(
       "BAD_REQUEST",
@@ -285,10 +316,22 @@ function validateWorkflowSpec(spec: WorkflowSpec): void {
   }
 }
 
+/** awaitSignal: gate stored on a run parked with no `timeoutMs` — never due,
+ * so only a delivery or a cancel can wake the run (the server's `i64::MAX`).
+ * Below any real clock reading `sleepUntil` can be compared against. */
+const NEVER_DUE = Number.MAX_SAFE_INTEGER;
+
+/** awaitSignal: serialized-size cap on one signal payload — mirrors server
+ * `workflows::MAX_SIGNAL_PAYLOAD_BYTES` (64 KiB). */
+const MAX_SIGNAL_PAYLOAD_BYTES = 64 * 1024;
+
 /** FM-29: a stored workflow run in the in-memory harness. Field names mirror
  * the server's `workflows` table columns; `sleepUntil` is always set (the
  * column is NOT NULL server-side — insert computes the initial gate, later
- * transitions overwrite it, terminal states leave it). */
+ * transitions overwrite it, terminal states leave it). The `wait*`/
+ * `signalPayload` fields mirror the server's awaitSignal side-table columns
+ * (`wait_name`/`waited_since`/`signal_payload`): present only from park until
+ * the wait resolves — every leave-`waiting` transition clears them. */
 interface WorkflowRun {
   id: string;
   spec: WorkflowSpec;
@@ -297,6 +340,9 @@ interface WorkflowRun {
   attempts: number;
   sleepUntil: number;
   lastError?: string;
+  waitName?: string;
+  waitedSince?: number;
+  signalPayload?: unknown;
   createdAt: number;
   updatedAt: number;
   startedAt?: number;
@@ -1121,18 +1167,61 @@ export class InMemoryRtDbClient {
     return this.toWorkflowInfo(this.startWorkflowJob(spec));
   }
 
-  /** Cancels a pending/running run: flips it to `cancelled` + `finishedAt`.
-   * Resolves `false` (a no-op, not an error) for an unknown or terminal run —
-   * the server's `workflows::cancel` contract. */
+  /** Cancels a pending/running/waiting run: flips it to `cancelled` +
+   * `finishedAt` and clears the awaitSignal wait columns (a parked run's only
+   * other escape). Resolves `false` (a no-op, not an error) for an unknown or
+   * terminal run — the server's `workflows::cancel` contract. */
   async cancelWorkflow(id: string): Promise<boolean> {
     const run = this.workflows.get(id);
-    if (!run || (run.status !== "pending" && run.status !== "running")) {
+    if (
+      !run ||
+      (run.status !== "pending" && run.status !== "running" && run.status !== "waiting")
+    ) {
       return false;
     }
     run.status = "cancelled";
     run.finishedAt = this.now();
     run.updatedAt = this.now();
+    delete run.waitName;
+    delete run.waitedSince;
+    delete run.signalPayload;
     return true;
+  }
+
+  /** Delivers a named signal to a waiting run's `awaitSignal` step
+   * (latest-wins: the payload overwrites any earlier unconsumed delivery and
+   * the run wakes on the next `tick`). Typed errors mirror the server's
+   * `SignalDelivery` classification: unknown id → NOT_FOUND; a parked run
+   * waiting on a different name → CONFLICT naming both; any other non-waiting
+   * state → CONFLICT. A payload over 64 KiB serialized rejects BAD_REQUEST. */
+  async signalWorkflow(id: string, name: string, payload?: unknown): Promise<boolean> {
+    if (payload !== undefined) {
+      const size = new TextEncoder().encode(JSON.stringify(payload)).length;
+      if (size > MAX_SIGNAL_PAYLOAD_BYTES) {
+        throw new RtDbError(
+          "BAD_REQUEST",
+          `signal payload exceeds ${MAX_SIGNAL_PAYLOAD_BYTES} bytes`,
+        );
+      }
+    }
+    const run = this.workflows.get(id);
+    if (!run) {
+      throw new RtDbError("NOT_FOUND", "unknown workflow");
+    }
+    // Matches a waiting row AND a pending row whose waitName survived an
+    // earlier delivery (latest-wins) — the server's conditional UPDATE.
+    if ((run.status === "waiting" || run.status === "pending") && run.waitName === name) {
+      const now = this.now();
+      run.status = "pending";
+      run.sleepUntil = now;
+      run.signalPayload = payload;
+      run.updatedAt = now;
+      return true;
+    }
+    if (run.status === "waiting") {
+      throw new RtDbError("CONFLICT", `workflow waiting on '${run.waitName}', got '${name}'`);
+    }
+    throw new RtDbError("CONFLICT", "workflow is not waiting for a signal");
   }
 
   /** Lists runs, newest first (createdAt DESC), optionally filtered by
@@ -1186,6 +1275,8 @@ export class InMemoryRtDbClient {
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
       ...(run.lastError === undefined ? {} : { lastError: run.lastError }),
+      ...(run.waitName === undefined ? {} : { waitingFor: run.waitName }),
+      ...(run.waitedSince === undefined ? {} : { waitedSince: run.waitedSince }),
       ...(run.startedAt === undefined ? {} : { startedAt: run.startedAt }),
       ...(run.finishedAt === undefined ? {} : { finishedAt: run.finishedAt }),
     };
@@ -1298,9 +1389,10 @@ export class InMemoryRtDbClient {
         }
       }
     }
-    // FM-29: claim due pending runs (server `claim_due`), then advance each.
+    // FM-29: claim due pending runs and waiting runs whose timeout gate
+    // expired (server `claim_due` covers both), then advance each.
     const due = [...this.workflows.values()].filter(
-      (run) => run.status === "pending" && run.sleepUntil <= now,
+      (run) => (run.status === "pending" || run.status === "waiting") && run.sleepUntil <= now,
     );
     for (const run of due) {
       run.status = "running";
@@ -1330,6 +1422,91 @@ export class InMemoryRtDbClient {
       }
       const step = run.spec.steps[run.currentStep];
       if (!step) {
+        return;
+      }
+      // awaitSignal: side-state only — no document writes. The server's
+      // three-way wake discriminator, read off the claimed run: a present
+      // payload = delivered, else unset waitedSince = first arrival, else
+      // the timeout gate expired.
+      if (step.awaitSignal !== undefined) {
+        const sig = step.awaitSignal;
+        if (run.signalPayload !== undefined) {
+          const outcome: StepOutcome = {
+            stepIndex: run.currentStep,
+            status: "success",
+            attempts: run.attempts + 1,
+            at: now,
+            signal: run.signalPayload,
+          };
+          run.stepOutcomes.push(outcome);
+          run.updatedAt = now;
+          delete run.signalPayload;
+          delete run.waitName;
+          delete run.waitedSince;
+          const isLast = run.currentStep + 1 >= run.spec.steps.length;
+          if (isLast) {
+            run.status = "success";
+            run.attempts = 0;
+            delete run.lastError;
+            run.finishedAt = now;
+            return;
+          }
+          run.currentStep += 1;
+          run.attempts = 0;
+          // Same next-gate logic as the txn path:
+          const gate = now + (run.spec.steps[run.currentStep].sleepBeforeMs ?? 0);
+          if (gate > now) {
+            run.status = "pending";
+            run.sleepUntil = gate;
+            run.updatedAt = now;
+            return;
+          }
+          continue;
+        }
+        // An omitted timeoutMs is never due — cancel or a delivery is the
+        // only escape (the server's i64::MAX gate).
+        const timeoutGate = sig.timeoutMs !== undefined ? now + sig.timeoutMs : NEVER_DUE;
+        if (run.waitedSince === undefined) {
+          // First arrival: park.
+          run.status = "waiting";
+          run.waitName = sig.name;
+          run.waitedSince = now;
+          run.sleepUntil = timeoutGate;
+          delete run.signalPayload;
+          run.updatedAt = now;
+          return;
+        }
+        // The row parked and its gate expired: a timed-out attempt. A retry
+        // waits the FULL timeoutMs again — never backoff.
+        const retry = resolveStepRetry(step.retry);
+        run.attempts += 1;
+        if (run.attempts < retry.maxAttempts) {
+          run.status = "waiting";
+          run.waitedSince = now;
+          run.sleepUntil = timeoutGate;
+          run.updatedAt = now;
+          return;
+        }
+        const error = `awaitSignal '${sig.name}' timed out`;
+        run.stepOutcomes.push({
+          stepIndex: run.currentStep,
+          status: "failed",
+          attempts: run.attempts,
+          at: now,
+          error,
+        });
+        run.status = "failed";
+        run.lastError = error;
+        run.finishedAt = now;
+        run.updatedAt = now;
+        delete run.signalPayload;
+        delete run.waitName;
+        delete run.waitedSince;
+        return;
+      }
+      if (step.txn === undefined) {
+        // Exactly-one-of is submit-validated; a step with neither is a
+        // corrupt snapshot — stop the pass rather than throw the tick.
         return;
       }
       let execError: string | null = null;
@@ -1367,13 +1544,7 @@ export class InMemoryRtDbClient {
         }
         continue;
       }
-      const retry: Required<StepRetry> = step.retry
-        ? {
-            maxAttempts: step.retry.maxAttempts,
-            initialRetryMs: step.retry.initialRetryMs ?? DEFAULT_STEP_RETRY.initialRetryMs,
-            maxRetryMs: step.retry.maxRetryMs ?? DEFAULT_STEP_RETRY.maxRetryMs,
-          }
-        : DEFAULT_STEP_RETRY;
+      const retry = resolveStepRetry(step.retry);
       run.attempts += 1;
       if (run.attempts < retry.maxAttempts) {
         run.status = "pending";
@@ -1493,11 +1664,15 @@ export class InMemoryRtDbClient {
     }
     if (step.op === "cancelWorkflow") {
       const run = this.workflows.get(step.id);
-      const cancelled = !!run && (run.status === "pending" || run.status === "running");
+      const cancelled =
+        !!run && (run.status === "pending" || run.status === "running" || run.status === "waiting");
       if (cancelled) {
         run.status = "cancelled";
         run.finishedAt = this.now();
         run.updatedAt = this.now();
+        delete run.waitName;
+        delete run.waitedSince;
+        delete run.signalPayload;
       }
       return { result: { cancelled } };
     }

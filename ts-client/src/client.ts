@@ -99,6 +99,7 @@ interface QueuedSchedule {
 type WorkflowMsg =
   | { kind: "start"; spec: WorkflowSpec }
   | { kind: "cancel"; id: string }
+  | { kind: "signal"; id: string; name: string; payload?: unknown }
   | { kind: "list"; status?: WorkflowStatus };
 
 /** A workflow call awaiting its server reply — the FM-29 analogue of
@@ -425,6 +426,20 @@ export class RtDbClient {
     return this.queueWorkflow<boolean>({ kind: "cancel", id });
   }
 
+  /** Delivers a named signal to a waiting run's `awaitSignal` step. Resolves
+   * `true` on `workflowAck.ok:true` (latest-wins: the payload overwrites any
+   * earlier unconsumed delivery); typed failures reject via the ack's `error`
+   * envelope — unknown id (`NOT_FOUND`), not waiting / name mismatch
+   * (`CONFLICT`). */
+  signalWorkflow(id: string, name: string, payload?: unknown): Promise<boolean> {
+    return this.queueWorkflow<boolean>({
+      kind: "signal",
+      id,
+      name,
+      ...(payload === undefined ? {} : { payload }),
+    });
+  }
+
   /** Lists workflow runs, newest first, optionally filtered by `status`
    * (FM-29). Resolves with the `workflows` array on `listWorkflowsOk`. A list
    * failure arrives typed `startWorkflowErr` (the frame vocabulary has no
@@ -659,6 +674,15 @@ export class RtDbClient {
         break;
       case "cancel":
         this.send({ type: "cancelWorkflow", workflowId: entry.workflowId, id: entry.msg.id });
+        break;
+      case "signal":
+        this.send({
+          type: "signalWorkflow",
+          workflowId: entry.workflowId,
+          id: entry.msg.id,
+          name: entry.msg.name,
+          ...(entry.msg.payload === undefined ? {} : { payload: entry.msg.payload }),
+        });
         break;
       case "list":
         this.send({

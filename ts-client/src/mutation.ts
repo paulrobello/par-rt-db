@@ -5,6 +5,7 @@ import type {
   StepJson,
   TransactionJson,
   WorkflowSpec,
+  WorkflowStepSpec,
 } from "./protocol.js";
 import type { IndexNamesOf, SchemaDefinition, TableNames, WithoutSystemFields } from "./schema.js";
 
@@ -248,6 +249,19 @@ export class TxnBuilder<S extends SchemaDefinition<any> = SchemaDefinition<any>>
   build(): TransactionJson {
     return { steps: [...this.steps] };
   }
+}
+
+/** Builds a workflow step that waits for a named signal (`awaitSignal`) —
+ * park the run until a matching `signalWorkflow` delivery arrives. Omit
+ * `timeoutMs` to wait indefinitely (cancel is the only escape); with it, each
+ * wait attempt is bounded and a timeout retries after the FULL timeout again
+ * (never backoff). Drops into a `WorkflowSpec`'s `steps` alongside ordinary
+ * txn steps — exactly one of `txn`/`awaitSignal` per step (server
+ * `validate_spec`). */
+export function awaitSignal(name: string, timeoutMs?: number): WorkflowStepSpec {
+  return {
+    awaitSignal: { name, ...(timeoutMs === undefined ? {} : { timeoutMs }) },
+  };
 }
 
 export function mutation(): TxnBuilder<SchemaDefinition<any>>;

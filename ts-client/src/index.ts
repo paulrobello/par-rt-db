@@ -78,12 +78,13 @@ export type { InMemoryRtDbClientOptions } from "./in_memory/index.js";
 export { InMemoryAdminClient, InMemoryRtDbClient, PresenceRooms } from "./in_memory/index.js";
 export { Migration } from "./migration.js";
 export type { StepInsertResult, StepResult, StepUpsertResult } from "./mutation.js";
-export { mutation, parseStepResults, TxnBuilder } from "./mutation.js";
+export { awaitSignal, mutation, parseStepResults, TxnBuilder } from "./mutation.js";
 export type { OptimisticProjection } from "./optimistic.js";
 export { projectOptimisticUpdate } from "./optimistic.js";
 export { decodeCursor, encodeCursor } from "./pagination.js";
 export type {
   AuthedUser,
+  AwaitSignalSpec,
   CaseWhenJson,
   Cast,
   CastFailureJson,
