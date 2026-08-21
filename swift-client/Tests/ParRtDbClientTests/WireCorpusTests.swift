@@ -20,11 +20,11 @@ import Testing
 // shortest form, `2.0` -> `2`, the documented JSONValue caveat), and
 // booleans stay distinct from numbers inside containers.
 //
-// Sections covered: client_messages (32), server_messages (30),
+// Sections covered: client_messages (35), server_messages (32),
 // authed_users (4), schedule_whens (4), schedule_infos (10), queries (13),
 // the admin-plane migrate sections — migrate_requests (3) and
-// migrate_results (2), through MigrateRequest/MigrateResult — the five
-// rejects_* sections (6 total), and protocol_constants.max_steps.
+// migrate_results (2), through MigrateRequest/MigrateResult — the six
+// rejects_* sections (7 total), and protocol_constants.max_steps.
 // query_results / error_envelopes / db_stats belong to their owning tasks'
 // types.
 //
@@ -214,6 +214,13 @@ struct WireCorpusTests {
 
     @Test func rejectsUnknownScheduleWhenField() throws {
         try corpusRejects(ScheduleWhen.self, "rejects_schedule_when_unknown_field", WireCorpus())
+    }
+
+    /// A bare `WorkflowSpec` (the nested-shape pattern of the schedule-when
+    /// reject section): an unknown field inside `awaitSignal` must fail to
+    /// decode — `AwaitSignalSpec` rejects unknown keys.
+    @Test func rejectsUnknownWorkflowSpecField() throws {
+        try corpusRejects(WorkflowSpec.self, "rejects_workflow_spec_unknown_field", WireCorpus())
     }
 
     @Test func rejectsUnknownAuthedUserKind() throws {

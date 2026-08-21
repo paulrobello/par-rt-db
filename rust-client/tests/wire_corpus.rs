@@ -13,7 +13,7 @@
 use par_rt_db_client::Query;
 use par_rt_db_client::wire::{
     AuthedUser, ClientMessage, ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen,
-    ServerMessage, UserKind,
+    ServerMessage, UserKind, WorkflowSpec,
 };
 use serde_json::{Value, json};
 
@@ -334,6 +334,12 @@ fn rejects_unknown_fields() {
         .enumerate()
     {
         must_reject::<ScheduleWhen>("rejects_schedule_when_unknown_field", i, entry);
+    }
+    for (i, entry) in section(&corpus, "rejects_workflow_spec_unknown_field")
+        .iter()
+        .enumerate()
+    {
+        must_reject::<WorkflowSpec>("rejects_workflow_spec_unknown_field", i, entry);
     }
 }
 
