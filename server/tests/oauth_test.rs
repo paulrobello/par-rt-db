@@ -614,6 +614,70 @@ async fn state_poll_returns_pending_before_callback() -> anyhow::Result<()> {
     Ok(())
 }
 
+// SEC-207: a cookie-mode begin (`mode=cookie`) keeps the session credential
+// out of the poll body entirely. The HttpOnly `rtdb_session` cookie set by the
+// callback is the only carrier, so no script-readable copy of the token exists
+// — not even for the single poll response that completes the sign-in.
+#[tokio::test]
+async fn cookie_mode_state_poll_omits_token() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    mount_github_mocks(&mock, verified_primary_email("user@example.com")).await;
+    let (_state, addr) = oauth_state(&mock).await;
+
+    let client = no_redirect_client();
+    let resp = client
+        .get(format!(
+            "http://{addr}/auth/github/begin?origin=http://localhost:5173&mode=cookie"
+        ))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let began: Value = resp.json().await?;
+    let state_token = began["state"].as_str().expect("state field").to_string();
+
+    let resp = callback(&client, addr, &state_token).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let poll = client
+        .get(format!("http://{addr}/auth/state?state={state_token}"))
+        .send()
+        .await?;
+    assert_eq!(poll.status(), reqwest::StatusCode::OK);
+    let body: Value = poll.json().await?;
+    assert_eq!(body["status"], "complete");
+    assert!(
+        body.get("token").is_none(),
+        "SEC-207: cookie-mode poll body must not carry the token"
+    );
+    assert!(body["user"]["email"].as_str().is_some());
+
+    // The HttpOnly cookie alone authenticates — the flow completes with no
+    // script-readable credential anywhere.
+    let me = client.get(format!("http://{addr}/auth/me")).send().await?;
+    assert_eq!(me.status(), reqwest::StatusCode::OK);
+    let me_body: Value = me.json().await?;
+    assert_eq!(me_body["user"]["email"], json!("user@example.com"));
+    Ok(())
+}
+
+// SEC-207: `mode` is a declared value, not a free-form flag — anything but the
+// documented `cookie` rejects loudly rather than silently falling back to
+// token delivery.
+#[tokio::test]
+async fn begin_with_unknown_mode_returns_bad_request() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let (_state, addr) = oauth_state(&mock).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/auth/github/begin?origin=http://localhost:5173&mode=bogus"
+        ))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
 // SEC-121: a leaked `state` URL alone is NOT the capability to poll. The poll
 // must also carry the `rtdb-oauth-state` cookie (set at /begin, same value);
 // without it, the server returns `expired`. This means a state token leaked

@@ -84,7 +84,9 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     provider: "github" | "google" | "microsoft" | "apple" | "gitlab" | "oidc",
   ): Promise<void> {
     const origin = window.location.origin;
-    const beginUrl = `${origin}/auth/${provider}/begin?origin=${encodeURIComponent(origin)}`;
+    // SEC-207: mode=cookie keeps the session token out of the /auth/state poll
+    // body — the HttpOnly cookie set by the callback is the only credential.
+    const beginUrl = `${origin}/auth/${provider}/begin?origin=${encodeURIComponent(origin)}&mode=cookie`;
     const poll = (
       state: string,
       deadline: number,

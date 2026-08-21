@@ -323,7 +323,13 @@ async fn set_outcome(state: &Arc<AppState>, state_token: &str, completed: Option
 
 enum PollResult {
     Pending,
-    Complete { token: String, user: AuthedUser },
+    /// `cookie_mode` (SEC-207): the login began with `mode=cookie`, so the
+    /// poll response omits the token — the HttpOnly cookie is the credential.
+    Complete {
+        token: String,
+        user: AuthedUser,
+        cookie_mode: bool,
+    },
     Failed,
     Expired,
 }
@@ -340,14 +346,14 @@ async fn poll_login(state: &Arc<AppState>, state_token: &str) -> PollResult {
     let now = now_ms();
     // The single-use consume: only an unconsumed, unexpired, terminal row
     // matches, so only the first poll after completion wins it.
-    let consumed: Option<(Option<String>, String)> = sqlx::query_as(
+    let consumed: Option<(Option<String>, String, bool)> = sqlx::query_as(
         "UPDATE rtdb_auth.oauth_states \
          SET consumed_at = $1 \
          WHERE state = $2 \
            AND status IN ($3, $4) \
            AND consumed_at IS NULL \
            AND expires_at > $1 \
-         RETURNING session_token, status",
+         RETURNING session_token, status, cookie_mode",
     )
     .bind(now)
     .bind(state_token)
@@ -358,13 +364,14 @@ async fn poll_login(state: &Arc<AppState>, state_token: &str) -> PollResult {
     .ok()
     .flatten();
 
-    if let Some((token, status)) = consumed {
+    if let Some((token, status, cookie_mode)) = consumed {
         if status == STATUS_COMPLETED {
             return match token {
                 Some(t) => match resolve_bearer(&state.pool, &t).await {
                     Ok(principal @ Principal::User { .. }) => PollResult::Complete {
                         token: t,
                         user: authed_user(&principal),
+                        cookie_mode,
                     },
                     _ => PollResult::Expired, // token did not resolve — treat as gone
                 },
@@ -413,6 +420,10 @@ pub async fn sweep_oauth_states(pool: &sqlx::PgPool) -> Result<u64, RtDbError> {
 #[derive(Deserialize)]
 struct BeginParams {
     origin: String,
+    /// SEC-207: `mode=cookie` marks a cookie-mode login — the poll response
+    /// omits the session token so no script-readable copy ever exists. Absent
+    /// (or any other value) is the historical token-delivering behavior.
+    mode: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -452,6 +463,14 @@ async fn provider_begin<P: OAuthProvider>(
     {
         return RtDbError::forbidden("origin not allowed").into_response();
     }
+
+    // SEC-207: a declared value, not a free-form flag — an unrecognized mode
+    // is a client bug and rejects rather than silently delivering the token.
+    let cookie_mode = match params.mode.as_deref() {
+        None => false,
+        Some("cookie") => true,
+        Some(_) => return RtDbError::bad_request("mode must be 'cookie'").into_response(),
+    };
 
     let state_token = random_token();
     let now = now_ms();
@@ -496,8 +515,8 @@ async fn provider_begin<P: OAuthProvider>(
     };
     if let Err(err) = sqlx::query(
         "INSERT INTO rtdb_auth.oauth_states \
-         (state, provider, status, created_at, expires_at, anon_user_id) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
+         (state, provider, status, created_at, expires_at, anon_user_id, cookie_mode) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(&state_token)
     .bind(P::name())
@@ -505,6 +524,7 @@ async fn provider_begin<P: OAuthProvider>(
     .bind(now)
     .bind(now + STATE_TTL_MS)
     .bind(&anon_user_id)
+    .bind(cookie_mode)
     .execute(&state.pool)
     .await
     {
@@ -701,7 +721,14 @@ struct StateQuery {
 #[serde(tag = "status", rename_all = "lowercase")]
 enum StateResponse {
     Pending,
-    Complete { token: String, user: AuthedUser },
+    /// SEC-207: `token` is omitted entirely for a cookie-mode login — the
+    /// HttpOnly session cookie set at the callback is the only credential
+    /// carrier, so the poll body never exposes a script-readable copy.
+    Complete {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        user: AuthedUser,
+    },
     Expired,
     Error,
 }
@@ -729,7 +756,12 @@ async fn auth_state(
     }
     match poll_login(&state, &params.state).await {
         PollResult::Pending => Json(StateResponse::Pending).into_response(),
-        PollResult::Complete { token, user } => {
+        PollResult::Complete {
+            token,
+            user,
+            cookie_mode,
+        } => {
+            let token = if cookie_mode { None } else { Some(token) };
             Json(StateResponse::Complete { token, user }).into_response()
         }
         PollResult::Failed => Json(StateResponse::Error).into_response(),

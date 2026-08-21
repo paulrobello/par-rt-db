@@ -243,7 +243,8 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
             session_token text,
             created_at  bigint NOT NULL,
             expires_at  bigint NOT NULL,
-            consumed_at bigint
+            consumed_at bigint,
+            cookie_mode boolean NOT NULL DEFAULT false
         )",
     )
     .execute(&mut *conn)
@@ -254,6 +255,13 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     sqlx::query("ALTER TABLE rtdb_auth.oauth_states ADD COLUMN IF NOT EXISTS anon_user_id text")
         .execute(&mut *conn)
         .await?;
+    // SEC-207: retrofit — a cookie-mode begin keeps the session token out of
+    // the `/auth/state` poll body (the HttpOnly cookie is the only carrier).
+    sqlx::query(
+        "ALTER TABLE rtdb_auth.oauth_states ADD COLUMN IF NOT EXISTS cookie_mode boolean NOT NULL DEFAULT false",
+    )
+    .execute(&mut *conn)
+    .await?;
 
     sqlx::query("CREATE SCHEMA IF NOT EXISTS rtdb")
         .execute(&mut *conn)

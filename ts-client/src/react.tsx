@@ -196,13 +196,16 @@ export function useRtDbAuth(): {
     async (provider: OAuthProvider = "github") => {
       // The OAuth popup runs in both modes; the server sets the HttpOnly
       // session cookie on its callback regardless. Token mode persists the
-      // posted-back token; cookie mode ignores it and re-dials tokenless so the
-      // now-set cookie authenticates — no script-readable credential (SEC-002).
-      // All providers share one `/auth/{provider}/begin` + `/auth/state` flow.
-      const token = await signInWithOAuth(authBaseUrl, provider);
+      // posted-back token; cookie mode begins with `mode=cookie` (SEC-207) so
+      // the poll response carries no token at all, then re-dials tokenless so
+      // the now-set cookie authenticates — no script-readable credential
+      // (SEC-002). All providers share one `/auth/{provider}/begin` +
+      // `/auth/state` flow.
       if (client.cookieMode) {
+        await signInWithOAuthCookie(authBaseUrl, provider);
         client.setToken(null);
       } else {
+        const token = await signInWithOAuth(authBaseUrl, provider);
         if (typeof localStorage !== "undefined") {
           localStorage.setItem(TOKEN_STORAGE_KEY, token);
         }
@@ -279,12 +282,16 @@ export const OAUTH_POLL_INTERVAL_MS = 800;
 export const OAUTH_POLL_TIMEOUT_MS = 180_000;
 
 /** One poll of `/auth/state`; resolves with the token on `complete`.
- *  A transient fetch failure or malformed body keeps polling (returns
- *  `{ done: false }`); only a terminal `expired`/`error` status rejects. */
+ *  Cookie mode (SEC-207) accepts a tokenless `complete` — the HttpOnly cookie
+ *  set by the callback is the credential, and the server omits the token from
+ *  the body. A transient fetch failure or malformed body keeps polling
+ *  (returns `{ done: false }`); only a terminal `expired`/`error` status
+ *  rejects. */
 async function pollOAuthState(
   apiBase: string,
   state: string,
-): Promise<{ done: true; token: string } | { done: false }> {
+  cookieMode: boolean,
+): Promise<{ done: true; token: string | undefined } | { done: false }> {
   let resp: Response;
   try {
     // SEC-121: send credentials so the `rtdb-oauth-state` cookie (set at /begin,
@@ -303,7 +310,7 @@ async function pollOAuthState(
   } catch {
     return { done: false };
   }
-  if (data.status === "complete" && typeof data.token === "string") {
+  if (data.status === "complete" && (cookieMode || typeof data.token === "string")) {
     return { done: true, token: data.token };
   }
   if (data.status === "expired" || data.status === "error") {
@@ -315,32 +322,60 @@ async function pollOAuthState(
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * Shared begin + poll relay. In cookie mode (SEC-207) `begin` carries
+ * `mode=cookie` so the server omits the token from the poll's `complete` —
+ * resolving with `undefined` (the HttpOnly cookie is the credential). Token
+ * mode always resolves with the token string.
+ */
+async function beginOAuthFlow(
+  baseUrl: string,
+  provider: OAuthProvider,
+  cookieMode: boolean,
+): Promise<string | undefined> {
+  const api = baseUrl.replace(/\/+$/, "");
+  const spaOrigin = window.location.origin;
+  const beginResp = await fetch(
+    `${api}/auth/${provider}/begin?origin=${encodeURIComponent(spaOrigin)}${cookieMode ? "&mode=cookie" : ""}`,
+    { credentials: "include" },
+  );
+  if (!beginResp.ok) {
+    throw new Error(`could not start sign-in (${beginResp.status})`);
+  }
+  const began = (await beginResp.json()) as { authorizeUrl: string; state: string };
+  window.open(began.authorizeUrl, "rtdb-auth", "noopener,noreferrer,width=600,height=700");
+  const deadline = Date.now() + OAUTH_POLL_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const r = await pollOAuthState(api, began.state, cookieMode);
+    if (r.done) return r.token;
+    await sleep(OAUTH_POLL_INTERVAL_MS);
+  }
+  throw new Error("sign-in timed out");
+}
+
+/**
  * Begins a provider OAuth flow, opens the authorize URL in a `noopener`
  * popup (SEC-012 tabnabbing hardening), and polls `/auth/state` until the
  * session token is ready. `noopener` means `window.open` returns null, so the
  * old postMessage/closed-poll relay is replaced by this poll.
  */
 function signInWithOAuth(baseUrl: string, provider: OAuthProvider): Promise<string> {
-  const api = baseUrl.replace(/\/+$/, "");
-  const spaOrigin = window.location.origin;
-  return (async () => {
-    const beginResp = await fetch(
-      `${api}/auth/${provider}/begin?origin=${encodeURIComponent(spaOrigin)}`,
-      { credentials: "include" },
-    );
-    if (!beginResp.ok) {
-      throw new Error(`could not start sign-in (${beginResp.status})`);
+  return beginOAuthFlow(baseUrl, provider, false).then((token) => {
+    // Token mode's server response always carries the token; this guard only
+    // keeps the typed contract honest without a cast.
+    if (token === undefined) {
+      throw new Error("sign-in completed without a token");
     }
-    const began = (await beginResp.json()) as { authorizeUrl: string; state: string };
-    window.open(began.authorizeUrl, "rtdb-auth", "noopener,noreferrer,width=600,height=700");
-    const deadline = Date.now() + OAUTH_POLL_TIMEOUT_MS;
-    while (Date.now() < deadline) {
-      const r = await pollOAuthState(api, began.state);
-      if (r.done) return r.token;
-      await sleep(OAUTH_POLL_INTERVAL_MS);
-    }
-    throw new Error("sign-in timed out");
-  })();
+    return token;
+  });
+}
+
+/**
+ * Cookie-mode variant (SEC-207): `begin` carries `mode=cookie`, so the poll's
+ * `complete` response carries no token — the HttpOnly cookie set by the
+ * callback is the only credential. Resolves when the flow completes.
+ */
+async function signInWithOAuthCookie(baseUrl: string, provider: OAuthProvider): Promise<void> {
+  await beginOAuthFlow(baseUrl, provider, true);
 }
 
 /** Begins the GitHub OAuth flow and resolves with the session token polled from `/auth/state`. */

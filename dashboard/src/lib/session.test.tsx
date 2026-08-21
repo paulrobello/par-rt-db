@@ -140,6 +140,13 @@ describe("SessionProvider", () => {
       expect.stringContaining("/auth/github/begin?origin="),
       expect.objectContaining({ credentials: "include" }),
     );
+    // SEC-207: the begin URL carries mode=cookie so the poll body carries no
+    // session token — the HttpOnly cookie is the only credential.
+    const beginCall = vi
+      .mocked(fetchMock)
+      .mock.calls.map((c) => String(c[0]))
+      .find((u) => u.includes("/auth/github/begin"));
+    expect(beginCall).toContain("&mode=cookie");
     expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/auth/state?state=s1"));
     // SEC-012: the popup must open the begin-returned authorizeUrl with
     // noopener,noreferrer so the relay page can't reach back into this window.

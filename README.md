@@ -365,10 +365,10 @@ setup (callback URLs, scopes, env-var pairs).
 
 | Method & path | Auth | Description |
 | --- | --- | --- |
-| `GET /auth/{provider}/begin?origin=` | none | Starts the OAuth flow for one of `github`/`google`/`gitlab`/`microsoft`/`apple`/`oidc`. Validates `origin` against the **live** `RTDB_ALLOWED_ORIGINS` (403 on miss), mints a single-use `state` token, sets the `SameSite=None;HttpOnly` `rtdb-oauth-csrf` nonce cookie, and returns JSON `{ authorizeUrl, state }`. The caller opens `authorizeUrl` in a `noopener,noreferrer` popup and polls `/auth/state` for completion. |
+| `GET /auth/{provider}/begin?origin=` | none | Starts the OAuth flow for one of `github`/`google`/`gitlab`/`microsoft`/`apple`/`oidc`. Validates `origin` against the **live** `RTDB_ALLOWED_ORIGINS` (403 on miss), mints a single-use `state` token, sets the `SameSite=None;HttpOnly` `rtdb-oauth-csrf` nonce cookie, and returns JSON `{ authorizeUrl, state }`. The caller opens `authorizeUrl` in a `noopener,noreferrer` popup and polls `/auth/state` for completion. Optional `&mode=cookie` (SEC-207) marks a cookie-mode login: the `/auth/state` completion omits the session token entirely — the HttpOnly cookie set by the callback is the only credential carrier, so no script-readable copy ever exists. Any other `mode` value is a `400`. |
 | `GET /auth/callback` | none (state token) | GitHub OAuth callback (the canonical path; Google/GitLab/Microsoft/OIDC use `GET /auth/{provider}/callback`). Constant-time-verifies the CSRF nonce cookie against `state`, claims the pending entry (replay → 400), exchanges the code, fetches the verified email, upserts `rtdb_auth.users`, sets the `HttpOnly` session cookie, and returns popup-closing HTML. |
 | `POST /auth/apple/callback` | none (state token) | Apple-specific callback — Apple POSTs `code`+`state` via `response_mode=form_post`. Same CSRF/session handling as the GET path (the `SameSite=None` cookie survives the cross-site POST). |
-| `GET /auth/state?state=` | none (state token + cookie) | Provider-agnostic poll endpoint keyed on the single-use `state` token. Returns `{ status: "pending" }` until the callback completes, then `{ status: "complete", token, user }` (one-shot); `{ status: "expired" }` for a timed-out/already-claimed flow, `{ status: "error" }` for a failed login. SEC-121: the poll must also carry the `rtdb-oauth-state` cookie set at `/begin` with the same value (constant-time compared; a miss returns `expired`), so a leaked state URL alone cannot poll — cross-origin SDK login sends `credentials: "include"` on the `/begin` and poll fetches (that cookie is `SameSite=None`, unlike the `SameSite=Lax` session cookie). |
+| `GET /auth/state?state=` | none (state token + cookie) | Provider-agnostic poll endpoint keyed on the single-use `state` token. Returns `{ status: "pending" }` until the callback completes, then `{ status: "complete", token, user }` (one-shot; for a `mode=cookie` begin the completion is `{ status: "complete", user }` — no `token` field, SEC-207); `{ status: "expired" }` for a timed-out/already-claimed flow, `{ status: "error" }` for a failed login. SEC-121: the poll must also carry the `rtdb-oauth-state` cookie set at `/begin` with the same value (constant-time compared; a miss returns `expired`), so a leaked state URL alone cannot poll — cross-origin SDK login sends `credentials: "include"` on the `/begin` and poll fetches (that cookie is `SameSite=None`, unlike the `SameSite=Lax` session cookie). |
 | `POST /auth/logout` | Bearer session | Deletes the session for the given bearer token. Idempotent: always 200 unless the delete query itself fails. |
 | `GET /auth/me` | Bearer session | Returns the authenticated user. 401 for a machine token (session only). |
 | `GET /auth/validate` | Bearer token | Validates a presented session or machine token; returns the `AuthedUser`. Used by backends to check a player-supplied token. |
@@ -379,7 +379,9 @@ opens the provider authorize URL in a `noopener,noreferrer` popup (reverse-tabna
 defense — `window.opener` is severed) → the parent polls
 `GET /auth/state?state=<token>` → the provider redirects to the callback →
 the callback sets the `HttpOnly` session cookie and returns popup-closing HTML
-→ the parent's next poll receives the session token and closes the popup.
+→ the parent's next poll receives the session token and closes the popup
+(in cookie mode the begin carries `&mode=cookie` and that poll carries **no**
+token — the cookie is the credential, SEC-207).
 Login-CSRF is defended by the `rtdb-oauth-csrf` double-submit cookie set at
 `/begin` and constant-time-verified at `/callback`
 (`RTDB_OAUTH_LOGIN_CSRF=true` by default; cross-origin SDK consumers must send

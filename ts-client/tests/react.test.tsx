@@ -479,6 +479,52 @@ describe("useRtDbAuth cookie mode (SEC-002)", () => {
     // SEC-002: the credential must NOT land in script-readable storage.
     expect(localStorage.getItem("rtdb-session-token")).toBeNull();
   });
+
+  // SEC-207: cookie mode begins with `mode=cookie` and completes on a
+  // tokenless `complete` — the server never puts the credential in a
+  // script-readable body, and the poll must not wait for one.
+  it("signIn sends mode=cookie at begin and completes without a token in the poll body", async () => {
+    vi.useFakeTimers();
+    const { client } = setupCookie();
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy.mockResolvedValueOnce(oauthResp({ authorizeUrl: "about:blank", state: "s1" }));
+    fetchSpy.mockResolvedValueOnce(oauthResp({ status: "complete", user: { kind: "user" } }));
+    vi.spyOn(window, "open").mockReturnValue(null);
+
+    let pending: Promise<void> | undefined;
+    function View() {
+      const { signIn } = useRtDbAuth();
+      return (
+        <button
+          type="button"
+          onClick={() => {
+            pending = signIn();
+          }}
+        >
+          in
+        </button>
+      );
+    }
+    render(
+      <RtDbProvider client={client} authBaseUrl="http://h:8300">
+        <View />
+      </RtDbProvider>,
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("in"));
+    });
+    // The tokenless `complete` must resolve the poll (not spin to timeout).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(OAUTH_POLL_INTERVAL_MS);
+      await pending;
+    });
+
+    const beginUrl = fetchSpy.mock.calls[0]?.[0] as string;
+    expect(beginUrl).toContain("/auth/github/begin?origin=");
+    expect(beginUrl).toContain("&mode=cookie");
+    expect(localStorage.getItem("rtdb-session-token")).toBeNull();
+  });
 });
 
 describe("usePaginatedQuery", () => {

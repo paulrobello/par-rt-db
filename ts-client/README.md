@@ -104,7 +104,10 @@ function Board({ projectId }: { projectId: string }) {
 The server's recommended auth mode is **cookie mode**: after OAuth sign-in the
 server sets an HttpOnly `rtdb_session` cookie that the browser attaches
 automatically, and `useRtDbAuth()` / `RtDbProvider` send `credentials: "include"`
-on auth requests. JS can never read the cookie, so an XSS or malicious
+on auth requests. JS can never read the cookie, and the cookie-mode sign-in
+begins with `mode=cookie` (SEC-207) so the completion poll's response body
+carries no token either — no script-readable copy of the credential exists at
+any point, so an XSS or malicious
 extension cannot lift the session token — this is the default and the safest
 option for browser apps.
 

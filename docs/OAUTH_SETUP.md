@@ -50,7 +50,11 @@ working with zero providers configured.
   the pending entry (a replay rejects with `400`), exchanges the code for an
   access token, fetches the user's **verified** email, upserts `rtdb_auth.users`,
   and returns popup-closing HTML. The session token is delivered twice — via the
-  HttpOnly session cookie **and** via the one-shot `/auth/state` poll. The poll
+  HttpOnly session cookie **and** via the one-shot `/auth/state` poll — unless
+  `/begin` was called with `&mode=cookie` (SEC-207), in which case the poll's
+  completion carries no token at all and the HttpOnly cookie is the only
+  carrier (the ts-client's cookie-mode sign-in and the operator dashboard
+  begin this way). The poll
   is keyed on the `state` token plus a `SameSite=None` `rtdb-oauth-state` cookie
   set at `/begin` (SEC-121 — a leaked state URL alone cannot poll), which is
   what makes cross-origin SDK login work where the `SameSite=Lax` session
@@ -412,6 +416,13 @@ or integrate with par-rt-db:
   `expired`). That cookie is `SameSite=None` — not the `SameSite=Lax` session
   cookie — so cross-origin SDK login works as long as the `/begin` and
   `/auth/state` fetches send `credentials: "include"`.
+- **Cookie-mode token omission (SEC-207).** A begin that carries
+  `&mode=cookie` stores the flag on the `oauth_states` row, and the poll's
+  `complete` response is `{ status: "complete", user }` — the session token
+  appears in no response body, so nothing script-readable (a fetch/Response
+  hook, a service worker, an extension) ever holds the credential. Any other
+  `mode` value rejects with `400`. This is how the ts-client's cookie-mode
+  `signIn` and the dashboard's OAuth popup begin.
 
 ## Troubleshooting
 
