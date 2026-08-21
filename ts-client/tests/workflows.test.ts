@@ -792,6 +792,36 @@ describe("InMemoryRtDbClient awaitSignal steps", () => {
     expect(done.stepOutcomes[0].signal).toEqual({ v: 2 });
   });
 
+  it("a delivered-but-unticked run is pending with NO waitingFor/waitedSince on its info", async () => {
+    const { c, setNow } = newEngine();
+    setNow(BASE);
+    const { id } = await c.startWorkflow({
+      name: "delivered-window",
+      steps: [{ awaitSignal: { name: "approve" } }],
+    });
+
+    c.tick(); // park
+    setNow(BASE + 1_000);
+    expect(await c.signalWorkflow(id, "approve", { v: 1 })).toBe(true);
+
+    // Latest-wins window: the run is `pending` with the slot set, pre-tick.
+    // The info projection gates the wait fields on status === "waiting"
+    // (server `info_from_row`) — neither list nor get may leak them.
+    const listed = (await c.listWorkflows()).find((w) => w.id === id);
+    expect(listed).toMatchObject({ status: "pending" });
+    expect("waitingFor" in (listed ?? {})).toBe(false);
+    expect("waitedSince" in (listed ?? {})).toBe(false);
+    const got = await c.getWorkflow(id);
+    expect(got.status).toBe("pending");
+    expect("waitingFor" in got).toBe(false);
+    expect("waitedSince" in got).toBe(false);
+
+    c.tick(); // the wake is claimed and consumed
+    const done = await c.getWorkflow(id);
+    expect(done.status).toBe("success");
+    expect(done.stepOutcomes[0].signal).toEqual({ v: 1 });
+  });
+
   it("cancel while waiting flips to cancelled and a late signal conflicts", async () => {
     const { c, setNow } = newEngine();
     setNow(BASE);

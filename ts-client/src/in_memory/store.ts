@@ -1277,8 +1277,15 @@ export class InMemoryRtDbClient {
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
       ...(run.lastError === undefined ? {} : { lastError: run.lastError }),
-      ...(run.waitName === undefined ? {} : { waitingFor: run.waitName }),
-      ...(run.waitedSince === undefined ? {} : { waitedSince: run.waitedSince }),
+      // Projected only while `waiting` (server `info_from_row`): a delivered
+      // signal flips the run to `pending` with the slot still set during the
+      // latest-wins window — the info row must not leak the stale wait.
+      ...(run.status !== "waiting" || run.waitName === undefined
+        ? {}
+        : { waitingFor: run.waitName }),
+      ...(run.status !== "waiting" || run.waitedSince === undefined
+        ? {}
+        : { waitedSince: run.waitedSince }),
       ...(run.startedAt === undefined ? {} : { startedAt: run.startedAt }),
       ...(run.finishedAt === undefined ? {} : { finishedAt: run.finishedAt }),
     };
