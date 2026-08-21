@@ -52,6 +52,14 @@ CLIENT_FIXTURES: list[str] = [
         '"spec": {"name": "drip", "steps": [{"txn": {"steps": []}}]}}'
     ),
     '{"type": "cancelWorkflow", "workflowId": "c2", "id": "wf9"}',
+    # awaitSignal delivery (mirrors server protocol.rs
+    # signal_workflow_frame_wire_shape): payload rides the frame verbatim and
+    # is omitted when absent.
+    (
+        '{"type": "signalWorkflow", "workflowId": "c4", "id": "wf1", '
+        '"name": "approve", "payload": {"ok": true}}'
+    ),
+    '{"type": "signalWorkflow", "workflowId": "c5", "id": "wf1", "name": "approve"}',
     '{"type": "listWorkflows", "workflowId": "c3"}',
     '{"type": "listWorkflows", "workflowId": "c3", "status": "failed"}',
 ]

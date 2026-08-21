@@ -63,6 +63,7 @@ from ..schema import (
 from ..wire import (
     AfterMs,
     AuthedUser,
+    AwaitSignalSpec,
     Cron,
     Interval,
     PresenceMember,
@@ -143,31 +144,54 @@ def worst_case_affected(txn: Transaction) -> int:
 def _count_steps(txn: Transaction) -> int:
     """FM-28: recursive step count — a ``schedule`` step counts as itself plus
     every step in its nested txn; a ``startWorkflow`` step (FM-29) as itself
-    plus every step of every txn in its spec. Mirrors the server's recursive
-    ruling against ``MAX_STEPS`` (a nested tree can't smuggle past the flat
-    cap)."""
+    plus every step of every txn in its spec (an ``awaitSignal`` step has no
+    txn — it counts 0 there, mirroring the server's ``map_or(0, count_steps)``).
+    Mirrors the server's recursive ruling against ``MAX_STEPS`` (a nested tree
+    can't smuggle past the flat cap)."""
     total = 0
     for step in txn.steps:
         total += 1
         if isinstance(step, _Schedule):
             total += _count_steps(step.txn)
         elif isinstance(step, _StartWorkflow):
-            total += sum(_count_steps(Transaction.model_validate(s.txn)) for s in step.spec.steps)
+            total += sum(
+                _count_steps(Transaction.model_validate(s.txn))
+                for s in step.spec.steps
+                if s.txn is not None
+            )
     return total
 
 
 def _validate_workflow_spec(spec: WorkflowSpec) -> None:
     """FM-29: submit-time spec validation — same checks and BAD_REQUEST
     messages as server ``workflows::validate_spec`` (and the ts harness's
-    ``validateWorkflowSpec``): 1..=MAX_WORKFLOW_STEPS steps, retry fields in
-    bounds, and the recursive step count summed across every step's txn
-    within ``MAX_STEPS`` (the FM-28 counter — bounds body size and the
-    nesting bomb)."""
+    ``validateWorkflowSpec``): 1..=MAX_WORKFLOW_STEPS steps, each step carries
+    exactly one of txn/awaitSignal (with the wait's name in 1..=256 chars and
+    a positive timeoutMs), retry fields in bounds, and the recursive step
+    count summed across every step's txn within ``MAX_STEPS`` (the FM-28
+    counter — bounds body size and the nesting bomb)."""
     if not spec.steps:
         raise RtDbError(ErrorCode.BAD_REQUEST, "workflow must have at least one step")
     if len(spec.steps) > MAX_WORKFLOW_STEPS:
         raise RtDbError(ErrorCode.BAD_REQUEST, f"workflow exceeds {MAX_WORKFLOW_STEPS} steps")
     for i, step in enumerate(spec.steps):
+        if (step.txn is None) == (step.await_signal is None):
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"steps[{i}] must carry exactly one of txn or awaitSignal",
+            )
+        if step.await_signal is not None:
+            sig = step.await_signal
+            if not sig.name or len(sig.name) > 256:
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    f"steps[{i}].awaitSignal.name must be 1..=256 chars",
+                )
+            if sig.timeout_ms == 0:
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    f"steps[{i}].awaitSignal.timeoutMs must be > 0",
+                )
         if step.retry is not None:
             if step.retry.max_attempts == 0:
                 raise RtDbError(
@@ -183,7 +207,9 @@ def _validate_workflow_spec(spec: WorkflowSpec) -> None:
                     f"steps[{i}].retry requires initialRetryMs > 0"
                     " and maxRetryMs >= initialRetryMs",
                 )
-    total = sum(_count_steps(Transaction.model_validate(s.txn)) for s in spec.steps)
+    total = sum(
+        _count_steps(Transaction.model_validate(s.txn)) for s in spec.steps if s.txn is not None
+    )
     if total > MAX_STEPS:
         raise RtDbError(
             ErrorCode.BAD_REQUEST,
@@ -270,13 +296,16 @@ class _WorkflowRun:
     """A stored workflow run (FM-29) — the in-memory mirror of the server's
     ``workflows`` side-table row. The run snapshots its :class:`WorkflowSpec`
     at insert time, so template edits never drift a live run.
-    :meth:`InMemoryRtDb.tick` claims due pending runs (→ running) and advances
-    them through :meth:`_advance_run` (the committer ``handle_workflow_advance``
-    port)."""
+    :meth:`InMemoryRtDb.tick` claims due pending/waiting runs (→ running) and
+    advances them through :meth:`_advance_run` (the committer
+    ``handle_workflow_advance`` port). The awaitSignal side-table columns
+    (``wait_name``/``waited_since``/``signal_payload``) are ``None`` on rows
+    never parked, and a claimed ``waiting`` row reads them to discriminate a
+    delivery (payload set) from a timed-out wait."""
 
     id: str
     spec: WorkflowSpec
-    status: str  # "pending" | "running" | "success" | "failed" | "cancelled"
+    status: str  # "pending" | "running" | "waiting" | "success" | "failed" | "cancelled"
     current_step: int
     attempts: int
     sleep_until: int | None
@@ -286,6 +315,10 @@ class _WorkflowRun:
     updated_at: int
     started_at: int | None
     finished_at: int | None
+    # awaitSignal side-table columns (None on rows never parked).
+    wait_name: str | None = None
+    waited_since: int | None = None
+    signal_payload: Any | None = None
 
     @property
     def step_count(self) -> int:
@@ -1132,8 +1165,16 @@ def _schedule_info(job: _ScheduledJob) -> ScheduleInfo:
 #: (3 attempts, 1s initial backoff doubling to a 60s cap).
 _DEFAULT_STEP_RETRY = StepRetry(max_attempts=3)
 
+#: The timeout gate for an awaitSignal step that omits ``timeoutMs`` — the
+#: server's ``i64::MAX`` "never due" sentinel. Only a delivery or a cancel
+#: wakes such a run; the claim pass never finds it due.
+_NEVER_DUE = 2**63 - 1
+
 
 def _workflow_info(run: _WorkflowRun) -> WorkflowInfo:
+    # The wait columns project ONLY while ``waiting`` (server: a terminal or
+    # never-parked row never leaks stale wait fields).
+    waiting = run.status == "waiting"
     return WorkflowInfo.model_validate(
         {
             "id": run.id,
@@ -1144,6 +1185,8 @@ def _workflow_info(run: _WorkflowRun) -> WorkflowInfo:
             "attempts": run.attempts,
             "sleepUntil": run.sleep_until,
             "lastError": run.last_error,
+            "waitingFor": run.wait_name if waiting else None,
+            "waitedSince": run.waited_since if waiting else None,
             "createdAt": run.created_at,
             "updatedAt": run.updated_at,
             "startedAt": run.started_at,
@@ -2114,16 +2157,48 @@ class _InMemoryStoreCore:
         return self._insert_workflow(spec)
 
     def cancel_workflow(self, id: str) -> bool:
-        """Flip a pending/running run to ``cancelled``. ``False`` when the run
-        is missing or already terminal (a no-op, not an error)."""
+        """Flip a pending/running/waiting run to ``cancelled``. ``False`` when
+        the run is missing or already terminal (a no-op, not an error). The
+        wait columns drop with the flip (leave-``waiting`` rule) — a cancelled
+        run never matches a later signal delivery."""
         run = self._find_workflow(id)
-        if run is None or run.status not in ("pending", "running"):
+        if run is None or run.status not in ("pending", "running", "waiting"):
             return False
         now = self._now()
         run.status = "cancelled"
+        run.wait_name = None
+        run.waited_since = None
+        run.signal_payload = None
         run.updated_at = now
         run.finished_at = now
         return True
+
+    def signal_workflow(self, id: str, name: str, payload: Any | None = None) -> bool:
+        """Deliver a named signal to a run parked at an ``awaitSignal`` step —
+        the in-memory mirror of server ``workflows::deliver_signal``. The slot
+        is latest-wins (every delivery while the wait is unconsumed overwrites
+        the payload) and the wake lands on the NEXT tick: the run flips to
+        ``pending`` due immediately, and the claim pass advances it.
+
+        Raises the server's typed errors: ``NOT_FOUND`` for an unknown run,
+        ``CONFLICT`` when the run is not waiting for a signal, and ``CONFLICT``
+        naming both names when it waits on a different one."""
+        run = self._find_workflow(id)
+        if run is None:
+            raise RtDbError(ErrorCode.NOT_FOUND, "unknown workflow")
+        if run.status in ("waiting", "pending") and run.wait_name == name:
+            now = self._now()
+            run.status = "pending"
+            run.sleep_until = now
+            run.signal_payload = payload
+            run.updated_at = now
+            return True
+        if run.status == "waiting":
+            raise RtDbError(
+                ErrorCode.CONFLICT,
+                f"workflow waiting on '{run.wait_name}', got '{name}'",
+            )
+        raise RtDbError(ErrorCode.CONFLICT, "workflow is not waiting for a signal")
 
     def list_workflows(self, status: WorkflowStatus | None = None) -> list[WorkflowInfo]:
         """Every run's info projection, newest first; ``status`` filters to a
@@ -2164,14 +2239,17 @@ class _InMemoryStoreCore:
 
     def _advance_workflows(self, now: int) -> None:
         """One claim pass per tick (mirroring the server's scheduler poll
-        cadence): every due pending run flips to running (``startedAt`` stamped
-        on the first claim only), then each advances through
-        :meth:`_advance_run`. A run that a sibling's step cancelled mid-pass is
-        skipped by the in-loop status re-check."""
+        cadence): every due pending OR waiting run flips to running
+        (``startedAt`` stamped on the first claim only), then each advances
+        through :meth:`_advance_run`. A claimed ``waiting`` row means the wait
+        timed out — or was woken by a delivery, which flips the row to
+        ``pending`` first (``signal_workflow``). A run that a sibling's step
+        cancelled mid-pass is skipped by the in-loop status re-check."""
         due = [
             r
             for r in self._workflows
-            if r.status == "pending" and (r.sleep_until is None or r.sleep_until <= now)
+            if r.status in ("pending", "waiting")
+            and (r.sleep_until is None or r.sleep_until <= now)
         ]
         for run in due:
             # Re-resolve from the live store: a sibling run's step txn may have
@@ -2179,7 +2257,7 @@ class _InMemoryStoreCore:
             # sibling txn replaces self._workflows with its snapshot — the
             # ``due`` reference would then read stale state.
             live = self._find_workflow(run.id)
-            if live is None or live.status != "pending":
+            if live is None or live.status not in ("pending", "waiting"):
                 continue
             live.status = "running"
             if live.started_at is None:
@@ -2191,12 +2269,14 @@ class _InMemoryStoreCore:
         """Advance one claimed run — the port of the committer's
         ``handle_workflow_advance`` loop. Re-checks the status at every loop
         boundary (only a running run continues — a cancel between steps stops
-        advancement), executes the current step's txn atomically, and on success
-        either moves to the next step (gating on its ``sleepBeforeMs``; a future
-        gate releases to pending, an immediate one keeps looping in this same
-        turn) or finalizes the run. On failure, retries with exponential backoff
-        until ``maxAttempts`` is exhausted, then marks the run failed with the
-        last error and a terminal failed outcome for the step."""
+        advancement), and branches per step kind: an ``awaitSignal`` step takes
+        the side-table path (consume a delivered signal / park / time out —
+        no document writes), anything else executes the step's txn atomically.
+        On txn success the run either moves to the next step (gating on its
+        ``sleepBeforeMs``; a future gate releases to pending, an immediate one
+        keeps looping in this same turn) or finalizes. On failure, retries with
+        exponential backoff until ``maxAttempts`` is exhausted, then marks the
+        run failed with the last error and a terminal failed outcome."""
         run_id = run.id
         while True:
             # Re-resolve from the live store at every boundary — the server
@@ -2210,6 +2290,10 @@ class _InMemoryStoreCore:
             run = live
             step = run.spec.steps[run.current_step]
             retry = step.retry or _DEFAULT_STEP_RETRY
+            if step.await_signal is not None:
+                if self._advance_await_signal(run, step.await_signal, retry, now):
+                    continue
+                return
             try:
                 txn = Transaction.model_validate(step.txn)
                 self._execute_transaction(txn)
@@ -2264,6 +2348,90 @@ class _InMemoryStoreCore:
                 run.sleep_until = gate
                 run.status = "pending"
                 return
+
+    def _advance_await_signal(
+        self, run: _WorkflowRun, sig: AwaitSignalSpec, retry: StepRetry, now: int
+    ) -> bool:
+        """One boundary of an ``awaitSignal`` step — the port of the committer's
+        three-way branch (side-table only: no document writes, no subscriber
+        notifications). The claimed row itself is the wake discriminator:
+        ``signal_payload`` set = a delivery to consume; else ``waited_since``
+        unset = first arrival (park); set = the gate expired (a timed-out
+        attempt). A timed-out retry waits the FULL ``timeoutMs`` again — never
+        backoff — and exhaustion terminal-fails with
+        ``awaitSignal '<name>' timed out``. Returns ``True`` when the advance
+        loop should continue in this same turn (a consumed signal whose next
+        step's gate is already due), ``False`` when the run parked, timed out
+        into a retry, or finalized."""
+        if run.signal_payload is not None:
+            payload = run.signal_payload
+            run.signal_payload = None
+            run.step_outcomes.append(
+                StepOutcome(
+                    step_index=run.current_step,
+                    status="success",
+                    attempts=run.attempts + 1,
+                    at=now,
+                    signal=payload,
+                )
+            )
+            run.attempts = 0
+            run.last_error = None
+            run.wait_name = None
+            run.waited_since = None
+            run.updated_at = now
+            if run.current_step == run.step_count - 1:
+                run.status = "success"
+                run.finished_at = now
+                return False
+            run.current_step += 1
+            gate = now + (run.spec.steps[run.current_step].sleep_before_ms or 0)
+            if gate > now:
+                run.sleep_until = gate
+                run.status = "pending"
+                return False
+            return True
+        # An omitted timeoutMs is never due — only a delivery or a cancel
+        # wakes the run.
+        timeout_gate = now + sig.timeout_ms if sig.timeout_ms is not None else _NEVER_DUE
+        if run.waited_since is None:
+            # First arrival: park (attempts persist, so a timeout retry that
+            # re-parks keeps its count).
+            run.status = "waiting"
+            run.wait_name = sig.name
+            run.waited_since = now
+            run.sleep_until = timeout_gate
+            run.signal_payload = None
+            run.updated_at = now
+            return False
+        # The run parked and its gate expired: a timed-out attempt. A retry
+        # waits the FULL timeoutMs again — never backoff.
+        run.attempts += 1
+        run.updated_at = now
+        if run.attempts < retry.max_attempts:
+            run.status = "waiting"
+            run.wait_name = sig.name
+            run.waited_since = now
+            run.sleep_until = timeout_gate
+            run.signal_payload = None
+            return False
+        error = f"awaitSignal '{sig.name}' timed out"
+        run.status = "failed"
+        run.last_error = error
+        run.finished_at = now
+        run.wait_name = None
+        run.waited_since = None
+        run.signal_payload = None
+        run.step_outcomes.append(
+            StepOutcome(
+                step_index=run.current_step,
+                status="failed",
+                attempts=run.attempts,
+                at=now,
+                error=error,
+            )
+        )
+        return False
 
     def _reap_ttl(self, now: int) -> int:
         """Remove docs whose declared TTL ``field`` (a number) is ``< now`` — the

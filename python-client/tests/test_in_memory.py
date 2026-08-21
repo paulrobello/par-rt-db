@@ -15,7 +15,7 @@ from typing import Any, Literal
 import pytest
 from pydantic import TypeAdapter
 
-from par_rt_db import Mutation, StepResult, TableQuery
+from par_rt_db import Mutation, StepResult, TableQuery, await_signal
 from par_rt_db.errors import ErrorCode, RtDbError
 from par_rt_db.in_memory import (
     MAX_AFFECTED_ROWS_PER_TXN,
@@ -2844,3 +2844,233 @@ def test_workflow_spec_nested_start_workflow_cannot_smuggle_past_max_steps() -> 
         c.start_workflow(_wf("smuggle", [_wf_step(outer_txn)]))
     assert ei.value.code is ErrorCode.BAD_REQUEST
     assert f"recursive step count {2 + MAX_STEPS} exceeds MAX_STEPS {MAX_STEPS}" in ei.value.message
+
+
+# --- awaitSignal: park / deliver / timeout (server workflows_test.rs ports) ---
+
+
+def _wf_wait_step(name: str, timeout_ms: int | None = None, **kw: Any) -> Any:
+    return WorkflowStepSpec(await_signal=await_signal(name, timeout_ms), **kw)
+
+
+def _wf_run(c: Any, wid: str) -> Any:
+    """The live ``_WorkflowRun`` (asserted present) — the outcome trail and the
+    wait columns live below the public ``WorkflowInfo`` projection."""
+    run = c._find_workflow(wid)
+    assert run is not None
+    return run
+
+
+def _wf_signal_error(c: Any, wid: str, name: str) -> RtDbError:
+    with pytest.raises(RtDbError) as ei:
+        c.signal_workflow(wid, name)
+    return ei.value
+
+
+def test_await_signal_parks_delivers_and_advances_with_payload() -> None:
+    c, clock = _new_clock_client()
+    wid = c.start_workflow(
+        _wf(
+            "gated",
+            [
+                _wf_step(_wf_txn("pre")),
+                _wf_wait_step("approve", timeout_ms=60_000),
+                _wf_step(_wf_txn("post")),
+            ],
+        )
+    )
+    c.tick()  # step 1 done, step 2 parks
+    info = _wf_status(c, wid)
+    assert info.status == "waiting"
+    assert info.waiting_for == "approve"
+    assert info.waited_since == clock[0]  # stamped by the injected clock at park
+    assert info.sleep_until == info.waited_since + 60_000
+    # Deliver with a payload; the wake lands on the NEXT tick.
+    assert c.signal_workflow(wid, "approve", {"ok": True}) is True
+    assert _wf_status(c, wid).status == "pending"  # woken, not yet advanced
+    c.tick()
+    info = _wf_status(c, wid)
+    assert info.status == "success"
+    assert sorted(d["name"] for d in c.run_query(TableQuery("items").build())) == [
+        "post",
+        "pre",
+    ]
+    # The delivered payload rides the outcome trail verbatim; the wait columns
+    # dropped with the leave-waiting flip.
+    run = _wf_run(c, wid)
+    assert run.step_outcomes[1].signal == {"ok": True}
+    assert run.wait_name is None and run.waited_since is None
+    assert _wf_status(c, wid).waiting_for is None
+
+
+def test_await_signal_timeout_retries_with_fresh_timeout_then_succeeds() -> None:
+    c, clock = _new_clock_client()
+    wid = c.start_workflow(
+        _wf(
+            "fresh",
+            [
+                _wf_wait_step(
+                    "approve",
+                    timeout_ms=5_000,
+                    # Backoff after one failure would be 10 ms; a fresh full
+                    # timeout is 5_000 — the gate distance discriminates.
+                    retry=StepRetry(max_attempts=3, initial_retry_ms=10, max_retry_ms=10),
+                )
+            ],
+        )
+    )
+    c.tick()  # park at gate t0+5000
+    parked = _wf_status(c, wid)
+    assert parked.waited_since is not None and parked.sleep_until is not None
+    clock[0] = parked.sleep_until
+    c.tick()  # gate expired -> timed-out attempt 1 -> re-park
+    repark = _wf_status(c, wid)
+    assert repark.status == "waiting" and repark.attempts == 1
+    assert repark.sleep_until is not None
+    assert repark.sleep_until - clock[0] == 5_000, "retry must wait the full timeoutMs again"
+    # A delivery into the re-parked wait then succeeds, accounting both the
+    # timed-out attempt and the delivered one.
+    assert c.signal_workflow(wid, "approve", {"after": "timeout"}) is True
+    c.tick()
+    run = _wf_run(c, wid)
+    assert run.status == "success"
+    assert run.step_outcomes[0].attempts == 2
+    assert run.step_outcomes[0].signal == {"after": "timeout"}
+
+
+def test_await_signal_timeout_exhaustion_fails_typed() -> None:
+    c, clock = _new_clock_client()
+    wid = c.start_workflow(
+        _wf(
+            "doomed",
+            [
+                _wf_step(_wf_txn("pre")),
+                _wf_wait_step("approve", timeout_ms=5_000, retry=StepRetry(max_attempts=1)),
+                _wf_step(_wf_txn("post")),
+            ],
+        )
+    )
+    c.tick()  # step 1 done, wait parks
+    parked = _wf_status(c, wid)
+    assert parked.sleep_until is not None
+    clock[0] = parked.sleep_until
+    c.tick()  # single attempt exhausted -> terminal failure
+    info = _wf_status(c, wid)
+    assert info.status == "failed"
+    assert info.last_error == "awaitSignal 'approve' timed out"
+    run = _wf_run(c, wid)
+    assert run.step_outcomes[1].status == "failed"
+    assert run.step_outcomes[1].error == "awaitSignal 'approve' timed out"
+    assert run.step_outcomes[1].signal is None
+    # The "post" step never ran.
+    assert [d["name"] for d in c.run_query(TableQuery("items").build())] == ["pre"]
+
+
+def test_await_signal_no_timeout_waits_indefinitely() -> None:
+    c, clock = _new_clock_client()
+    wid = c.start_workflow(_wf("forever", [_wf_wait_step("approve")]))
+    c.tick()  # parks with a never-due gate
+    clock[0] += 10_000_000_000  # heat-death-of-universe tick
+    c.tick()
+    info = _wf_status(c, wid)
+    assert info.status == "waiting" and info.waiting_for == "approve"
+    # A signal still advances it.
+    assert c.signal_workflow(wid, "approve", {"late": True}) is True
+    c.tick()
+    run = _wf_run(c, wid)
+    assert run.status == "success"
+    assert run.step_outcomes[0].signal == {"late": True}
+
+
+def test_await_signal_latest_wins_payload() -> None:
+    c, _clock = _new_clock_client()
+    wid = c.start_workflow(_wf("lw", [_wf_wait_step("approve", timeout_ms=60_000)]))
+    c.tick()
+    # Two deliveries into the unconsumed wait both ack; the SECOND payload is
+    # the one consumed.
+    assert c.signal_workflow(wid, "approve", {"v": 1}) is True
+    assert c.signal_workflow(wid, "approve", {"v": 2}) is True
+    c.tick()
+    run = _wf_run(c, wid)
+    assert run.status == "success"
+    assert run.step_outcomes[0].signal == {"v": 2}
+
+
+def test_cancel_while_waiting_ends_the_wait() -> None:
+    c, _clock = _new_clock_client()
+    wid = c.start_workflow(_wf("cw", [_wf_wait_step("z", timeout_ms=60_000)]))
+    c.tick()
+    assert _wf_status(c, wid).status == "waiting"
+    assert c.cancel_workflow(wid) is True
+    assert _wf_status(c, wid).status == "cancelled"
+    # The wait columns dropped with the flip: a late signal on the terminal
+    # run conflicts (not a delivery into a resurrected wait).
+    err = _wf_signal_error(c, wid, "z")
+    assert err.code is ErrorCode.CONFLICT
+    assert err.message == "workflow is not waiting for a signal"
+
+
+def test_signal_workflow_typed_delivery_errors() -> None:
+    c, _clock = _new_clock_client()
+    # Unknown id -> NOT_FOUND.
+    err = _wf_signal_error(c, "nope", "approve")
+    assert err.code is ErrorCode.NOT_FOUND
+    assert err.message == "unknown workflow"
+    # Not parked (running-free spec that already finished) -> CONFLICT.
+    wid = c.start_workflow(_wf("plain", [_wf_step(_wf_txn("a"))]))
+    err = _wf_signal_error(c, wid, "approve")
+    assert err.code is ErrorCode.CONFLICT
+    assert err.message == "workflow is not waiting for a signal"
+    # Waiting on a different name -> CONFLICT naming BOTH names.
+    wid2 = c.start_workflow(_wf("mw", [_wf_wait_step("approve")]))
+    c.tick()
+    err = _wf_signal_error(c, wid2, "reject")
+    assert err.code is ErrorCode.CONFLICT
+    assert err.message == "workflow waiting on 'approve', got 'reject'"
+    # None of the failed deliveries consumed the wait.
+    assert _wf_status(c, wid2).status == "waiting"
+
+
+def test_await_signal_spec_validation_rejects_invalid_steps() -> None:
+    """The complete submit-time validation port: exactly-one-of txn/awaitSignal,
+    name in 1..=256 chars, timeoutMs > 0 — same BAD_REQUEST messages as server
+    ``workflows::validate_spec``."""
+    c, _clock = _new_clock_client()
+
+    def rejects(spec: Any, message: str) -> None:
+        with pytest.raises(RtDbError) as ei:
+            c.start_workflow(spec)
+        assert ei.value.code is ErrorCode.BAD_REQUEST
+        assert ei.value.message == message
+
+    # Neither txn nor awaitSignal:
+    rejects(
+        _wf("empty-step", [WorkflowStepSpec(sleep_before_ms=5)]),
+        "steps[0] must carry exactly one of txn or awaitSignal",
+    )
+    # Both:
+    rejects(
+        _wf(
+            "both",
+            [_wf_step(_wf_txn("a"), await_signal=await_signal("a"))],
+        ),
+        "steps[0] must carry exactly one of txn or awaitSignal",
+    )
+    # Name bounds:
+    rejects(
+        _wf("empty-name", [_wf_wait_step("")]),
+        "steps[0].awaitSignal.name must be 1..=256 chars",
+    )
+    rejects(
+        _wf("long-name", [_wf_wait_step("x" * 257)]),
+        "steps[0].awaitSignal.name must be 1..=256 chars",
+    )
+    # Zero timeout:
+    rejects(
+        _wf("zero-timeout", [_wf_wait_step("a", timeout_ms=0)]),
+        "steps[0].awaitSignal.timeoutMs must be > 0",
+    )
+    # A valid awaitSignal step with no txn passes (and awaits its signal).
+    wid = c.start_workflow(_wf("ok", [_wf_wait_step("a")]))
+    c.tick()
+    assert _wf_status(c, wid).status == "waiting"

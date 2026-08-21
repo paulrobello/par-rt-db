@@ -46,6 +46,7 @@ from .wire import (
     _ClientPresenceState,
     _ClientResumeSchedule,
     _ClientSchedule,
+    _ClientSignalWorkflow,
     _ClientStartWorkflow,
 )
 
@@ -681,6 +682,14 @@ class RtDbClient:
         was cancelled; ``False`` when it was missing or already terminal."""
         return await self._wf_op("cancel", id=id)
 
+    async def signal_workflow(self, id: str, name: str, payload: Any | None = None) -> bool:
+        """Deliver a named signal to a run parked at an ``awaitSignal`` step.
+        ``True`` when delivered (the payload lands in the step outcome's
+        ``signal``; the run wakes on its next advance). ``NOT_FOUND`` for an
+        unknown run; ``CONFLICT`` when the run is not waiting or is waiting on
+        a different name."""
+        return await self._wf_op("signal", id=id, name=name, payload=payload)
+
     async def list_workflows(self, status: WorkflowStatus | None = None) -> list[WorkflowInfo]:
         """List workflow runs on this database, newest first. ``status``
         filters to that lifecycle state."""
@@ -690,6 +699,10 @@ class RtDbClient:
     async def _wf_op(self, kind: Literal["start"], *, spec: WorkflowSpec) -> WorkflowInfo: ...
     @overload
     async def _wf_op(self, kind: Literal["cancel"], *, id: str) -> bool: ...
+    @overload
+    async def _wf_op(
+        self, kind: Literal["signal"], *, id: str, name: str, payload: Any | None = ...
+    ) -> bool: ...
     @overload
     async def _wf_op(
         self, kind: Literal["list"], *, status: WorkflowStatus | None = ...
@@ -1183,6 +1196,10 @@ def _build_wf_frame(kind: str, wid: str, fields: dict[str, Any]) -> str:
         return _ClientCancelWorkflow(workflow_id=wid, id=fields["id"]).model_dump_json(
             by_alias=True
         )
+    if kind == "signal":
+        return _ClientSignalWorkflow(
+            workflow_id=wid, id=fields["id"], name=fields["name"], payload=fields.get("payload")
+        ).model_dump_json(by_alias=True)
     return _ClientListWorkflows(workflow_id=wid, status=fields.get("status")).model_dump_json(
         by_alias=True
     )

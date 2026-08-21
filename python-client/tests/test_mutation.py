@@ -27,7 +27,7 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 
 from par_rt_db.errors import ErrorCode, RtDbError
-from par_rt_db.mutation import MAX_STEPS, Mutation, StepResult, Transaction
+from par_rt_db.mutation import MAX_STEPS, Mutation, StepResult, Transaction, await_signal
 from par_rt_db.wire import AfterMs, FilterExpr, StepRetry, WorkflowSpec, WorkflowStepSpec
 
 
@@ -329,6 +329,17 @@ def test_workflow_builder_methods_return_self():
     b = Mutation.builder()
     assert b.start_workflow(_wf_spec()) is b
     assert b.cancel_workflow("wf1") is b
+
+
+def test_await_signal_helper_builds_wait_declaration():
+    # The spec-level counterpart of the step constructors: an awaitSignal step
+    # serializes to exactly {"awaitSignal": {"name", "timeoutMs"?}}.
+    step = WorkflowStepSpec(await_signal=await_signal("approve", timeout_ms=60_000))
+    assert json.loads(step.model_dump_json(by_alias=True)) == {
+        "awaitSignal": {"name": "approve", "timeoutMs": 60_000}
+    }
+    bare = WorkflowStepSpec(await_signal=await_signal("approve"))
+    assert json.loads(bare.model_dump_json(by_alias=True)) == {"awaitSignal": {"name": "approve"}}
 
 
 def test_step_result_start_and_cancel_workflow():
