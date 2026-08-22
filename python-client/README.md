@@ -313,9 +313,10 @@ scoped raw-SQL escape hatch (one table's `doc` jsonb, no joins/DDL). See
 
 ### Durable workflows (FM-29)
 
-A named spec of steps — each an ordinary dumped `Transaction` plus optional
-`StepRetry` and `sleep_before_ms` — the server advances durably (at-least-once
-per step; a step that exhausts its retries fails the run). The sync and async
+A named spec of steps — each either an ordinary dumped `Transaction` or an
+`awaitSignal` wait (exactly one per step), plus optional `StepRetry` and
+`sleep_before_ms` — the server advances durably (at-least-once per step; a
+step that exhausts its retries fails the run). The sync and async
 HTTP clients return the new run id; the reactive client returns `WorkflowInfo`.
 
 ```python
@@ -351,10 +352,30 @@ Mutation.builder().insert("users", {"name": "a"}).start_workflow(spec).build()
 Steps fire as the system principal (a scoped machine token is confined at
 submit time), so write idempotent step txns. The admin client adds
 `admin_list_workflows`/`admin_start_workflow`/`admin_get_workflow`/
-`admin_cancel_workflow`/`admin_delete_workflow` (sync + async) over the
+`admin_cancel_workflow`/`admin_signal_workflow`/`admin_delete_workflow`
+(sync + async) over the
 `/admin/db/{db}/workflows` routes, and the in-memory harness models the
 engine (spec validation + `tick()` advance) so workflow flows are testable
 with no network.
+
+An `awaitSignal` step is an approval gate: it parks the run in the
+non-terminal `waiting` state until `signal_workflow(id, name, payload)` (sync
++ async HTTP, reactive WS, admin) delivers a matching signal. The payload is
+latest-wins and is recorded verbatim on the step outcome (`signal`); while
+waiting, `WorkflowInfo` carries `waiting_for`/`waited_since`. An optional
+`timeout_ms` counts as a failed attempt through the step's `retry` (each
+re-wait is the full timeout again, no backoff); omit it to wait forever —
+cancel is the escape. The harness models the parked state on `tick()` too.
+
+```python
+from par_rt_db.mutation import await_signal
+
+gate = WorkflowSpec(
+    name="gate",
+    steps=[WorkflowStepSpec(await_signal=await_signal("approve", timeout_ms=86_400_000))],
+)
+await db.signal_workflow(run_id, "approve", {"approvedBy": "u1"})  # releases the gate
+```
 
 ### Cascade delete + soft delete (FM-33)
 

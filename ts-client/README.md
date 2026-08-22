@@ -296,6 +296,30 @@ covers the admin route. The in-memory harness models the engine: it validates
 the spec and advances runs on `tick()`, so workflow flows are testable with no
 network.
 
+A step can instead be an `awaitSignal` approval gate (exactly one of
+`txn`/`awaitSignal` per step): `awaitSignal(name, timeoutMs?)` parks the run
+in the non-terminal `waiting` state until `signalWorkflow(id, name, payload?)`
+— on both the reactive and HTTP clients, `adminSignalWorkflow` on the admin
+client — delivers a matching signal. The payload is latest-wins and is
+recorded verbatim on the step outcome (`signal`); while waiting,
+`WorkflowInfo` carries `waitingFor`/`waitedSince`. An optional `timeoutMs`
+counts as a failed attempt through the step's `retry` (each re-wait is the
+full timeout again, no backoff); omit it to wait forever — cancel is the
+escape. The harness models the parked state on `tick()` too.
+
+```ts
+import { awaitSignal } from "@par-rt-db/client";
+
+const spec: WorkflowSpec = {
+  name: "gate",
+  steps: [
+    { txn: mutation().insert("workItems", { title: "review me" }).build() },
+    awaitSignal("approve", 86_400_000), // parks `waiting` for up to 24h
+  ],
+};
+await db.signalWorkflow(id, "approve", { approvedBy: "u1" }); // releases the gate
+```
+
 ## Cascade delete & soft delete
 
 Referential actions (FM-33) are declared on the CHILD table's id field — no

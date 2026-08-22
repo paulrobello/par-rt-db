@@ -178,8 +178,9 @@ should write idempotent scheduled txns. A past-due one-shot fires immediately
 
 Durable declarative workflows (FM-29) live in `src/workflows.rs`. A run is a
 row in a per-db `workflows` side table snapshotting its `WorkflowSpec`: a
-`name` plus an ordered list of steps, each an ordinary declarative
-`Transaction` with an optional `retry` policy (`StepRetry` — `maxAttempts`
+`name` plus an ordered list of steps, each either an ordinary declarative
+`Transaction` or an `awaitSignal {name, timeoutMs?}` wait (exactly one of the
+two per step), with an optional `retry` policy (`StepRetry` — `maxAttempts`
 counts TOTAL attempts, default 3; `initialRetryMs` default 1000 doubling to a
 `maxRetryMs` cap of 60000) and an optional `sleepBeforeMs` gate before the
 step. The per-db scheduler polls this table alongside `scheduled_txns` and
@@ -188,6 +189,23 @@ arm (`handle_workflow_advance`) executes the current step's txn via the normal
 `execute_txn` + `subs.fan_out` path and publishes through the tap sites with
 `source = "workflow"` — op-feed, audit, and webhooks see every step. The
 single-writer invariant is intact (the scheduler only claims and enqueues).
+
+An `awaitSignal` step is an approval gate: instead of a txn it parks the run
+in a non-terminal `waiting` state until an out-of-band signal with a matching
+name is delivered, or the optional `timeoutMs` fires. The advance arm handles
+the parked step inside its existing branch structure — `waited_since` is the
+discriminator (NULL = first arrival, so park; set and gate expired = timeout,
+which counts as a failed attempt routed into the step's `retry`, re-parked
+with a fresh full `timeoutMs`, no backoff; a present `signal_payload` = the
+signal won, consumed atomically with the step boundary). Claim and wake
+(`claim_due`/`next_due`) admit `waiting` rows, whose `sleep_until` is the
+timeout gate. Signal delivery (`workflows::deliver_signal`) is one
+conditional side-table UPDATE flipping a `waiting` row to `pending` with the
+latest-wins payload — the exact precedent of `workflows::cancel`, called from
+the HTTP/WS/admin handlers. `awaitSignal` steps write no documents: **no new
+committer arm, no new tap site**. While waiting, `WorkflowInfo` carries
+`waitingFor`/`waitedSince` (omitted otherwise); the delivered payload is
+recorded verbatim on the step outcome (`signal`).
 
 Semantics: steps fire as the **system (bypass) principal** — per-row
 `ownerField`/`authorize` rules don't apply to workflow writes, like scheduled
@@ -205,13 +223,19 @@ started on a db with no live per-db tasks both starts and advances.
 
 Surfaces: txn steps `startWorkflow`/`cancelWorkflow` (the run row inserts on
 the open sqlx tx, atomic with the txn's writes); WS frames
-`startWorkflow`/`cancelWorkflow`/`listWorkflows` (replies `startWorkflowOk`/
-`startWorkflowErr`/`workflowAck`/`listWorkflowsOk`); HTTP `POST
+`startWorkflow`/`cancelWorkflow`/`listWorkflows`/`signalWorkflow` (replies
+`startWorkflowOk`/`startWorkflowErr`/`workflowAck`/`listWorkflowsOk` —
+`signalWorkflow` reuses `workflowAck`, whose `error` carries the full
+`{code, message}` envelope); HTTP `POST
 /api/workflows`, `POST /api/workflows/list` (capped at 100), `POST
-/api/workflows/{id}/cancel`; admin `GET|POST /admin/db/{db}/workflows`,
+/api/workflows/{id}/cancel`, `POST /api/workflows/{id}/signal` (body
+`{db, name, payload?}` → `{"delivered": true}`; payload capped at 64 KiB
+serialized; typed 404 unknown id / 409 not-waiting or name-mismatch); admin
+`GET|POST /admin/db/{db}/workflows`,
 `GET /admin/db/{db}/workflows/{id}` (full row + step-outcome trail),
-`POST /admin/db/{db}/workflows/{id}/cancel`, `DELETE
-/admin/db/{db}/workflows/{id}`.
+`POST /admin/db/{db}/workflows/{id}/cancel`, `POST
+/admin/db/{db}/workflows/{id}/signal` (body `{name, payload?}` → `{ok}`),
+`DELETE /admin/db/{db}/workflows/{id}`.
 
 ## File storage
 

@@ -155,9 +155,10 @@ use par_rt_db_client::{StepRetry, WorkflowInfo, WorkflowSpec, WorkflowStepSpec};
 let spec = WorkflowSpec {
     name: "onboard".into(),
     steps: vec![
-        WorkflowStepSpec { txn, retry: None, sleep_before_ms: None },
+        WorkflowStepSpec { txn, await_signal: None, retry: None, sleep_before_ms: None },
         WorkflowStepSpec {
             txn: txn2,
+            await_signal: None,
             retry: Some(StepRetry { max_attempts: 5, ..Default::default() }),
             sleep_before_ms: Some(60_000),
         },
@@ -168,11 +169,33 @@ db.cancel_workflow(&id).await?;                     // false for a missing/termi
 let runs: Vec<WorkflowInfo> = db.list_workflows(None).await?;
 ```
 
+A step is either a txn or an `awaitSignal` wait (exactly one per step).
+`WorkflowStepSpec::await_signal(name, timeout_ms)` builds the wait variant: it
+parks the run in the non-terminal `waiting` state until a matching signal
+arrives — `signal_workflow(id, name, payload)` delivers it on the http, ws,
+and admin clients (latest-wins payload, recorded on the step outcome as
+`signal`; typed 404/409 errors on unknown id / not waiting / name mismatch).
+An optional `timeout_ms` counts as a failed attempt through the step's
+`retry` (each re-wait is the full timeout again, no backoff); `None` waits
+forever — cancel is the escape. While waiting, `WorkflowInfo` carries
+`waiting_for`/`waited_since`.
+
+```rust
+let spec = WorkflowSpec {
+    name: "gate".into(),
+    steps: vec![
+        WorkflowStepSpec::await_signal("approve", Some(86_400_000)),
+    ],
+};
+db.signal_workflow(&id, "approve", Some(serde_json::json!({ "approvedBy": "u1" }))).await?;
+```
+
 Steps fire as the system principal (a scoped machine token is confined at
 submit time); delivery is at-least-once per step, so write idempotent step
 txns. A step that exhausts its retries fails the run (terminal). The admin
 client adds `list_workflows`/`get_workflow`/`start_workflow`/`cancel_workflow`/
-`delete_workflow` over the `/admin/db/{db}/workflows` routes. Note: the
+`signal_workflow`/`delete_workflow` over the `/admin/db/{db}/workflows` routes.
+Note: the
 in-memory test harness does NOT model the workflow engine (its workflow arms
 return `Internal` errors) — test workflow flows against a live server.
 

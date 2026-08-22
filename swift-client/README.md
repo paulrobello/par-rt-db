@@ -150,7 +150,8 @@ await sub.cancel()     // refcounted: the server unsubscribes when the last hand
 Mutations, scheduling, and workflows also run over the WS client
 (`mutate(_:idempotencyKey:)`, `schedule(_:when:)`, `cancelSchedule(_:)`,
 `pauseSchedule(_:)`, `resumeSchedule(_:)`, `listSchedules()`,
-`startWorkflow(_:)`, `cancelWorkflow(_:)`, `listWorkflows()`).
+`startWorkflow(_:)`, `cancelWorkflow(_:)`, `signalWorkflow(_:name:payload:)`,
+`listWorkflows()`).
 
 Presence rooms (ENH-015): `presence(room:state:)` joins (or attaches to) a
 room and returns a `PresenceHandle` whose `current`/`stream` carry
@@ -235,6 +236,27 @@ let bulk = try MutationBuilder()
     .patchByQuery("tasks", filter: .eq(field: "status", value: .string("stale")),
                   patch: ["archived": .bool(true)])
     .build()
+```
+
+### Durable workflows
+
+A workflow step is either a txn or an `awaitSignal` wait (exactly one per
+step). `WorkflowStepSpec.awaitSignal(name:timeoutMs:retry:sleepBeforeMs:)`
+builds the wait variant — an approval gate that parks the run in the
+non-terminal `waiting` state until a matching signal arrives;
+`signalWorkflow(_:name:payload:)` on the HTTP, WS, and admin clients delivers
+it (latest-wins payload, recorded on the step outcome as `signal`; typed
+NOT_FOUND/CONFLICT rejections on unknown id / not waiting / name mismatch).
+An optional `timeoutMs` counts as a failed attempt through the step's
+`retry` (each re-wait is the full timeout again, no backoff); nil waits
+forever — cancel is the escape. While waiting, `WorkflowInfo` carries
+`waitingFor`/`waitedSince`. The in-memory engine models the parked state on
+`tick()` too.
+
+```swift
+let step = try WorkflowStepSpec.awaitSignal(name: "approve", timeoutMs: 86_400_000)
+let runId = try await http.startWorkflow(WorkflowSpec(name: "gate", steps: [step]))
+try await http.signalWorkflow(runId, name: "approve", payload: .object(["approvedBy": .string("u1")]))
 ```
 
 ### Schema DSL (`SchemaBuilder`)

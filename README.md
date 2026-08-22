@@ -75,7 +75,7 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 - **Full-text search**: websearch-syntax `search` ranked by `ts_rank` with optional snippets, plus a `trgm` mode for substring/autocomplete matching
 - **Vector + hybrid search**: write-maintained pgvector columns ranked by the index's declared metric; `hybridSearch` fuses full-text and vector rankings via Reciprocal Rank Fusion
 - **Scheduling**: one-shot (`afterMs`/`runAt`), 5-field UTC `cron`, and fixed-interval (`everyMs`) transactions with cancel/pause/resume — scheduled work is data, not server code
-- **Durable workflows**: multi-step specs with per-step retry, backoff, and sleep; at-least-once per step with crash-resume
+- **Durable workflows**: multi-step specs with per-step retry, backoff, and sleep, plus `awaitSignal` approval gates that park a run until an out-of-band signal (or timeout); at-least-once per step with crash-resume
 - **Server-stamped `updatedAt`**: a table may declare `updatedAtField` naming a `number`/`int64` field the server stamps with epoch-ms on every version-bumping write (insert/patch/replace/upsert/patchByQuery/cascade setNull), overwriting client-supplied values — no more hand-rolled timestamps in every mutation, and orderable with a declared index
 - **Auto-increment counters**: a table may declare `autoIncrementField` naming an `int64` field the server assigns from a per-table Postgres sequence on insert (overwriting client-supplied values, immutable afterward, unique-indexable) — ticket/issue numbers with zero races; snapshot import continues numbering past the imported max, and gaps from rolled-back transactions are documented behavior
 - **Realtime presence**: transient room membership and state ("who is online", cursors, typing) over the existing `/sync` socket — no extra infrastructure
@@ -243,6 +243,7 @@ since browsers cannot set headers on a WS handshake.
 | `POST /api/workflows` | Bearer token | Starts a durable workflow run from a `WorkflowSpec` (FM-29); returns `{id}`. See [Durable workflows](#durable-workflows). |
 | `POST /api/workflows/list` | Bearer token | Lists workflow runs for a database (`WorkflowInfo[]`, newest first; optional `status` filter). |
 | `POST /api/workflows/{id}/cancel` | Bearer token | Cancels a non-terminal run (`{ok:false}` = unknown/terminal — a no-op, not an error). |
+| `POST /api/workflows/{id}/signal` | Bearer token | Delivers a named signal to a `waiting` run (`{db, name, payload?}` → `{"delivered": true}`; releases an `awaitSignal` step). 404 unknown id; 409 not waiting or name mismatch; payload capped at 64 KiB serialized. |
 
 ### File storage (HTTP-only, bypasses the committer)
 
@@ -324,6 +325,7 @@ loss is `DROP TABLE` for tables absent from the target snapshot, and migrate dat
 | `GET|POST /admin/db/{db}/workflows` | Bearer admin key | Lists workflow runs for a database / starts one (admin-scoped; `POST` body is a `WorkflowSpec`). |
 | `GET|DELETE /admin/db/{db}/workflows/{id}` | Bearer admin key | Fetches one run's `WorkflowInfo` / deletes a terminal run's row. |
 | `POST /admin/db/{db}/workflows/{id}/cancel` | Bearer admin key | Cancels a non-terminal run (admin-scoped; `{ok:false}` = unknown/terminal). |
+| `POST /admin/db/{db}/workflows/{id}/signal` | Bearer admin key | Delivers a named signal to a `waiting` run (admin-scoped; `{name, payload?}` → `{ok}`) — the route the dashboard's send-signal form and `rtdb workflows signal` ride. |
 | `GET|PATCH /admin/db/{db}/anonymous-access` | Bearer admin key | Per-database anonymous-auth toggle (SEC-103), on top of the instance-wide `RTDB_AUTH_ANONYMOUS_ENABLED` boot gate. |
 | `GET /admin/db/{db}/storage` | Bearer admin key | Lists blobs stored in a database (id, sha256, size, contentType, createdAt). |
 | `POST /admin/db/{db}/storage` | Bearer admin key | Uploads a blob (admin-scoped; same shape as `POST /api/storage/{db}`). |
@@ -762,11 +764,12 @@ re-run on every op, not just at connect.
 
 ## Durable workflows
 
-A workflow is a named spec of steps — each an ordinary declarative
-`Transaction` plus an optional `StepRetry` (`maxAttempts`, default 3; 1s
-initial backoff doubling to a 60s cap) and an optional `sleepBeforeMs` — that
-the server advances durably (FM-29). A run is a row in a per-db `workflows`
-side table; the scheduler timer enqueues each due step as
+A workflow is a named spec of steps — each either an ordinary declarative
+`Transaction` or an `awaitSignal` wait (`{"name": string, "timeoutMs"?: number}`,
+exactly one of the two per step), plus an optional `StepRetry` (`maxAttempts`,
+default 3; 1s initial backoff doubling to a 60s cap) and an optional
+`sleepBeforeMs` — that the server advances durably (FM-29). A run is a row in a
+per-db `workflows` side table; the scheduler timer enqueues each due step as
 `CommitterRequest::RunWorkflowAdvance` and the committer executes it through
 the normal `execute_txn` + `fan_out` path, so the single-writer invariant and
 the op-feed/audit/webhook taps hold for every step. Delivery is
@@ -774,26 +777,51 @@ the op-feed/audit/webhook taps hold for every step. Delivery is
 is re-armed at startup); a step that exhausts its retries fails the run.
 Steps fire as the system (bypass) principal — a scoped machine token is
 confined at submit time — so write idempotent step txns. A run's status is
-one of `pending` / `running` / `success` / `failed` / `cancelled`.
+one of `pending` / `running` / `success` / `failed` / `cancelled` /
+`waiting`.
+
+An `awaitSignal` step is an approval gate: it parks the run in the
+non-terminal `waiting` state until an out-of-band signal with a matching name
+is delivered (or an optional timeout fires). While waiting, `WorkflowInfo`
+carries `waitingFor` (the signal name) and `waitedSince` (ms epoch the wait
+started); both are omitted otherwise. The delivered payload is recorded
+verbatim on the step outcome (`signal`) and is **latest-wins** — a second
+delivery while the run is still waiting overwrites the first (every delivery
+still acks). A `timeoutMs` expiry counts as a failed attempt routed into the
+step's `retry` policy, and each re-parked attempt waits the full `timeoutMs`
+again (no backoff); omit `timeoutMs` to park forever — cancel is the escape.
+
+Send the signal on any of three surfaces — `POST /api/workflows/{id}/signal`
+(Bearer token, body `{db, name, payload?}` → `{"delivered": true}`), the WS
+`signalWorkflow` frame (reply reuses `workflowAck`, with the typed
+`{code, message}` error envelope on failure), or admin
+`POST /admin/db/{db}/workflows/{id}/signal` (the dashboard and `rtdb`
+CLI ride this one). Unknown id is 404; a non-waiting run or a name mismatch
+is 409 (the message names both signals). Delivery is one conditional UPDATE
+on the side table row (like cancel) — `awaitSignal` steps write no documents.
 
 Start runs via the HTTP `POST /api/workflows` routes, the WS
 `startWorkflow` / `cancelWorkflow` / `listWorkflows` frames, the admin CRUD
 routes, or the `startWorkflow` / `cancelWorkflow` txn steps (insertion atomic
 with the enclosing writes). All four clients mirror the surface:
-`startWorkflow` / `cancelWorkflow` / `listWorkflows` (ts, rust, python —
-reactive + HTTP) plus admin variants, the `rtdb workflows` CLI, and the
-dashboard Workflows page. Spec:
-[`docs/superpowers/specs/2026-08-15-workflows-design.md`](docs/superpowers/specs/2026-08-15-workflows-design.md).
+`startWorkflow` / `cancelWorkflow` / `listWorkflows` / `signalWorkflow`
+(ts, rust, python, swift — reactive + HTTP) plus admin variants, the
+`rtdb workflows` CLI (incl. `rtdb workflows signal`), and the dashboard
+Workflows page (which shows waiting runs and can send the signal). Spec:
+[`docs/superpowers/specs/2026-08-15-workflows-design.md`](docs/superpowers/specs/2026-08-15-workflows-design.md)
++ [`docs/superpowers/specs/2026-08-21-workflow-await-signal-design.md`](docs/superpowers/specs/2026-08-21-workflow-await-signal-design.md).
 
 ### TypeScript client
 
 ```ts
-import { WorkflowSpec } from "@par-rt-db/client";
+import { WorkflowSpec, awaitSignal } from "@par-rt-db/client";
 
 const spec: WorkflowSpec = {
   name: "onboard",
   steps: [
     { txn: { steps: [{ op: "insert", table: "work_items", doc: { title: "welcome" } }] } },
+    // Approval gate: parks the run as `waiting` until a matching signal.
+    { ...awaitSignal("approve", 86_400_000), retry: { maxAttempts: 1 } },
     {
       txn: { steps: [{ op: "insert", table: "work_items", doc: { title: "follow-up" } }] },
       retry: { maxAttempts: 5 },
@@ -802,6 +830,7 @@ const spec: WorkflowSpec = {
   ],
 };
 const { id } = await client.startWorkflow(spec);
+await client.signalWorkflow(id, "approve", { approvedBy: "u1" }); // releases the gate
 await client.cancelWorkflow(id); // false for a missing/terminal run
 const runs = await client.listWorkflows("running"); // newest first
 ```
