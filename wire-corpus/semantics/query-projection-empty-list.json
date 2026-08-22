@@ -1,0 +1,34 @@
+{
+  "name": "query-projection-empty-list",
+  "$comment": "fields: [] is meaningful — an ids-only view. After the default normalization strips _id/_creationTime/_version, every projected doc is the empty object. Derived from server behavior (project_result retains only _-prefixed keys).",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" }
+        },
+        "indexes": [
+          { "name": "by_status", "fields": ["status"] }
+        ]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "status": "todo" },
+    { "name": "b", "status": "todo" }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "index": "by_status",
+      "eq": ["todo"],
+      "order": "asc",
+      "fields": []
+    }
+  },
+  "expect": [
+    {},
+    {}
+  ]
+}

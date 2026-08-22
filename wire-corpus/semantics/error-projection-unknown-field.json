@@ -1,0 +1,20 @@
+{
+  "name": "error-projection-unknown-field",
+  "$comment": "Projection validation: a fields entry the table does not declare (and that is not one of the always-included system fields) fails with BAD_REQUEST at compile time.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": { "name": { "type": "string" } },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }]
+      }
+    }
+  },
+  "seed": [{ "name": "a" }],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "fields": ["name", "bogus"]
+    }
+  },
+  "expect": { "error": { "code": "BAD_REQUEST" } }
+}

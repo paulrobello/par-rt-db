@@ -1,0 +1,36 @@
+{
+  "name": "query-projection-collect",
+  "$comment": "fields projection on an ordered collect: each result doc keeps only the listed user fields (system fields are normalized away by the runner). Pins that unlisted user fields (status, order) are absent from every doc.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" },
+          "order": { "type": "number" }
+        },
+        "indexes": [
+          { "name": "by_status_and_order", "fields": ["status", "order"] }
+        ]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "status": "todo", "order": 3 },
+    { "name": "b", "status": "todo", "order": 1 },
+    { "name": "c", "status": "done", "order": 5 }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "index": "by_status_and_order",
+      "eq": ["todo"],
+      "order": "asc",
+      "fields": ["name"]
+    }
+  },
+  "expect": [
+    { "name": "b" },
+    { "name": "a" }
+  ]
+}

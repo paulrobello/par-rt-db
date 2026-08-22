@@ -1,0 +1,37 @@
+{
+  "name": "query-projection-paginate",
+  "$comment": "fields composes with paginate: page docs carry only the listed user fields; the next cursor (minted from the unprojected row inside the terminal, before projection) is still produced and the page still paginates.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" },
+          "order": { "type": "number" }
+        },
+        "indexes": [
+          { "name": "by_status_and_order", "fields": ["status", "order"] }
+        ]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "status": "todo", "order": 1 },
+    { "name": "b", "status": "todo", "order": 2 },
+    { "name": "c", "status": "todo", "order": 3 }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "index": "by_status_and_order",
+      "eq": ["todo"],
+      "order": "asc",
+      "paginate": { "numItems": 2 },
+      "fields": ["name"]
+    }
+  },
+  "expect": {
+    "docs": [ { "name": "a" }, { "name": "b" } ]
+  },
+  "expect_next_cursor": true
+}

@@ -124,7 +124,8 @@
     { "table": "embeds", "vectorSearch": { "index": "by_embedding", "vector": [ 1.0 ], "limit": 3, "filter": { "op": "eq", "field": "userId", "value": "u1" } } },
     { "table": "workItems", "paginate": { "numItems": 10 } },
     { "table": "workItems", "paginate": { "cursor": "abc", "numItems": 10 } },
-    { "table": "workItems", "index": "by_project_and_status", "eq": [ "p1" ], "distinct": true }
+    { "table": "workItems", "index": "by_project_and_status", "eq": [ "p1" ], "distinct": true },
+    { "table": "workItems", "index": "by_status", "eq": [ "backlog" ], "take": 10, "fields": [ "title", "status", "_id" ] }
   ],
   "migrate_requests": [
     {

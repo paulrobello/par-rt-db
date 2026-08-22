@@ -1,0 +1,31 @@
+{
+  "name": "query-projection-search",
+  "$comment": "fields composes with the search terminal: the non-matching doc's body field is dropped from the hit; ranking unchanged. Search snippet is not requested, so no _searchSnippet appears.",
+  "schema": {
+    "tables": {
+      "notes": {
+        "fields": {
+          "title": { "type": "string" },
+          "body": { "type": "string" }
+        },
+        "indexes": [
+          { "name": "search_content", "fields": ["title", "body"], "search": true }
+        ]
+      }
+    }
+  },
+  "seed": [
+    { "title": "database notes", "body": "a database is a database" },
+    { "title": "cooking notes", "body": "how to boil water" }
+  ],
+  "op": {
+    "query": {
+      "table": "notes",
+      "search": { "index": "search_content", "query": "database" },
+      "fields": ["title"]
+    }
+  },
+  "expect": [
+    { "title": "database notes" }
+  ]
+}
