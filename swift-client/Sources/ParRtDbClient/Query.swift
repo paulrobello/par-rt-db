@@ -84,6 +84,9 @@ public struct Query: Equatable, Codable, Sendable {
     public var vectorSearch: VectorSearchQuery?
     /// Hybrid terminal: RRF fusion of full-text and vector ranking.
     public var hybridSearch: HybridSearchQuery?
+    /// Projection: keep only these user fields per result doc; `_`-prefixed
+    /// system fields are always kept. `[]` = system fields only; nil = full docs.
+    public var fields: [String]?
 
     public init(
         table: String, get: String? = nil, index: String? = nil, eq: [JSONValue] = [],
@@ -93,7 +96,7 @@ public struct Query: Equatable, Codable, Sendable {
         distinct: Bool = false, aggregate: AggregateSpec? = nil,
         paginate: Paginate? = nil, filter: FilterExpr? = nil,
         search: SearchQuery? = nil, vectorSearch: VectorSearchQuery? = nil,
-        hybridSearch: HybridSearchQuery? = nil
+        hybridSearch: HybridSearchQuery? = nil, fields: [String]? = nil
     ) {
         self.table = table
         self.get = get
@@ -115,12 +118,13 @@ public struct Query: Equatable, Codable, Sendable {
         self.search = search
         self.vectorSearch = vectorSearch
         self.hybridSearch = hybridSearch
+        self.fields = fields
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
         case table, get, index, eq, gt, gte, lt, lte, order, take
         case unique, first, count, distinct, aggregate, paginate, filter
-        case search, vectorSearch, hybridSearch
+        case search, vectorSearch, hybridSearch, fields
     }
 
     public init(from decoder: Decoder) throws {
@@ -146,6 +150,7 @@ public struct Query: Equatable, Codable, Sendable {
         search = try container.decodeIfPresent(SearchQuery.self, forKey: .search)
         vectorSearch = try container.decodeIfPresent(VectorSearchQuery.self, forKey: .vectorSearch)
         hybridSearch = try container.decodeIfPresent(HybridSearchQuery.self, forKey: .hybridSearch)
+        fields = try container.decodeIfPresent([String].self, forKey: .fields)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -180,5 +185,6 @@ public struct Query: Equatable, Codable, Sendable {
         try container.encodeIfPresent(search, forKey: .search)
         try container.encodeIfPresent(vectorSearch, forKey: .vectorSearch)
         try container.encodeIfPresent(hybridSearch, forKey: .hybridSearch)
+        try container.encodeIfPresent(fields, forKey: .fields)
     }
 }

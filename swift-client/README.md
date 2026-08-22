@@ -213,6 +213,10 @@ let done = try TableQuery("tasks")
     ]))
     .build()
 
+// Field projection: keep the listed user fields per result doc (system fields
+// always kept; .fields() with no names = ids-only view; unknown = badRequest)
+let titles = try TableQuery("tasks").fields("title", "status").build()
+
 // Terminal-combination rules are enforced client-side at build(), with the
 // server's verbatim messages (e.g. "first cannot be combined with take").
 ```

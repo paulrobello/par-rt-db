@@ -1026,18 +1026,39 @@ public final class InMemoryRtDbClient: MigrationStore {
 
     /// Recomputes every subscription touching `writeSet` and fires listeners
     /// on change (store.ts `notifySubs`). JSONValue equality is key-order
-    /// independent — the TS canonicalizes for the same property.
+    /// independent — the TS canonicalizes for the same property. A projected
+    /// subscription (`fields` set) compares through `diffCanonical`, which
+    /// strips the volatile `_version` first; pushed payloads still carry it.
     private func notifySubs(_ writeSet: Set<String>) {
         for sub in subs {
             guard writeSet.contains(sub.table), sub.onUpdate != nil else { continue }
             guard let next = try? executeQuery(sub.query, requireTable(sub.table), rowsFor)
             else { continue }
-            if sub.hasValue, next == sub.last {
+            if sub.hasValue, let last = sub.last, diffCanonical(sub.query, next) == diffCanonical(sub.query, last) {
                 continue
             }
             sub.last = next
             sub.hasValue = true
             sub.onUpdate?(next)
+        }
+    }
+
+    /// The form a subscription's result diffs against for push decisions — a
+    /// port of server `diff_canonical`. For an UNPROJECTED query this is the
+    /// result as-is (unchanged push behavior). For a PROJECTED one the
+    /// volatile `_version` is stripped from every doc: it bumps on every
+    /// write, so an unstripped compare would push on any member write even
+    /// when no projected field changed — defeating the payload-width point of
+    /// a projected subscription. (A subscriber that must see every `_version`
+    /// bump should use an unprojected subscription.)
+    private func diffCanonical(_ query: Query, _ result: JSONValue) -> JSONValue {
+        guard query.fields != nil else {
+            return result
+        }
+        return mapResultDocs(query, result) { doc in
+            guard case var .object(object) = doc else { return doc }
+            object.removeValue(forKey: "_version")
+            return .object(object)
         }
     }
 

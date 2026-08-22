@@ -8,4 +8,4 @@ identifier_name:
   excluded:
     - k # HybridSearchQuery.k — the wire field name (the RRF constant), not style
 type_body_length: 1600 # WsClientTests.swift + WsClient.swift accumulate Tasks 12+13+14 suites/surfaces (+ fix-round, presence, and optimistic tests) in one file per the task layout
-file_length: 2500 # WsClientTests.swift accumulates Tasks 12+13+14 suites (+ fix-round, onTermination-release, presence, and optimistic tests) in one file per the task layout; InMemoryEngine.swift grew past 2300 with the awaitSignal engine branch (2026-08-21)
+file_length: 2560 # WsClientTests.swift accumulates Tasks 12+13+14 suites (+ fix-round, onTermination-release, presence, and optimistic tests) in one file per the task layout; InMemoryEngine.swift grew past 2300 with the awaitSignal engine branch (2026-08-21), past 2500 with the projection diff-canonical branch (2026-08-21)

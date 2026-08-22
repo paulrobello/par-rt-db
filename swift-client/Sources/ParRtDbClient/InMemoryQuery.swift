@@ -304,6 +304,73 @@ func mergeDoc(_ row: StoredRow) -> JSONValue {
     return .object(merged)
 }
 
+// MARK: - Projection (Query.fields)
+
+/// Validate a `Query.fields` projection against the table — a port of server
+/// `validate_projection`: every name must be a declared field or one of the
+/// system fields (`_id`/`_creationTime`/`_version` — always included, so
+/// listing them is an allowed no-op). Anything else — including typo'd system
+/// names and other `_`-prefixed names — is BAD_REQUEST. `[]` (system fields
+/// only) validates trivially.
+func validateProjection(_ tableDef: TableDef, _ fields: [String]) throws {
+    let systemFields: Set = ["_id", "_creationTime", "_version"]
+    for name in fields {
+        if systemFields.contains(name) || tableDef.fields[name] != nil {
+            continue
+        }
+        throw RtDbError(code: .badRequest, message: "unknown projection field '\(name)'")
+    }
+}
+
+/// Apply `transform` to every result doc of a doc-bearing terminal — the
+/// shared walker for the projection (server `project_result`) and the
+/// subscription diff's `_version` strip (server `diff_canonical`). The
+/// server discriminates by `QueryResult` variant; this engine's untagged
+/// `JSONValue` cannot (an aggregate-group row is as much an object as a doc),
+/// so the query's terminal drives the walk instead: doc-less terminals
+/// (count/distinct/aggregate) return the result untouched; `paginate`
+/// transforms `docs`; get/unique/first transform the object-or-null doc;
+/// everything else (collect/take/search/vectorSearch/hybridSearch) is an
+/// array of docs.
+func mapResultDocs(
+    _ query: Query, _ result: JSONValue, _ transform: (JSONValue) -> JSONValue
+) -> JSONValue {
+    if query.count || query.distinct || query.aggregate != nil {
+        return result
+    }
+    if query.paginate != nil {
+        guard case var .object(page) = result, case let .array(docs) = page["docs"] else {
+            return result
+        }
+        page["docs"] = .array(docs.map(transform))
+        return .object(page)
+    }
+    if query.get != nil || query.unique || query.first {
+        return transform(result) // null passes through the transform's object guard
+    }
+    guard case let .array(docs) = result else {
+        return result
+    }
+    return .array(docs.map(transform))
+}
+
+/// Apply a `Query.fields` projection to an executed result — a port of server
+/// `project_result`: each result doc keeps its `_`-prefixed keys and the
+/// listed user fields; every other user field is dropped. `_`-prefixed keys
+/// are exactly the system fields plus synthetic result fields
+/// (`_searchSnippet`) — user fields can never be `_`-prefixed (write
+/// validation rejects them) — so this rule IS "system fields are always
+/// kept". Doc-less terminals are unaffected by construction.
+func projectedResult(_ query: Query, _ result: JSONValue, _ fields: [String]) -> JSONValue {
+    mapResultDocs(query, result) { doc in
+        guard case var .object(object) = doc else { return doc }
+        for key in Array(object.keys) where !key.hasPrefix("_") && !fields.contains(key) {
+            object.removeValue(forKey: key)
+        }
+        return .object(object)
+    }
+}
+
 // MARK: - Scan plan
 
 /// Everything the row scan needs besides the query itself (query.ts
@@ -323,11 +390,31 @@ struct ScanPlan {
 // MARK: - Dispatcher
 
 /// One-shot query execution — same shape as the HTTP client's `query`
-/// (query.ts `executeQuery`). Thin dispatcher: guards, standalone terminals,
+/// (query.ts `executeQuery`). Projection seam (server `execute_query`):
+/// validation runs before every early return so all terminals — including
+/// `get` — reject unknown field names up front, and the projection is applied
+/// at this one exit so one-shot queries, the initial subscribe push, and
+/// every subscription re-run all see the projected shape.
+func executeQuery(
+    _ query: Query,
+    _ tableDef: TableDef,
+    _ rowsFor: (String) -> [String: StoredRow]
+) throws -> JSONValue {
+    if let fields = query.fields {
+        try validateProjection(tableDef, fields)
+    }
+    let result = try executeQueryUnprojected(query, tableDef, rowsFor)
+    if let fields = query.fields {
+        return projectedResult(query, result, fields)
+    }
+    return result
+}
+
+/// The dispatcher under the projection seam: guards, standalone terminals,
 /// then the shared scan -> per-terminal executors. Table access goes through
 /// the lazy `rowsFor` accessor the engine core passes in. FM-33: stamped
 /// (soft-deleted) rows are invisible to every terminal.
-func executeQuery(
+private func executeQueryUnprojected(
     _ query: Query,
     _ tableDef: TableDef,
     _ rowsFor: (String) -> [String: StoredRow]

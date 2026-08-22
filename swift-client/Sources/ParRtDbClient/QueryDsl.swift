@@ -274,6 +274,18 @@ public struct TableQuery: Sendable {
         }
     }
 
+    /// Field projection: keep only these user fields per result doc.
+    /// `_`-prefixed keys — the system fields (`_id`/`_creationTime`/
+    /// `_version`) plus synthetic result fields like `_searchSnippet` — are
+    /// always kept. An empty list is meaningful (the system-fields-only view);
+    /// not calling this is full docs. Composes with every terminal (doc-less
+    /// terminals — count/distinct/aggregate — ignore it). Each name must be a
+    /// table field or one of the three system fields; anything else is
+    /// BAD_REQUEST at execution.
+    public func fields(_ names: String...) -> TableQuery {
+        with { $0.fields = names }
+    }
+
     /// Validate terminal combinations (the server cascade's rules and messages,
     /// ported verbatim) and construct the wire `Query`.
     public func build() throws -> Query {
@@ -298,7 +310,8 @@ public struct TableQuery: Sendable {
             filter: acc.filter,
             search: acc.search,
             vectorSearch: wireVectorSearch(),
-            hybridSearch: wireHybridSearch()
+            hybridSearch: wireHybridSearch(),
+            fields: acc.fields
         )
     }
 
@@ -352,6 +365,7 @@ private struct Acc: Sendable {
     var search: SearchQuery?
     var vectorSearch: VectorSearchArgs?
     var hybridSearch: HybridSearchArgs?
+    var fields: [String]?
 }
 
 /// Accumulator-only spec structs: keep the numeric fields as Int so `build()`
