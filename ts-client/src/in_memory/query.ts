@@ -33,6 +33,7 @@ import {
   evalFilterExpr,
   type FieldMap,
   indexColumnType,
+  isPlainObject,
   type PgType,
   validateFilter,
 } from "./validate.js";
@@ -253,11 +254,117 @@ interface ScanPlan {
   lte: unknown;
 }
 
+/** The always-included system fields — listing one in a `fields` projection is
+ *  an accepted no-op (server `validate_projection`'s `SYSTEM_FIELDS`). */
+const PROJECTION_SYSTEM_FIELDS = new Set(["_id", "_creationTime", "_version"]);
+
+/** Validate a `fields` projection against the table: every name must be a
+ *  declared field or one of the system fields (`_id`/`_creationTime`/
+ *  `_version` — always included, so listing them is an allowed no-op). Anything
+ *  else — including typo'd system names and other `_`-prefixed names — is
+ *  `BAD_REQUEST` at compile time, the same gate the server runs in
+ *  `compile_query` (and `/explain`). `[]` (system fields only) validates
+ *  trivially. */
+function validateProjection(tableDef: TableJson, fields: string[]): void {
+  for (const name of fields) {
+    if (PROJECTION_SYSTEM_FIELDS.has(name) || name in tableDef.fields) continue;
+    throw new RtDbError("BAD_REQUEST", `unknown projection field '${name}'`);
+  }
+}
+
+/** Map `fn` over every doc of an executed result. The result shape is taken
+ *  from the query's terminal (mirroring the server's match over the
+ *  `QueryResult` enum), never sniffed from the value — a grouped aggregate's
+ *  `[{key,value}]` rows must not be mistaken for a docs array. Doc-less
+ *  terminals (`count`/`distinct`/`aggregate`) pass through unchanged, which is
+ *  what makes them unaffected by projection by construction. */
+function mapResultDocs(result: unknown, q: QueryJson, fn: (doc: unknown) => unknown): unknown {
+  if (q.paginate !== undefined) {
+    if (isPlainObject(result) && Array.isArray(result.docs)) {
+      return { ...result, docs: result.docs.map(fn) };
+    }
+    return result;
+  }
+  if (q.count || q.distinct || q.aggregate !== undefined) {
+    return result;
+  }
+  if (q.get !== undefined || q.unique || q.first) {
+    return fn(result);
+  }
+  // collect / search / vectorSearch / hybridSearch: an array of docs.
+  return Array.isArray(result) ? result.map(fn) : result;
+}
+
+/** Apply a `fields` projection to one doc: keep its `_`-prefixed keys (exactly
+ *  the system fields plus synthetics like `_searchSnippet` — user fields can
+ *  never be `_`-prefixed, `validateDoc` rejects them at write time) and the
+ *  listed user fields; drop every other user field. The rebuild is
+ *  delete-free, so key order is preserved and canonical output stays stable
+ *  across subscription re-runs. */
+function projectDoc(doc: unknown, fields: string[]): unknown {
+  if (!isPlainObject(doc)) {
+    return doc;
+  }
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(doc)) {
+    if (key.startsWith("_") || fields.includes(key)) {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+/** Apply a `Query.fields` projection to an executed result — a port of server
+ *  `project_result`. Sorting, cursors, and snippets were computed on the
+ *  unprojected rows inside the terminals, so cursors still work and
+ *  `_searchSnippet` survives. */
+function projectResult(result: unknown, fields: string[], q: QueryJson): unknown {
+  return mapResultDocs(result, q, (doc) => projectDoc(doc, fields));
+}
+
+/** Strip the volatile `_version` from every doc of an executed result — the
+ *  projected-subscription diff's pre-comparison step (a port of server
+ *  `diff_canonical`'s stripping half; the caller then canonicalizes).
+ *  `_version` bumps on every write, so an unstripped comparison would push on
+ *  any member write even when no projected field changed. Pushed payloads
+ *  still carry `_version`; only change detection ignores it. */
+export function stripVersionForDiff(result: unknown, q: QueryJson): unknown {
+  const stripDoc = (doc: unknown): unknown => {
+    if (!isPlainObject(doc)) {
+      return doc;
+    }
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(doc)) {
+      if (key !== "_version") {
+        out[key] = value;
+      }
+    }
+    return out;
+  };
+  return mapResultDocs(result, q, stripDoc);
+}
+
 /**
  * One-shot query — same shape as the http client's `query`. Thin dispatcher:
  * guards, standalone terminals, then the shared scan → per-terminal executors.
+ * Projection validation runs before every early return so all terminals
+ * (including `get`) reject unknown field names, and the projection itself is
+ * applied at this one seam — every doc-bearing terminal's rows flow back
+ * through here (mirrors server `execute_query`).
  */
 export function executeQuery(
+  q: QueryJson,
+  tableDef: TableJson,
+  rowsFor: (table: string) => Map<string, StoredRow>,
+): unknown {
+  if (q.fields !== undefined) {
+    validateProjection(tableDef, q.fields);
+  }
+  const result = executeUnprojected(q, tableDef, rowsFor);
+  return q.fields === undefined ? result : projectResult(result, q.fields, q);
+}
+
+function executeUnprojected(
   q: QueryJson,
   tableDef: TableJson,
   rowsFor: (table: string) => Map<string, StoredRow>,

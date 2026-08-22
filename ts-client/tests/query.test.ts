@@ -280,6 +280,43 @@ describe("TableQuery.filter", () => {
   });
 });
 
+describe("TableQuery.fields", () => {
+  it("builds a projection composable with index, order, and take", () => {
+    const q = api.items
+      .query()
+      .withIndex("by_project", ["p1"])
+      .fields("status", "order")
+      .order("asc")
+      .take(10);
+    expect(q.json).toEqual({
+      table: "items",
+      index: "by_project",
+      eq: ["p1"],
+      order: "asc",
+      take: 10,
+      fields: ["status", "order"],
+    });
+  });
+
+  it("omits fields on the wire when not set (absent, not undefined)", () => {
+    const q = api.items.query().withIndex("by_project", ["p1"]).collect();
+    expect("fields" in q.json).toBe(false);
+    expect(JSON.stringify(q.json)).not.toContain("fields");
+    expect(q.json).toEqual({ table: "items", index: "by_project", eq: ["p1"] });
+  });
+
+  it("preserves an empty list (the system-fields-only view is meaningful)", () => {
+    const q = api.items.query().fields().collect();
+    expect(q.json).toEqual({ table: "items", fields: [] });
+    expect(q.json.fields).toEqual([]);
+  });
+
+  it("passes listed system fields through (accepted no-ops)", () => {
+    const q = api.items.query().fields("_id", "_creationTime", "_version", "status").collect();
+    expect(q.json.fields).toEqual(["_id", "_creationTime", "_version", "status"]);
+  });
+});
+
 describe("TableQuery.search", () => {
   it("builds a search terminal and composes with take", () => {
     const q = api.items.query().search("search_content", "hello world").take(10);

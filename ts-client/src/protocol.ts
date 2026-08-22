@@ -24,6 +24,13 @@ export interface QueryJson {
   search?: SearchQuery;
   vectorSearch?: VectorQuery;
   hybridSearch?: HybridSearchQuery;
+  /** Projection: keep only these user fields per result doc. Every
+   * `_`-prefixed key (the system fields `_id`/`_creationTime`/`_version` plus
+   * synthetics like `_searchSnippet`) is always kept; `[]` is a meaningful
+   * system-fields-only (ids-only) view, not treated as absent. Omitted on the
+   * wire when unset (full docs) — mirrors server `Query.fields`
+   * (`skip_serializing_if = "Option::is_none"`). */
+  fields?: string[];
 }
 
 export interface Paginate {

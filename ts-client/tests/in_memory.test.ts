@@ -650,6 +650,141 @@ describe("InMemoryRtDbClient — subscribe", () => {
   });
 });
 
+describe("InMemoryRtDbClient — fields projection", () => {
+  it("collect keeps the listed user fields plus system fields, dropping the rest (key order preserved)", async () => {
+    const c = newClient();
+    await c.mutate(mutation().insert("items", { name: "b", status: "todo", order: 1 }).build());
+    await c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 3 }).build());
+    const docs = await c.query(
+      api.items.query().withIndex("by_status", ["todo"]).fields("name").order("asc").collect(),
+    );
+    expect(docs).toHaveLength(2);
+    for (const doc of docs) {
+      // `name` first (mergeDoc's user-fields-then-system order), then the
+      // always-kept system fields; status/order dropped.
+      expect(Object.keys(doc as object)).toEqual(["name", "_id", "_creationTime", "_version"]);
+    }
+    expect((docs as Array<{ name: string }>)[0].name).toBe("b"); // order: 1 < 3
+  });
+
+  it("fields() with no names is the system-fields-only (ids-only) view", async () => {
+    const c = newClient();
+    await c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
+    const docs = await c.query(
+      api.items.query().withIndex("by_status", ["todo"]).fields().collect(),
+    );
+    expect(docs).toHaveLength(1);
+    expect(Object.keys(docs[0] as object)).toEqual(["_id", "_creationTime", "_version"]);
+  });
+
+  it("projects page docs and still mints a next cursor (cursor built from the unprojected row)", async () => {
+    const c = newClient();
+    await c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
+    await c.mutate(mutation().insert("items", { name: "b", status: "todo", order: 2 }).build());
+    await c.mutate(mutation().insert("items", { name: "c", status: "todo", order: 3 }).build());
+    const page = await c.query(
+      api.items
+        .query()
+        .withIndex("by_status_and_order", ["todo"])
+        .fields("name")
+        .order("asc")
+        .paginate(undefined, 2),
+    );
+    const result = page as PaginatedResultJson;
+    expect(result.docs).toHaveLength(2);
+    for (const doc of result.docs) {
+      expect(Object.keys(doc as object)).toEqual(["name", "_id", "_creationTime", "_version"]);
+    }
+    expect(result.nextCursor).toBeDefined();
+    // The cursor still resumes: the second page returns the remaining doc.
+    const next = (await c.query(
+      api.items
+        .query()
+        .withIndex("by_status_and_order", ["todo"])
+        .fields("name")
+        .order("asc")
+        .paginate(result.nextCursor, 2),
+    )) as PaginatedResultJson;
+    expect((next.docs[0] as { name: string }).name).toBe("c");
+    expect(next.nextCursor).toBeUndefined();
+  });
+
+  it("projects a get point read", async () => {
+    const c = newClient();
+    const [res] = await c.mutate(
+      mutation().insert("items", { name: "a", status: "todo", order: 1 }).build(),
+    );
+    const id = (res as { id: string }).id;
+    const doc = await c.query({ json: { table: "items", get: id, fields: ["name"] } });
+    expect(Object.keys(doc as object)).toEqual(["name", "_id", "_creationTime", "_version"]);
+  });
+
+  it("doc-less terminals are unaffected (count still counts)", async () => {
+    const c = newClient();
+    await c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
+    await c.mutate(mutation().insert("items", { name: "b", status: "todo", order: 2 }).build());
+    const n = await c.query(
+      api.items.query().withIndex("by_status", ["todo"]).fields("name").count(),
+    );
+    expect(n).toBe(2);
+  });
+
+  it("rejects an unknown projection field with BAD_REQUEST", async () => {
+    const c = newClient();
+    await expect(
+      c.query(api.items.query().withIndex("by_status", ["todo"]).fields("name", "bogus").collect()),
+    ).rejects.toMatchObject({ name: "RtDbError", code: "BAD_REQUEST" });
+  });
+
+  it("accepts the system fields as projection no-ops", async () => {
+    const c = newClient();
+    await c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
+    const docs = await c.query(
+      api.items
+        .query()
+        .withIndex("by_status", ["todo"])
+        .fields("_id", "_creationTime", "_version")
+        .collect(),
+    );
+    expect(Object.keys(docs[0] as object)).toEqual(["_id", "_creationTime", "_version"]);
+  });
+
+  it("a projected subscription ignores _version: no re-emit on a non-projected write, re-emit on a projected one", async () => {
+    const c = newClient();
+    const [res] = await c.mutate(
+      mutation().insert("items", { name: "a", status: "todo", order: 1 }).build(),
+    );
+    const id = (res as { id: string }).id;
+    const updates: Array<Array<{ name: unknown; version: unknown }>> = [];
+    const unsub = c.subscribe(
+      api.items.query().withIndex("by_status", ["todo"]).fields("name").collect(),
+      (docs) => {
+        updates.push(
+          (docs as unknown as Array<Record<string, unknown>>).map((d) => ({
+            name: d.name,
+            version: d._version,
+          })),
+        );
+      },
+    );
+
+    expect(updates).toHaveLength(1); // initial value
+    expect(updates[0]).toEqual([{ name: "a", version: 1 }]);
+
+    // Patch a NON-projected field: _version bumps, but the projected view is
+    // unchanged — the diff strips _version, so nothing is pushed.
+    await c.mutate(mutation().patch("items", id, { order: 2 }).build());
+    expect(updates).toHaveLength(1);
+
+    // Patch the projected field: pushed, and the payload still carries _version.
+    await c.mutate(mutation().patch("items", id, { name: "z" }).build());
+    expect(updates).toHaveLength(2);
+    expect(updates[1]).toEqual([{ name: "z", version: 3 }]);
+
+    unsub();
+  });
+});
+
 describe("InMemoryRtDbClient — presence", () => {
   it("two clients sharing PresenceRooms see each other's cursor updates and leaves", () => {
     const rooms = new PresenceRooms();

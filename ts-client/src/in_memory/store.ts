@@ -65,7 +65,7 @@ import {
   validateOnDelete,
   validateSchema,
 } from "./migrate.js";
-import { executeQuery, requireIndex } from "./query.js";
+import { executeQuery, requireIndex, stripVersionForDiff } from "./query.js";
 import {
   clone,
   coerceIndexValue,
@@ -550,6 +550,19 @@ function canonical(value: unknown): string {
     }
     return v;
   });
+}
+
+/** The canonical a subscription diffs against for push decisions (a port of
+ *  server `diff_canonical`). For an UNPROJECTED query this is the plain
+ *  `canonical` — byte-identical push semantics to pre-projection behavior. For
+ *  a PROJECTED query (`fields` set) the volatile `_version` is stripped from
+ *  every doc before comparing: `_version` bumps on every write, so an
+ *  unstripped canonical would push on any member write even when no projected
+ *  field changed — defeating the payload-width point of a projected
+ *  subscription. Pushed payloads still carry `_version`; only the
+ *  change-detection comparison ignores it. */
+function diffCanonical(value: unknown, q: QueryJson): string {
+  return canonical(q.fields === undefined ? value : stripVersionForDiff(value, q));
 }
 
 /** Recursive value validator — a port of server `schema::validate_value`. */
@@ -2167,7 +2180,7 @@ export class InMemoryRtDbClient {
         continue;
       }
       const next = this.executeQuery(sub.query);
-      if (sub.hasValue && canonical(next) === canonical(sub.last)) {
+      if (sub.hasValue && diffCanonical(next, sub.query) === diffCanonical(sub.last, sub.query)) {
         continue;
       }
       sub.last = next;

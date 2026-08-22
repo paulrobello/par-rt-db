@@ -89,6 +89,13 @@ export function projectOptimisticUpdate(
   txn: TransactionJson,
   now: () => number = Date.now,
 ): OptimisticProjection {
+  // A projected query (`fields` set) caches docs that carry only the projected
+  // fields, while txn steps carry full docs/fields — an overlay computed from
+  // the two would surface fields the authoritative (projected) result drops.
+  // Decline, per the file rule: a wrong overlay is worse than a brief wait.
+  if (query.fields !== undefined) {
+    return SKIP;
+  }
   if (query.get !== undefined) {
     return projectGet(query, last, txn);
   }

@@ -27,6 +27,7 @@ import type {
   ClientMessage,
   MigrateRequestJson,
   MigrateResultJson,
+  QueryJson,
   ScheduleInfo,
   ScheduleWhen,
   SearchQuery,
@@ -215,6 +216,30 @@ describe("wire-corpus: search query entries (FM-31 operators/snippet)", () => {
     const snippet = searchEntries.find((e) => e.search.snippet === true);
     expect(snippet?.search.query).toBe("hello world");
     expect(snippet?.search.mode).toBeUndefined();
+  });
+});
+
+/**
+ * Projection pin: the corpus `queries` section gained a `fields` entry
+ * (Query.fields). The generic loop above round-trips it raw; this block
+ * additionally type-checks it against `QueryJson` and asserts it is present
+ * with its projection intact — including a listed system field (`_id`), an
+ * accepted no-op. A corpus or protocol drift on the projection surface fails
+ * here, not just silently round-tripping.
+ */
+describe("wire-corpus: projection query entry (Query.fields)", () => {
+  const corpus = loadCorpus();
+  const projected = corpus.queries.filter(
+    (q): q is QueryJson & { fields: string[] } =>
+      typeof q === "object" && q !== null && "fields" in q,
+  );
+  it("carries the fields entry with title/status/_id intact", () => {
+    expect(projected).toHaveLength(1);
+    const _typeCheck: QueryJson = projected[0];
+    void _typeCheck;
+    expect(projected[0].index).toBe("by_status");
+    expect(projected[0].take).toBe(10);
+    expect(projected[0].fields).toEqual(["title", "status", "_id"]);
   });
 });
 

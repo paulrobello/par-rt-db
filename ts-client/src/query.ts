@@ -53,6 +53,19 @@ export class TableQuery<DocT, Indexes extends string> {
     return new TableQuery({ ...this.json, filter: expr });
   }
 
+  /** Field projection: each result doc keeps only the listed user fields plus
+   * every `_`-prefixed key (the system fields `_id`/`_creationTime`/`_version`
+   * and synthetics like `_searchSnippet` — always present; listing one is an
+   * accepted no-op). Calling with no arguments (`fields()`) is the meaningful
+   * system-fields-only (ids-only) view. Composes with every doc-bearing
+   * terminal (get/collect/first/unique/paginate and the search family);
+   * doc-less terminals (count/distinct/aggregate) are unaffected. Not a
+   * terminal. Unknown names are rejected `BAD_REQUEST` by the server (and the
+   * in-memory harness) at compile time. */
+  fields(...names: string[]): TableQuery<DocT, Indexes> {
+    return new TableQuery({ ...this.json, fields: names });
+  }
+
   /** Full-text `search` over a declared search index. Composes only with `take`
    * (e.g. `.search("idx", "text").take(10)`); the server rejects every other
    * terminal alongside it. The optional `filter` narrows results server-side via
