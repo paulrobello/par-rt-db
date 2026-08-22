@@ -18,12 +18,14 @@ import type {
   DirectiveJson,
   DirectiveReportJson,
   FieldTypeJson,
+  FilterExpr,
   OnDeleteAction,
   SchemaJson,
   TableJson,
+  ValueExprJson,
 } from "../protocol.js";
 import type { StoredRow } from "./store.js";
-import { clone, indexColumnType, isInt64String } from "./validate.js";
+import { clone, indexColumnType, isInt64String, walkValueExprFields } from "./validate.js";
 
 /** Returns the values a finite literal-union (or lone literal) accepts, mirroring
  *  server `schema::literal_set`: a lone `literal` yields its single value, and a
@@ -470,6 +472,87 @@ function coerceValue(cast: Cast, v: unknown): unknown {
   }
 }
 
+/** Rewrite every `field` reference in `expr` that equals `from` to `to`, in
+ *  place — the mutating mirror of `walkValueExprFields` (server
+ *  `migrate::rename_value_expr_fields`). `case.whens` predicates reuse
+ *  {@link renameFilterFields} (the same rewrite `authorize` gets on the
+ *  server), so a rename carries computed expressions across intact. `to` is
+ *  fresh (renameField rejects an existing target), so no reference set can
+ *  collide. */
+function renameValueExprFields(expr: ValueExprJson, from: string, to: string): void {
+  switch (expr.op) {
+    case "field":
+      if (expr.field === from) expr.field = to;
+      return;
+    case "literal":
+    case "now":
+      return;
+    case "concat":
+    case "coalesce":
+      for (const part of expr.parts) {
+        renameValueExprFields(part, from, to);
+      }
+      return;
+    case "add":
+    case "sub":
+    case "mul":
+    case "div":
+      renameValueExprFields(expr.left, from, to);
+      renameValueExprFields(expr.right, from, to);
+      return;
+    case "lower":
+    case "upper":
+    case "trim":
+    case "cast":
+      renameValueExprFields(expr.value, from, to);
+      return;
+    case "case":
+      for (const cw of expr.whens) {
+        renameFilterFields(cw.when, from, to);
+        renameValueExprFields(cw.then, from, to);
+      }
+      renameValueExprFields(expr.otherwise, from, to);
+      return;
+  }
+}
+
+/** Rewrite every `field` reference in a `case.when` predicate — a port of
+ *  server `migrate::rename_filter_fields`. Recurses through `and`/`or`/`not`. */
+function renameFilterFields(expr: FilterExpr, from: string, to: string): void {
+  switch (expr.op) {
+    case "eq":
+    case "neq":
+    case "gt":
+    case "gte":
+    case "lt":
+    case "lte":
+    case "in":
+    case "contains":
+    case "exists":
+      if (expr.field === from) expr.field = to;
+      return;
+    case "and":
+    case "or":
+      for (const e of expr.exprs) {
+        renameFilterFields(e, from, to);
+      }
+      return;
+    case "not":
+      renameFilterFields(expr.expr, from, to);
+      return;
+  }
+}
+
+/** True if any `field` reference in `expr` (including `case.when` filter
+ *  fields) equals `field` — the dropField reference check. */
+function valueExprReferencesField(expr: ValueExprJson, field: string): boolean {
+  let referenced = false;
+  walkValueExprFields(expr, (f) => {
+    if (f === field) referenced = true;
+  });
+  return referenced;
+}
+
 /** Doc-store handle the directive functions operate through: the live
  *  `tables` map (renames/drops re-key it) plus the lazy per-table row
  *  accessor from the client core. */
@@ -547,6 +630,23 @@ function applyRenameFieldDirective(
   }
   if (t.ownerField === d.from) t.ownerField = d.to;
   if (t.collaboratorsField === d.from) t.collaboratorsField = d.to;
+  // ENH-028: the computed map follows the rename the way owner/collaborators
+  // do — an entry KEYED on the renamed field moves to the new name (leaving
+  // it keyed on `from` would fail push validation's declared-field rule on
+  // the derived schema), and every expression's `field` references (including
+  // `case.whens` predicates) are rewritten to read the renamed doc key.
+  // Input values are unchanged by the rename, so stored computed values stay
+  // correct; the next write re-stamps.
+  if (t.computed !== undefined) {
+    const keyed = t.computed[d.from];
+    if (keyed !== undefined) {
+      delete t.computed[d.from];
+      t.computed[d.to] = keyed;
+    }
+    for (const expr of Object.values(t.computed)) {
+      renameValueExprFields(expr, d.from, d.to);
+    }
+  }
   let affected = 0;
   for (const row of store.rowsFor(d.table).values()) {
     if (d.from in row.doc) {
@@ -634,6 +734,20 @@ function applyDropFieldDirective(
   if (!(d.field in t.fields)) {
     throw new RtDbError("BAD_REQUEST", `dropped field '${d.table}.${d.field}' does not exist`);
   }
+  // ENH-028: a computed expression reading the dropped field would dangle —
+  // every future write fails its stamp. Reject, naming the computed field, so
+  // the caller amends the computed map first (a push removing the entry
+  // leaves stored values in place).
+  if (t.computed !== undefined) {
+    for (const [computedField, expr] of Object.entries(t.computed)) {
+      if (valueExprReferencesField(expr, d.field)) {
+        throw new RtDbError(
+          "BAD_REQUEST",
+          `cannot drop field '${d.table}.${d.field}': it is referenced by computed field '${d.table}.${computedField}'; drop the computed field first`,
+        );
+      }
+    }
+  }
   delete t.fields[d.field];
   for (const ix of t.indexes ?? []) {
     ix.fields = ix.fields.filter((f) => f !== d.field);
@@ -644,6 +758,17 @@ function applyDropFieldDirective(
   // assigning literal `undefined` to them. `delete` removes the key.
   if (t.ownerField === d.field) delete t.ownerField;
   if (t.collaboratorsField === d.field) delete t.collaboratorsField;
+  // An entry KEYED on the dropped field goes with it: the applier removes the
+  // stored key from every doc, so leaving the entry would fail push
+  // validation's declared-field rule on the derived schema. An emptied map
+  // drops the key entirely — the server's BTreeMap skips serialization when
+  // empty, so the derived schema stays wire-identical.
+  if (t.computed !== undefined) {
+    delete t.computed[d.field];
+    if (Object.keys(t.computed).length === 0) {
+      delete t.computed;
+    }
+  }
   const rows = store.rowsFor(d.table);
   let affected = 0;
   for (const row of rows.values()) {

@@ -30,7 +30,13 @@ import { describe, expect, it } from "vitest";
 
 import { RtDbError } from "../src/errors.js";
 import { InMemoryRtDbClient } from "../src/in_memory/index.js";
-import type { Paginate, QueryJson, SchemaJson, TransactionJson } from "../src/protocol.js";
+import type {
+  MigrateRequestJson,
+  Paginate,
+  QueryJson,
+  SchemaJson,
+  TransactionJson,
+} from "../src/protocol.js";
 
 /** System fields minted at run time and projected out of both sides unless a
  * case's `normalize` list replaces the default (README "Semantics corpus
@@ -50,9 +56,14 @@ interface SemanticsCase {
   name: string;
   $comment?: string;
   schema: SchemaJson;
-  seed: unknown[];
-  op: { query?: QueryJson; txn?: TransactionJson };
-  expect: unknown;
+  /** Present only on non-`pushError` cases (a `pushError` case's push IS the
+   * whole case — no seed/op/then/expect). */
+  seed?: unknown[];
+  op: { query?: QueryJson; txn?: TransactionJson; migrate?: MigrateRequestJson };
+  expect?: unknown;
+  /** Asserts the schema PUSH fails with this error code (code only, never the
+   * message). A `pushError` case carries no seed/op/then/expect. */
+  pushError?: { code: string };
   unordered?: boolean;
   normalize?: string[];
   expect_next_cursor?: boolean;
@@ -249,11 +260,13 @@ function assertErrorCode(err: unknown, wantCode: string, caseName: string): void
 
 /** Compare an op/then success result against its `expect` block: apply the
  * `normalize` projection to both trees, structurally assert `nextCursor`
- * presence when the block pins it (paginate), then ordered/unordered compare. */
+ * presence when the block pins it (paginate), then ordered/unordered compare.
+ * `expect` is optional only because `SemanticsCase` widens it for `pushError`
+ * cases — which return before any assertResult call. */
 function assertResult(
   caseName: string,
   actual: unknown,
-  block: { expect: unknown; expect_next_cursor?: boolean },
+  block: { expect?: unknown; expect_next_cursor?: boolean },
   keys: string[],
   unordered: boolean,
 ): void {
@@ -279,6 +292,28 @@ async function runCase(caseName: string, caseData: SemanticsCase): Promise<void>
   // `_creationTime` are stable. No time is advanced between seed and op.
   let ms = 1_700_000_000_000;
   const client = new InMemoryRtDbClient({ now: () => ms++, random: () => 0 });
+
+  // A `pushError` case asserts the schema PUSH itself fails (the value
+  // carries the same `{code}` object `expect.error` does; only the code is
+  // asserted, never the message). Push is the whole case — a stray
+  // seed/op/then/expect is an authoring error.
+  if (caseData.pushError !== undefined) {
+    for (const stray of ["seed", "op", "then", "expect"] as const) {
+      if (caseData[stray] !== undefined) {
+        throw new Error(
+          `${caseName}: a pushError case must not carry '${stray}' — push is the whole case`,
+        );
+      }
+    }
+    try {
+      client.pushSchema(caseData.schema);
+    } catch (err) {
+      assertErrorCode(err, caseData.pushError.code, caseName);
+      return;
+    }
+    throw new Error(`${caseName}: pushError case — the push must fail`);
+  }
+
   client.pushSchema(caseData.schema);
 
   const tableNames = Object.keys(caseData.schema.tables);
@@ -287,7 +322,7 @@ async function runCase(caseName: string, caseData: SemanticsCase): Promise<void>
   // Seed in array order through the normal insert path (mutate), recording
   // `label -> minted id` for `$id`-labeled entries.
   const ids = new Map<string, string>();
-  for (const [i, entry] of caseData.seed.entries()) {
+  for (const [i, entry] of (caseData.seed ?? []).entries()) {
     const { table, doc, label } = parseSeedEntry(entry, singleTable, caseName);
     const results = await client.mutate({ steps: [{ op: "insert", table, doc }] });
     if (label !== undefined) {
@@ -345,8 +380,26 @@ async function runCase(caseName: string, caseData: SemanticsCase): Promise<void>
       assertErrorCode(err, expectErr, caseName);
       return; // a failed op has no `then` follow-up
     }
+  } else if (caseData.op.migrate !== undefined) {
+    // An `op.migrate` case runs the admin MigrateRequest through the engine's
+    // migrate — the in-process shape of the server runner's `run_migrate`
+    // (plan + apply): effects persist so a follow-up `then` reads them, and
+    // `dryRun` rolls them back. The result compares as the MigrateResult wire
+    // shape ({applied, schema, directives}) under the same normalize rules.
+    const req = substitute(caseData.op.migrate, ids, caseName) as MigrateRequestJson;
+    try {
+      opResult = client.migrate(req);
+    } catch (err) {
+      if (expectErr === undefined) {
+        throw new Error(
+          `${caseName}: unexpected migrate error: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      assertErrorCode(err, expectErr, caseName);
+      return; // a failed op has no `then` follow-up
+    }
   } else {
-    throw new Error(`${caseName}: op must carry \`query\` or \`txn\``);
+    throw new Error(`${caseName}: op must carry \`query\`, \`txn\`, or \`migrate\``);
   }
 
   if (expectErr !== undefined) {

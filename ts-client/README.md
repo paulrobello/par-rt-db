@@ -60,6 +60,45 @@ mutate, and subscription re-run; machine tokens bypass):
   stored one. Must be `int64` exactly and differ from `ttl.field` and
   `updatedAtField`; legal in a unique index (the ticket-number guarantee).
   Gaps are possible on rolled-back transactions.
+- `.computed(name, expr)` — declares a server-computed field (ENH-028): the
+  server re-evaluates `expr` on every write (insert, patch, replace, upsert
+  both branches, patchByQuery, cascade setNull) and stores the result,
+  overwriting any client-supplied value. A null result REMOVES the key, so an
+  optional computed field is absent when its expression yields null. Build
+  `expr` with the `ve` helper namespace (below); the value lands in a typed
+  column, so a computed field is indexable and orderable like any other.
+  Push-time-validated: the key must be a declared, non-stamped field
+  (not `ownerField`/`collaboratorsField`/`autoIncrementField`), referenced
+  fields must be declared and non-computed, and a statically-known result
+  kind must fit the field's type (wrap arithmetic in `ve.cast(..., "toString")`
+  to store into an `int64` field).
+
+The `ve` namespace builds the expression grammar for `.computed(...)`
+(and migrate's typed `evalExpr`): `ve.field(name)` reads a declared field as
+text (numbers become `"42"`-style strings), `ve.literal(v)` is any JSON
+literal, `ve.concat(...parts)` skips null parts, `ve.add/sub/mul/div` do
+IEEE-double arithmetic with null propagation, `ve.coalesce(...parts)`,
+`ve.lower/upper/trim(value)` (trim strips spaces only), `ve.cast(value, to)`
+with `to` one of `"toString" | "toNumber" | "toInt64" | "toBoolean"`,
+`ve.now()` (epoch-ms), and `ve.case(whens, otherwise)` where each `when` is
+the same `FilterExpr` DSL `.filter()` queries use.
+
+```ts
+import { defineSchema, defineTable, t, ve } from "@par-rt-db/client";
+
+export const schema = defineSchema({
+  users: defineTable({
+    first: t.string(),
+    last: t.string(),
+    handle: t.string(),
+    fullName: t.string(), // computed — never written by the client
+    slug: t.string(), // computed — never written by the client
+  })
+    .index("by_fullName", ["fullName"]) // the computed column is indexable
+    .computed("fullName", ve.concat(ve.field("first"), ve.literal(" "), ve.field("last")))
+    .computed("slug", ve.lower(ve.trim(ve.field("handle")))),
+});
+```
 
 Push it with the admin client (admin key required):
 

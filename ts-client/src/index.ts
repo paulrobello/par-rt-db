@@ -136,4 +136,4 @@ export type {
   Validator,
   WithoutSystemFields,
 } from "./schema.js";
-export { defineSchema, defineTable, SchemaDefinition, TableDefinition, t } from "./schema.js";
+export { defineSchema, defineTable, SchemaDefinition, TableDefinition, t, ve } from "./schema.js";

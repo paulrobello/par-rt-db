@@ -2,7 +2,7 @@
  * Value/filter validation for the in-memory harness — the leaf module of the
  * `in_memory/` decomposition (mirrors `rust-client/src/in_memory/validate.rs`).
  *
- * Three concerns live here:
+ * Four concerns live here:
  * - structural validation + evaluation of the query DSL's `FilterExpr`
  *   (mirroring server `query::compile_filter_node` / `field_lhs_and_bind` /
  *   `jsonb_lhs_and_bind`, including the SEC-126 value-kind checks);
@@ -11,11 +11,21 @@
  *   engine's eq/range binds and the filter validator's indexed path;
  * - the pure JSON value predicates (`isHexId`, `isInt64String`, `clone`, …)
  *   shared by the store (`validateValue`), the query engine
- *   (`coerceIndexValue`), and the migration engine (`coerceValue`).
+ *   (`coerceIndexValue`), and the migration engine (`coerceValue`);
+ * - the `ValueExpr` interpreter (`evalValueExpr`) and its field walkers —
+ *   mirrors of server `value_expr.rs` (`eval_value_expr` /
+ *   `walk_value_expr_fields`), shared by the store's computed-field stamping
+ *   and push validation and the migration engine's rename/drop handling.
  */
 
 import { RtDbError } from "../errors.js";
-import type { FieldTypeJson, FilterExpr, TableJson } from "../protocol.js";
+import type {
+  CaseWhenJson,
+  FieldTypeJson,
+  FilterExpr,
+  TableJson,
+  ValueExprJson,
+} from "../protocol.js";
 
 /** Deep clone of a JSON doc (docs are pure JSON — safe to round-trip). */
 export function clone<T>(value: T): T {
@@ -379,4 +389,305 @@ function compareValues(
     case "lte":
       return lhs <= rhs;
   }
+}
+
+// ---- ValueExpr interpreter (ENH-028) -----------------------------------------
+//
+// Mirrors server `value_expr.rs::eval_value_expr` — the per-write counterpart
+// of the SQL compiler. Semantics are pinned by the computed-fields plan's
+// "ValueExpr interpreter semantics" table: field reads are text extraction
+// (the `doc->>'field'` convention), arithmetic is IEEE doubles with SQL-NULL
+// propagation, a non-finite result is an error, trim strips spaces only, and
+// `Case` predicates reuse this module's `evalFilterExpr` (principal markers
+// are push-rejected inside computed exprs, so no principal context is needed).
+
+/** JSON value → text, mirroring server `value_expr::to_text` (the SQL
+ * `doc->>'field'` extraction the compile path emits): `null` (or an absent
+ * key, which arrives as `undefined`) maps to SQL NULL; numbers use their JSON
+ * number text form; objects/arrays use COMPACT JSON text (`{"a":1}` — the
+ * convention all five implementations pin, deliberately not Postgres's spaced
+ * jsonb text). Returns `null` for SQL NULL, never a JSON `"null"` string. */
+function toText(v: unknown): string | null {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "string") return v;
+  if (typeof v === "number") return String(v);
+  if (typeof v === "boolean") return v ? "true" : "false";
+  return JSON.stringify(v);
+}
+
+/** Strict decimal grammar for {@link toNumeric}'s string parse — JS `Number()`
+ * accepts forms Rust's `f64::from_str` rejects (`"0x10"`, `""` → 0), so the
+ * grammar is checked first and the empty string (post-trim) is an error on
+ * both sides. */
+function parseNumericString(s: string): number {
+  const t = s.trim();
+  if (!/^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/.test(t)) {
+    throw new RtDbError("BAD_REQUEST", `cannot cast '${s}' to number`);
+  }
+  const n = Number(t);
+  if (!Number.isFinite(n)) {
+    throw new RtDbError("BAD_REQUEST", `cannot cast '${s}' to number`);
+  }
+  return n;
+}
+
+/** JSON value → number for the arithmetic nodes, mirroring server
+ * `value_expr::to_numeric`: `null` (or an absent key) is SQL NULL —
+ * propagation, not an error; numbers yield their value; strings are trimmed
+ * and strictly parsed; bool/object/array are type errors. */
+function toNumeric(v: unknown): number | null {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "number") return v;
+  if (typeof v === "string") return parseNumericString(v);
+  throw new RtDbError("BAD_REQUEST", "cannot cast to number");
+}
+
+/** IEEE double → JSON number, mirroring server `finite_number`: a non-finite
+ * result (NaN, ±inf — overflow-shaped arithmetic) is an error rather than a
+ * stored value. */
+function finiteNumber(x: number): number {
+  if (!Number.isFinite(x)) {
+    throw new RtDbError("BAD_REQUEST", "numeric result is not finite");
+  }
+  return x;
+}
+
+/** `cast: "toInt64"` — a number must be an in-range integer (a float payload
+ * like `3.5` is not), a string is trimmed and strictly parsed. The result is a
+ * JSON NUMBER; the int64 decimal-string wire convention applies only to stored
+ * int64 fields (the plan's "Int64 note"). */
+function castToInt64(v: unknown): unknown {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "number") {
+    // Range-checked through BigInt — the i64 bounds are not JS-number-exact.
+    if (!Number.isInteger(v)) {
+      throw new RtDbError("BAD_REQUEST", `cannot cast ${v} to int64`);
+    }
+    const bi = BigInt(v);
+    if (bi < -(2n ** 63n) || bi > 2n ** 63n - 1n) {
+      throw new RtDbError("BAD_REQUEST", `cannot cast ${v} to int64`);
+    }
+    return v;
+  }
+  if (typeof v === "string") {
+    if (!/^[+-]?\d+$/.test(v.trim())) {
+      throw new RtDbError("BAD_REQUEST", `cannot cast '${v}' to int64`);
+    }
+    const n = BigInt(v.trim());
+    if (n < -(2n ** 63n) || n > 2n ** 63n - 1n) {
+      throw new RtDbError("BAD_REQUEST", `cannot cast '${v}' to int64`);
+    }
+    return Number(n);
+  }
+  throw new RtDbError("BAD_REQUEST", "cannot cast to int64");
+}
+
+const BOOLEAN_TRUE_WORDS = ["true", "t", "yes", "on", "1"];
+const BOOLEAN_FALSE_WORDS = ["false", "f", "no", "off", "0"];
+
+/** `cast: "toBoolean"` — bools pass through; numbers accept exactly `1`/`0`
+ * (numeric equality, so `1.0`/`0.0` agree); strings match case-insensitively
+ * against Postgres's boolean literal set. Mirrors server `cast_to_boolean`. */
+function castToBoolean(v: unknown): unknown {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "boolean") return v;
+  if (typeof v === "number") {
+    if (v === 1) return true;
+    if (v === 0) return false;
+    throw new RtDbError("BAD_REQUEST", `cannot cast ${v} to boolean`);
+  }
+  if (typeof v === "string") {
+    const lower = v.toLowerCase();
+    if (BOOLEAN_TRUE_WORDS.includes(lower)) return true;
+    if (BOOLEAN_FALSE_WORDS.includes(lower)) return false;
+    throw new RtDbError("BAD_REQUEST", `cannot cast '${v}' to boolean`);
+  }
+  throw new RtDbError("BAD_REQUEST", "cannot cast to boolean");
+}
+
+/** Evaluates a {@link ValueExprJson} against a doc — a port of server
+ * `value_expr::eval_value_expr`. `fields` is the table's declared field map,
+ * used only by `Case` predicates (this module's `evalFilterExpr`); markers are
+ * push-rejected inside computed exprs, so no principal context exists here.
+ * Throws `BAD_REQUEST` on an evaluation error (cast failure, division by
+ * zero, non-finite arithmetic); the caller names the computed field. */
+export function evalValueExpr(
+  expr: ValueExprJson,
+  doc: Record<string, unknown>,
+  nowMs: number,
+  fields: FieldMap = {},
+): unknown {
+  switch (expr.op) {
+    case "field": {
+      const text = toText(doc[expr.field]);
+      return text === null ? null : text;
+    }
+    case "literal":
+      return expr.value ?? null;
+    case "concat": {
+      let out = "";
+      for (const part of expr.parts) {
+        // toText is null exactly for null parts — concat skips them rather
+        // than nulling the result; all-null parts yield "".
+        const text = toText(evalValueExpr(part, doc, nowMs, fields));
+        if (text !== null) {
+          out += text;
+        }
+      }
+      return out;
+    }
+    case "add":
+    case "sub":
+    case "mul":
+    case "div": {
+      const l = toNumeric(evalValueExpr(expr.left, doc, nowMs, fields));
+      const r = toNumeric(evalValueExpr(expr.right, doc, nowMs, fields));
+      if (l === null || r === null) {
+        // Either operand SQL-NULL → NULL; propagation precedes the zero-divisor
+        // and finiteness checks (null / 0 is null, not an error).
+        return null;
+      }
+      if (expr.op === "div" && r === 0) {
+        // True for -0 too (IEEE equality), so both zero spellings error.
+        throw new RtDbError("BAD_REQUEST", "division by zero");
+      }
+      const x =
+        expr.op === "add" ? l + r : expr.op === "sub" ? l - r : expr.op === "mul" ? l * r : l / r;
+      return finiteNumber(x);
+    }
+    case "coalesce": {
+      for (const part of expr.parts) {
+        const v = evalValueExpr(part, doc, nowMs, fields);
+        if (v !== null && v !== undefined) {
+          return v;
+        }
+      }
+      return null;
+    }
+    case "lower":
+    case "upper":
+    case "trim": {
+      const text = toText(evalValueExpr(expr.value, doc, nowMs, fields));
+      if (text === null) {
+        return null;
+      }
+      if (expr.op === "lower") return text.toLowerCase();
+      if (expr.op === "upper") return text.toUpperCase();
+      // Spaces only — Postgres btrim's default, not Unicode whitespace: a
+      // leading tab survives.
+      return text.replace(/^ +/, "").replace(/ +$/, "");
+    }
+    case "cast": {
+      const v = evalValueExpr(expr.value, doc, nowMs, fields);
+      switch (expr.to) {
+        case "toString": {
+          const text = toText(v);
+          return text === null ? null : text;
+        }
+        case "toNumber": {
+          const n = toNumeric(v);
+          return n === null ? null : finiteNumber(n);
+        }
+        case "toInt64":
+          return castToInt64(v);
+        case "toBoolean":
+          return castToBoolean(v);
+      }
+      throw new RtDbError("BAD_REQUEST", `unknown cast '${String(expr.to)}'`);
+    }
+    case "now":
+      return nowMs;
+    case "case": {
+      for (const cw of expr.whens) {
+        if (evalFilterExpr(cw.when, doc, fields)) {
+          return evalValueExpr(cw.then, doc, nowMs, fields);
+        }
+      }
+      return evalValueExpr(expr.otherwise, doc, nowMs, fields);
+    }
+  }
+  throw new RtDbError(
+    "BAD_REQUEST",
+    `unknown value expr op '${String((expr as { op: string }).op)}'`,
+  );
+}
+
+/** Visits every field name a {@link ValueExprJson} reads: each `field` node,
+ * every `case` branch's `then`/`otherwise`, and every `FilterExpr` field
+ * inside `case.whens` — a port of server `walk_value_expr_fields`, used by
+ * computed-field push validation and the migrate rename/drop handling. */
+export function walkValueExprFields(expr: ValueExprJson, visit: (field: string) => void): void {
+  switch (expr.op) {
+    case "field":
+      visit(expr.field);
+      return;
+    case "literal":
+    case "now":
+      return;
+    case "concat":
+    case "coalesce":
+      for (const part of expr.parts) {
+        walkValueExprFields(part, visit);
+      }
+      return;
+    case "add":
+    case "sub":
+    case "mul":
+    case "div":
+      walkValueExprFields(expr.left, visit);
+      walkValueExprFields(expr.right, visit);
+      return;
+    case "lower":
+    case "upper":
+    case "trim":
+    case "cast":
+      walkValueExprFields(expr.value, visit);
+      return;
+    case "case":
+      for (const cw of expr.whens as CaseWhenJson[]) {
+        walkFilterExprFields(cw.when, visit);
+        walkValueExprFields(cw.then, visit);
+      }
+      walkValueExprFields(expr.otherwise, visit);
+      return;
+  }
+  // The rust walkers are exhaustive matches; the JSON shape is not a closed
+  // enum at runtime, so an unknown op must throw here — silently visiting
+  // nothing would let push validation accept it.
+  throw new RtDbError(
+    "BAD_REQUEST",
+    `unknown value expr op '${String((expr as { op: string }).op)}'`,
+  );
+}
+
+/** The `FilterExpr` half of the walk: `and`/`or`/`not` recurse; every leaf
+ * variant carries a `field`. A port of server
+ * `value_expr::walk_filter_expr_fields`. */
+export function walkFilterExprFields(expr: FilterExpr, visit: (field: string) => void): void {
+  switch (expr.op) {
+    case "eq":
+    case "neq":
+    case "gt":
+    case "gte":
+    case "lt":
+    case "lte":
+    case "in":
+    case "contains":
+    case "exists":
+      visit(expr.field);
+      return;
+    case "and":
+    case "or":
+      for (const e of expr.exprs) {
+        walkFilterExprFields(e, visit);
+      }
+      return;
+    case "not":
+      walkFilterExprFields(expr.expr, visit);
+      return;
+  }
+  throw new RtDbError(
+    "BAD_REQUEST",
+    `unknown filter expr op '${String((expr as { op: string }).op)}'`,
+  );
 }

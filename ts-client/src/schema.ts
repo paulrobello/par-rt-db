@@ -1,4 +1,6 @@
 import type {
+  CaseWhenJson,
+  Cast,
   DistanceMetric,
   FieldTypeJson,
   FilterExpr,
@@ -7,6 +9,7 @@ import type {
   SchemaJson,
   TableJson,
   TtlDef,
+  ValueExprJson,
 } from "./protocol.js";
 
 /** Branded id string. `Id<"projects">` is assignable to `string` but distinct across tables. */
@@ -65,6 +68,49 @@ function fieldsToJson(
   return out;
 }
 
+/** Builders for the `ValueExpr` grammar (ENH-028) — the expression language a
+ * `.computed(name, expr)` field is derived from (and, in its raw
+ * {@link ValueExprJson} form, what migrate's typed `evalExpr` accepts). One
+ * helper per wire variant, producing the wire shape directly; `ve.field`
+ * reads are text extraction (numbers become `"42"`-style strings, mirroring
+ * the server's `doc->>'field'`), arithmetic coerces its operands back to
+ * numbers, and `concat` skips null parts. */
+export const ve = {
+  /** A declared field on the same table, read as text (`doc->>'field'`). */
+  field: (name: string): ValueExprJson => ({ op: "field", field: name }),
+  /** Any JSON literal (string/number/boolean/object/array/null). */
+  literal: (value: unknown): ValueExprJson => ({ op: "literal", value }),
+  /** String concatenation; null parts are skipped (all-null → `""`). */
+  concat: (...parts: ValueExprJson[]): ValueExprJson => ({ op: "concat", parts }),
+  add: (left: ValueExprJson, right: ValueExprJson): ValueExprJson => ({ op: "add", left, right }),
+  sub: (left: ValueExprJson, right: ValueExprJson): ValueExprJson => ({ op: "sub", left, right }),
+  mul: (left: ValueExprJson, right: ValueExprJson): ValueExprJson => ({ op: "mul", left, right }),
+  /** Division; a zero divisor fails the write at evaluation time — guard the
+   * divisor with `ve.case`/`ve.coalesce` when it may be zero. */
+  div: (left: ValueExprJson, right: ValueExprJson): ValueExprJson => ({ op: "div", left, right }),
+  /** First non-null part, else null. */
+  coalesce: (...parts: ValueExprJson[]): ValueExprJson => ({ op: "coalesce", parts }),
+  /** ASCII lowercasing of the operand's text form; null stays null. */
+  lower: (value: ValueExprJson): ValueExprJson => ({ op: "lower", value }),
+  /** ASCII uppercasing of the operand's text form; null stays null. */
+  upper: (value: ValueExprJson): ValueExprJson => ({ op: "upper", value }),
+  /** Strips leading/trailing SPACES only (not tabs/newlines); null stays
+   * null. */
+  trim: (value: ValueExprJson): ValueExprJson => ({ op: "trim", value }),
+  /** A closed scalar coercion — `to` is one of the {@link Cast} wire values
+   * (`"toString" | "toNumber" | "toInt64" | "toBoolean"`). */
+  cast: (value: ValueExprJson, to: Cast): ValueExprJson => ({ op: "cast", value, to }),
+  /** Current timestamp as epoch-ms (a JSON number). */
+  now: (): ValueExprJson => ({ op: "now" }),
+  /** First matching `when`'s `then`, else `otherwise`. Each `when` is a
+   * `FilterExpr` over the doc — the same DSL `.filter()` queries use. */
+  case: (whens: CaseWhenJson[], otherwise: ValueExprJson): ValueExprJson => ({
+    op: "case",
+    whens,
+    otherwise,
+  }),
+};
+
 export const t = {
   string: (): Validator<string> => makeValidator({ type: "string" }),
   number: (): Validator<number> => makeValidator({ type: "number" }),
@@ -122,6 +168,7 @@ export class TableDefinition<
     readonly softDeleteFlag?: boolean,
     readonly updatedAtFieldName?: string,
     readonly autoIncrementFieldName?: string,
+    readonly computedMap?: Record<string, ValueExprJson>,
   ) {}
 
   index<Name extends string>(
@@ -139,6 +186,7 @@ export class TableDefinition<
       this.softDeleteFlag,
       this.updatedAtFieldName,
       this.autoIncrementFieldName,
+      this.computedMap,
     );
   }
 
@@ -179,6 +227,7 @@ export class TableDefinition<
       this.softDeleteFlag,
       this.updatedAtFieldName,
       this.autoIncrementFieldName,
+      this.computedMap,
     );
   }
 
@@ -207,6 +256,7 @@ export class TableDefinition<
       this.softDeleteFlag,
       this.updatedAtFieldName,
       this.autoIncrementFieldName,
+      this.computedMap,
     );
   }
 
@@ -247,6 +297,7 @@ export class TableDefinition<
       this.softDeleteFlag,
       this.updatedAtFieldName,
       this.autoIncrementFieldName,
+      this.computedMap,
     );
   }
 
@@ -265,6 +316,7 @@ export class TableDefinition<
       this.softDeleteFlag,
       this.updatedAtFieldName,
       this.autoIncrementFieldName,
+      this.computedMap,
     );
   }
 
@@ -284,6 +336,7 @@ export class TableDefinition<
       this.softDeleteFlag,
       this.updatedAtFieldName,
       this.autoIncrementFieldName,
+      this.computedMap,
     );
   }
 
@@ -308,6 +361,7 @@ export class TableDefinition<
       this.softDeleteFlag,
       this.updatedAtFieldName,
       this.autoIncrementFieldName,
+      this.computedMap,
     );
   }
 
@@ -330,6 +384,7 @@ export class TableDefinition<
       this.softDeleteFlag,
       this.updatedAtFieldName,
       this.autoIncrementFieldName,
+      this.computedMap,
     );
   }
 
@@ -353,6 +408,7 @@ export class TableDefinition<
       this.softDeleteFlag,
       this.updatedAtFieldName,
       this.autoIncrementFieldName,
+      this.computedMap,
     );
   }
 
@@ -374,6 +430,7 @@ export class TableDefinition<
       true,
       this.updatedAtFieldName,
       this.autoIncrementFieldName,
+      this.computedMap,
     );
   }
 
@@ -399,6 +456,7 @@ export class TableDefinition<
       this.softDeleteFlag,
       field,
       this.autoIncrementFieldName,
+      this.computedMap,
     );
   }
 
@@ -427,6 +485,36 @@ export class TableDefinition<
       this.softDeleteFlag,
       this.updatedAtFieldName,
       field,
+      this.computedMap,
+    );
+  }
+
+  /** Declare a server-computed field (ENH-028): `field` names a declared
+   * field whose value the server re-evaluates from `expr` on EVERY write —
+   * insert, patch, replace, upsert (both branches), patchByQuery, and cascade
+   * setNull — overwriting any client-supplied value (the `ownerField`
+   * authority model). A null result REMOVES the key, so an optional computed
+   * field is absent rather than stored-null when its expression yields null.
+   * Build `expr` with the {@link ve} helpers. Because the value lands in a
+   * typed column, a computed field is indexable and orderable like any other.
+   * Push-time-validated server-side (the key must be a declared,
+   * non-stamped field; referenced fields declared and non-computed; a
+   * statically-known result kind must fit the field's type); the client only
+   * declares it and round-trips it on the wire as `computed`, omitted when
+   * the table declares none. */
+  computed(field: string, expr: ValueExprJson): TableDefinition<Fields, Indexes> {
+    return new TableDefinition(
+      this.fields,
+      this.indexes,
+      this.ownerFieldName,
+      this.collaboratorsFieldName,
+      this.ttlDef,
+      this.authorizeDef,
+      this.defaultsMap,
+      this.softDeleteFlag,
+      this.updatedAtFieldName,
+      this.autoIncrementFieldName,
+      { ...this.computedMap, [field]: expr },
     );
   }
 
@@ -456,6 +544,9 @@ export class TableDefinition<
     if (this.defaultsMap && Object.keys(this.defaultsMap).length > 0) {
       json.defaults = this.defaultsMap;
     }
+    if (this.computedMap && Object.keys(this.computedMap).length > 0) {
+      json.computed = this.computedMap;
+    }
     if (this.softDeleteFlag) {
       json.softDelete = true;
     }
@@ -466,7 +557,7 @@ export class TableDefinition<
 /** Declare one table from a field-name → validator map (e.g. `t.string()`),
  * then chain `.index()`/`.searchIndex()`/`.vectorIndex()`/`.ownerField()`/
  * `.collaboratorsField()`/`.authorize()`/`.ttl()`/`.defaults()`/`.softDelete()`/
- * `.updatedAtField()`/`.autoIncrementField()`.
+ * `.updatedAtField()`/`.autoIncrementField()`/`.computed()`.
  * Both the runtime schema pushed to the server and the inferred TS document
  * types derive from this one declaration — there is no codegen. */
 export function defineTable<Fields extends Record<string, Validator<unknown, boolean>>>(

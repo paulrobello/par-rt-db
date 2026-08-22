@@ -51,6 +51,7 @@ import type {
   StepRetry,
   TableJson,
   TransactionJson,
+  ValueExprJson,
   WorkflowInfo,
   WorkflowInfoFull,
   WorkflowSpec,
@@ -70,11 +71,14 @@ import {
   clone,
   coerceIndexValue,
   evalFilterExpr,
+  evalValueExpr,
   isBase64String,
   isHexId,
   isInt64String,
   isPlainObject,
   validateFilter,
+  walkFilterExprFields,
+  walkValueExprFields,
 } from "./validate.js";
 
 /** Normalizes any {@link UploadInput} to `Uint8Array` for hashing/storage.
@@ -725,11 +729,240 @@ function applyDefaults(table: TableJson, doc: Record<string, unknown>): Record<s
   return out;
 }
 
-/** Applies a patch's fields onto `doc` — a port of server `txn::apply_patch`. */
+/** Stamps the table's computed fields (ENH-028): every `computed` entry is
+ * re-evaluated against the final doc and stored — a null result REMOVES the
+ * key (an unset optional field is an absent key, `stripUnsetOptionals`' shape
+ * convention) and a non-null result overwrites whatever is there (the
+ * ownerField authority model: client-supplied values never survive). An
+ * evaluation error fails the whole write as BAD_REQUEST, naming the field.
+ * Runs last in the stamp chain — after ttl default, updatedAt, defaults, and
+ * autoIncrement, so expressions see final inputs — and before `validateDoc` at
+ * every site: `applyPatch` (patch, upsert's update branch, patchByQuery, and
+ * cascade setNull), `doInsert` (insert + upsert's insert branch), and
+ * `doReplace`. Mirrors server `txn::stamp_computed`; returns the same `doc`
+ * reference when the table declares no computed fields. */
+function stampComputed(
+  table: TableJson,
+  doc: Record<string, unknown>,
+  now: number,
+): Record<string, unknown> {
+  const computed = table.computed;
+  if (!computed) return doc;
+  const out: Record<string, unknown> = { ...doc };
+  for (const [name, expr] of Object.entries(computed)) {
+    let value: unknown;
+    try {
+      value = evalValueExpr(expr, out, now, table.fields);
+    } catch (err) {
+      const message = err instanceof RtDbError ? err.message : String(err);
+      throw new RtDbError("BAD_REQUEST", `computed field '${name}': ${message}`);
+    }
+    if (value === null || value === undefined) {
+      delete out[name];
+    } else {
+      out[name] = value;
+    }
+  }
+  return out;
+}
+
+/** The statically-known result kind of a `ValueExprJson`, for the computed-field
+ * push check — a port of server `schema::infer_static_kind`. `undefined` means
+ * the result kind varies by input: `field` (text extraction of any JSON
+ * value), `coalesce`/`case` (whichever branch wins), and the null / object /
+ * array literals whose runtime `validateDoc` check is the only guard. */
+type StaticKind = "string" | "number" | "boolean";
+
+function inferStaticKind(expr: ValueExprJson): StaticKind | undefined {
+  switch (expr.op) {
+    case "field":
+    case "coalesce":
+    case "case":
+      return undefined;
+    case "literal": {
+      const v = expr.value;
+      if (typeof v === "string") return "string";
+      if (typeof v === "number") return "number";
+      if (typeof v === "boolean") return "boolean";
+      return undefined;
+    }
+    case "concat":
+    case "lower":
+    case "upper":
+    case "trim":
+      return "string";
+    case "cast":
+      switch (expr.to) {
+        case "toString":
+          return "string";
+        case "toNumber":
+        case "toInt64":
+          return "number";
+        case "toBoolean":
+          return "boolean";
+      }
+      return undefined;
+    case "add":
+    case "sub":
+    case "mul":
+    case "div":
+    case "now":
+      return "number";
+  }
+}
+
+/** Computed-field push validation (ENH-028) — a port of server
+ * `schema::TableDef::validate_computed`, called from `pushSchema` and re-run
+ * on a migration's derived schema (the `changeType` re-validation path). Rules:
+ * 1. every `computed` key names a declared field;
+ * 2. the key is not one of the server-stamped declaration fields
+ *    (`ownerField`/`collaboratorsField`/`autoIncrementField`);
+ * 3. every field the expression references (including `case.whens` filter
+ *    fields) is declared and not itself computed (no chained evaluation);
+ * 4. `case.when` filters reject principal markers — computed exprs run on
+ *    every write with no interactive principal (the engine's `validateFilter`
+ *    rejects a marker's object value as a non-scalar filter value);
+ * 5. when the expression's result kind is statically known, the field's type
+ *    must accept a value of that kind (an int64 field admits a String kind —
+ *    decimal-string possibility — but never a Number kind, since arithmetic
+ *    yields JSON numbers);
+ * 6. the table's `authorize` predicate references no computed field.
+ * Every failure is BAD_REQUEST, like the server. */
+function validateComputed(schema: SchemaJson): void {
+  for (const [tableName, table] of Object.entries(schema.tables)) {
+    const computed = table.computed;
+    if (computed) {
+      for (const [field, expr] of Object.entries(computed)) {
+        if (!Object.hasOwn(table.fields, field)) {
+          throw new RtDbError(
+            "BAD_REQUEST",
+            `computed field '${tableName}.${field}' is not a declared field`,
+          );
+        }
+        if (table.ownerField === field) {
+          throw new RtDbError(
+            "BAD_REQUEST",
+            `computed field '${tableName}.${field}' must not be the table's ownerField`,
+          );
+        }
+        if (table.collaboratorsField === field) {
+          throw new RtDbError(
+            "BAD_REQUEST",
+            `computed field '${tableName}.${field}' must not be the table's collaboratorsField`,
+          );
+        }
+        if (table.autoIncrementField === field) {
+          throw new RtDbError(
+            "BAD_REQUEST",
+            `computed field '${tableName}.${field}' must not be the table's autoIncrementField`,
+          );
+        }
+        walkValueExprFields(expr, (referenced) => {
+          if (!Object.hasOwn(table.fields, referenced)) {
+            throw new RtDbError(
+              "BAD_REQUEST",
+              `computed field '${tableName}.${field}' references undeclared field '${referenced}'`,
+            );
+          }
+          if (computed[referenced] !== undefined) {
+            throw new RtDbError(
+              "BAD_REQUEST",
+              `computed field '${tableName}.${field}' references computed field '${referenced}' (computed fields may not reference each other)`,
+            );
+          }
+        });
+        validateComputedCaseWhens(expr, table);
+        const kind = inferStaticKind(expr);
+        if (kind !== undefined) {
+          const sample = kind === "string" ? "s" : kind === "number" ? 1 : true;
+          // `validateValue` is the wire contract, but int64's wire form is a
+          // decimal STRING: a Number-kind result can never validate
+          // (arithmetic yields JSON numbers), while a String-kind one can
+          // ("42") — decimal-ness stays a runtime `validateDoc` check.
+          // Optional unwrapping admits the nullable spelling.
+          let inner = table.fields[field];
+          while (inner.type === "optional") {
+            inner = inner.inner;
+          }
+          const accepts =
+            validateValue(table.fields[field], sample) ||
+            (inner.type === "int64" && kind === "string");
+          if (!accepts) {
+            throw new RtDbError(
+              "BAD_REQUEST",
+              `computed field '${tableName}.${field}' produces ${kind === "string" ? "a string" : kind === "number" ? "a number" : "a boolean"}, which the field type does not accept`,
+            );
+          }
+        }
+      }
+    }
+    // Rule 6: authorize runs pre-stamp on the insert paths, so a predicate
+    // over a computed field would read client input.
+    if (table.authorize !== undefined && computed !== undefined) {
+      walkFilterExprFields(table.authorize, (referenced) => {
+        if (computed[referenced] !== undefined) {
+          throw new RtDbError(
+            "BAD_REQUEST",
+            `computed field '${tableName}.${referenced}' must not be referenced by the table's authorize predicate (authorize predicates may not reference computed fields)`,
+          );
+        }
+      });
+    }
+  }
+}
+
+/** Walks a computed expression's `case` nodes validating each `when` filter
+ * with the engine's filter validator — the marker-rejecting mode the server's
+ * `validate_computed_case_whens` applies (a `{"$user":true}` marker value
+ * fails the scalar-value check). `then`/`otherwise` recurse so a `case`
+ * nested inside a branch is covered. */
+function validateComputedCaseWhens(expr: ValueExprJson, table: TableJson): void {
+  switch (expr.op) {
+    case "case":
+      for (const cw of expr.whens) {
+        validateFilter(cw.when, table);
+        validateComputedCaseWhens(cw.then, table);
+      }
+      validateComputedCaseWhens(expr.otherwise, table);
+      return;
+    case "concat":
+    case "coalesce":
+      for (const part of expr.parts) {
+        validateComputedCaseWhens(part, table);
+      }
+      return;
+    case "add":
+    case "sub":
+    case "mul":
+    case "div":
+      validateComputedCaseWhens(expr.left, table);
+      validateComputedCaseWhens(expr.right, table);
+      return;
+    case "lower":
+    case "upper":
+    case "trim":
+    case "cast":
+      validateComputedCaseWhens(expr.value, table);
+      return;
+    case "field":
+    case "literal":
+    case "now":
+      return;
+  }
+}
+
+/** Applies a patch's fields onto `doc` — a port of server `txn::apply_patch`.
+ * Every patch-shaped path funnels through here (`patch`, upsert's update
+ * branch, `patchByQuery`, and cascade setNull), so the computed-field stamp
+ * sits here too: client-supplied computed keys are dropped pre-merge (the
+ * stamp after the loop overwrites them, but a wrong-typed value must not fail
+ * validation first), and each computed field is re-evaluated against the
+ * merged doc before `validateDoc`. */
 function applyPatch(
   table: TableJson,
   doc: Record<string, unknown>,
   fields: Record<string, unknown>,
+  now: number,
 ): Record<string, unknown> {
   // The auto-increment field is server-assigned and immutable after insert.
   // A patch may carry it back unchanged (round-trip friendly), but any
@@ -743,6 +976,12 @@ function applyPatch(
   }
   const merged: Record<string, unknown> = { ...doc };
   for (const [field, value] of Object.entries(fields)) {
+    // ENH-028: a computed key in the patch payload is dropped — the stamp
+    // below re-derives it from the merged doc (server `apply_patch`'s
+    // skip+drop of `table_def.computed` keys).
+    if (table.computed !== undefined && Object.hasOwn(table.computed, field)) {
+      continue;
+    }
     const fieldTy = table.fields[field];
     if (!fieldTy) {
       throw new RtDbError("SCHEMA_VIOLATION", `unknown field '${field}'`);
@@ -756,8 +995,9 @@ function applyPatch(
     }
     merged[field] = value;
   }
-  validateDoc(table, merged);
-  return merged;
+  const stamped = stampComputed(table, merged, now);
+  validateDoc(table, stamped);
+  return stamped;
 }
 
 /**
@@ -829,6 +1069,7 @@ export class InMemoryRtDbClient {
     const next = toSchemaJson(schema);
     validateSchema(next);
     validateOnDelete(next);
+    validateComputed(next);
     if (this.schema) {
       detectDestructiveChanges(this.schema, next);
       // Additive: keep existing tables' rows and the idempotency cache; only
@@ -880,6 +1121,13 @@ export class InMemoryRtDbClient {
         reports.push(report);
         if (table) touched.add(table);
       }
+      // ENH-028: directive folding must not be able to invalidate a computed
+      // entry — e.g. `changeType` retyping a computed field so its
+      // expression's static kind no longer fits. Re-validate the derived maps
+      // (pure) before anything commits, mirroring `plan_migration`'s trailing
+      // `validate_computed` call; a failure rolls back like any failed
+      // directive (also on `dryRun`, which validates the full plan).
+      validateComputed(planned);
     } catch (err) {
       // Atomicity: a failed directive rolls back every earlier structural+data effect.
       this.restoreTables(tableSnap);
@@ -1757,6 +2005,7 @@ export class InMemoryRtDbClient {
           tableDef,
           row.doc,
           stampUpdatedAt(tableDef, step.patch, this.now()),
+          this.now(),
         );
         this.doUpdate(table, tableDef, row, merged);
         return { result: { id: row.id, inserted: false }, table };
@@ -1771,6 +2020,7 @@ export class InMemoryRtDbClient {
             tableDef,
             row.doc,
             stampUpdatedAt(tableDef, step.patch, this.now()),
+            this.now(),
           );
           this.doUpdate(table, tableDef, row, merged);
         }
@@ -1806,14 +2056,20 @@ export class InMemoryRtDbClient {
 
   private doInsert(tableName: string, tableDef: TableJson, doc: Record<string, unknown>): string {
     // Server `step_insert` order: ttl default → updatedAt stamp → defaults →
-    // autoIncrement stamp (the counter wins over a defaults entry).
-    const stamped = this.stampAutoIncrement(
-      tableName,
+    // autoIncrement stamp (the counter wins over a defaults entry) → computed
+    // stamp (ENH-028: overwrites any client-supplied computed value before
+    // validation ever sees it).
+    const stamped = stampComputed(
       tableDef,
-      applyDefaults(
+      this.stampAutoIncrement(
+        tableName,
         tableDef,
-        stampUpdatedAt(tableDef, stampTtlDefault(tableDef, doc, this.now()), this.now()),
+        applyDefaults(
+          tableDef,
+          stampUpdatedAt(tableDef, stampTtlDefault(tableDef, doc, this.now()), this.now()),
+        ),
       ),
+      this.now(),
     );
     validateDoc(tableDef, stamped);
     const stored = stripUnsetOptionals(tableDef, stamped);
@@ -1832,7 +2088,12 @@ export class InMemoryRtDbClient {
     const row = this.requireRow(tableName, id);
     // FM-36: the updatedAt stamp rides inside the patch payload (server
     // `step_patch`), overwriting any client-supplied value pre-merge.
-    const merged = applyPatch(tableDef, row.doc, stampUpdatedAt(tableDef, fields, this.now()));
+    const merged = applyPatch(
+      tableDef,
+      row.doc,
+      stampUpdatedAt(tableDef, fields, this.now()),
+      this.now(),
+    );
     this.doUpdate(tableName, tableDef, row, merged);
   }
 
@@ -1890,6 +2151,9 @@ export class InMemoryRtDbClient {
         throw new RtDbError("BAD_REQUEST", `autoIncrementField '${auto}' cannot be changed`);
       }
     }
+    // ENH-028: the computed stamp runs last, overwriting any client-supplied
+    // computed value before validation (server `txn::do_replace`).
+    stamped = stampComputed(tableDef, stamped, this.now());
     validateDoc(tableDef, stamped);
     const stored = stripUnsetOptionals(tableDef, stamped);
     this.checkUniqueIndexes(tableName, tableDef, stored, row.id);
@@ -2018,6 +2282,7 @@ export class InMemoryRtDbClient {
               childTableDef,
               childRow.doc,
               stampUpdatedAt(childTableDef, { [fieldName]: null }, this.now()),
+              this.now(),
             );
             this.doUpdate(childTableName, childTableDef, childRow, merged);
             ctx.touched.add(childTableName);

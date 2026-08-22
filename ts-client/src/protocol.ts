@@ -638,6 +638,15 @@ export interface TableJson {
    * clients only declare it. Omitted on the wire when the table declares
    * none. */
   defaults?: Record<string, unknown>;
+  /** Computed fields (ENH-028): declared field name → {@link ValueExprJson}.
+   * The server re-evaluates each expression on every write and stores the
+   * result in the doc (overwriting any client-supplied value — the
+   * `ownerField` authority model); a null result removes the key. Push-time
+   * validation (`validate_computed`): keys must be declared non-stamped fields,
+   * referenced fields declared and non-computed, `Case.whens` reject principal
+   * markers, and a statically-known result kind must be acceptable to the
+   * field's type. Omitted on the wire when the table declares none. */
+  computed?: Record<string, ValueExprJson>;
   /** Opt-in soft delete (FM-33): `delete`/`deleteByQuery` stamp an internal
    * `deleted_at` instead of removing the row — the row becomes invisible to
    * every read terminal, eq-lookup, and unique index, and an `undelete` step
