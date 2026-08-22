@@ -30,6 +30,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_serializer
 from pydantic_core.core_schema import SerializerFunctionWrapHandler
 
+from .value_expr import ValueExpr
 from .wire import FilterExpr, to_camel
 
 
@@ -276,6 +277,12 @@ class TableDef(_S):
     # the harness / server txn docs). Wire key `softDelete`, omitted when false
     # (server `skip_serializing_if = "is_false"`).
     soft_delete: bool = False
+    # ENH-028: computed fields — a `ValueExpr` per declared field, re-evaluated
+    # by the server on every write and stored (declarative denormalization).
+    # Client-supplied values are dropped before validation; a null result
+    # removes the key. Wire name is `computed`, omitted when empty (server
+    # `BTreeMap::is_empty` skip rule).
+    computed: dict[str, ValueExpr] = Field(default_factory=dict)
 
     @model_serializer(mode="wrap")
     def _drop_absent_owner(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
@@ -307,6 +314,10 @@ class TableDef(_S):
         # drop False, keep True.
         if not out.get("softDelete"):
             out.pop("softDelete", None)
+        # `computed` is omitted on the wire when empty (server
+        # skip_serializing_if = "BTreeMap::is_empty").
+        if not out.get("computed"):
+            out.pop("computed", None)
         return out
 
 
@@ -338,6 +349,7 @@ class TableBuilder:
         self._soft_delete: bool = False
         self._updated_at: str | None = None
         self._auto_increment: str | None = None
+        self._computed: dict[str, Any] | None = None
 
     def field(self, name: str, ft: Any) -> TableBuilder:
         """Declare a typed field ``name`` of type ``ft`` (a ``t.*`` constructor dict)."""
@@ -486,6 +498,23 @@ class TableBuilder:
         self._auto_increment = name
         return self
 
+    def computed(self, name: str, expr: Any) -> TableBuilder:
+        """Declare a computed field (ENH-028): ``name`` must be a declared
+        field (not the table's ``ownerField``/``collaboratorsField``/
+        ``autoIncrementField``), re-derived by the server on every write —
+        insert, patch, replace, upsert, patchByQuery, and cascade ``setNull``
+        — from ``expr`` (a :class:`par_rt_db.value_expr.ValueExpr`, built with
+        the ``ve.*`` constructors) over the final doc. Client-supplied values
+        are dropped before validation; a null result removes the key; an
+        evaluation error fails the write with ``BAD_REQUEST`` naming the field.
+        The declared field may be indexed (that is the point — derived values
+        become queryable). Round-tripped on the wire as ``computed``, omitted
+        when empty."""
+        if self._computed is None:
+            self._computed = {}
+        self._computed[name] = expr
+        return self
+
     def _build(self) -> dict[str, Any]:
         out: dict[str, Any] = {"fields": self._fields, "indexes": self._indexes}
         if self._owner is not None:
@@ -502,6 +531,8 @@ class TableBuilder:
             out["updatedAtField"] = self._updated_at
         if self._auto_increment is not None:
             out["autoIncrementField"] = self._auto_increment
+        if self._computed:
+            out["computed"] = self._computed
         return out
 
 

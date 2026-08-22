@@ -78,6 +78,7 @@ from ..wire import (
 )
 from .migrate import _detect_destructive_changes, _on_delete_ref, _validate_on_delete
 from .validate import _eval_filter_expr, _validate_filter
+from .value_expr import _stamp_computed, _validate_computed
 
 #: Maximum number of steps in a single transaction (mirrors the server cap).
 MAX_STEPS = 1024
@@ -899,10 +900,23 @@ def _strip_unset_optionals(table: TableDef, doc: dict[str, Any]) -> dict[str, An
     return out
 
 
-def apply_patch(table: TableDef, doc: dict[str, Any], fields: dict[str, Any]) -> dict[str, Any]:
+def apply_patch(
+    table: TableDef,
+    doc: dict[str, Any],
+    fields: dict[str, Any],
+    now: int = 0,
+) -> dict[str, Any]:
     """Apply a patch's ``fields`` onto ``doc``. A ``None`` onto an ``Optional``
     field whose inner type doesn't itself accept ``None`` deletes the key; the
-    merged doc is then re-validated whole. Raises ``SCHEMA_VIOLATION`` on violation."""
+    merged doc is then re-validated whole. Raises ``SCHEMA_VIOLATION`` on violation.
+
+    ENH-028: a computed key in the patch is dropped, not merged — the stamp
+    below re-derives it from the final merged doc, so skipping here also keeps
+    a wrong-typed client value from failing ``validate_value`` first — and the
+    computed fields are stamped after the merge and before the whole-doc
+    validation (server ``apply_patch`` order; ``now`` feeds ``Now()``
+    expressions, defaulting to 0 only for direct call-site compatibility —
+    every engine path passes the client clock)."""
     # FM-37: the auto-increment field is server-assigned and immutable after
     # insert. A patch may carry it back unchanged (round-trip friendly), but
     # any different value — including a type-shifted form of the same number —
@@ -913,6 +927,8 @@ def apply_patch(table: TableDef, doc: dict[str, Any], fields: dict[str, Any]) ->
         raise RtDbError(ErrorCode.BAD_REQUEST, f"autoIncrementField '{auto}' cannot be changed")
     merged = dict(doc)
     for fld, value in fields.items():
+        if fld in table.computed:
+            continue
         field_ty = table.fields.get(fld)
         if field_ty is None:
             raise RtDbError(ErrorCode.SCHEMA_VIOLATION, f"unknown field '{fld}'")
@@ -923,6 +939,7 @@ def apply_patch(table: TableDef, doc: dict[str, Any], fields: dict[str, Any]) ->
         if not validate_value(field_ty, value):
             raise RtDbError(ErrorCode.SCHEMA_VIOLATION, f"field '{fld}' has an invalid value")
         merged[fld] = value
+    merged = _stamp_computed(table, merged, now)
     validate_doc(table, merged)
     return merged
 
@@ -1334,6 +1351,11 @@ class _InMemoryStoreCore:
         # FM-33: the server validates `onDelete` placement/shape in
         # `SchemaDef::validate` on every push; mirror both passes here.
         _validate_on_delete(schema)
+        # ENH-028: computed-field validation (keys declared and non-stamped,
+        # references declared and non-computed, marker-free `case.whens`,
+        # static-kind fit, authorize interplay) — `BAD_REQUEST` on the same
+        # rules as the server's push path.
+        _validate_computed(schema)
         # FM-37: mirror `ddl::apply_sequence` — when a table's declaration is
         # newly added or changed, reposition its counter so the next stamp is
         # strictly past every stored value of the new field AND strictly past
@@ -1550,6 +1572,7 @@ class _InMemoryStoreCore:
                         table_def,
                         row.doc,
                         _stamp_updated_at(table_def, patch_fields, self._now()),
+                        now=self._now(),
                     )
                     self._do_update(table_def, table, row.id, merged)
                     return _upsert_result(row.id, False), {table}
@@ -1580,6 +1603,7 @@ class _InMemoryStoreCore:
                         table_def,
                         row.doc,
                         _stamp_updated_at(table_def, patch_fields, self._now()),
+                        now=self._now(),
                     )
                     self._do_update(table_def, table, row.id, merged)
                 return _patch_by_query_result(len(take), truncated), {table}
@@ -1658,6 +1682,11 @@ class _InMemoryStoreCore:
         # on the same field loses — and before validation, so a required
         # counter field is always populated.
         doc = self._stamp_auto_increment(table_name, table_def, doc)
+        # ENH-028: computed stamping is the LAST insert stamp — after the ttl /
+        # updatedAt / defaults / autoIncrement chain, so expressions see final
+        # inputs — and before validation, so a client-supplied computed value
+        # never reaches validation (server `do_insert` order).
+        doc = _stamp_computed(table_def, doc, self._now())
         validate_doc(table_def, doc)
         stored = _strip_unset_optionals(table_def, doc)
         self._check_unique_indexes(table_def, table_name, stored, None)
@@ -1683,7 +1712,12 @@ class _InMemoryStoreCore:
         # — a patch that never mentions the field still restamps, and a
         # client-supplied value is overwritten. Before `apply_patch`'s whole-
         # doc validation, so a legacy doc missing the field re-populates.
-        merged = apply_patch(table_def, row.doc, _stamp_updated_at(table_def, fields, self._now()))
+        merged = apply_patch(
+            table_def,
+            row.doc,
+            _stamp_updated_at(table_def, fields, self._now()),
+            now=self._now(),
+        )
         self._do_update(table_def, table_name, sid, merged)
 
     def _do_replace(
@@ -1721,6 +1755,13 @@ class _InMemoryStoreCore:
                 raise RtDbError(
                     ErrorCode.BAD_REQUEST, f"autoIncrementField '{auto}' cannot be changed"
                 )
+        # ENH-028: client-supplied computed values are dropped before
+        # validation — the stamp re-derives them from the final doc, and a
+        # wrong-typed client value must not fail validate_doc first (server
+        # `do_replace` order).
+        for name in table_def.computed:
+            doc.pop(name, None)
+        doc = _stamp_computed(table_def, dict(doc), self._now())
         validate_doc(table_def, doc)
         stored = _strip_unset_optionals(table_def, doc)
         self._check_unique_indexes(table_def, table_name, stored, sid)
@@ -1857,6 +1898,7 @@ class _InMemoryStoreCore:
                             child_table_def,
                             child_row.doc,
                             _stamp_updated_at(child_table_def, {field_name: None}, self._now()),
+                            now=self._now(),
                         )
                         self._docs[(child_table_name, child_id)] = replace(
                             child_row, doc=merged, version=child_row.version + 1

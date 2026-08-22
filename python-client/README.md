@@ -286,6 +286,65 @@ sort_tuple = decode_cursor(cursor)  # round-trips back to the list
 / `t.union([...])` / `t.object({...})` are the field constructors; see
 `par_rt_db/schema.py` for the full set of 15 variants.
 
+### Computed fields (ENH-028)
+
+A computed field is declared with an expression the server re-evaluates on
+every write (insert / patch / replace / upsert / patchByQuery / cascade
+`setNull`) and stores — declarative denormalization with no server code, and
+the derived value is indexable. Build expressions with the `ve` constructors
+(`from par_rt_db import ve`) and declare them via the table builder's
+`.computed(name, expr)`:
+
+```python
+from par_rt_db import Schema, t, ve
+
+schema = (
+    Schema.builder()
+    .table(
+        "users",
+        lambda tb: (
+            tb.field("first", t.string())
+            .field("last", t.string())
+            .field("nickname", t.optional(t.string()))
+            # fullName = first ++ " " ++ last — a required derived field,
+            # indexed so scans ride the computed column.
+            .field("fullName", t.string())
+            .index("by_fullName", ["fullName"])
+            # slug = lower(trim(nickname)) — an optional derived field: when
+            # the expression evaluates null (no nickname), NO key is stored.
+            .field("slug", t.optional(t.string()))
+            .computed("fullName", ve.concat(ve.field("first"), ve.literal(" "), ve.field("last")))
+            .computed("slug", ve.lower(ve.trim(ve.field("nickname"))))
+        ),
+    )
+    .build()
+)
+```
+
+Semantics (mirrored exactly by the in-memory harness):
+
+- Client-supplied values for a computed field are **dropped** before
+  validation — the stamp always re-derives from the final document.
+- A **null** result removes the key (an unset optional field is an absent
+  key, never a stored null); an evaluation error fails the write with
+  `BAD_REQUEST` naming the field.
+- Field reads are text extraction (`42` → `"42"`, objects → compact JSON);
+  arithmetic is IEEE doubles with null propagation (`null / 0` is `null`, a
+  literal `x / 0` is an error); `ve.trim` strips spaces only; `ve.now()` is
+  epoch-ms; `ve.case(whens, otherwise)` branches on the same filter
+  expressions queries use.
+- Push-time validation: the computed key must be a declared field (not
+  `ownerField`/`collaboratorsField`/`autoIncrementField`), every referenced
+  field must be declared and not itself computed, `case.when` filters may not
+  use principal markers, and a statically-kinded expression must fit the
+  field's type (arithmetic into an `int64` field is rejected — its wire form
+  is a decimal string; wrap in `ve.cast(expr, Cast.TO_STRING)`).
+
+The full `ve.*` set: `field` / `literal` / `concat` / `add` / `sub` / `mul` /
+`div` / `coalesce` / `lower` / `upper` / `trim` / `cast` / `now` / `case` —
+see `par_rt_db/value_expr.py`. `renameField` migrations rewrite expression
+references automatically; dropping a field an expression reads is rejected.
+
 ### Schema migration (`[http]` extra)
 
 Destructive/type-changing schema transformations are a deliberate admin operation,

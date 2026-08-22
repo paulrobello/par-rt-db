@@ -19,6 +19,13 @@ to both trees, ``unordered`` multiset comparison via canonical-JSON sort,
 numeric-tolerant equality, and structural ``expect_next_cursor`` presence. No
 clock advance / TTL tick between seeding and the op — the corpus pins
 synchronous semantics only.
+
+Two additive case kinds (ENH-028): a ``pushError`` case asserts the schema
+PUSH itself fails with the given code (push is the whole case — no seed, no
+op), and an ``op.migrate`` case runs the engine's migrate machinery
+(:meth:`InMemoryRtDbClient.migrate_schema`, apply-persisted before ``then``
+reads, ``dryRun`` honored) with the ``MigrateResult`` compared like any op
+result under the runner's existing normalize rules.
 """
 
 from __future__ import annotations
@@ -34,6 +41,7 @@ from pydantic import BaseModel
 from par_rt_db import Mutation
 from par_rt_db.errors import ErrorCode, RtDbError
 from par_rt_db.in_memory import InMemoryRtDbClient, InMemoryRtDbClientOptions
+from par_rt_db.migration import MigrateRequest
 from par_rt_db.query import Query
 from par_rt_db.schema import SchemaDef
 
@@ -263,6 +271,29 @@ def _run_case(case: dict[str, Any]) -> None:
     client = InMemoryRtDbClient(InMemoryRtDbClientOptions(now=now, random=lambda: 0.0))
     schema_json = case["schema"]
     assert isinstance(schema_json, dict), f"{name}: schema must be an object"
+
+    # A `pushError` case asserts the schema PUSH itself fails (README format:
+    # the value carries the same `{code}` object `expect.error` does; only the
+    # code is asserted, never the message). Push is the whole case — a stray
+    # seed/op/then/expect is an authoring error.
+    push_error = case.get("pushError")
+    if push_error is not None:
+        for stray in ("seed", "op", "then", "expect"):
+            assert stray not in case, (
+                f"{name}: a pushError case must not carry `{stray}` — push is the whole case"
+            )
+        assert isinstance(push_error, dict) and "code" in push_error, (
+            f"{name}: pushError must carry a code object"
+        )
+        want = ErrorCode(push_error["code"])  # raises loudly on an unknown fixture code
+        with pytest.raises(RtDbError) as ei:
+            client.push_schema(SchemaDef.model_validate(schema_json))
+        assert ei.value.code == want, (
+            f"{name}: push error code mismatch (got {ei.value.code.value}, want"
+            f" {want.value}) — engine message: {ei.value.message}"
+        )
+        return
+
     client.push_schema(SchemaDef.model_validate(schema_json))
 
     tables = list(schema_json["tables"])
@@ -295,8 +326,8 @@ def _run_case(case: dict[str, Any]) -> None:
     case_keys = _normalize_keys(case, _DEFAULT_NORMALIZE, name)
 
     op = case.get("op")
-    assert isinstance(op, dict) and ("txn" in op or "query" in op), (
-        f"{name}: op must carry `query` or `txn`"
+    assert isinstance(op, dict) and ("txn" in op or "query" in op or "migrate" in op), (
+        f"{name}: op must carry `query`, `txn`, or `migrate`"
     )
 
     # Execute the op. A query op first resolves the "$prev" paginate-cursor
@@ -315,6 +346,29 @@ def _run_case(case: dict[str, Any]) -> None:
             _assert_error_code(err, expect, name)
             return  # a failed op has no `then` follow-up
         op_result: Any = [_step_result_json(r) for r in results]
+    elif "migrate" in op:
+        # An `op.migrate` case routes the admin MigrateRequest wire body
+        # through the engine's migrate (apply-persisted unless `dryRun`, so a
+        # follow-up `then` reads resolve fields through the derived schema —
+        # the engine installs it on apply). The MigrateResult is compared like
+        # any op result under the runner's normalize rules; migrate-domain
+        # errors assert the `expect.error` envelope code.
+        migrate_json = _substitute(op["migrate"], ids, name)
+        assert isinstance(migrate_json, dict), f"{name}: op.migrate must be an object"
+        try:
+            req = MigrateRequest.model_validate(migrate_json)
+        except Exception as err:  # noqa: BLE001 — named loudly with the case
+            raise AssertionError(f"{name}: op.migrate does not parse: {err}") from err
+        try:
+            result = client.migrate_schema(list(req.directives), dry_run=req.dry_run)
+        except RtDbError as err:
+            if not expects_error:
+                raise AssertionError(
+                    f"{name}: unexpected migrate error ({err.code.value}): {err.message}"
+                ) from err
+            _assert_error_code(err, expect, name)
+            return  # a failed op has no `then` follow-up
+        op_result = result.model_dump(by_alias=True, mode="json")
     else:
         q_json = _substitute(op["query"], ids, name)
         assert isinstance(q_json, dict), f"{name}: op.query must be an object"

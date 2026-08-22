@@ -10,6 +10,8 @@ import math
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
+from pydantic import TypeAdapter
+
 from ..errors import ErrorCode, RtDbError
 from ..migration import (
     Cast,
@@ -38,6 +40,8 @@ from ..schema import (
     _FString,
     _FUnion,
 )
+from ..value_expr import ValueExpr
+from .value_expr import _validate_computed, walk_value_expr_fields
 
 if TYPE_CHECKING:
     from .store import _InMemoryStoreCore as _Core
@@ -381,6 +385,71 @@ def _where_signature(pred: Any) -> Any:
     return pred.model_dump(mode="json")
 
 
+#: Revalidation adapter for a rewritten ``ValueExpr`` (the rename rewrite works
+#: on the dumped wire tree, then re-parses through the discriminated union).
+_VE_ADAPTER = TypeAdapter(ValueExpr)
+
+
+def _rewrite_ve_field(d: Any, from_: str, to: str) -> Any:
+    """Rename ``from_`` → ``to`` in one dumped ``ValueExpr`` tree: every
+    ``field`` node's ``field``, and every ``case.whens[].when`` filter's leaf
+    ``field`` (filter value positions are never touched — they carry values,
+    not field references). Port of server ``migrate.rs::rename_value_expr_fields``."""
+    if not isinstance(d, dict):
+        return d
+    op = d.get("op")
+    if op == "field":
+        return {"op": "field", "field": to if d.get("field") == from_ else d.get("field")}
+    if op in ("literal", "now"):
+        return d
+    if op in ("concat", "coalesce"):
+        return {**d, "parts": [_rewrite_ve_field(p, from_, to) for p in d.get("parts", [])]}
+    if op in ("add", "sub", "mul", "div"):
+        return {
+            **d,
+            "left": _rewrite_ve_field(d.get("left"), from_, to),
+            "right": _rewrite_ve_field(d.get("right"), from_, to),
+        }
+    if op in ("lower", "upper", "trim", "cast"):
+        return {**d, "value": _rewrite_ve_field(d.get("value"), from_, to)}
+    if op == "case":
+        return {
+            **d,
+            "whens": [
+                {
+                    "when": _rewrite_filter_fields(cw.get("when"), from_, to),
+                    "then": _rewrite_ve_field(cw.get("then"), from_, to),
+                }
+                for cw in d.get("whens", [])
+            ],
+            "otherwise": _rewrite_ve_field(d.get("otherwise"), from_, to),
+        }
+    return d
+
+
+def _rewrite_filter_fields(d: Any, from_: str, to: str) -> Any:
+    """The ``FilterExpr`` half of the rename rewrite: leaf ``field`` keys move,
+    ``and``/``or``/``not`` recurse, value positions (``value``/``values``) are
+    left untouched."""
+    if not isinstance(d, dict):
+        return d
+    op = d.get("op")
+    if op in ("and", "or"):
+        return {**d, "exprs": [_rewrite_filter_fields(e, from_, to) for e in d.get("exprs", [])]}
+    if op == "not":
+        return {**d, "expr": _rewrite_filter_fields(d.get("expr"), from_, to)}
+    if isinstance(d.get("field"), str):
+        return {**d, "field": to if d["field"] == from_ else d["field"]}
+    return d
+
+
+def _rename_value_expr_fields(expr: ValueExpr, from_: str, to: str) -> ValueExpr:
+    """One computed entry with its ``field`` references (including
+    ``case.when`` filter fields) rewritten from ``from_`` to ``to``."""
+    dumped = expr.model_dump(by_alias=True, mode="json")
+    return _VE_ADAPTER.validate_python(_rewrite_ve_field(dumped, from_, to))
+
+
 class _MigrateEngine(_Core):
     """``migrate_schema`` and the per-directive appliers over ``self._docs``."""
 
@@ -433,6 +502,17 @@ class _MigrateEngine(_Core):
             reports.append(report)
             if table is not None:
                 touched.add(table)
+
+        # ENH-028: directive folding must not be able to invalidate a computed
+        # entry — e.g. a `changeType` retyping a computed field so its
+        # expression's static kind no longer fits. Re-validate the derived
+        # computed maps (pure) before anything commits, mirroring server
+        # `plan_migration`'s post-fold `validate_computed` call.
+        try:
+            _validate_computed(planned)
+        except RtDbError:
+            self._docs = snapshot
+            raise
 
         if dry_run:
             self._docs = snapshot
@@ -512,6 +592,18 @@ class _MigrateEngine(_Core):
             t.owner_field = d.to
         if t.collaborators_field == d.from_:
             t.collaborators_field = d.to
+        # ENH-028: the computed map follows the rename the way the server's
+        # does — an entry KEYED on the renamed field moves to the new name
+        # (its declared field moved; leaving it keyed on `from_` would fail
+        # `validate_computed`'s declared-field rule on the derived schema), and
+        # every expression's `field` references (including `case.whens`
+        # predicates) are rewritten to read the renamed doc key. Input values
+        # are unchanged by the rename, so stored computed values stay correct;
+        # the next write re-stamps.
+        if d.from_ in t.computed:
+            t.computed[d.to] = t.computed.pop(d.from_)
+        for key in list(t.computed):
+            t.computed[key] = _rename_value_expr_fields(t.computed[key], d.from_, d.to)
         affected = 0
         for (tname, _), row in self._docs.items():
             if tname != d.table:
@@ -613,6 +705,27 @@ class _MigrateEngine(_Core):
             t.owner_field = None
         if t.collaborators_field == d.field:
             t.collaborators_field = None
+        # ENH-028: a computed expression reading the dropped field would
+        # dangle — every future write fails its stamp. Reject, naming the
+        # computed field, so the caller amends the computed map first (mirrors
+        # server `migrate.rs`).
+        computed_offender: str | None = None
+        for computed_field, expr in t.computed.items():
+            refs: list[str] = []
+            walk_value_expr_fields(expr, refs.append)
+            if d.field in refs:
+                computed_offender = computed_field
+                break
+        if computed_offender is not None:
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"cannot drop field '{d.table}.{d.field}': it is referenced by computed"
+                f" field '{d.table}.{computed_offender}'; drop the computed field first",
+            )
+        # An entry KEYED on the dropped field goes with it: the applier below
+        # removes the stored key from every doc, so leaving the entry would
+        # fail `validate_computed`'s declared-field rule on the derived schema.
+        t.computed.pop(d.field, None)
         affected = 0
         for (tname, _), row in self._docs.items():
             if tname != d.table:

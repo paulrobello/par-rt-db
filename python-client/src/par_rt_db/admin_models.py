@@ -27,7 +27,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_serializer
+from pydantic_core.core_schema import SerializerFunctionWrapHandler
 
 from .mutation import StepResult
 from .schema import SchemaDef
@@ -299,6 +300,18 @@ class DirectiveReport(_Wire):
     affected_rows: int
     cast_failures: list[CastFailure] = Field(default_factory=list)
     sample_changes: list[SampleChange] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def _drop_empty_lists(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        # Server uses `skip_serializing_if = "Vec::is_empty"` on both lists, so
+        # an empty `castFailures`/`sampleChanges` is omitted entirely — the
+        # report serializes as `{"op", "affectedRows"}` alone.
+        if not out.get("castFailures"):
+            out.pop("castFailures", None)
+        if not out.get("sampleChanges"):
+            out.pop("sampleChanges", None)
+        return out
 
 
 class MigrateResult(_Wire):
