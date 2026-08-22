@@ -1587,7 +1587,7 @@ impl InMemoryRtDbClient {
         // fires) to keep `subscribe`/`notify_subs` infallible — tests that need
         // to assert on a failing query should call `run_query` directly.
         if let Ok(initial) = self.run_query(&query) {
-            let initial_canon = canonical(&initial);
+            let initial_canon = diff_canonical(&initial, &query);
             *sub.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(initial_canon);
             callback(initial);
         }
@@ -1614,7 +1614,7 @@ impl InMemoryRtDbClient {
                 Ok(v) => v,
                 Err(_) => continue, // DIVERGENCE from TS (which propagates): suppress so a bad subscriber query can't abort the write
             };
-            let next_canon = canonical(&next);
+            let next_canon = diff_canonical(&next, &sub.query);
             let mut last_lock = sub.last.lock().unwrap_or_else(|p| p.into_inner());
             let changed = match &*last_lock {
                 None => true,
@@ -2185,7 +2185,7 @@ mod validate;
 
 // Cross-module helpers (private to this module's descendants).
 use migrate::detect_destructive_changes;
-use query::{collect_index_key, require_index};
+use query::{collect_index_key, diff_canonical, require_index};
 use validate::{apply_defaults, matches_filter, stamp_ttl_default, stamp_updated_at};
 
 // Public API re-exports (preserves `par_rt_db_client::in_memory::*`).

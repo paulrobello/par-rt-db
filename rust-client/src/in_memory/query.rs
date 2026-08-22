@@ -38,6 +38,28 @@ impl InMemoryRtDbClient {
     /// its combination guards reject `count`/`unique`/`first`/`take`.
     pub fn run_query(&self, q: &Query) -> Result<Value, RtDbError> {
         let table_def = self.require_table(&q.table)?.clone();
+        // Projection validation runs before every early return so all terminals
+        // (including `get`) reject unknown field names up front — the same
+        // compile-time gate the server runs in `compile_query` (and `/explain`).
+        if let Some(fields) = &q.fields {
+            validate_projection(&table_def, fields)?;
+        }
+        let result = self.execute_query(q, &table_def)?;
+        // Apply the caller's field projection at this one seam: every
+        // doc-bearing terminal's docs flow back through here (mirrors server
+        // `execute_query`), so one pass covers one-shot reads and every
+        // subscription re-run — whose diff then sees the projected shape.
+        Ok(match q.fields {
+            Some(_) => project_result(result, q),
+            None => result,
+        })
+    }
+
+    /// The terminal dispatch behind [`run_query`](Self::run_query): guards,
+    /// standalone terminals, then the shared scan → per-terminal executors.
+    /// The projection seam in `run_query` wraps this, so nothing here needs
+    /// to know about `fields`.
+    fn execute_query(&self, q: &Query, table_def: &TableDef) -> Result<Value, RtDbError> {
         let eq = &q.eq;
         let has_range = q.gt.is_some() || q.gte.is_some() || q.lt.is_some() || q.lte.is_some();
 
@@ -57,7 +79,7 @@ impl InMemoryRtDbClient {
         // the previous stub returned `[]` unconditionally, which diverged from
         // the server (and the other clients) on every non-empty match.
         if let Some(vector) = &q.vector_search {
-            return self.execute_vector_search_terminal(q, vector, &table_def, eq, has_range);
+            return self.execute_vector_search_terminal(q, vector, table_def, eq, has_range);
         }
 
         // `hybridSearch` terminal — cascade mirror of server `execute_query`.
@@ -84,10 +106,10 @@ impl InMemoryRtDbClient {
         // match. `mode: "trgm"` (FM-30) instead substring-matches and ranks
         // by approximate similarity — see `execute_search_terminal`.
         if let Some(search) = &q.search {
-            return self.execute_search_terminal(q, search, &table_def, eq, has_range);
+            return self.execute_search_terminal(q, search, table_def, eq, has_range);
         }
 
-        let plan = prepare_scan(q, &table_def, eq, has_range)?;
+        let plan = prepare_scan(q, table_def, eq, has_range)?;
         let mut filtered = self.fetch_filtered_rows(q, &plan, &table_def.fields);
 
         // `count` short-circuits before the sort (the count is the cardinality
@@ -103,7 +125,7 @@ impl InMemoryRtDbClient {
         // last in ASC).
         if q.distinct {
             return self.execute_distinct_terminal(
-                &table_def,
+                table_def,
                 plan.index_def.as_ref(),
                 &plan.typed_eq,
                 &filtered,
@@ -119,7 +141,7 @@ impl InMemoryRtDbClient {
         if let Some(agg) = &q.aggregate {
             return self.execute_aggregate_terminal(
                 agg,
-                &table_def,
+                table_def,
                 plan.index_def.as_ref(),
                 &plan.typed_eq,
                 &filtered,
@@ -130,7 +152,7 @@ impl InMemoryRtDbClient {
         // `_creationTime`, then `_id`. The unique `id` tiebreaker means the
         // order is total — no row is ambiguous relative to another.
         let dir = q.order.unwrap_or(Order::Asc);
-        sort_filtered_rows(&mut filtered, &table_def, &plan, dir);
+        sort_filtered_rows(&mut filtered, table_def, &plan, dir);
 
         // `paginate` terminal: keyset-cursor paging over the sorted set. Ports
         // TS `executeQuery` :1135-1137 → `paginateResult` (`:1164-1202`). The
@@ -138,7 +160,7 @@ impl InMemoryRtDbClient {
         // eq prefix, then `_creationTime`, then `_id`); the cursor encodes one
         // value per column.
         if let Some(pag) = &q.paginate {
-            return execute_paginate_terminal(pag, &table_def, &filtered, &plan, dir);
+            return execute_paginate_terminal(pag, table_def, &filtered, &plan, dir);
         }
 
         self.execute_collect_terminal(q, filtered)
@@ -785,6 +807,115 @@ impl InMemoryRtDbClient {
             .collect();
         Ok(Value::Array(out))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Field projection (`Query.fields`) — mirrors server `query/mod.rs`'s
+// `validate_projection` / `project_result` / `diff_canonical` and the
+// ts-client's `validateProjection` / `projectResult` / `stripVersionForDiff`.
+// ---------------------------------------------------------------------------
+
+/// The always-included system fields — listing one in a `fields` projection is
+/// an accepted no-op (server `validate_projection`'s `SYSTEM_FIELDS`).
+const PROJECTION_SYSTEM_FIELDS: [&str; 3] = ["_id", "_creationTime", "_version"];
+
+/// Validate a `fields` projection against the table: every name must be a
+/// declared field or one of the system fields (`_id`/`_creationTime`/
+/// `_version` — always included, so listing them is an allowed no-op).
+/// Anything else — including typo'd system names and other `_`-prefixed
+/// names — is `BAD_REQUEST` at compile time, the same gate the server runs
+/// in `compile_query` (and `/explain`). `[]` (system fields only) validates
+/// trivially.
+fn validate_projection(table_def: &TableDef, fields: &[String]) -> Result<(), RtDbError> {
+    for name in fields {
+        if PROJECTION_SYSTEM_FIELDS.contains(&name.as_str()) || table_def.fields.contains_key(name)
+        {
+            continue;
+        }
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            format!("unknown projection field '{name}'"),
+        ));
+    }
+    Ok(())
+}
+
+/// Apply `f` to every doc of an executed result, in place. The result shape is
+/// taken from the query's terminal (mirroring the server's match over the
+/// `QueryResult` enum and the ts `mapResultDocs`), never sniffed from the
+/// value — a grouped aggregate's `[{key,value}]` rows must not be mistaken
+/// for a docs array. Doc-less terminals (`count`/`distinct`/`aggregate`) and
+/// non-doc values pass through unchanged, which is what makes those terminals
+/// unaffected by projection by construction.
+fn map_result_docs(q: &Query, result: &mut Value, mut f: impl FnMut(&mut Map<String, Value>)) {
+    if q.count || q.distinct || q.aggregate.is_some() {
+        return;
+    }
+    if q.paginate.is_some() {
+        // The paginate envelope `{docs, nextCursor?}`: visit only the docs —
+        // `nextCursor` was minted from the unprojected row inside the
+        // terminal and must survive untouched.
+        if let Some(docs) = result.get_mut("docs").and_then(Value::as_array_mut) {
+            for doc in docs {
+                if let Some(m) = doc.as_object_mut() {
+                    f(m);
+                }
+            }
+        }
+        return;
+    }
+    match result {
+        // get / unique / first: one doc (or null).
+        Value::Object(m) => f(m),
+        // collect / search / vectorSearch / hybridSearch: an array of docs.
+        Value::Array(docs) => {
+            for doc in docs {
+                if let Some(m) = doc.as_object_mut() {
+                    f(m);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Apply a `Query::fields` projection to an executed result: each doc keeps
+/// its `_`-prefixed keys (exactly the system fields plus synthetics like
+/// `_searchSnippet` — user fields can never be `_`-prefixed, `validate_doc`
+/// rejects them at write time) and the listed user fields; every other user
+/// field is dropped. Sorting, cursors, and snippets were computed on the
+/// unprojected rows inside the terminals, so cursors still work and
+/// `_searchSnippet` survives. `Map::retain` preserves key order, so
+/// `canonical` output stays stable across subscription re-runs.
+fn project_result(mut result: Value, q: &Query) -> Value {
+    let Some(fields) = q.fields.as_deref() else {
+        return result;
+    };
+    map_result_docs(q, &mut result, |doc| {
+        doc.retain(|k, _| k.starts_with('_') || fields.iter().any(|f| f == k));
+    });
+    result
+}
+
+/// The canonical a subscription diffs against for push decisions (a port of
+/// server `diff_canonical`). For an UNPROJECTED query this is the plain
+/// [`canonical`] — byte-identical push semantics to pre-projection behavior.
+/// For a PROJECTED query (`fields` set) the volatile `_version` is stripped
+/// from every doc before comparing: `_version` bumps on every write, so an
+/// unstripped canonical would push on any member write even when no projected
+/// field changed — defeating the payload-width point of a projected
+/// subscription. Pushed payloads still carry `_version`; only the
+/// change-detection comparison ignores it. (A subscriber that must see every
+/// `_version` bump should use an unprojected subscription.)
+pub(super) fn diff_canonical(result: &Value, q: &Query) -> String {
+    if q.fields.is_none() {
+        return canonical(result);
+    }
+    let mut stripped = result.clone();
+    map_result_docs(q, &mut stripped, |doc| {
+        doc.remove("_version");
+    });
+    canonical(&stripped)
 }
 
 /// Conflicting-terminal guards, in the server's validation order: each

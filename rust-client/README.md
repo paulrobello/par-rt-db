@@ -22,8 +22,10 @@ Crate name: `par-rt-db-client` → in Rust, `use par_rt_db_client::...`.
 no features. `[lints.rust] warnings = "deny"` — same zero-warning posture as the
 server.
 
-The `http` surface also carries `.filter()` / `.search()` / `.vector_search()`
-query builders (predicate, full-text, and vector-similarity terminals;
+The `http` surface also carries `.filter()` / `.search()` / `.vector_search()` /
+`.fields()` query builders (predicate, full-text, vector-similarity terminals, and
+field projection — `.fields(&["title"])` keeps the listed user fields per
+result doc, system fields always kept, `&[]` an ids-only view, FM-38;
 `.search()` takes an optional `mode: "tsquery" | "trgm"` — `trgm` is
 substring/autocomplete matching ranked by pg_trgm similarity, FM-30 — and a
 `snippet: bool` opt, FM-31: the query text honors web-search operator syntax

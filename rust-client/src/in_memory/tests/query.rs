@@ -752,3 +752,288 @@ async fn query_rejects_conflicting_terminals() {
         );
     }
 }
+
+// ---- query: fields projection ------------------------------------
+
+/// An ordered collect with `fields(["name"])`: each doc keeps the listed user
+/// field plus every `_`-prefixed system field, drops the rest (status, order,
+/// note), and the projection never disturbs the sort (rows come back in
+/// index order n1, n2, n3).
+#[tokio::test]
+async fn projection_collect_keeps_listed_and_system_fields() {
+    let mut c = new_client();
+    seed_query_rows(&mut c).await;
+
+    let docs = c
+        .run_query(
+            &TableQuery::new("items")
+                .with_index("by_status_and_order", &[json!("todo")])
+                .order(Order::Asc)
+                .fields(&["name"])
+                .collect(),
+        )
+        .expect("projected collect ok");
+    let arr = docs.as_array().expect("collect returns array");
+    assert_eq!(arr.len(), 3);
+    let names: Vec<&str> = arr
+        .iter()
+        .map(|d| d["name"].as_str().expect("name kept"))
+        .collect();
+    assert_eq!(names, &["n1", "n2", "n3"], "sort order preserved");
+    for (i, doc) in arr.iter().enumerate() {
+        let keys: Vec<&str> = doc
+            .as_object()
+            .expect("doc")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            &["_creationTime", "_id", "_version", "name"],
+            "doc {i} keeps only the system fields + name (sorted-key order)"
+        );
+    }
+}
+
+/// `fields(&[])` is the meaningful ids-only view: every user field is dropped
+/// and each doc is exactly the three system fields.
+#[tokio::test]
+async fn projection_empty_list_is_system_fields_only() {
+    let mut c = new_client();
+    seed_query_rows(&mut c).await;
+
+    let docs = c
+        .run_query(
+            &TableQuery::new("items")
+                .with_index("by_status", &[json!("todo")])
+                .fields(&[])
+                .collect(),
+        )
+        .expect("empty projection ok");
+    for doc in docs.as_array().expect("collect returns array") {
+        let keys: Vec<&str> = doc
+            .as_object()
+            .expect("doc")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, &["_creationTime", "_id", "_version"]);
+    }
+}
+
+/// The `get` terminal projects too: a point-read keeps the listed user field
+/// and the system fields, drops the rest.
+#[tokio::test]
+async fn projection_get_terminal_projects_point_read() {
+    let mut c = new_client();
+    let results = c
+        .mutate(
+            &Mutation::new()
+                .insert("items", json!({"name": "a", "status": "todo", "order": 1}))
+                .build(),
+            None,
+        )
+        .await
+        .expect("insert");
+    let StepResult::Insert { id } = &results[0] else {
+        panic!("expected Insert step result");
+    };
+    let doc = c
+        .run_query(&Query {
+            table: "items".into(),
+            get: Some(id.clone()),
+            fields: Some(vec!["name".into()]),
+            ..Default::default()
+        })
+        .expect("projected get ok");
+    assert_eq!(doc["name"], json!("a"));
+    assert_eq!(doc["_id"], json!(id));
+    assert!(doc["_version"].is_number());
+    assert!(doc.get("status").is_none() && doc.get("order").is_none());
+}
+
+/// `fields` composes with `paginate`: page docs are projected, while the
+/// next cursor — minted from the unprojected row inside the terminal, before
+/// projection — still resumes the scan at the right row.
+#[tokio::test]
+async fn projection_paginate_projects_docs_and_keeps_cursor_paging() {
+    let mut c = new_client();
+    seed_query_rows(&mut c).await;
+
+    let page1 = c
+        .run_query(
+            &TableQuery::new("items")
+                .with_index("by_status_and_order", &[json!("todo")])
+                .order(Order::Asc)
+                .fields(&["name"])
+                .paginate(None, 2),
+        )
+        .expect("page 1 ok");
+    let docs1 = page1["docs"].as_array().expect("page docs");
+    assert_eq!(docs1.len(), 2);
+    for doc in docs1 {
+        assert!(doc.get("name").is_some());
+        assert!(doc.get("order").is_none(), "unlisted field dropped");
+    }
+    let cursor = page1["nextCursor"]
+        .as_str()
+        .expect("cursor present")
+        .to_string();
+
+    let page2 = c
+        .run_query(
+            &TableQuery::new("items")
+                .with_index("by_status_and_order", &[json!("todo")])
+                .order(Order::Asc)
+                .fields(&["name"])
+                .paginate(Some(&cursor), 2),
+        )
+        .expect("page 2 ok");
+    let docs2 = page2["docs"].as_array().expect("page docs");
+    assert_eq!(docs2.len(), 1, "cursor resumed past the first page");
+    assert_eq!(docs2[0]["name"], json!("n3"));
+    assert!(page2.get("nextCursor").is_none(), "last page has no cursor");
+}
+
+/// An unknown name (not a declared field, not one of the three system fields)
+/// is BAD_REQUEST — including on the `get` terminal, where validation runs
+/// before every early return (the compile-time gate, not a post-check).
+#[tokio::test]
+async fn projection_unknown_field_is_bad_request() {
+    let mut c = new_client();
+    seed_query_rows(&mut c).await;
+    let err = c
+        .run_query(
+            &TableQuery::new("items")
+                .with_index("by_status", &[json!("todo")])
+                .fields(&["name", "bogus"])
+                .collect(),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(
+        err.message.contains("unknown projection field 'bogus'"),
+        "got: {err}"
+    );
+
+    // The `get` terminal rejects too (validation precedes the get early return).
+    let err = c
+        .run_query(&Query {
+            table: "items".into(),
+            get: Some("x".into()),
+            fields: Some(vec!["nope".into()]),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(err.message.contains("unknown projection field 'nope'"));
+}
+
+/// Listing a system field is an accepted no-op (system fields are always
+/// included anyway); listing ONLY system fields equals the ids-only view.
+#[tokio::test]
+async fn projection_system_field_names_are_accepted_noops() {
+    let mut c = new_client();
+    seed_query_rows(&mut c).await;
+    let docs = c
+        .run_query(
+            &TableQuery::new("items")
+                .with_index("by_status", &[json!("todo")])
+                .fields(&["_id", "_creationTime", "_version"])
+                .collect(),
+        )
+        .expect("system names validate trivially");
+    assert_eq!(docs.as_array().expect("docs").len(), 3);
+}
+
+/// Doc-less terminals are unaffected: `count` still returns a bare number,
+/// `distinct` a plain scalar array, and a grouped `aggregate` its
+/// `[{key, value}]` rows — the projection never mistakes those rows for docs.
+#[tokio::test]
+async fn projection_doc_less_terminals_unaffected() {
+    let mut c = new_client();
+    seed_query_rows(&mut c).await;
+    c.mutate(
+        &Mutation::new()
+            .insert("items", json!({"name": "n4", "status": "done", "order": 5}))
+            .build(),
+        None,
+    )
+    .await
+    .expect("insert done row");
+
+    let count = c
+        .run_query(
+            &TableQuery::new("items")
+                .with_index("by_status", &[json!("todo")])
+                .fields(&["name"])
+                .count(),
+        )
+        .expect("count ok");
+    assert_eq!(count, json!(3));
+
+    let distinct = c
+        .run_query(
+            &TableQuery::new("items")
+                .with_index("by_status_and_order", &[json!("todo")])
+                .fields(&["name"])
+                .distinct(),
+        )
+        .expect("distinct ok");
+    assert_eq!(distinct, json!([1, 2, 3]));
+
+    let grouped = c
+        .run_query(
+            &TableQuery::new("items")
+                .with_index("by_status_and_order", &[])
+                .fields(&["name"])
+                .aggregate(AggregateOp::Sum, true),
+        )
+        .expect("grouped aggregate ok");
+    assert_eq!(
+        grouped,
+        json!([{"key": "done", "value": 5.0}, {"key": "todo", "value": 6.0}]),
+        "aggregate rows keep their key/value shape (sorted by group key) under a projection"
+    );
+}
+
+/// A search hit keeps its synthetic `_searchSnippet` (the `_`-prefix rule)
+/// alongside the listed user fields, while ranking ran on the unprojected
+/// rows inside the terminal.
+#[tokio::test]
+async fn projection_search_keeps_snippet_synthetic() {
+    let mut c = new_client();
+    c.mutate(
+        &Mutation::new()
+            .insert(
+                "items",
+                json!({"name": "hello world", "status": "todo", "order": 1}),
+            )
+            .build(),
+        None,
+    )
+    .await
+    .expect("insert");
+
+    let hits = c
+        .run_query(
+            &TableQuery::new("items")
+                .search(
+                    "by_content",
+                    "hello",
+                    SearchOpts {
+                        snippet: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .fields(&["name"])
+                .collect(),
+        )
+        .expect("projected search ok");
+    let arr = hits.as_array().expect("search returns array");
+    assert_eq!(arr.len(), 1);
+    let hit = &arr[0];
+    assert!(hit.get("_searchSnippet").is_some(), "synthetic kept");
+    assert_eq!(hit["name"], json!("hello world"));
+    assert!(hit.get("status").is_none() && hit.get("order").is_none());
+}

@@ -107,6 +107,14 @@ pub struct Query {
         skip_serializing_if = "Option::is_none"
     )]
     pub hybrid_search: Option<crate::wire::HybridSearchQuery>,
+    /// Projection: keep only these user fields per result doc. Every
+    /// `_`-prefixed key (the system fields `_id`/`_creationTime`/`_version`
+    /// plus synthetics like `_searchSnippet`) is always kept, so listing one
+    /// is an accepted no-op. `Some(vec![])` is a meaningful system-fields-only
+    /// (ids-only) view, not treated as absent; `None` (omitted on the wire) is
+    /// full docs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<String>>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -266,6 +274,21 @@ impl TableQuery {
     /// bounds/`order`/`take`; the server validates terminal combinations.
     pub fn filter(mut self, expr: FilterExpr) -> Self {
         self.q.filter = Some(expr);
+        self
+    }
+
+    /// Field projection: each result doc keeps only the listed user fields
+    /// plus every `_`-prefixed key (the system fields
+    /// `_id`/`_creationTime`/`_version` and synthetics like `_searchSnippet`
+    /// — always present; listing one is an accepted no-op). Passing an empty
+    /// slice (`.fields(&[])`) is the meaningful system-fields-only (ids-only)
+    /// view. Composes with every doc-bearing terminal (get / collect / first /
+    /// unique / paginate and the search family); doc-less terminals (count /
+    /// distinct / aggregate) are unaffected. Not a terminal. Unknown names are
+    /// rejected `BAD_REQUEST` by the server (and the in-memory harness) at
+    /// compile time.
+    pub fn fields(mut self, names: &[&str]) -> Self {
+        self.q.fields = Some(names.iter().map(|n| (*n).to_string()).collect());
         self
     }
 
@@ -661,6 +684,50 @@ mod tests {
                 {"op":"in","field":"status","values":["blocked","backlog"]},
                 {"op":"lte","field":"order","value":3}
             ]}})
+        );
+    }
+
+    #[test]
+    fn fields_builder_serializes_projection() {
+        // Non-empty `fields` rides the wire as a plain array key (mirrors
+        // server `Query.fields`); system-field names pass through verbatim.
+        let q = TableQuery::new("workItems")
+            .with_index("by_status", &[json!("backlog")])
+            .fields(&["title", "status", "_id"])
+            .take(10);
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"table":"workItems","index":"by_status","eq":["backlog"],"fields":["title","status","_id"],"take":10})
+        );
+    }
+
+    #[test]
+    fn fields_empty_slice_is_ids_only_view_on_wire() {
+        // `fields(&[])` is `Some(vec![])` — a meaningful system-fields-only
+        // view — so the empty array is preserved, not omitted.
+        let q = TableQuery::new("items").fields(&[]).collect();
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"table":"items","fields":[]})
+        );
+    }
+
+    #[test]
+    fn fields_round_trips_none_and_some() {
+        // Absent on the wire parses to `None` and serializes back without the
+        // key (skip_serializing_if); a present list round-trips value-identically.
+        let bare: Query = serde_json::from_value(json!({"table":"items"})).unwrap();
+        assert!(bare.fields.is_none());
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap(),
+            json!({"table":"items"})
+        );
+        let projected: Query =
+            serde_json::from_value(json!({"table":"items","fields":["name"]})).unwrap();
+        assert_eq!(projected.fields, Some(vec!["name".to_string()]));
+        assert_eq!(
+            serde_json::to_value(&projected).unwrap(),
+            json!({"table":"items","fields":["name"]})
         );
     }
 
