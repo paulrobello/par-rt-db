@@ -486,6 +486,7 @@ fn rename_filter_fields(expr: &mut FilterExpr, from: &str, to: &str) {
         | FilterExpr::Lte { field, .. }
         | FilterExpr::In { field, .. }
         | FilterExpr::Contains { field, .. }
+        | FilterExpr::OlderThan { field, .. }
         | FilterExpr::Exists { field } => {
             if field == from {
                 *field = to.to_string();
@@ -848,6 +849,17 @@ fn validate_computed_case_whens(ve: &crate::value_expr::ValueExpr) -> Result<(),
                         ),
                     ));
                 }
+                // `olderThan` is by-query-only: a computed `case` when runs on
+                // every write, and an execution-time-relative cutoff has no
+                // meaning there (the server rejects it via the same
+                // `validate_filter_expr_fields(_, _, false, false)` call,
+                // mapped to BAD_REQUEST like every computed rule).
+                if filter_expr_has_older_than(&cw.when) {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        "olderThan filter is only allowed in patchByQuery/deleteByQuery filters",
+                    ));
+                }
                 validate_computed_case_whens(&cw.then)?;
             }
             validate_computed_case_whens(otherwise)
@@ -891,11 +903,29 @@ fn filter_expr_marker_field(expr: &FilterExpr) -> Option<String> {
             .iter()
             .any(is_principal_marker)
             .then(|| field.clone()),
-        FilterExpr::Exists { .. } => None,
+        FilterExpr::Exists { .. } | FilterExpr::OlderThan { .. } => None,
         FilterExpr::And { exprs } | FilterExpr::Or { exprs } => {
             exprs.iter().find_map(filter_expr_marker_field)
         }
         FilterExpr::Not { expr } => filter_expr_marker_field(expr),
+    }
+}
+
+/// Whether the expression contains an `olderThan` leaf anywhere — the
+/// push-time context gate. `olderThan`'s cutoff is execution-time-relative,
+/// so the schema-declared surfaces that would freeze it (`authorize`
+/// predicates, partial-index `where` predicates, computed `case` whens)
+/// reject it at push, mirroring server `validate_structure`'s authorize walk
+/// (via `validate_filter_expr_fields(_, _, _, false)`), DDL's
+/// `compile_filter_literal` arm, and `validate_computed_case_whens`.
+fn filter_expr_has_older_than(expr: &FilterExpr) -> bool {
+    match expr {
+        FilterExpr::OlderThan { .. } => true,
+        FilterExpr::And { exprs } | FilterExpr::Or { exprs } => {
+            exprs.iter().any(filter_expr_has_older_than)
+        }
+        FilterExpr::Not { expr } => filter_expr_has_older_than(expr),
+        _ => false,
     }
 }
 
@@ -982,7 +1012,33 @@ impl SchemaDef {
     /// [`InMemoryRtDbClient::push_schema`] before the destructive-change check.
     pub fn validate(&self) -> Result<(), RtDbError> {
         for (table_name, table) in &self.tables {
+            // `olderThan` context gate for `authorize` (server
+            // `validate_structure`'s `validate_filter_expr_fields(authorize,
+            // _, true, false)` call): an authorize predicate is evaluated per
+            // write per principal, and an execution-time-relative cutoff has
+            // no meaning on that surface — SCHEMA_VIOLATION, same as the
+            // server's push-time rejection.
+            if let Some(authorize) = &table.authorize
+                && filter_expr_has_older_than(authorize)
+            {
+                return Err(RtDbError::new(
+                    ErrorCode::SchemaViolation,
+                    "olderThan filter is only allowed in patchByQuery/deleteByQuery filters",
+                ));
+            }
             for index in table.indexes.iter().flatten() {
+                // A partial-index `where` predicate is baked into DDL as a
+                // literal — an execution-time-relative cutoff has no static
+                // meaning there (the server rejects it in
+                // `compile_filter_literal`, BAD_REQUEST).
+                if let Some(pred) = &index.r#where
+                    && filter_expr_has_older_than(pred)
+                {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        "olderThan filter is not allowed in a partial-index predicate",
+                    ));
+                }
                 if index.fields.is_empty() {
                     return Err(RtDbError::new(
                         ErrorCode::SchemaViolation,

@@ -1,0 +1,23 @@
+{
+  "name": "error-read-filter-older-than-rejected",
+  "$comment": "olderThan is by-query-only: a read/query filter carrying it is rejected. A live subscription would go stale between writes (nothing re-evaluates a wall-clock window on a timer), so the read path refuses the operator.",
+  "schema": {
+    "tables": {
+      "items": {
+        "fields": {
+          "title": { "type": "string" },
+          "completedAt": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_title", "fields": ["title"] }]
+      }
+    }
+  },
+  "seed": [{ "$id": "a", "doc": { "title": "a", "completedAt": 1 } }],
+  "op": {
+    "query": {
+      "table": "items",
+      "filter": { "op": "olderThan", "field": "completedAt", "ms": 1000000000000 }
+    }
+  },
+  "expect": { "error": { "code": "BAD_REQUEST" } }
+}

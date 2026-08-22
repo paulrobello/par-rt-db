@@ -26,16 +26,22 @@ from ..wire import (
     _FilterLte,
     _FilterNeq,
     _FilterNot,
+    _FilterOlderThan,
     _FilterOr,
 )
 
 
-def _validate_filter(expr: FilterExpr, table_def: TableDef) -> None:
+def _validate_filter(
+    expr: FilterExpr, table_def: TableDef, *, allow_relative_time: bool = False
+) -> None:
     """Structural + value-kind validation of a ``FilterExpr`` against a table's
     declared fields (the prologue the server runs in ``compile_filter``).
     Raises ``BAD_REQUEST`` for an empty ``and``/``or``/``in``, an unknown field,
     a non-string/number/boolean leaf value, mixed-type ``in`` values, or a value
-    whose JSON kind does not match the field's declared type (SEC-126)."""
+    whose JSON kind does not match the field's declared type (SEC-126).
+    ``allow_relative_time`` admits the ``olderThan`` leaf — only the by-query
+    step filters pass ``True`` (server ``compile_scan_where``); every read-path
+    caller keeps the default, which rejects it there."""
     match expr:
         case _FilterAnd(exprs=exprs) | _FilterOr(exprs=exprs):
             if not exprs:
@@ -43,7 +49,7 @@ def _validate_filter(expr: FilterExpr, table_def: TableDef) -> None:
                     ErrorCode.BAD_REQUEST, f"{expr.op} filter requires at least one expr"
                 )
             for e in exprs:
-                _validate_filter(e, table_def)
+                _validate_filter(e, table_def, allow_relative_time=allow_relative_time)
         case _FilterIn(field=fld, values=values):
             if not values:
                 raise RtDbError(ErrorCode.BAD_REQUEST, "in filter requires at least one value")
@@ -65,8 +71,30 @@ def _validate_filter(expr: FilterExpr, table_def: TableDef) -> None:
             | _FilterLte(field=fld, value=val)
         ):
             _check_leaf_value(fld, val, table_def)
+        case _FilterOlderThan(field=fld, ms=ms):
+            # Server validation order (schema.rs validate_filter_expr_fields):
+            # context, then ms, then declared field, then numeric type.
+            if not allow_relative_time:
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    "olderThan filter is only allowed in patchByQuery/deleteByQuery filters",
+                )
+            if ms < 0:
+                raise RtDbError(ErrorCode.BAD_REQUEST, "olderThan ms must be >= 0")
+            if fld not in table_def.fields:
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST, f"filter references undeclared field '{fld}'"
+                )
+            ty = table_def.fields[fld]
+            if _field_type_tag(ty) == "optional":
+                ty = ty.get("inner") if isinstance(ty, dict) else getattr(ty, "inner", None)
+            if _field_type_tag(ty) not in ("number", "int64"):
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    f"field '{fld}' must be a number or int64 field for olderThan",
+                )
         case _FilterNot(expr=inner):
-            _validate_filter(inner, table_def)
+            _validate_filter(inner, table_def, allow_relative_time=allow_relative_time)
         case _FilterContains(field=fld, value=val):
             _check_leaf_value(fld, val, table_def)
         case _FilterExists(field=fld):
@@ -133,7 +161,9 @@ def _in_value_kind(value: Any) -> str:
     return "boolean"
 
 
-def _eval_filter_expr(expr: FilterExpr, doc: dict[str, Any], fields: Mapping[str, Any]) -> bool:
+def _eval_filter_expr(
+    expr: FilterExpr, doc: dict[str, Any], fields: Mapping[str, Any], now: int | None = None
+) -> bool:
     """Evaluate a ``FilterExpr`` predicate against a stored doc. The filter
     value's kind picks the comparison domain — string compares the doc field's
     ``->>`` text, number compares it as ``float8``, boolean as ``boolean`` —
@@ -142,12 +172,17 @@ def _eval_filter_expr(expr: FilterExpr, doc: dict[str, Any], fields: Mapping[str
     strings must order ``-605 < -1 < 15``, not lexicographically (ENH-027
     parity fix). A null/absent field never matches (SQL NULL exclusion).
     ``fields`` is the table's declared field map (pass an empty mapping for
-    type-less evaluation, e.g. unit tests). Assumes ``_validate_filter`` passed."""
+    type-less evaluation, e.g. unit tests). ``now`` is the execution clock the
+    ``olderThan`` cutoff derives from — the by-query step evaluation passes the
+    engine's injected clock; every other caller leaves it ``None``, where an
+    ``olderThan`` leaf fail-closes to ``False`` (mirrors the server's
+    ``filter_matches`` unreachable arm — validation keeps it off those paths).
+    Assumes ``_validate_filter`` passed."""
     match expr:
         case _FilterAnd(exprs=exprs):
-            return all(_eval_filter_expr(e, doc, fields) for e in exprs)
+            return all(_eval_filter_expr(e, doc, fields, now) for e in exprs)
         case _FilterOr(exprs=exprs):
-            return any(_eval_filter_expr(e, doc, fields) for e in exprs)
+            return any(_eval_filter_expr(e, doc, fields, now) for e in exprs)
         case _FilterIn(field=fld, values=values):
             return any(_compare_leaf("eq", fld, v, doc, fields) for v in values)
         case (
@@ -160,15 +195,47 @@ def _eval_filter_expr(expr: FilterExpr, doc: dict[str, Any], fields: Mapping[str
         ):
             return _compare_leaf(expr.op, fld, val, doc, fields)
         case _FilterNot(expr=inner):
-            return not _eval_filter_expr(inner, doc, fields)
+            return not _eval_filter_expr(inner, doc, fields, now)
         case _FilterContains(field=fld, value=val):
             arr = doc.get(fld)
             want = json.dumps(val, sort_keys=True)
             return isinstance(arr, list) and any(json.dumps(v, sort_keys=True) == want for v in arr)
         case _FilterExists(field=fld):
             return doc.get(fld) is not None
+        case _FilterOlderThan(field=fld, ms=ms):
+            return now is not None and _older_than_matches(doc.get(fld), ms, now, fields.get(fld))
         case _:
             return False
+
+
+def _older_than_matches(doc_val: Any, ms: int, now: int, ty: Any) -> bool:
+    """One ``olderThan`` leaf: ``doc_val < now − ms``, strict. A null, absent,
+    boolean, or non-numeric value never matches (SQL NULL / cast failure). A
+    declared ``int64`` field holds its decimal-string wire form end to end, so
+    string values parse exactly as i64 (``_parse_i64_exact`` — ASCII-strict);
+    a ``number`` field's string values parse through the strict decimal
+    grammar (``value_expr._NUMERIC_RE``, mirroring ``f64::from_str`` — Python
+    ``float()`` alone would accept forms Rust rejects)."""
+    if doc_val is None or isinstance(doc_val, bool):
+        return False
+    cutoff = now - ms
+    if isinstance(doc_val, int):
+        return doc_val < cutoff
+    if isinstance(doc_val, float):
+        return math.isfinite(doc_val) and doc_val < cutoff
+    if isinstance(doc_val, str):
+        if _is_int64_field(ty):
+            n = _parse_i64_exact(doc_val)
+            return n is not None and n < cutoff
+        # Deferred import: value_expr imports this module at load time.
+        from .value_expr import _NUMERIC_RE
+
+        s = doc_val.strip()
+        if _NUMERIC_RE.fullmatch(s) is None:
+            return False
+        f = float(s)
+        return math.isfinite(f) and f < cutoff
+    return False
 
 
 def _compare_leaf(
@@ -224,7 +291,7 @@ def _is_int64_field(ty: Any) -> bool:
     return False
 
 
-_I64_RE = re.compile(r"[+-]?\d+")
+_I64_RE = re.compile(r"[+-]?\d+", re.ASCII)
 
 
 def _parse_i64_exact(s: str) -> int | None:

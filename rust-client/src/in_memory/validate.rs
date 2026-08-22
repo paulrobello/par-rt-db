@@ -401,11 +401,34 @@ enum ValueKind {
 /// `field_lhs_and_bind` typing) and the TS `validateFilter`
 /// (`ts-client/src/in_memory.ts:361-386`). Returns `BAD_REQUEST` for: an empty
 /// `and`/`or`, an empty `in`, an unknown field, a non-string/number/boolean
-/// leaf value, mixed-type `in` values, or a value whose JSON kind does not
+/// leaf value, mixed-type `in` values, a value whose JSON kind does not
 /// match the field's declared type (SEC-126 — indexed fields type through the
-/// eq-bind conversion, other declared fields through the jsonb kind check).
+/// eq-bind conversion, other declared fields through the jsonb kind check),
+/// or an `olderThan` leaf — this is the READ-context entry point; only
+/// [`validate_by_query_filter`] (the by-query step filters) admits it.
 /// Call once before evaluating per row.
 pub fn validate_filter(expr: &FilterExpr, table: &TableDef) -> Result<(), RtDbError> {
+    validate_filter_expr_fields(expr, table, false)
+}
+
+/// The by-query step-filter chokepoint (`patchByQuery`/`deleteByQuery`) — the
+/// ONE filter context that accepts the execution-time-relative `olderThan`
+/// leaf, mirroring server `compile_scan_where`'s
+/// `compile_filter(.., allow_relative_time = true)`: its cutoff is derived
+/// from the engine clock at execution (per fire for a scheduled txn), which
+/// is the whole point of the operator.
+pub fn validate_by_query_filter(expr: &FilterExpr, table: &TableDef) -> Result<(), RtDbError> {
+    validate_filter_expr_fields(expr, table, true)
+}
+
+/// Core walk behind both entry points — the `allow_relative_time` axis of
+/// server `schema::validate_filter_expr_fields` (the engine's filter
+/// validation has no principal-marker mode, so this flag is the only axis).
+fn validate_filter_expr_fields(
+    expr: &FilterExpr,
+    table: &TableDef,
+    allow_relative_time: bool,
+) -> Result<(), RtDbError> {
     match expr {
         FilterExpr::And { exprs } => {
             if exprs.is_empty() {
@@ -415,7 +438,7 @@ pub fn validate_filter(expr: &FilterExpr, table: &TableDef) -> Result<(), RtDbEr
                 ));
             }
             for e in exprs {
-                validate_filter(e, table)?;
+                validate_filter_expr_fields(e, table, allow_relative_time)?;
             }
             Ok(())
         }
@@ -427,7 +450,7 @@ pub fn validate_filter(expr: &FilterExpr, table: &TableDef) -> Result<(), RtDbEr
                 ));
             }
             for e in exprs {
-                validate_filter(e, table)?;
+                validate_filter_expr_fields(e, table, allow_relative_time)?;
             }
             Ok(())
         }
@@ -462,7 +485,37 @@ pub fn validate_filter(expr: &FilterExpr, table: &TableDef) -> Result<(), RtDbEr
         | FilterExpr::Lt { field, value }
         | FilterExpr::Lte { field, value }
         | FilterExpr::Contains { field, value } => check_leaf(field, value, table),
-        FilterExpr::Not { expr } => validate_filter(expr, table),
+        // Execution-time-relative leaf, in the server's check order: context,
+        // ms >= 0, declared field, numeric field type. Everything except the
+        // context gate also guards the by-query path (the server runs the
+        // same four checks from `validate_filter_expr_fields` there).
+        FilterExpr::OlderThan { field, ms } => {
+            if !allow_relative_time {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "olderThan filter is only allowed in patchByQuery/deleteByQuery filters",
+                ));
+            }
+            if *ms < 0 {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "olderThan ms must be >= 0",
+                ));
+            }
+            let fty = leaf_field_type(field, table)?;
+            let inner = match fty {
+                FieldType::Optional { inner } => inner.as_ref(),
+                _ => fty,
+            };
+            if !matches!(inner, FieldType::Number | FieldType::Int64) {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    format!("field '{field}' must be a number or int64 field for olderThan"),
+                ));
+            }
+            Ok(())
+        }
+        FilterExpr::Not { expr } => validate_filter_expr_fields(expr, table, allow_relative_time),
         FilterExpr::Exists { field } => {
             leaf_field_type(field, table)?;
             Ok(())
@@ -578,15 +631,49 @@ fn in_value_kind(value: &Value) -> ValueKind {
 /// not lexicographically (ENH-027 parity fix). A null/absent field never
 /// matches (SQL NULL exclusion). `fields` is the table's declared field map
 /// (pass an empty map for type-less evaluation, e.g. unit tests). Assumes
-/// [`validate_filter`] already passed.
+/// [`validate_filter`] already passed. An `olderThan` leaf fail-closes to
+/// `false` here — this entry point serves the read filters, `authorize`
+/// predicates, case whens, and unique-index wheres, every one of which
+/// rejects the operator at validation (the by-query scan uses
+/// [`eval_filter_expr_at`], mirroring server `filter_matches`'s `false` arm).
 pub fn eval_filter_expr(
     expr: &FilterExpr,
     doc: &Value,
     fields: &BTreeMap<String, FieldType>,
 ) -> bool {
+    eval_filter_with_clock(expr, doc, fields, None)
+}
+
+/// The by-query evaluator: identical to [`eval_filter_expr`] except that an
+/// `olderThan` leaf compares the doc value against `now − ms` — strict
+/// less-than, with `now` the engine clock at execution. Callers read the
+/// clock ONCE per step (the server derives the cutoff a single time when it
+/// compiles the scan predicate), so every row of one scan sees the same
+/// cutoff.
+pub fn eval_filter_expr_at(
+    expr: &FilterExpr,
+    doc: &Value,
+    fields: &BTreeMap<String, FieldType>,
+    now: i64,
+) -> bool {
+    eval_filter_with_clock(expr, doc, fields, Some(now))
+}
+
+/// Shared core: `now` is `Some` only on the by-query path (the one context
+/// whose validation admits `olderThan`); `None` fail-closes that leaf.
+fn eval_filter_with_clock(
+    expr: &FilterExpr,
+    doc: &Value,
+    fields: &BTreeMap<String, FieldType>,
+    now: Option<i64>,
+) -> bool {
     match expr {
-        FilterExpr::And { exprs } => exprs.iter().all(|e| eval_filter_expr(e, doc, fields)),
-        FilterExpr::Or { exprs } => exprs.iter().any(|e| eval_filter_expr(e, doc, fields)),
+        FilterExpr::And { exprs } => exprs
+            .iter()
+            .all(|e| eval_filter_with_clock(e, doc, fields, now)),
+        FilterExpr::Or { exprs } => exprs
+            .iter()
+            .any(|e| eval_filter_with_clock(e, doc, fields, now)),
         FilterExpr::In { field, values } => values
             .iter()
             .any(|v| compare_leaf(FilterOp::Eq, field, v, doc, fields)),
@@ -596,12 +683,30 @@ pub fn eval_filter_expr(
         FilterExpr::Gte { field, value } => compare_leaf(FilterOp::Gte, field, value, doc, fields),
         FilterExpr::Lt { field, value } => compare_leaf(FilterOp::Lt, field, value, doc, fields),
         FilterExpr::Lte { field, value } => compare_leaf(FilterOp::Lte, field, value, doc, fields),
-        FilterExpr::Not { expr } => !eval_filter_expr(expr, doc, fields),
+        FilterExpr::Not { expr } => !eval_filter_with_clock(expr, doc, fields, now),
         FilterExpr::Contains { field, value } => match doc.get(field) {
             Some(Value::Array(arr)) => arr.iter().any(|v| v == value),
             _ => false,
         },
         FilterExpr::Exists { field } => matches!(doc.get(field), Some(v) if !v.is_null()),
+        // `now == None` is the fail-closed context (see `eval_filter_expr`).
+        // With a clock: strict `value < now − ms`; a null/absent/non-numeric
+        // value never matches (SQL NULL exclusion — the server's NULL lhs
+        // falls out of the `<` comparison). An int64 field's decimal-string
+        // wire form parses and compares exactly as i64 (the typed `bigint`
+        // column path — `i64::MAX` is not f64-exact); everything else
+        // compares as `float8` via `doc_to_number` (numeric strings parse,
+        // mirroring `(doc->>'f')::float8`).
+        FilterExpr::OlderThan { field, ms } => now.is_some_and(|now| {
+            let cutoff = now.saturating_sub(*ms);
+            match doc.get(field) {
+                Some(Value::String(s)) if is_int64_field(fields.get(field)) => {
+                    s.parse::<i64>().is_ok_and(|lhs| lhs < cutoff)
+                }
+                Some(v) if !v.is_null() => doc_to_number(v).is_some_and(|lhs| lhs < cutoff as f64),
+                _ => false,
+            }
+        }),
     }
 }
 

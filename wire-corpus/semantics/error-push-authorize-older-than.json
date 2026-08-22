@@ -1,0 +1,17 @@
+{
+  "name": "error-push-authorize-older-than",
+  "$comment": "olderThan is by-query-only, and the authorize predicate is validated at push with allow_relative_time=false — the push fails SCHEMA_VIOLATION (an authorize predicate would also run pre-stamp and per-row at read time, where a wall-clock window has no coherent meaning).",
+  "pushError": { "code": "SCHEMA_VIOLATION" },
+  "schema": {
+    "tables": {
+      "items": {
+        "fields": {
+          "title": { "type": "string" },
+          "completedAt": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_title", "fields": ["title"] }],
+        "authorize": { "op": "olderThan", "field": "completedAt", "ms": 1000 }
+      }
+    }
+  }
+}

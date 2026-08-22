@@ -7,7 +7,7 @@ Discriminator unions:
 * ``ScheduleWhen`` is tagged by ``type`` (camelCase variants:
   ``afterMs``/``runAt``/``cron``/``interval``).
 * ``FilterExpr`` is tagged by ``op`` (lowercase variants: ``eq``/``neq``/``gt``/``gte``/
-  ``lt``/``lte``/``in``/``and``/``or``/``not``/``contains``/``exists``).
+  ``lt``/``lte``/``in``/``and``/``or``/``not``/``contains``/``exists``/``olderThan``).
 
 Message and Schema families (``ClientMessage``/``ServerMessage``) are appended in
 later tasks; the leaf types below are placed so that append is clean.
@@ -335,6 +335,18 @@ class _FilterExists(_FilterLeaf):
     op: Literal["exists"] = "exists"
 
 
+class _FilterOlderThan(_FilterLeaf):
+    """Execution-time-relative age predicate (by-query step filters only —
+    ``patchByQuery``/``deleteByQuery``): the field's epoch-ms value is strictly
+    older than ``now − ms`` with ``now`` read from the engine clock at each
+    execution. Read/query filters, ``authorize`` predicates, partial-index
+    ``where`` predicates, and computed ``case`` whens reject it (mirrors
+    server ``dsl.rs::FilterExpr::OlderThan``)."""
+
+    op: Literal["olderThan"] = "olderThan"
+    ms: int
+
+
 FilterExpr = Annotated[
     (
         _FilterEq
@@ -349,6 +361,7 @@ FilterExpr = Annotated[
         | _FilterNot
         | _FilterContains
         | _FilterExists
+        | _FilterOlderThan
     ),
     Field(discriminator="op"),
 ]

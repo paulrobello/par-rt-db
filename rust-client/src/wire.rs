@@ -977,6 +977,23 @@ pub enum FilterExpr {
         /// The field to test.
         field: String,
     },
+    /// Execution-time-relative age predicate: the field's epoch-ms value is
+    /// strictly older than `now − ms`, with `now` read from the clock AT
+    /// EXECUTION TIME — a scheduled txn's stored filter stays fresh on every
+    /// fire instead of freezing a literal at schedule time (server-side
+    /// sweeps: archive done rows older than 7d, expire claim leases). Valid
+    /// ONLY in the by-query step filters (`patchByQuery`/`deleteByQuery`);
+    /// read-path filters, `authorize` predicates, partial-index `where`
+    /// predicates, and computed `case` whens reject it. The field must be
+    /// declared `number` or `int64` (a null or absent value never matches),
+    /// and `ms >= 0`.
+    #[serde(rename = "olderThan")]
+    OlderThan {
+        /// The declared field to test.
+        field: String,
+        /// Age window in milliseconds (`>= 0`).
+        ms: i64,
+    },
 }
 
 /// One slot of a `POST /api/query-batch` response. Mirrors server
@@ -1769,6 +1786,33 @@ mod tests {
         assert!(
             serde_json::from_value::<FilterExpr>(json!({"op":"exists","field":"x","bogus":true}))
                 .is_err()
+        );
+    }
+
+    // `olderThan` — execution-time-relative leaf, by-query step filters only.
+    // The per-variant rename is load-bearing: `rename_all = "lowercase"` on
+    // the enum would tag it "olderthan", but the wire contract is camelCase.
+    #[test]
+    fn filter_expr_older_than_variant() {
+        let older = FilterExpr::OlderThan {
+            field: "completedAt".into(),
+            ms: 604800000,
+        };
+        assert_eq!(
+            serde_json::to_value(&older).unwrap(),
+            json!({"op":"olderThan","field":"completedAt","ms":604800000})
+        );
+        let back: FilterExpr =
+            serde_json::from_value(serde_json::to_value(&older).unwrap()).unwrap();
+        assert!(
+            matches!(back, FilterExpr::OlderThan { ref field, ms } if field == "completedAt" && ms == 604800000)
+        );
+        // deny_unknown_fields: exactly two payload fields.
+        assert!(
+            serde_json::from_value::<FilterExpr>(
+                json!({"op":"olderThan","field":"x","ms":1,"bogus":true})
+            )
+            .is_err()
         );
     }
 

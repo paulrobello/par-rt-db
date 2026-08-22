@@ -25,7 +25,13 @@ import type {
   ValueExprJson,
 } from "../protocol.js";
 import type { StoredRow } from "./store.js";
-import { clone, indexColumnType, isInt64String, walkValueExprFields } from "./validate.js";
+import {
+  clone,
+  filterContainsOlderThan,
+  indexColumnType,
+  isInt64String,
+  walkValueExprFields,
+} from "./validate.js";
 
 /** Returns the values a finite literal-union (or lone literal) accepts, mirroring
  *  server `schema::literal_set`: a lone `literal` yields its single value, and a
@@ -138,10 +144,27 @@ export function detectDestructiveChanges(oldSchema: SchemaJson, newSchema: Schem
  *  fields, and a TTL must name a numeric field carrying a single-field,
  *  non-unique, non-partial btree index. Deliberately a subset — identifier
  *  formats, owner/collaborator fields, defaults, and `onDelete` shapes stay
- *  server-side (the last has its own `validateOnDelete` pass). */
+ *  server-side (the last has its own `validateOnDelete` pass) — EXCEPT the
+ *  `olderThan` boundary: `authorize` predicates reject the op here
+ *  (SCHEMA_VIOLATION, like the server's `validate_structure` arm) and
+ *  partial-index `where` predicates reject it (BAD_REQUEST, the server's
+ *  partial-index literal-compile arm), since an execution-time-relative
+ *  cutoff has no static meaning in either. */
 export function validateSchema(schema: SchemaJson): void {
   for (const [tableName, table] of Object.entries(schema.tables)) {
+    if (table.authorize !== undefined && filterContainsOlderThan(table.authorize)) {
+      throw new RtDbError(
+        "SCHEMA_VIOLATION",
+        "olderThan filter is only allowed in patchByQuery/deleteByQuery filters",
+      );
+    }
     for (const index of table.indexes ?? []) {
+      if (index.where !== undefined && filterContainsOlderThan(index.where)) {
+        throw new RtDbError(
+          "BAD_REQUEST",
+          "olderThan filter is not allowed in a partial-index predicate",
+        );
+      }
       if (index.fields.length === 0) {
         throw new RtDbError(
           "SCHEMA_VIOLATION",
@@ -529,6 +552,7 @@ function renameFilterFields(expr: FilterExpr, from: string, to: string): void {
     case "in":
     case "contains":
     case "exists":
+    case "olderThan":
       if (expr.field === from) expr.field = to;
       return;
     case "and":

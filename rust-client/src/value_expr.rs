@@ -310,6 +310,7 @@ pub fn walk_filter_expr_fields(expr: &FilterExpr, f: &mut impl FnMut(&str)) {
         | FilterExpr::Lte { field, .. }
         | FilterExpr::In { field, .. }
         | FilterExpr::Contains { field, .. }
+        | FilterExpr::OlderThan { field, .. }
         | FilterExpr::Exists { field } => f(field),
         FilterExpr::And { exprs } | FilterExpr::Or { exprs } => {
             for e in exprs {

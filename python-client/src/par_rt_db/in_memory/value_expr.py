@@ -59,6 +59,7 @@ from ..wire import (
     _FilterLte,
     _FilterNeq,
     _FilterNot,
+    _FilterOlderThan,
     _FilterOr,
 )
 from .validate import _eval_filter_expr, _parse_i64_exact
@@ -322,6 +323,7 @@ def walk_filter_expr_fields(expr: FilterExpr, f: Callable[[str], None]) -> None:
             | _FilterIn(field=name)
             | _FilterContains(field=name)
             | _FilterExists(field=name)
+            | _FilterOlderThan(field=name)
         ):
             f(name)
         case _FilterAnd(exprs=exprs) | _FilterOr(exprs=exprs):
@@ -408,13 +410,16 @@ def _validate_computed_case_whens(ve: ValueExpr, table: TableDef) -> None:
     """Walk a computed expression's ``case`` nodes validating each ``when``
     filter with the marker-rejecting rule (server rule 4: computed exprs run
     on every write with no interactive principal, so a ``$user``/``$email``
-    marker has no value to resolve); ``then``/``otherwise`` recurse so a
-    ``case`` nested inside a branch is covered. Declared-field checks for the
-    same filters come from :func:`walk_value_expr_fields` (rule 3)."""
+    marker has no value to resolve) and the relative-time-rejecting rule
+    (``olderThan`` is by-query-only — a computed expression has no execution
+    clock); ``then``/``otherwise`` recurse so a ``case`` nested inside a
+    branch is covered. Declared-field checks for the same filters come from
+    :func:`walk_value_expr_fields` (rule 3)."""
     match ve:
         case _ValueCase(whens=whens, otherwise=otherwise):
             for cw in whens:
                 _reject_principal_markers(cw.when)
+                _reject_relative_time(cw.when, code=ErrorCode.BAD_REQUEST)
                 _validate_computed_case_whens(cw.then, table)
             _validate_computed_case_whens(otherwise, table)
         case _ValueConcat(parts=parts) | _ValueCoalesce(parts=parts):
@@ -474,6 +479,31 @@ def _reject_principal_markers(expr: FilterExpr) -> None:
             _reject_principal_markers(inner)
         case _FilterExists():
             pass
+
+
+def _reject_relative_time(
+    expr: FilterExpr,
+    message: str = "olderThan filter is only allowed in patchByQuery/deleteByQuery filters",
+    code: ErrorCode = ErrorCode.SCHEMA_VIOLATION,
+) -> None:
+    """Reject an ``olderThan`` leaf anywhere in a push-time filter: the op is
+    by-query-only, and the three push-time surfaces that reach here —
+    ``authorize`` predicates, partial-index ``where`` predicates, and computed
+    ``case`` whens — have no execution clock to derive the cutoff from.
+    Codes mirror the server per surface: authorize raises
+    ``SCHEMA_VIOLATION`` (the ``validate_structure`` arm); a partial-index
+    predicate is baked into DDL as a literal, where an execution-time-relative
+    cutoff has no static meaning, and that caller plus the case-when caller
+    raise ``BAD_REQUEST`` (the ``compile_filter_literal`` /
+    ``validate_computed`` arms — those callers pass their distinct messages)."""
+    match expr:
+        case _FilterOlderThan():
+            raise RtDbError(code, message)
+        case _FilterAnd(exprs=exprs) | _FilterOr(exprs=exprs):
+            for e in exprs:
+                _reject_relative_time(e, message, code)
+        case _FilterNot(expr=inner):
+            _reject_relative_time(inner, message, code)
 
 
 def _validate_computed(schema: SchemaDef) -> None:

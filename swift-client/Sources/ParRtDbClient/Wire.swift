@@ -1085,7 +1085,8 @@ public struct WorkflowInfo: Equatable, Codable, Sendable {
 /// tags, unknown fields rejected per variant. Leaves compare one declared
 /// field to a value (`in` to a non-empty list); `and`/`or` nest arbitrarily;
 /// `not` wraps a nested expr; `contains` tests membership of `value` in
-/// `doc.field[]`; `exists` tests the field is present and non-null.
+/// `doc.field[]`; `exists` tests the field is present and non-null;
+/// `olderThan` is the execution-time-relative age predicate (by-query-only).
 public indirect enum FilterExpr: Equatable, Codable, Sendable {
     /// `field == value`.
     case eq(field: String, value: JSONValue)
@@ -1111,9 +1112,13 @@ public indirect enum FilterExpr: Equatable, Codable, Sendable {
     case contains(field: String, value: JSONValue)
     /// The field is present and non-null.
     case exists(field: String)
+    /// Execution-time-relative age predicate (by-query step filters only):
+    /// the field's epoch-ms value is strictly older than `now − ms`, with
+    /// `now` taken from the engine clock at execution.
+    case olderThan(field: String, ms: Int64)
 
     enum CodingKeys: String, CodingKey, CaseIterable {
-        case op, field, value, values, exprs, expr
+        case op, field, value, values, exprs, expr, ms
     }
 
     // swiftlint:disable:next cyclomatic_complexity function_body_length
@@ -1207,6 +1212,15 @@ public indirect enum FilterExpr: Equatable, Codable, Sendable {
                 allowed: ["op", "field"]
             )
             self = try .exists(field: container.decode(String.self, forKey: .field))
+        case "olderThan":
+            try rejectUnknownVariantFields(
+                "FilterExpr", variant: payload.tag, keys: payload.keys,
+                allowed: ["op", "field", "ms"]
+            )
+            self = try .olderThan(
+                field: container.decode(String.self, forKey: .field),
+                ms: container.decode(Int64.self, forKey: .ms)
+            )
         case let unknown:
             throw DecodingError.dataCorrupted(
                 DecodingError.Context(
@@ -1217,7 +1231,7 @@ public indirect enum FilterExpr: Equatable, Codable, Sendable {
         }
     }
 
-    // swiftlint:disable:next cyclomatic_complexity
+    // swiftlint:disable:next cyclomatic_complexity function_body_length
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
@@ -1265,6 +1279,10 @@ public indirect enum FilterExpr: Equatable, Codable, Sendable {
         case let .exists(field):
             try container.encode("exists", forKey: .op)
             try container.encode(field, forKey: .field)
+        case let .olderThan(field, ms):
+            try container.encode("olderThan", forKey: .op)
+            try container.encode(field, forKey: .field)
+            try container.encode(ms, forKey: .ms)
         }
     }
 }

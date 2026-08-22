@@ -240,6 +240,18 @@ let bulk = try MutationBuilder()
     .patchByQuery("tasks", filter: .eq(field: "status", value: .string("stale")),
                   patch: ["archived": .bool(true)])
     .build()
+
+// Execution-time-relative sweep: .olderThan matches rows whose epoch-ms
+// field is strictly older than now − ms, with the cutoff derived from the
+// clock at each execution — a scheduled txn carrying it stays fresh on
+// every fire with no client re-scheduling. By-query-only: read/query
+// filters, authorize predicates, partial-index `where` predicates, and
+// computed `case` whens reject it; the field must be a declared
+// number/int64 field with ms >= 0.
+let sweep = try MutationBuilder()
+    .deleteByQuery("sessions",
+                   filter: .olderThan(field: "claimExpiresAt", ms: 0))
+    .build()
 ```
 
 ### Durable workflows

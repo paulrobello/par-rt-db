@@ -236,14 +236,21 @@ public func coerceIndexValue(
 
 // MARK: - Filter validation
 
-// swiftlint:disable cyclomatic_complexity
+// swiftlint:disable cyclomatic_complexity function_body_length
 /// Structural validation of a `FilterExpr` against a table's declared fields,
 /// mirroring server `query::compile_filter_node` / `field_lhs_and_bind`
 /// (validate.ts `validateFilter`). Throws BAD_REQUEST for an unknown field, an
 /// empty `and`/`or`, an empty `in`, a non-scalar leaf value, or — SEC-126 — a
 /// value whose JSON kind does not match the field's declared type. Call once
 /// before evaluating per row.
-public func validateFilter(_ node: FilterExpr, _ table: TableDef) throws {
+///
+/// `allowRelativeTime` admits the `olderThan` leaf — the mirror of the server
+/// `validate_filter_expr_fields` 4th param. Only the by-query step filters
+/// (`scanByQuery`) pass `true`; every read-path caller keeps the default
+/// `false`, rejecting the op there.
+public func validateFilter(
+    _ node: FilterExpr, _ table: TableDef, allowRelativeTime: Bool = false
+) throws {
     switch node {
     case let .and(exprs), let .or(exprs):
         if exprs.isEmpty {
@@ -255,7 +262,37 @@ public func validateFilter(_ node: FilterExpr, _ table: TableDef) throws {
             throw RtDbError(code: .badRequest, message: "\(op) filter requires at least one expr")
         }
         for expr in exprs {
-            try validateFilter(expr, table)
+            try validateFilter(expr, table, allowRelativeTime: allowRelativeTime)
+        }
+    case let .olderThan(field, ms):
+        // Server `validate_filter_expr_fields`'s OlderThan arm, in its order:
+        // context, ms, declared field, numeric field type — all BAD_REQUEST
+        // here (the server's compile_filter chokepoint maps its schema error
+        // to bad_request for txn/query filters).
+        if !allowRelativeTime {
+            throw RtDbError(
+                code: .badRequest,
+                message: "olderThan filter is only allowed in patchByQuery/deleteByQuery filters"
+            )
+        }
+        if ms < 0 {
+            throw RtDbError(code: .badRequest, message: "olderThan ms must be >= 0")
+        }
+        guard let fieldType = table.fields[field] else {
+            throw RtDbError(
+                code: .badRequest, message: "filter references undeclared field '\(field)'"
+            )
+        }
+        let inner: FieldType = if case let .optional(wrapped) = fieldType {
+            wrapped
+        } else {
+            fieldType
+        }
+        guard inner == .number || inner == .int64 else {
+            throw RtDbError(
+                code: .badRequest,
+                message: "field '\(field)' must be a number or int64 field for olderThan"
+            )
         }
     case let .inValues(field, values):
         if values.isEmpty {
@@ -272,7 +309,7 @@ public func validateFilter(_ node: FilterExpr, _ table: TableDef) throws {
             )
         }
     case let .not(expr):
-        try validateFilter(expr, table)
+        try validateFilter(expr, table, allowRelativeTime: allowRelativeTime)
     case let .contains(field, value):
         try checkLeafValue(field, value, table)
     case let .exists(field):
@@ -287,7 +324,7 @@ public func validateFilter(_ node: FilterExpr, _ table: TableDef) throws {
     }
 }
 
-// swiftlint:enable cyclomatic_complexity
+// swiftlint:enable cyclomatic_complexity function_body_length
 
 private func checkLeafValue(_ field: String, _ value: JSONValue, _ table: TableDef) throws {
     guard table.fields[field] != nil else {
@@ -377,24 +414,33 @@ private func inValueKind(_ value: JSONValue) -> String {
 /// `int64` field, where a string value compares numerically so decimal strings
 /// order `-605 < -1 < 15`, not lexicographically (ENH-027). A null/absent
 /// field never matches (SQL NULL exclusion). Assumes `validateFilter` passed.
+///
+/// `olderThan` needs the execution clock: pass `now` (the by-query scan does,
+/// reading the engine clock once per scan — server `older_than_lhs_and_bind`
+/// derives the cutoff at compile == execution time). Without `now` the leaf
+/// evaluates `false` — the fail-closed answer of the server's `filter_matches`
+/// OlderThan arm for the surfaces that never admit it (authorize predicates,
+/// case whens, read filters).
 public func evalFilterExpr(
-    _ node: FilterExpr, _ doc: [String: JSONValue], _ fields: FieldMap
+    _ node: FilterExpr, _ doc: [String: JSONValue], _ fields: FieldMap, now: Int64? = nil
 ) -> Bool {
     switch node {
     case let .and(exprs):
-        return exprs.allSatisfy { evalFilterExpr($0, doc, fields) }
+        return exprs.allSatisfy { evalFilterExpr($0, doc, fields, now: now) }
     case let .or(exprs):
-        return exprs.contains { evalFilterExpr($0, doc, fields) }
+        return exprs.contains { evalFilterExpr($0, doc, fields, now: now) }
     case let .inValues(field, values):
         return values.contains { compareLeaf(.eq, field, $0, doc, fields) }
     case let .not(expr):
-        return !evalFilterExpr(expr, doc, fields)
+        return !evalFilterExpr(expr, doc, fields, now: now)
     case let .contains(field, value):
         guard case let .array(array) = doc[field] else { return false }
         return array.contains { jsonEq($0, value) }
     case let .exists(field):
         guard let value = doc[field] else { return false }
         return value != .null
+    case let .olderThan(field, ms):
+        return olderThanMatches(field, ms, doc, fields, now)
     case let .eq(field, value):
         return compareLeaf(.eq, field, value, doc, fields)
     case let .neq(field, value):
@@ -411,6 +457,37 @@ public func evalFilterExpr(
 }
 
 // swiftlint:enable cyclomatic_complexity
+
+/// Mirrors server `older_than_lhs_and_bind`: the field's stored value is
+/// strictly below `now − ms`. An `int64` field compares exactly in i64 (the
+/// decimal-string wire form parsed — the typed bigint column path); a
+/// `number` field compares as `float8` (`docToNumber`, the jsonb-extraction
+/// cast). A null, absent, or non-numeric value never matches (SQL NULL
+/// exclusion against the strict `<`). `now == nil` is the fail-closed
+/// `filter_matches` answer for surfaces that never admit the op.
+private func olderThanMatches(
+    _ field: String, _ ms: Int64, _ doc: [String: JSONValue], _ fields: FieldMap, _ now: Int64?
+) -> Bool {
+    guard let now else { return false }
+    guard let docVal = doc[field], docVal != .null else { return false }
+    if isInt64Field(fields[field]) {
+        guard let lhs = i64DocValue(docVal) else { return false }
+        return lhs < now - ms
+    }
+    guard let lhs = docToNumber(docVal) else { return false }
+    return lhs < Double(now - ms)
+}
+
+/// The i64 reading of a stored int64-field value: the canonical decimal
+/// string (parsed exactly, `parseI64`), or a JSON integer directly. nil on
+/// anything else — an unparseable value never matches.
+private func i64DocValue(_ docVal: JSONValue) -> Int64? {
+    switch docVal {
+    case let .string(string): parseI64(string)
+    case let .int(int): int
+    default: nil
+    }
+}
 
 /// The six leaf comparison operators (validate.ts `FilterLeafOp`).
 enum FilterLeafOp {

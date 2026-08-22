@@ -233,7 +233,8 @@ pub(crate) fn compile_value_expr(
                 // unchanged to the recursive `then`/`otherwise` calls — the
                 // shared `binds.len()` tracks the running offset.
                 let cur = start_pos + binds.len();
-                let (cond_sql, cond_binds) = crate::query::compile_filter(&cw.when, table, cur)?;
+                let (cond_sql, cond_binds) =
+                    crate::query::compile_filter(&cw.when, table, cur, false)?;
                 binds.extend(cond_binds.into_iter().map(Into::into));
                 let then_sql = compile_value_expr(&cw.then, table, start_pos, binds)?;
                 fragments.push(format!("WHEN {cond_sql} THEN {then_sql}"));
@@ -508,7 +509,8 @@ pub(crate) fn walk_filter_expr_fields(expr: &FilterExpr, f: &mut impl FnMut(&str
         | FilterExpr::Lte { field, .. }
         | FilterExpr::In { field, .. }
         | FilterExpr::Contains { field, .. }
-        | FilterExpr::Exists { field } => f(field),
+        | FilterExpr::Exists { field }
+        | FilterExpr::OlderThan { field, .. } => f(field),
         FilterExpr::And { exprs } | FilterExpr::Or { exprs } => {
             for e in exprs {
                 walk_filter_expr_fields(e, f);

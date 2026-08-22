@@ -146,6 +146,9 @@ pub(crate) fn principal_bearing_fields(table: &TableDef) -> Vec<PrincipalField> 
                 }
                 FilterExpr::Not { expr } => walk_authorize(expr, out, push),
                 FilterExpr::Exists { .. } => {}
+                // Relative-time predicates are rejected in authorize
+                // predicates at push; no principal-bearing value to inspect.
+                FilterExpr::OlderThan { .. } => {}
             }
         }
         walk_authorize(authorize, &mut out, &push);

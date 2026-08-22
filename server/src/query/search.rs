@@ -188,7 +188,7 @@ pub(crate) fn compile_search(
         SearchMode::Trgm => 3,
     };
     if let Some(filter) = &search.filter {
-        let (fragment, filter_binds) = compile_filter(filter, table_def, start)?;
+        let (fragment, filter_binds) = compile_filter(filter, table_def, start, false)?;
         binds.extend(filter_binds);
         extra.push_str(" AND (");
         extra.push_str(&fragment);
@@ -404,7 +404,7 @@ pub(crate) fn compile_vector_search(
     let mut extra = String::new();
     let start = 1usize;
     if let Some(filter) = &vs.filter {
-        let (fragment, filter_binds) = compile_filter(filter, table_def, start)?;
+        let (fragment, filter_binds) = compile_filter(filter, table_def, start, false)?;
         binds.extend(filter_binds);
         extra.push_str(" AND (");
         extra.push_str(&fragment);

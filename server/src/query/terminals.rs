@@ -359,7 +359,7 @@ pub(crate) fn compile_query_window<'a>(
     let filter_start = eq_len + range_binds.len() + 1;
     let mut filter_binds: Vec<EqBind> = match &effective_filter {
         Some(filter) => {
-            let (fragment, binds) = compile_filter(filter, table_def, filter_start)?;
+            let (fragment, binds) = compile_filter(filter, table_def, filter_start, false)?;
             where_conditions.push(fragment);
             binds
         }

@@ -112,6 +112,16 @@ Add `expect_version` / `expect_absent` preconditions for optimistic-concurrency
 patterns; combine with `retry_on_precondition` from `par_rt_db.errors` for
 read-modify-write loops.
 
+A by-query `filter` additionally accepts the execution-time-relative
+`olderThan` op — `{"op": "olderThan", "field": "completedAt", "ms": 604800000}` —
+matching rows whose epoch-ms field is strictly older than `now − ms`, with the
+cutoff derived from the server clock **at each execution**. A scheduled
+one-shot/cron/interval txn carrying it stays fresh on every fire with no
+client re-scheduling (server-side sweeps: archive done rows older than 7 days,
+expire claim leases). The op is by-query-only — read/query filters, `authorize`
+predicates, partial-index `where` predicates, and computed `case` whens reject
+it — and requires a declared `number`/`int64` field with `ms ≥ 0`.
+
 ### Query + subscribe
 
 ```python

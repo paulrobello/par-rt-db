@@ -481,7 +481,8 @@ fn collect_unindexed_filter_fields(
         | FilterExpr::Lte { field, .. }
         | FilterExpr::In { field, .. }
         | FilterExpr::Contains { field, .. }
-        | FilterExpr::Exists { field } => {
+        | FilterExpr::Exists { field }
+        | FilterExpr::OlderThan { field, .. } => {
             if !table_def.fields.contains_key(field) {
                 return;
             }
@@ -870,6 +871,7 @@ mod tests {
             },
             &table,
             1,
+            false,
         )
         .unwrap();
         // SEC-117: Not wraps the inner in COALESCE(..., FALSE) so the SQL scan
@@ -884,6 +886,7 @@ mod tests {
             },
             &table,
             1,
+            false,
         )
         .unwrap();
         assert_eq!(sql, "(doc->'editors') ? $1");
@@ -894,6 +897,7 @@ mod tests {
             },
             &table,
             1,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -1223,7 +1227,7 @@ mod tests {
             field: "title".into(),
             value: json!(5),
         };
-        let err = compile_filter(&pred, &table, 1).unwrap_err();
+        let err = compile_filter(&pred, &table, 1, false).unwrap_err();
         assert!(
             err.message.contains("value kind does not match"),
             "expected type-mismatch message, got: {}",
@@ -1235,6 +1239,6 @@ mod tests {
             field: "title".into(),
             value: json!("a"),
         };
-        assert!(compile_filter(&ok, &table, 1).is_ok());
+        assert!(compile_filter(&ok, &table, 1, false).is_ok());
     }
 }

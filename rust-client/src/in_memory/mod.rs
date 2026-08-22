@@ -1280,7 +1280,14 @@ impl InMemoryRtDbClient {
         filter: &FilterExpr,
         limit_opt: Option<u32>,
     ) -> Result<(Vec<String>, bool), RtDbError> {
-        validate_filter(filter, table_def)?;
+        // The one filter context that accepts `olderThan`: its cutoff is
+        // derived from the engine clock at execution (per fire for a
+        // scheduled txn) — mirrors `compile_scan_where`'s
+        // `allow_relative_time = true`. `now` is read once per step, the
+        // same single cutoff derivation the server's compile does, so every
+        // row of one scan compares against the same value.
+        validate_by_query_filter(filter, table_def)?;
+        let now = (self.now)();
         let limit = limit_opt
             .unwrap_or(MAX_BY_QUERY_ROWS)
             .min(MAX_BY_QUERY_ROWS);
@@ -1291,7 +1298,7 @@ impl InMemoryRtDbClient {
             // FM-33: a soft-deleted row is absent to every scan (the server's
             // compile_scan_where composes the same live-only predicate).
             .filter(|(_, row)| row.deleted_at.is_none())
-            .filter(|(_, row)| matches_filter(filter, &row.doc, &table_def.fields))
+            .filter(|(_, row)| eval_filter_expr_at(filter, &row.doc, &table_def.fields, now))
             .map(|(_, row)| (row.created_at, row.id.clone()))
             .collect();
         matching.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -2224,9 +2231,9 @@ pub use query::{
     index_column_type, merge_doc, type_tag,
 };
 pub use validate::{
-    apply_patch, canonical, clone_value, eval_filter_expr, is_base64_string, is_hex_id,
-    is_int64_string, is_plain_object, strip_unset_optionals, validate_doc, validate_filter,
-    validate_value,
+    apply_patch, canonical, clone_value, eval_filter_expr, eval_filter_expr_at, is_base64_string,
+    is_hex_id, is_int64_string, is_plain_object, strip_unset_optionals, validate_by_query_filter,
+    validate_doc, validate_filter, validate_value,
 };
 pub use value_expr::eval_value_expr;
 

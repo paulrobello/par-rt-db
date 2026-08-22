@@ -125,11 +125,30 @@ public func detectDestructiveChanges(_ oldSchema: SchemaDef, _ newSchema: Schema
 /// `validateOnDelete` pass).
 public func validateSchema(_ schema: SchemaDef) throws {
     for (tableName, table) in schema.tables {
+        // `olderThan` is by-query-only: an `authorize` predicate is
+        // push-validated with `allow_relative_time = false` (server
+        // `validate_structure`) — a row-visibility predicate is evaluated per
+        // write/read, never at a by-query execution time.
+        if let authorize = table.authorize {
+            try rejectRelativeTimeFilter(
+                authorize, code: .schemaViolation,
+                "olderThan filter is only allowed in patchByQuery/deleteByQuery filters"
+            )
+        }
         for index in table.indexes ?? [] {
             if index.fields.isEmpty {
                 throw RtDbError(
                     code: .schemaViolation,
                     message: "index '\(index.name)' on table '\(tableName)' has no fields"
+                )
+            }
+            // A partial-index predicate is baked into DDL as a literal (server
+            // `compile_filter_literal` at push) — an execution-time-relative
+            // cutoff has no static meaning there.
+            if let predicate = index.whereClause {
+                try rejectRelativeTimeFilter(
+                    predicate, code: .badRequest,
+                    "olderThan filter is not allowed in a partial-index predicate"
                 )
             }
             // A vector index's `fields[0]` is a Vector column, not
@@ -456,16 +475,47 @@ private func isPrincipalMarker(_ value: JSONValue) -> Bool {
     return false
 }
 
+/// Rejects the execution-time-relative `olderThan` leaf anywhere in `expr` —
+/// the `allow_relative_time = false` mode of the server's
+/// `validate_filter_expr_fields` at its push-time call sites: `authorize`
+/// predicates (`validate_structure` — SCHEMA_VIOLATION), computed `case`
+/// whens (`validate_computed_case_whens`, mapped to BAD_REQUEST), and
+/// partial-index `where` predicates (DDL compile — BAD_REQUEST with its own
+/// message). The sites surface different codes/messages; the caller supplies
+/// both.
+private func rejectRelativeTimeFilter(
+    _ expr: FilterExpr, code: ErrorCode, _ message: String
+) throws {
+    switch expr {
+    case let .and(exprs), let .or(exprs):
+        for subExpr in exprs {
+            try rejectRelativeTimeFilter(subExpr, code: code, message)
+        }
+    case let .not(inner):
+        try rejectRelativeTimeFilter(inner, code: code, message)
+    case .olderThan:
+        throw RtDbError(code: code, message: message)
+    case .eq, .neq, .gt, .gte, .lt, .lte, .inValues, .contains, .exists:
+        break
+    }
+}
+
 /// Walks a computed expression's `caseExpr` nodes rejecting principal markers
 /// in every `when` filter — computed exprs run on every write with no
 /// interactive principal, so a `$user`/`$email` marker has no value to
-/// resolve (server `validate_computed_case_whens`). Branch bodies recurse so
-/// a `caseExpr` nested inside a `then`/`otherwise` is covered.
+/// resolve (server `validate_computed_case_whens`). Also rejects `olderThan`
+/// (the walker's `allow_relative_time = false` mode) — a case-when is
+/// evaluated per write, not at execution time. Branch bodies recurse so a
+/// `caseExpr` nested inside a `then`/`otherwise` is covered.
 private func validateComputedCaseWhens(_ ve: ValueExpr) throws {
     switch ve {
     case let .caseExpr(whens, otherwise):
         for cw in whens {
             try rejectPrincipalMarkers(cw.when)
+            try rejectRelativeTimeFilter(
+                cw.when, code: .badRequest,
+                "olderThan filter is only allowed in patchByQuery/deleteByQuery filters"
+            )
             try validateComputedCaseWhens(cw.then)
         }
         try validateComputedCaseWhens(otherwise)
@@ -513,7 +563,7 @@ private func rejectPrincipalMarkers(_ expr: FilterExpr) throws {
         }
     case let .not(expr):
         try rejectPrincipalMarkers(expr)
-    case .exists:
+    case .exists, .olderThan:
         break
     }
 }
@@ -851,6 +901,8 @@ private func renamedFilterExpr(_ expr: FilterExpr, _ from: String, _ to: String)
         .contains(field: name == from ? to : name, value: value)
     case let .exists(name):
         .exists(field: name == from ? to : name)
+    case let .olderThan(name, ms):
+        .olderThan(field: name == from ? to : name, ms: ms)
     case let .and(exprs):
         .and(exprs: exprs.map { renamedFilterExpr($0, from, to) })
     case let .or(exprs):

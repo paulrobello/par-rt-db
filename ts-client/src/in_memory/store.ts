@@ -2321,23 +2321,28 @@ export class InMemoryRtDbClient {
   }
 
   /** Scans `table` for rows matching `filter` (the same `FilterExpr` the read
-   * path uses), ordered by `createdAt` then `id` (server
-   * `ORDER BY "created_at", "id"`), and applies the by-query `limit` (default
-   * and cap `MAX_BY_QUERY_ROWS`). Returns the selected rows and whether the
-   * match set exceeded the limit (`truncated`). Mirrors server
-   * `txn::step_{patch,delete}_by_query`'s scan + `query::compile_scan_where`. */
+   * path uses — plus the by-query-only `olderThan` op), ordered by `createdAt`
+   * then `id` (server `ORDER BY "created_at", "id"`), and applies the by-query
+   * `limit` (default and cap `MAX_BY_QUERY_ROWS`). Returns the selected rows
+   * and whether the match set exceeded the limit (`truncated`). Mirrors server
+   * `txn::step_{patch,delete}_by_query`'s scan + `query::compile_scan_where`:
+   * `allowRelativeTime = true` is what makes this the one filter surface that
+   * accepts `olderThan`, and the clock is read ONCE per step execution (the
+   * server compiles the `now − ms` cutoff at that point), so a scheduled txn
+   * re-derives it on every fire. */
   private scanByQuery(
     tableDef: TableJson,
     tableName: string,
     filter: FilterExpr,
     limitOpt: number | undefined,
   ): { rows: StoredRow[]; truncated: boolean } {
-    validateFilter(filter, tableDef);
+    validateFilter(filter, tableDef, true);
     const limit = Math.min(limitOpt ?? MAX_BY_QUERY_ROWS, MAX_BY_QUERY_ROWS);
+    const now = this.now();
     const matched: StoredRow[] = [];
     for (const row of this.rowsFor(tableName).values()) {
       if (row.deletedAt !== undefined) continue; // FM-33: stamped rows are absent
-      if (evalFilterExpr(filter, row.doc, tableDef.fields)) {
+      if (evalFilterExpr(filter, row.doc, tableDef.fields, now)) {
         matched.push(row);
       }
     }

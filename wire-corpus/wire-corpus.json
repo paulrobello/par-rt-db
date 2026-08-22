@@ -35,7 +35,8 @@
     { "type": "mutate", "mutId": "m9", "txn": { "steps": [ { "op": "schedule", "when": { "type": "interval", "everyMs": 300000 }, "txn": { "steps": [] } } ] } },
     { "type": "signalWorkflow", "workflowId": "w1", "id": "wf-1", "name": "approve", "payload": { "ok": true, "count": 2 } },
     { "type": "signalWorkflow", "workflowId": "w2", "id": "wf-2", "name": "approve" },
-    { "type": "mutate", "mutId": "m10", "txn": { "steps": [ { "op": "startWorkflow", "spec": { "name": "gated", "steps": [ { "txn": { "steps": [ { "op": "insert", "table": "workItems", "doc": { "title": "pre" } } ] } }, { "awaitSignal": { "name": "approve", "timeoutMs": 3600000 } }, { "awaitSignal": { "name": "audit" } } ] } } ] } }
+    { "type": "mutate", "mutId": "m10", "txn": { "steps": [ { "op": "startWorkflow", "spec": { "name": "gated", "steps": [ { "txn": { "steps": [ { "op": "insert", "table": "workItems", "doc": { "title": "pre" } } ] } }, { "awaitSignal": { "name": "approve", "timeoutMs": 3600000 } }, { "awaitSignal": { "name": "audit" } } ] } } ] } },
+    { "type": "mutate", "mutId": "m11", "txn": { "steps": [ { "op": "patchByQuery", "table": "workItems", "filter": { "op": "olderThan", "field": "completedAt", "ms": 604800000 }, "patch": { "status": "archived" } }, { "op": "deleteByQuery", "table": "sessions", "filter": { "op": "and", "exprs": [ { "op": "olderThan", "field": "claimExpiresAt", "ms": 0 }, { "op": "exists", "field": "claimExpiresAt" } ] }, "limit": 500 } ] } }
   ],
   "server_messages": [
     { "type": "authOk", "user": { "kind": "user", "email": "a@b.com", "name": null, "githubLogin": "alice", "githubId": 12345 } },
@@ -114,6 +115,7 @@
   "queries": [
     { "table": "workItems" },
     { "table": "workItems", "filter": { "op": "eq", "field": "status", "value": "done" } },
+    { "table": "workItems", "filter": { "op": "olderThan", "field": "completedAt", "ms": 604800000 } },
     { "table": "workItems", "filter": { "op": "or", "exprs": [ { "op": "in", "field": "status", "values": [ "a", "b" ] }, { "op": "lte", "field": "order", "value": 5 } ] } },
     { "table": "notes", "search": { "index": "search_body", "query": "hello world" } },
     { "table": "notes", "search": { "index": "search_body", "query": "conv", "mode": "trgm" } },

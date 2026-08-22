@@ -1,0 +1,38 @@
+{
+  "name": "patch-by-query-older-than-sweeps-old-rows",
+  "$comment": "Execution-time-relative olderThan in a patchByQuery filter: rows whose epoch-ms field is strictly older than now − ms match, evaluated with the execution clock (wall-clock on the server, the injected ~1.7e12 clock in engines — the margins make the exact value irrelevant: completedAt 1 is below any cutoff for decades, 9e15 above it forever). This is the primitive a scheduled sweep uses: the stored txn carries no cutoff literal, so every fire re-derives it.",
+  "schema": {
+    "tables": {
+      "items": {
+        "fields": {
+          "title": { "type": "string" },
+          "completedAt": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_title", "fields": ["title"] }]
+      }
+    }
+  },
+  "seed": [
+    { "$id": "old", "doc": { "title": "old", "completedAt": 1 } },
+    { "$id": "future", "doc": { "title": "future", "completedAt": 9000000000000000 } }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "patchByQuery",
+          "table": "items",
+          "filter": { "op": "olderThan", "field": "completedAt", "ms": 1000000000000 },
+          "patch": { "title": "swept" }
+        }
+      ]
+    }
+  },
+  "expect": [{ "patched": 1, "truncated": false }],
+  "normalize": ["_id", "_creationTime", "_version"],
+  "then": {
+    "query": { "table": "items", "index": "by_title", "eq": ["swept"] },
+    "expect": [{ "title": "swept", "completedAt": 1 }],
+    "normalize": ["_id", "_creationTime", "_version"]
+  }
+}

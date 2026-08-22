@@ -1,0 +1,37 @@
+{
+  "name": "delete-by-query-older-than-sweeps-old-rows",
+  "$comment": "olderThan in a deleteByQuery filter: only rows strictly older than now − ms are deleted (margins per patch-by-query-older-than-sweeps-old-rows — the exact execution clock never matters). The claim-lease-expiry shape: a scheduled txn clears expired rows with no client re-scheduling.",
+  "schema": {
+    "tables": {
+      "items": {
+        "fields": {
+          "title": { "type": "string" },
+          "claimExpiresAt": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_title", "fields": ["title"] }]
+      }
+    }
+  },
+  "seed": [
+    { "$id": "old", "doc": { "title": "expired", "claimExpiresAt": 1 } },
+    { "$id": "future", "doc": { "title": "live", "claimExpiresAt": 9000000000000000 } }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "deleteByQuery",
+          "table": "items",
+          "filter": { "op": "olderThan", "field": "claimExpiresAt", "ms": 1000000000000 }
+        }
+      ]
+    }
+  },
+  "expect": [{ "deleted": 1, "truncated": false }],
+  "normalize": ["_id", "_creationTime", "_version"],
+  "then": {
+    "query": { "table": "items", "index": "by_title", "eq": ["live"] },
+    "expect": [{ "title": "live", "claimExpiresAt": 9000000000000000 }],
+    "normalize": ["_id", "_creationTime", "_version"]
+  }
+}

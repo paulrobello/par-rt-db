@@ -40,11 +40,13 @@ export interface Paginate {
 
 /**
  * Mirrors server `query::FilterExpr` byte-for-byte: internally tagged by `op`
- * (lowercase variant names), `deny_unknown_fields`. Leaves compare one declared
- * field to a value (`in` to a non-empty list); `and`/`or` nest arbitrarily;
- * `not` wraps a nested expr; `contains` tests membership of `value` in
- * `doc.field[]` (reverse of `in`); `exists` tests the field is present and
- * non-null.
+ * (variant names — `olderThan` is camelCase, the rest lowercase),
+ * `deny_unknown_fields`. Leaves compare one declared field to a value (`in` to
+ * a non-empty list); `and`/`or` nest arbitrarily; `not` wraps a nested expr;
+ * `contains` tests membership of `value` in `doc.field[]` (reverse of `in`);
+ * `exists` tests the field is present and non-null; `olderThan` is the
+ * execution-time-relative age predicate — valid ONLY in `patchByQuery`/
+ * `deleteByQuery` step filters (a declared `number`/`int64` field, `ms >= 0`).
  */
 export type FilterExpr =
   | { op: "eq"; field: string; value: unknown }
@@ -58,7 +60,8 @@ export type FilterExpr =
   | { op: "or"; exprs: FilterExpr[] }
   | { op: "not"; expr: FilterExpr }
   | { op: "contains"; field: string; value: unknown }
-  | { op: "exists"; field: string };
+  | { op: "exists"; field: string }
+  | { op: "olderThan"; field: string; ms: number };
 
 /** Mirrors server `query::SearchMode` byte-for-byte (lowercase variants).
  * `tsquery` is the default (word/stem full-text); `trgm` is case-insensitive

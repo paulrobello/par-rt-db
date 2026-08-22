@@ -1,0 +1,29 @@
+{
+  "name": "error-push-computed-case-when-older-than",
+  "$comment": "A computed field's Case.when filter is validated at push with allow_relative_time=false (like every non-by-query filter surface) — the push fails BAD_REQUEST (validate_computed's mapping, same code the read-filter rejection uses).",
+  "pushError": { "code": "BAD_REQUEST" },
+  "schema": {
+    "tables": {
+      "items": {
+        "fields": {
+          "title": { "type": "string" },
+          "completedAt": { "type": "number" },
+          "flag": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_title", "fields": ["title"] }],
+        "computed": {
+          "flag": {
+            "op": "case",
+            "whens": [
+              {
+                "when": { "op": "olderThan", "field": "completedAt", "ms": 1000 },
+                "then": { "op": "literal", "value": "old" }
+              }
+            ],
+            "otherwise": { "op": "literal", "value": "new" }
+          }
+        }
+      }
+    }
+  }
+}

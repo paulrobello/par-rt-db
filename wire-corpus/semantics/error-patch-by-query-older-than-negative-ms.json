@@ -1,0 +1,29 @@
+{
+  "name": "error-patch-by-query-older-than-negative-ms",
+  "$comment": "olderThan requires ms >= 0 — a negative window (\"newer than\") is rejected at the by-query validation chokepoint. Asserts code only, per the error-case ruling.",
+  "schema": {
+    "tables": {
+      "items": {
+        "fields": {
+          "title": { "type": "string" },
+          "completedAt": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_title", "fields": ["title"] }]
+      }
+    }
+  },
+  "seed": [],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "patchByQuery",
+          "table": "items",
+          "filter": { "op": "olderThan", "field": "completedAt", "ms": -1 },
+          "patch": { "title": "swept" }
+        }
+      ]
+    }
+  },
+  "expect": { "error": { "code": "BAD_REQUEST" } }
+}

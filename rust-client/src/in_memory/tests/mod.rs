@@ -25,6 +25,7 @@ mod migrate;
 mod paginate;
 mod presence;
 mod query;
+mod relative_filter;
 mod scheduler;
 mod schema;
 mod search;

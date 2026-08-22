@@ -78,7 +78,7 @@ from ..wire import (
 )
 from .migrate import _detect_destructive_changes, _on_delete_ref, _validate_on_delete
 from .validate import _eval_filter_expr, _validate_filter
-from .value_expr import _stamp_computed, _validate_computed
+from .value_expr import _reject_relative_time, _stamp_computed, _validate_computed
 
 #: Maximum number of steps in a single transaction (mirrors the server cap).
 MAX_STEPS = 1024
@@ -992,11 +992,25 @@ def _validate_schema(schema: SchemaDef) -> None:
     formats, owner/collaborator fields, defaults, and ``onDelete`` shapes stay
     server-side (the last has its own ``_validate_on_delete`` pass)."""
     for table_name, table in schema.tables.items():
+        # `authorize` predicates reject `olderThan` at push (server
+        # `validate_structure`: the op is by-query-only and authorize runs on
+        # reads/writes with no execution-clock cutoff).
+        if table.authorize is not None:
+            _reject_relative_time(table.authorize)
         for index in table.indexes:
             if not index.fields:
                 raise RtDbError(
                     ErrorCode.SCHEMA_VIOLATION,
                     f"index '{index.name}' on table '{table_name}' has no fields",
+                )
+            # A partial-index predicate is baked into DDL as a literal — an
+            # execution-time-relative `olderThan` cutoff has no static meaning
+            # there (server `compile_filter_literal` rejects it at push).
+            if index.where is not None:
+                _reject_relative_time(
+                    index.where,
+                    "olderThan filter is not allowed in a partial-index predicate",
+                    code=ErrorCode.BAD_REQUEST,
                 )
             # A vector index's ``fields[0]`` is a Vector column, which is not
             # btree-indexable — the server validates vector specs in their own
@@ -1580,7 +1594,12 @@ class _InMemoryStoreCore:
                 return _upsert_result(new_id, True), {table}
             case _PatchByQuery(table=table, filter=flt, patch=patch_fields, limit=limit_opt):
                 table_def = self._require_table(table)
-                _validate_filter(flt, table_def)
+                # `allow_relative_time=True` makes the by-query scan the one
+                # surface that accepts `olderThan` (server compile_scan_where).
+                _validate_filter(flt, table_def, allow_relative_time=True)
+                # The cutoff clock is read once per step execution (compile ==
+                # execution inside the committer turn on the server).
+                step_now = self._now()
                 # FM-33: soft-deleted rows are absent to the scan (the server
                 # selects through `compile_scan_where`'s `deleted_at IS NULL`).
                 matched = [
@@ -1588,7 +1607,7 @@ class _InMemoryStoreCore:
                     for (t, _id), row in self._docs.items()
                     if t == table
                     and _is_live(row)
-                    and _eval_filter_expr(flt, row.doc, table_def.fields)
+                    and _eval_filter_expr(flt, row.doc, table_def.fields, step_now)
                 ]
                 matched.sort(key=lambda r: (r.created_at, r.id))
                 limit = (
@@ -1609,13 +1628,14 @@ class _InMemoryStoreCore:
                 return _patch_by_query_result(len(take), truncated), {table}
             case _DeleteByQuery(table=table, filter=flt, limit=limit_opt):
                 table_def = self._require_table(table)
-                _validate_filter(flt, table_def)
+                _validate_filter(flt, table_def, allow_relative_time=True)
+                step_now = self._now()
                 matched = [
                     row
                     for (t, _id), row in self._docs.items()
                     if t == table
                     and _is_live(row)
-                    and _eval_filter_expr(flt, row.doc, table_def.fields)
+                    and _eval_filter_expr(flt, row.doc, table_def.fields, step_now)
                 ]
                 matched.sort(key=lambda r: (r.created_at, r.id))
                 limit = (

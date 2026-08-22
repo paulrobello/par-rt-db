@@ -119,6 +119,29 @@ let _results = db.mutate(&txn, None).await?; // idempotency key is optional
 let _one: Option<Item> = db.get("items", "i1").await?;
 ```
 
+The by-query steps — `patch_by_query(table, filter, patch, limit)` /
+`delete_by_query(table, filter, limit)` — additionally accept the
+execution-time-relative `olderThan` filter op:
+
+```rust
+use par_rt_db_client::wire::FilterExpr;
+// Archive rows whose completedAt is strictly older than now − 7d.
+let sweep = FilterExpr::OlderThan { field: "completedAt".into(), ms: 604_800_000 };
+let txn = Mutation::new()
+    .patch_by_query("workItems", sweep, json!({ "status": "archived" }), None)
+    .build();
+```
+
+The cutoff is derived from the server clock **at each execution**, so a
+scheduled one-shot/cron/interval txn carrying it stays fresh on every fire
+with no client re-scheduling (server-side sweeps: archive done rows older
+than 7 days, expire claim leases). The op is by-query-only — read/query
+filters (`.filter(...)`), `authorize` predicates, partial-index `where`
+predicates, and computed `case` whens reject it (`BAD_REQUEST` /
+`SCHEMA_VIOLATION` at push) — and requires a declared `number`/`int64`
+field (`optional` unwrapped; a null or absent value never matches) with
+`ms >= 0`.
+
 `run` deserializes `{result}` into `T` — use the terminal that matches `T`
 (`collect`/`take` → `Vec<T>`, `first`/`unique`/`get` → `Option<T>`,
 `count` → `i64`, `paginate` → `Paginated<T>`, `distinct` →

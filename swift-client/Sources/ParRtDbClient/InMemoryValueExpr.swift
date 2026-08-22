@@ -286,7 +286,8 @@ func walkFilterExprFieldNames(_ expr: FilterExpr, _ visit: (String) -> Void) {
     switch expr {
     case let .eq(field, _), let .neq(field, _), let .gt(field, _),
          let .gte(field, _), let .lt(field, _), let .lte(field, _),
-         let .inValues(field, _), let .contains(field, _), let .exists(field):
+         let .inValues(field, _), let .contains(field, _), let .exists(field),
+         let .olderThan(field, _):
         visit(field)
     case let .and(exprs), let .or(exprs):
         for subExpr in exprs {

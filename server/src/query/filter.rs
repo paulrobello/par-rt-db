@@ -48,7 +48,11 @@ pub(crate) fn compile_scan_where(
     let mut where_conditions: Vec<String> = Vec::new();
     let mut binds: Vec<EqBind> = Vec::new();
     if let Some(f) = filter {
-        let (fragment, filter_binds) = compile_filter(f, table_def, 1)?;
+        // `allow_relative_time = true` is what makes a by-query scan the one
+        // surface that accepts `olderThan` — its cutoff is computed from the
+        // clock at execution time (per fire for a scheduled txn), which is
+        // the whole point of the operator.
+        let (fragment, filter_binds) = compile_filter(f, table_def, 1, true)?;
         where_conditions.push(fragment);
         binds.extend(filter_binds);
     }
@@ -78,10 +82,15 @@ pub(crate) fn compile_scan_where(
 /// Compiles a `filter` into a fully-parenthesized SQL predicate plus its typed
 /// binds, with `$n` placeholders numbered from 1-based `start_pos`. Every leaf
 /// emits at least one bind, so the fragment is never empty.
+///
+/// `allow_relative_time` admits the `olderThan` leaf — only `compile_scan_where`
+/// (the by-query step filters) passes `true`; every read-path caller passes
+/// `false`, rejecting it there.
 pub(crate) fn compile_filter(
     filter: &FilterExpr,
     table: &TableDef,
     start_pos: usize,
+    allow_relative_time: bool,
 ) -> Result<(String, Vec<EqBind>), RtDbError> {
     // SEC-125: validate at the single compilation chokepoint so EVERY client
     // filter entry point (q.filter, compile_scan_where's client filter,
@@ -90,7 +99,7 @@ pub(crate) fn compile_filter(
     // all of these — the authorize predicate is the only path that permits
     // principal markers, and it bypasses `compile_filter` (compiling via
     // `compile_filter_node` directly after `resolve_predicate_markers`).
-    validate_filter_expr_fields(filter, table, false)
+    validate_filter_expr_fields(filter, table, false, allow_relative_time)
         .map_err(|e| RtDbError::bad_request(e.message))?;
     let mut binds: Vec<EqBind> = Vec::new();
     let sql = compile_filter_node(filter, table, start_pos, &mut binds)?;
@@ -189,6 +198,17 @@ pub(crate) fn compile_filter_node(
         FilterExpr::Exists { field } => {
             jsonb_field_lhs(field, table)?;
             Ok(format!("(doc ? '{field}' AND doc->>'{field}' IS NOT NULL)"))
+        }
+        // Execution-time-relative cutoff: `lhs < now − ms`, with `now` read
+        // here (compile == execution: this runs inside the committer turn
+        // that executes the step, so a scheduled txn re-derives the cutoff
+        // on every fire). The clock read is a separate `now_ms()` from the
+        // step's other stamps by microseconds at most — the same looseness
+        // the per-row stamp sites already have.
+        FilterExpr::OlderThan { field, ms } => {
+            let (lhs, bind) = older_than_lhs_and_bind(field, *ms, table)?;
+            let placeholder = push_filter_bind(start_pos, binds, bind);
+            Ok(format!("{lhs} < {placeholder}"))
         }
     }
 }
@@ -303,6 +323,59 @@ fn render_filter_literal_node(node: &FilterExpr, table: &TableDef) -> Result<Str
             jsonb_field_lhs(field, table)?;
             Ok(format!("(doc ? '{field}' AND doc->>'{field}' IS NOT NULL)"))
         }
+        // A partial-index predicate is baked into DDL as a literal — an
+        // execution-time-relative cutoff has no static meaning there.
+        FilterExpr::OlderThan { .. } => Err(RtDbError::bad_request(
+            "olderThan filter is not allowed in a partial-index predicate",
+        )),
+    }
+}
+
+/// Resolves an `olderThan` field to its numeric LHS and the execution-time
+/// cutoff bind (`now_ms() − ms`). Indexed fields compare against their typed
+/// column (`double precision` for `number`, `bigint` for `int64` — the bind
+/// typed to match, per `indexed_column_type`); a declared-but-unindexed field
+/// uses jsonb text extraction cast to `float8` (the same cast path
+/// `jsonb_lhs_and_bind` gives numeric comparisons — epoch-ms magnitudes are
+/// exact well within f64). A null or absent stored value compares as SQL
+/// NULL, which never matches the strict `<`.
+fn older_than_lhs_and_bind(
+    field: &str,
+    ms: i64,
+    table: &TableDef,
+) -> Result<(String, EqBind), RtDbError> {
+    let field_type = table.fields.get(field).ok_or_else(|| {
+        RtDbError::bad_request(format!("filter references unknown field '{field}'"))
+    })?;
+    let inner = match field_type {
+        FieldType::Optional { inner } => inner.as_ref(),
+        _ => field_type,
+    };
+    let cutoff = crate::db::now_ms() - ms;
+    let is_indexed = table
+        .indexes
+        .iter()
+        .any(|idx| idx.fields.iter().any(|f| f == field));
+    match inner {
+        // The indexed int64 column is `bigint`; compare in i64 so a stored
+        // value near i64::MAX stays exact on the typed-column path.
+        FieldType::Int64 if is_indexed => {
+            Ok((format!("\"{}\"", pg_col(field)), EqBind::I64(cutoff)))
+        }
+        FieldType::Int64 | FieldType::Number => {
+            let cutoff_f = cutoff as f64;
+            Ok((
+                if is_indexed {
+                    format!("\"{}\"", pg_col(field))
+                } else {
+                    format!("(doc->>'{field}')::float8")
+                },
+                EqBind::Num(cutoff_f),
+            ))
+        }
+        _ => Err(RtDbError::bad_request(format!(
+            "field '{field}' must be a number or int64 field for olderThan"
+        ))),
     }
 }
 

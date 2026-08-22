@@ -2101,15 +2101,20 @@ public final class InMemoryRtDbClient: MigrationStore {
     private func scanByQuery(
         _ tableDef: TableDef, _ tableName: String, _ filter: FilterExpr, _ limitOpt: UInt32?
     ) throws -> (rows: [StoredRow], truncated: Bool) {
-        try validateFilter(filter, tableDef)
+        try validateFilter(filter, tableDef, allowRelativeTime: true)
         let limit = min(limitOpt.map(Int.init) ?? InMemoryLimits.maxByQueryRows,
                         InMemoryLimits.maxByQueryRows)
+        // The by-query scan is the one surface admitting `olderThan`: its
+        // cutoff is derived from the clock at execution, read once per scan
+        // (server `older_than_lhs_and_bind` runs at compile == execution
+        // time, once per scan's WHERE compile).
+        let now = nowFn()
         var matched: [StoredRow] = []
         for row in rowStore(tableName).rows.values {
             if row.deletedAt != nil {
                 continue
             } // FM-33: stamped rows are absent
-            if evalFilterExpr(filter, row.doc, tableDef.fields) {
+            if evalFilterExpr(filter, row.doc, tableDef.fields, now: now) {
                 matched.append(row)
             }
         }

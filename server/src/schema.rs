@@ -470,19 +470,24 @@ fn check_field_declared(field: &str, table: &TableDef) -> Result<(), RtDbError> 
 /// predicate, `allow_principal_markers = true`) and by the query boundary in
 /// Task 6 (for client `.filter()` expressions, `allow_principal_markers = false`).
 ///
-/// - Every `field` (eq/neq/in/gt/gte/lt/lte/contains/exists) must name a
-///   declared field.
+/// - Every `field` (eq/neq/in/gt/gte/lt/lte/contains/exists/olderThan) must
+///   name a declared field.
 /// - `Contains` requires an array-of-strings field (`is_string_array_field`),
 ///   since it compiles to a jsonb membership test against a bound text uid.
 /// - Comparison fields (gt/gte/lt/lte) must be scalar-indexable
 ///   (`indexed_column_type` ok) so the SQL and doc evaluators can order them.
 /// - When `allow_principal_markers` is false, any principal marker appearing in
 ///   a value position is rejected (Task 6's client-filter guard).
+/// - `olderThan` is accepted only when `allow_relative_time` is true (the
+///   by-query step filters — `compile_scan_where`); everywhere else (read
+///   filters, `authorize`, computed `case` whens, migrate filters) it is
+///   rejected. Requires a declared `number`/`int64` field and `ms >= 0`.
 /// - `And`/`Or`/`Not` recurse.
 pub fn validate_filter_expr_fields(
     expr: &FilterExpr,
     table: &TableDef,
     allow_principal_markers: bool,
+    allow_relative_time: bool,
 ) -> Result<(), RtDbError> {
     match expr {
         FilterExpr::Eq { field, value }
@@ -510,6 +515,28 @@ pub fn validate_filter_expr_fields(
                         "field '{field}' must be a scalar indexable type for comparison"
                     )));
                 }
+            }
+        }
+        FilterExpr::OlderThan { field, ms } => {
+            if !allow_relative_time {
+                return Err(RtDbError::schema(
+                    "olderThan filter is only allowed in patchByQuery/deleteByQuery filters"
+                        .to_string(),
+                ));
+            }
+            if *ms < 0 {
+                return Err(RtDbError::schema("olderThan ms must be >= 0".to_string()));
+            }
+            check_field_declared(field, table)?;
+            let fty = &table.fields[field];
+            let inner = match fty {
+                FieldType::Optional { inner } => inner.as_ref(),
+                _ => fty,
+            };
+            if !matches!(inner, FieldType::Number | FieldType::Int64) {
+                return Err(RtDbError::schema(format!(
+                    "field '{field}' must be a number or int64 field for olderThan"
+                )));
             }
         }
         FilterExpr::In { field, values } => {
@@ -543,11 +570,16 @@ pub fn validate_filter_expr_fields(
         }
         FilterExpr::And { exprs } | FilterExpr::Or { exprs } => {
             for e in exprs {
-                validate_filter_expr_fields(e, table, allow_principal_markers)?;
+                validate_filter_expr_fields(
+                    e,
+                    table,
+                    allow_principal_markers,
+                    allow_relative_time,
+                )?;
             }
         }
         FilterExpr::Not { expr } => {
-            validate_filter_expr_fields(expr, table, allow_principal_markers)?;
+            validate_filter_expr_fields(expr, table, allow_principal_markers, allow_relative_time)?;
         }
     }
     Ok(())
@@ -653,7 +685,7 @@ impl TableDef {
         if let Some(authorize) = &self.authorize {
             // Principal markers are valid here (rejected in client filters by
             // Task 6 at the query boundary via the same walker with `false`).
-            validate_filter_expr_fields(authorize, self, true)?;
+            validate_filter_expr_fields(authorize, self, true, false)?;
         }
         self.validate_indexes(table_name)?;
         self.validate_ttl()?;
@@ -1205,7 +1237,7 @@ fn validate_computed_case_whens(ve: &ValueExpr, table: &TableDef) -> Result<(), 
     match ve {
         ValueExpr::Case { whens, otherwise } => {
             for cw in whens {
-                validate_filter_expr_fields(&cw.when, table, false)
+                validate_filter_expr_fields(&cw.when, table, false, false)
                     .map_err(|e| RtDbError::bad_request(e.message))?;
                 validate_computed_case_whens(&cw.then, table)?;
             }
@@ -3345,14 +3377,14 @@ mod tests {
             field: "owner".into(),
             value: serde_json::json!({"$user": true}),
         };
-        assert!(validate_filter_expr_fields(&with_marker, &table, true).is_ok());
-        assert!(validate_filter_expr_fields(&with_marker, &table, false).is_err());
+        assert!(validate_filter_expr_fields(&with_marker, &table, true, false).is_ok());
+        assert!(validate_filter_expr_fields(&with_marker, &table, false, false).is_err());
         let email_marker = FilterExpr::Eq {
             field: "owner".into(),
             value: serde_json::json!({"$email": true}),
         };
-        assert!(validate_filter_expr_fields(&email_marker, &table, true).is_ok());
-        assert!(validate_filter_expr_fields(&email_marker, &table, false).is_err());
+        assert!(validate_filter_expr_fields(&email_marker, &table, true, false).is_ok());
+        assert!(validate_filter_expr_fields(&email_marker, &table, false, false).is_err());
         // a marker nested under And is still rejected
         let nested = FilterExpr::And {
             exprs: vec![
@@ -3366,14 +3398,14 @@ mod tests {
                 },
             ],
         };
-        assert!(validate_filter_expr_fields(&nested, &table, false).is_err());
+        assert!(validate_filter_expr_fields(&nested, &table, false, false).is_err());
         // a non-marker value passes regardless of the flag
         let plain = FilterExpr::Eq {
             field: "visibility".into(),
             value: serde_json::json!("public"),
         };
-        assert!(validate_filter_expr_fields(&plain, &table, true).is_ok());
-        assert!(validate_filter_expr_fields(&plain, &table, false).is_ok());
+        assert!(validate_filter_expr_fields(&plain, &table, true, false).is_ok());
+        assert!(validate_filter_expr_fields(&plain, &table, false, false).is_ok());
     }
 
     // ---- computed fields (ENH-028) ----

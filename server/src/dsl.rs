@@ -333,6 +333,23 @@ pub enum FilterExpr {
     Exists {
         field: String,
     },
+    /// Execution-time-relative age predicate: the named field's epoch-ms
+    /// value is strictly older than `now − ms`, with `now` taken from the
+    /// server clock AT EXECUTION TIME — a scheduled txn's stored filter
+    /// stays fresh on every fire instead of freezing a literal at schedule
+    /// time (server-side sweeps: archive done rows older than 7d, expire
+    /// claim leases). Valid ONLY in the by-query step filters
+    /// (`patchByQuery`/`deleteByQuery`); read-path filters reject it (a live
+    /// subscription would go stale between writes — nothing re-evaluates a
+    /// wall-clock window on a timer), and so do `authorize` predicates,
+    /// partial-index `where` predicates, and computed `case` whens. The
+    /// field must be declared `number` or `int64` (`optional` unwrapped; a
+    /// null or absent value never matches), and `ms >= 0`.
+    #[serde(rename = "olderThan")]
+    OlderThan {
+        field: String,
+        ms: i64,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -704,5 +721,12 @@ pub fn filter_matches(doc: &serde_json::Value, expr: &FilterExpr, ctx: &Principa
             .and_then(|v| v.as_array())
             .is_some_and(|arr| arr.iter().any(|v| v == &resolve_value(value, ctx))),
         FilterExpr::Exists { field } => doc.get(field).is_some_and(|v| !v.is_null()),
+        // Unreachable through validation: relative-time predicates are
+        // by-query-only (accepted with `allow_relative_time = true` there,
+        // rejected in authorize / case-when / read filters), and
+        // `filter_matches` evaluates only authorize predicates and case
+        // whens. `false` is the fail-closed answer if one ever reaches here
+        // anyway (deny the write / take the `otherwise` branch).
+        FilterExpr::OlderThan { .. } => false,
     }
 }

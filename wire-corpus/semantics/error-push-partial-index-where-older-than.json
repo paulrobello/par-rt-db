@@ -1,0 +1,22 @@
+{
+  "name": "error-push-partial-index-where-older-than",
+  "$comment": "A partial-index `where` predicate is baked into DDL as a literal at push time — an execution-time-relative cutoff has no static meaning there, so the push fails BAD_REQUEST (the DDL compile path's own code, distinct from the authorize push rejection).",
+  "pushError": { "code": "BAD_REQUEST" },
+  "schema": {
+    "tables": {
+      "items": {
+        "fields": {
+          "title": { "type": "string" },
+          "completedAt": { "type": "number" }
+        },
+        "indexes": [
+          {
+            "name": "by_completedAt",
+            "fields": ["completedAt"],
+            "where": { "op": "olderThan", "field": "completedAt", "ms": 1000 }
+          }
+        ]
+      }
+    }
+  }
+}

@@ -147,15 +147,25 @@ type FilterLeafOp = "eq" | "neq" | "gt" | "gte" | "lt" | "lte";
  * fields type through the eq-bind conversion, other declared fields through
  * the server's `validate_jsonb_comparison_value`). Call once before
  * evaluating per row.
+ *
+ * `allowRelativeTime` (the mirror of server `validate_filter_expr_fields`'s
+ * fourth param) admits the `olderThan` leaf — only the by-query step scan
+ * path (`scanByQuery`) passes `true`; every other caller (read/query filters,
+ * search/vector filters, computed `case` whens) rejects it, exactly like the
+ * server's `compile_filter` chokepoint.
  */
-export function validateFilter(node: FilterExpr, table: TableJson): void {
+export function validateFilter(
+  node: FilterExpr,
+  table: TableJson,
+  allowRelativeTime = false,
+): void {
   switch (node.op) {
     case "and":
     case "or":
       if (node.exprs.length === 0) {
         throw new RtDbError("BAD_REQUEST", `${node.op} filter requires at least one expr`);
       }
-      for (const e of node.exprs) validateFilter(e, table);
+      for (const e of node.exprs) validateFilter(e, table, allowRelativeTime);
       return;
     case "in": {
       if (node.values.length === 0) {
@@ -171,8 +181,33 @@ export function validateFilter(node: FilterExpr, table: TableJson): void {
       return;
     }
     case "not":
-      validateFilter(node.expr, table);
+      validateFilter(node.expr, table, allowRelativeTime);
       return;
+    case "olderThan": {
+      // The server's OlderThan arm of validate_filter_expr_fields, in its
+      // exact order: context, ms sign, declaredness, field kind.
+      if (!allowRelativeTime) {
+        throw new RtDbError(
+          "BAD_REQUEST",
+          "olderThan filter is only allowed in patchByQuery/deleteByQuery filters",
+        );
+      }
+      if (node.ms < 0) {
+        throw new RtDbError("BAD_REQUEST", "olderThan ms must be >= 0");
+      }
+      if (!Object.hasOwn(table.fields, node.field)) {
+        throw new RtDbError("BAD_REQUEST", `filter references undeclared field '${node.field}'`);
+      }
+      const ty = table.fields[node.field];
+      const inner = ty.type === "optional" ? ty.inner : ty;
+      if (inner.type !== "number" && inner.type !== "int64") {
+        throw new RtDbError(
+          "BAD_REQUEST",
+          `field '${node.field}' must be a number or int64 field for olderThan`,
+        );
+      }
+      return;
+    }
     case "contains":
       checkLeafValue(node.field, node.value, table);
       return;
@@ -266,21 +301,29 @@ export type FieldMap = Readonly<Record<string, FieldTypeJson>>;
  * (SQL NULL exclusion). `fields` is the table's declared field map (pass an
  * empty object for type-less evaluation, e.g. unit tests). Assumes
  * `validateFilter` already passed.
+ *
+ * `nowMs` is the execution-time clock the `olderThan` leaf derives its cutoff
+ * from (`nowMs − ms`, strict `<`) — only the by-query step scan passes it
+ * (one read per step, mirroring the server's compile-once `now_ms()`). Without
+ * a clock the leaf evaluates `false` — the fail-closed arm of server
+ * `filter_matches`, which only ever sees authorize/case-when predicates
+ * (both push-reject the op) and answers "deny"/"otherwise" on doubt.
  */
 export function evalFilterExpr(
   node: FilterExpr,
   doc: Record<string, unknown>,
   fields: FieldMap,
+  nowMs?: number,
 ): boolean {
   switch (node.op) {
     case "and":
-      return node.exprs.every((e) => evalFilterExpr(e, doc, fields));
+      return node.exprs.every((e) => evalFilterExpr(e, doc, fields, nowMs));
     case "or":
-      return node.exprs.some((e) => evalFilterExpr(e, doc, fields));
+      return node.exprs.some((e) => evalFilterExpr(e, doc, fields, nowMs));
     case "in":
       return node.values.some((v) => compareLeaf("eq", node.field, v, doc, fields));
     case "not":
-      return !evalFilterExpr(node.expr, doc, fields);
+      return !evalFilterExpr(node.expr, doc, fields, nowMs);
     case "contains": {
       const arr = doc[node.field];
       const want = JSON.stringify(node.value);
@@ -289,6 +332,34 @@ export function evalFilterExpr(
     case "exists": {
       const v = doc[node.field];
       return v !== undefined && v !== null;
+    }
+    case "olderThan": {
+      if (nowMs === undefined) {
+        return false;
+      }
+      const docVal = doc[node.field];
+      if (docVal === null || docVal === undefined) {
+        return false;
+      }
+      const cutoff = nowMs - node.ms;
+      if (isInt64Field(fields[node.field])) {
+        // int64 rides the decimal-string wire form end to end; parse exactly
+        // (i64::MAX is not float-exact — the server's typed bigint column
+        // compares in i64). The cutoff is an integer in the wire domain
+        // (epoch-ms clock minus an integer ms); the Number fallback only
+        // guards a hostile fractional ms.
+        if (typeof docVal !== "string") {
+          return false;
+        }
+        const lhs = parseI64(docVal);
+        return (
+          lhs !== null && (Number.isInteger(cutoff) ? lhs < BigInt(cutoff) : Number(lhs) < cutoff)
+        );
+      }
+      if (typeof docVal !== "number" || !Number.isFinite(docVal)) {
+        return false;
+      }
+      return docVal < cutoff;
     }
     default:
       return compareLeaf(node.op, node.field, node.value, doc, fields);
@@ -674,6 +745,7 @@ export function walkFilterExprFields(expr: FilterExpr, visit: (field: string) =>
     case "in":
     case "contains":
     case "exists":
+    case "olderThan":
       visit(expr.field);
       return;
     case "and":
@@ -690,4 +762,24 @@ export function walkFilterExprFields(expr: FilterExpr, visit: (field: string) =>
     "BAD_REQUEST",
     `unknown filter expr op '${String((expr as { op: string }).op)}'`,
   );
+}
+
+/** Whether a `FilterExpr` tree carries an `olderThan` leaf anywhere — the
+ * push-time guard for the two schema-declared filter surfaces (`authorize`
+ * predicates and partial-index `where` predicates), which the harness
+ * otherwise leaves unvalidated (a deliberate subset of server push
+ * validation; server rejects the op in `validate_structure` and
+ * `render_filter_literal_node` respectively). */
+export function filterContainsOlderThan(expr: FilterExpr): boolean {
+  switch (expr.op) {
+    case "olderThan":
+      return true;
+    case "and":
+    case "or":
+      return expr.exprs.some((e) => filterContainsOlderThan(e));
+    case "not":
+      return filterContainsOlderThan(expr.expr);
+    default:
+      return false;
+  }
 }

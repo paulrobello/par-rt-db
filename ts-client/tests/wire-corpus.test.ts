@@ -25,6 +25,7 @@ import type {
   AuthedUser,
   AuthedUserKind,
   ClientMessage,
+  FilterExpr,
   MigrateRequestJson,
   MigrateResultJson,
   QueryJson,
@@ -240,6 +241,65 @@ describe("wire-corpus: projection query entry (Query.fields)", () => {
     expect(projected[0].index).toBe("by_status");
     expect(projected[0].take).toBe(10);
     expect(projected[0].fields).toEqual(["title", "status", "_id"]);
+  });
+});
+
+/**
+ * olderThan pins: the corpus gained the execution-time-relative filter op —
+ * `patchByQuery`/`deleteByQuery` steps carrying an `olderThan` filter inside a
+ * `client_messages` Mutate frame, plus a `queries` entry with a bare
+ * `olderThan` filter. The generic loops above round-trip them raw; this block
+ * additionally type-checks both against the wire types (`FilterExpr` inside
+ * `StepJson`/`QueryJson`) and asserts each entry is present with its
+ * load-bearing fields intact — a corpus or protocol drift on the olderThan
+ * surface fails here, not just silently round-tripping.
+ */
+describe("wire-corpus: olderThan entries (by-query filter op)", () => {
+  const corpus = loadCorpus();
+  const byQuerySteps = corpus.client_messages
+    .filter((m): m is Extract<ClientMessage, { type: "mutate" }> => m.type === "mutate")
+    .flatMap((m) => m.txn.steps)
+    .flatMap((s) =>
+      s.op === "patchByQuery" || s.op === "deleteByQuery" ? [{ stepOp: s.op, ...s }] : [],
+    );
+  const olderThanQueries = corpus.queries.filter(
+    (q): q is QueryJson & { filter: { op: "olderThan"; field: string; ms: number } } =>
+      typeof q === "object" &&
+      q !== null &&
+      "filter" in q &&
+      (q as { filter?: { op?: string } }).filter?.op === "olderThan",
+  );
+  it("carries the patchByQuery bare-olderThan and deleteByQuery and-wrapped steps", () => {
+    expect(byQuerySteps).toHaveLength(2);
+    const patch = byQuerySteps.find((s) => s.stepOp === "patchByQuery");
+    expect(patch).toBeDefined();
+    // The bare-leaf form; narrowing the discriminant types `filter` as the
+    // olderThan member for the field/ms assertions.
+    if (patch?.filter.op === "olderThan") {
+      const _typeCheck: FilterExpr = patch.filter;
+      void _typeCheck;
+      expect(patch.filter.field).toBe("completedAt");
+      expect(patch.filter.ms).toBe(604800000);
+    } else {
+      throw new Error("patchByQuery step must carry a bare olderThan filter");
+    }
+    // The composed form: olderThan nested inside an `and` with an `exists`.
+    const del = byQuerySteps.find((s) => s.stepOp === "deleteByQuery");
+    expect(del).toBeDefined();
+    expect(del?.filter.op).toBe("and");
+    const inner = del?.filter.op === "and" ? del.filter.exprs[0] : undefined;
+    expect(inner?.op).toBe("olderThan");
+    expect((inner as { field: string; ms: number }).field).toBe("claimExpiresAt");
+    expect((inner as { field: string; ms: number }).ms).toBe(0);
+    expect((del as { limit?: number }).limit).toBe(500);
+  });
+  it("carries the bare olderThan query entry and it satisfies QueryJson", () => {
+    expect(olderThanQueries).toHaveLength(1);
+    const _typeCheck: QueryJson = olderThanQueries[0];
+    void _typeCheck;
+    expect(olderThanQueries[0].table).toBe("workItems");
+    expect(olderThanQueries[0].filter.field).toBe("completedAt");
+    expect(olderThanQueries[0].filter.ms).toBe(604800000);
   });
 });
 

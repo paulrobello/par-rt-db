@@ -677,6 +677,10 @@ struct WireFilterQueryTests {
             FilterExpr.exists(field: "email"),
             as: #"{"op":"exists","field":"email"}"#
         )
+        try expectEncodes(
+            FilterExpr.olderThan(field: "completedAt", ms: 604_800_000),
+            as: #"{"op":"olderThan","field":"completedAt","ms":604800000}"#
+        )
     }
 
     @Test func filterExprNests() throws {
@@ -714,6 +718,7 @@ struct WireFilterQueryTests {
     @Test func filterExprRejectsUnknownFieldAndOp() {
         expectDecodingThrows(FilterExpr.self, #"{"op":"eq","field":"f","value":1,"zzz":2}"#)
         expectDecodingThrows(FilterExpr.self, #"{"op":"between","field":"f","value":1}"#)
+        expectDecodingThrows(FilterExpr.self, #"{"op":"olderThan","field":"f","ms":1,"zzz":2}"#)
     }
 
     // MARK: - Search / vector / hybrid / aggregate

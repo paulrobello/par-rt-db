@@ -407,7 +407,7 @@ fn validate_one(schema: &mut SchemaDef, d: &Directive) -> Result<(), RtDbError> 
                 ExprSource::Legacy(_) => {}
             }
             if let Some(CondSource::Typed(f)) = where_clause {
-                crate::schema::validate_filter_expr_fields(f, t, false)
+                crate::schema::validate_filter_expr_fields(f, t, false, false)
                     .map_err(|e| RtDbError::bad_request(e.message))?;
             }
         }
@@ -437,7 +437,8 @@ fn rename_filter_fields(expr: &mut crate::query::FilterExpr, from: &str, to: &st
         | FilterExpr::Lte { field, .. }
         | FilterExpr::In { field, .. }
         | FilterExpr::Contains { field, .. }
-        | FilterExpr::Exists { field } => {
+        | FilterExpr::Exists { field }
+        | FilterExpr::OlderThan { field, .. } => {
             if field == from {
                 *field = to.to_string();
             }
@@ -504,7 +505,8 @@ fn filter_expr_references_field(expr: &crate::query::FilterExpr, field: &str) ->
         | FilterExpr::Lte { field: f, .. }
         | FilterExpr::In { field: f, .. }
         | FilterExpr::Contains { field: f, .. }
-        | FilterExpr::Exists { field: f } => f == field,
+        | FilterExpr::Exists { field: f }
+        | FilterExpr::OlderThan { field: f, .. } => f == field,
         FilterExpr::And { exprs } | FilterExpr::Or { exprs } => {
             exprs.iter().any(|e| filter_expr_references_field(e, field))
         }
@@ -1140,7 +1142,7 @@ async fn apply_eval_expr(
             // Compile the typed `where` once for the id-SELECT ($1..).
             let (cond_sql, cond_binds) = match cond {
                 Some(CondSource::Typed(f)) => {
-                    let (sql, binds) = crate::query::compile_filter(f, derived_table, 1)?;
+                    let (sql, binds) = crate::query::compile_filter(f, derived_table, 1, false)?;
                     (sql, binds)
                 }
                 Some(CondSource::Legacy(_)) => {
@@ -1162,7 +1164,7 @@ async fn apply_eval_expr(
             let (cond_sql2, cond_binds2) = match cond {
                 Some(CondSource::Typed(f)) => {
                     let start = 1 + expr_binds.len();
-                    crate::query::compile_filter(f, derived_table, start)?
+                    crate::query::compile_filter(f, derived_table, start, false)?
                 }
                 _ => ("true".to_string(), Vec::new()),
             };
@@ -1397,7 +1399,7 @@ pub(crate) fn validate_value_expr_fields(
         ValueExpr::Cast { value, .. } => validate_value_expr_fields(value, table)?,
         ValueExpr::Case { whens, otherwise } => {
             for cw in whens {
-                crate::schema::validate_filter_expr_fields(&cw.when, table, false)
+                crate::schema::validate_filter_expr_fields(&cw.when, table, false, false)
                     .map_err(|e| RtDbError::bad_request(e.message))?;
                 validate_value_expr_fields(&cw.then, table)?;
             }

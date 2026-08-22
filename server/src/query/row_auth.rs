@@ -126,6 +126,10 @@ fn resolve_predicate_markers(expr: &FilterExpr, ctx: &PrincipalCtx) -> FilterExp
         FilterExpr::Exists { field } => FilterExpr::Exists {
             field: field.clone(),
         },
+        FilterExpr::OlderThan { field, ms } => FilterExpr::OlderThan {
+            field: field.clone(),
+            ms: *ms,
+        },
         FilterExpr::And { exprs } => FilterExpr::And {
             exprs: exprs
                 .iter()

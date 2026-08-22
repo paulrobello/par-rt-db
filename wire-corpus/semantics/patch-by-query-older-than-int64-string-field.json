@@ -1,0 +1,41 @@
+{
+  "name": "patch-by-query-older-than-int64-string-field",
+  "$comment": "olderThan over an indexed int64 field: values ride the int64 wire form (decimal strings end to end) and the comparison is numeric — \"1\" is below the cutoff, the 9e15 string above it (margins per patch-by-query-older-than-sweeps-old-rows).",
+  "schema": {
+    "tables": {
+      "items": {
+        "fields": {
+          "title": { "type": "string" },
+          "completedAt": { "type": "int64" }
+        },
+        "indexes": [
+          { "name": "by_title", "fields": ["title"] },
+          { "name": "by_completedAt", "fields": ["completedAt"] }
+        ]
+      }
+    }
+  },
+  "seed": [
+    { "$id": "old", "doc": { "title": "old", "completedAt": "1" } },
+    { "$id": "future", "doc": { "title": "future", "completedAt": "9000000000000000" } }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "patchByQuery",
+          "table": "items",
+          "filter": { "op": "olderThan", "field": "completedAt", "ms": 1000000000000 },
+          "patch": { "title": "swept" }
+        }
+      ]
+    }
+  },
+  "expect": [{ "patched": 1, "truncated": false }],
+  "normalize": ["_id", "_creationTime", "_version"],
+  "then": {
+    "query": { "table": "items", "index": "by_title", "eq": ["future"] },
+    "expect": [{ "title": "future", "completedAt": "9000000000000000" }],
+    "normalize": ["_id", "_creationTime", "_version"]
+  }
+}
