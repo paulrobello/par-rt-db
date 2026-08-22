@@ -462,7 +462,7 @@ mirrored as the HTTP `Retry-After` header); every other code omits it:
 ### Query shape
 
 `{"table": "<name>", "get"?, "index"?, "eq"?, "order"?, "take"?, "unique"?, "first"?,
-"count"?, "filter"?, "search"?, "vectorSearch"?, "hybridSearch"?, "paginate"?, "distinct"?, "aggregate"?}`
+"count"?, "filter"?, "search"?, "vectorSearch"?, "hybridSearch"?, "paginate"?, "distinct"?, "aggregate"?, "fields"?}`
 — exactly one terminal per query (terminals are mutually exclusive). See
 `server/src/query/` for full semantics: index prefix binds, range predicates
 (`gt`/`gte`/`lt`/`lte`) follow the `eq` prefix, `order: "asc"|"desc"`, `take`
@@ -487,7 +487,14 @@ Reciprocal Rank Fusion, `paginate` is opaque-cursor keyset pagination,
 (ascending; NULLs included, sorted last), and `aggregate` runs a scalar
 `sum`/`min`/`max`/`avg`/`count`, optionally grouped (`groupBy`) by the next
 index field (rows missing the group value form one `key: null` group,
-sorted last).
+sorted last), and an optional `fields` array projects each result doc to the
+listed user fields — the system fields (`_id`/`_creationTime`/`_version`) and
+synthetic fields (`_searchSnippet`) are always kept, `fields: []` is an
+ids-only view, names are validated against the schema (`BAD_REQUEST` on an
+unknown field), it composes with every doc-bearing terminal (`count`/
+`distinct`/`aggregate` return no docs, so it is a no-op there), and a
+projected subscription does not push when a write changes only non-projected
+fields (the pushed payloads still carry `_version`).
 
 ### Transaction shape
 

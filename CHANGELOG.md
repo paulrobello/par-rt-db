@@ -14,6 +14,32 @@ contract against Convex.
 
 ## [Unreleased]
 
+### Feature: query field projection — `fields` on any query (FM-38, server + all four clients)
+
+An optional `fields: string[]` on the wire `Query` (additive; omitted when
+unset) projects each result doc to the listed user fields. Every `_`-prefixed
+key is always kept — exactly the system fields (`_id`/`_creationTime`/
+`_version`) plus synthetic result fields like `_searchSnippet`, since user
+fields can never be `_`-prefixed — and `fields: []` is a meaningful ids-only
+view. Names are validated at compile time against the table (a declared field
+or one of the three system names; anything else is `BAD_REQUEST`), projection
+applies at the single `execute_query` seam so every doc-bearing terminal
+(`get`/`collect`/`first`/`unique`/`paginate`/`search`/`vectorSearch`/
+`hybridSearch`) composes with it on every surface (HTTP one-shot, WS initial
+subscribe push, subscription re-runs), and doc-less terminals (`count`/
+`distinct`/`aggregate`) are unaffected by construction. Sorting, cursors, and
+snippet rendering are computed before projection, so pagination still works
+and `snippet: true` keeps its `_searchSnippet`. Subscription semantics: a
+projected subscription's change detection strips the volatile `_version`
+(`diff_canonical`), so a write touching only non-projected fields re-runs the
+subscription but pushes nothing — pushed payloads still carry `_version`, and
+unprojected subscriptions keep byte-identical push behavior. All four SDKs
+mirror the `.fields(...)` builder, the in-memory engine projection +
+validation, and the projected-subscription diff semantics; pinned by five
+semantics-corpus cases and a `wire-corpus.json` entry. Convex parity: Convex
+returns full documents (open request
+[get-convex/convex-backend#97](https://github.com/get-convex/convex-backend/issues/97)).
+
 ### Feature: `awaitSignal` workflow steps — external approval gates (FM-29, server + all four clients)
 
 A workflow step is now either a txn or an `awaitSignal {name, timeoutMs?}`

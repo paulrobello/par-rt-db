@@ -146,6 +146,17 @@ allowed), `order` sorts by the remaining index fields then `created_at`, termina
 one of `take(n)`, `unique` (error if >1 match), or `collect`. Point reads:
 `{"get": "<id>"}`. No general filter expressions in MVP.
 
+Post-MVP query modifiers (each additive on the wire, documented in
+[FEATURE_MATRIX.md](../../FEATURE_MATRIX.md)): db-side `filter` predicates (#15),
+`count`/`distinct`/`aggregate` terminals, `paginate`, the ranked
+`search`/`vectorSearch`/`hybridSearch` family (#11, FM-30/31), and `fields`
+projection (FM-38) — an optional list of field names projecting each result doc to
+the listed user fields (system fields `_id`/`_creationTime`/`_version` and synthetic
+fields like `_searchSnippet` always kept; `[]` = ids-only view; unknown names are
+`BAD_REQUEST`). Projection applies identically to one-shot reads and subscription
+pushes; a projected subscription's change detection ignores `_version`, so writes
+that touch only non-projected fields re-run the subscription but push nothing.
+
 ### Transaction DSL
 
 A mutation is an ordered list of steps executed all-or-nothing:
