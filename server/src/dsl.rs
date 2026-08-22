@@ -78,6 +78,8 @@ pub struct Query {
         skip_serializing_if = "Option::is_none"
     )]
     pub hybrid_search: Option<HybridSearchQuery>, // hybrid terminal: fuses full-text (ts_rank) and vector (cosine) ranking via Reciprocal Rank Fusion; carries its own limit
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<String>>, // projection: keep only these user fields per result doc; `_`-prefixed system fields are always kept. `Some([])` = system fields only; `None` = full docs
 }
 
 impl Query {

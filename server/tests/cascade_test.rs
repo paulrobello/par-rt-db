@@ -287,6 +287,7 @@ fn base_query(table: &str) -> Query {
         search: None,
         vector_search: None,
         hybrid_search: None,
+        fields: None,
         aggregate: None,
     }
 }

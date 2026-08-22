@@ -181,6 +181,7 @@ fn notes_query() -> Query {
         search: None,
         vector_search: None,
         hybrid_search: None,
+        fields: None,
         aggregate: None,
     }
 }
@@ -371,6 +372,7 @@ async fn non_owner_table_is_unaffected_by_owner() -> anyhow::Result<()> {
         search: None,
         vector_search: None,
         hybrid_search: None,
+        fields: None,
         aggregate: None,
     };
     let res = execute_query(
@@ -2497,6 +2499,7 @@ fn posts_query() -> Query {
         search: None,
         vector_search: None,
         hybrid_search: None,
+        fields: None,
         aggregate: None,
     }
 }
@@ -3235,6 +3238,7 @@ async fn fetch_doc_bypass(
         search: None,
         vector_search: None,
         hybrid_search: None,
+        fields: None,
         aggregate: None,
     };
     match execute_query(pool, db, schema, &q, &PrincipalCtx::bypass(), false).await {
@@ -3379,6 +3383,7 @@ async fn authorize_insert_without_user_leaf_forbidden_when_predicate_fails() -> 
         search: None,
         vector_search: None,
         hybrid_search: None,
+        fields: None,
         aggregate: None,
     };
     let res = execute_query(&pool, &db, &schema, &q, &PrincipalCtx::bypass(), false).await?;
@@ -3578,6 +3583,7 @@ fn get_query(table: &str, id: &str) -> Query {
         search: None,
         vector_search: None,
         hybrid_search: None,
+        fields: None,
         aggregate: None,
     }
 }
@@ -4025,6 +4031,7 @@ fn docs_query() -> Query {
         search: None,
         vector_search: None,
         hybrid_search: None,
+        fields: None,
         aggregate: None,
     }
 }
@@ -4656,6 +4663,7 @@ async fn sec117_seed_without_flag(
         search: None,
         vector_search: None,
         hybrid_search: None,
+        fields: None,
         aggregate: None,
     };
     let res = execute_query(pool, db, _schema, &get_q, &PrincipalCtx::bypass(), false)
@@ -4699,6 +4707,7 @@ async fn sec117_assert_agree(predicate: FilterExpr, expect_visible: bool) {
         search: None,
         vector_search: None,
         hybrid_search: None,
+        fields: None,
         aggregate: None,
     };
     let user_ctx = PrincipalCtx {

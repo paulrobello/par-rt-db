@@ -24,7 +24,7 @@ use crate::error::RtDbError;
 use crate::metrics::Metrics;
 use crate::mutation_log;
 use crate::protocol::ServerMessage;
-use crate::query::{Query, canonical, execute_query};
+use crate::query::{Query, diff_canonical, execute_query};
 use crate::scheduler;
 use crate::subs::{ConnId, SubscriptionManager};
 use crate::txn::{OpKind, Transaction, TxnOutcome, WriteSet, execute_txn};
@@ -2137,7 +2137,7 @@ async fn handle_subscribe(
 ) -> Result<(), RtDbError> {
     let schema = ctx.schemas.get(&ctx.pool, &ctx.db).await?;
     let result = execute_query(&ctx.pool, &ctx.db, &schema, &query, &principal_ctx, false).await?;
-    let last = canonical(&result);
+    let last = diff_canonical(&result, &query);
     // Mirror `subs::fan_out`: a serialization failure is logged and surfaced
     // as an internal error so the subscriber sees an explicit error rather
     // than a silently-pushed `{"result": null}` (QA-004). In practice

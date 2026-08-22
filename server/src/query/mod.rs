@@ -510,6 +510,84 @@ fn field_is_indexed(table_def: &TableDef, field: &str) -> bool {
         })
 }
 
+/// Validate a `Query::fields` projection against the table: every name must be
+/// a declared field or one of the system fields (`_id`/`_creationTime`/
+/// `_version` — always included, so listing them is an allowed no-op). Anything
+/// else — including typo'd system names and other `_`-prefixed names — is
+/// `BadRequest` at compile time, the same gate `/explain` runs. `Some([])`
+/// (system fields only) validates trivially.
+pub fn validate_projection(table_def: &TableDef, fields: &[String]) -> Result<(), RtDbError> {
+    const SYSTEM_FIELDS: [&str; 3] = ["_id", "_creationTime", "_version"];
+    for name in fields {
+        if SYSTEM_FIELDS.contains(&name.as_str()) || table_def.fields.contains_key(name) {
+            continue;
+        }
+        return Err(RtDbError::bad_request(format!(
+            "unknown projection field '{name}'"
+        )));
+    }
+    Ok(())
+}
+
+/// Apply a `Query::fields` projection to an executed result: each doc keeps
+/// its `_`-prefixed keys and the listed user fields; every other user field is
+/// dropped. `_`-prefixed keys are exactly the system fields plus synthetic
+/// result fields (`_searchSnippet`) — user fields can never be `_`-prefixed
+/// (`validate_doc` rejects them at write time) — so this rule IS "system
+/// fields are always present". Doc-less terminals (`Count`/`Distinct`/
+/// `Aggregate`) are unaffected by construction. `Map::retain` preserves key
+/// order, so `canonical` output stays stable across re-runs.
+pub fn project_result(result: &mut QueryResult, fields: &[String]) {
+    fn project(doc: &mut serde_json::Value, fields: &[String]) {
+        if let serde_json::Value::Object(map) = doc {
+            map.retain(|k, _| k.starts_with('_') || fields.iter().any(|f| f == k));
+        }
+    }
+    match result {
+        QueryResult::Doc(Some(doc)) => project(doc, fields),
+        QueryResult::Docs(docs) => {
+            for doc in docs {
+                project(doc, fields);
+            }
+        }
+        QueryResult::Paginated(page) => {
+            for doc in &mut page.docs {
+                project(doc, fields);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The canonical a subscription diffs against for push decisions. For an
+/// UNPROJECTED query this is the plain [`canonical`] — byte-identical push
+/// semantics to pre-projection behavior. For a PROJECTED query (`fields` set)
+/// the volatile `_version` is stripped from every doc before serializing:
+/// `_version` bumps on every write, so an unstripped canonical would push on
+/// any member write even when no projected field changed — defeating the
+/// payload-width point of a projected subscription. Pushed payloads still
+/// carry `_version`; only the change-detection comparison ignores it. (A
+/// subscriber that must see every `_version` bump should use an unprojected
+/// subscription.)
+pub fn diff_canonical(result: &QueryResult, q: &Query) -> String {
+    if q.fields.is_none() {
+        return canonical(result);
+    }
+    fn strip_version(doc: &mut serde_json::Value) {
+        if let serde_json::Value::Object(map) = doc {
+            map.remove("_version");
+        }
+    }
+    let mut stripped = result.clone();
+    match &mut stripped {
+        QueryResult::Doc(Some(doc)) => strip_version(doc),
+        QueryResult::Docs(docs) => docs.iter_mut().for_each(strip_version),
+        QueryResult::Paginated(page) => page.docs.iter_mut().for_each(strip_version),
+        _ => {}
+    }
+    canonical(&stripped)
+}
+
 pub async fn execute_query(
     pool: &PgPool,
     db: &str,
@@ -551,7 +629,7 @@ pub async fn execute_query(
             collaborators_field,
             ctx,
         };
-        match cq.terminal {
+        let mut result = match cq.terminal {
             "get" => point_read(&sctx, cq, owner).await,
             // `snippet` travels on the query, not the CompiledQuery (whose
             // shape is the /explain contract), so the execute tail gets it
@@ -599,7 +677,17 @@ pub async fn execute_query(
             other => Err(RtDbError::internal(format!(
                 "unknown compiled terminal '{other}'"
             ))),
+        }?;
+        // Apply the caller's field projection at this one seam: every
+        // terminal's docs flow back through here, so one pass covers HTTP
+        // one-shots, the WS initial subscribe push, and every subscription
+        // re-run — whose canonical diff then sees the projected shape (a
+        // write to a non-projected field re-runs the sub but leaves the
+        // canonical unchanged, so nothing is pushed).
+        if let Some(fields) = &q.fields {
+            project_result(&mut result, fields);
         }
+        Ok(result)
     }
     .instrument(span)
     .await

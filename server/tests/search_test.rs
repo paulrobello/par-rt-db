@@ -1359,3 +1359,64 @@ async fn snippet_rejected_with_trgm_mode() {
     assert_eq!(err.code, ErrorCode::BadRequest);
     assert!(err.message.contains("tsquery mode"));
 }
+
+// --- projection + search ---
+
+// fields composes with the search terminal: hits keep the system fields, the
+// listed user fields, AND the synthetic `_searchSnippet` (every `_`-prefixed
+// key is a system/synthetic field the projection never strips — snippet:true
+// stays useful alongside a projection).
+#[tokio::test]
+async fn projection_composes_with_search_and_keeps_snippet() {
+    let state = test_state().await;
+    let (db, schema) = fresh_search_db(&state).await;
+    let pool = &state.pool;
+    insert_note(
+        pool,
+        &db,
+        &schema,
+        "database notes",
+        "a database is a database",
+    )
+    .await;
+
+    let q: Query = serde_json::from_value(serde_json::json!({
+        "table": "notes",
+        "search": {"index": "search_content", "query": "database", "snippet": true},
+        "fields": ["title"]
+    }))
+    .expect("projection search query");
+    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass(), false)
+        .await
+        .expect("projection search");
+    match res {
+        QueryResult::Docs(docs) => {
+            assert_eq!(docs.len(), 1);
+            let doc = &docs[0];
+            let mut keys: Vec<&str> = doc
+                .as_object()
+                .expect("doc object")
+                .keys()
+                .map(|k| k.as_str())
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec![
+                    "_creationTime",
+                    "_id",
+                    "_searchSnippet",
+                    "_version",
+                    "title"
+                ]
+            );
+            assert_eq!(doc["title"], serde_json::json!("database notes"));
+            assert!(
+                doc["_searchSnippet"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("<mark>"))
+            );
+        }
+        other => panic!("expected Docs variant, got {other:?}"),
+    }
+}

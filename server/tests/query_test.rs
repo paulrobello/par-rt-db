@@ -168,6 +168,7 @@ async fn get_by_id_returns_doc_with_system_fields() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -223,6 +224,7 @@ async fn get_missing_returns_null() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -269,6 +271,7 @@ async fn get_combined_with_index_is_bad_request() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -318,6 +321,7 @@ async fn get_combined_with_paginate_is_bad_request() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -364,6 +368,7 @@ async fn unique_combined_with_take_is_bad_request() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -411,6 +416,7 @@ async fn full_eq_compound_index_orders_by_created_at_asc() -> anyhow::Result<()>
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -456,6 +462,7 @@ async fn full_eq_compound_index_order_desc_reverses() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -503,6 +510,7 @@ async fn prefix_eq_on_compound_index_sorts_by_remaining_index_field_then_created
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -557,6 +565,7 @@ async fn unique_on_by_name_returns_single_doc() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -608,6 +617,7 @@ async fn unique_with_duplicate_name_is_precondition_failed() -> anyhow::Result<(
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -655,6 +665,7 @@ async fn no_index_collect_returns_all_docs_in_created_at_order() -> anyhow::Resu
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -700,6 +711,7 @@ async fn take_over_cap_is_bad_request() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -746,6 +758,7 @@ async fn unknown_index_is_bad_request() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -792,6 +805,7 @@ async fn eq_longer_than_index_fields_is_bad_request() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -836,6 +850,7 @@ async fn unknown_table_is_not_found() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -882,6 +897,7 @@ async fn take_zero_returns_empty_docs() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -925,6 +941,7 @@ async fn unique_without_index_scans_whole_table() -> anyhow::Result<()> {
         search: None,
         vector_search: None,
         hybrid_search: None,
+        fields: None,
         aggregate: None,
     };
 
@@ -1000,6 +1017,7 @@ async fn canonical_is_stable_for_identical_results() -> anyhow::Result<()> {
         search: None,
         vector_search: None,
         hybrid_search: None,
+        fields: None,
         aggregate: None,
     };
 
@@ -1046,6 +1064,7 @@ async fn range_gt_excludes_boundary_and_sorts_by_bound_field() -> anyhow::Result
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -1094,6 +1113,7 @@ async fn range_gte_includes_boundary() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -1148,6 +1168,7 @@ async fn range_gt_and_lt_bounded_numeric_range() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -1196,6 +1217,7 @@ async fn range_bounded_numeric_range_with_order_desc_and_take() -> anyhow::Resul
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -1241,6 +1263,7 @@ async fn range_without_eq_prefix_applies_to_first_index_field() -> anyhow::Resul
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -1289,6 +1312,7 @@ async fn range_gt_and_gte_both_set_is_bad_request() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -1335,6 +1359,7 @@ async fn range_lt_and_lte_both_set_is_bad_request() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -1381,6 +1406,7 @@ async fn range_without_index_is_bad_request() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -1427,6 +1453,7 @@ async fn range_with_no_remaining_index_field_is_bad_request() -> anyhow::Result<
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -1473,6 +1500,7 @@ async fn range_combined_with_get_is_bad_request() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -1519,6 +1547,7 @@ async fn range_value_wrong_type_is_bad_request() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -1565,6 +1594,7 @@ async fn range_lte_includes_boundary_value() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -1615,6 +1645,7 @@ async fn first_on_no_matching_docs_returns_null() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -1660,6 +1691,7 @@ async fn first_with_single_matching_doc_returns_it() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -1712,6 +1744,7 @@ async fn first_combined_with_range_bound_returns_smallest_in_ascending_order() -
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -1762,6 +1795,7 @@ async fn first_combined_with_range_bound_and_order_desc_returns_largest() -> any
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -1812,6 +1846,7 @@ async fn first_combined_with_take_is_bad_request() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -1858,6 +1893,7 @@ async fn first_combined_with_unique_is_bad_request() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -1904,6 +1940,7 @@ async fn first_combined_with_get_is_bad_request() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -1952,6 +1989,7 @@ async fn count_on_empty_table_returns_zero() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -1997,6 +2035,7 @@ async fn count_with_eq_prefix_counts_matching_subset() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -2042,6 +2081,7 @@ async fn count_with_range_bound_counts_matching_subset() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -2087,6 +2127,7 @@ async fn count_combined_with_order_is_bad_request() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -2133,6 +2174,7 @@ async fn count_combined_with_take_is_bad_request() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -2179,6 +2221,7 @@ async fn count_combined_with_unique_is_bad_request() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -2225,6 +2268,7 @@ async fn count_combined_with_first_is_bad_request() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -2271,6 +2315,7 @@ async fn count_combined_with_get_is_bad_request() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -2323,6 +2368,7 @@ fn distinct_query(
         search: None,
         vector_search: None,
         hybrid_search: None,
+        fields: None,
         aggregate: None,
     };
     range(&mut q);
@@ -2624,6 +2670,7 @@ fn aggregate_query(
         search: None,
         vector_search: None,
         hybrid_search: None,
+        fields: None,
     };
     range(&mut q);
     q
@@ -3237,6 +3284,7 @@ fn paginate_query(
         search: None,
         vector_search: None,
         hybrid_search: None,
+        fields: None,
         aggregate: None,
     }
 }
@@ -4282,6 +4330,7 @@ async fn int64_index_range_and_eq_compare_numerically() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -4315,6 +4364,7 @@ async fn int64_index_range_and_eq_compare_numerically() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -4359,6 +4409,7 @@ async fn int64_index_count_and_aggregate() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: None,
         },
         &PrincipalCtx::bypass(),
@@ -4391,6 +4442,7 @@ async fn int64_index_count_and_aggregate() -> anyhow::Result<()> {
             search: None,
             vector_search: None,
             hybrid_search: None,
+            fields: None,
             aggregate: Some(AggregateSpec {
                 op: AggregateOp::Sum,
                 group_by: false,
@@ -4402,5 +4454,293 @@ async fn int64_index_count_and_aggregate() -> anyhow::Result<()> {
     .await?;
     // SUM(bigint) projects via to_jsonb -> JSON number.
     assert!(matches!(r, QueryResult::Aggregate(ref v) if v.as_f64() == Some(60.0)));
+    Ok(())
+}
+
+// =====================================================================
+// Field projection (Query.fields)
+// =====================================================================
+
+/// Builds a query via the wire shape (the same serde path clients exercise)
+/// with only the projection-relevant pieces set.
+fn projection_query(table: &str, extra: serde_json::Value, fields: &[&str]) -> Query {
+    let mut value = serde_json::json!({"table": table});
+    let obj = value.as_object_mut().expect("object");
+    if let Some(extra_obj) = extra.as_object() {
+        for (k, v) in extra_obj {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    obj.insert(
+        "fields".to_string(),
+        serde_json::Value::Array(fields.iter().map(|f| serde_json::json!(f)).collect()),
+    );
+    serde_json::from_value(value).expect("parse projection query")
+}
+
+/// Sorted key set of a result doc, for exact projected-shape assertions.
+fn sorted_doc_keys(doc: &serde_json::Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = doc
+        .as_object()
+        .expect("doc object")
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+// (a) collect + fields: docs carry exactly the system fields + the listed
+// user fields; every unlisted user field is dropped.
+#[tokio::test]
+async fn projection_collect_subsets_user_fields_and_keeps_system() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    seed_kanban(&pool, &db, &schema).await?;
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &projection_query("workItems", serde_json::json!({}), &["title", "status"]),
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await?;
+    match result {
+        QueryResult::Docs(docs) => {
+            assert_eq!(docs.len(), 5);
+            for doc in &docs {
+                assert_eq!(
+                    sorted_doc_keys(doc),
+                    vec!["_creationTime", "_id", "_version", "status", "title"]
+                );
+                assert!(
+                    doc["title"]
+                        .as_str()
+                        .is_some_and(|t| t.starts_with("item "))
+                );
+                assert!(doc["status"].is_string());
+            }
+        }
+        other => panic!("expected Docs variant, got {other:?}"),
+    }
+    Ok(())
+}
+
+// (b) fields: [] is meaningful — system fields only (an ids-only view).
+#[tokio::test]
+async fn projection_empty_fields_list_is_system_fields_only() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    seed_kanban(&pool, &db, &schema).await?;
+
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &projection_query("workItems", serde_json::json!({}), &[]),
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await?;
+    match result {
+        QueryResult::Docs(docs) => {
+            assert_eq!(docs.len(), 5);
+            for doc in &docs {
+                assert_eq!(
+                    sorted_doc_keys(doc),
+                    vec!["_creationTime", "_id", "_version"]
+                );
+            }
+        }
+        other => panic!("expected Docs variant, got {other:?}"),
+    }
+    Ok(())
+}
+
+// (c) projection composes with get and paginate: point reads and every page
+// of a pagination carry the projected shape, and cursors still work.
+#[tokio::test]
+async fn projection_composes_with_get_and_paginate() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, items) = seed_kanban(&pool, &db, &schema).await?;
+
+    // get: Doc(Some) carries only system fields + title.
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &projection_query(
+            "workItems",
+            serde_json::json!({"get": items[0]}),
+            &["title"],
+        ),
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await?;
+    match result {
+        QueryResult::Doc(Some(doc)) => {
+            assert_eq!(
+                sorted_doc_keys(&doc),
+                vec!["_creationTime", "_id", "_version", "title"]
+            );
+            assert_eq!(doc["_id"], serde_json::json!(items[0]));
+        }
+        other => panic!("expected Doc(Some(_)), got {other:?}"),
+    }
+
+    // paginate page 1: projected docs + a next cursor minted from the
+    // unprojected row (cursor building runs inside the terminal, before
+    // projection).
+    let page1 = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &projection_query(
+            "workItems",
+            serde_json::json!({"index": "by_project", "eq": [project_id], "paginate": {"numItems": 2}}),
+            &["status"],
+        ),
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await?;
+    let cursor = match &page1 {
+        QueryResult::Paginated(page) => {
+            assert_eq!(page.docs.len(), 2);
+            for doc in &page.docs {
+                assert_eq!(
+                    sorted_doc_keys(doc),
+                    vec!["_creationTime", "_id", "_version", "status"]
+                );
+            }
+            page.next_cursor.clone().expect("page 1 has a next cursor")
+        }
+        other => panic!("expected Paginated variant, got {other:?}"),
+    };
+
+    // Page 2 follows that cursor and is projected too.
+    let page2 = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &projection_query(
+            "workItems",
+            serde_json::json!({"index": "by_project", "eq": [project_id], "paginate": {"numItems": 2, "cursor": cursor}}),
+            &["status"],
+        ),
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await?;
+    match page2 {
+        QueryResult::Paginated(page) => {
+            assert_eq!(page.docs.len(), 2);
+            for doc in &page.docs {
+                assert_eq!(
+                    sorted_doc_keys(doc),
+                    vec!["_creationTime", "_id", "_version", "status"]
+                );
+            }
+        }
+        other => panic!("expected Paginated variant, got {other:?}"),
+    }
+    Ok(())
+}
+
+// (d) unknown projection field -> BadRequest; listing the system fields
+// explicitly is an accepted no-op.
+#[tokio::test]
+async fn projection_unknown_field_is_bad_request() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    seed_kanban(&pool, &db, &schema).await?;
+
+    let err = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &projection_query("workItems", serde_json::json!({}), &["title", "bogus"]),
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .expect_err("unknown projection field must be rejected");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+
+    // The system fields may be listed explicitly (always kept anyway).
+    let result = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &projection_query(
+            "workItems",
+            serde_json::json!({}),
+            &["_id", "_creationTime", "_version", "title"],
+        ),
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await?;
+    assert!(matches!(result, QueryResult::Docs(ref docs) if docs.len() == 5));
+    Ok(())
+}
+
+// (e) doc-less terminals are unaffected by construction: count still counts,
+// aggregate still aggregates — projection neither errors nor changes them.
+#[tokio::test]
+async fn projection_doc_less_terminals_unaffected() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+
+    let (project_id, _) = seed_kanban(&pool, &db, &schema).await?;
+
+    let count = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &projection_query(
+            "workItems",
+            serde_json::json!({"index": "by_status", "eq": ["backlog"], "count": true}),
+            &["title"],
+        ),
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await?;
+    assert_eq!(count_value(&count), 2);
+
+    // order values 1..=5 sum to 15.
+    let agg = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &projection_query(
+            "workItems",
+            serde_json::json!({"index": "by_project_and_order", "eq": [project_id], "aggregate": {"op": "sum"}}),
+            &["title"],
+        ),
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await?;
+    assert!(matches!(agg, QueryResult::Aggregate(ref v) if v.as_f64() == Some(15.0)));
     Ok(())
 }

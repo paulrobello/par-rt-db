@@ -20,6 +20,7 @@ use super::{
     GET_MESSAGE, GET_PEERS, HYBRID_SEARCH_MESSAGE, HYBRID_SEARCH_PEERS, MAX_TAKE,
     PAGINATE_INCOMPATIBLES, SEARCH_MESSAGE, SEARCH_PEERS, UNIQUE_MESSAGE, UNIQUE_PEERS,
     VECTOR_SEARCH_MESSAGE, VECTOR_SEARCH_PEERS, reject_if_any_set, reject_per_peer_set,
+    validate_projection,
 };
 use crate::auth::{PrincipalCtx, authorize_table};
 use crate::db::validate_db_name;
@@ -98,6 +99,12 @@ pub fn compile_query(
     authorize_table(ctx, &q.table)?;
     let owner = ctx.user_id.as_deref();
     let table_def = schema.table(&q.table)?;
+    // Projection validation runs before every early return so all terminals
+    // (including `get`) reject unknown field names at compile time — the same
+    // shapes fail for the same reasons on the /explain path.
+    if let Some(fields) = &q.fields {
+        validate_projection(table_def, fields)?;
+    }
     let owner_field = table_def.owner_field.as_deref();
     let collaborators_field = table_def.collaborators_field.as_deref();
     let sctx = CompileSearchCtx {

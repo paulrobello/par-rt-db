@@ -87,6 +87,7 @@ fn base_query() -> Query {
         search: None,
         vector_search: None,
         hybrid_search: None,
+        fields: None,
         aggregate: None,
     }
 }

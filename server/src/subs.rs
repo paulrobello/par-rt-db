@@ -24,7 +24,7 @@ use crate::auth::{PrincipalCtx, authorize_table};
 use crate::error::RtDbError;
 use crate::metrics::{Metrics, SkipClass};
 use crate::protocol::ServerMessage;
-use crate::query::{Order, Query, QueryResult, canonical, execute_query};
+use crate::query::{Order, Query, QueryResult, diff_canonical, execute_query};
 use crate::schema::{FieldType, IndexDef, SchemaDef, TableDef};
 use crate::txn::{DocValues, EqBind, WriteSet, eq_bind_for, eq_binds};
 
@@ -1182,7 +1182,7 @@ impl SubscriptionManager {
                 ordered.boundary = ordered.boundary_from_result(&result);
             }
 
-            let canon = canonical(&result);
+            let canon = diff_canonical(&result, &entry.query);
             if canon == entry.last {
                 // Unchanged. For a verification pass this is the expected
                 // outcome — the skip was correct, and it cost one round-trip to

@@ -99,6 +99,7 @@ async fn get_doc(
         search: None,
         vector_search: None,
         hybrid_search: None,
+        fields: None,
         aggregate: None,
     };
     match execute_query(pool, db, schema, &query, &PrincipalCtx::bypass(), false).await {
@@ -377,6 +378,7 @@ async fn doc_present(
         search: None,
         vector_search: None,
         hybrid_search: None,
+        fields: None,
         aggregate: None,
     };
     matches!(

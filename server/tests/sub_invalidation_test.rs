@@ -1580,3 +1580,102 @@ async fn sampling_off_by_default_records_skips_but_no_verifications() -> anyhow:
 
     Ok(())
 }
+
+// =====================================================================
+// Projection-diff suppression: a projected collect re-runs on a member's
+// non-projected field change but the canonical is unchanged => no push.
+// (Without the projection this same patch pushes — see test 3 above,
+// body_patch_pushes_collect_not_count. Projection narrows what the canonical
+// sees, so the diff machinery — not the skip machinery — is what goes quiet.)
+// =====================================================================
+
+#[tokio::test]
+async fn projection_suppresses_non_projected_field_push() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+
+    // Seed one backlog item.
+    let outcome = state
+        .realtime
+        .committers
+        .mutate(&db, None, insert("backlog", 1.0), PrincipalCtx::bypass())
+        .await?;
+    let id = id_of(&outcome);
+
+    // Collect sub on the backlog window, projecting to title + status —
+    // order is stripped from every pushed doc.
+    let projected: Query = serde_json::from_value(serde_json::json!({
+        "table": "workItems",
+        "index": "by_status",
+        "eq": ["backlog"],
+        "fields": ["title", "status"]
+    }))
+    .expect("parse projected collect");
+
+    // Sanity on the initial push: the projected doc shape (only system fields
+    // + title + status).
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    state
+        .realtime
+        .committers
+        .subscribe(
+            &db,
+            next_conn_id(),
+            "q".to_string(),
+            projected,
+            tx,
+            PrincipalCtx::bypass(),
+        )
+        .await
+        .expect("subscribe");
+    match rx.try_recv() {
+        Ok(ServerMessage::QueryUpdate { result, .. }) => {
+            // Docs serializes untagged: the result IS the array.
+            let docs = result.as_array().expect("docs array");
+            assert_eq!(docs.len(), 1);
+            let mut keys: Vec<&str> = docs[0]
+                .as_object()
+                .expect("doc")
+                .keys()
+                .map(|k| k.as_str())
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec!["_creationTime", "_id", "_version", "status", "title"]
+            );
+        }
+        other => panic!("expected initial QueryUpdate, got {other:?}"),
+    }
+
+    // Patch the member's order (a non-projected field, window unchanged): the
+    // sub re-runs — an in-window content change on a content-bearing collect
+    // — but the projected canonical is unchanged, so nothing is pushed.
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            patch_field(&id, "order", serde_json::json!(9.0)),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    expect_no_update(&mut rx, "non-projected order patch");
+
+    // Control: patch the projected title — the projected canonical changes,
+    // so the diff machinery pushes.
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            patch_field(&id, "title", serde_json::Value::String("renamed".into())),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    expect_update(&mut rx, "projected title patch").await;
+
+    Ok(())
+}
