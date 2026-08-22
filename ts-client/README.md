@@ -163,7 +163,11 @@ Beyond the `collect`/`take` queries above, the builder carries `first()`,
 that narrows the matching set server-side. A filter value whose JSON kind
 contradicts the declared field type (a number against a string field) is
 rejected with `BAD_REQUEST` — on the server and in `InMemoryRtDbClient` alike —
-instead of silently matching nothing.
+instead of silently matching nothing. `.fields(...names)` projects each result
+doc to the listed fields (system fields `_id`/`_creationTime`/`_version` are
+always kept; `.fields()` with no args is an ids-only view; unknown names are
+`BAD_REQUEST`) — it composes with every doc-bearing terminal, and a projected
+subscription stays silent when a write changes only non-projected fields.
 
 ```ts
 // given .index("by_project_status", ["projectId", "status"]) — distinct and
