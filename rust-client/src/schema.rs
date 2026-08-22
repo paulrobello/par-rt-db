@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use crate::value_expr::ValueExpr;
 use crate::wire::FilterExpr;
 
 /// Referential action applied to child rows when the referenced parent row is
@@ -412,6 +413,18 @@ pub struct TableDef {
     /// `server/src/schema.rs::TableDef` byte-for-byte.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub defaults: BTreeMap<String, serde_json::Value>,
+    /// Computed fields (ENH-028): field name → expression. The server
+    /// re-evaluates each expression on every write and stores the result in
+    /// the doc (overwriting any client-supplied value — the `ownerField`
+    /// authority model); a null result removes the key. Push-time validation
+    /// is `validate_computed`: keys must be declared non-stamped fields,
+    /// referenced fields declared and non-computed, `Case.whens` reject
+    /// principal markers, and a statically-known result kind must be
+    /// acceptable to the field's type. Additive — schemas without it
+    /// deserialize unchanged. Mirrors `server/src/schema.rs::TableDef`
+    /// byte-for-byte (wire key `computed`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub computed: BTreeMap<String, ValueExpr>,
     /// Soft delete (FM-33): `Delete`/`DeleteByQuery` rows on this table are
     /// STAMPED (`deleted_at`) instead of removed — invisible to every read and
     /// write lookup, restorable via the `undelete` mutation step, physically
@@ -443,6 +456,7 @@ pub struct TableBuilder {
     auto_increment_field: Option<String>,
     authorize: Option<FilterExpr>,
     defaults: BTreeMap<String, serde_json::Value>,
+    computed: BTreeMap<String, ValueExpr>,
     soft_delete: bool,
     /// Index of the most recently pushed [`IndexDef`] in [`Self::indexes`], so
     /// the chainable `.unique()` / `.where_clause()` setters can configure it
@@ -464,6 +478,7 @@ impl TableBuilder {
             auto_increment_field: None,
             authorize: None,
             defaults: BTreeMap::new(),
+            computed: BTreeMap::new(),
             soft_delete: false,
             last_index: None,
         }
@@ -648,6 +663,21 @@ impl TableBuilder {
         self
     }
 
+    /// Declare a computed field (ENH-028): the server re-evaluates `expr`
+    /// against the final doc on every write (insert / patch / replace / upsert
+    /// / patchByQuery / cascade setNull) and stores the result, overwriting any
+    /// client-supplied value; a null result removes the key. `name` must name a
+    /// declared field (and not the table's ownerField / collaboratorsField /
+    /// autoIncrementField), every field `expr` references must be declared and
+    /// not itself computed, and the field's type must accept the expression's
+    /// statically-known result kind — all enforced at push time. Build the
+    /// expression with the [`ValueExpr`] constructors
+    /// ([`ValueExpr::field`], [`ValueExpr::concat`], [`ValueExpr::lower`], …).
+    pub fn computed(mut self, name: &str, expr: ValueExpr) -> Self {
+        self.computed.insert(name.into(), expr);
+        self
+    }
+
     /// Declare soft delete (FM-33): rows on this table are stamped
     /// (`deleted_at`) instead of removed on delete — invisible to every read
     /// and write lookup, restorable via the `undelete` mutation step. Mirrors
@@ -673,6 +703,7 @@ impl TableBuilder {
             auto_increment_field: self.auto_increment_field,
             authorize: self.authorize,
             defaults: self.defaults,
+            computed: self.computed,
             soft_delete: self.soft_delete,
         }
     }
@@ -1199,6 +1230,134 @@ mod tests {
         let legacy = json!({"fields": {"title": {"type": "string"}}});
         let from_legacy: TableDef = serde_json::from_value(legacy).unwrap();
         assert!(from_legacy.defaults.is_empty());
+    }
+
+    #[test]
+    fn computed_serializes_and_round_trips() {
+        // ENH-028: `computed` is a field-name → ValueExpr map, present on the
+        // wire when non-empty and omitted entirely when empty, mirroring
+        // `server/src/schema.rs::TableDef`'s `skip_serializing_if =
+        // "BTreeMap::is_empty"` byte-for-byte. The expression itself round-trips
+        // with the `op`-tagged camelCase shape the corpus cases pin.
+        let td = Table::new()
+            .field("first", FieldType::String)
+            .field("last", FieldType::String)
+            .field("fullName", FieldType::String)
+            .index("by_fullName", &["fullName"])
+            .computed(
+                "fullName",
+                ValueExpr::concat([
+                    ValueExpr::field("first"),
+                    ValueExpr::literal(" "),
+                    ValueExpr::field("last"),
+                ]),
+            )
+            .finish();
+        let v = serde_json::to_value(&td).unwrap();
+        assert_eq!(
+            v["computed"],
+            json!({
+                "fullName": {"op": "concat", "parts": [
+                    {"op": "field", "field": "first"},
+                    {"op": "literal", "value": " "},
+                    {"op": "field", "field": "last"}
+                ]}
+            })
+        );
+        // Round-trips back through the wire type.
+        let back: TableDef = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            back.computed.get("fullName"),
+            Some(&ValueExpr::Concat {
+                parts: vec![
+                    ValueExpr::Field {
+                        field: "first".into()
+                    },
+                    ValueExpr::Literal { value: json!(" ") },
+                    ValueExpr::Field {
+                        field: "last".into()
+                    },
+                ]
+            })
+        );
+        // Empty -> omitted entirely (not serialized as `{}` or null).
+        let none = Table::new().field("title", FieldType::String).finish();
+        assert!(
+            !serde_json::to_string(&none).unwrap().contains("computed"),
+            "computed must be omitted on the wire when empty"
+        );
+        // A table that never carried a `computed` key (legacy wire payload)
+        // deserializes to an empty map.
+        let legacy = json!({"fields": {"title": {"type": "string"}}});
+        let from_legacy: TableDef = serde_json::from_value(legacy).unwrap();
+        assert!(from_legacy.computed.is_empty());
+    }
+
+    #[test]
+    fn computed_dsl_builds_value_expr_helpers() {
+        // The `.computed(name, expr)` declaration composes with the ValueExpr
+        // constructors; multiple entries chain. The wire result is the same
+        // shape a hand-built enum produces.
+        let td = Table::new()
+            .field("name", FieldType::String)
+            .field("slug", FieldType::String)
+            .field("score", FieldType::Number)
+            .field("flag", FieldType::Boolean)
+            .computed(
+                "slug",
+                ValueExpr::lower(ValueExpr::trim(ValueExpr::field("name"))),
+            )
+            .computed(
+                "score",
+                ValueExpr::add(ValueExpr::field("a"), ValueExpr::literal(1)),
+            )
+            .computed(
+                "flag",
+                ValueExpr::case(
+                    vec![crate::value_expr::CaseWhen {
+                        when: FilterExpr::Eq {
+                            field: "name".into(),
+                            value: json!("x"),
+                        },
+                        then: ValueExpr::literal(true),
+                    }],
+                    ValueExpr::literal(false),
+                ),
+            )
+            .finish();
+        assert_eq!(td.computed.len(), 3);
+        assert_eq!(
+            td.computed["slug"],
+            ValueExpr::Lower {
+                value: Box::new(ValueExpr::Trim {
+                    value: Box::new(ValueExpr::Field {
+                        field: "name".into()
+                    })
+                })
+            }
+        );
+        assert!(matches!(td.computed["score"], ValueExpr::Add { .. }));
+        assert!(matches!(td.computed["flag"], ValueExpr::Case { .. }));
+        // The full expr grammar survives a wire round-trip through the builder
+        // path (cast/now/arith/coalesce/case nesting).
+        let wide = Table::new()
+            .field("n", FieldType::Number)
+            .field("s", FieldType::String)
+            .field("out", FieldType::Any)
+            .computed(
+                "out",
+                ValueExpr::coalesce([
+                    ValueExpr::cast(ValueExpr::field("n"), crate::value_expr::Cast::ToString),
+                    ValueExpr::sub(
+                        ValueExpr::mul(ValueExpr::field("n"), ValueExpr::literal(2)),
+                        ValueExpr::div(ValueExpr::now(), ValueExpr::literal(1)),
+                    ),
+                    ValueExpr::upper(ValueExpr::field("s")),
+                ]),
+            )
+            .finish();
+        let back: TableDef = serde_json::from_value(serde_json::to_value(&wide).unwrap()).unwrap();
+        assert_eq!(back.computed, wide.computed);
     }
 
     #[test]

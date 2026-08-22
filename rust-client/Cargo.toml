@@ -54,7 +54,10 @@ required-features = ["in_memory"]
 
 [[test]]
 name = "semantics_corpus"
-required-features = ["in_memory"]
+# `admin` too since ENH-028's `op.migrate` corpus kind routes to the engine's
+# `migrate_schema` (feature `admin`) through the admin `MigrateRequest` wire
+# shape.
+required-features = ["in_memory", "admin"]
 
 [[test]]
 name = "hot_config_test"

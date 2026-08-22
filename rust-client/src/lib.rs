@@ -45,6 +45,7 @@ pub mod mutation;
 pub mod optimistic;
 pub mod query;
 pub mod schema;
+pub mod value_expr;
 pub mod wire;
 
 #[cfg(feature = "admin")]
@@ -70,6 +71,7 @@ pub use query::{
 pub use schema::{
     DistanceMetric, FieldType, IndexDef, OnDeleteAction, SchemaDef, TableDef, VectorIndexSpec,
 };
+pub use value_expr::{CaseWhen, Cast, ValueExpr};
 pub use wire::{
     AggregateGroup, AggregateOp, AggregateSpec, AuthedUser, AwaitSignalSpec, ClientMessage,
     FilterExpr, OutcomeStatus, PresenceMember, ScheduleInfo, ScheduleKind, ScheduleStatus,
@@ -95,7 +97,7 @@ pub use ws::{
 
 #[cfg(feature = "admin")]
 pub use wire::admin::{
-    AdminMember, AuditEntry, AuditQuery, BackupsListResponse, Cast, CastFailure, ConfigResponse,
+    AdminMember, AuditEntry, AuditQuery, BackupsListResponse, CastFailure, ConfigResponse,
     CreateWebhookOptions, DbStats, Directive, DirectiveReport, HotConfig, HotConfigPatch,
     LatencyStats, ListDeliveriesOptions, MergeConflict, MergeDbResult, MergeReport,
     MetricsSnapshot, MigrateRequest, MigrateRequestOwned, MigrateResult, MintTokenOptions,
@@ -104,6 +106,9 @@ pub use wire::admin::{
     SessionListOptions, TableStat, TokenInfo, Webhook, WebhookDelivery, WebhookEditOptions,
     WorkflowListOptions,
 };
+// `Cast` (like `ValueExpr`/`CaseWhen`) is re-exported unconditionally from
+// `value_expr` above — the same type `wire::admin` re-exports — so the root
+// name exists in every feature combination, not only under `admin`.
 
 #[cfg(feature = "admin")]
 pub use migration::Migration;

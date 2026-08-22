@@ -88,6 +88,22 @@ impl InMemoryRtDbClient {
         if t.collaborators_field.as_deref() == Some(from) {
             t.collaborators_field = Some(to.to_string());
         }
+        // ENH-028: the computed map follows the rename the way the field,
+        // indexes, and owner/collaborator hints do — an entry KEYED on the
+        // renamed field moves to the new name (its declared field moved;
+        // leaving it keyed on `from` would fail `validate_computed`'s
+        // declared-field rule on the derived schema), and every expression's
+        // `Field` references (including `Case.whens` predicates) are
+        // rewritten to read the renamed doc key. Input values are unchanged
+        // by the rename, so stored computed values stay correct; the next
+        // write re-stamps. Mirrors server `migrate::validate_one`'s RenameField
+        // arm.
+        if let Some(expr) = t.computed.remove(from) {
+            t.computed.insert(to.to_string(), expr);
+        }
+        for expr in t.computed.values_mut() {
+            rename_value_expr_fields(expr, from, to);
+        }
         let mut affected = 0i64;
         for ((tname, _), row) in self.docs.iter_mut() {
             if tname != table {
@@ -260,6 +276,37 @@ impl InMemoryRtDbClient {
         if t.collaborators_field.as_deref() == Some(field) {
             t.collaborators_field = None;
         }
+        // ENH-028: a computed expression reading the dropped field would
+        // dangle — every future write fails its stamp. Reject, naming the
+        // computed field, so the caller amends the computed map first (a
+        // push removing the entry leaves stored values in place). Mirrors
+        // server `migrate::validate_one`'s DropField arm.
+        let mut computed_offender: Option<&String> = None;
+        for (computed_field, expr) in &t.computed {
+            let mut referenced = false;
+            crate::value_expr::walk_value_expr_fields(expr, &mut |f| {
+                if f == field {
+                    referenced = true;
+                }
+            });
+            if referenced {
+                computed_offender = Some(computed_field);
+                break;
+            }
+        }
+        if let Some(computed_field) = computed_offender {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!(
+                    "cannot drop field '{table}.{field}': it is referenced by computed field '{table}.{computed_field}'; drop the computed field first"
+                ),
+            ));
+        }
+        // An entry KEYED on the dropped field goes with it: the applier
+        // removes the stored key from every doc, so leaving the entry would
+        // fail `validate_computed`'s declared-field rule on the derived
+        // schema.
+        t.computed.remove(field);
         // `affected_rows` counts only rows whose `doc` actually changes
         // (rows carrying the field) — server parity. `obj.remove` returns
         // the removed value, so count the row iff the key was present.
@@ -424,6 +471,78 @@ fn migrate_table_mut<'a>(
     })
 }
 
+/// Rewrite every `field` reference in `expr` that equals `from` to `to`, in
+/// place. Used by `RenameField` to carry `Case.whens` predicates (and any
+/// other `FilterExpr` the schema carries) across a field rename. Mirrors
+/// server `migrate::rename_filter_fields`.
+#[cfg(feature = "admin")]
+fn rename_filter_fields(expr: &mut FilterExpr, from: &str, to: &str) {
+    match expr {
+        FilterExpr::Eq { field, .. }
+        | FilterExpr::Neq { field, .. }
+        | FilterExpr::Gt { field, .. }
+        | FilterExpr::Gte { field, .. }
+        | FilterExpr::Lt { field, .. }
+        | FilterExpr::Lte { field, .. }
+        | FilterExpr::In { field, .. }
+        | FilterExpr::Contains { field, .. }
+        | FilterExpr::Exists { field } => {
+            if field == from {
+                *field = to.to_string();
+            }
+        }
+        FilterExpr::And { exprs } | FilterExpr::Or { exprs } => {
+            for e in exprs {
+                rename_filter_fields(e, from, to);
+            }
+        }
+        FilterExpr::Not { expr } => rename_filter_fields(expr, from, to),
+    }
+}
+
+/// The `ValueExpr` half of the rename: rewrites every `Field` reference equal
+/// to `from` to `to`, in place — the `&mut` mirror of
+/// `value_expr::walk_value_expr_fields`. `Case.whens` predicates reuse
+/// [`rename_filter_fields`], so a rename carries computed expressions across
+/// intact. `to` is fresh (the RenameField arm rejects an existing target), so
+/// no reference set can collide. Mirrors server
+/// `migrate::rename_value_expr_fields`.
+#[cfg(feature = "admin")]
+fn rename_value_expr_fields(expr: &mut crate::value_expr::ValueExpr, from: &str, to: &str) {
+    use crate::value_expr::ValueExpr;
+    match expr {
+        ValueExpr::Field { field } => {
+            if field == from {
+                *field = to.to_string();
+            }
+        }
+        ValueExpr::Literal { .. } | ValueExpr::Now => {}
+        ValueExpr::Concat { parts } | ValueExpr::Coalesce { parts } => {
+            for p in parts {
+                rename_value_expr_fields(p, from, to);
+            }
+        }
+        ValueExpr::Add { left, right }
+        | ValueExpr::Sub { left, right }
+        | ValueExpr::Mul { left, right }
+        | ValueExpr::Div { left, right } => {
+            rename_value_expr_fields(left, from, to);
+            rename_value_expr_fields(right, from, to);
+        }
+        ValueExpr::Lower { value } | ValueExpr::Upper { value } | ValueExpr::Trim { value } => {
+            rename_value_expr_fields(value, from, to);
+        }
+        ValueExpr::Cast { value, .. } => rename_value_expr_fields(value, from, to),
+        ValueExpr::Case { whens, otherwise } => {
+            for cw in whens {
+                rename_filter_fields(&mut cw.when, from, to);
+                rename_value_expr_fields(&mut cw.then, from, to);
+            }
+            rename_value_expr_fields(otherwise, from, to);
+        }
+    }
+}
+
 /// True iff `cast` can coerce from `old` — a port of server
 /// `migrate::cast_valid_for` and ts-client `castValidFor`. Locks the same
 /// coercion matrix as the server (the closed set of sound source types per
@@ -583,6 +702,267 @@ pub(super) fn detect_destructive_changes(
         }
     }
     Ok(())
+}
+
+/// Computed-field push validation (ENH-028) — a port of server
+/// `schema::TableDef::validate_computed`, the six rules in the same order:
+/// 1. every `computed` key names a declared field;
+/// 2. the key is not one of the server-stamped declaration fields
+///    (`ownerField`/`collaboratorsField`/`autoIncrementField`) — those carry
+///    their own stamping authority and a computed entry would fight it on
+///    every write;
+/// 3. every field the expression references (including `Case.when` filter
+///    fields) is declared and not itself computed (no chained or cyclic
+///    evaluation);
+/// 4. `Case.when` filters reject principal markers — computed exprs run on
+///    every write with no interactive principal, so a `$user`/`$email` marker
+///    has no value to resolve;
+/// 5. when the expression's result kind is statically known, the field's type
+///    must accept a value of that kind;
+/// 6. the table's `authorize` predicate references no computed field.
+///
+/// Unlike the other rules in [`SchemaDef::validate`] (which mirror the
+/// server's `SCHEMA_VIOLATION`s), these reject with `BAD_REQUEST` — the same
+/// code the server's `validate_computed` raises, which the semantics-corpus
+/// `pushError` cases pin.
+fn validate_computed(table_name: &str, table: &TableDef) -> Result<(), RtDbError> {
+    use crate::value_expr::walk_filter_expr_fields;
+    use crate::value_expr::walk_value_expr_fields;
+
+    for (field, expr) in &table.computed {
+        if !table.fields.contains_key(field) {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("computed field '{table_name}.{field}' is not a declared field"),
+            ));
+        }
+        if table.owner_field.as_deref() == Some(field.as_str()) {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("computed field '{table_name}.{field}' must not be the table's ownerField"),
+            ));
+        }
+        if table.collaborators_field.as_deref() == Some(field.as_str()) {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!(
+                    "computed field '{table_name}.{field}' must not be the table's collaboratorsField"
+                ),
+            ));
+        }
+        if table.auto_increment_field.as_deref() == Some(field.as_str()) {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!(
+                    "computed field '{table_name}.{field}' must not be the table's autoIncrementField"
+                ),
+            ));
+        }
+        // First offense wins; the walk covers `Field` nodes and every
+        // `Case.when` filter field.
+        let mut offender: Option<String> = None;
+        walk_value_expr_fields(expr, &mut |referenced| {
+            if offender.is_some() {
+                return;
+            }
+            if !table.fields.contains_key(referenced) {
+                offender = Some(format!(
+                    "computed field '{table_name}.{field}' references undeclared field '{referenced}'"
+                ));
+            } else if table.computed.contains_key(referenced) {
+                offender = Some(format!(
+                    "computed field '{table_name}.{field}' references computed field '{referenced}' (computed fields may not reference each other)"
+                ));
+            }
+        });
+        if let Some(message) = offender {
+            return Err(RtDbError::new(ErrorCode::BadRequest, message));
+        }
+        validate_computed_case_whens(expr)?;
+        if let Some(kind) = infer_static_kind(expr) {
+            let sample = match kind {
+                StaticKind::String => Value::String("s".into()),
+                StaticKind::Number => Value::from(1),
+                StaticKind::Boolean => Value::Bool(true),
+            };
+            // `validate_value` is the wire contract, but int64's wire form is
+            // a decimal STRING: a Number-kind result can never validate
+            // (arithmetic yields JSON numbers), while a String-kind one can
+            // ("42") — decimal-ness stays a runtime `validate_doc` check.
+            // Optional unwrapping admits the nullable spelling.
+            let mut inner = &table.fields[field];
+            while let FieldType::Optional { inner: deeper } = inner {
+                inner = deeper;
+            }
+            let accepts = validate_value(&table.fields[field], &sample)
+                || (matches!(inner, FieldType::Int64) && matches!(kind, StaticKind::String));
+            if !accepts {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    format!(
+                        "computed field '{table_name}.{field}' produces {}, which the field type does not accept",
+                        kind.as_str()
+                    ),
+                ));
+            }
+        }
+    }
+    // Rule 6: authorize runs pre-stamp on the insert paths, so a predicate
+    // over a computed field would read client input.
+    if let Some(authorize) = &table.authorize {
+        let mut offender: Option<String> = None;
+        walk_filter_expr_fields(authorize, &mut |referenced| {
+            if offender.is_none() && table.computed.contains_key(referenced) {
+                offender = Some(referenced.to_string());
+            }
+        });
+        if let Some(field) = offender {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!(
+                    "computed field '{table_name}.{field}' must not be referenced by the table's authorize predicate (authorize predicates may not reference computed fields)"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Walks a computed expression's `Case` nodes rejecting principal markers in
+/// each `when` filter — the engine-side half of server
+/// `schema::validate_computed_case_whens` (the server reuses the query
+/// boundary's marker-rejecting filter validation; the engine's filter
+/// validation has no marker mode, so this is the marker rule alone — the
+/// field-declared rule is already covered by rule 3's walk). `then`/
+/// `otherwise` recurse so a `Case` nested inside a branch is covered.
+fn validate_computed_case_whens(ve: &crate::value_expr::ValueExpr) -> Result<(), RtDbError> {
+    use crate::value_expr::ValueExpr;
+    match ve {
+        ValueExpr::Case { whens, otherwise } => {
+            for cw in whens {
+                if let Some(field) = filter_expr_marker_field(&cw.when) {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!(
+                            "principal markers ({{\"$user\":true}}/{{\"$email\":true}}) are not allowed in computed expressions (field '{field}')"
+                        ),
+                    ));
+                }
+                validate_computed_case_whens(&cw.then)?;
+            }
+            validate_computed_case_whens(otherwise)
+        }
+        ValueExpr::Concat { parts } | ValueExpr::Coalesce { parts } => {
+            for p in parts {
+                validate_computed_case_whens(p)?;
+            }
+            Ok(())
+        }
+        ValueExpr::Add { left, right }
+        | ValueExpr::Sub { left, right }
+        | ValueExpr::Mul { left, right }
+        | ValueExpr::Div { left, right } => {
+            validate_computed_case_whens(left)?;
+            validate_computed_case_whens(right)
+        }
+        ValueExpr::Lower { value }
+        | ValueExpr::Upper { value }
+        | ValueExpr::Trim { value }
+        | ValueExpr::Cast { value, .. } => validate_computed_case_whens(value),
+        ValueExpr::Field { .. } | ValueExpr::Literal { .. } | ValueExpr::Now => Ok(()),
+    }
+}
+
+/// The first leaf field whose value (or `in` value list) carries a principal
+/// marker, if any — the marker-rejecting walk the server folds into
+/// `validate_filter_expr_fields(_, _, false)`.
+fn filter_expr_marker_field(expr: &FilterExpr) -> Option<String> {
+    match expr {
+        FilterExpr::Eq { field, value }
+        | FilterExpr::Neq { field, value }
+        | FilterExpr::Gt { field, value }
+        | FilterExpr::Gte { field, value }
+        | FilterExpr::Lt { field, value }
+        | FilterExpr::Lte { field, value }
+        | FilterExpr::Contains { field, value } => {
+            is_principal_marker(value).then(|| field.clone())
+        }
+        FilterExpr::In { field, values } => values
+            .iter()
+            .any(is_principal_marker)
+            .then(|| field.clone()),
+        FilterExpr::Exists { .. } => None,
+        FilterExpr::And { exprs } | FilterExpr::Or { exprs } => {
+            exprs.iter().find_map(filter_expr_marker_field)
+        }
+        FilterExpr::Not { expr } => filter_expr_marker_field(expr),
+    }
+}
+
+/// `true` iff `v` is a principal marker: `{"$user": true}` or
+/// `{"$email": true}`. Mirrors server `schema::is_principal_marker`.
+fn is_principal_marker(v: &Value) -> bool {
+    if let Value::Object(map) = v
+        && map.len() == 1
+    {
+        return matches!(map.get("$user").and_then(|x| x.as_bool()), Some(true))
+            || matches!(map.get("$email").and_then(|x| x.as_bool()), Some(true));
+    }
+    false
+}
+
+/// The statically-known result kind of a `ValueExpr`, for the computed-field
+/// push check. `None` means the result kind varies by input — `Field` (text
+/// extraction of any JSON value), `Coalesce`/`Case` (whichever branch wins),
+/// and the null / object / array literals whose runtime `validate_doc` check
+/// is the only guard. Mirrors server `schema::StaticKind`.
+enum StaticKind {
+    String,
+    Number,
+    Boolean,
+}
+
+impl StaticKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            StaticKind::String => "a string",
+            StaticKind::Number => "a number",
+            StaticKind::Boolean => "a boolean",
+        }
+    }
+}
+
+fn infer_static_kind(ve: &crate::value_expr::ValueExpr) -> Option<StaticKind> {
+    use crate::value_expr::{Cast, ValueExpr};
+    match ve {
+        ValueExpr::Field { .. } | ValueExpr::Coalesce { .. } | ValueExpr::Case { .. } => None,
+        ValueExpr::Literal { value } => match value {
+            Value::String(_) => Some(StaticKind::String),
+            Value::Number(_) => Some(StaticKind::Number),
+            Value::Bool(_) => Some(StaticKind::Boolean),
+            Value::Null | Value::Object(_) | Value::Array(_) => None,
+        },
+        ValueExpr::Concat { .. }
+        | ValueExpr::Lower { .. }
+        | ValueExpr::Upper { .. }
+        | ValueExpr::Trim { .. }
+        | ValueExpr::Cast {
+            to: Cast::ToString, ..
+        } => Some(StaticKind::String),
+        ValueExpr::Add { .. }
+        | ValueExpr::Sub { .. }
+        | ValueExpr::Mul { .. }
+        | ValueExpr::Div { .. }
+        | ValueExpr::Cast {
+            to: Cast::ToNumber | Cast::ToInt64,
+            ..
+        }
+        | ValueExpr::Now => Some(StaticKind::Number),
+        ValueExpr::Cast {
+            to: Cast::ToBoolean,
+            ..
+        } => Some(StaticKind::Boolean),
+    }
 }
 
 /// Push-time schema validation — the TTL, `updatedAtField`,
@@ -747,6 +1127,9 @@ impl SchemaDef {
                     ));
                 }
             }
+            // Computed-field rules (ENH-028) — BAD_REQUEST, not
+            // SCHEMA_VIOLATION (see `validate_computed`'s docs).
+            validate_computed(table_name, table)?;
         }
         Ok(())
     }

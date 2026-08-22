@@ -517,6 +517,17 @@ impl InMemoryRtDbClient {
             }
         }
 
+        // ENH-028: directive folding must not be able to invalidate a computed
+        // entry — e.g. `changeType` retyping a computed field so its
+        // expression's static kind no longer fits. Re-validate the derived
+        // schema (pure) before anything commits, mirroring server
+        // `plan_migration`'s `validate_computed` + derived-validate pair; a
+        // failure rolls the data effects back like any directive failure.
+        if let Err(e) = planned.validate() {
+            self.restore_docs(snapshot);
+            return Err(e);
+        }
+
         if dry_run {
             // Preview only: discard the data effects, return the derived schema.
             self.restore_docs(snapshot);
@@ -759,8 +770,9 @@ impl InMemoryRtDbClient {
                 if let Some(row) = rows.into_iter().next() {
                     // FM-36: the update branch restamps `updatedAtField` into
                     // the patch fields (server `step_upsert` update branch).
-                    let patch = stamp_updated_at(&table_def, patch, (self.now)());
-                    let merged = apply_patch(&table_def, &row.doc, &patch)?;
+                    let now = (self.now)();
+                    let patch = stamp_updated_at(&table_def, patch, now);
+                    let merged = apply_patch(&table_def, &row.doc, &patch, now)?;
                     self.do_update(&table_def, table, &row.id, merged)?;
                     Ok((
                         StepResult::Upsert {
@@ -896,6 +908,11 @@ impl InMemoryRtDbClient {
         // so it overwrites any client value AND any defaults entry on the
         // field.
         let stamped = self.stamp_auto_increment(table_name, table_def, stamped);
+        // ENH-028: computed stamping is the LAST insert stamp — after the
+        // ttl / updatedAt / defaults / autoIncrement chain — so expressions
+        // see final inputs, and before validate_doc so a client-supplied
+        // computed value never reaches validation (server do_insert order).
+        let stamped = stamp_computed(table_def, stamped, now)?;
         let doc_value = Value::Object(stamped);
         validate_doc(table_def, &doc_value)?;
         let stored = strip_unset_optionals(table_def, &doc_value);
@@ -936,8 +953,9 @@ impl InMemoryRtDbClient {
         // FM-36: stamp `updatedAtField` into the patch fields before the
         // merge — the same seam the server stamps (step_patch, and via the
         // shared patch paths patchByQuery + cascade setNull land here too).
-        let fields = stamp_updated_at(table_def, fields, (self.now)());
-        let merged = apply_patch(table_def, &row.doc, &fields)?;
+        let now = (self.now)();
+        let fields = stamp_updated_at(table_def, fields, now);
+        let merged = apply_patch(table_def, &row.doc, &fields, now)?;
         self.do_update(table_def, table_name, id, merged)?;
         Ok(())
     }
@@ -995,6 +1013,15 @@ impl InMemoryRtDbClient {
                 Some(_) => {}
             }
         }
+        // ENH-028: client-supplied computed values are dropped before
+        // validation — the stamp re-derives them from the final doc, and a
+        // wrong-typed client value must not fail validate_doc first (server
+        // do_replace order; `apply_patch` does the same drop on the patch
+        // paths).
+        for name in table_def.computed.keys() {
+            stamped.remove(name);
+        }
+        let stamped = stamp_computed(table_def, stamped, (self.now)())?;
         let doc_value = Value::Object(stamped);
         validate_doc(table_def, &doc_value)?;
         let stored = strip_unset_optionals(table_def, &doc_value);
@@ -2182,11 +2209,13 @@ mod migrate;
 mod presence;
 mod query;
 mod validate;
+mod value_expr;
 
 // Cross-module helpers (private to this module's descendants).
 use migrate::detect_destructive_changes;
 use query::{collect_index_key, diff_canonical, require_index};
 use validate::{apply_defaults, matches_filter, stamp_ttl_default, stamp_updated_at};
+use value_expr::stamp_computed;
 
 // Public API re-exports (preserves `par_rt_db_client::in_memory::*`).
 pub use presence::{PresenceHandle, PresenceRooms};
@@ -2199,6 +2228,7 @@ pub use validate::{
     is_int64_string, is_plain_object, strip_unset_optionals, validate_doc, validate_filter,
     validate_value,
 };
+pub use value_expr::eval_value_expr;
 
 #[cfg(test)]
 mod tests;

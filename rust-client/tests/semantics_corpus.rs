@@ -22,6 +22,14 @@
 //! its public surface (`push_schema` + `run_query`/`mutate`), never internals,
 //! and no clock advance / scheduler tick / TTL reap happens between seeding
 //! and the op — the corpus pins synchronous semantics.
+//!
+//! Two additive case kinds (ENH-028, mirroring the server runner): a
+//! `pushError` case asserts the schema PUSH itself fails with the given code
+//! (push is the whole case — no seed, no op), and an `op.migrate` case runs
+//! the engine's `migrate_schema` (the InMemoryMigrate port — plan fold +
+//! derived-schema validation + apply, apply-persisted unless `dryRun`) with
+//! the `MigrateResult` compared like any op result; a follow-up `then` reads
+//! against the DERIVED schema.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,6 +38,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use par_rt_db_client::in_memory::InMemoryRtDbClientOptions;
 use par_rt_db_client::mutation::Step;
 use par_rt_db_client::schema::SchemaDef;
+use par_rt_db_client::wire::admin::MigrateRequestOwned;
 use par_rt_db_client::{ErrorCode, InMemoryRtDbClient, Query, StepResult, Transaction};
 use serde_json::{Map, Value};
 
@@ -294,6 +303,32 @@ async fn run_case(case_name: &str, case: &Value) {
     let schema: SchemaDef = serde_json::from_value(case["schema"].clone())
         .unwrap_or_else(|e| panic!("{case_name}: schema does not parse: {e}"));
     let mut client = new_client();
+
+    // A `pushError` case asserts the schema PUSH itself fails (the value
+    // carries the same `{code}` object `expect.error` does; only the code is
+    // asserted, never the message). Push is the whole case — a stray
+    // seed/op/then/expect is an authoring error.
+    if let Some(push_err) = case.get("pushError") {
+        for stray in ["seed", "op", "then", "expect"] {
+            assert!(
+                case.get(stray).is_none(),
+                "{case_name}: a pushError case must not carry `{stray}` — push is the whole case"
+            );
+        }
+        let want: ErrorCode = serde_json::from_value(push_err["code"].clone())
+            .unwrap_or_else(|e| panic!("{case_name}: pushError.code does not parse: {e}"));
+        let err = client
+            .push_schema(&schema)
+            .err()
+            .unwrap_or_else(|| panic!("{case_name}: pushError case — the push must fail"));
+        assert_eq!(
+            err.code, want,
+            "{case_name}: push error code mismatch — engine message: {}",
+            err.message
+        );
+        return;
+    }
+
     client
         .push_schema(&schema)
         .unwrap_or_else(|e| panic!("{case_name}: push_schema: {e:?}"));
@@ -373,8 +408,31 @@ async fn run_case(case_name: &str, case: &Value) {
                 return; // a failed op has no `then` follow-up
             }
         }
+    } else if let Some(migrate_json) = case.pointer("/op/migrate") {
+        // The admin MigrateRequest wire shape (`{directives, dryRun}`),
+        // routed to the engine's migrate_schema (the InMemoryMigrate port):
+        // directive fold + derived-schema validation, then apply — persisted
+        // for real, or rolled back on `dryRun`. A follow-up `then` reads
+        // against the derived schema + data effects (the engine's live
+        // schema was swapped by the migrate).
+        let req: MigrateRequestOwned =
+            serde_json::from_value(substitute(migrate_json, &ids, case_name))
+                .unwrap_or_else(|e| panic!("{case_name}: op.migrate does not parse: {e}"));
+        match client.migrate_schema(&req.directives, req.dry_run) {
+            Ok(result) => serde_json::to_value(&result).expect("serialize MigrateResult"),
+            Err(e) => {
+                if !expects_error {
+                    panic!(
+                        "{case_name}: unexpected migrate error ({:?}): {}",
+                        e.code, e.message
+                    );
+                }
+                assert_error_code(&e, expect, case_name);
+                return; // a failed op has no `then` follow-up
+            }
+        }
     } else {
-        panic!("{case_name}: op must carry `query` or `txn`");
+        panic!("{case_name}: op must carry `query`, `txn`, or `migrate`");
     };
 
     assert!(

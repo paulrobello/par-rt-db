@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 
 mod aggregate;
 mod cascade;
+mod computed;
 mod filter;
 // Every migrate test (and its fixture) is `#[cfg(feature = "admin")]` — the
 // migrate surface only exists on admin-enabled builds, so the module is too.

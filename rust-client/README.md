@@ -60,7 +60,9 @@ insert branch), after defaults, overwriting any client-supplied value (and any
 `defaults` entry on the field); the decimal-string value is immutable after
 insert (a patch / upsert-update patch / patchByQuery supplying a different
 value is rejected, and a replace must round-trip the stored value —
-omitted/null is filled back in).
+omitted/null is filled back in). `.computed(field, expr)` declares a computed
+field (ENH-028) — the named field is re-derived from the closed `ValueExpr`
+grammar on every write (see below).
 
 ### In-memory test harness (feature `in_memory`)
 
@@ -229,6 +231,56 @@ is an additive schema push — runtime delete behavior only, no stored-row
 change. The TTL reaper hard-deletes expired rows even on a `softDelete`
 table and honors `onDelete` children. The `in_memory` harness mirrors all
 of this (see `src/in_memory/tests/`).
+
+## Computed fields
+
+`.computed(field, expr)` (ENH-028) declares a field the server re-derives on
+every write (insert, patch, replace, upsert, patchByQuery, cascade setNull) —
+declarative denormalization with no server code, so derived values are
+indexable. Any client-supplied value is overwritten (the `ownerField`
+authority model); a `null` result removes the key; an evaluation error (e.g.
+division by zero, a bad cast) fails the write with `BAD_REQUEST` naming the
+field. Build the expression with the `ValueExpr` constructors —
+`field`/`literal`/`concat`/`add`/`sub`/`mul`/`div`/`coalesce`/`lower`/`upper`/
+`trim`/`cast`/`now`/`case`:
+
+```rust
+use par_rt_db_client::schema::{FieldType, Table};
+use par_rt_db_client::ValueExpr;
+
+let table = Table::new()
+    .field("first", FieldType::String)
+    .field("last", FieldType::String)
+    .field("fullName", FieldType::String)
+    .field("email", FieldType::String)
+    .field("handle", FieldType::String)
+    .index("by_fullName", &["fullName"])
+    // fullName = concat(first, " ", last)
+    .computed(
+        "fullName",
+        ValueExpr::concat([
+            ValueExpr::field("first"),
+            ValueExpr::literal(" "),
+            ValueExpr::field("last"),
+        ]),
+    )
+    // handle = lower(trim(email)) — spaces only, like Postgres btrim
+    .computed(
+        "handle",
+        ValueExpr::lower(ValueExpr::trim(ValueExpr::field("email"))),
+    );
+```
+
+Push validation rejects (with `BAD_REQUEST`) a computed key that is not a
+declared field, targets the table's `ownerField`/`collaboratorsField`/
+`autoIncrementField`, references an undeclared or computed field, carries a
+principal marker in a `Case.when`, or produces a statically-known kind the
+field type rejects (e.g. `concat` on a `number` field — wrap arithmetic in
+`Cast::ToString` to store into an `int64` field). `renameField` migrations
+rewrite expression references (a keyed entry follows its field);
+`dropField` on a referenced field is rejected; `changeType` re-validates. The
+`in_memory` harness mirrors the interpreter, stamping, push validation, and
+migrate interplay (see `src/in_memory/tests/computed.rs`).
 
 ## Schema migration
 

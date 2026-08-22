@@ -297,10 +297,18 @@ pub(super) fn apply_defaults(table_def: &TableDef, doc: &Map<String, Value>) -> 
 /// because every patch-shaped path here (`Patch`, upsert's update branch,
 /// `patchByQuery`, cascade setNull) funnels through this function, one check
 /// covers them all exactly as on the server.
+///
+/// ENH-028: a computed key in the patch is dropped, not merged — the stamp
+/// below re-derives it from the final doc, so skipping here also keeps a
+/// wrong-typed client value from failing `validate_value` first. After the
+/// merge, `stamp_computed` re-evaluates every computed entry over the merged
+/// doc (`now` feeds `Now` expressions) and the result is re-validated whole,
+/// exactly the server's apply_patch order.
 pub fn apply_patch(
     table: &TableDef,
     doc: &Value,
     fields: &Map<String, Value>,
+    now: i64,
 ) -> Result<Value, RtDbError> {
     if let Some(auto) = &table.auto_increment_field
         && let Some(value) = fields.get(auto)
@@ -316,6 +324,11 @@ pub fn apply_patch(
         None => Map::new(),
     };
     for (field, value) in fields {
+        // A computed key in the patch is dropped, not merged (see the doc
+        // comment above) — the stamp below re-derives it from the final doc.
+        if table.computed.contains_key(field) {
+            continue;
+        }
         let field_ty = match table.fields.get(field) {
             Some(t) => t,
             None => {
@@ -344,6 +357,7 @@ pub fn apply_patch(
         }
         merged.insert(field.clone(), value.clone());
     }
+    let merged = stamp_computed(table, merged, now)?;
     let merged_value = Value::Object(merged);
     validate_doc(table, &merged_value)?;
     Ok(merged_value)

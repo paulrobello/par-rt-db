@@ -192,7 +192,7 @@ fn apply_patch_merges_fields_and_re_validates_whole_doc() {
     let table = items_table(&schema);
     let doc = json!({"name": "a", "status": "todo", "order": 1});
     let fields = json!({"order": 9}).as_object().unwrap().clone();
-    let merged = apply_patch(table, &doc, &fields).expect("patch ok");
+    let merged = apply_patch(table, &doc, &fields, 0).expect("patch ok");
     assert_eq!(merged["order"], 9);
     assert_eq!(merged["name"], "a", "non-patched fields preserved");
 }
@@ -205,7 +205,7 @@ fn apply_patch_null_on_optional_inner_that_rejects_null_deletes_key() {
     let table = items_table(&schema);
     let doc = json!({"name": "a", "status": "todo", "order": 1, "note": "hi"});
     let fields = json!({"note": null}).as_object().unwrap().clone();
-    let merged = apply_patch(table, &doc, &fields).expect("patch ok");
+    let merged = apply_patch(table, &doc, &fields, 0).expect("patch ok");
     assert!(merged.get("note").is_none(), "note key stripped: {merged}");
 }
 
@@ -215,7 +215,7 @@ fn apply_patch_rejects_unknown_field() {
     let table = items_table(&schema);
     let doc = json!({"name": "a", "status": "todo", "order": 1});
     let fields = json!({"bogus": 1}).as_object().unwrap().clone();
-    let err = apply_patch(table, &doc, &fields).unwrap_err();
+    let err = apply_patch(table, &doc, &fields, 0).unwrap_err();
     assert_eq!(err.code, ErrorCode::SchemaViolation);
     assert!(err.message.contains("bogus"));
 }
