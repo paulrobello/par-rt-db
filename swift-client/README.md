@@ -299,12 +299,49 @@ The full `FieldType` set is supported (15 variants — including `int64`, `bytes
 indexes (`searchIndex(_:on:language:)`), vector indexes
 (`vectorIndex(_:on:dimensions:filterFields:metric:)`), partial indexes
 (`whereClause(_:)`), `collaboratorsField`, `authorize(_:)`, `defaults(_:)`,
-`updatedAtField(_:)` (server stamps the named `number`/`int64` field with
+`computed(_:_:)` (server re-derives the named field from a `ValueExpr` on every
+write — client-supplied values never survive, and a null result removes the
+key), `updatedAtField(_:)` (server stamps the named `number`/`int64` field with
 epoch-ms on every write, overwriting any client value),
 `autoIncrementField(_:)` (server stamps the named `int64` field with the next
 per-table counter value on insert, overwriting any client value; immutable
 after insert), and `onDelete` on id fields
 (`.id("projects").onDelete(.cascade)`).
+
+#### Computed fields (`ValueExpr`)
+
+`.computed(name, expr)` declares a write-maintained derived field. The
+expression grammar is the same typed `ValueExpr` the migrate `evalExprTyped`
+builder uses — field reads are text extraction, arithmetic is IEEE-double with
+null propagation, `concat` skips nulls, and `caseExpr` branches on the query
+DSL's filters. Two examples:
+
+```swift
+.table("users") { t in
+    t.field("first", .string)
+        .field("last", .string)
+        .field("fullName", .string)   // "Ada Lovelace" — re-derived on every write
+        .index("by_fullName", on: ["fullName"])
+        .computed("fullName", .concat(parts: [
+            .field(field: "first"),
+            .literal(value: .string(" ")),
+            .field(field: "last"),
+        ]))
+}
+.table("posts") { t in
+    t.field("title", .string)
+        .field("slug", .optional(.string))   // null result removes the key
+        .computed("slug", .lower(value: .trim(value: .field(field: "title"))))
+}
+```
+
+The expression may reference only declared NON-computed fields (push validation
+rejects undeclared references, computed-on-computed chains, and a
+statically-known result kind the field type does not accept — wrap arithmetic
+feeding an `int64` field in `.cast(value:, to: .toString)`, since int64 travels
+as a decimal string on the wire). An evaluation error (division by zero, a bad
+cast) fails the write with BAD_REQUEST naming the field. A `renameField`
+migration rewrites the expression's references with the field.
 
 ## Storage
 
@@ -425,7 +462,7 @@ let result = try await retryOnPrecondition {
 | Wire types — fifth implementation of the contract | ✅ (+ `wire-corpus.json` parity runner, ARC-008) |
 | Query DSL — every terminal incl. `search`/`vectorSearch`/`hybridSearch`/`paginate`/`aggregate`/`distinct` | ✅ |
 | Mutation DSL — all 14 step ops, recursive step-cap enforcement | ✅ |
-| Schema DSL — 15 field types, btree/search/vector/unique/partial indexes, `ownerField`/`collaboratorsField`/`authorize`, `ttl`, `updatedAtField`, `autoIncrementField`, `defaults`, `softDelete`, `onDelete` | ✅ |
+| Schema DSL — 15 field types, btree/search/vector/unique/partial indexes, `ownerField`/`collaboratorsField`/`authorize`, `ttl`, `updatedAtField`, `autoIncrementField`, `defaults`, `computed`, `softDelete`, `onDelete` | ✅ |
 | HTTP client — query/query-batch/mutate (+ idempotency key, retry helper), schedule ops, workflow ops, full storage surface, `pushSchema`/`previewSchema`, `authMe` | ✅ |
 | WS client — auth/reconnect/heartbeat, shared subscriptions with replay, mutate-over-WS, schedule + workflow ops | ✅ |
 | Presence (ENH-015) — `presence(room:state:)` / `updatePresence(room:state:ttlMs:)` / `leavePresence(room:)`, `PresenceSnapshot` fan-out, reconnect replay of joined rooms | ✅ |

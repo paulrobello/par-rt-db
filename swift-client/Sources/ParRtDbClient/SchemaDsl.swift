@@ -403,8 +403,8 @@ public struct TtlDef: Equatable, Codable, Sendable {
 /// One table: fields, indexes, and opt-in per-row rules / TTL / defaults.
 /// Mirrors rust-client `TableDef` — `indexes` omitted when nil, `ownerField` /
 /// `collaboratorsField` / `ttl` / `updatedAtField` / `autoIncrementField` /
-/// `authorize` omitted when nil, `defaults` omitted when empty, `softDelete`
-/// omitted when false.
+/// `authorize` omitted when nil, `defaults` and `computed` omitted when empty,
+/// `softDelete` omitted when false.
 public struct TableDef: Equatable, Codable, Sendable {
     /// Field name to declared type.
     public var fields: [String: FieldType]
@@ -444,6 +444,14 @@ public struct TableDef: Equatable, Codable, Sendable {
     /// (insert/replace/upsert-insert) when it omits the key; `patch` never
     /// re-applies. Literals the server validates at push time.
     public var defaults: [String: JSONValue]
+    /// Computed fields (ENH-028): field name -> expression. The server (and
+    /// the engine's write path) re-evaluates every entry over the final doc on
+    /// every write and stores the result — a null result removes the key, and
+    /// client-supplied values never survive (dropped before validation). The
+    /// expression grammar is `Migrate.swift`'s `ValueExpr`, shared with the
+    /// migrate `evalExpr` directive: one grammar type, two executions.
+    /// Omitted from the wire when empty (the server's `BTreeMap::is_empty`).
+    public var computed: [String: ValueExpr]
     /// Soft delete: `delete`/`deleteByQuery` rows on this table are stamped
     /// (`deleted_at`) instead of removed — invisible to every read and write
     /// lookup, restorable via the `undelete` mutation step.
@@ -459,6 +467,7 @@ public struct TableDef: Equatable, Codable, Sendable {
         autoIncrementField: String? = nil,
         authorize: FilterExpr? = nil,
         defaults: [String: JSONValue] = [:],
+        computed: [String: ValueExpr] = [:],
         softDelete: Bool = false
     ) {
         self.fields = fields
@@ -470,12 +479,13 @@ public struct TableDef: Equatable, Codable, Sendable {
         self.autoIncrementField = autoIncrementField
         self.authorize = authorize
         self.defaults = defaults
+        self.computed = computed
         self.softDelete = softDelete
     }
 
     enum CodingKeys: String, CodingKey {
         case fields, indexes, ttl, updatedAtField, autoIncrementField, authorize, defaults
-        case ownerField, collaboratorsField, softDelete
+        case computed, ownerField, collaboratorsField, softDelete
     }
 
     public init(from decoder: Decoder) throws {
@@ -495,6 +505,9 @@ public struct TableDef: Equatable, Codable, Sendable {
         defaults = try container.decodeIfPresent(
             [String: JSONValue].self, forKey: .defaults
         ) ?? [:]
+        computed = try container.decodeIfPresent(
+            [String: ValueExpr].self, forKey: .computed
+        ) ?? [:]
         softDelete = try container.decodeIfPresent(Bool.self, forKey: .softDelete) ?? false
     }
 
@@ -510,6 +523,9 @@ public struct TableDef: Equatable, Codable, Sendable {
         try container.encodeIfPresent(authorize, forKey: .authorize)
         if !defaults.isEmpty {
             try container.encode(defaults, forKey: .defaults)
+        }
+        if !computed.isEmpty {
+            try container.encode(computed, forKey: .computed)
         }
         if softDelete {
             try container.encode(softDelete, forKey: .softDelete)
@@ -704,6 +720,16 @@ public struct TableBuilder: Sendable {
         with { $0.authorize = predicate }
     }
 
+    /// Declare a computed field (ENH-028, wire `computed`): `name` names a
+    /// declared field the server re-derives from `expr` over the final doc on
+    /// every write — a null result removes the key, and client-supplied values
+    /// never survive. The expression may reference only declared non-computed
+    /// fields (push validation rejects anything else). Re-declaring the same
+    /// name overwrites the expression (map-insert semantics).
+    public func computed(_ name: String, _ expr: ValueExpr) -> TableBuilder {
+        with { $0.computed[name] = expr }
+    }
+
     /// Declare field-level default values. Each key must name a declared field
     /// and its value a non-null literal satisfying that field's type (the
     /// server validates at push time). Server-stamped values (ttl default,
@@ -734,6 +760,7 @@ public struct TableBuilder: Sendable {
             autoIncrementField: acc.autoIncrementField,
             authorize: acc.authorize,
             defaults: acc.defaults,
+            computed: acc.computed,
             softDelete: acc.softDelete
         )
     }
@@ -750,6 +777,7 @@ private struct Acc: Sendable {
     var autoIncrementField: String?
     var authorize: FilterExpr?
     var defaults: [String: JSONValue] = [:]
+    var computed: [String: ValueExpr] = [:]
     var softDelete = false
     /// Position of the most recently declared index, for the chainable
     /// `unique()` / `whereClause(_:)` setters. nil until the first index.

@@ -27,6 +27,13 @@ import Testing
 // is advanced and no scheduler/TTL reaper runs between seeding and the op —
 // the corpus pins synchronous semantics only.
 //
+// Two additive case kinds (ENH-028): a `pushError` case asserts the schema
+// PUSH itself fails with the pinned error code (push is the whole case — no
+// seed/op/then/expect), and an `op.migrate` case routes the admin
+// `MigrateRequest` wire shape through the engine's migrate with the
+// `MigrateResult` compared like any op result under the existing normalize
+// rules. Both mirror the server runner's extensions.
+
 // A `skip: {"swift": "reason"}` case is skipped loudly: the reason rides the
 // test-case ID (the argument's `description`). No corpus case carries a swift
 // skip today — the engine is a full port.
@@ -158,9 +165,14 @@ struct SemanticsCase: Sendable, CustomStringConvertible {
     let stem: String
     let schema: SchemaDef
     let seed: [JSONValue]
+    /// The error code a `pushError` case pins for the schema push itself —
+    /// push is the whole case (seed/op/then/expect are authoring errors).
+    let pushErrorCode: String?
     let opQuery: JSONValue?
     let opTxn: JSONValue?
-    let expect: JSONValue
+    let opMigrate: JSONValue?
+    /// nil only on a `pushError` case (which asserts the push, not a result).
+    let expect: JSONValue?
     let unordered: Bool
     let normalize: [String]?
     let expectNextCursor: Bool?
@@ -200,6 +212,7 @@ private func corpusStems() throws -> [String] {
     return stems.sorted()
 }
 
+// swiftlint:disable cyclomatic_complexity function_body_length
 /// Parse one case file. `name` must equal the filename stem (README format).
 private func loadCase(stem: String) throws -> SemanticsCase {
     let url = corpusDirectory().appendingPathComponent("\(stem).json")
@@ -223,18 +236,44 @@ private func loadCase(stem: String) throws -> SemanticsCase {
     let schema = try decodeWire(
         SchemaDef.self, required(object, "schema", stem), "\(stem): schema"
     )
-    guard let seed = object["seed"]?.arrayValue else {
+    // A `pushError` case asserts the schema PUSH itself fails (the value
+    // carries the same `{code}` object `expect.error` does; only the code is
+    // asserted, never the message). Push is the whole case — a stray
+    // seed/op/then/expect is an authoring error.
+    let pushError = object["pushError"]?.objectValue
+    if let pushError {
+        for stray in ["seed", "op", "then", "expect"] where object[stray] != nil {
+            throw CorpusFailure(
+                "\(stem): a pushError case must not carry `\(stray)` — push is the whole case"
+            )
+        }
+        guard let code = pushError["code"]?.stringValue else {
+            throw CorpusFailure("\(stem): pushError.code must be a string")
+        }
+        return try SemanticsCase(
+            stem: stem, schema: schema, seed: [], pushErrorCode: code,
+            opQuery: nil, opTxn: nil, opMigrate: nil, expect: nil,
+            unordered: false, normalize: nil, expectNextCursor: nil,
+            thenBlock: nil, skipReason: skipReason(object, stem)
+        )
+    }
+    let seed: [JSONValue]
+    if let array = object["seed"]?.arrayValue {
+        seed = array
+    } else if object["seed"] == nil {
+        seed = []
+    } else {
         throw CorpusFailure("\(stem): seed must be an array")
     }
     guard let op = object["op"]?.objectValue else {
         throw CorpusFailure("\(stem): missing op object")
     }
-    guard op["query"] != nil || op["txn"] != nil else {
-        throw CorpusFailure("\(stem): op must carry `query` or `txn`")
+    guard op["query"] != nil || op["txn"] != nil || op["migrate"] != nil else {
+        throw CorpusFailure("\(stem): op must carry `query`, `txn`, or `migrate`")
     }
     return try SemanticsCase(
-        stem: stem, schema: schema, seed: seed,
-        opQuery: op["query"], opTxn: op["txn"],
+        stem: stem, schema: schema, seed: seed, pushErrorCode: nil,
+        opQuery: op["query"], opTxn: op["txn"], opMigrate: op["migrate"],
         expect: required(object, "expect", stem),
         unordered: object["unordered"]?.boolValue ?? false,
         normalize: stringList(object["normalize"], "\(stem): normalize"),
@@ -243,6 +282,8 @@ private func loadCase(stem: String) throws -> SemanticsCase {
         skipReason: skipReason(object, stem)
     )
 }
+
+// swiftlint:enable cyclomatic_complexity function_body_length
 
 /// The required member `key` of a case object, or a loud failure.
 private func required(
@@ -568,8 +609,25 @@ private func executeOp(
             return .failure(error)
         }
     }
+    if let migrateJson = corpusCase.opMigrate {
+        // The admin MigrateRequest wire shape routed through the engine's
+        // migrate: apply-persist effects so a `then` read sees them, dryRun
+        // commits nothing, and the MigrateResult ({applied, schema,
+        // directives}) compares like any op result under the case's normalize
+        // rules (a `sampleChanges[].id` rides the normalize list as `id`).
+        let request = try decodeWire(
+            MigrateRequest.self, substitute(migrateJson, ids, caseName), "\(caseName): op.migrate"
+        )
+        do {
+            let result = try client.migrate(request)
+            let data = try JSONEncoder().encode(result)
+            return try .success(JSONDecoder().decode(JSONValue.self, from: data))
+        } catch let error as RtDbError {
+            return .failure(error)
+        }
+    }
     guard let queryJson = corpusCase.opQuery else {
-        throw CorpusFailure("\(caseName): op must carry `query` or `txn`")
+        throw CorpusFailure("\(caseName): op must carry `query`, `txn`, or `migrate`")
     }
     do {
         return try .success(executeQueryOp(client, queryJson, ids, caseName))
@@ -599,18 +657,46 @@ private func seedClient(
     return ids
 }
 
+// swiftlint:disable function_body_length
 /// Execute one corpus case end to end against a fresh in-memory instance.
 /// Every failure names the case.
 private func runCase(_ corpusCase: SemanticsCase) throws {
     let caseName = corpusCase.stem
     let client = makeClient()
+
+    // A pushError case asserts the push itself fails with the pinned code
+    // (only the code, never the message) — nothing else executes.
+    if let wantCode = corpusCase.pushErrorCode {
+        guard let want = ErrorCode(rawValue: wantCode) else {
+            throw CorpusFailure("\(caseName): pushError.code does not parse: \(wantCode)")
+        }
+        do {
+            try client.pushSchema(corpusCase.schema)
+        } catch let error as RtDbError {
+            guard error.code == want else {
+                throw CorpusFailure(
+                    "\(caseName): push error code mismatch — got \(error.code.rawValue), "
+                        + "want \(wantCode) (engine message: \(error.message))"
+                )
+            }
+            return
+        }
+        throw CorpusFailure("\(caseName): pushError case — the push must fail")
+    }
+
     try client.pushSchema(corpusCase.schema)
 
     let tableNames = corpusCase.schema.tables.keys.sorted()
     let singleTable = tableNames.count == 1 ? tableNames[0] : nil
     let ids = try seedClient(client, corpusCase, singleTable)
 
-    let expectErr = errorCodeOf(corpusCase.expect)
+    let expect = try {
+        guard let value = corpusCase.expect else {
+            throw CorpusFailure("\(caseName): missing expect")
+        }
+        return value
+    }()
+    let expectErr = errorCodeOf(expect)
     let caseKeys = corpusCase.normalize ?? defaultNormalize
 
     // Execute the op. An expected-error case asserts the code and stops (no
@@ -635,7 +721,7 @@ private func runCase(_ corpusCase: SemanticsCase) throws {
         )
     }
     try assertResult(caseName, opResult, Expectation(
-        expect: corpusCase.expect,
+        expect: expect,
         expectNextCursor: corpusCase.expectNextCursor,
         keys: caseKeys,
         unordered: corpusCase.unordered
@@ -655,6 +741,8 @@ private func runCase(_ corpusCase: SemanticsCase) throws {
         unordered: then.unordered
     ))
 }
+
+// swiftlint:enable function_body_length
 
 // MARK: - Suite
 

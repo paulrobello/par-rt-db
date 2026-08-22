@@ -650,7 +650,8 @@ func stampAutoIncrement(
 /// (store.ts `applyPatch`). A null on an optional field whose inner type
 /// rejects null removes the key.
 func applyPatch(
-    _ table: TableDef, _ doc: [String: JSONValue], _ fields: [String: JSONValue]
+    _ table: TableDef, _ doc: [String: JSONValue], _ fields: [String: JSONValue],
+    now: Int64
 ) throws -> [String: JSONValue] {
     // The auto-increment field is server-assigned and immutable after insert.
     // A patch may carry it back unchanged (round-trip friendly), but any
@@ -665,6 +666,12 @@ func applyPatch(
     }
     var merged = doc
     for (field, value) in fields {
+        // A computed key in the patch is dropped, not merged: the stamp below
+        // re-derives it from the final doc, so skipping here also keeps a
+        // wrong-typed client value from failing validateValue first.
+        if table.computed[field] != nil {
+            continue
+        }
         guard let fieldTy = table.fields[field] else {
             throw RtDbError(code: .schemaViolation, message: "unknown field '\(field)'")
         }
@@ -681,8 +688,9 @@ func applyPatch(
         }
         merged[field] = value
     }
-    try validateDoc(table, merged)
-    return merged
+    let stamped = try stampComputed(table, merged, now)
+    try validateDoc(table, stamped)
+    return stamped
 }
 
 // MARK: - Storage types
@@ -875,6 +883,18 @@ public final class InMemoryRtDbClient: MigrationStore {
             }
         } catch {
             // Atomicity: a failed directive rolls back every earlier effect.
+            restoreTables(tableSnap)
+            throw error
+        }
+        // Directive folding must not be able to invalidate a computed entry —
+        // e.g. `changeType` retyping a computed field so its expression's
+        // static kind no longer fits. Re-validate the derived map here (pure),
+        // mirroring plan_migration's post-folding validate_computed; the
+        // restore covers the interleaved row effects the server's plan-first
+        // ordering never commits.
+        do {
+            try validateComputed(planned)
+        } catch {
             restoreTables(tableSnap)
             throw error
         }
@@ -1789,7 +1809,9 @@ public final class InMemoryRtDbClient: MigrationStore {
                     table: table, extraTables: []
                 )
             }
-            let merged = try applyPatch(tableDef, row.doc, stampUpdatedAt(tableDef, patch, nowFn()))
+            let merged = try applyPatch(
+                tableDef, row.doc, stampUpdatedAt(tableDef, patch, nowFn()), now: nowFn()
+            )
             try doUpdate(table, tableDef, row, merged)
             return StepExecution(
                 result: .object(["id": .string(row.id), "inserted": .bool(false)]),
@@ -1802,7 +1824,7 @@ public final class InMemoryRtDbClient: MigrationStore {
                 // Fresh stamp per row, exactly as the server restamps inside
                 // its per-row loop.
                 let merged = try applyPatch(
-                    tableDef, row.doc, stampUpdatedAt(tableDef, patch, nowFn())
+                    tableDef, row.doc, stampUpdatedAt(tableDef, patch, nowFn()), now: nowFn()
                 )
                 try doUpdate(table, tableDef, row, merged)
             }
@@ -1848,6 +1870,11 @@ public final class InMemoryRtDbClient: MigrationStore {
         stamped = stampUpdatedAt(tableDef, stamped, nowFn())
         stamped = applyDefaults(tableDef, stamped)
         stamped = stampAutoIncrement(rowStore(tableName), tableDef, stamped)
+        // Computed stamping is the LAST insert stamp — after the ttl /
+        // updatedAt / defaults / autoIncrement chain — so expressions see
+        // final inputs, and before validateDoc so a client-supplied computed
+        // value never reaches validation.
+        stamped = try stampComputed(tableDef, stamped, nowFn())
         try validateDoc(tableDef, stamped)
         let stored = stripUnsetOptionals(tableDef, stamped)
         try checkUniqueIndexes(tableName, tableDef, stored)
@@ -1865,7 +1892,7 @@ public final class InMemoryRtDbClient: MigrationStore {
         // The updatedAt stamp rides IN the patch payload, so the merged doc
         // carries it even when the patch does not mention the field.
         let stamped = stampUpdatedAt(tableDef, fields, nowFn())
-        let merged = try applyPatch(tableDef, row.doc, stamped)
+        let merged = try applyPatch(tableDef, row.doc, stamped, now: nowFn())
         try doUpdate(tableName, tableDef, row, merged)
     }
 
@@ -1900,6 +1927,10 @@ public final class InMemoryRtDbClient: MigrationStore {
                 resolved[auto] = storedCounter
             }
         }
+        // Client-supplied computed values are dropped before validation: the
+        // stamp re-derives them from the final doc, and a wrong-typed client
+        // value must not fail validateDoc first.
+        resolved = try stampComputed(tableDef, resolved, nowFn())
         try validateDoc(tableDef, resolved)
         let stored = stripUnsetOptionals(tableDef, resolved)
         try checkUniqueIndexes(tableName, tableDef, stored, excludeId: row.id)
@@ -2022,7 +2053,9 @@ public final class InMemoryRtDbClient: MigrationStore {
                         let stamped = stampUpdatedAt(
                             childTableDef, [fieldName: .null], nowFn()
                         )
-                        let merged = try applyPatch(childTableDef, childRow.doc, stamped)
+                        let merged = try applyPatch(
+                            childTableDef, childRow.doc, stamped, now: nowFn()
+                        )
                         try doUpdate(childTableName, childTableDef, childRow, merged)
                         context.touched.insert(childTableName)
                     }

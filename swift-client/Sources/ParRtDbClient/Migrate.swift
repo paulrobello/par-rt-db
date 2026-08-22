@@ -57,7 +57,7 @@ public indirect enum ValueExpr: Equatable, Codable, Sendable {
     case trim(value: ValueExpr)
     /// A closed scalar coercion. Reuses `Directive.changeType`'s `Cast`.
     case cast(value: ValueExpr, to: Cast)
-    /// Current timestamp (`now()`), as jsonb.
+    /// Current timestamp as epoch milliseconds (a JSON number).
     case now
     /// Conditional: first matching `when`'s `then`, else `otherwise`. Each
     /// `when` is a `FilterExpr` (field references schema-validated, values bound).

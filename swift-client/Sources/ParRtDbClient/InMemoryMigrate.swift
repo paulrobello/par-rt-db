@@ -244,6 +244,12 @@ public func validateSchema(_ schema: SchemaDef) throws {
                 )
             }
         }
+        // ENH-028: computed-field rules (server `validate_structure` ->
+        // `validate_computed`) — declared keys, non-stamped targets, declared
+        // non-computed references, marker-free `caseExpr` whens, static-kind
+        // fit, and authorize independence. BAD_REQUEST, matching the server
+        // (the corpus pushError cases pin the code).
+        try validateComputedTable(table, tableName)
     }
 }
 
@@ -384,6 +390,256 @@ public func onDeleteRef(_ ty: FieldType, _ parentTable: String) -> OnDeleteActio
     return nil
 }
 
+// MARK: - Computed-field push validation (ENH-028)
+
+/// The statically-known result kind of a `ValueExpr`, for the computed-field
+/// push check (server `StaticKind`). nil means the result kind varies by
+/// input — `field` (text extraction of any JSON value), `coalesce`/`caseExpr`
+/// (whichever branch wins), and the null / object / array literals whose
+/// runtime `validateDoc` check is the only guard.
+private enum ComputedStaticKind: Equatable {
+    case string
+    case number
+    case boolean
+
+    /// The sample value the field's type must accept (server: "s" / 1 / true).
+    var sample: JSONValue {
+        switch self {
+        case .string: .string("s")
+        case .number: .int(1)
+        case .boolean: .bool(true)
+        }
+    }
+
+    /// The kind's name in the rejection message (server `as_str`).
+    var name: String {
+        switch self {
+        case .string: "a string"
+        case .number: "a number"
+        case .boolean: "a boolean"
+        }
+    }
+}
+
+private func inferStaticKind(_ ve: ValueExpr) -> ComputedStaticKind? {
+    switch ve {
+    case .field, .coalesce, .caseExpr:
+        nil
+    case let .literal(value):
+        switch value {
+        case .string: .string
+        case .int, .double: .number
+        case .bool: .boolean
+        case .null, .array, .object: nil
+        }
+    case .concat, .lower, .upper, .trim, .cast(_, .toString):
+        .string
+    case .add, .sub, .mul, .div, .cast(_, .toNumber), .cast(_, .toInt64), .now:
+        .number
+    case .cast(_, .toBoolean):
+        .boolean
+    }
+}
+
+/// Whether a filter value is a principal marker — `{"$user":true}` or
+/// `{"$email":true}` (server `is_principal_marker`).
+private func isPrincipalMarker(_ value: JSONValue) -> Bool {
+    guard case let .object(map) = value, map.count == 1 else {
+        return false
+    }
+    if case .bool(true)? = map["$user"] {
+        return true
+    }
+    if case .bool(true)? = map["$email"] {
+        return true
+    }
+    return false
+}
+
+/// Walks a computed expression's `caseExpr` nodes rejecting principal markers
+/// in every `when` filter — computed exprs run on every write with no
+/// interactive principal, so a `$user`/`$email` marker has no value to
+/// resolve (server `validate_computed_case_whens`). Branch bodies recurse so
+/// a `caseExpr` nested inside a `then`/`otherwise` is covered.
+private func validateComputedCaseWhens(_ ve: ValueExpr) throws {
+    switch ve {
+    case let .caseExpr(whens, otherwise):
+        for cw in whens {
+            try rejectPrincipalMarkers(cw.when)
+            try validateComputedCaseWhens(cw.then)
+        }
+        try validateComputedCaseWhens(otherwise)
+    case let .concat(parts), let .coalesce(parts):
+        for part in parts {
+            try validateComputedCaseWhens(part)
+        }
+    case let .add(left, right), let .sub(left, right),
+         let .mul(left, right), let .div(left, right):
+        try validateComputedCaseWhens(left)
+        try validateComputedCaseWhens(right)
+    case let .lower(value), let .upper(value), let .trim(value), let .cast(value, _):
+        try validateComputedCaseWhens(value)
+    case .field, .literal, .now:
+        break
+    }
+}
+
+/// Rejects a principal marker in any leaf VALUE position of a filter
+/// (eq/neq/gt/gte/lt/lte/contains values and `in` values) — the
+/// marker-rejecting mode of the server's `validate_filter_expr_fields`.
+private func rejectPrincipalMarkers(_ expr: FilterExpr) throws {
+    switch expr {
+    case let .eq(field, value), let .neq(field, value), let .gt(field, value),
+         let .gte(field, value), let .lt(field, value), let .lte(field, value),
+         let .contains(field, value):
+        if isPrincipalMarker(value) {
+            throw RtDbError(
+                code: .badRequest,
+                message: "principal markers ({\"$user\":true}/{\"$email\":true}) are not "
+                    + "allowed in client filters (field '\(field)')"
+            )
+        }
+    case let .inValues(field, values):
+        for value in values where isPrincipalMarker(value) {
+            throw RtDbError(
+                code: .badRequest,
+                message: "principal markers ({\"$user\":true}/{\"$email\":true}) are not "
+                    + "allowed in client filters (field '\(field)')"
+            )
+        }
+    case let .and(exprs), let .or(exprs):
+        for subExpr in exprs {
+            try rejectPrincipalMarkers(subExpr)
+        }
+    case let .not(expr):
+        try rejectPrincipalMarkers(expr)
+    case .exists:
+        break
+    }
+}
+
+// swiftlint:disable cyclomatic_complexity function_body_length
+/// Computed-field push validation — a port of server
+/// `schema::TableDef::validate_computed`. Rules, in order:
+/// 1. every `computed` key names a declared field;
+/// 2. the key is not one of the server-stamped declaration fields
+///    (`ownerField`/`collaboratorsField`/`autoIncrementField`);
+/// 3. every field the expression references (including `caseExpr.when` filter
+///    fields) is declared and not itself computed (no chained or cyclic
+///    evaluation);
+/// 4. `caseExpr.when` filters reject principal markers;
+/// 5. when the expression's result kind is statically known, the field's type
+///    must accept a value of that kind (int64 accepts a String kind — a
+///    decimal-string possibility — but never a Number kind);
+/// 6. the table's `authorize` predicate references no computed field (authorize
+///    runs pre-stamp on the insert paths, so such a predicate would evaluate
+///    forgeable client input).
+func validateComputedTable(_ table: TableDef, _ tableName: String) throws {
+    for (field, expr) in table.computed {
+        if table.fields[field] == nil {
+            throw RtDbError(
+                code: .badRequest,
+                message: "computed field '\(tableName).\(field)' is not a declared field"
+            )
+        }
+        if table.ownerField == field {
+            throw RtDbError(
+                code: .badRequest,
+                message: "computed field '\(tableName).\(field)' must not be the table's "
+                    + "ownerField"
+            )
+        }
+        if table.collaboratorsField == field {
+            throw RtDbError(
+                code: .badRequest,
+                message: "computed field '\(tableName).\(field)' must not be the table's "
+                    + "collaboratorsField"
+            )
+        }
+        if table.autoIncrementField == field {
+            throw RtDbError(
+                code: .badRequest,
+                message: "computed field '\(tableName).\(field)' must not be the table's "
+                    + "autoIncrementField"
+            )
+        }
+        // First offense wins; the walk covers `field` nodes and every
+        // `caseExpr.when` filter field.
+        var offender: String?
+        walkValueExprFields(expr) { referenced in
+            guard offender == nil else {
+                return
+            }
+            if table.fields[referenced] == nil {
+                offender = "computed field '\(tableName).\(field)' references undeclared "
+                    + "field '\(referenced)'"
+            } else if table.computed[referenced] != nil {
+                offender = "computed field '\(tableName).\(field)' references computed "
+                    + "field '\(referenced)' (computed fields may not reference each other)"
+            }
+        }
+        if let message = offender {
+            throw RtDbError(code: .badRequest, message: message)
+        }
+        try validateComputedCaseWhens(expr)
+        if let kind = inferStaticKind(expr) {
+            // `validateValue` is the wire contract, but int64's wire form is a
+            // decimal STRING: a Number-kind result can never validate
+            // (arithmetic yields JSON numbers), while a String-kind one can
+            // ("42") — decimal-ness stays a runtime `validateDoc` check.
+            // Optional unwrapping admits the nullable spelling. Rule 1 above
+            // guarantees the key is declared.
+            guard let declared = table.fields[field] else {
+                return
+            }
+            var inner = declared
+            while case let .optional(wrapped) = inner {
+                inner = wrapped
+            }
+            let accepts = validateValue(declared, kind.sample)
+                || (inner == .int64 && kind == .string)
+            if !accepts {
+                throw RtDbError(
+                    code: .badRequest,
+                    message: "computed field '\(tableName).\(field)' produces \(kind.name), "
+                        + "which the field type does not accept"
+                )
+            }
+        }
+    }
+    // Rule 6: authorize runs pre-stamp on the insert paths, so a predicate
+    // over a computed field would read client input.
+    if let authorize = table.authorize {
+        var offender: String?
+        walkFilterExprFieldNames(authorize) { referenced in
+            if offender == nil, table.computed[referenced] != nil {
+                offender = referenced
+            }
+        }
+        if let field = offender {
+            throw RtDbError(
+                code: .badRequest,
+                message: "computed field '\(tableName).\(field)' must not be referenced by "
+                    + "the table's authorize predicate (authorize predicates may not "
+                    + "reference computed fields)"
+            )
+        }
+    }
+}
+
+// swiftlint:enable cyclomatic_complexity function_body_length
+
+/// Validates every table's computed-field map — the schema-level entry point
+/// behind `validateSchema`'s per-table pass, also called by the engine's
+/// `migrate` after directive folding so a `changeType` that invalidates a
+/// computed entry fails at plan time (server `schema::validate_computed`,
+/// called from `plan_migration`).
+public func validateComputed(_ schema: SchemaDef) throws {
+    for (tableName, table) in schema.tables {
+        try validateComputedTable(table, tableName)
+    }
+}
+
 // MARK: - Casts
 
 /// True iff `cast` can coerce from `old` — a port of server
@@ -514,6 +770,7 @@ private func requireMigrateTable(_ schema: SchemaDef, _ name: String) throws {
     }
 }
 
+// swiftlint:disable:next cyclomatic_complexity
 private func applyRenameFieldDirective(
     _ planned: inout SchemaDef, _ table: String, _ from: String, _ to: String,
     _ store: MigrationStore
@@ -543,6 +800,24 @@ private func applyRenameFieldDirective(
     if planned.tables[table]?.collaboratorsField == from {
         planned.tables[table]?.collaboratorsField = to
     }
+    // ENH-028: the computed map follows the rename the way `defaults` does —
+    // an entry KEYED on the renamed field moves to the new name (its declared
+    // field moved; leaving it keyed on `from` would fail validateComputed's
+    // declared-field rule on the derived schema), and every expression's
+    // `field` references (including `caseExpr.whens` predicates) are rewritten
+    // to read the renamed doc key. Input values are unchanged by the rename,
+    // so stored computed values stay correct; the next write re-stamps.
+    if var computed = planned.tables[table]?.computed {
+        if let keyed = computed.removeValue(forKey: from) {
+            computed[to] = keyed
+        }
+        for key in Array(computed.keys) {
+            if let expr = computed[key] {
+                computed[key] = renamedValueExpr(expr, from, to)
+            }
+        }
+        planned.tables[table]?.computed = computed
+    }
     var affected: Int64 = 0
     for row in store.rowsFor(table).values {
         guard let value = row.doc.removeValue(forKey: from) else { continue }
@@ -551,6 +826,90 @@ private func applyRenameFieldDirective(
     }
     return (DirectiveReport(op: "renameField", affectedRows: affected), table)
 }
+
+// swiftlint:disable cyclomatic_complexity
+/// The `FilterExpr` half of a field rename: rewrites every leaf `field` equal
+/// to `from` to `to` (server `rename_filter_fields`). Recurses through
+/// `and`/`or`/`not`.
+private func renamedFilterExpr(_ expr: FilterExpr, _ from: String, _ to: String) -> FilterExpr {
+    switch expr {
+    case let .eq(name, value):
+        .eq(field: name == from ? to : name, value: value)
+    case let .neq(name, value):
+        .neq(field: name == from ? to : name, value: value)
+    case let .gt(name, value):
+        .gt(field: name == from ? to : name, value: value)
+    case let .gte(name, value):
+        .gte(field: name == from ? to : name, value: value)
+    case let .lt(name, value):
+        .lt(field: name == from ? to : name, value: value)
+    case let .lte(name, value):
+        .lte(field: name == from ? to : name, value: value)
+    case let .inValues(name, values):
+        .inValues(field: name == from ? to : name, values: values)
+    case let .contains(name, value):
+        .contains(field: name == from ? to : name, value: value)
+    case let .exists(name):
+        .exists(field: name == from ? to : name)
+    case let .and(exprs):
+        .and(exprs: exprs.map { renamedFilterExpr($0, from, to) })
+    case let .or(exprs):
+        .or(exprs: exprs.map { renamedFilterExpr($0, from, to) })
+    case let .not(inner):
+        .not(expr: renamedFilterExpr(inner, from, to))
+    }
+}
+
+// swiftlint:enable cyclomatic_complexity
+
+// swiftlint:disable cyclomatic_complexity
+/// The `ValueExpr` half of a field rename: rewrites every `field` reference
+/// equal to `from` to `to` — the value-returning mirror of
+/// `walkValueExprFields` (server `rename_value_expr_fields`). `caseExpr.whens`
+/// predicates reuse `renamedFilterExpr` (the same rewrite `authorize` gets on
+/// the server), so a rename carries computed expressions across intact. `to`
+/// is fresh (renameField rejects an existing target), so no reference set can
+/// collide.
+private func renamedValueExpr(_ ve: ValueExpr, _ from: String, _ to: String) -> ValueExpr {
+    switch ve {
+    case let .field(name):
+        name == from ? .field(field: to) : ve
+    case .literal, .now:
+        ve
+    case let .concat(parts):
+        .concat(parts: parts.map { renamedValueExpr($0, from, to) })
+    case let .coalesce(parts):
+        .coalesce(parts: parts.map { renamedValueExpr($0, from, to) })
+    case let .add(left, right):
+        .add(left: renamedValueExpr(left, from, to), right: renamedValueExpr(right, from, to))
+    case let .sub(left, right):
+        .sub(left: renamedValueExpr(left, from, to), right: renamedValueExpr(right, from, to))
+    case let .mul(left, right):
+        .mul(left: renamedValueExpr(left, from, to), right: renamedValueExpr(right, from, to))
+    case let .div(left, right):
+        .div(left: renamedValueExpr(left, from, to), right: renamedValueExpr(right, from, to))
+    case let .lower(value):
+        .lower(value: renamedValueExpr(value, from, to))
+    case let .upper(value):
+        .upper(value: renamedValueExpr(value, from, to))
+    case let .trim(value):
+        .trim(value: renamedValueExpr(value, from, to))
+    case let .cast(value, castTo):
+        .cast(value: renamedValueExpr(value, from, to), to: castTo)
+    case let .caseExpr(whens, otherwise):
+        .caseExpr(
+            whens: whens.map { cw in
+                CaseWhen(
+                    when: renamedFilterExpr(cw.when, from, to),
+                    then: renamedValueExpr(cw.then, from, to)
+                )
+            },
+            otherwise: renamedValueExpr(otherwise, from, to)
+        )
+    }
+}
+
+// swiftlint:enable cyclomatic_complexity
 
 private func applyRenameTableDirective(
     _ planned: inout SchemaDef, _ from: String, _ to: String, _ store: MigrationStore
@@ -619,6 +978,7 @@ private func applyChangeTypeDirective(
 
 // swiftlint:enable function_parameter_count
 
+// swiftlint:disable:next cyclomatic_complexity
 private func applyDropFieldDirective(
     _ planned: inout SchemaDef, _ table: String, _ field: String, _ store: MigrationStore
 ) throws -> (report: DirectiveReport, table: String?) {
@@ -641,6 +1001,35 @@ private func applyDropFieldDirective(
     if planned.tables[table]?.collaboratorsField == field {
         planned.tables[table]?.collaboratorsField = nil
     }
+    // ENH-028: a computed expression reading the dropped field would dangle —
+    // every future write fails its stamp. Reject, naming the computed field,
+    // so the caller amends the computed map first (a push removing the entry
+    // leaves stored values in place).
+    var computedOffender: String?
+    for (computedField, expr) in planned.tables[table]?.computed ?? [:] {
+        var referenced = false
+        walkValueExprFields(expr) { name in
+            if name == field {
+                referenced = true
+            }
+        }
+        if referenced {
+            computedOffender = computedField
+            break
+        }
+    }
+    if let computedField = computedOffender {
+        throw RtDbError(
+            code: .badRequest,
+            message: "cannot drop field '\(table).\(field)': it is referenced by computed "
+                + "field '\(table).\(computedField)'; drop the computed field first"
+        )
+    }
+    // An entry KEYED on the dropped field goes with it (the `defaults`
+    // discipline): the applier removes the stored key from every doc, so
+    // leaving the entry would fail validateComputed's declared-field rule on
+    // the derived schema.
+    planned.tables[table]?.computed.removeValue(forKey: field)
     var affected: Int64 = 0
     for row in store.rowsFor(table).values {
         let removed = row.doc.removeValue(forKey: field)
