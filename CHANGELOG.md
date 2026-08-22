@@ -14,6 +14,37 @@ contract against Convex.
 
 ## [Unreleased]
 
+### Feature: `awaitSignal` workflow steps — external approval gates (FM-29, server + all four clients)
+
+A workflow step is now either a txn or an `awaitSignal {name, timeoutMs?}`
+wait (exactly one of the two per step, submit-time validated): the run parks
+in a new non-terminal `waiting` status — visible as `waitingFor`/
+`waitedSince` on `WorkflowInfo` (omitted otherwise) — until a matching
+signal arrives. Signal delivery rides three surfaces, all mapping onto
+typed errors (404 unknown id; 409 not-waiting or name-mismatch) and one
+shared 64 KiB serialized-payload cap enforced in `workflows::deliver_signal`:
+`POST /api/workflows/{id}/signal`, the WS `signalWorkflow` frame (reply
+reuses `workflowAck`), and admin `POST /admin/db/{db}/workflows/{id}/signal`.
+Delivery is latest-wins (a second delivery into an unconsumed wait
+overwrites the slot), the consumed payload is recorded verbatim on the step
+outcome (`signal`), an omitted `timeoutMs` parks forever (cancel is the
+escape), and a `timeoutMs` expiry counts as a failed attempt routed into
+the step's `retry` policy — but each re-parked attempt waits the FULL
+`timeoutMs` again, never backoff. `awaitSignal` steps write no documents:
+delivery is one conditional side-table UPDATE (`cancel`'s precedent — no
+new committer arm or tap site). The `rtdb workflows signal` CLI subcommand
+and the dashboard Workflows page's send-signal form deliver through the
+same surfaces; all four SDKs mirror the step builder, `signalWorkflow`
+(+ admin variant), and the `waiting` wire shape — pinned by wire-corpus
+entries (`awaitSignal` spec steps and `signalWorkflow` frames with payload/
+timeoutMs present and omitted; a waiting-status `WorkflowInfo`) and server
+tests including the payload-cap rejection (previously pinned only in the
+python harness). **Breaking (rust crate):** `WorkflowStepSpec.txn` is now
+`Option<Transaction>` so a step can carry the wait — migrate `txn: t` to
+`txn: Some(t)`, or use the new `WorkflowStepSpec::await_signal(name,
+timeout_ms)` constructor; TS, python, and swift users are unaffected beyond
+the new optional field.
+
 ### Feature: interval recurrence for scheduled transactions (`when: {type:"interval", everyMs}` — server + all four clients)
 
 The third recurrence shape alongside one-shot (`afterMs`/`runAt`) and cron: a

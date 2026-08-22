@@ -2060,3 +2060,51 @@ async fn await_signal_ws_and_admin_surfaces_deliver() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// (25) The 64 KiB payload cap, pinned server-side (until now only the
+/// python harness covered it): a delivery whose serialized payload exceeds
+/// `MAX_SIGNAL_PAYLOAD_BYTES` is `BadRequest` — the exact `deliver_signal`
+/// message — BEFORE any slot write, so the row is still `waiting` with the
+/// signal slot empty: a failed delivery consumes nothing. Side-table only
+/// (the lifecycle test's claim-then-park setup — no committer, no spawn).
+#[tokio::test]
+async fn await_signal_payload_cap_rejects_without_consuming() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    workflows::ensure_table(&pool, &db).await?;
+    let spec: WorkflowSpec = serde_json::from_value(serde_json::json!({
+        "name": "cap", "steps": [ { "awaitSignal": { "name": "approve", "timeoutMs": 60_000 } } ]
+    }))?;
+    let id = workflows::insert(&pool, &db, &spec).await?;
+    // Only the advance arm parks, on a row it holds `running` — claim first
+    // (the `status = 'running'` guard on `park_waiting`).
+    let claimed = workflows::claim_due(&pool, &db, now_ms(), 10).await?;
+    assert_eq!(claimed.len(), 1);
+    workflows::park_waiting(&pool, &db, &id, 0, "approve", now_ms() + 60_000).await?;
+
+    // A JSON string of exactly MAX_SIGNAL_PAYLOAD_BYTES chars serializes to
+    // MAX + 2 bytes (the quotes), so it is over the cap.
+    let oversized = serde_json::Value::String("x".repeat(workflows::MAX_SIGNAL_PAYLOAD_BYTES));
+    let err = workflows::deliver_signal(&pool, &db, &id, "approve", Some(oversized))
+        .await
+        .expect_err("an over-cap payload must be rejected");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert_eq!(err.message, "signal payload exceeds 65536 bytes");
+
+    let full = workflows::get(&pool, &db, &id).await?.expect("row");
+    assert_eq!(full.info.status, WorkflowStatus::Waiting);
+    assert_eq!(full.info.waiting_for.as_deref(), Some("approve"));
+    let slot: Option<serde_json::Value> = sqlx::query_scalar(&format!(
+        "SELECT signal_payload FROM \"db_{db}\".workflows WHERE id = $1"
+    ))
+    .bind(&id)
+    .fetch_one(&pool)
+    .await?;
+    assert!(
+        slot.is_none(),
+        "a failed delivery consumed nothing — the slot stays empty"
+    );
+
+    Ok(())
+}
