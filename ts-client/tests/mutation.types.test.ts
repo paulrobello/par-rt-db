@@ -76,3 +76,43 @@ describe("typed mutation builder", () => {
     expectTypeOf(untyped.insert).toBeCallableWith("anything", { any: "shape" });
   });
 });
+
+// Server-stamped fields (FM-36 updatedAtField / FM-37 autoIncrementField)
+// are optional in insert/replace inputs — the server stamps an omitted value
+// and overwrites a supplied one — while a plain required field stays required.
+const stampedSchema = defineSchema({
+  tasks: defineTable({
+    title: t.string(),
+    updatedAt: t.number(),
+  })
+    .index("by_title", ["title"])
+    .updatedAtField("updatedAt"),
+  tickets: defineTable({
+    title: t.string(),
+    num: t.int64(),
+  })
+    .index("by_title", ["title"])
+    .autoIncrementField("num"),
+});
+
+const stampedBuilder = mutation(stampedSchema);
+
+describe("typed mutation builder — server-stamped fields", () => {
+  it("accepts an insert/replace omitting the updatedAtField field", () => {
+    expectTypeOf(stampedBuilder.insert).toBeCallableWith("tasks", { title: "a" });
+    expectTypeOf(stampedBuilder.insert).toBeCallableWith("tasks", {
+      title: "a",
+      updatedAt: 123,
+    });
+    expectTypeOf(stampedBuilder.replace).toBeCallableWith("tasks", "id1", { title: "a" });
+  });
+
+  it("accepts an insert omitting the autoIncrementField field", () => {
+    expectTypeOf(stampedBuilder.insert).toBeCallableWith("tickets", { title: "a" });
+  });
+
+  it("still rejects omitting a plain required field on a stamped table", () => {
+    // @ts-expect-error - "title" is required
+    stampedBuilder.insert("tasks", { updatedAt: 123 });
+  });
+});

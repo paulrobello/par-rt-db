@@ -156,7 +156,14 @@ export const t = {
 export class TableDefinition<
   Fields extends Record<string, Validator<unknown, boolean>>,
   Indexes extends string = never,
+  Stamped extends string = never,
 > {
+  /** Phantom type-level marker naming the fields the server stamps on this
+   * table's insert paths (updatedAtField / autoIncrementField), so insert/
+   * replace input types can make them optional while read types keep them
+   * required. Never assigned at runtime. */
+  declare readonly __stamped?: Stamped;
+
   constructor(
     readonly fields: Fields,
     readonly indexes: IndexJson[] = [],
@@ -174,7 +181,7 @@ export class TableDefinition<
   index<Name extends string>(
     name: Name,
     fields: [keyof Fields & string, ...(keyof Fields & string)[]],
-  ): TableDefinition<Fields, Indexes | Name> {
+  ): TableDefinition<Fields, Indexes | Name, Stamped> {
     return new TableDefinition(
       this.fields,
       [...this.indexes, { name, fields: [...fields] }],
@@ -194,7 +201,7 @@ export class TableDefinition<
    * compiles this to `CREATE UNIQUE INDEX` over the index's declared `fields`
    * (no trailing tiebreaker — uniqueness is on `fields` only). Btree-only: do
    * not chain after `searchIndex`/`vectorIndex` (the server rejects the combo). */
-  unique(): TableDefinition<Fields, Indexes> {
+  unique(): TableDefinition<Fields, Indexes, Stamped> {
     return this.amendLastIndex((last) => ({ ...last, unique: true }));
   }
 
@@ -202,7 +209,7 @@ export class TableDefinition<
    * The server bakes the predicate into `CREATE INDEX … WHERE` (literal SQL — no
    * bind params at DDL time). Same `FilterExpr` shape as the query-time
    * `.filter()` terminal. Btree-only. */
-  where(predicate: FilterExpr): TableDefinition<Fields, Indexes> {
+  where(predicate: FilterExpr): TableDefinition<Fields, Indexes, Stamped> {
     return this.amendLastIndex((last) => ({ ...last, where: predicate }));
   }
 
@@ -210,7 +217,9 @@ export class TableDefinition<
    * `amend(last)`. Throws if no index has been declared yet. The index object is
    * copied rather than mutated, so earlier `TableDefinition` instances stay
    * intact (matching the immutable style of `index`/`searchIndex`/`vectorIndex`). */
-  private amendLastIndex(amend: (last: IndexJson) => IndexJson): TableDefinition<Fields, Indexes> {
+  private amendLastIndex(
+    amend: (last: IndexJson) => IndexJson,
+  ): TableDefinition<Fields, Indexes, Stamped> {
     if (this.indexes.length === 0) {
       throw new Error("unique()/where() require a preceding index() call");
     }
@@ -241,7 +250,7 @@ export class TableDefinition<
     name: Name,
     fields: [keyof Fields & string, ...(keyof Fields & string)[]],
     language?: string,
-  ): TableDefinition<Fields, Indexes | Name> {
+  ): TableDefinition<Fields, Indexes | Name, Stamped> {
     return new TableDefinition(
       this.fields,
       [
@@ -274,7 +283,7 @@ export class TableDefinition<
     dimensions: number,
     filterFields: (keyof Fields & string)[] = [],
     metric: DistanceMetric = "cosine",
-  ): TableDefinition<Fields, Indexes | Name> {
+  ): TableDefinition<Fields, Indexes | Name, Stamped> {
     return new TableDefinition(
       this.fields,
       [
@@ -304,7 +313,7 @@ export class TableDefinition<
   /** Declare the per-row owner field for authorization. `field` names a declared
    * string-compatible field whose value is the owning user's id. Server-enforced;
    * the client only declares it and round-trips it on the wire as `ownerField`. */
-  ownerField(field: string): TableDefinition<Fields, Indexes> {
+  ownerField(field: string): TableDefinition<Fields, Indexes, Stamped> {
     return new TableDefinition(
       this.fields,
       this.indexes,
@@ -324,7 +333,7 @@ export class TableDefinition<
    * declared array-of-strings (or array-of-id) field whose values are additional
    * user ids that may read/mutate the row (owner OR collaborator). Server-enforced;
    * the client only declares it and round-trips it on the wire as `collaboratorsField`. */
-  collaboratorsField(field: string): TableDefinition<Fields, Indexes> {
+  collaboratorsField(field: string): TableDefinition<Fields, Indexes, Stamped> {
     return new TableDefinition(
       this.fields,
       this.indexes,
@@ -348,7 +357,7 @@ export class TableDefinition<
    * round-trips it on the wire as `ttl`. The server requires a single-field,
    * non-unique, non-partial btree index on `field` (declare one with `index()`
    * before/after this call). */
-  ttl(field: string, defaultDurationMs?: number): TableDefinition<Fields, Indexes> {
+  ttl(field: string, defaultDurationMs?: number): TableDefinition<Fields, Indexes, Stamped> {
     const ttlDef: TtlDef = defaultDurationMs != null ? { field, defaultDurationMs } : { field };
     return new TableDefinition(
       this.fields,
@@ -372,7 +381,7 @@ export class TableDefinition<
    * values are valid only here — client `.filter()` queries reject them.
    * Server-enforced; the client only declares it and round-trips it on the wire
    * as `authorize`. */
-  authorize(predicate: FilterExpr): TableDefinition<Fields, Indexes> {
+  authorize(predicate: FilterExpr): TableDefinition<Fields, Indexes, Stamped> {
     return new TableDefinition(
       this.fields,
       this.indexes,
@@ -396,7 +405,7 @@ export class TableDefinition<
    * must be a declared field of this table, values non-null and matching the
    * field's type); the client only declares it and round-trips it on the wire
    * as `defaults`, omitted when the table declares none. */
-  defaults(map: Record<string, unknown>): TableDefinition<Fields, Indexes> {
+  defaults(map: Record<string, unknown>): TableDefinition<Fields, Indexes, Stamped> {
     return new TableDefinition(
       this.fields,
       this.indexes,
@@ -418,7 +427,7 @@ export class TableDefinition<
    * index, and an `undelete` mutation step restores it. The TTL reaper always
    * hard-deletes. Server-enforced; the client only declares it and round-trips
    * it on the wire as `softDelete: true`, omitted when unset. */
-  softDelete(): TableDefinition<Fields, Indexes> {
+  softDelete(): TableDefinition<Fields, Indexes, Stamped> {
     return new TableDefinition(
       this.fields,
       this.indexes,
@@ -444,7 +453,9 @@ export class TableDefinition<
    * must differ from `ttl.field`. No index is required on the field.
    * Server-enforced; the client only declares it and round-trips it on the
    * wire as `updatedAtField`. */
-  updatedAtField(field: string): TableDefinition<Fields, Indexes> {
+  updatedAtField<F extends keyof Fields & string>(
+    field: F,
+  ): TableDefinition<Fields, Indexes, Stamped | F> {
     return new TableDefinition(
       this.fields,
       this.indexes,
@@ -473,7 +484,9 @@ export class TableDefinition<
    * rolled-back transactions (sequences are monotonic, not gap-free).
    * Server-enforced; the client only declares it and round-trips it on the
    * wire as `autoIncrementField`. */
-  autoIncrementField(field: string): TableDefinition<Fields, Indexes> {
+  autoIncrementField<F extends keyof Fields & string>(
+    field: F,
+  ): TableDefinition<Fields, Indexes, Stamped | F> {
     return new TableDefinition(
       this.fields,
       this.indexes,
@@ -502,7 +515,7 @@ export class TableDefinition<
    * statically-known result kind must fit the field's type); the client only
    * declares it and round-trips it on the wire as `computed`, omitted when
    * the table declares none. */
-  computed(field: string, expr: ValueExprJson): TableDefinition<Fields, Indexes> {
+  computed(field: string, expr: ValueExprJson): TableDefinition<Fields, Indexes, Stamped> {
     return new TableDefinition(
       this.fields,
       this.indexes,
@@ -566,7 +579,7 @@ export function defineTable<Fields extends Record<string, Validator<unknown, boo
   return new TableDefinition(fields);
 }
 
-export class SchemaDefinition<Tables extends Record<string, TableDefinition<any, string>>> {
+export class SchemaDefinition<Tables extends Record<string, TableDefinition<any, string, any>>> {
   constructor(readonly tables: Tables) {}
 
   toJSON(): SchemaJson {
@@ -582,7 +595,7 @@ export class SchemaDefinition<Tables extends Record<string, TableDefinition<any,
  * the result to `createApi(schema)` for the typed query/mutation builders and
  * to `admin.pushSchema(db, schema)` to push it (additive DDL only —
  * destructive changes go through `Migration`). */
-export function defineSchema<Tables extends Record<string, TableDefinition<any, string>>>(
+export function defineSchema<Tables extends Record<string, TableDefinition<any, string, any>>>(
   tables: Tables,
 ): SchemaDefinition<Tables> {
   return new SchemaDefinition(tables);
@@ -612,10 +625,26 @@ export type DocFields<Fields extends Record<string, Validator<unknown, boolean>>
 export type TableNames<S extends SchemaDefinition<any>> = keyof S["tables"] & string;
 
 type FieldsOf<S extends SchemaDefinition<any>, T extends TableNames<S>> =
-  S["tables"][T] extends TableDefinition<infer F, string> ? F : never;
+  S["tables"][T] extends TableDefinition<infer F, string, any> ? F : never;
 
 export type IndexNamesOf<S extends SchemaDefinition<any>, T extends TableNames<S>> =
-  S["tables"][T] extends TableDefinition<any, infer I> ? I : never;
+  S["tables"][T] extends TableDefinition<any, infer I, any> ? I : never;
+
+/** The table's server-stamped insert fields (`updatedAtField` /
+ * `autoIncrementField`), carried on the table type's phantom marker. */
+type StampedFieldsOf<S extends SchemaDefinition<any>, T extends TableNames<S>> =
+  S["tables"][T] extends TableDefinition<any, string, infer ST> ? ST : never;
+
+/** Insert/replace input keys that must be supplied: every non-optional field
+ * except the server-stamped ones (a stamped field may be omitted — and any
+ * supplied value is overwritten). */
+type InsertRequiredKeys<Fields, Stamped extends string> = {
+  [K in keyof Fields]: Fields[K] extends Validator<unknown, true>
+    ? never
+    : K extends Stamped
+      ? never
+      : K;
+}[keyof Fields];
 
 /** A read document: declared fields plus the merged system fields. */
 export type Doc<S extends SchemaDefinition<any>, T extends TableNames<S>> = DocFields<
@@ -623,8 +652,16 @@ export type Doc<S extends SchemaDefinition<any>, T extends TableNames<S>> = DocF
 > &
   SystemFields<T>;
 
-/** An insert/patch input: declared fields only, no system fields. */
-export type WithoutSystemFields<
-  S extends SchemaDefinition<any>,
-  T extends TableNames<S>,
-> = DocFields<FieldsOf<S, T>>;
+/** An insert/replace input: declared fields only, no system fields. Fields
+ * the server stamps (updatedAtField / autoIncrementField) are optional —
+ * omission is accepted and stamped, a supplied value is overwritten — while
+ * they stay required in the read type {@link Doc} (every stored doc carries
+ * them). */
+export type WithoutSystemFields<S extends SchemaDefinition<any>, T extends TableNames<S>> = {
+  [K in InsertRequiredKeys<FieldsOf<S, T>, StampedFieldsOf<S, T>>]: Infer<FieldsOf<S, T>[K]>;
+} & {
+  [K in Exclude<
+    keyof FieldsOf<S, T>,
+    InsertRequiredKeys<FieldsOf<S, T>, StampedFieldsOf<S, T>>
+  >]?: Infer<FieldsOf<S, T>[K]>;
+};

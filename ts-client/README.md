@@ -49,12 +49,15 @@ mutate, and subscription re-run; machine tokens bypass):
   the current epoch-ms on every version-bumping write (insert, patch, replace,
   upsert both branches, patchByQuery, cascade setNull), overwriting any
   client-supplied value — a JSON number on `number`, a decimal string on
-  `int64`. Must differ from `ttl.field`; no index required.
+  `int64`. The field is optional in the insert/replace input type (omission is
+  accepted and stamped; read types keep it required). Must differ from
+  `ttl.field`; no index required.
 - `.autoIncrementField("num")` — declares a server-assigned per-table
   monotonic counter (FM-37): names a declared `int64` field the server stamps
   with the next sequence value on insert (and upsert's insert branch) as a
   decimal string, overwriting any client-supplied value (a `defaults` entry
-  on the field loses to the stamp). Immutable after insert — a patch or
+  on the field loses to the stamp). Optional in the insert input type —
+  omission is accepted and assigned. Immutable after insert — a patch or
   replace that changes the stored value is rejected; round-tripping the
   equal value is allowed, and a replace that omits the field keeps the
   stored one. Must be `int64` exactly and differ from `ttl.field` and

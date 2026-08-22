@@ -1,0 +1,35 @@
+{
+  "name": "updated-at-field-omitted-on-insert",
+  "$comment": "Server-stamped updatedAtField (FM-36) insert-omission: a non-optional updatedAtField field may be OMITTED on insert — the stamp runs before required-field validation, so the omission never reaches the validator (the same authority that overwrites a supplied value). Determinism: the follow-up read filters updatedAt > 0, matching only a server-stamped epoch-ms value; the generated stamp is normalized out of the expected doc.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "title": { "type": "string" },
+          "updatedAt": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_title", "fields": ["title"] }],
+        "updatedAtField": "updatedAt"
+      }
+    }
+  },
+  "seed": [],
+  "op": {
+    "txn": {
+      "steps": [
+        { "op": "insert", "table": "tasks", "doc": { "title": "a" } }
+      ]
+    }
+  },
+  "expect": [{}],
+  "normalize": ["_id", "_creationTime", "_version", "id"],
+  "then": {
+    "query": {
+      "table": "tasks",
+      "filter": { "op": "gt", "field": "updatedAt", "value": 0 }
+    },
+    "expect": [{ "title": "a" }],
+    "normalize": ["_id", "_creationTime", "_version", "updatedAt"],
+    "unordered": true
+  }
+}

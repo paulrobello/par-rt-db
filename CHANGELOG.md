@@ -14,6 +14,23 @@ contract against Convex.
 
 ## [Unreleased]
 
+### Fix: server-stamped fields are optional in the ts-client insert/replace types (FM-36/FM-37)
+
+The server accepts an insert/replace that omits a table's `updatedAtField`
+or `autoIncrementField` field — the stamp runs before required-field
+validation and supplies the value (the same authority that overwrites a
+supplied one; every engine already mirrored this) — but the ts-client's
+`WithoutSystemFields` insert/replace input type kept the field required,
+forcing callers to pass a dead value the server immediately overwrites.
+`updatedAtField()`/`autoIncrementField()` now record the field on the
+table's type (a phantom type parameter threaded through every builder
+method, chaining in any order), and `WithoutSystemFields` makes exactly
+those fields optional — read types (`Doc`) keep them required, since every
+stored doc carries them. Pinned by type tests
+(`mutation.types.test.ts`) and two new semantics-corpus cases
+(`updated-at-field-omitted-on-insert` / `-on-replace`) pinning the
+engine-level ruling across all five runners.
+
 ### Feature: query field projection — `fields` on any query (FM-38, server + all four clients)
 
 An optional `fields: string[]` on the wire `Query` (additive; omitted when
