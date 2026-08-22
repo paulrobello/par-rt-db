@@ -670,6 +670,44 @@ def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def _strip_doc_version(doc: dict[str, Any]) -> dict[str, Any]:
+    """One result doc minus its volatile ``_version`` — the diff-comparison
+    view only; pushed payloads always carry ``_version``."""
+    return {k: v for k, v in doc.items() if k != "_version"}
+
+
+def _diff_canonical(value: Any, q: Query) -> str:
+    """The canonical a subscription diffs against for push decisions.
+
+    For an UNPROJECTED query this is the plain :func:`_canonical` —
+    byte-identical push semantics to pre-projection behavior. For a PROJECTED
+    query (``fields`` set) the volatile ``_version`` is stripped from every
+    doc before serializing: ``_version`` bumps on every write, so an
+    unstripped canonical would push on any member write even when no
+    projected field changed — defeating the payload-width point of a
+    projected subscription. Pushed payloads still carry ``_version``; only
+    the change-detection comparison ignores it (a subscriber that must see
+    every ``_version`` bump should use an unprojected subscription).
+    Mirrors the server's ``query::diff_canonical`` over the typed result
+    variants: the doc-bearing terminals (``get``/``first``/``unique`` docs,
+    ``collect`` + the search family's doc lists, ``paginate`` pages) strip;
+    the doc-less terminals (``count``/``distinct``/``aggregate``) pass through
+    untouched."""
+    if q.fields is None:
+        return _canonical(value)
+    terminal = _terminal_of(q)
+    if terminal in ("get", "first", "unique"):
+        return _canonical(None if value is None else _strip_doc_version(value))
+    if terminal == "paginate":
+        page = dict(value)
+        page["docs"] = [_strip_doc_version(d) for d in value["docs"]]
+        return _canonical(page)
+    if terminal == "collect":
+        # collect + the search family (which `_terminal_of` classifies as collect).
+        return _canonical([_strip_doc_version(d) for d in value])
+    return _canonical(value)
+
+
 def _merge_doc(row: StoredRow) -> dict[str, Any]:
     """Merge a stored row with its system fields (``_id``/``_creationTime``/
     ``_version``), layered over the user doc at read time."""
@@ -2006,7 +2044,7 @@ class _InMemoryStoreCore:
             initial = self.run_query(query)
         except RtDbError:
             initial = None
-        sub.last = _canonical(initial)
+        sub.last = _diff_canonical(initial, query)
         on_update(initial)
         return SubscriptionHandle(alive)
 
@@ -2021,7 +2059,7 @@ class _InMemoryStoreCore:
                 nxt = self.run_query(sub.query)
             except RtDbError:
                 continue  # suppress: a bad subscriber query must not abort the write
-            nxt_canon = _canonical(nxt)
+            nxt_canon = _diff_canonical(nxt, sub.query)
             if sub.last is None or sub.last != nxt_canon:
                 sub.last = nxt_canon
                 fires.append((sub.callback, nxt))

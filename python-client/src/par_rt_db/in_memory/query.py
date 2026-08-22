@@ -3,7 +3,10 @@
 per-terminal executors, and the search/cursor/aggregate helpers they share.
 ``run_query`` is a thin dispatcher — ``_check_query_combinations``,
 ``_prepare_scan``, ``_fetch_filtered_rows``, ``_sort_filtered_rows``, then
-one executor per terminal."""
+one executor per terminal — with a ``fields`` projection validated up front
+(:func:`_validate_projection`) and applied to each doc-bearing terminal's
+result (:func:`_project_doc`/:func:`_project_docs`) at the dispatcher's seam,
+mirroring the server's single ``execute_query`` tail."""
 
 from __future__ import annotations
 
@@ -141,6 +144,54 @@ def _check_query_combinations(q: Query) -> None:
             raise RtDbError(
                 ErrorCode.BAD_REQUEST, "aggregate cannot be combined with hybrid search"
             )
+
+
+#: The always-included system fields a ``fields`` projection may name
+#: explicitly (accepted no-ops — ``_``-prefixed keys are kept unconditionally
+#: by :func:`_project_doc` anyway). Mirrors the server's
+#: ``validate_projection`` ``SYSTEM_FIELDS``.
+_PROJECTION_SYSTEM_FIELDS = ("_id", "_creationTime", "_version")
+
+
+def _validate_projection(table_def: TableDef, fields: list[str]) -> None:
+    """Validate a ``Query.fields`` projection against the table: every name
+    must be a declared field or one of the system fields (``_id``/
+    ``_creationTime``/``_version`` — always included, so listing them is an
+    allowed no-op). Anything else — including typo'd system names and other
+    ``_``-prefixed names — is ``BAD_REQUEST`` at query time, the same gate the
+    server's compile-time ``validate_projection`` runs. ``[]`` (system fields
+    only) validates trivially."""
+    for name in fields:
+        if name in _PROJECTION_SYSTEM_FIELDS or name in table_def.fields:
+            continue
+        raise RtDbError(ErrorCode.BAD_REQUEST, f"unknown projection field '{name}'")
+
+
+def _project_doc(doc: dict[str, Any] | None, fields: list[str] | None) -> dict[str, Any] | None:
+    """Apply a ``Query.fields`` projection to one result doc: the doc keeps
+    exactly its ``_``-prefixed keys (the system fields plus synthetic result
+    fields like ``_searchSnippet`` — user fields can never be ``_``-prefixed)
+    and the listed user fields; every other user field is dropped. Insertion
+    order is preserved (Python dicts keep it), so the canonical form stays
+    stable across subscription re-runs. No-op when ``fields`` is ``None``
+    (full docs) or ``doc`` is ``None`` (a get/first/unique miss)."""
+    if fields is None or doc is None:
+        return doc
+    return {k: v for k, v in doc.items() if k.startswith("_") or k in fields}
+
+
+def _project_docs(docs: list[dict[str, Any]], fields: list[str] | None) -> list[dict[str, Any]]:
+    """Apply a ``Query.fields`` projection to every doc of a docs list (the
+    collect / search / vectorSearch / hybridSearch results and a paginate
+    page's docs). See :func:`_project_doc`; no-op when ``fields`` is ``None``."""
+    if fields is None:
+        return docs
+    out: list[dict[str, Any]] = []
+    for doc in docs:
+        projected = _project_doc(doc, fields)
+        assert projected is not None  # docs lists never carry a None member
+        out.append(projected)
+    return out
 
 
 @dataclass
@@ -566,23 +617,35 @@ class _QueryEngine(_Core):
           row is a candidate; ``hybridSearch`` still returns an empty list).
 
         ``filter`` is structurally validated once up front, then evaluated per
-        row. See the module docs for the unimplemented terminals.
+        row. A ``fields`` projection is validated once up front (before every
+        terminal, including ``get``) and applied to each doc-bearing
+        terminal's result; the doc-less terminals (``count``/``distinct``/
+        ``aggregate``) are unaffected. See the module docs for the
+        unimplemented terminals.
         """
         table_def = self._require_table(q.table)
+        # Projection validation runs before every terminal dispatch so all
+        # shapes (including `get`) reject unknown field names — the same gate
+        # the server's compile_query applies before its early returns.
+        if q.fields is not None:
+            _validate_projection(table_def, q.fields)
+        fields = q.fields
         eq = q.eq or []
         has_range = q.gt is not None or q.gte is not None or q.lt is not None or q.lte is not None
 
         if q.get is not None:
-            return self._execute_get_terminal(q, eq, has_range)
+            return _project_doc(self._execute_get_terminal(q, eq, has_range), fields)
 
         _check_query_combinations(q)
 
         if q.vector_search is not None:
-            return self._execute_vector_search_terminal(q, table_def, eq, has_range)
+            return _project_docs(
+                self._execute_vector_search_terminal(q, table_def, eq, has_range), fields
+            )
         if q.search is not None:
-            return self._execute_search_terminal(q, table_def, eq, has_range)
+            return _project_docs(self._execute_search_terminal(q, table_def, eq, has_range), fields)
         if q.hybrid_search is not None:
-            return self._execute_hybrid_search_terminal(q, eq, has_range)
+            return _project_docs(self._execute_hybrid_search_terminal(q, eq, has_range), fields)
 
         plan = _prepare_scan(q, table_def, eq, has_range)
         filtered = self._fetch_filtered_rows(q, plan, table_def.fields)
@@ -604,11 +667,21 @@ class _QueryEngine(_Core):
         _sort_filtered_rows(filtered, table_def, plan.index_def, plan.typed_eq, direction)
 
         if q.paginate is not None:
-            return self._execute_paginate_terminal(
+            page: Any = self._execute_paginate_terminal(
                 q.paginate, table_def, filtered, plan.index_def, plan.typed_eq, direction
             )
+            if fields is not None:
+                page["docs"] = _project_docs(page["docs"], fields)
+            return page
 
-        return self._execute_collect_terminal(q, filtered)
+        result: Any = self._execute_collect_terminal(q, filtered)
+        if fields is not None:
+            result = (
+                _project_docs(result, fields)
+                if isinstance(result, list)
+                else _project_doc(result, fields)
+            )
+        return result
 
     def _execute_get_terminal(self, q: Query, eq: list[Any], has_range: bool) -> Any:
         """``get(id)`` terminal: point read by id, exclusive of every other clause.

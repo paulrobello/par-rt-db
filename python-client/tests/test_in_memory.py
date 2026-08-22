@@ -1897,6 +1897,166 @@ def test_mut_id_caches_results_and_short_circuits() -> None:
 
 
 # ---------------------------------------------------------------------------
+# field projection (Query.fields)
+# ---------------------------------------------------------------------------
+
+
+def _insert_item(c: InMemoryRtDbClient, name: str, order: float) -> str:
+    """Insert one todo item; returns its minted id."""
+    [res] = c.mutate(
+        Mutation.builder().insert("items", {"name": name, "status": "todo", "order": order}).build()
+    )
+    return _id_of(res)
+
+
+def test_projection_collect_subsets_user_fields_and_keeps_system() -> None:
+    # Mirrors the server's projection_collect_subsets_user_fields_and_keeps_system:
+    # each doc keeps exactly the system fields + the listed user fields, and
+    # the projected dict preserves the original doc's key order.
+    c = _new_client()
+    _insert_item(c, "a", 1)
+    _insert_item(c, "b", 2)
+    docs = c.run_query(
+        TableQuery("items").with_index("by_status").eq("todo").fields("name", "status").build()
+    )
+    assert [d["name"] for d in docs] == ["a", "b"]
+    for doc in docs:
+        assert sorted(doc) == ["_creationTime", "_id", "_version", "name", "status"]
+        assert list(doc) == ["name", "status", "_id", "_creationTime", "_version"]
+        assert "order" not in doc
+
+
+def test_projection_empty_fields_list_is_system_fields_only() -> None:
+    # fields=[] is meaningful — the ids-only view. After projection every doc
+    # carries exactly the three system fields.
+    c = _new_client()
+    _insert_item(c, "a", 1)
+    docs = c.run_query(TableQuery("items").with_index("by_status").eq("todo").fields().build())
+    assert len(docs) == 1
+    assert sorted(docs[0]) == ["_creationTime", "_id", "_version"]
+
+
+def test_projection_composes_with_get_first_and_unique() -> None:
+    c = _new_client()
+    id0 = _insert_item(c, "a", 1)
+    doc = c.run_query(TableQuery("items").get(id0).fields("name").build())
+    assert doc is not None and doc["_id"] == id0
+    assert sorted(doc) == ["_creationTime", "_id", "_version", "name"]
+    first = c.run_query(
+        TableQuery("items").with_index("by_status").eq("todo").first().fields("status").build()
+    )
+    assert first is not None and sorted(first) == ["_creationTime", "_id", "_version", "status"]
+    unique = c.run_query(
+        TableQuery("items").with_index("by_name").eq("a").unique().fields("order").build()
+    )
+    assert unique is not None and sorted(unique) == ["_creationTime", "_id", "_version", "order"]
+
+
+def test_projection_composes_with_paginate_and_cursor_survives() -> None:
+    # The next cursor is minted from the unprojected row inside the terminal
+    # (before projection), so a projected page still paginates.
+    c = _new_client()
+    for i in (1, 2, 3):
+        _insert_item(c, chr(96 + i), float(i))
+    page1 = c.run_query(
+        TableQuery("items")
+        .with_index("by_status_and_order")
+        .eq("todo")
+        .order("asc")
+        .paginate(num_items=2)
+        .fields("name")
+        .build()
+    )
+    assert [d["name"] for d in page1["docs"]] == ["a", "b"]
+    assert all(sorted(d) == ["_creationTime", "_id", "_version", "name"] for d in page1["docs"])
+    assert page1["nextCursor"] is not None
+    page2 = c.run_query(
+        TableQuery("items")
+        .with_index("by_status_and_order")
+        .eq("todo")
+        .order("asc")
+        .paginate(cursor=page1["nextCursor"], num_items=2)
+        .fields("name")
+        .build()
+    )
+    assert [d["name"] for d in page2["docs"]] == ["c"]
+    assert "nextCursor" not in page2, "exhausted page carries no cursor"
+
+
+def test_projection_unknown_field_is_bad_request_and_system_names_accepted() -> None:
+    c = _new_client()
+    _insert_item(c, "a", 1)
+    with pytest.raises(RtDbError) as ei:
+        c.run_query(
+            TableQuery("items").with_index("by_status").eq("todo").fields("name", "bogus").build()
+        )
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "unknown projection field 'bogus'" in ei.value.message
+    # Projection validation runs for the get terminal too (compile-time gate
+    # before the early return), matching the server's compile order.
+    with pytest.raises(RtDbError) as eget:
+        c.run_query(TableQuery("items").get("x").fields("bogus").build())
+    assert eget.value.code is ErrorCode.BAD_REQUEST
+    # The system fields may be listed explicitly (always kept anyway) — an
+    # accepted no-op, not an error.
+    docs = c.run_query(
+        TableQuery("items").fields("_id", "_creationTime", "_version", "name").build()
+    )
+    assert len(docs) == 1
+    assert sorted(docs[0]) == ["_creationTime", "_id", "_version", "name"]
+
+
+def test_projection_doc_less_terminals_unaffected() -> None:
+    # count/distinct/aggregate never bear docs: projection neither errors nor
+    # changes their results.
+    c = _new_client()
+    _insert_item(c, "a", 1)
+    _insert_item(c, "b", 2)
+    assert (
+        c.run_query(
+            TableQuery("items").with_index("by_status").eq("todo").count().fields("name").build()
+        )
+        == 2
+    )
+    distinct = c.run_query(
+        TableQuery("items")
+        .with_index("by_status_and_order")
+        .eq("todo")
+        .distinct()
+        .fields("name")
+        .build()
+    )
+    assert distinct == [1, 2]
+    total = c.run_query(
+        TableQuery("items")
+        .with_index("by_status_and_order")
+        .eq("todo")
+        .aggregate("sum")
+        .fields("name")
+        .build()
+    )
+    assert total == 3.0
+
+
+def test_projection_search_keeps_snippet_and_drops_unlisted_fields() -> None:
+    # `_searchSnippet` is `_`-prefixed (a synthetic result field computed
+    # BEFORE projection), so it survives; the unlisted `name` (the matched
+    # text!) is dropped.
+    c = _new_client()
+    c.mutate(
+        Mutation.builder()
+        .insert("items", {"name": "hello world", "status": "todo", "order": 1})
+        .build()
+    )
+    docs = c.run_query(
+        TableQuery("items").search("search_name", "hello", snippet=True).fields("status").build()
+    )
+    assert len(docs) == 1
+    assert sorted(docs[0]) == ["_creationTime", "_id", "_searchSnippet", "_version", "status"]
+    assert "<mark>hello</mark>" in docs[0]["_searchSnippet"]
+
+
+# ---------------------------------------------------------------------------
 # subscribe
 # ---------------------------------------------------------------------------
 
@@ -1945,6 +2105,47 @@ def test_subscribe_context_manager_unsubscribes_on_exit() -> None:
         Mutation.builder().insert("items", {"name": "d", "status": "todo", "order": 4}).build()
     )
     assert updates == [0], "exiting the with-block cleared the listener"
+
+
+def test_projected_subscription_suppresses_non_projected_field_push() -> None:
+    # Mirrors the server's projection_suppresses_non_projected_field_push: a
+    # projected sub's diff canonical strips the volatile `_version`, so a
+    # write that bumps `_version` but changes no projected field re-runs the
+    # sub and pushes NOTHING; a projected-field change still pushes, and the
+    # pushed payload still carries `_version`.
+    c = _new_client()
+    id0 = _insert_item(c, "a", 1)
+    updates: list[Any] = []
+    q = TableQuery("items").with_index("by_status").eq("todo").fields("name", "status").build()
+    with c.subscribe(q, lambda v: updates.append(v)):
+        assert len(updates) == 1, "initial value delivered synchronously"
+        assert sorted(updates[0][0]) == ["_creationTime", "_id", "_version", "name", "status"]
+        # Patch the NON-projected `order`: `_version` bumps (would push an
+        # unprojected sub — see the control below), but the projected
+        # canonical is unchanged, so nothing is pushed.
+        c.mutate(Mutation.builder().patch("items", id0, {"order": 9}).build())
+        assert len(updates) == 1, "non-projected order patch did not re-fire the sub"
+        # Control: patching a projected field changes the projected canonical.
+        c.mutate(Mutation.builder().patch("items", id0, {"name": "renamed"}).build())
+        assert len(updates) == 2, "projected name patch pushed"
+        assert updates[1][0]["name"] == "renamed"
+        # Payloads still carry _version (insert=1, order patch=2, name patch=3);
+        # only change detection ignores it.
+        assert updates[1][0]["_version"] == 3
+
+
+def test_unprojected_subscription_still_pushes_on_version_bump() -> None:
+    # Control for the projected test above: without `fields`, the same
+    # non-projected patch DOES push — the plain canonical still sees the
+    # `_version` bump (byte-identical pre-projection behavior).
+    c = _new_client()
+    id0 = _insert_item(c, "a", 1)
+    updates: list[Any] = []
+    q = TableQuery("items").with_index("by_status").eq("todo").build()
+    with c.subscribe(q, lambda v: updates.append(v)):
+        assert len(updates) == 1
+        c.mutate(Mutation.builder().patch("items", id0, {"order": 9}).build())
+        assert len(updates) == 2, "unprojected sub pushed on the _version bump"
 
 
 # ---------------------------------------------------------------------------

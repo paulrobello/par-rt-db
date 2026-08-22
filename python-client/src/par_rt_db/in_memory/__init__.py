@@ -133,6 +133,12 @@ from .query import (
 from .query import (
     _parse_websearch as _parse_websearch,
 )
+from .query import (
+    _project_doc as _project_doc,
+)
+from .query import (
+    _project_docs as _project_docs,
+)
 from .query import _QueryEngine
 from .query import (
     _search_field_words as _search_field_words,
@@ -145,6 +151,9 @@ from .query import (
 )
 from .query import (
     _validate_cursor_values as _validate_cursor_values,
+)
+from .query import (
+    _validate_projection as _validate_projection,
 )
 from .query import (
     _Websearch as _Websearch,
@@ -264,6 +273,9 @@ from .store import (
     _delete_by_query_result as _delete_by_query_result,
 )
 from .store import (
+    _diff_canonical as _diff_canonical,
+)
+from .store import (
     _index_column_type as _index_column_type,
 )
 from .store import (
@@ -311,6 +323,9 @@ from .store import (
 )
 from .store import (
     _start_workflow_result as _start_workflow_result,
+)
+from .store import (
+    _strip_doc_version as _strip_doc_version,
 )
 from .store import (
     _strip_unset_optionals as _strip_unset_optionals,

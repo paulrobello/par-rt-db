@@ -14,6 +14,11 @@ Wire shapes (load-bearing — match the server exactly):
   ``#[serde(rename = "vectorSearch")]``); its ``filter`` is the full
   ``FilterExpr`` (the same type ``.filter()`` and ``search`` use), omitted when
   ``None``.
+* ``Query.fields`` is the projection clause: keep only these user fields per
+  result doc (``_``-prefixed system fields are always kept). ``None`` (the
+  default) is omitted from the wire — full docs; ``[]`` is meaningful (a
+  system-fields-only, ids-only view) and serializes as an empty list, never as
+  absence.
 
 ``QueryResult`` arrives untagged (the server's ``#[serde(untagged)]``); this
 module re-attaches a shape via the terminal (``get``/``collect``/``first``/
@@ -66,7 +71,10 @@ class Query(BaseModel):
 
     ``vector_search`` serializes as ``vectorSearch`` (the lone camelCase key,
     matching the server's ``#[serde(rename = "vectorSearch")]``). ``None`` fields
-    are dropped on serialization to match the server's omit-when-absent shape.
+    are dropped on serialization to match the server's omit-when-absent shape —
+    except ``fields``, where an explicit empty list is meaningful (a
+    system-fields-only view) and is kept: ``fields=None`` → full docs (key
+    omitted), ``fields=[]`` → ids-only.
     """
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -91,6 +99,7 @@ class Query(BaseModel):
     vector_search: VectorSearchQuery | None = Field(default=None, alias="vectorSearch")
     hybrid_search: HybridSearchQuery | None = Field(default=None, alias="hybridSearch")
     paginate: _Paginate | None = None
+    fields: list[str] | None = None
 
     def model_dump(self, **kw: Any) -> dict[str, Any]:
         out = super().model_dump(**kw)
@@ -136,6 +145,7 @@ class TableQuery:
         self._vector: VectorSearchQuery | None = None
         self._hybrid: HybridSearchQuery | None = None
         self._paginate: _Paginate | None = None
+        self._fields: list[str] | None = None
 
     # --- builder methods (return self) ---
 
@@ -191,6 +201,23 @@ class TableQuery:
         """Apply a ``FilterExpr`` predicate over document fields. Mutually exclusive
         with ``search``/``vector_search``/``hybrid_search``."""
         self._filter = f
+        return self
+
+    def fields(self, *names: str) -> TableQuery:
+        """Project each result doc down to these user fields: every doc keeps
+        its ``_``-prefixed keys (the system fields plus synthetic result fields
+        like ``_searchSnippet``) and the listed user fields; all other user
+        fields are dropped. Composes with every terminal — doc-bearing
+        terminals (``get``/``collect``/``first``/``unique``/``paginate``/
+        ``search`` family) return projected docs; doc-less terminals
+        (``count``/``distinct``/``aggregate``) are unaffected. Each name must
+        be a field the table declares or one of ``_id``/``_creationTime``/
+        ``_version`` (always kept, so listing them is an accepted no-op) —
+        anything else is rejected server-side with ``BAD_REQUEST``. Called
+        with no arguments, the projection is the ids-only view (``fields:
+        []`` on the wire — meaningful, never dropped); never calling it keeps
+        full docs (the key is omitted entirely)."""
+        self._fields = list(names)
         return self
 
     def search(
@@ -375,6 +402,8 @@ class TableQuery:
             payload["hybridSearch"] = self._hybrid
         if self._paginate is not None:
             payload["paginate"] = self._paginate
+        if self._fields is not None:
+            payload["fields"] = self._fields
         return Query.model_validate(payload)
 
     # test affordances mirroring rust's typed terminals

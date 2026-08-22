@@ -395,6 +395,49 @@ def test_query_drops_none_fields():
     assert "take" not in wire and "index" not in wire and "filter" not in wire
 
 
+def test_query_fields_lands_on_wire():
+    # `fields` chains with the scan clauses like every other non-terminal wire
+    # field; the listed names ride verbatim (system fields may be named).
+    wire = (
+        TableQuery("t")
+        .with_index("by_status")
+        .eq("todo")
+        .take(10)
+        .fields("title", "status", "_id")
+        .build()
+        .model_dump(by_alias=True, mode="json")
+    )
+    assert wire["fields"] == ["title", "status", "_id"]
+
+
+def test_query_fields_omitted_when_unset():
+    # Never calling .fields() keeps the key off the wire entirely (full docs) —
+    # existing requests stay byte-identical.
+    wire = TableQuery("t").take(5).build().model_dump(by_alias=True, mode="json")
+    assert "fields" not in wire
+
+
+def test_query_fields_empty_list_is_meaningful():
+    # .fields() with no names is the ids-only (system-fields-only) view: an
+    # explicit empty list must serialize as [], NOT be dropped the way None is.
+    wire = TableQuery("t").fields().build().model_dump(by_alias=True, mode="json")
+    assert wire == {"table": "t", "fields": []}
+
+
+def test_query_fields_wire_model_round_trip():
+    # The wire model drops None but keeps a set list (empty included) — the
+    # omit-when-absent shape every other Query field follows, with [] distinct.
+    q = Query.model_validate({"table": "t", "fields": ["a", "_id"]})
+    assert q.fields == ["a", "_id"]
+    assert q.model_dump(by_alias=True, mode="json") == {"table": "t", "fields": ["a", "_id"]}
+    empty = Query.model_validate({"table": "t", "fields": []})
+    assert empty.fields == []
+    assert empty.model_dump(by_alias=True, mode="json") == {"table": "t", "fields": []}
+    bare = Query.model_validate({"table": "t"})
+    assert bare.fields is None
+    assert bare.model_dump(by_alias=True, mode="json") == {"table": "t"}
+
+
 def test_query_terminals_mutually_exclusive_with_get():
     with pytest.raises(ValueError):
         TableQuery("t").get("x").take(5).build()

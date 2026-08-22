@@ -32,7 +32,7 @@ Package name: `par-rt-db` → in Python, `import par_rt_db`.
 The DSL layer is feature-complete: every server query terminal
 (`get`/`index`+`eq`/`gt`/`gte`/`lt`/`lte`/`order`/`take`/`unique`/`first`/`count`/
 `collect`/`distinct`/`aggregate`/`filter`/`search`/`vector_search`/`hybrid_search`/`paginate`)
-and every mutation step
+plus the `fields` projection clause, and every mutation step
 (`insert`/`patch`/`replace`/`delete`/`undelete` (FM-33)/`expectVersion`/
 `expectAbsent`/`upsert`
 per-id steps, the `patch_by_query`/`delete_by_query` bulk steps, plus the
@@ -142,6 +142,15 @@ phrase = TableQuery("items").search("by_name", '"release notes" -draft', snippet
 
 # Vector similarity over a pgvector index (embeddings are client-supplied).
 vs = TableQuery("docs").vector_search("by_embedding", [0.1, 0.2, ...], limit=5).build()
+
+# Field projection: each result doc keeps its system fields (`_id`/
+# `_creationTime`/`_version`, plus synthetic fields like `_searchSnippet`) and
+# the listed user fields; every other user field is dropped. `fields()` with no
+# names is the ids-only view; never calling it keeps full docs. Composes with
+# every terminal (count/distinct/aggregate are doc-less and unaffected), and a
+# projected subscription only re-pushes when a projected field actually
+# changes (`_version` bumps alone go quiet).
+titles = TableQuery("items").with_index("by_status").eq("todo").fields("title").build()
 ```
 
 `distinct` and `aggregate` follow the server's SQL NULL semantics: `distinct`
