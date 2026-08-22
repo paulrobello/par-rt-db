@@ -999,6 +999,30 @@ impl RtDbAdminClient {
         Ok(parsed.ok)
     }
 
+    /// `POST /admin/db/{db}/workflows/{id}/signal` with body `{name, payload?}`
+    /// → `{ok}` — deliver a named signal to a waiting run (`awaitSignal`
+    /// steps). `Ok(true)` = delivered; typed 404/409 rejections (unknown run,
+    /// not waiting, name mismatch) surface as [`RtDbError`]. `payload` is
+    /// latest-wins and rides the step's outcome as `signal`.
+    pub async fn signal_workflow(
+        &self,
+        db: &str,
+        id: &str,
+        name: &str,
+        payload: Option<&serde_json::Value>,
+    ) -> Result<bool, RtDbError> {
+        // Transport errors are already mapped inside `post_json`; the typed
+        // 404/409 envelopes surface through `deserialize`.
+        let resp = self
+            .post_json(
+                &format!("/admin/db/{db}/workflows/{id}/signal"),
+                &crate::wire::admin::WorkflowSignalRequest { name, payload },
+            )
+            .await?;
+        let parsed: crate::wire::admin::OkResponse = self.deserialize(resp).await?;
+        Ok(parsed.ok)
+    }
+
     /// `DELETE /admin/db/{db}/workflows/{id}` → `{ok}`. Hard-deletes the run
     /// row — unlike cancel, the outcome trail does not survive. `Ok(false)`
     /// when already gone.

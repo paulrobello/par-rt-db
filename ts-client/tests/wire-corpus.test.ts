@@ -56,6 +56,7 @@ interface Corpus {
   migrate_results: MigrateResultJson[];
   rejects_client_message_unknown_field: unknown[];
   rejects_schedule_when_unknown_field: unknown[];
+  rejects_workflow_spec_unknown_field: unknown[];
   rejects_authed_user_unknown_kind: unknown[];
   rejects_schedule_info_unknown_kind: unknown[];
   rejects_schedule_info_unknown_status: unknown[];
@@ -221,14 +222,17 @@ describe("wire-corpus: search query entries (FM-31 operators/snippet)", () => {
  * FM-29 pins: the corpus gained workflow entries — `startWorkflow` /
  * `cancelWorkflow` txn steps inside `client_messages` Mutate frames, and the
  * `startWorkflowOk` / `startWorkflowErr` / `workflowAck` / `listWorkflowsOk`
- * server frames. The generic loops above round-trip them raw; this block
- * additionally type-checks the spec family (`WorkflowSpec`, `WorkflowStepSpec`,
- * `StepRetry`, `WorkflowInfo`) and asserts each entry is present with its
- * load-bearing fields intact. The `retry` object carries all three fields
- * (server `StepRetry` serde-defaults without `skip_serializing_if`, so a
- * serialized retry always re-emits them — this pins the canonical full form),
- * the second spec step pins optional-field absence, and `workflowAck` mirrors
- * `scheduleAck`'s ok/error shape.
+ * server frames. The awaitSignal feature added `signalWorkflow` frames, a
+ * mixed `awaitSignal`-among-txn spec, a CONFLICT `workflowAck`, and a
+ * `waiting`-status info. The generic loops above round-trip them raw; this
+ * block additionally type-checks the spec family (`WorkflowSpec`,
+ * `WorkflowStepSpec`, `StepRetry`, `WorkflowInfo`, `AwaitSignalSpec`) and
+ * asserts each entry is present with its load-bearing fields intact. The
+ * `retry` object carries all three fields (server `StepRetry` serde-defaults
+ * without `skip_serializing_if`, so a serialized retry always re-emits them —
+ * this pins the canonical full form), the second spec step pins
+ * optional-field absence, and `workflowAck` mirrors `scheduleAck`'s ok/error
+ * shape.
  */
 describe("wire-corpus: workflow entries (FM-29 steps + frames)", () => {
   const corpus = loadCorpus();
@@ -240,7 +244,7 @@ describe("wire-corpus: workflow entries (FM-29 steps + frames)", () => {
   );
 
   it("carries a startWorkflow step whose spec type-checks with retry and sleep", () => {
-    expect(startSteps).toHaveLength(1);
+    expect(startSteps).toHaveLength(2);
     const spec: WorkflowSpec = startSteps[0].spec;
     expect(spec.name).toBe("drip");
     expect(spec.steps).toHaveLength(2);
@@ -252,6 +256,33 @@ describe("wire-corpus: workflow entries (FM-29 steps + frames)", () => {
     const second: WorkflowStepSpec = spec.steps[1];
     expect(second.retry).toBeUndefined();
     expect(second.sleepBeforeMs).toBeUndefined();
+  });
+
+  it("carries a startWorkflow step mixing awaitSignal waits among txn steps", () => {
+    const gated = startSteps.find((s) => s.spec.name === "gated");
+    expect(gated).toBeDefined();
+    const spec: WorkflowSpec | undefined = gated?.spec;
+    expect(spec?.steps).toHaveLength(3);
+    // Ordinary txn step first, then a bounded wait, then an unbounded one —
+    // `timeoutMs` omitted on the wire when absent (skip_serializing_if).
+    expect(spec?.steps[0].txn).toBeDefined();
+    expect(spec?.steps[0].awaitSignal).toBeUndefined();
+    expect(spec?.steps[1].awaitSignal).toEqual({ name: "approve", timeoutMs: 3600000 });
+    expect(spec?.steps[1].txn).toBeUndefined();
+    expect(spec?.steps[2].awaitSignal).toEqual({ name: "audit" });
+    expect(spec?.steps[2].awaitSignal?.timeoutMs).toBeUndefined();
+  });
+
+  it("carries signalWorkflow frames with payload present and omitted", () => {
+    const signalFrames = corpus.client_messages.filter(
+      (m): m is Extract<ClientMessage, { type: "signalWorkflow" }> => m.type === "signalWorkflow",
+    );
+    expect(signalFrames).toHaveLength(2);
+    expect(signalFrames[0].payload).toEqual({ ok: true, count: 2 });
+    // The omitted-payload frame must not carry `payload` at all — the raw
+    // round-trip loop above fails any implementation that emits `payload: null`.
+    expect(signalFrames[1].payload).toBeUndefined();
+    expect("payload" in signalFrames[1]).toBe(false);
   });
 
   it("carries a cancelWorkflow step", () => {
@@ -282,14 +313,17 @@ describe("wire-corpus: workflow entries (FM-29 steps + frames)", () => {
     const ackFrames = corpus.server_messages.filter(
       (m): m is Extract<ServerMessage, { type: "workflowAck" }> => m.type === "workflowAck",
     );
-    expect(ackFrames).toHaveLength(2);
+    expect(ackFrames).toHaveLength(3);
     expect(ackFrames.filter((f) => f.ok)).toHaveLength(1);
-    expect(ackFrames.filter((f) => !f.ok && f.error)).toHaveLength(1);
+    expect(ackFrames.filter((f) => !f.ok && f.error)).toHaveLength(2);
+    // A name-mismatch delivery acks CONFLICT naming both signals.
+    const conflict = ackFrames.find((f) => f.error?.code === "CONFLICT");
+    expect(conflict?.error?.message).toBe("workflow waiting on 'approve', got 'ok'");
 
     const listFrames = corpus.server_messages.filter(
       (m): m is Extract<ServerMessage, { type: "listWorkflowsOk" }> => m.type === "listWorkflowsOk",
     );
-    expect(listFrames).toHaveLength(2);
+    expect(listFrames).toHaveLength(3);
     expect(listFrames.some((f) => f.workflows.length === 0)).toBe(true);
     const populated = listFrames.find((f) => f.workflows.length > 0);
     expect(populated).toBeDefined();
@@ -299,6 +333,12 @@ describe("wire-corpus: workflow entries (FM-29 steps + frames)", () => {
     expect(failed?.lastError).toBe("boom");
     expect(failed?.startedAt).toBe(110);
     expect(failed?.finishedAt).toBe(200);
+    // A run parked at an awaitSignal step reports `waiting` with the wait
+    // fields present (waitingFor/waitedSince) — omitted in every other state.
+    const waiting = listFrames.flatMap((f) => f.workflows).find((w) => w.status === "waiting");
+    expect(waiting?.waitingFor).toBe("approve");
+    expect(waiting?.waitedSince).toBe(1234);
+    expect(waiting?.sleepUntil).toBe(3601234);
   });
 });
 
@@ -314,6 +354,7 @@ describe("wire-corpus: rejects fixtures are JSON-stable (TS cannot reject at run
   const allRejects = [
     ...corpus.rejects_client_message_unknown_field,
     ...corpus.rejects_schedule_when_unknown_field,
+    ...corpus.rejects_workflow_spec_unknown_field,
     ...corpus.rejects_authed_user_unknown_kind,
     ...corpus.rejects_schedule_info_unknown_kind,
     ...corpus.rejects_schedule_info_unknown_status,

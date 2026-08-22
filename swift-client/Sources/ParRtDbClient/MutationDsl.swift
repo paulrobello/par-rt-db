@@ -217,17 +217,50 @@ private enum PendingStep: Sendable {
 
 /// Port of server/src/txn.rs `count_steps` — the step budget is counted
 /// recursively: a schedule step costs 1 + its nested txn, a startWorkflow step
-/// 1 + every spec step's txn. `build()` enforces the cap against this count.
+/// 1 + every spec step's txn (an `awaitSignal` step has no txn and counts 0
+/// nested — the server's `s.txn.as_ref().map_or(0, count_steps)`).
+/// `build()` enforces the cap against this count.
 func countSteps(_ txn: Transaction) -> Int {
     txn.steps.reduce(0) { total, step in
         switch step {
         case let .schedule(_, nested):
             total + 1 + countSteps(nested)
         case let .startWorkflow(spec):
-            total + 1 + spec.steps.reduce(0) { $0 + countSteps($1.txn) }
+            total + 1 + spec.steps.reduce(0) { $0 + ($1.txn.map(countSteps) ?? 0) }
         default:
             total + 1
         }
+    }
+}
+
+// MARK: - WorkflowStepSpec: awaitSignal builder
+
+public extension WorkflowStepSpec {
+    /// Build an `awaitSignal` wait step — park the run until a signal named
+    /// `name` is delivered (`timeoutMs` bounds each wait attempt; nil waits
+    /// indefinitely, cancel is the escape). The `WorkflowStepSpec(txn:)`
+    /// initializer constructs the ordinary-step variant; together the two
+    /// constructors enforce the exactly-one-of rule structurally.
+    ///
+    /// Throws badRequest eagerly for the two constraints the server's
+    /// `validate_spec` checks on every `awaitSignal` step: `name` 1..=256
+    /// chars and `timeoutMs` > 0 when present.
+    static func awaitSignal(
+        name: String, timeoutMs: UInt64? = nil, retry: StepRetry? = nil,
+        sleepBeforeMs: UInt64? = nil
+    ) throws -> WorkflowStepSpec {
+        if name.isEmpty || name.count > 256 {
+            throw RtDbError(code: .badRequest, message: "awaitSignal.name must be 1..=256 chars")
+        }
+        if let timeoutMs, timeoutMs == 0 {
+            throw RtDbError(code: .badRequest, message: "awaitSignal.timeoutMs must be > 0")
+        }
+        return WorkflowStepSpec(
+            txn: nil,
+            awaitSignal: AwaitSignalSpec(name: name, timeoutMs: timeoutMs),
+            retry: retry,
+            sleepBeforeMs: sleepBeforeMs
+        )
     }
 }
 

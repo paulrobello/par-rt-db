@@ -24,7 +24,8 @@ use rtdb_server::error::ErrorCode;
 use rtdb_server::metrics::Metrics;
 use rtdb_server::op_feed::OpFeed;
 use rtdb_server::protocol::{
-    OutcomeStatus, ScheduleWhen, WorkflowInfo, WorkflowInfoFull, WorkflowSpec, WorkflowStatus,
+    OutcomeStatus, ScheduleWhen, StepOutcome, WorkflowInfo, WorkflowInfoFull, WorkflowSpec,
+    WorkflowStatus,
 };
 use rtdb_server::quota;
 use rtdb_server::scheduler;
@@ -78,6 +79,117 @@ async fn insert_claim_reset_roundtrip() {
     assert_eq!(full.info.status, WorkflowStatus::Cancelled);
     assert!(full.step_outcomes.is_empty());
     assert!(workflows::delete(&pool, &db, &id).await.unwrap());
+}
+
+/// Task 2: the awaitSignal side-table lifecycle — park (visibility columns +
+/// gate), deliver (latest-wins slot write + wake flip), consume (atomic step
+/// boundary), and the typed delivery classification. No committer needed.
+#[tokio::test]
+async fn await_signal_side_table_lifecycle() {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    workflows::ensure_table(&pool, &db).await.unwrap();
+    let spec: WorkflowSpec = serde_json::from_value(serde_json::json!({
+        "name": "gate", "steps": [ { "awaitSignal": { "name": "approve", "timeoutMs": 50 } } ]
+    }))
+    .unwrap();
+    let id = workflows::insert(&pool, &db, &spec).await.unwrap();
+    // Only the advance arm parks, on a row it holds `running` — claim first
+    // (the `status = 'running'` guard on `park_waiting`).
+    let claimed = workflows::claim_due(&pool, &db, now_ms(), 10)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    // Park: waiting + visibility columns; not claimable before the gate.
+    workflows::park_waiting(&pool, &db, &id, 0, "approve", now_ms() + 60_000)
+        .await
+        .unwrap();
+    let full = workflows::get(&pool, &db, &id).await.unwrap().unwrap();
+    assert_eq!(full.info.status, WorkflowStatus::Waiting);
+    assert_eq!(full.info.waiting_for.as_deref(), Some("approve"));
+    assert!(full.info.waited_since.is_some());
+    assert!(
+        workflows::claim_due(&pool, &db, now_ms(), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // next_due sees the waiting gate:
+    assert!(workflows::next_due(&pool, &db).await.unwrap().is_some());
+
+    // Delivery: latest-wins + wake flip.
+    let d1 = workflows::deliver_signal(&pool, &db, &id, "wrong", None)
+        .await
+        .unwrap();
+    assert!(matches!(d1, workflows::SignalDelivery::NameMismatch { .. }));
+    let d2 = workflows::deliver_signal(
+        &pool,
+        &db,
+        &id,
+        "approve",
+        Some(serde_json::json!({"v": 1})),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(d2, workflows::SignalDelivery::Delivered));
+    let d3 = workflows::deliver_signal(
+        &pool,
+        &db,
+        &id,
+        "approve",
+        Some(serde_json::json!({"v": 2})),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(d3, workflows::SignalDelivery::Delivered));
+    let claimed = workflows::claim_due(&pool, &db, now_ms(), 10)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].signal_payload, Some(serde_json::json!({"v": 2})));
+
+    // Consume + boundary clears the wait columns.
+    let outcome = StepOutcome {
+        step_index: 0,
+        status: OutcomeStatus::Success,
+        attempts: 1,
+        at: now_ms(),
+        error: None,
+        signal: Some(serde_json::json!({"v": 2})),
+    };
+    workflows::record_signal_success(&pool, &db, &id, 1, &outcome)
+        .await
+        .unwrap();
+    let full = workflows::get(&pool, &db, &id).await.unwrap().unwrap();
+    assert_eq!(full.info.status, WorkflowStatus::Running);
+    assert!(full.info.waiting_for.is_none() && full.info.waited_since.is_none());
+    assert_eq!(full.step_outcomes.len(), 1);
+    assert_eq!(
+        full.step_outcomes[0].signal,
+        Some(serde_json::json!({"v": 2}))
+    );
+
+    // Typed classification against a fresh parked row + unknown id.
+    let id2 = workflows::insert(&pool, &db, &spec).await.unwrap();
+    assert!(matches!(
+        workflows::deliver_signal(&pool, &db, "nope", "approve", None)
+            .await
+            .unwrap(),
+        workflows::SignalDelivery::NotFound
+    ));
+    workflows::cancel(&pool, &db, &id2).await.unwrap();
+    assert!(matches!(
+        workflows::deliver_signal(&pool, &db, &id2, "approve", None)
+            .await
+            .unwrap(),
+        workflows::SignalDelivery::NotWaiting
+    ));
+    let full2 = workflows::get(&pool, &db, &id2).await.unwrap().unwrap();
+    assert!(
+        full2.info.waiting_for.is_none(),
+        "cancel clears wait columns"
+    );
 }
 
 // --- Task 3: advancement engine (committer arm + scheduler dual poll) ------
@@ -498,10 +610,12 @@ async fn spec_bounds_and_allowlist_rejected() -> anyhow::Result<()> {
 
     // The smuggle attempt: a spec whose step txn writes the forbidden table.
     let mut smuggle = one_step_spec("scoped");
-    smuggle.steps[0].txn.steps = vec![Step::Insert {
-        table: "workItems".to_string(),
-        doc: valid_work_item_doc("smuggled"),
-    }];
+    smuggle.steps[0].txn = Some(Transaction {
+        steps: vec![Step::Insert {
+            table: "workItems".to_string(),
+            doc: valid_work_item_doc("smuggled"),
+        }],
+    });
     let err = execute_txn(
         &pool,
         &db,
@@ -526,10 +640,12 @@ async fn spec_bounds_and_allowlist_rejected() -> anyhow::Result<()> {
     // forbidden table — the `authorize_txn_tables` → `authorize_spec_tables`
     // recursion blocks it.
     let mut nested = one_step_spec("nested");
-    nested.steps[0].txn.steps = vec![Step::Insert {
-        table: "workItems".to_string(),
-        doc: valid_work_item_doc("nested"),
-    }];
+    nested.steps[0].txn = Some(Transaction {
+        steps: vec![Step::Insert {
+            table: "workItems".to_string(),
+            doc: valid_work_item_doc("nested"),
+        }],
+    });
     let err = execute_txn(
         &pool,
         &db,
@@ -1206,6 +1322,789 @@ async fn http_start_on_cold_db_first_try_advances() -> anyhow::Result<()> {
     let full = await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Success).await;
     assert_eq!(full.step_outcomes.len(), 1);
     assert_eq!(projects_count(&pool, &db).await, 1);
+
+    Ok(())
+}
+
+// --- awaitSignal (approval gates): park / deliver / timeout integration ------
+// Engine tests follow the make_committers pattern above (the per-db scheduler
+// claims rows and the committer's three-way awaitSignal branch advances them);
+// surface tests add spawn_app for the HTTP/WS/admin delivery routes. All
+// polling goes through `await_status` — the scheduler's wake is ≤2 s per gate,
+// so fixed sleeps would flake.
+
+/// The approval-gate shape every awaitSignal test uses: insert "pre", wait for
+/// `signal`, insert "post". `timeout_ms = None` parks with no gate (only a
+/// delivery or cancel wakes the run). The retry backoff window is far below
+/// every timeout used here, so a FRESH-timeout re-park is distinguishable from
+/// a backoff re-park by the gate distance alone.
+fn await_gate_spec(
+    name: &str,
+    signal: &str,
+    timeout_ms: Option<u64>,
+    max_attempts: u32,
+) -> WorkflowSpec {
+    let mut gate = serde_json::json!({
+        "awaitSignal": { "name": signal },
+        "retry": { "maxAttempts": max_attempts, "initialRetryMs": 10, "maxRetryMs": 50 }
+    });
+    if let Some(ms) = timeout_ms {
+        gate["awaitSignal"]["timeoutMs"] = serde_json::json!(ms);
+    }
+    serde_json::from_value(serde_json::json!({
+        "name": name,
+        "steps": [insert_step("pre"), gate, insert_step("post")]
+    }))
+    .expect("parse await-gate workflow spec")
+}
+
+/// (17) Happy path: the run parks at the await step (`waiting` + visibility
+/// columns), an HTTP signal delivers (`{"delivered": true}`), the run resumes
+/// and completes, and the outcome trail carries the payload verbatim.
+#[tokio::test]
+async fn await_signal_parks_delivers_and_advances_with_payload() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    workflows::ensure_table(&pool, &db).await?;
+    let committers = make_committers(&state).await;
+    warm_up(&committers, &db).await;
+    let addr = spawn_app(state.clone()).await;
+    let token = mint_scoped_token(addr, &db, &["projects"]).await;
+
+    let id = workflows::insert(
+        &pool,
+        &db,
+        &await_gate_spec("park", "approve", Some(60_000), 5),
+    )
+    .await?;
+
+    // Step 0's doc is durable; the run parks at step 1 with the wait visible.
+    let parked = await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Waiting).await;
+    assert_eq!(parked.info.current_step, 1);
+    assert_eq!(parked.info.waiting_for.as_deref(), Some("approve"));
+    assert!(parked.info.waited_since.is_some());
+    assert_eq!(projects_count(&pool, &db).await, 1);
+
+    let resp = api_post(
+        addr,
+        &format!("/api/workflows/{id}/signal"),
+        &token,
+        serde_json::json!({ "db": db, "name": "approve", "payload": { "ok": true } }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body, serde_json::json!({ "delivered": true }));
+
+    let done = await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Success).await;
+    assert_eq!(done.step_outcomes.len(), 3);
+    assert!(
+        done.step_outcomes
+            .iter()
+            .all(|o| o.status == OutcomeStatus::Success)
+    );
+    assert_eq!(
+        done.step_outcomes[1].signal,
+        Some(serde_json::json!({ "ok": true })),
+        "the outcome trail carries the payload verbatim"
+    );
+    assert_eq!(done.info.waiting_for, None);
+    assert_eq!(projects_count(&pool, &db).await, 2);
+
+    Ok(())
+}
+
+/// (17b) A payload-less delivery consumes the gate: the omitted payload is
+/// delivered as JSON null (never SQL NULL, which is the no-signal state), so
+/// the run completes and the outcome records `signal: null` — present, not
+/// omitted — without burning a timeout attempt.
+#[tokio::test]
+async fn await_signal_payloadless_delivery_consumes_gate() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    workflows::ensure_table(&pool, &db).await?;
+    let committers = make_committers(&state).await;
+    warm_up(&committers, &db).await;
+    let addr = spawn_app(state.clone()).await;
+    let token = mint_scoped_token(addr, &db, &["projects"]).await;
+
+    let id = workflows::insert(
+        &pool,
+        &db,
+        &await_gate_spec("payloadless", "approve", Some(60_000), 5),
+    )
+    .await?;
+
+    let parked = await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Waiting).await;
+    assert_eq!(parked.info.current_step, 1);
+
+    let resp = api_post(
+        addr,
+        &format!("/api/workflows/{id}/signal"),
+        &token,
+        serde_json::json!({ "db": db, "name": "approve" }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body, serde_json::json!({ "delivered": true }));
+
+    let done = await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Success).await;
+    assert_eq!(done.step_outcomes.len(), 3);
+    assert_eq!(done.step_outcomes[1].attempts, 1);
+    // The committer records `signal: null` in the stored trail — but the
+    // typed `signal: Option<Value>` collapses JSON null to None on every read
+    // (deserialize null → None, re-serialize → omitted), so present-vs-absent
+    // is asserted on the raw jsonb column (a missing key would parse to Null
+    // too — `.get` is what distinguishes them).
+    let stored: serde_json::Value = sqlx::query_scalar(&format!(
+        "SELECT step_outcomes FROM \"db_{db}\".workflows WHERE id = $1"
+    ))
+    .bind(&id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        stored[1].get("signal"),
+        Some(&serde_json::Value::Null),
+        "an omitted payload records signal: null — present, not absent"
+    );
+    assert_eq!(projects_count(&pool, &db).await, 2);
+
+    Ok(())
+}
+
+/// (18) Timeout retry waits a FRESH full timeoutMs (never backoff): the first
+/// re-park carries attempts == 1 and a gate ≈ timeoutMs past the re-park
+/// (backoff at initialRetryMs 10 would leave ~10 ms); a delivery into the
+/// re-parked wait then succeeds with the attempts accounting (outcome
+/// attempts == 2 — one timed-out attempt plus the delivered one).
+#[tokio::test]
+async fn await_signal_timeout_retries_with_fresh_timeout_then_succeeds() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    workflows::ensure_table(&pool, &db).await?;
+    let committers = make_committers(&state).await;
+    warm_up(&committers, &db).await;
+    let addr = spawn_app(state.clone()).await;
+    let token = mint_scoped_token(addr, &db, &["projects"]).await;
+
+    let id = workflows::insert(
+        &pool,
+        &db,
+        &await_gate_spec("fresh-timeout", "approve", Some(100), 3),
+    )
+    .await?;
+
+    let repark = await_status(&pool, &db, &id, |i| {
+        i.status == WorkflowStatus::Waiting && i.attempts >= 1
+    })
+    .await;
+    assert_eq!(repark.info.attempts, 1);
+    assert_eq!(repark.info.waiting_for.as_deref(), Some("approve"));
+    let gate = repark
+        .info
+        .sleep_until
+        .expect("waiting rows carry their gate");
+    assert!(
+        gate - repark.info.updated_at >= 90,
+        "retry must wait the full timeoutMs again, not backoff (gate {gate}, updated_at {}, distance {})",
+        repark.info.updated_at,
+        gate - repark.info.updated_at
+    );
+
+    let resp = api_post(
+        addr,
+        &format!("/api/workflows/{id}/signal"),
+        &token,
+        serde_json::json!({ "db": db, "name": "approve", "payload": { "after": "timeout" } }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body, serde_json::json!({ "delivered": true }));
+
+    let done = await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Success).await;
+    assert_eq!(
+        done.step_outcomes[1].attempts, 2,
+        "one timed-out attempt + the delivered one"
+    );
+    assert_eq!(
+        done.step_outcomes[1].signal,
+        Some(serde_json::json!({ "after": "timeout" }))
+    );
+    assert_eq!(projects_count(&pool, &db).await, 2);
+
+    Ok(())
+}
+
+/// (19) Timeout exhaustion fails typed: maxAttempts 1 with no delivery ends
+/// `failed` with `last_error == "awaitSignal 'approve' timed out"`, the
+/// outcome trail marks the await step Failed, and the "post" step never runs.
+#[tokio::test]
+async fn await_signal_timeout_exhaustion_fails_typed() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    workflows::ensure_table(&pool, &db).await?;
+    let committers = make_committers(&state).await;
+    warm_up(&committers, &db).await;
+
+    let id = workflows::insert(
+        &pool,
+        &db,
+        &await_gate_spec("exhaust", "approve", Some(100), 1),
+    )
+    .await?;
+
+    let failed = await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Failed).await;
+    assert_eq!(
+        failed.info.last_error.as_deref(),
+        Some("awaitSignal 'approve' timed out")
+    );
+    assert_eq!(failed.info.current_step, 1);
+    assert_eq!(failed.info.attempts, 1);
+    assert_eq!(failed.step_outcomes.len(), 2);
+    assert_eq!(failed.step_outcomes[0].status, OutcomeStatus::Success);
+    assert_eq!(failed.step_outcomes[1].status, OutcomeStatus::Failed);
+    assert_eq!(
+        failed.step_outcomes[1].error.as_deref(),
+        Some("awaitSignal 'approve' timed out")
+    );
+    assert_eq!(failed.step_outcomes[1].signal, None);
+    assert_eq!(
+        projects_count(&pool, &db).await,
+        1,
+        "\"post\" must never insert after exhaustion"
+    );
+
+    Ok(())
+}
+
+/// (20) Typed delivery errors on all three surfaces: wrong name → 409 CONFLICT
+/// naming both signals; unknown id → 404 NOT_FOUND; after cancel → 409
+/// not-waiting. Same classification via the WS ack's error envelope and the
+/// admin route. A read-only token is rejected (403 HTTP / FORBIDDEN ack)
+/// before any delivery attempt — the wait survives every failed delivery
+/// above, and only the cancel ends it.
+#[tokio::test]
+async fn signal_delivery_typed_errors_on_all_three_surfaces() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    workflows::ensure_table(&pool, &db).await?;
+    let committers = make_committers(&state).await;
+    warm_up(&committers, &db).await;
+    let addr = spawn_app(state.clone()).await;
+    let token = mint_scoped_token(addr, &db, &["projects"]).await;
+    // A read-only machine token (the mint-scoped pattern with readOnly).
+    let resp = admin_post(
+        addr,
+        "/admin/mint-token",
+        serde_json::json!({
+            "db": db, "name": "ro", "tables": ["projects"], "readOnly": true
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let ro: serde_json::Value = resp.json().await?;
+    let ro = ro["token"].as_str().expect("read-only token").to_string();
+
+    let id = workflows::insert(
+        &pool,
+        &db,
+        &await_gate_spec("typed", "approve", Some(60_000), 5),
+    )
+    .await?;
+    await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Waiting).await;
+
+    // HTTP: wrong name → 409 CONFLICT naming both signals.
+    let resp = api_post(
+        addr,
+        &format!("/api/workflows/{id}/signal"),
+        &token,
+        serde_json::json!({ "db": db, "name": "reject" }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], serde_json::json!("CONFLICT"));
+    assert_eq!(
+        body["message"],
+        serde_json::json!("workflow waiting on 'approve', got 'reject'")
+    );
+
+    // HTTP: unknown id → 404 NOT_FOUND.
+    let resp = api_post(
+        addr,
+        "/api/workflows/nope/signal",
+        &token,
+        serde_json::json!({ "db": db, "name": "approve" }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], serde_json::json!("NOT_FOUND"));
+    assert_eq!(body["message"], serde_json::json!("unknown workflow"));
+
+    // WS: the same classifications ride the workflowAck error envelope.
+    let mut ws = ws_connect(addr).await;
+    let hello = ws_auth(&mut ws, &token, &db).await;
+    assert_eq!(hello["type"], serde_json::json!("authOk"));
+    ws_send_json(
+        &mut ws,
+        serde_json::json!({
+            "type": "signalWorkflow", "workflowId": "w1",
+            "id": id, "name": "reject"
+        }),
+    )
+    .await;
+    let ack = ws_recv_json(&mut ws).await;
+    assert_eq!(ack["type"], serde_json::json!("workflowAck"));
+    assert_eq!(ack["workflowId"], serde_json::json!("w1"));
+    assert_eq!(ack["ok"], serde_json::json!(false));
+    assert_eq!(ack["error"]["code"], serde_json::json!("CONFLICT"));
+    assert_eq!(
+        ack["error"]["message"],
+        serde_json::json!("workflow waiting on 'approve', got 'reject'")
+    );
+    ws_send_json(
+        &mut ws,
+        serde_json::json!({
+            "type": "signalWorkflow", "workflowId": "w2",
+            "id": "nope", "name": "approve"
+        }),
+    )
+    .await;
+    let ack = ws_recv_json(&mut ws).await;
+    assert_eq!(ack["workflowId"], serde_json::json!("w2"));
+    assert_eq!(ack["ok"], serde_json::json!(false));
+    assert_eq!(ack["error"]["code"], serde_json::json!("NOT_FOUND"));
+    assert_eq!(
+        ack["error"]["message"],
+        serde_json::json!("unknown workflow")
+    );
+
+    // Admin route: same two classifications.
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{db}/workflows/{id}/signal"),
+        serde_json::json!({ "name": "reject" }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], serde_json::json!("CONFLICT"));
+    assert_eq!(
+        body["message"],
+        serde_json::json!("workflow waiting on 'approve', got 'reject'")
+    );
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{db}/workflows/nope/signal"),
+        serde_json::json!({ "name": "approve" }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], serde_json::json!("NOT_FOUND"));
+
+    // Read-only token: rejected on HTTP (403) and WS (ack error) — before any
+    // delivery attempt, so the check does not need a deliverable wait.
+    let resp = api_post(
+        addr,
+        &format!("/api/workflows/{id}/signal"),
+        &ro,
+        serde_json::json!({ "db": db, "name": "approve" }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], serde_json::json!("FORBIDDEN"));
+    assert_eq!(
+        body["message"],
+        serde_json::json!("read-only token cannot mutate")
+    );
+    let mut ro_ws = ws_connect(addr).await;
+    let hello = ws_auth(&mut ro_ws, &ro, &db).await;
+    assert_eq!(hello["type"], serde_json::json!("authOk"));
+    ws_send_json(
+        &mut ro_ws,
+        serde_json::json!({
+            "type": "signalWorkflow", "workflowId": "w3",
+            "id": id, "name": "approve"
+        }),
+    )
+    .await;
+    let ack = ws_recv_json(&mut ro_ws).await;
+    assert_eq!(ack["type"], serde_json::json!("workflowAck"));
+    assert_eq!(ack["ok"], serde_json::json!(false));
+    assert_eq!(ack["error"]["code"], serde_json::json!("FORBIDDEN"));
+    assert_eq!(
+        ack["error"]["message"],
+        serde_json::json!("read-only token cannot mutate")
+    );
+
+    // None of the failed deliveries consumed the wait; cancel ends it, and a
+    // late signal on the terminal run conflicts on all three surfaces.
+    let parked = workflows::get(&pool, &db, &id).await?.expect("row");
+    assert_eq!(parked.info.status, WorkflowStatus::Waiting);
+    assert!(workflows::cancel(&pool, &db, &id).await?);
+
+    let resp = api_post(
+        addr,
+        &format!("/api/workflows/{id}/signal"),
+        &token,
+        serde_json::json!({ "db": db, "name": "approve" }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], serde_json::json!("CONFLICT"));
+    assert_eq!(
+        body["message"],
+        serde_json::json!("workflow is not waiting for a signal")
+    );
+
+    ws_send_json(
+        &mut ws,
+        serde_json::json!({
+            "type": "signalWorkflow", "workflowId": "w4",
+            "id": id, "name": "approve"
+        }),
+    )
+    .await;
+    let ack = ws_recv_json(&mut ws).await;
+    assert_eq!(ack["workflowId"], serde_json::json!("w4"));
+    assert_eq!(ack["ok"], serde_json::json!(false));
+    assert_eq!(ack["error"]["code"], serde_json::json!("CONFLICT"));
+    assert_eq!(
+        ack["error"]["message"],
+        serde_json::json!("workflow is not waiting for a signal")
+    );
+
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{db}/workflows/{id}/signal"),
+        serde_json::json!({ "name": "approve" }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], serde_json::json!("CONFLICT"));
+    assert_eq!(
+        body["message"],
+        serde_json::json!("workflow is not waiting for a signal")
+    );
+    assert_eq!(
+        projects_count(&pool, &db).await,
+        1,
+        "the cancelled run never advances to \"post\""
+    );
+
+    Ok(())
+}
+
+/// (21) No timeoutMs: the wait is indefinite — the run stays `waiting` across
+/// several scheduler claim sweeps and the gate is not claimable even 10 s out;
+/// a signal still advances it.
+#[tokio::test]
+async fn await_signal_no_timeout_waits_indefinitely() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    workflows::ensure_table(&pool, &db).await?;
+    let committers = make_committers(&state).await;
+    warm_up(&committers, &db).await;
+
+    let id = workflows::insert(&pool, &db, &await_gate_spec("forever", "approve", None, 5)).await?;
+
+    let parked = await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Waiting).await;
+    assert_eq!(parked.info.waiting_for.as_deref(), Some("approve"));
+    assert_eq!(projects_count(&pool, &db).await, 1);
+
+    // Several claim sweeps (the scheduler loop wakes at least once per its
+    // 2 s MAX_SLEEP) leave the run parked; the gate is never due.
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    let still = workflows::get(&pool, &db, &id).await?.expect("row");
+    assert_eq!(still.info.status, WorkflowStatus::Waiting);
+    assert_eq!(still.info.current_step, 1);
+    assert!(
+        workflows::claim_due(&pool, &db, now_ms() + 10_000, 10)
+            .await?
+            .is_empty(),
+        "no timeoutMs ⇒ the gate is never claimable"
+    );
+    assert_eq!(projects_count(&pool, &db).await, 1);
+
+    assert!(matches!(
+        workflows::deliver_signal(
+            &pool,
+            &db,
+            &id,
+            "approve",
+            Some(serde_json::json!({"late": true}))
+        )
+        .await?,
+        workflows::SignalDelivery::Delivered
+    ));
+    let done = await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Success).await;
+    assert_eq!(
+        done.step_outcomes[1].signal,
+        Some(serde_json::json!({ "late": true }))
+    );
+    assert_eq!(projects_count(&pool, &db).await, 2);
+
+    Ok(())
+}
+
+/// (22) Latest-wins payload: two deliveries into an unconsumed wait both ack
+/// `{"delivered": true}` and the consumed signal is the SECOND payload. The
+/// park is manual and the engine spawns only after both deliveries — a live
+/// scheduler could otherwise claim between them and turn the second into a
+/// not-waiting 409 (the side-table-lifecycle + crash-resume patterns).
+#[tokio::test]
+async fn await_signal_latest_wins_payload() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    workflows::ensure_table(&pool, &db).await?;
+    let addr = spawn_app(state.clone()).await;
+    let token = mint_scoped_token(addr, &db, &["projects"]).await;
+
+    // The await step at index 0: claim → park, no engine running yet.
+    let spec: WorkflowSpec = serde_json::from_value(serde_json::json!({
+        "name": "latest",
+        "steps": [
+            { "awaitSignal": { "name": "approve", "timeoutMs": 60_000 },
+              "retry": { "maxAttempts": 5, "initialRetryMs": 10, "maxRetryMs": 50 } },
+            insert_step("post")
+        ]
+    }))
+    .expect("parse latest-wins workflow spec");
+    let id = workflows::insert(&pool, &db, &spec).await?;
+    let claimed = workflows::claim_due(&pool, &db, now_ms(), 10).await?;
+    assert_eq!(claimed.len(), 1);
+    workflows::park_waiting(&pool, &db, &id, 0, "approve", now_ms() + 60_000).await?;
+
+    for payload in [serde_json::json!({ "v": 1 }), serde_json::json!({ "v": 2 })] {
+        let resp = api_post(
+            addr,
+            &format!("/api/workflows/{id}/signal"),
+            &token,
+            serde_json::json!({ "db": db, "name": "approve", "payload": payload }),
+        )
+        .await;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await?;
+        assert_eq!(body, serde_json::json!({ "delivered": true }));
+    }
+
+    // Spawn the engine after the slot is final: the claim consumes {"v": 2}.
+    let committers = make_committers(&state).await;
+    warm_up(&committers, &db).await;
+    let done = await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Success).await;
+    assert_eq!(done.step_outcomes.len(), 2);
+    assert_eq!(
+        done.step_outcomes[0].signal,
+        Some(serde_json::json!({ "v": 2 })),
+        "latest delivery wins the consumed slot"
+    );
+    assert_eq!(projects_count(&pool, &db).await, 1);
+
+    Ok(())
+}
+
+/// (23) Cancel while waiting: the run flips `cancelled` (wait columns drop
+/// with the projection), and a late signal for the right name conflicts
+/// instead of resurrecting it.
+#[tokio::test]
+async fn cancel_while_waiting_then_late_signal_conflicts() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    workflows::ensure_table(&pool, &db).await?;
+    let committers = make_committers(&state).await;
+    warm_up(&committers, &db).await;
+    let addr = spawn_app(state.clone()).await;
+    let token = mint_scoped_token(addr, &db, &["projects"]).await;
+
+    let id = workflows::insert(
+        &pool,
+        &db,
+        &await_gate_spec("cancel-wait", "approve", Some(60_000), 5),
+    )
+    .await?;
+    await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Waiting).await;
+
+    let resp = api_post(
+        addr,
+        &format!("/api/workflows/{id}/cancel"),
+        &token,
+        serde_json::json!({ "db": db }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body, serde_json::json!({ "cancelled": true }));
+
+    let row = workflows::get(&pool, &db, &id).await?.expect("row");
+    assert_eq!(row.info.status, WorkflowStatus::Cancelled);
+    assert_eq!(
+        row.info.waiting_for, None,
+        "leaving waiting clears the wait"
+    );
+    assert!(row.info.finished_at.is_some());
+
+    let resp = api_post(
+        addr,
+        &format!("/api/workflows/{id}/signal"),
+        &token,
+        serde_json::json!({ "db": db, "name": "approve" }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], serde_json::json!("CONFLICT"));
+    assert_eq!(
+        body["message"],
+        serde_json::json!("workflow is not waiting for a signal")
+    );
+    let row = workflows::get(&pool, &db, &id).await?.expect("row");
+    assert_eq!(row.info.status, WorkflowStatus::Cancelled);
+    assert_eq!(
+        projects_count(&pool, &db).await,
+        1,
+        "\"post\" must never insert after the cancel"
+    );
+
+    Ok(())
+}
+
+/// (24) The WS frame and the admin route each deliver a signal that advances a
+/// parked run — both surfaces drive the same `deliver_signal` wake the HTTP
+/// route covers in (17), each landing its own payload in the outcome trail.
+#[tokio::test]
+async fn await_signal_ws_and_admin_surfaces_deliver() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    workflows::ensure_table(&pool, &db).await?;
+    let committers = make_committers(&state).await;
+    warm_up(&committers, &db).await;
+    let addr = spawn_app(state.clone()).await;
+    let token = mint_scoped_token(addr, &db, &["projects"]).await;
+
+    let ws_id = workflows::insert(
+        &pool,
+        &db,
+        &await_gate_spec("ws-gate", "approve", Some(60_000), 5),
+    )
+    .await?;
+    let admin_id = workflows::insert(
+        &pool,
+        &db,
+        &await_gate_spec("admin-gate", "approve", Some(60_000), 5),
+    )
+    .await?;
+    await_status(&pool, &db, &ws_id, |i| i.status == WorkflowStatus::Waiting).await;
+    await_status(&pool, &db, &admin_id, |i| {
+        i.status == WorkflowStatus::Waiting
+    })
+    .await;
+
+    let mut ws = ws_connect(addr).await;
+    let hello = ws_auth(&mut ws, &token, &db).await;
+    assert_eq!(hello["type"], serde_json::json!("authOk"));
+    ws_send_json(
+        &mut ws,
+        serde_json::json!({
+            "type": "signalWorkflow", "workflowId": "w1",
+            "id": ws_id, "name": "approve", "payload": { "via": "ws" }
+        }),
+    )
+    .await;
+    let ack = ws_recv_json(&mut ws).await;
+    assert_eq!(ack["type"], serde_json::json!("workflowAck"));
+    assert_eq!(ack["workflowId"], serde_json::json!("w1"));
+    assert_eq!(ack["ok"], serde_json::json!(true));
+    assert!(ack.get("error").is_none(), "clean ack omits error");
+
+    let ws_done = await_status(&pool, &db, &ws_id, |i| i.status == WorkflowStatus::Success).await;
+    assert_eq!(
+        ws_done.step_outcomes[1].signal,
+        Some(serde_json::json!({ "via": "ws" }))
+    );
+
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{db}/workflows/{admin_id}/signal"),
+        serde_json::json!({ "name": "approve", "payload": { "via": "admin" } }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body, serde_json::json!({ "ok": true }));
+
+    let admin_done = await_status(&pool, &db, &admin_id, |i| {
+        i.status == WorkflowStatus::Success
+    })
+    .await;
+    assert_eq!(
+        admin_done.step_outcomes[1].signal,
+        Some(serde_json::json!({ "via": "admin" }))
+    );
+    assert_eq!(projects_count(&pool, &db).await, 4);
+
+    Ok(())
+}
+
+/// (25) The 64 KiB payload cap, pinned server-side (until now only the
+/// python harness covered it): a delivery whose serialized payload exceeds
+/// `MAX_SIGNAL_PAYLOAD_BYTES` is `BadRequest` — the exact `deliver_signal`
+/// message — BEFORE any slot write, so the row is still `waiting` with the
+/// signal slot empty: a failed delivery consumes nothing. Side-table only
+/// (the lifecycle test's claim-then-park setup — no committer, no spawn).
+#[tokio::test]
+async fn await_signal_payload_cap_rejects_without_consuming() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    workflows::ensure_table(&pool, &db).await?;
+    let spec: WorkflowSpec = serde_json::from_value(serde_json::json!({
+        "name": "cap", "steps": [ { "awaitSignal": { "name": "approve", "timeoutMs": 60_000 } } ]
+    }))?;
+    let id = workflows::insert(&pool, &db, &spec).await?;
+    // Only the advance arm parks, on a row it holds `running` — claim first
+    // (the `status = 'running'` guard on `park_waiting`).
+    let claimed = workflows::claim_due(&pool, &db, now_ms(), 10).await?;
+    assert_eq!(claimed.len(), 1);
+    workflows::park_waiting(&pool, &db, &id, 0, "approve", now_ms() + 60_000).await?;
+
+    // A JSON string of exactly MAX_SIGNAL_PAYLOAD_BYTES chars serializes to
+    // MAX + 2 bytes (the quotes), so it is over the cap.
+    let oversized = serde_json::Value::String("x".repeat(workflows::MAX_SIGNAL_PAYLOAD_BYTES));
+    let err = workflows::deliver_signal(&pool, &db, &id, "approve", Some(oversized))
+        .await
+        .expect_err("an over-cap payload must be rejected");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert_eq!(err.message, "signal payload exceeds 65536 bytes");
+
+    let full = workflows::get(&pool, &db, &id).await?.expect("row");
+    assert_eq!(full.info.status, WorkflowStatus::Waiting);
+    assert_eq!(full.info.waiting_for.as_deref(), Some("approve"));
+    let slot: Option<serde_json::Value> = sqlx::query_scalar(&format!(
+        "SELECT signal_payload FROM \"db_{db}\".workflows WHERE id = $1"
+    ))
+    .bind(&id)
+    .fetch_one(&pool)
+    .await?;
+    assert!(
+        slot.is_none(),
+        "a failed delivery consumed nothing — the slot stays empty"
+    );
 
     Ok(())
 }

@@ -589,6 +589,50 @@ async fn cancel_workflow_handler(
     Ok(Json(CancelWorkflowResponse { cancelled }))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SignalWorkflowRequest {
+    db: String,
+    name: String,
+    #[serde(default)]
+    payload: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct SignalWorkflowResponse {
+    delivered: bool,
+}
+
+/// `POST /api/workflows/{id}/signal`: deliver an out-of-band signal to a
+/// waiting run (spec §HTTP) — typed 404/409s, latest-wins payload.
+async fn signal_workflow_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    ApiJson(body): ApiJson<SignalWorkflowRequest>,
+) -> Result<Json<SignalWorkflowResponse>, RtDbError> {
+    let principal = authed(&state, &headers, &body.db).await?;
+    if principal.is_read_only() {
+        return Err(RtDbError::forbidden("read-only token cannot mutate"));
+    }
+    check_http_rate_limits(&state, &principal, &body.db).await?;
+    // Cold-db guard (the table is ensured only at scheduler startup): ensure
+    // inline so signal on a db with no spawned tasks is a typed 404, not a 500.
+    workflows::ensure_table(&state.pool, &body.db).await?;
+    match workflows::deliver_signal(&state.pool, &body.db, &id, &body.name, body.payload).await? {
+        workflows::SignalDelivery::Delivered => {
+            Ok(Json(SignalWorkflowResponse { delivered: true }))
+        }
+        workflows::SignalDelivery::NotFound => Err(RtDbError::not_found("unknown workflow")),
+        workflows::SignalDelivery::NotWaiting => {
+            Err(RtDbError::conflict("workflow is not waiting for a signal"))
+        }
+        workflows::SignalDelivery::NameMismatch { waiting_on } => Err(RtDbError::conflict(
+            format!("workflow waiting on '{waiting_on}', got '{}'", body.name),
+        )),
+    }
+}
+
 /// HTTP one-shot routes, authorized via `Authorization: Bearer <token>`
 /// (machine token or user session) resolved and checked per-request.
 pub fn http_api_routes() -> Router<Arc<AppState>> {
@@ -604,6 +648,7 @@ pub fn http_api_routes() -> Router<Arc<AppState>> {
         .route("/api/workflows", post(start_workflow_handler))
         .route("/api/workflows/list", post(list_workflows_handler))
         .route("/api/workflows/{id}/cancel", post(cancel_workflow_handler))
+        .route("/api/workflows/{id}/signal", post(signal_workflow_handler))
         // Upload bypasses axum's 2 MiB default body limit; `to_bytes` inside
         // the handler enforces `RTDB_MAX_FILE_SIZE` as the sole ceiling.
         .route(

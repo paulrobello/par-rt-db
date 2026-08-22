@@ -261,6 +261,18 @@ public actor RtDbHttpClient {
         _ = response.cancelled
     }
 
+    /// Deliver a named signal to a waiting run (`POST /api/workflows/{id}/signal`
+    /// `{db, name, payload?}`). A 200 always carries `{delivered: true}` — the
+    /// typed failures (unknown id, not waiting, name mismatch) surface as
+    /// NOT_FOUND/CONFLICT errors, so this Void surface drops the flag.
+    public func signalWorkflow(_ id: String, name: String, payload: JSONValue? = nil) async throws {
+        let response: SignalWorkflowResponse = try await postJson(
+            "signal workflow", "/api/workflows/\(encodePath(id))/signal",
+            SignalWorkflowRequest(db: db, name: name, payload: payload)
+        )
+        _ = response.delivered
+    }
+
     /// List this database's workflow runs, newest first
     /// (`POST /api/workflows/list`).
     public func listWorkflows() async throws -> [WorkflowInfo] {
@@ -603,6 +615,16 @@ private struct OkResponse: Decodable {
 
 private struct CancelledResponse: Decodable {
     let cancelled: Bool
+}
+
+private struct SignalWorkflowRequest: Encodable {
+    let db: String
+    let name: String
+    let payload: JSONValue?
+}
+
+private struct SignalWorkflowResponse: Decodable {
+    let delivered: Bool
 }
 
 private struct SchedulesResponse: Decodable {

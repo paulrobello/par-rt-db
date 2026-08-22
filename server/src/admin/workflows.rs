@@ -129,6 +129,38 @@ pub(super) async fn admin_cancel_workflow(
     Ok(Json(AdminWorkflowManageResponse { ok }))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct AdminSignalParams {
+    name: String,
+    #[serde(default)]
+    payload: Option<serde_json::Value>,
+}
+
+/// `POST /admin/db/{db}/workflows/{id}/signal` — deliver a signal (typed
+/// 404/409s; `ok` only on delivery).
+pub(super) async fn admin_signal_workflow(
+    State(state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    Path((db, id)): Path<(String, String)>,
+    ApiJson(params): ApiJson<AdminSignalParams>,
+) -> Result<Json<AdminWorkflowManageResponse>, RtDbError> {
+    if !db::database_exists(&state.pool, &db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    workflows::ensure_table(&state.pool, &db).await?;
+    match workflows::deliver_signal(&state.pool, &db, &id, &params.name, params.payload).await? {
+        workflows::SignalDelivery::Delivered => Ok(Json(AdminWorkflowManageResponse { ok: true })),
+        workflows::SignalDelivery::NotFound => Err(RtDbError::not_found("unknown workflow")),
+        workflows::SignalDelivery::NotWaiting => {
+            Err(RtDbError::conflict("workflow is not waiting for a signal"))
+        }
+        workflows::SignalDelivery::NameMismatch { waiting_on } => Err(RtDbError::conflict(
+            format!("workflow waiting on '{waiting_on}', got '{}'", params.name),
+        )),
+    }
+}
+
 /// `DELETE /admin/db/{db}/workflows/{id}` — hard-delete one run row (unlike
 /// cancel, the audit trail does not survive; `ok: false` when already gone).
 pub(super) async fn admin_delete_workflow(

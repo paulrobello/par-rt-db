@@ -35,7 +35,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_serializer
 from pydantic_core.core_schema import SerializerFunctionWrapHandler
 
 from .errors import ErrorCode, RtDbError
-from .wire import FilterExpr, ScheduleWhen, WorkflowSpec, to_camel
+from .wire import AwaitSignalSpec, FilterExpr, ScheduleWhen, WorkflowSpec, to_camel
 
 #: Client-side cap on transaction length. Mirrors ``server/src/txn.rs::MAX_STEPS``
 #: (1024); the server rejects anything longer, so the builder raises eagerly to
@@ -491,6 +491,26 @@ class _MutationNamespace:
 
 
 Mutation = _MutationNamespace
+
+
+def await_signal(name: str, timeout_ms: int | None = None) -> AwaitSignalSpec:
+    """Build an ``awaitSignal`` wait declaration for a
+    :class:`~par_rt_db.wire.WorkflowStepSpec` — the spec-level counterpart of
+    the builder's step constructors::
+
+        WorkflowSpec(
+            name="gate",
+            steps=[
+                WorkflowStepSpec(txn=txn.model_dump(by_alias=True)),
+                WorkflowStepSpec(await_signal=await_signal("approve", timeout_ms=60_000)),
+            ],
+        )
+
+    The step parks the run until a signal named ``name`` is delivered
+    (``signal_workflow`` on the clients); ``timeout_ms`` bounds each wait
+    attempt — omitted means wait indefinitely (cancel is the only escape).
+    A timed-out attempt retries the FULL timeout again (never backoff)."""
+    return AwaitSignalSpec(name=name, timeout_ms=timeout_ms)
 
 
 # Resolve deferred annotations (``from __future__ import annotations`` makes

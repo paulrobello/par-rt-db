@@ -201,6 +201,9 @@ from .store import (
     MAX_EVERY_MS as MAX_EVERY_MS,
 )
 from .store import (
+    MAX_SIGNAL_PAYLOAD_BYTES as MAX_SIGNAL_PAYLOAD_BYTES,
+)
+from .store import (
     MAX_STEPS as MAX_STEPS,
 )
 from .store import (

@@ -1300,7 +1300,9 @@ async fn handle_scheduled(
 /// Advance a claimed workflow run (FM-29). Executes the current step's txn
 /// as the system (bypass) principal — same fire path as `handle_scheduled` —
 /// publishes through the tap sites with `source = "workflow"`, and loops
-/// while the next gate is already due. Claim discipline: the row stays
+/// while the next gate is already due. awaitSignal steps take a side-table
+/// branch instead — park / consume-signal / timeout — writing no documents
+/// and firing no taps. Claim discipline: the row stays
 /// `running` for the whole loop (the scheduler only claims `pending` rows),
 /// so a no-sleep chain completes in one turn, bounded by the spec's step
 /// count (≤ `workflows::MAX_WORKFLOW_STEPS` at submit). At-least-once per
@@ -1354,18 +1356,126 @@ async fn handle_workflow_advance(
             return Ok(());
         };
         let retry = step.retry.unwrap_or_default();
-        let exec = match quota_err.take() {
-            Some(e) => Err(e),
-            None => {
-                execute_txn(
+        if let Some(sig) = &step.await_signal {
+            // awaitSignal: side-table only — no document writes, no taps
+            // (spec §Server design). The wake discriminator is the claimed
+            // row itself: `signal_payload` set = delivered, else
+            // `waited_since` NULL = first arrival, set = gate expired.
+            let now = now_ms();
+            if let Some(payload) = row.signal_payload.take() {
+                ctx.metrics
+                    .record_workflow_step(crate::metrics::WorkflowStepOutcome::Success);
+                let finished = row.current_step as usize + 1 >= row.spec.steps.len();
+                let record = crate::protocol::StepOutcome {
+                    step_index: row.current_step,
+                    status: crate::protocol::OutcomeStatus::Success,
+                    attempts: row.attempts + 1,
+                    at: now,
+                    error: None,
+                    signal: Some(payload),
+                };
+                if finished {
+                    crate::workflows::finalize_success(&ctx.pool, &ctx.db, &row.id, &record)
+                        .await?;
+                    return Ok(());
+                }
+                crate::workflows::record_signal_success(
                     &ctx.pool,
                     &ctx.db,
-                    &schema,
-                    &step.txn,
-                    &PrincipalCtx::bypass(),
+                    &row.id,
+                    row.current_step + 1,
+                    &record,
                 )
-                .await
+                .await?;
+                row.current_step += 1;
+                row.attempts = 0;
+                row.waited_since = None;
+                row.wait_name = None;
+                // Same next-gate logic as the txn path:
+                let next = &row.spec.steps[row.current_step as usize];
+                // Clamp before the u64→i64 cast: a serde-accepted u64 above
+                // i64::MAX would wrap negative ⇒ an instantly-due gate.
+                let sleep_ms = next.sleep_before_ms.unwrap_or(0).min(i64::MAX as u64) as i64;
+                let gate = now.saturating_add(sleep_ms);
+                if gate > now_ms() {
+                    crate::workflows::set_pending(&ctx.pool, &ctx.db, &row.id, gate).await?;
+                    return Ok(());
+                }
+                continue;
             }
+            // Timeout gate, clamped like the sleep gate (u64→i64 wrap
+            // hazard); an omitted timeoutMs is never due — cancel is the
+            // only escape.
+            let timeout_gate = match sig.timeout_ms {
+                Some(ms) => now.saturating_add(ms.min(i64::MAX as u64) as i64),
+                None => i64::MAX,
+            };
+            if row.waited_since.is_none() {
+                // First arrival (or crash-recovered boundary): park.
+                crate::workflows::park_waiting(
+                    &ctx.pool,
+                    &ctx.db,
+                    &row.id,
+                    row.attempts,
+                    &sig.name,
+                    timeout_gate,
+                )
+                .await?;
+                return Ok(());
+            }
+            // The row parked and its gate expired: a timed-out attempt. A
+            // retry waits the FULL timeoutMs again — never backoff.
+            row.attempts += 1;
+            if row.attempts < retry.max_attempts {
+                crate::workflows::park_waiting(
+                    &ctx.pool,
+                    &ctx.db,
+                    &row.id,
+                    row.attempts,
+                    &sig.name,
+                    timeout_gate,
+                )
+                .await?;
+                ctx.metrics
+                    .record_workflow_step(crate::metrics::WorkflowStepOutcome::Retry);
+                return Ok(());
+            }
+            let error = format!("awaitSignal '{}' timed out", sig.name);
+            let record = crate::protocol::StepOutcome {
+                step_index: row.current_step,
+                status: crate::protocol::OutcomeStatus::Failed,
+                attempts: row.attempts,
+                at: now,
+                error: Some(error.clone()),
+                signal: None,
+            };
+            crate::workflows::mark_failed(&ctx.pool, &ctx.db, &row.id, &record, &error).await?;
+            ctx.metrics
+                .record_workflow_step(crate::metrics::WorkflowStepOutcome::Fail);
+            return Ok(());
+        }
+        // Every step carries exactly one of txn/awaitSignal (submit-time
+        // `validate_spec`); the branch above handled the latter. A txn-less
+        // step here is a corrupt row — mark failed rather than panic the
+        // committer task, mirroring the out-of-range guard above.
+        let txn = match step.txn.as_ref() {
+            Some(txn) => txn,
+            None => {
+                let outcome = failed_outcome(&row, "step has neither txn nor awaitSignal");
+                crate::workflows::mark_failed(
+                    &ctx.pool,
+                    &ctx.db,
+                    &row.id,
+                    &outcome,
+                    "workflow step missing txn",
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let exec = match quota_err.take() {
+            Some(e) => Err(e),
+            None => execute_txn(&ctx.pool, &ctx.db, &schema, txn, &PrincipalCtx::bypass()).await,
         };
         match exec {
             Ok(outcome) => {
@@ -1393,6 +1503,7 @@ async fn handle_workflow_advance(
                     attempts: row.attempts + 1,
                     at: now,
                     error: None,
+                    signal: None,
                 };
                 if finished {
                     crate::workflows::finalize_success(&ctx.pool, &ctx.db, &row.id, &record)
@@ -1448,6 +1559,7 @@ async fn handle_workflow_advance(
                     attempts: row.attempts,
                     at: now,
                     error: Some(err.message.clone()),
+                    signal: None,
                 };
                 crate::workflows::mark_failed(&ctx.pool, &ctx.db, &row.id, &record, &err.message)
                     .await?;
@@ -1471,6 +1583,7 @@ fn failed_outcome(
         attempts: row.attempts.max(1),
         at: now_ms(),
         error: Some(error.to_string()),
+        signal: None,
     }
 }
 

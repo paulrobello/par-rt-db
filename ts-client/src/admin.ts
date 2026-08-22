@@ -937,6 +937,22 @@ export class RtDbAdminClient {
     )) as { ok: boolean };
   }
 
+  /** Deliver a signal to a waiting run (POST /admin/db/{db}/workflows/{id}/signal;
+   *  latest-wins payload). Typed 404/409s on unknown id / not waiting / name
+   *  mismatch; `ok:true` only on delivery. */
+  async adminSignalWorkflow(
+    db: string,
+    id: string,
+    name: string,
+    payload?: unknown,
+  ): Promise<{ ok: boolean }> {
+    return (await this.request(
+      "POST",
+      `/admin/db/${encodeURIComponent(db)}/workflows/${encodeURIComponent(id)}/signal`,
+      { name, ...(payload === undefined ? {} : { payload }) },
+    )) as { ok: boolean };
+  }
+
   /** Hard-delete one run row (DELETE /admin/db/{db}/workflows/{id}). Unlike
    *  cancel, this removes the row entirely — including its outcome trail. */
   async adminDeleteWorkflow(db: string, id: string): Promise<{ ok: boolean }> {

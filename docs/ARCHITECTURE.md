@@ -176,6 +176,21 @@ principal like scheduled jobs — records the step outcome, and applies
 per step; a crash mid-advance leaves the row `running`, and scheduler startup
 `reset_running` re-arms it.
 
+A step is either a txn or an `awaitSignal {name, timeoutMs?}` wait (exactly
+one per step). An `awaitSignal` step parks the run in a non-terminal
+`waiting` state; inside the same advance arm, `waited_since` is the
+discriminator — NULL means first arrival (park: set `wait_name`,
+`waited_since`, and the `sleep_until` timeout gate), set-and-expired means
+timeout (a failed attempt through the step's `retry`, re-parked with a fresh
+full `timeoutMs`), and a present `signal_payload` means the signal won
+(consumed atomically with the step boundary; the payload is recorded on the
+step outcome, latest-wins). `claim_due`/`next_due` admit `waiting` rows.
+Signal delivery (`deliver_signal`, from the HTTP/WS/admin handlers) is a
+single conditional side-table UPDATE flipping the `waiting` row to `pending`
+with the payload — the same side-table-only precedent as `cancel`. There is
+**no new committer arm and no new tap site**: `awaitSignal` steps write no
+documents, so the op-feed/audit/webhook tap enumeration is unchanged.
+
 **Cold-db liveness**: every workflows surface ensures the side table inline
 (admin handlers + the client list/cancel arms — the table is otherwise ensured
 only at scheduler startup), and all three standalone start surfaces (WS

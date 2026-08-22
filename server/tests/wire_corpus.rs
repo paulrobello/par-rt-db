@@ -14,7 +14,7 @@
 
 use rtdb_server::migrate::{MigrateRequest, MigrateResult};
 use rtdb_server::protocol::{
-    AuthedUser, ClientMessage, ScheduleInfo, ScheduleWhen, ServerMessage, UserKind,
+    AuthedUser, ClientMessage, ScheduleInfo, ScheduleWhen, ServerMessage, UserKind, WorkflowSpec,
 };
 use serde_json::{Value, json};
 
@@ -152,6 +152,12 @@ fn rejects_unknown_fields() {
         .enumerate()
     {
         must_reject::<ScheduleWhen>("rejects_schedule_when_unknown_field", i, entry);
+    }
+    for (i, entry) in section(&corpus, "rejects_workflow_spec_unknown_field")
+        .iter()
+        .enumerate()
+    {
+        must_reject::<WorkflowSpec>("rejects_workflow_spec_unknown_field", i, entry);
     }
 }
 

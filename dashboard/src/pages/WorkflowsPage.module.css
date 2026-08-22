@@ -134,6 +134,9 @@
 .statusRunning {
   color: var(--accent);
 }
+.statusWaiting {
+  color: var(--warn);
+}
 .statusRetry {
   color: var(--warn);
 }
@@ -170,6 +173,46 @@
   font-family: var(--mono);
   font-size: var(--t-mono-xs);
   color: var(--error);
+}
+
+.signalForm {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+  padding: var(--sp-1) 0;
+}
+.signalField {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+.signalName,
+.signalPayload {
+  background: var(--inset);
+  color: var(--ink);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-1);
+  font-family: var(--mono);
+  font-size: var(--t-mono-sm);
+  padding: 6px var(--sp-2);
+  outline: none;
+  box-sizing: border-box;
+}
+.signalName {
+  min-width: 180px;
+}
+.signalPayload {
+  min-width: 280px;
+  resize: vertical;
+}
+.signalActions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+.signalError {
+  width: 100%;
 }
 
 .detailRow > td {

@@ -1428,3 +1428,22 @@ async def test_workflow_ops_round_trip() -> None:
     assert [w.id for w in wfs] == ["wf-1"]
     assert wfs[0].sleep_until == 9000
     assert ok is True
+
+
+async def test_signal_workflow_posts_name_and_payload_returns_bool() -> None:
+    captured: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append({"path": request.url.path, "body": json.loads(request.content)})
+        return httpx.Response(200, json={"delivered": True})
+
+    async with _client(handler) as c:
+        assert await c.signal_workflow("wf-1", "approve", {"ok": True}) is True
+        assert await c.signal_workflow("wf-1", "approve") is True
+    assert [c["path"] for c in captured] == [
+        "/api/workflows/wf-1/signal",
+        "/api/workflows/wf-1/signal",
+    ]
+    # payload rides the body verbatim and is omitted when not supplied.
+    assert captured[0]["body"] == {"db": DB, "name": "approve", "payload": {"ok": True}}
+    assert captured[1]["body"] == {"db": DB, "name": "approve"}

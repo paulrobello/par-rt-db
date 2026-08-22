@@ -28,6 +28,7 @@ from par_rt_db.wire import (
     ScheduleInfo,
     ScheduleWhen,
     ServerMessage,
+    WorkflowSpec,
 )
 
 # (wire_json_string) — every entry must round-trip identically.
@@ -52,6 +53,14 @@ CLIENT_FIXTURES: list[str] = [
         '"spec": {"name": "drip", "steps": [{"txn": {"steps": []}}]}}'
     ),
     '{"type": "cancelWorkflow", "workflowId": "c2", "id": "wf9"}',
+    # awaitSignal delivery (mirrors server protocol.rs
+    # signal_workflow_frame_wire_shape): payload rides the frame verbatim and
+    # is omitted when absent.
+    (
+        '{"type": "signalWorkflow", "workflowId": "c4", "id": "wf1", '
+        '"name": "approve", "payload": {"ok": true}}'
+    ),
+    '{"type": "signalWorkflow", "workflowId": "c5", "id": "wf1", "name": "approve"}',
     '{"type": "listWorkflows", "workflowId": "c3"}',
     '{"type": "listWorkflows", "workflowId": "c3", "status": "failed"}',
 ]
@@ -269,6 +278,20 @@ def test_corpus_schedule_when_rejects_unknown_field(entry: dict[str, Any]) -> No
     adapter = TypeAdapter(ScheduleWhen)
     with pytest.raises(ValidationError):
         adapter.validate_python(entry)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    _corpus_section("rejects_workflow_spec_unknown_field"),
+    ids=lambda e: json.dumps(e, sort_keys=True),
+)
+def test_corpus_workflow_spec_rejects_unknown_field(entry: dict[str, Any]) -> None:
+    """A bare ``WorkflowSpec`` (the nested-shape pattern of the schedule-when
+    reject section — ``ClientMessage`` types ``txn`` as ``dict`` and so cannot
+    reject nested step-spec fields at the envelope layer): an unknown field
+    inside ``awaitSignal`` must fail ``extra='forbid'``."""
+    with pytest.raises(ValidationError):
+        WorkflowSpec.model_validate(entry)
 
 
 @pytest.mark.parametrize(

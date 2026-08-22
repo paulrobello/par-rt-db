@@ -320,6 +320,7 @@ Commands:
   get     Print one workflow run: the info row plus the per-step outcome trail
   start   Start a new workflow run from a WorkflowSpec JSON file
   cancel  Cancel a workflow run
+  signal  Deliver a named signal to a waiting run (releases an `awaitSignal` step)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -336,7 +337,7 @@ List workflow runs in `--db`, newest first
 Usage: rtdb workflows list [OPTIONS]
 
 Options:
-      --status <STATUS>  Filter by run status: pending|running|success|failed|cancelled
+      --status <STATUS>  Filter by run status: pending|running|waiting|success|failed|cancelled
       --limit <LIMIT>    Cap the result count (server default 100, capped at 500)
   -h, --help             Print help
 ```
@@ -375,6 +376,20 @@ Usage: rtdb workflows cancel --id <ID>
 Options:
       --id <ID>  Workflow run id to cancel
   -h, --help     Print help
+```
+
+#### `rtdb workflows signal`
+
+```text
+Deliver a named signal to a waiting run (releases an `awaitSignal` step)
+
+Usage: rtdb workflows signal [OPTIONS] --id <ID> --name <NAME>
+
+Options:
+      --id <ID>                      Workflow run id to signal
+      --name <NAME>                  Signal name (must match the parked step's `awaitSignal.name`)
+      --payload-json <PAYLOAD_JSON>  Optional JSON payload for the signal, e.g. `'{"approvedBy":"u1"}'`
+  -h, --help                         Print help
 ```
 <!-- cli-reference:end -->
 
@@ -428,16 +443,24 @@ rtdb --url $URL --admin-key $KEY --db kanban workflows list --status running --l
 rtdb --url $URL --admin-key $KEY --db kanban workflows get --id <runId>
 rtdb --url $URL --admin-key $KEY --db kanban workflows start --file spec.json
 rtdb --url $URL --admin-key $KEY --db kanban workflows cancel --id <runId>
+rtdb --url $URL --admin-key $KEY --db kanban workflows signal --id <runId> --name approve \
+  --payload-json '{"approvedBy":"u1"}'
 ```
 
 `list` filters by `--status` — validated client-side against exactly
-`pending`|`running`|`success`|`failed`|`cancelled` — and pages with `--limit`
-(server default 100, capped at 500). `get` prints the full run: the
+`pending`|`running`|`waiting`|`success`|`failed`|`cancelled` — and pages with
+`--limit` (server default 100, capped at 500). A `waiting` row carries
+`waitingFor` (the parked step's signal name) and `waitedSince` (epoch ms).
+`get` prints the full run: the
 info fields plus the per-step outcome trail. `start` reads a `WorkflowSpec`
 JSON file (`{"name": .., "steps": [{"txn": <Transaction>, "retry"?: ..,
 "sleepBeforeMs"?: ..}]}`, `@`-prefix supported) and prints the new run id.
 `cancel` prints `{ok}`; `ok: false` means the run was unknown or already
 terminal — a legitimate no-op, not an error — and warns on stderr.
+`signal` delivers a named signal to a waiting run (releasing its `awaitSignal`
+step); `--payload-json` is optional (validated client-side before any request)
+and rides the step's outcome as `signal`. Unknown runs, non-waiting runs, and
+name mismatches surface as typed `NOT_FOUND`/`CONFLICT` errors.
 
 ## Develop
 

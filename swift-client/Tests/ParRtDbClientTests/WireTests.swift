@@ -175,6 +175,28 @@ struct WireTests {
         #expect(filtered == ClientMessage.listWorkflows(workflowId: "c3", status: .failed))
     }
 
+    @Test func signalWorkflowClientFrame() throws {
+        // protocol.rs signal_workflow_frame_wire_shape — payload omitted when
+        // nil, present verbatim when set; field spellings are load-bearing.
+        try expectEncodes(
+            ClientMessage.signalWorkflow(workflowId: "c4", id: "wf9", name: "approve", payload: nil),
+            as: #"{"type":"signalWorkflow","workflowId":"c4","id":"wf9","name":"approve"}"#
+        )
+        let withPayload = ClientMessage.signalWorkflow(
+            workflowId: "c4", id: "wf9", name: "approve",
+            payload: .object(["v": .int(2)])
+        )
+        try expectEncodes(
+            withPayload,
+            as: #"{"type":"signalWorkflow","workflowId":"c4","id":"wf9","name":"approve","payload":{"v":2}}"#
+        )
+        #expect(try roundTrip(withPayload) == withPayload)
+        expectDecodingThrows(
+            ClientMessage.self,
+            #"{"type":"signalWorkflow","workflowId":"c4","id":"wf9","name":"approve","bogus":1}"#
+        )
+    }
+
     @Test func presenceClientFrames() throws {
         // protocol.rs presence_client_message_wire_tags / presence_state_ttl_ms_wire_tag.
         try expectEncodes(
@@ -460,8 +482,8 @@ struct WireDslTests {
 
     @Test func workflowStatusWireIsSnakeCase() throws {
         let all: [(WorkflowStatus, String)] = [
-            (.pending, "pending"), (.running, "running"), (.success, "success"),
-            (.failed, "failed"), (.cancelled, "cancelled")
+            (.pending, "pending"), (.running, "running"), (.waiting, "waiting"),
+            (.success, "success"), (.failed, "failed"), (.cancelled, "cancelled")
         ]
         for (variant, wire) in all {
             #expect(variant.rawValue == wire)
@@ -497,6 +519,119 @@ struct WireDslTests {
         #expect(spec.steps[1].retry == StepRetry(maxAttempts: 5, initialRetryMs: 500, maxRetryMs: 2000))
         #expect(spec.steps[0].retry == nil)
         #expect(try roundTrip(spec) == spec)
+    }
+
+    @Test func awaitSignalStepWireShape() throws {
+        // protocol.rs await_signal_step_wire_shape — the wait variant carries
+        // no txn, absent optionals are omitted, unknown fields rejected.
+        let spec = try decode(
+            WorkflowSpec.self,
+            #"{"name":"gate","steps":[{"awaitSignal":{"name":"approve","timeoutMs":3600000}}]}"#
+        )
+        let step = spec.steps[0]
+        #expect(step.txn == nil)
+        #expect(step.awaitSignal == AwaitSignalSpec(name: "approve", timeoutMs: 3_600_000))
+        try expectEncodes(
+            spec,
+            as: #"{"name":"gate","steps":[{"awaitSignal":{"name":"approve","timeoutMs":3600000}}]}"#
+        )
+        #expect(try roundTrip(spec) == spec)
+        // timeoutMs omitted = wait indefinitely; the key disappears.
+        let untimed = try WorkflowSpec(
+            name: "gate",
+            steps: [.awaitSignal(name: "approve")]
+        )
+        try expectEncodes(
+            untimed, as: #"{"name":"gate","steps":[{"awaitSignal":{"name":"approve"}}]}"#
+        )
+        expectDecodingThrows(
+            WorkflowSpec.self,
+            #"{"name":"g","steps":[{"awaitSignal":{"name":"a","bogus":1}}]}"#
+        )
+        // AwaitSignalSpec itself rejects unknown keys and a missing name.
+        expectDecodingThrows(AwaitSignalSpec.self, #"{"timeoutMs":5}"#)
+        expectDecodingThrows(AwaitSignalSpec.self, #"{"name":"a","zzz":1}"#)
+    }
+
+    @Test func awaitSignalBuilderValidatesLikeTheServer() {
+        /// The factory ports validate_spec's awaitSignal constraints eagerly:
+        /// name 1..=256 chars, timeoutMs > 0 when present.
+        func factoryError(_ spec: @autoclosure () throws -> WorkflowStepSpec) -> RtDbError? {
+            do {
+                _ = try spec()
+                return nil
+            } catch let error as RtDbError {
+                return error
+            } catch {
+                return nil
+            }
+        }
+        #expect(
+            try factoryError(.awaitSignal(name: "", timeoutMs: 5))?.message
+                == "awaitSignal.name must be 1..=256 chars"
+        )
+        #expect(
+            try factoryError(.awaitSignal(name: String(repeating: "a", count: 257)))?.message
+                == "awaitSignal.name must be 1..=256 chars"
+        )
+        #expect(
+            try factoryError(.awaitSignal(name: "approve", timeoutMs: 0))?.message
+                == "awaitSignal.timeoutMs must be > 0"
+        )
+        #expect(try factoryError(.awaitSignal(name: "approve")) == nil)
+        #expect(try factoryError(.awaitSignal(name: "a", timeoutMs: 1)) == nil)
+    }
+
+    @Test func workflowInfoWaitFieldsOmitWhenAbsent() throws {
+        // protocol.rs workflow_info_wait_fields — waitingFor/waitedSince ride
+        // only a waiting row and are omitted when nil.
+        let waiting = try decode(
+            WorkflowInfo.self,
+            """
+            {"id":"w1","name":"n","status":"waiting","currentStep":1,"stepCount":2,
+            "attempts":1,"waitingFor":"approve","waitedSince":1234,"createdAt":10,"updatedAt":20}
+            """
+        )
+        #expect(waiting.status == .waiting)
+        #expect(waiting.waitingFor == "approve")
+        #expect(waiting.waitedSince == 1234)
+        #expect(try roundTrip(waiting) == waiting)
+        let done = try decode(
+            WorkflowInfo.self,
+            """
+            {"id":"w1","name":"n","status":"success","currentStep":2,"stepCount":2,
+            "attempts":0,"createdAt":10,"updatedAt":30,"finishedAt":30}
+            """
+        )
+        #expect(done.waitingFor == nil)
+        #expect(done.waitedSince == nil)
+        try expectEncodes(
+            done,
+            as: """
+            {"id":"w1","name":"n","status":"success","currentStep":2,"stepCount":2,
+            "attempts":0,"createdAt":10,"updatedAt":30,"finishedAt":30}
+            """
+        )
+    }
+
+    @Test func stepOutcomeSignalField() throws {
+        // The delivered payload rides the success outcome verbatim; the key
+        // is omitted on outcomes without one (errors, txn successes).
+        let delivered = try decode(
+            StepOutcome.self,
+            #"{"stepIndex":0,"status":"success","attempts":1,"at":9,"signal":{"v":2}}"#
+        )
+        #expect(delivered.signal == .object(["v": .int(2)]))
+        #expect(try roundTrip(delivered) == delivered)
+        let plain = StepOutcome(stepIndex: 1, status: .failed, attempts: 3, at: 12, error: "boom")
+        try expectEncodes(
+            plain,
+            as: #"{"stepIndex":1,"status":"failed","attempts":3,"at":12,"error":"boom"}"#
+        )
+        expectDecodingThrows(
+            StepOutcome.self,
+            #"{"stepIndex":0,"status":"success","attempts":1,"at":9,"signal":{"v":2},"bogus":1}"#
+        )
     }
 } // schedule/workflow fixtures end; DSL fixtures below
 

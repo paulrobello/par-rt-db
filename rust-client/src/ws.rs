@@ -275,9 +275,20 @@ enum WorkflowOutcome {
 /// while queued so the driver can build the right `ClientMessage` frame on
 /// flush. Mirrors `ts-client`'s `WorkflowMsg`.
 enum WorkflowMsg {
-    Start { spec: WorkflowSpec },
-    Cancel { id: String },
-    List { status: Option<WorkflowStatus> },
+    Start {
+        spec: WorkflowSpec,
+    },
+    Cancel {
+        id: String,
+    },
+    Signal {
+        id: String,
+        name: String,
+        payload: Option<serde_json::Value>,
+    },
+    List {
+        status: Option<WorkflowStatus>,
+    },
 }
 
 /// A workflow call awaiting its turn to be sent. Same reconnect contract as
@@ -920,6 +931,32 @@ impl RtDbClient {
         }
     }
 
+    /// Deliver a named signal to a waiting run — an `awaitSignal` step's
+    /// release. The reply reuses `workflowAck`: resolves `true` on
+    /// `ok:true` (delivered); rejects with [`RtDbError`] on the typed
+    /// error envelope (unknown run, not waiting, name mismatch — unlike
+    /// cancel, the server never sends a bare `ok:false` here). `payload`
+    /// is latest-wins and rides the step's outcome as `signal`. Mirrors
+    /// [`RtDbHttpClient::signal_workflow`](crate::http::RtDbHttpClient::signal_workflow).
+    pub async fn signal_workflow(
+        &self,
+        id: &str,
+        name: &str,
+        payload: Option<serde_json::Value>,
+    ) -> Result<bool, RtDbError> {
+        match self
+            .queue_workflow(WorkflowMsg::Signal {
+                id: id.to_string(),
+                name: name.to_string(),
+                payload,
+            })
+            .await?
+        {
+            WorkflowOutcome::Ack(ok) => Ok(ok),
+            _ => Err(RtDbError::internal("unexpected workflow reply")),
+        }
+    }
+
     /// List workflow runs (FM-29). Resolves with the `workflows` array on
     /// `listWorkflowsOk`. A failed list arrives typed `startWorkflowErr`
     /// carrying this call's correlation id (the frame vocabulary has no
@@ -1539,6 +1576,12 @@ where
             workflow_id: q.workflow_id.clone(),
             id: id.clone(),
         },
+        WorkflowMsg::Signal { id, name, payload } => ClientMessage::SignalWorkflow {
+            workflow_id: q.workflow_id.clone(),
+            id: id.clone(),
+            name: name.clone(),
+            payload: payload.clone(),
+        },
         WorkflowMsg::List { status } => ClientMessage::ListWorkflows {
             workflow_id: q.workflow_id.clone(),
             status: *status,
@@ -2054,7 +2097,8 @@ mod tests {
         let spec = WorkflowSpec {
             name: "drip".into(),
             steps: vec![WorkflowStepSpec {
-                txn: Transaction { steps: vec![] },
+                txn: Some(Transaction { steps: vec![] }),
+                await_signal: None,
                 retry: None,
                 sleep_before_ms: None,
             }],
@@ -2079,6 +2123,28 @@ mod tests {
             })
             .unwrap(),
             json!({"type":"cancelWorkflow","workflowId":"wf-2","id":"wf-9"})
+        );
+        // signalWorkflow: payload included when Some, omitted when None.
+        assert_eq!(
+            serde_json::to_value(ClientMessage::SignalWorkflow {
+                workflow_id: "wf-4".into(),
+                id: "wf-9".into(),
+                name: "approve".into(),
+                payload: Some(json!({"ok": true})),
+            })
+            .unwrap(),
+            json!({"type":"signalWorkflow","workflowId":"wf-4","id":"wf-9",
+                   "name":"approve","payload":{"ok":true}})
+        );
+        assert_eq!(
+            serde_json::to_value(ClientMessage::SignalWorkflow {
+                workflow_id: "wf-4".into(),
+                id: "wf-9".into(),
+                name: "approve".into(),
+                payload: None,
+            })
+            .unwrap(),
+            json!({"type":"signalWorkflow","workflowId":"wf-4","id":"wf-9","name":"approve"})
         );
         assert_eq!(
             serde_json::to_value(ClientMessage::ListWorkflows {
@@ -2735,6 +2801,8 @@ mod tests {
             attempts: 0,
             sleep_until: None,
             last_error: None,
+            waiting_for: None,
+            waited_since: None,
             created_at: 1,
             updated_at: 2,
             started_at: None,

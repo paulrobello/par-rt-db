@@ -2113,6 +2113,29 @@ def test_admin_cancel_and_delete_workflow_return_bools() -> None:
     ]
 
 
+def test_admin_signal_workflow_posts_name_and_payload() -> None:
+    seen: list[tuple[str, str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        seen.append((request.method, request.url.path, body))
+        return httpx.Response(200, json={"ok": True})
+
+    with _sync_client(handler) as c:
+        assert c.admin_signal_workflow("kanban", "wf-1", "approve", {"ok": True}) is True
+        assert c.admin_signal_workflow("kanban", "wf-1", "approve") is True
+    # payload rides the body verbatim and is omitted when not supplied; the
+    # response parses through the same ok-bool shape as cancel.
+    assert seen == [
+        (
+            "POST",
+            "/admin/db/kanban/workflows/wf-1/signal",
+            {"name": "approve", "payload": {"ok": True}},
+        ),
+        ("POST", "/admin/db/kanban/workflows/wf-1/signal", {"name": "approve"}),
+    ]
+
+
 async def test_async_admin_workflow_ops() -> None:
     from par_rt_db.wire import WorkflowSpec, WorkflowStepSpec
 
@@ -2136,6 +2159,8 @@ async def test_async_admin_workflow_ops() -> None:
             )
         if request.method == "POST" and request.url.path.endswith("/cancel"):
             return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path.endswith("/signal"):
+            return httpx.Response(200, json={"ok": True})
         if request.method == "DELETE":
             return httpx.Response(200, json={"ok": False})
         return httpx.Response(404, text=f"no mock for {request.url.path}")
@@ -2145,11 +2170,13 @@ async def test_async_admin_workflow_ops() -> None:
         wid = await c.admin_start_workflow("kanban", spec)
         full = await c.admin_get_workflow("kanban", "wf-1")
         cancelled = await c.admin_cancel_workflow("kanban", "wf-1")
+        signalled = await c.admin_signal_workflow("kanban", "wf-1", "approve", {"ok": True})
         deleted = await c.admin_delete_workflow("kanban", "wf-1")
     assert [r.id for r in rows] == ["wf-1"]
     assert wid == "wf-9"
     assert full.step_outcomes[0].attempts == 1
     assert cancelled is True
+    assert signalled is True
     assert deleted is False
 
 

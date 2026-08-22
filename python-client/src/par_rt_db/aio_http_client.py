@@ -321,6 +321,18 @@ class RtDbAsyncHttpClient:
         resp = await self._send("POST", f"/api/workflows/{id}/cancel", json={"db": self._db})
         return bool(resp.json()["cancelled"])
 
+    async def signal_workflow(self, id: str, name: str, payload: Any | None = None) -> bool:
+        """``POST /api/workflows/{id}/signal`` → deliver a named signal to a run
+        parked at an ``awaitSignal`` step. ``True`` when delivered (the payload
+        lands in the step outcome's ``signal``; the run wakes on its next
+        advance). ``NOT_FOUND`` for an unknown run; ``CONFLICT`` when the run is
+        not waiting or is waiting on a different name."""
+        body: dict[str, Any] = {"db": self._db, "name": name}
+        if payload is not None:
+            body["payload"] = payload
+        resp = await self._send("POST", f"/api/workflows/{id}/signal", json=body)
+        return bool(resp.json()["delivered"])
+
     # --- data plane: batch query (POST /api/query-batch) ---
 
     async def batch_query(self, queries: list[Query | TableQuery]) -> list[BatchQueryOutcome]:

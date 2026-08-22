@@ -433,6 +433,12 @@ async fn handle_text_frame(
         ClientMessage::CancelWorkflow { workflow_id, id } => {
             handle_cancel_workflow(fctx, workflow_id, id).await
         }
+        ClientMessage::SignalWorkflow {
+            workflow_id,
+            id,
+            name,
+            payload,
+        } => handle_signal_workflow(fctx, workflow_id, id, name, payload).await,
         ClientMessage::ListWorkflows {
             workflow_id,
             status,
@@ -795,6 +801,58 @@ async fn handle_cancel_workflow(fctx: &FrameCtx<'_>, workflow_id: String, id: St
         Ok(()) => match workflows::ensure_table(&state.pool, db).await {
             Ok(()) => match workflows::cancel(&state.pool, db, &id).await {
                 Ok(ok) => (ok, None),
+                Err(error) => (false, Some(error)),
+            },
+            Err(error) => (false, Some(error)),
+        },
+        Err(error) => (false, Some(error)),
+    };
+    let _ = out_tx.send(ServerMessage::WorkflowAck {
+        workflow_id,
+        ok,
+        error,
+    });
+    false
+}
+
+/// `SignalWorkflow` arm: `authorize`-only gate, reject read-only tokens,
+/// deliver (typed errors ride the ack's `error` envelope — spec §WS).
+async fn handle_signal_workflow(
+    fctx: &FrameCtx<'_>,
+    workflow_id: String,
+    id: String,
+    name: String,
+    payload: Option<serde_json::Value>,
+) -> bool {
+    let state = fctx.state;
+    let principal = fctx.principal;
+    let db = fctx.db;
+    let out_tx = fctx.out_tx;
+
+    let (ok, error) = match authorize(&state.pool, principal, db).await {
+        Ok(()) if principal.is_read_only() => (
+            false,
+            Some(RtDbError::forbidden("read-only token cannot mutate")),
+        ),
+        // Cold-db guard (the table is ensured only at scheduler startup):
+        // ensure inline so signal on a db with no spawned tasks is a clean
+        // typed error, not a 500.
+        Ok(()) => match workflows::ensure_table(&state.pool, db).await {
+            Ok(()) => match workflows::deliver_signal(&state.pool, db, &id, &name, payload).await {
+                Ok(workflows::SignalDelivery::Delivered) => (true, None),
+                Ok(workflows::SignalDelivery::NotFound) => {
+                    (false, Some(RtDbError::not_found("unknown workflow")))
+                }
+                Ok(workflows::SignalDelivery::NotWaiting) => (
+                    false,
+                    Some(RtDbError::conflict("workflow is not waiting for a signal")),
+                ),
+                Ok(workflows::SignalDelivery::NameMismatch { waiting_on }) => (
+                    false,
+                    Some(RtDbError::conflict(format!(
+                        "workflow waiting on '{waiting_on}', got '{name}'"
+                    ))),
+                ),
                 Err(error) => (false, Some(error)),
             },
             Err(error) => (false, Some(error)),

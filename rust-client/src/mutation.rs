@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::wire::{FilterExpr, ScheduleWhen, WorkflowSpec};
+use crate::wire::{FilterExpr, ScheduleWhen, WorkflowSpec, WorkflowStepSpec};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// An ordered list of steps executed atomically by the server's committer.
@@ -407,6 +407,25 @@ impl Default for Mutation {
     }
 }
 
+impl WorkflowStepSpec {
+    /// Build an `awaitSignal` step: park the run until a signal named `name`
+    /// is delivered (`WorkflowStepSpec::await_signal`, spec §Wire — exactly
+    /// one of `txn`/`awaitSignal` per step; the server's `validate_spec`
+    /// enforces it). `timeout_ms` bounds each wait attempt; `None` waits
+    /// indefinitely (cancel is the escape).
+    pub fn await_signal(name: impl Into<String>, timeout_ms: Option<u64>) -> Self {
+        Self {
+            txn: None,
+            await_signal: Some(crate::wire::AwaitSignalSpec {
+                name: name.into(),
+                timeout_ms,
+            }),
+            retry: None,
+            sleep_before_ms: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,17 +612,19 @@ mod tests {
             name: "drip".into(),
             steps: vec![
                 WorkflowStepSpec {
-                    txn: Transaction {
+                    txn: Some(Transaction {
                         steps: vec![Step::Insert {
                             table: "workItems".into(),
                             doc: Mutation::obj(json!({"title":"first"})),
                         }],
-                    },
+                    }),
+                    await_signal: None,
                     retry: None,
                     sleep_before_ms: None,
                 },
                 WorkflowStepSpec {
-                    txn: Transaction { steps: vec![] },
+                    txn: Some(Transaction { steps: vec![] }),
+                    await_signal: None,
                     retry: Some(StepRetry {
                         max_attempts: 5,
                         initial_retry_ms: 500,
@@ -648,6 +669,35 @@ mod tests {
             cancelled,
             StepResult::Cancelled { cancelled: false }
         ));
+    }
+
+    #[test]
+    fn await_signal_step_builder_serializes() {
+        // The builder emits ONLY the awaitSignal key — no txn, no retry, no
+        // sleepBeforeMs (absent optionals are skipped, corpus parity).
+        let spec = WorkflowSpec {
+            name: "gate".into(),
+            steps: vec![WorkflowStepSpec::await_signal("approve", Some(3_600_000))],
+        };
+        assert_eq!(
+            serde_json::to_value(&spec).unwrap(),
+            json!({
+                "name": "gate",
+                "steps": [ { "awaitSignal": { "name": "approve", "timeoutMs": 3600000 } } ]
+            })
+        );
+        // Indefinite wait omits timeoutMs.
+        let spec = WorkflowSpec {
+            name: "gate".into(),
+            steps: vec![WorkflowStepSpec::await_signal("approve", None)],
+        };
+        assert_eq!(
+            serde_json::to_value(&spec).unwrap(),
+            json!({
+                "name": "gate",
+                "steps": [ { "awaitSignal": { "name": "approve" } } ]
+            })
+        );
     }
 
     #[test]

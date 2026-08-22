@@ -718,3 +718,42 @@ async def test_start_workflow_err_rejects():
         assert ei.value.code is ErrorCode.BAD_REQUEST
     finally:
         await client.close()
+
+
+async def test_signal_workflow_sends_frame_and_resolves_on_ack():
+    conn = FakeConn()
+    client = await _connected(conn)
+    try:
+        signal = asyncio.create_task(client.signal_workflow("wf-1", "approve", {"ok": True}))
+        await _drain()
+        # The signalWorkflow frame's field spellings are load-bearing: the
+        # correlation key, the run id, the signal name, and the payload (the
+        # ack reuses workflowAck).
+        sent = json.loads([f for f in conn.sent if '"signalWorkflow"' in f][0])
+        assert sent["type"] == "signalWorkflow"
+        assert sent["workflowId"] == _wf_id(conn, "signalWorkflow")
+        assert sent["id"] == "wf-1"
+        assert sent["name"] == "approve"
+        assert sent["payload"] == {"ok": True}
+        await conn.deliver(
+            '{"type":"workflowAck","workflowId":"' + _wf_id(conn, "signalWorkflow") + '","ok":true}'
+        )
+        assert await asyncio.wait_for(signal, 1.0) is True
+
+        # A bare-name signal omits the payload entirely (each call assigns a
+        # fresh correlation id — ack the one THIS frame carried).
+        bare = asyncio.create_task(client.signal_workflow("wf-1", "approve"))
+        await _drain()
+        sent_bare = json.loads([f for f in conn.sent if '"signalWorkflow"' in f][-1])
+        assert "payload" not in sent_bare
+        await conn.deliver(
+            '{"type":"workflowAck","workflowId":"'
+            + sent_bare["workflowId"]
+            + '","ok":false,"error":{"code":"CONFLICT",'
+            '"message":"workflow is not waiting for a signal"}}'
+        )
+        with pytest.raises(RtDbError) as ei:
+            await asyncio.wait_for(bare, 1.0)
+        assert ei.value.code is ErrorCode.CONFLICT
+    finally:
+        await client.close()

@@ -141,24 +141,44 @@ class StepRetry(_Camel):
     max_retry_ms: int = 60_000
 
 
+class AwaitSignalSpec(_Camel):
+    """An ``awaitSignal`` step's wait declaration: park the run until a signal
+    named ``name`` is delivered; ``timeout_ms`` bounds each wait attempt
+    (omitted = wait indefinitely, cancel is the escape). ``timeoutMs`` is
+    omitted on the wire when ``None``."""
+
+    name: str
+    timeout_ms: int | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_none_optional(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("timeoutMs") is None:
+            out.pop("timeoutMs", None)
+        return out
+
+
 class WorkflowStepSpec(_Camel):
-    """One workflow step: an ordinary ``Transaction`` plus policy. The txn may
-    itself carry schedule/cancelSchedule steps. ``retry``/``sleep_before_ms``
-    are omitted on the wire when ``None``.
+    """One workflow step: either an ordinary ``Transaction`` or an
+    :class:`AwaitSignalSpec` wait (exactly one — submit-time validation
+    enforces it), plus policy. The txn may itself carry schedule/cancelSchedule
+    steps. ``txn``/``await_signal``/``retry``/``sleep_before_ms`` are omitted on
+    the wire when ``None``.
 
     ``txn`` is deliberately ``dict[str, Any]`` (the dumped ``Transaction``)
     rather than the ``Transaction`` model itself, keeping the wire layer
     decoupled from the DSL layer (avoids a circular import with
     ``mutation.py``) — same convention as ``_ClientSchedule.txn``."""
 
-    txn: dict[str, Any]
+    txn: dict[str, Any] | None = None
+    await_signal: AwaitSignalSpec | None = None
     retry: StepRetry | None = None
     sleep_before_ms: int | None = None
 
     @model_serializer(mode="wrap")
     def _drop_none_optional(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
-        for alias in ("retry", "sleepBeforeMs"):
+        for alias in ("txn", "awaitSignal", "retry", "sleepBeforeMs"):
             if out.get(alias) is None:
                 out.pop(alias, None)
         return out
@@ -172,8 +192,10 @@ class WorkflowSpec(_Camel):
     steps: list[WorkflowStepSpec]
 
 
-# Snake-case wire values (server enum is rename_all = "snake_case").
-WorkflowStatus = Literal["pending", "running", "success", "failed", "cancelled"]
+# Snake-case wire values (server enum is rename_all = "snake_case"). "waiting"
+# is the parked-at-an-awaitSignal-step state (only a delivery, a timeout, or a
+# cancel leaves it).
+WorkflowStatus = Literal["pending", "running", "waiting", "success", "failed", "cancelled"]
 
 # Lowercase wire values (server OutcomeStatus enum).
 OutcomeStatus = Literal["success", "failed"]
@@ -182,26 +204,31 @@ OutcomeStatus = Literal["success", "failed"]
 class StepOutcome(_Camel):
     """Terminal record for one step: completed successfully, or exhausted its
     retries (``status: "failed"``). Individual retried attempts are NOT
-    recorded — the ``attempts`` count carries them. ``error`` is omitted on
-    the wire when ``None``."""
+    recorded — the ``attempts`` count carries them. ``error``/``signal`` are
+    omitted on the wire when ``None``; ``signal`` carries a delivered
+    awaitSignal payload verbatim."""
 
     step_index: int
     status: OutcomeStatus
     attempts: int
     at: int
     error: str | None = None
+    signal: Any | None = None
 
     @model_serializer(mode="wrap")
     def _drop_none_optional(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
-        if out.get("error") is None:
-            out.pop("error", None)
+        for alias in ("error", "signal"):
+            if out.get(alias) is None:
+                out.pop(alias, None)
         return out
 
 
 class WorkflowInfo(_Camel):
     """List/get projection of one run. ``sleep_until``/``last_error``/
-    ``started_at``/``finished_at`` are omitted on the wire when ``None``."""
+    ``waiting_for``/``waited_since``/``started_at``/``finished_at`` are omitted
+    on the wire when ``None`` (the wait fields project only while the run is
+    parked at an ``awaitSignal`` step)."""
 
     id: str
     name: str
@@ -211,6 +238,8 @@ class WorkflowInfo(_Camel):
     attempts: int
     sleep_until: int | None = None
     last_error: str | None = None
+    waiting_for: str | None = None
+    waited_since: int | None = None
     created_at: int
     updated_at: int
     started_at: int | None = None
@@ -219,7 +248,14 @@ class WorkflowInfo(_Camel):
     @model_serializer(mode="wrap")
     def _drop_none_optional(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
-        for alias in ("sleepUntil", "lastError", "startedAt", "finishedAt"):
+        for alias in (
+            "sleepUntil",
+            "lastError",
+            "waitingFor",
+            "waitedSince",
+            "startedAt",
+            "finishedAt",
+        ):
             if out.get(alias) is None:
                 out.pop(alias, None)
         return out
@@ -564,6 +600,25 @@ class _ClientCancelWorkflow(_Camel):
     id: str
 
 
+class _ClientSignalWorkflow(_Camel):
+    """Deliver a named signal to a waiting run (``awaitSignal`` steps). The
+    reply reuses ``workflowAck``. ``payload`` (the value handed to the step
+    outcome's ``signal``) is omitted on the wire when ``None``."""
+
+    type: Literal["signalWorkflow"] = "signalWorkflow"
+    workflow_id: str
+    id: str
+    name: str
+    payload: Any | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_none_payload(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("payload") is None:
+            out.pop("payload", None)
+        return out
+
+
 class _ClientListWorkflows(_Camel):
     """FM-29 list runs, newest first. ``status`` is omitted on the wire when
     ``None`` (no filter)."""
@@ -640,6 +695,7 @@ ClientMessage = Annotated[
         | _ClientListSchedules
         | _ClientStartWorkflow
         | _ClientCancelWorkflow
+        | _ClientSignalWorkflow
         | _ClientListWorkflows
         | _ClientPresence
         | _ClientPresenceState
@@ -787,8 +843,9 @@ class _ServerStartWorkflowErr(_Camel):
 
 
 class _ServerWorkflowAck(_Camel):
-    """FM-29 reply to cancelWorkflow. ``error`` is omitted on the wire when
-    ``ok``."""
+    """FM-29 reply to cancelWorkflow AND signalWorkflow (a failed delivery —
+    unknown run, not waiting, name mismatch — arrives as ``ok: false`` plus the
+    error envelope). ``error`` is omitted on the wire when ``ok``."""
 
     type: Literal["workflowAck"] = "workflowAck"
     workflow_id: str

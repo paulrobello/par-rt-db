@@ -48,6 +48,10 @@ public enum InMemoryLimits {
     /// FM-29: hard cap on steps per workflow spec (server
     /// `workflows::MAX_WORKFLOW_STEPS`).
     static let maxWorkflowSteps = 64
+    /// awaitSignal: serialized-size cap on a signal payload (server
+    /// `workflows::MAX_SIGNAL_PAYLOAD_BYTES`), enforced on delivery so every
+    /// surface gets the same bound.
+    static let maxSignalPayloadBytes = 64 * 1024
 }
 
 /// SEC-104: total documents a txn could touch in the worst case (store.ts
@@ -333,6 +337,49 @@ private func backoffMs(_ retry: StepRetry, _ attempts: Int) -> Int64 {
     return Int64(clamping: capped)
 }
 
+/// FM-29 + awaitSignal: one spec step's submit-time checks — a port of the
+/// per-step half of server `workflows::validate_spec`. A step carries exactly
+/// one of txn/awaitSignal; the wait declaration is bounded (name 1..=256
+/// chars, a present timeoutMs strictly positive); retry needs
+/// maxAttempts >= 1 and maxRetryMs >= a positive initialRetryMs.
+private func validateWorkflowStep(_ step: WorkflowStepSpec, index: Int) throws {
+    switch (step.txn, step.awaitSignal) {
+    case (.some, .some), (.none, .none):
+        throw RtDbError(
+            code: .badRequest,
+            message: "steps[\(index)] must carry exactly one of txn or awaitSignal"
+        )
+    case (.some, nil):
+        break
+    case (nil, let .some(signal)):
+        if signal.name.isEmpty || signal.name.count > 256 {
+            throw RtDbError(
+                code: .badRequest,
+                message: "steps[\(index)].awaitSignal.name must be 1..=256 chars"
+            )
+        }
+        if let timeoutMs = signal.timeoutMs, timeoutMs == 0 {
+            throw RtDbError(
+                code: .badRequest,
+                message: "steps[\(index)].awaitSignal.timeoutMs must be > 0"
+            )
+        }
+    }
+    guard let retry = step.retry else { return }
+    if retry.maxAttempts == 0 {
+        throw RtDbError(
+            code: .badRequest, message: "steps[\(index)].retry.maxAttempts must be >= 1"
+        )
+    }
+    if retry.initialRetryMs == 0 || retry.maxRetryMs < retry.initialRetryMs {
+        throw RtDbError(
+            code: .badRequest,
+            message: "steps[\(index)].retry requires initialRetryMs > 0 and "
+                + "maxRetryMs >= initialRetryMs"
+        )
+    }
+}
+
 /// FM-29: submit-time spec validation — a port of server
 /// `workflows::validate_spec` (store.ts `validateWorkflowSpec`), including
 /// the recursive `maxSteps` gate over the spec's step txns.
@@ -347,21 +394,9 @@ private func validateWorkflowSpec(_ spec: WorkflowSpec) throws {
         )
     }
     for (index, step) in spec.steps.enumerated() {
-        guard let retry = step.retry else { continue }
-        if retry.maxAttempts == 0 {
-            throw RtDbError(
-                code: .badRequest, message: "steps[\(index)].retry.maxAttempts must be >= 1"
-            )
-        }
-        if retry.initialRetryMs == 0 || retry.maxRetryMs < retry.initialRetryMs {
-            throw RtDbError(
-                code: .badRequest,
-                message: "steps[\(index)].retry requires initialRetryMs > 0 and "
-                    + "maxRetryMs >= initialRetryMs"
-            )
-        }
+        try validateWorkflowStep(step, index: index)
     }
-    let total = spec.steps.reduce(0) { $0 + countSteps($1.txn) }
+    let total = spec.steps.reduce(0) { $0 + ($1.txn.map(countSteps) ?? 0) }
     if total > InMemoryLimits.maxSteps {
         throw RtDbError(
             code: .badRequest,
@@ -374,6 +409,10 @@ private func validateWorkflowSpec(_ spec: WorkflowSpec) throws {
 /// FM-29: a stored workflow run (store.ts `WorkflowRun`); field semantics
 /// mirror the server's `workflows` table. `sleepUntil` is always set. A class
 /// so `advanceWorkflow` can identity-check the live entry between steps.
+/// The `awaitSignal` side-table columns (`waitName`/`waitedSince`/
+/// `signalPayload`) are nil on runs never parked; set on a claim they tell
+/// the advancer why the run woke (payload = delivered, else `waitedSince`
+/// set = the timeout gate expired).
 final class WorkflowRun {
     let id: String
     let spec: WorkflowSpec
@@ -382,6 +421,9 @@ final class WorkflowRun {
     var attempts: Int
     var sleepUntil: Int64
     var lastError: String?
+    var waitName: String?
+    var waitedSince: Int64?
+    var signalPayload: JSONValue?
     let createdAt: Int64
     var updatedAt: Int64
     var startedAt: Int64?
@@ -1175,17 +1217,64 @@ public final class InMemoryRtDbClient: MigrationStore {
         return try toWorkflowInfo(startWorkflowJob(spec))
     }
 
-    /// Cancels a pending/running run: false (a no-op) for an unknown or
-    /// terminal run — the server's `workflows::cancel` contract.
+    /// Cancels a pending/running/waiting run: false (a no-op) for an unknown
+    /// or terminal run — the server's `workflows::cancel` contract. Waiting
+    /// rows are cancellable; the wait columns drop with the flip (the
+    /// leave-`waiting` rule).
     @discardableResult
     public func cancelWorkflow(_ id: String) -> Bool {
-        guard let run = workflows[id], run.status == .pending || run.status == .running else {
+        guard let run = workflows[id],
+              run.status == .pending || run.status == .running || run.status == .waiting
+        else {
             return false
         }
         run.status = .cancelled
+        run.waitName = nil
+        run.waitedSince = nil
+        run.signalPayload = nil
         run.finishedAt = nowFn()
         run.updatedAt = nowFn()
         return true
+    }
+
+    /// Delivers a named signal to a waiting run (the server's
+    /// `workflows::deliver_signal`): latest-wins slot write + wake flip in one
+    /// step — a `waiting` run AND a `pending` run whose `waitName` survived an
+    /// earlier delivery both match (every delivery while the wait is
+    /// unconsumed overwrites the slot; an ordinary pending run never matches).
+    /// The flipped run is due on the next `tick`. Typed errors mirror the
+    /// server's classification: NOT_FOUND unknown id, CONFLICT not-waiting,
+    /// CONFLICT name mismatch naming both names. An omitted payload is
+    /// delivered as JSON null — the slot is always set on a delivery (nil
+    /// stays exclusively the no-signal state).
+    public func signalWorkflow(_ id: String, name: String, payload: JSONValue? = nil) throws {
+        if let payload {
+            let encoded = try JSONEncoder().encode(payload)
+            if encoded.count > InMemoryLimits.maxSignalPayloadBytes {
+                throw RtDbError(
+                    code: .badRequest,
+                    message: "signal payload exceeds \(InMemoryLimits.maxSignalPayloadBytes) bytes"
+                )
+            }
+        }
+        guard let run = workflows[id] else {
+            throw RtDbError(code: .notFound, message: "unknown workflow")
+        }
+        let now = nowFn()
+        if run.status == .waiting || run.status == .pending, run.waitName == name {
+            run.status = .pending
+            run.sleepUntil = now
+            run.signalPayload = payload ?? .null
+            run.updatedAt = now
+            return
+        }
+        if run.status == .waiting {
+            throw RtDbError(
+                code: .conflict,
+                message: "workflow waiting on '\(run.waitName ?? "")', got '\(name)'"
+            )
+        }
+        throw RtDbError(code: .conflict, message: "workflow is not waiting for a signal")
     }
 
     /// Lists runs, newest first (createdAt DESC, insertion order on ties).
@@ -1233,7 +1322,10 @@ public final class InMemoryRtDbClient: MigrationStore {
     }
 
     private func toWorkflowInfo(_ run: WorkflowRun) -> WorkflowInfo {
-        WorkflowInfo(
+        // Wait columns project only while `waiting` — terminal rows never
+        // leak stale wait state (leave-waiting ops clear it).
+        let waiting = run.status == .waiting
+        return WorkflowInfo(
             id: run.id,
             name: run.spec.name,
             status: run.status,
@@ -1242,6 +1334,8 @@ public final class InMemoryRtDbClient: MigrationStore {
             attempts: UInt32(run.attempts),
             sleepUntil: run.sleepUntil,
             lastError: run.lastError,
+            waitingFor: waiting ? run.waitName : nil,
+            waitedSince: waiting ? run.waitedSince : nil,
             createdAt: run.createdAt,
             updatedAt: run.updatedAt,
             startedAt: run.startedAt,
@@ -1335,8 +1429,10 @@ public final class InMemoryRtDbClient: MigrationStore {
             }
         }
         // FM-29: claim due pending runs (server `claim_due`), then advance.
+        // A `waiting` run whose timeout gate (its `sleepUntil`) expired is
+        // claimed too — that claim IS the timed-out attempt.
         let due = workflowOrder.compactMap { workflows[$0] }.filter {
-            $0.status == .pending && $0.sleepUntil <= now
+            ($0.status == .pending || $0.status == .waiting) && $0.sleepUntil <= now
         }
         for run in due {
             run.status = .running
@@ -1349,13 +1445,19 @@ public final class InMemoryRtDbClient: MigrationStore {
         return try reapTtl(now)
     }
 
-    // swiftlint:disable function_body_length
+    // swiftlint:disable cyclomatic_complexity function_body_length
     /// FM-29: drives one claimed run across step boundaries (store.ts
     /// `advanceWorkflow`). Success on the last step finalizes; success earlier
     /// moves to the next step and applies its `sleepBeforeMs` gate (a future
     /// gate re-pends the run; a `now` gate continues in the same tick);
     /// failure re-pends with exponential backoff or, once attempts are
-    /// exhausted, marks the run failed with a terminal outcome.
+    /// exhausted, marks the run failed with a terminal outcome. An
+    /// `awaitSignal` step takes the server committer's three-way branch
+    /// instead: a delivered payload consumes the wait as a success outcome
+    /// carrying the payload; a first arrival parks the run (`waiting`, fresh
+    /// `waitedSince`, gate `now + timeoutMs` or forever); an expired gate is a
+    /// timeout attempt — re-parked with the FULL timeout again, terminal fail
+    /// `awaitSignal '<name>' timed out` at exhaustion.
     private func advanceWorkflow(_ run: WorkflowRun, now: Int64) {
         while true {
             // Per-boundary liveness check: a cancel (or terminal transition)
@@ -1364,9 +1466,20 @@ public final class InMemoryRtDbClient: MigrationStore {
             guard workflows[run.id] === run, run.status == .running else { return }
             guard run.currentStep < run.spec.steps.count else { return }
             let step = run.spec.steps[run.currentStep]
+            if let signal = step.awaitSignal {
+                if advanceAwaitSignal(run, signal, step, now: now) {
+                    return
+                }
+                continue
+            }
+            // Every step carries exactly one of txn/awaitSignal (submit-time
+            // `validateWorkflowSpec`); the branch above handled the latter. A
+            // txn-less step here is unreachable — stop the pass like the
+            // out-of-range guard above rather than trap.
+            guard let txn = step.txn else { return }
             var execError: String?
             do {
-                _ = try executeTransaction(step.txn)
+                _ = try executeTransaction(txn)
             } catch {
                 execError = errorMessage(error)
             }
@@ -1422,6 +1535,107 @@ public final class InMemoryRtDbClient: MigrationStore {
             run.updatedAt = now
             return
         }
+    }
+
+    // swiftlint:enable cyclomatic_complexity function_body_length
+
+    // swiftlint:disable function_body_length
+    /// The awaitSignal half of `advanceWorkflow` — the server committer's
+    /// three-way branch. Side-store only (no document writes); the wake
+    /// discriminator is the claimed run itself: `signalPayload` set =
+    /// delivered, else `waitedSince` nil = first arrival, set = the timeout
+    /// gate expired. Returns true when the pass ends (boundary written and
+    /// re-pended, parked, or terminal); false when the consumed signal's next
+    /// step gate is due now and the caller should keep looping.
+    private func advanceAwaitSignal(
+        _ run: WorkflowRun, _ signal: AwaitSignalSpec, _ step: WorkflowStepSpec, now: Int64
+    ) -> Bool {
+        if let payload = run.signalPayload {
+            run.signalPayload = nil
+            let outcome = StepOutcome(
+                stepIndex: UInt32(run.currentStep),
+                status: .success,
+                attempts: UInt32(run.attempts + 1),
+                at: now,
+                signal: payload
+            )
+            run.stepOutcomes.append(outcome)
+            run.updatedAt = now
+            let isLast = run.currentStep + 1 >= run.spec.steps.count
+            if isLast {
+                run.status = .success
+                run.attempts = 0
+                run.lastError = nil
+                run.waitName = nil
+                run.waitedSince = nil
+                run.finishedAt = now
+                return true
+            }
+            run.currentStep += 1
+            run.attempts = 0
+            run.waitName = nil
+            run.waitedSince = nil
+            let next = run.spec.steps[run.currentStep]
+            let gate = now + Int64(next.sleepBeforeMs ?? 0)
+            if gate > now {
+                run.status = .pending
+                run.sleepUntil = gate
+                run.updatedAt = now
+                return true
+            }
+            return false
+        }
+        // Timeout gate — Int64.max when the step omits `timeoutMs` (never
+        // due; only a delivery or cancel wakes the run). The u64→Int64 clamp
+        // and saturating add mirror the server's wrap-hazard guards.
+        let timeoutGate: Int64
+        if let timeoutMs = signal.timeoutMs {
+            let clamped = Int64(min(timeoutMs, UInt64(Int64.max)))
+            let (added, overflow) = now.addingReportingOverflow(clamped)
+            timeoutGate = overflow ? Int64.max : added
+        } else {
+            timeoutGate = Int64.max
+        }
+        if run.waitedSince == nil {
+            // First arrival: park. `attempts` rides the run so a timeout
+            // retry that re-parks keeps its count.
+            run.status = .waiting
+            run.waitName = signal.name
+            run.waitedSince = now
+            run.sleepUntil = timeoutGate
+            run.updatedAt = now
+            return true
+        }
+        // The run parked and its gate expired: a timed-out attempt. A retry
+        // waits the FULL timeoutMs again — never backoff.
+        run.attempts += 1
+        let retry = step.retry ?? defaultStepRetry
+        if run.attempts < Int(retry.maxAttempts) {
+            run.status = .waiting
+            run.waitName = signal.name
+            run.waitedSince = now
+            run.sleepUntil = timeoutGate
+            run.updatedAt = now
+            return true
+        }
+        let error = "awaitSignal '\(signal.name)' timed out"
+        run.stepOutcomes.append(
+            StepOutcome(
+                stepIndex: UInt32(run.currentStep),
+                status: .failed,
+                attempts: UInt32(run.attempts),
+                at: now,
+                error: error
+            )
+        )
+        run.status = .failed
+        run.lastError = error
+        run.waitName = nil
+        run.waitedSince = nil
+        run.signalPayload = nil
+        run.finishedAt = now
+        run.updatedAt = now
+        return true
     }
 
     // swiftlint:enable function_body_length

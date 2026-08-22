@@ -550,6 +550,17 @@ def _op_admin_cancel_workflow(db: str, id: str) -> _AdminRequest:
     )
 
 
+def _op_admin_signal_workflow(
+    db: str, id: str, name: str, payload: Any | None = None
+) -> _AdminRequest:
+    body: dict[str, Any] = {"name": name}
+    if payload is not None:
+        body["payload"] = payload
+    return _AdminRequest(
+        "POST", f"/admin/db/{db}/workflows/{id}/signal", {"json": body}, _parse_ok_bool
+    )
+
+
 def _op_admin_delete_workflow(db: str, id: str) -> _AdminRequest:
     return _AdminRequest("DELETE", f"/admin/db/{db}/workflows/{id}", {}, _parse_ok_bool)
 
@@ -1293,6 +1304,15 @@ class RtDbAdminClient:
         no-op, not an error)."""
         return self._executor.run(_op_admin_cancel_workflow(db, id))
 
+    def admin_signal_workflow(
+        self, db: str, id: str, name: str, payload: Any | None = None
+    ) -> bool:
+        """``POST .../workflows/{id}/signal`` → ``True`` when the named signal
+        was delivered to a run parked at an ``awaitSignal`` step. ``NOT_FOUND``
+        for an unknown run; ``CONFLICT`` when the run is not waiting or is
+        waiting on a different name."""
+        return self._executor.run(_op_admin_signal_workflow(db, id, name, payload))
+
     def admin_delete_workflow(self, db: str, id: str) -> bool:
         """``DELETE /admin/db/{db}/workflows/{id}`` → ``True`` when the run row
         was removed; ``False`` when it was already gone."""
@@ -1970,6 +1990,18 @@ class AsyncRtDbAdminClient:
         ``False`` is a legitimate no-op (missing/terminal run), not an error.
         """
         return await self._executor.run(_op_admin_cancel_workflow(db, id))
+
+    async def admin_signal_workflow(
+        self, db: str, id: str, name: str, payload: Any | None = None
+    ) -> bool:
+        """``POST .../workflows/{id}/signal`` → signal delivery outcome bool
+        (async).
+
+        ``True`` when delivered. ``NOT_FOUND`` for an unknown run;
+        ``CONFLICT`` when the run is not waiting or is waiting on a different
+        name.
+        """
+        return await self._executor.run(_op_admin_signal_workflow(db, id, name, payload))
 
     async def admin_delete_workflow(self, db: str, id: str) -> bool:
         """``DELETE /admin/db/{db}/workflows/{id}`` → delete outcome bool (async)."""

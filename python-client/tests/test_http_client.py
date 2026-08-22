@@ -1494,3 +1494,22 @@ def test_cancel_workflow_posts_db_returns_bool() -> None:
     assert client.cancel_workflow("wf-1") is True
     assert captured["path"] == "/api/workflows/wf-1/cancel"
     assert captured["body"] == {"db": DB}
+
+
+def test_signal_workflow_posts_name_and_payload_returns_bool() -> None:
+    captured: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append({"path": request.url.path, "body": json.loads(request.content)})
+        return httpx.Response(200, json={"delivered": True})
+
+    client = _client(handler)
+    assert client.signal_workflow("wf-1", "approve", {"ok": True}) is True
+    assert client.signal_workflow("wf-1", "approve") is True
+    assert [c["path"] for c in captured] == [
+        "/api/workflows/wf-1/signal",
+        "/api/workflows/wf-1/signal",
+    ]
+    # payload rides the body verbatim and is omitted when not supplied.
+    assert captured[0]["body"] == {"db": DB, "name": "approve", "payload": {"ok": True}}
+    assert captured[1]["body"] == {"db": DB, "name": "approve"}

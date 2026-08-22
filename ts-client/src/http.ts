@@ -189,6 +189,19 @@ export class RtDbHttpClient {
     return (body as { cancelled: boolean }).cancelled;
   }
 
+  /** Delivers an out-of-band signal to a waiting run's `awaitSignal` step
+   * (latest-wins payload). Resolves `true` on delivery; typed failures reject
+   * via the standard error envelope — unknown id (`NOT_FOUND`), not waiting /
+   * name mismatch (`CONFLICT`). */
+  async signalWorkflow(id: string, name: string, payload?: unknown): Promise<boolean> {
+    const body = await this.post(`/api/workflows/${encodeURIComponent(id)}/signal`, {
+      db: this.db,
+      name,
+      ...(payload === undefined ? {} : { payload }),
+    });
+    return (body as { delivered: boolean }).delivered;
+  }
+
   /** Lists workflow runs, newest first, optionally filtered by `status` (FM-29). */
   async listWorkflows(status?: WorkflowStatus): Promise<WorkflowInfo[]> {
     const body = await this.post("/api/workflows/list", {

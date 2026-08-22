@@ -542,6 +542,53 @@ impl RtDbHttpClient {
         Ok(parsed.cancelled)
     }
 
+    /// Deliver a named signal to a waiting run (`POST /api/workflows/{id}/signal`
+    /// — an `awaitSignal` step's release). Typed 404 (unknown run) / 409 (not
+    /// waiting, or waiting on a different name) reject as [`RtDbError`];
+    /// success resolves `true` (delivered). `payload` is latest-wins — a
+    /// second delivery overwrites the first — and rides the step's outcome
+    /// as `signal`.
+    pub async fn signal_workflow(
+        &self,
+        id: &str,
+        name: &str,
+        payload: Option<serde_json::Value>,
+    ) -> Result<bool, RtDbError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            db: &'a str,
+            name: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            payload: Option<&'a serde_json::Value>,
+        }
+        let body = Body {
+            db: &self.db,
+            name,
+            payload: payload.as_ref(),
+        };
+        let resp = self
+            .client
+            // `id` is caller-supplied, so percent-encode the path segment
+            // (same guard as `cancel_workflow`).
+            .post(format!(
+                "{}/api/workflows/{}/signal",
+                self.url,
+                encode_uri_component(id)
+            ))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("signal workflow request failed: {e}")))?;
+        #[derive(serde::Deserialize)]
+        struct SignalResponse {
+            delivered: bool,
+        }
+        let parsed = self.deserialize::<SignalResponse>(resp).await?;
+        Ok(parsed.delivered)
+    }
+
     /// List this database's workflow runs, newest first
     /// (`POST /api/workflows/list`, FM-29). `status` optionally filters by
     /// run state. Mirrors `ts-client`'s `listWorkflows`.
@@ -1518,7 +1565,8 @@ mod tests {
         let spec = crate::wire::WorkflowSpec {
             name: "drip".into(),
             steps: vec![crate::wire::WorkflowStepSpec {
-                txn: Mutation::new().build(),
+                txn: Some(Mutation::new().build()),
+                await_signal: None,
                 retry: None,
                 sleep_before_ms: None,
             }],
@@ -1538,6 +1586,43 @@ mod tests {
             .await;
         // `false` (missing or already-terminal run) is a no-op, not an error.
         assert!(!client.cancel_workflow("wf-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn signal_workflow_posts_db_name_payload_and_returns_delivered() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/workflows/wf-1/signal"))
+            .and(body_partial_json(json!({
+                "db": "t<uuid>", "name": "approve", "payload": {"ok": true}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"delivered": true})))
+            .mount(&server)
+            .await;
+        // `payload: None` omits the key entirely — exact raw body, not a
+        // partial match (same dual-mount pattern as `list_workflows`).
+        Mock::given(method("POST"))
+            .and(path("/api/workflows/wf-1/signal"))
+            .and(body_bytes(
+                serde_json::to_string(&json!({"db": "t<uuid>", "name": "approve"}))
+                    .unwrap()
+                    .into_bytes(),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"delivered": true})))
+            .mount(&server)
+            .await;
+        assert!(
+            client
+                .signal_workflow("wf-1", "approve", Some(json!({"ok": true})))
+                .await
+                .unwrap()
+        );
+        assert!(
+            client
+                .signal_workflow("wf-1", "approve", None)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

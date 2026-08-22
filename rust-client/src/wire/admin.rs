@@ -251,6 +251,16 @@ pub(crate) struct WorkflowsResponse {
     pub(crate) workflows: Vec<crate::wire::WorkflowInfo>,
 }
 
+/// Request body for `POST /admin/db/{db}/workflows/{id}/signal` — the admin
+/// signal surface (db rides the path, so only `name`/`payload` in the body).
+/// `payload` is omitted from the JSON when `None`.
+#[derive(Serialize)]
+pub(crate) struct WorkflowSignalRequest<'a> {
+    pub(crate) name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) payload: Option<&'a serde_json::Value>,
+}
+
 /// Response for `DELETE /admin/sessions?user={userId}` → `{ok, revoked}` where
 /// `revoked` is the count of sessions dropped. Mirrors `ts-client`'s
 /// `revokeUserSessions` return shape.

@@ -269,6 +269,7 @@ pub struct DbWorkflowStatusRow {
     pub db: String,
     pub pending: i64,
     pub running: i64,
+    pub waiting: i64,
     pub success: i64,
     pub failed: i64,
     pub cancelled: i64,
@@ -719,6 +720,7 @@ pub async fn per_db_workflows_rows(pool: &PgPool) -> Vec<DbWorkflowStatusRow> {
                     db,
                     pending: 0,
                     running: 0,
+                    waiting: 0,
                     success: 0,
                     failed: 0,
                     cancelled: 0,
@@ -727,6 +729,7 @@ pub async fn per_db_workflows_rows(pool: &PgPool) -> Vec<DbWorkflowStatusRow> {
                     match status {
                         WorkflowStatus::Pending => row.pending = n,
                         WorkflowStatus::Running => row.running = n,
+                        WorkflowStatus::Waiting => row.waiting = n,
                         WorkflowStatus::Success => row.success = n,
                         WorkflowStatus::Failed => row.failed = n,
                         WorkflowStatus::Cancelled => row.cancelled = n,

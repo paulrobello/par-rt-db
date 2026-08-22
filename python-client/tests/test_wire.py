@@ -682,11 +682,61 @@ def test_workflow_spec_round_trip() -> None:
     assert len(spec.steps) == 1
 
 
+def test_await_signal_step_wire_shape() -> None:
+    """Mirrors server protocol.rs ``await_signal_step_wire_shape``: an
+    awaitSignal step carries the wait declaration, ``txn`` stays absent, and
+    the round-trip omits every unset optional."""
+    spec = WorkflowSpec.model_validate(
+        {"name": "gate", "steps": [{"awaitSignal": {"name": "approve", "timeoutMs": 3_600_000}}]}
+    )
+    step = spec.steps[0]
+    assert step.txn is None
+    assert step.await_signal is not None
+    assert step.await_signal.name == "approve"
+    assert step.await_signal.timeout_ms == 3_600_000
+    d = spec.model_dump(by_alias=True, mode="json")
+    assert d["steps"][0] == {"awaitSignal": {"name": "approve", "timeoutMs": 3_600_000}}
+    assert "txn" not in d["steps"][0]
+    assert "sleepBeforeMs" not in d["steps"][0]
+
+
+def test_await_signal_omits_timeout_ms_when_absent() -> None:
+    spec = WorkflowSpec.model_validate({"name": "g", "steps": [{"awaitSignal": {"name": "a"}}]})
+    d = spec.model_dump(by_alias=True, mode="json")
+    assert d["steps"][0] == {"awaitSignal": {"name": "a"}}
+    assert "timeoutMs" not in d["steps"][0]["awaitSignal"]
+
+
+def test_await_signal_rejects_unknown_fields() -> None:
+    with pytest.raises(ValidationError):
+        WorkflowSpec.model_validate(
+            {"name": "g", "steps": [{"awaitSignal": {"name": "a", "bogus": 1}}]}
+        )
+
+
+def test_workflow_step_spec_rejects_empty_step() -> None:
+    """Neither txn nor awaitSignal — the exactly-one-of contract is a wire
+    shape (validation fires at submit, but the empty step itself parses to
+    both-None which submit-time validation rejects)."""
+    s = WorkflowStepSpec.model_validate({"sleepBeforeMs": 5})
+    assert s.txn is None and s.await_signal is None
+    d = s.model_dump(by_alias=True, mode="json")
+    assert d == {"sleepBeforeMs": 5}
+
+
 def test_workflow_status_literal_domain() -> None:
     info = WorkflowInfo.model_validate({**_WF_INFO_FIXTURE, "status": "running"})
     assert info.status == "running"
     with pytest.raises(ValidationError):
         WorkflowInfo.model_validate({**_WF_INFO_FIXTURE, "status": "bogus"})
+
+
+def test_workflow_status_waiting_literal_accepted() -> None:
+    """Mirrors server protocol.rs ``waiting_status_wire_is_snake_case``: the
+    parked-at-an-awaitSignal-step state is the snake-case ``"waiting"``."""
+    info = WorkflowInfo.model_validate({**_WF_INFO_FIXTURE, "status": "waiting"})
+    assert info.status == "waiting"
+    assert info.model_dump(by_alias=True, mode="json")["status"] == "waiting"
 
 
 _WF_INFO_FIXTURE = {
@@ -706,6 +756,26 @@ def test_workflow_info_omits_optionals_when_absent() -> None:
     assert d == _WF_INFO_FIXTURE
     for absent in ("sleepUntil", "lastError", "startedAt", "finishedAt"):
         assert absent not in d
+
+
+def test_workflow_info_wait_fields_omit_when_absent() -> None:
+    """Mirrors server protocol.rs ``workflow_info_wait_fields_omit_when_absent``:
+    ``waitingFor``/``waitedSince`` project only while parked (they are absent
+    on a never-waiting row and drop again once cleared)."""
+    info = WorkflowInfo.model_validate(
+        {
+            **_WF_INFO_FIXTURE,
+            "status": "waiting",
+            "waitingFor": "approve",
+            "waitedSince": 1234,
+        }
+    )
+    assert info.waiting_for == "approve"
+    assert info.waited_since == 1234
+    cleared = info.model_copy(update={"waiting_for": None, "waited_since": None})
+    d = cleared.model_dump(by_alias=True, mode="json")
+    assert "waitingFor" not in d
+    assert "waitedSince" not in d
 
 
 def test_workflow_info_full_flattens_info() -> None:
@@ -732,6 +802,29 @@ def test_workflow_info_full_flattens_info() -> None:
     assert "error" not in d["stepOutcomes"][0]
     # flatten: no nested "info" key
     assert "info" not in d
+
+
+def test_step_outcome_signal_carries_payload_and_omits_when_absent() -> None:
+    """A delivered awaitSignal payload rides the outcome trail verbatim and is
+    omitted when the step carried no signal."""
+    full = WorkflowInfoFull.model_validate(
+        {
+            **_WF_INFO_FIXTURE,
+            "stepOutcomes": [
+                {
+                    "stepIndex": 0,
+                    "status": "success",
+                    "attempts": 1,
+                    "at": 150,
+                    "signal": {"ok": True, "nested": [1, 2]},
+                },
+                {"stepIndex": 1, "status": "success", "attempts": 1, "at": 200},
+            ],
+        }
+    )
+    d = full.model_dump(by_alias=True, mode="json")
+    assert d["stepOutcomes"][0]["signal"] == {"ok": True, "nested": [1, 2]}
+    assert "signal" not in d["stepOutcomes"][1]
 
 
 def test_client_start_workflow_frame() -> None:
