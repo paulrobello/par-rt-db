@@ -574,7 +574,9 @@ mirrored across all four clients (`HotConfig`/`HotConfigPatch` +
 ## Wire contract and clients
 
 `server/src/protocol.rs`, `ts-client/src/protocol.ts`,
-`rust-client/src/wire.rs`, and `python-client/src/par_rt_db/wire.py` are four
+`rust-client/src/wire.rs`, `python-client/src/par_rt_db/wire.py`, and
+`swift-client/Sources/ParRtDbClient/Wire.swift` (query/txn wire structs in
+`Query.swift`/`Mutation.swift` alongside it) are five
 implementations of the same protocol and must stay byte-identical (serde tags
 and field names). The casing is deliberately non-uniform and load-bearing —
 match the protocol files exactly (see the spec). The SDKs are no-codegen: a
@@ -582,7 +584,8 @@ schema object is both pushed to the server and the source of inferred types.
 The Rust client ports the TS SDK (design at
 [`superpowers/specs/2026-07-22-rust-client-design.md`](superpowers/specs/2026-07-22-rust-client-design.md));
 its `http`, reactive `ws`, and `admin` features all ship, plus
-index/`mutate_with_retry` helpers and `.filter()`/`.search()` builders. The
+index/`mutate_with_retry` helpers and `.filter()`/`.search()`/`.fields()`
+builders. The
 Python client ships the wire contract and schema/mutation/query DSL today
 (design at
 [`superpowers/specs/2026-07-25-python-client-design.md`](superpowers/specs/2026-07-25-python-client-design.md));
