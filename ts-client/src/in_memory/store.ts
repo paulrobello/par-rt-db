@@ -864,7 +864,7 @@ function validateComputed(schema: SchemaJson): void {
               `computed field '${tableName}.${field}' references undeclared field '${referenced}'`,
             );
           }
-          if (computed[referenced] !== undefined) {
+          if (Object.hasOwn(computed, referenced)) {
             throw new RtDbError(
               "BAD_REQUEST",
               `computed field '${tableName}.${field}' references computed field '${referenced}' (computed fields may not reference each other)`,
@@ -900,7 +900,7 @@ function validateComputed(schema: SchemaJson): void {
     // over a computed field would read client input.
     if (table.authorize !== undefined && computed !== undefined) {
       walkFilterExprFields(table.authorize, (referenced) => {
-        if (computed[referenced] !== undefined) {
+        if (Object.hasOwn(computed, referenced)) {
           throw new RtDbError(
             "BAD_REQUEST",
             `computed field '${tableName}.${referenced}' must not be referenced by the table's authorize predicate (authorize predicates may not reference computed fields)`,

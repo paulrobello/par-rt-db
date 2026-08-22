@@ -74,8 +74,10 @@ _BOOLEAN_FALSE_WORDS = frozenset(("false", "f", "no", "off", "0"))
 #: Strict decimal grammar for ``to_numeric``'s string parse — Python's
 #: ``float()`` accepts forms Rust's ``f64::from_str`` rejects (PEP 515
 #: underscores like ``"1_0"``, hex, a bare sign), so the grammar is checked
-#: first (mirrors the ts engine's ``parseNumericString``).
-_NUMERIC_RE = re.compile(r"[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?")
+#: first; digits are ASCII-only — ``\d`` without :data:`re.ASCII` also
+#: matches Unicode decimal digits (e.g. ``"٤٢"``) that ``float()`` accepts
+#: (mirrors the ts engine's ``parseNumericString``).
+_NUMERIC_RE = re.compile(r"[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?", re.ASCII)
 
 
 def to_text(v: Any) -> str | None:

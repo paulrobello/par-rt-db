@@ -179,6 +179,18 @@ def test_numeric_string_with_underscores_is_rejected() -> None:
         _eval(ve.add(ve.literal("1_0"), ve.literal(1)), {})
 
 
+def test_numeric_string_with_unicode_digits_is_rejected() -> None:
+    # Without re.ASCII, \d matches Unicode decimal digits ("٤٢" — Arabic-Indic
+    # 42) which float() accepts but Rust's f64::from_str and the ts engine's
+    # strict regex reject.
+    from par_rt_db import Cast
+
+    with pytest.raises(RtDbError, match="cannot cast"):
+        _eval(ve.cast(ve.literal("٤٢"), Cast.TO_NUMBER), {})
+    with pytest.raises(RtDbError, match="cannot cast"):
+        _eval(ve.add(ve.literal("٤٢"), ve.literal(1)), {})
+
+
 def test_cast_to_int64_requires_integral_numbers() -> None:
     from par_rt_db import Cast
 

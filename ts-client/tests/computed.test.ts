@@ -731,6 +731,35 @@ describe("computed push validation (ENH-028)", () => {
     );
   });
 
+  it("accepts a computed reference and authorize predicate over a DECLARED prototype-named field", () => {
+    // "toString" here IS a declared field — the computed-reference and
+    // authorize checks must use own-property lookups (Object.hasOwn), or the
+    // Object.prototype member falsely trips "references computed field" /
+    // "must not be referenced by authorize" (the server's BTreeMap lookups
+    // never see inherited keys).
+    expect(() =>
+      makeClient({
+        tables: {
+          users: {
+            fields: { ...baseFields, toString: { type: "string" } as FieldTypeJson },
+            computed: { fullName: { op: "field", field: "toString" } },
+          },
+        },
+      }),
+    ).not.toThrow();
+    expect(() =>
+      makeClient({
+        tables: {
+          users: {
+            fields: { ...baseFields, toString: { type: "string" } as FieldTypeJson },
+            authorize: { op: "eq", field: "toString", value: "x" },
+            computed: { fullName: concatExpr },
+          },
+        },
+      }),
+    ).not.toThrow();
+  });
+
   it("rejects a principal marker inside a Case.when", () => {
     pushShouldReject(
       {
