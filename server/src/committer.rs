@@ -1854,6 +1854,19 @@ async fn handle_merge_users(
             if !rewrite_doc(&mut doc, &fields, anon_id, real_id) {
                 continue;
             }
+            // This path bypasses the `do_*` write functions, so computed
+            // stamping runs here too — a computed expr over a principal-
+            // bearing field must see the rewritten uid, never the pre-merge
+            // one. A stamp failure follows the same abort contract as a
+            // failing apply_update below: rows already committed still
+            // publish.
+            let doc = match crate::txn::stamp_computed(table_def, doc, now_ms()) {
+                Ok(doc) => doc,
+                Err(err) => {
+                    abort = Some(err);
+                    break;
+                }
+            };
             match crate::txn::apply_update(
                 &mut conn,
                 &pg_schema_name,

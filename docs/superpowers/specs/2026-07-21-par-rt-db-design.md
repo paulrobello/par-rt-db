@@ -176,6 +176,68 @@ through the committer, there is no other conflict mode.
 Every step is validated against the pushed schema (`SCHEMA_VIOLATION` on mismatch)
 before the Postgres transaction begins.
 
+### Computed fields
+
+A table declaration may carry a `computed` map — field name → typed `ValueExpr`
+(additive wire key, omitted when empty). The grammar is the closed set migrate's
+`evalExpr` already accepts (`field` / `literal` / `concat` / `add` / `sub` /
+`mul` / `div` / `coalesce` / `lower` / `upper` / `trim` / `cast` / `now` /
+`case`; no subqueries, no function calls by name, no raw SQL — see
+`server/src/value_expr.rs`):
+
+```json
+{
+  "tables": {
+    "users": {
+      "fields": { "first": { "type": "string" }, "last": { "type": "string" },
+                  "fullName": { "type": "string" } },
+      "indexes": [{ "name": "by_fullName", "fields": ["fullName"] }],
+      "computed": {
+        "fullName": { "op": "concat", "parts": [
+          { "op": "field", "field": "first" },
+          { "op": "literal", "value": " " },
+          { "op": "field", "field": "last" }
+        ] }
+      }
+    }
+  }
+}
+```
+
+**Write-path invariant.** Every write — insert, patch, replace, upsert (both
+branches), `patchByQuery`, cascade setNull, and the anon→real merge restamp — re-evaluates each
+expression against the resulting document and stores the value in the doc body
+*and* the typed column, which is what makes a computed field indexable. A
+client-supplied value for a computed field never survives: it is dropped before
+validation (a wrong-typed one cannot fail the write) and the stamp overwrites
+it. A `null` result leaves the key absent (the unset-optional convention, never
+a stored `null`). `now` yields epoch milliseconds as a JSON number — the same
+value `updatedAtField` stamping uses. A runtime evaluation error (e.g. division
+by zero) fails the entire transaction atomically with `BAD_REQUEST` naming the
+field; the stored document is unchanged.
+
+**Push validation** (in `validate_computed`, firing on every push, preview,
+snapshot import, restore, and migrate): (1) every key names a declared field
+that is not `ownerField` / `collaboratorsField` / `autoIncrementField` (those
+carry their own stamping authority); (2) every referenced field — including
+`case` `when` filter fields — is declared and not itself computed (no chaining
+or cycles); (3) `case` `when` filters reject `$user`/`$email` principal markers
+(stamping runs with no interactive principal); (4) a statically-known result
+kind must be acceptable to the field's type; (5) the table's `authorize`
+predicate may not reference a computed field (authorize runs pre-stamp on the
+insert paths and would read forgeable client input).
+
+**Backfill.** A push (or restore) that adds or changes an entry re-derives every
+existing row — doc body and typed column, no `_version` bump, not a write.
+Removing an entry rewrites nothing: the stored values remain and the field
+becomes an ordinary client-writable field again.
+
+**Migrate interplay.** `renameField` rewrites the expression's field references
+and re-stamps affected rows; `dropField` on a referenced field is rejected
+naming the computed field; `changeType` re-validates the derived schema's
+computed map; and `evalExpr` / `setDefault` / `changeType` rewrites that feed a
+computed input re-stamp the dependent computed values in the same migrate.
+
 ## Reactivity
 
 After each committed transaction the committer:

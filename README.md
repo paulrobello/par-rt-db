@@ -24,6 +24,7 @@
 * [Pagination](#pagination)
 * [Scheduling](#scheduling)
 * [Durable workflows](#durable-workflows)
+* [Computed fields](#computed-fields)
 * [Realtime presence](#realtime-presence)
 * [Make targets](#make-targets)
 * [Graceful shutdown](#graceful-shutdown)
@@ -78,6 +79,7 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 - **Durable workflows**: multi-step specs with per-step retry, backoff, and sleep, plus `awaitSignal` approval gates that park a run until an out-of-band signal (or timeout); at-least-once per step with crash-resume
 - **Server-stamped `updatedAt`**: a table may declare `updatedAtField` naming a `number`/`int64` field the server stamps with epoch-ms on every version-bumping write (insert/patch/replace/upsert/patchByQuery/cascade setNull), overwriting client-supplied values — no more hand-rolled timestamps in every mutation, and orderable with a declared index
 - **Auto-increment counters**: a table may declare `autoIncrementField` naming an `int64` field the server assigns from a per-table Postgres sequence on insert (overwriting client-supplied values, immutable afterward, unique-indexable) — ticket/issue numbers with zero races; snapshot import continues numbering past the imported max, and gaps from rolled-back transactions are documented behavior
+- **Computed fields**: a table may declare `computed`, a map of field name → typed expression (`concat`/arithmetic/`coalesce`/`lower`/`upper`/`trim`/casts/`case`/`now`), re-derived by the server on every write and stored in the doc body **and** the typed column — client-supplied values never survive, `null` results leave the key absent, the field stays indexable, and pushes backfill existing rows (see [Computed fields](#computed-fields))
 - **Realtime presence**: transient room membership and state ("who is online", cursors, typing) over the existing `/sync` socket — no extra infrastructure
 - **File storage**: opaque unauthenticated public URLs, signed time-limited URLs, HTTP `Range` support, and read-time image transforms
 - **Auth**: six optional OAuth providers (GitHub, Google, GitLab, Microsoft, Apple, generic OIDC), per-database machine tokens, optional anonymous access with anon→real account merge, and per-row `ownerField`/`authorize` rules
@@ -841,6 +843,70 @@ await client.signalWorkflow(id, "approve", { approvedBy: "u1" }); // releases th
 await client.cancelWorkflow(id); // false for a missing/terminal run
 const runs = await client.listWorkflows("running"); // newest first
 ```
+
+## Computed fields
+
+A table may declare `computed`, a map of field name → typed expression, and the
+server re-derives every entry on **every write** (insert, patch, replace, upsert
+both branches, `patchByQuery`, cascade setNull) — storing the result in both the document body and
+the typed column, which is what makes a computed field **indexable** (`order`,
+`filter`, and `count` work over its declared index like any field). The grammar
+is the closed `ValueExpr` set the migrate `evalExpr` path already uses — `field`,
+`literal`, `concat`, arithmetic (`add`/`sub`/`mul`/`div`), `coalesce`,
+`lower`/`upper`/`trim`, casts, `now`, and `case` — with no subqueries, no
+function calls by name, and no raw SQL.
+
+Semantics:
+
+- **Server authority**: a client-supplied value for a computed field never
+  survives — it is dropped before validation (so even a wrong-typed one cannot
+  fail the write) and the stamp overwrites it.
+- **Null removes the key**: an expression evaluating `null` (e.g. `coalesce`
+  over a missing optional input) leaves the key absent — the unset-optional
+  convention, never a stored `null`.
+- **`now` is epoch-ms** — a JSON number, the same value `updatedAtField`
+  stamping uses.
+- **A runtime error fails the write**: e.g. division by zero fails the whole
+  transaction atomically with `BAD_REQUEST` naming the field.
+- **Push validates the map**: keys must name declared fields (not
+  `ownerField`/`collaboratorsField`/`autoIncrementField`), every referenced
+  field must be declared and not itself computed (no chaining), `case` `when`
+  filters may not use `$user`/`$email` markers, and a statically-known result
+  kind must be acceptable to the field's type.
+- **Push backfills**: adding or changing an entry re-derives every existing row
+  (no `_version` bump — a backfill is not a write). **Removing** an entry
+  leaves the stored values in place; the field becomes an ordinary
+  client-writable field again.
+
+```bash
+# Declare computed fields: fullName = first + " " + last, handle = lower(trim(email)).
+curl -s -X POST http://localhost:8300/admin/push-schema \
+  -H "Authorization: Bearer $RTDB_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"db":"myapp","schema":{"tables":{"users":{"fields":{"first":{"type":"string"},"last":{"type":"string"},"email":{"type":"string"},"fullName":{"type":"string"},"handle":{"type":"string"}},"indexes":[{"name":"by_fullName","fields":["fullName"]}],"computed":{"fullName":{"op":"concat","parts":[{"op":"field","field":"first"},{"op":"literal","value":" "},{"op":"field","field":"last"}]},"handle":{"op":"lower","value":{"op":"trim","value":{"op":"field","field":"email"}}}}}}}}'
+
+# Insert — client-supplied fullName is ignored; fullName and handle are stamped.
+curl -s -X POST http://localhost:8300/api/mutate \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"db":"myapp","txn":{"steps":[{"op":"insert","table":"users","doc":{"first":"Grace","last":"Hopper","email":"  Grace@Example.COM ","fullName":"WRONG"}}]}}'
+
+# Read it back — fullName and handle are server-derived; email is untouched.
+curl -s -X POST http://localhost:8300/api/query \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"db":"myapp","query":{"table":"users","index":"by_fullName","order":"desc"}}'
+# {"result":[{"_id":"…","_creationTime":…,"_version":1,"first":"Grace","last":"Hopper",
+#             "email":"  Grace@Example.COM ","fullName":"Grace Hopper","handle":"grace@example.com"}]}
+```
+
+A patch that changes `first` re-derives `fullName` from the merged document
+within that same write. Schema migration stays consistent: `renameField` rewrites the
+expression and re-stamps, dropping a referenced field is rejected naming the
+computed field, and `evalExpr`/`setDefault`/`changeType` rewrites that feed a
+computed input re-stamp dependents in the same migrate. See
+[FEATURE_MATRIX #39](FEATURE_MATRIX.md) and
+[`docs/superpowers/specs/2026-07-21-par-rt-db-design.md`](docs/superpowers/specs/2026-07-21-par-rt-db-design.md).
 
 ## Realtime presence
 

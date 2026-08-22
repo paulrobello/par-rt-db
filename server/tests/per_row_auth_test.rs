@@ -44,6 +44,7 @@ fn owner_schema() -> SchemaDef {
         "notes".to_string(),
         TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: notes_fields,
             indexes: notes_indexes,
             owner_field: Some("userId".into()),
@@ -61,6 +62,7 @@ fn owner_schema() -> SchemaDef {
         "open".to_string(),
         TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: open_fields,
             indexes: vec![],
             owner_field: None,
@@ -548,6 +550,7 @@ async fn search_filters_to_own_rows() -> anyhow::Result<()> {
         "notes".to_string(),
         TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: notes_fields,
             indexes: notes_indexes,
             owner_field: Some("userId".into()),
@@ -670,6 +673,7 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
         "docs".to_string(),
         TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: docs_fields,
             indexes: docs_indexes,
             owner_field: Some("userId".into()),
@@ -805,6 +809,7 @@ async fn vector_search_composes_filter_fields_with_owner() -> anyhow::Result<()>
         "docs".to_string(),
         TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: docs_fields,
             indexes: docs_indexes,
             owner_field: Some("userId".into()),
@@ -1764,6 +1769,7 @@ fn collab_schema() -> SchemaDef {
         "notes".to_string(),
         TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: notes_fields,
             indexes: notes_indexes,
             owner_field: Some("userId".into()),
@@ -2419,6 +2425,7 @@ fn authorize_schema() -> SchemaDef {
         "posts".to_string(),
         TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: posts_fields,
             indexes: posts_indexes,
             owner_field: None,
@@ -3103,6 +3110,7 @@ fn insert_stamp_schema() -> SchemaDef {
         let fields: BTreeMap<String, FieldType> = fields.into_iter().collect();
         TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![],
             owner_field: None,
@@ -3950,6 +3958,7 @@ fn composed_schema() -> SchemaDef {
         "docs".to_string(),
         TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![],
             owner_field: Some("owner".into()),
@@ -4588,6 +4597,7 @@ fn sec117_schema(authorize: FilterExpr) -> SchemaDef {
         "items".to_string(),
         TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![],
             owner_field: None,

@@ -1,0 +1,41 @@
+{
+  "name": "computed-null-optional",
+  "$comment": "ENH-028 null-removal semantics: an optional computed field (`nick` = coalesce(nickname)) stores NO key when the expression evaluates null — the unset-optional shape convention, never a stored null. Ada carries nickname \"Ace\" at insert (nick stamped \"Ace\"), then a patch nulls the input: the optional input key is stripped AND the recomputed null REMOVES the computed key. Bo never had the input (key absent straight from insert); Cy keeps hers (coalesce passthrough, nick = \"Cee\"). Full-equality on the unordered collect makes each absence and the one presence itself the assertion. Mirrors computed_test.rs (7).",
+  "schema": {
+    "tables": {
+      "users": {
+        "fields": {
+          "name": { "type": "string" },
+          "nickname": { "type": "optional", "inner": { "type": "string" } },
+          "nick": { "type": "optional", "inner": { "type": "string" } }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }],
+        "computed": {
+          "nick": { "op": "coalesce", "parts": [{ "op": "field", "field": "nickname" }] }
+        }
+      }
+    }
+  },
+  "seed": [
+    { "$id": "ada", "doc": { "name": "Ada", "nickname": "Ace" } },
+    { "name": "Bo" },
+    { "name": "Cy", "nickname": "Cee" }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        { "op": "patch", "table": "users", "id": { "$idRef": "ada" }, "fields": { "nickname": null } }
+      ]
+    }
+  },
+  "expect": [null],
+  "then": {
+    "query": { "table": "users" },
+    "expect": [
+      { "name": "Ada" },
+      { "name": "Bo" },
+      { "name": "Cy", "nickname": "Cee", "nick": "Cee" }
+    ],
+    "unordered": true
+  }
+}

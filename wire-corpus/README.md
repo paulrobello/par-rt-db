@@ -11,7 +11,8 @@ implementations honest against each other. Three artifacts live here:
   one JSON file per case, each self-contained (own schema + seed + operation +
   expected result), covering behavior the golden vector does not — transactions
   with per-step results, write-then-read visibility, defaults, soft delete, TTL,
-  cursors, and error codes.
+  cursors, error codes, schema-push validation (`pushError` cases), and migrate
+  interplay (`op.migrate` cases).
 - [`wire-corpus.json`](wire-corpus.json) — the **wire-shape parity corpus**
   (ARC-008): client/server messages, authed users, schedule whens/infos, and
   queries that every wire implementation must encode/decode value-identically —
@@ -67,7 +68,8 @@ JSON object:
 | `$comment` | no | Author note: what the case pins, and where the expected value was derived from when it is non-obvious. Keep concise. |
 | `schema` | yes | The schema wire object exactly as a client pushes it (`{"tables": {"<name>": {"fields": {...}, "indexes": [...], ...}}}` — the `SchemaDef` shape from `server/src/schema.rs`). Do NOT use golden-vector's flat `schema_table`/`schema_fields` shorthand; that is a legacy convention local to `golden-vector.json`. |
 | `seed` | yes | Documents inserted (in array order, via the normal insert path) before the op. Either a plain doc object (legal only when `schema` declares exactly one table) or `{"table"?: "...", "doc": {...}, "$id"?: "<label>"}` (`table` may be omitted when the schema has exactly one table). Disambiguation: an entry is a wrapped entry iff it is an object with a `doc` key whose value is an object; any other object is a plain doc — so a table with a field literally named `doc` holding an object is inexpressible as a plain seed, and corpus tables never declare one. |
-| `op` | yes | `{"query": <Query DSL>}` or `{"txn": {"steps": [<Step DSL>]}}` — the exact wire shapes from `server/src/dsl.rs`. |
+| `op` | yes | `{"query": <Query DSL>}`, `{"txn": {"steps": [<Step DSL>]}}`, or `{"migrate": {"directives": [<Directive>...], "dryRun": <bool>}}` — the query/txn wire shapes from `server/src/dsl.rs`; the `migrate` block is the admin `MigrateRequest` wire shape (`server/src/migrate.rs`, the same directives `wire-corpus.json`'s `migrate_requests` exercises). |
+| `pushError` | no | `{"code": "<CODE>"}` — when present, the schema PUSH itself is expected to fail, and the push is the whole case: the runner attempts the push and asserts the failure's code (the same `{code}` object and code-only matching `expect.error` uses; never message text). A `pushError` case carries no `seed`, `op`, `then`, or `expect`. |
 | `expect` | yes | The expected result (see below), or `{"error": {"code": "<CODE>"}}` for error cases. |
 | `unordered` | no | `true` when `expect` (or `then.expect`) is an array of docs with no deterministic order; compare as a sorted set (see [Determinism rulings](#determinism-rulings)). |
 | `normalize` | no | Keys projected out of both the actual and expected trees before comparison — the projection applies RECURSIVELY to every object in both trees (docs nested inside `paginate.docs`, step results, ...). Defaults to `["_id", "_creationTime", "_version"]` when absent; a present list REPLACES the default (txn cases add `"id"` for minted step-result ids). |
@@ -107,7 +109,9 @@ keys projected out:
 ## How a runner executes a case
 
 1. Create a fresh database/instance, push `schema` through the normal
-   schema-push path.
+   schema-push path. If the case carries `pushError`, the push is EXPECTED to
+   fail: assert its failure code and stop — the case has no seed, op, `then`,
+   or `expect` (a push that succeeds fails the case loudly).
 2. Insert each `seed` entry through the normal insert path — the `doc` member
    of a wrapped entry (into its `table`, or the single declared table), with
    any `$id` label stripped first and never sent — recording
@@ -121,6 +125,11 @@ keys projected out:
 5. Execute `op`. If `expect` is an error object, assert the failure's `code`.
    Otherwise assert success and compare the result to `expect` after applying
    `normalize` projection, `unordered` (if set), and numeric-tolerant equality.
+   A `migrate` op runs the package's real migrate path over `op.migrate`'s
+   directives (`dryRun` honored); its result — `{applied, schema, directives}`
+   (the derived schema plus per-directive reports; report `sampleChanges[].id`
+   is minted, so those cases carry `"id"` in `normalize`) — compares like any
+   op result, and the DERIVED schema replaces the case schema for `then`.
 6. If `then` is present and `op` succeeded, execute `then.query` and compare to
    `then.expect` the same way.
 

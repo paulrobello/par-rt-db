@@ -1250,6 +1250,7 @@ mod tests {
     fn test_table_def() -> TableDef {
         TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([
                 ("status".to_string(), FieldType::String),
                 ("order".to_string(), FieldType::Number),

@@ -426,6 +426,36 @@ async fn apply_schema_additive(
             }
         }
 
+        // Computed-field backfill (ENH-028): when this apply ADDED or CHANGED
+        // an entry in the table's computed map, re-derive that field for every
+        // existing row (plus its typed column, which the loop above may just
+        // have added — the doc key it backfills from is absent until the
+        // stamp runs). Runs before index creation so a new index builds over
+        // final values. An unchanged map runs no UPDATE — docs and `version`
+        // stay untouched on a pure re-push. This is the one additive-apply
+        // site shared by push (`push_schema`) and restore
+        // (`reconcile_schema_destructive` from `handle_restore_schema`), so
+        // both paths backfill. Removing an entry backfills nothing: stored
+        // values stay and become ordinary client-writable fields.
+        if let Some(old_table) = old_table {
+            let changed_computed: Vec<String> = new_table
+                .computed
+                .iter()
+                .filter(|(f, e)| old_table.computed.get(*f) != Some(*e))
+                .map(|(f, _)| f.clone())
+                .collect();
+            if !changed_computed.is_empty() {
+                crate::migrate::backfill_computed(
+                    tx,
+                    pg_schema_name,
+                    table_name,
+                    schema,
+                    &changed_computed,
+                )
+                .await?;
+            }
+        }
+
         // Auto-increment sequence: created (and repositioned past any stored
         // values) whenever the declaration is newly present — new table,
         // declaration added to an existing table, or declaration changed.
@@ -872,6 +902,7 @@ mod tests {
             table.to_string(),
             TableDef {
                 defaults: std::collections::BTreeMap::new(),
+                computed: std::collections::BTreeMap::new(),
                 fields,
                 indexes: vec![],
                 owner_field: None,

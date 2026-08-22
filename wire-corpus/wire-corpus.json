@@ -180,7 +180,12 @@
         { "op": "dropField", "affectedRows": 5, "castFailures": [ { "id": "i1", "value": null } ], "sampleChanges": [ { "id": "i1", "before": { "legacy": true }, "after": {} } ] }
       ]
     }
-  ],
+  ,
+    {
+      "applied": true,
+      "schema": { "tables": { "users": { "fields": { "first": { "type": "string" }, "last": { "type": "string" }, "fullName": { "type": "string" }, "slug": { "type": "optional", "inner": { "type": "string" } } }, "computed": { "fullName": { "op": "concat", "parts": [ { "op": "field", "field": "first" }, { "op": "literal", "value": " " }, { "op": "field", "field": "last" } ] }, "slug": { "op": "lower", "value": { "op": "trim", "value": { "op": "field", "field": "fullName" } } } }, "indexes": [] } } },
+      "directives": [ { "op": "renameField", "affectedRows": 0 } ]
+    }],
   "rejects_client_message_unknown_field": [
     { "type": "auth", "token": "t", "db": "d", "bogus": true },
     { "type": "unsubscribe", "queryId": "q1", "extra": 1 }

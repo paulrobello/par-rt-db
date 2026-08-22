@@ -1,0 +1,23 @@
+{
+  "name": "computed-push-validation",
+  "$comment": "ENH-028 push validation, rule 3: a computed expression referencing an undeclared field (`middle`) fails the schema push with BAD_REQUEST (validate_computed's undeclared-reference check — a `pushError` case: the push is the whole case, no seed/op). Engines must reject identically from their push paths. Mirrors computed_test.rs (9), first half.",
+  "schema": {
+    "tables": {
+      "users": {
+        "fields": {
+          "first": { "type": "string" },
+          "last": { "type": "string" },
+          "fullName": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_fullName", "fields": ["fullName"] }],
+        "computed": {
+          "fullName": { "op": "concat", "parts": [
+            { "op": "field", "field": "first" },
+            { "op": "field", "field": "middle" }
+          ] }
+        }
+      }
+    }
+  },
+  "pushError": { "code": "BAD_REQUEST" }
+}

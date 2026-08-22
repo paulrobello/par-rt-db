@@ -1,0 +1,45 @@
+{
+  "name": "computed-insert-patch-recompute",
+  "$comment": "ENH-028 computed fields on the write path: `fullName` is concat(first, \" \", last). An insert carrying a client-supplied `fullName` (\"WRONG\") has it overwritten by the stamp (step 1 — the txn result is {} after `id` normalize); a patch to the input `first` re-derives it from the merged doc (step 2: Gracie→Grace yields \"Grace Hopper\"). The follow-up collect over the `by_fullName` index in desc order pins that the typed computed column serves the scan — Grace Hopper, Alan Turing, Ada Lovelace — and the exact 3-row array pins the row count over the indexed computed field (the count terminal over the same index stays pinned in server/tests/computed_test.rs). Mirrors computed_test.rs (1), (2), (5).",
+  "schema": {
+    "tables": {
+      "users": {
+        "fields": {
+          "first": { "type": "string" },
+          "last": { "type": "string" },
+          "fullName": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_fullName", "fields": ["fullName"] }],
+        "computed": {
+          "fullName": { "op": "concat", "parts": [
+            { "op": "field", "field": "first" },
+            { "op": "literal", "value": " " },
+            { "op": "field", "field": "last" }
+          ] }
+        }
+      }
+    }
+  },
+  "seed": [
+    { "$id": "alan", "doc": { "first": "Alan", "last": "Turing" } },
+    { "$id": "grace", "doc": { "first": "Gracie", "last": "Hopper" } }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        { "op": "insert", "table": "users", "doc": { "first": "Ada", "last": "Lovelace", "fullName": "WRONG" } },
+        { "op": "patch", "table": "users", "id": { "$idRef": "grace" }, "fields": { "first": "Grace" } }
+      ]
+    }
+  },
+  "expect": [{}, null],
+  "normalize": ["_id", "_creationTime", "_version", "id"],
+  "then": {
+    "query": { "table": "users", "index": "by_fullName", "order": "desc" },
+    "expect": [
+      { "first": "Grace", "last": "Hopper", "fullName": "Grace Hopper" },
+      { "first": "Alan", "last": "Turing", "fullName": "Alan Turing" },
+      { "first": "Ada", "last": "Lovelace", "fullName": "Ada Lovelace" }
+    ]
+  }
+}

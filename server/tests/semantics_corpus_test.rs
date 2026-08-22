@@ -19,6 +19,14 @@
 //! canonical-JSON sort, numeric-tolerant equality, and structural
 //! `expect_next_cursor` presence. No clocks are advanced and no reaper runs
 //! between seeding and the op — the corpus pins synchronous semantics.
+//!
+//! Two additive case kinds (ENH-028): a `pushError` case asserts the schema
+//! PUSH itself fails with the given code (push is the whole case — no seed, no
+//! op), and an `op.migrate` case runs the real migrate machinery
+//! (`plan_migration` → `apply_migration` on a pool tx, the committer's
+//! `RunMigrate` shape minus committer-side quota/history/tap machinery) with
+//! the `MigrateResult` compared like any op result; a follow-up `then` reads
+//! against the DERIVED schema.
 
 mod common;
 
@@ -30,6 +38,7 @@ use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::db;
 use rtdb_server::ddl;
 use rtdb_server::error::{ErrorCode, RtDbError};
+use rtdb_server::migrate::{MigrateRequest, apply_migration, plan_migration};
 use rtdb_server::query::{Query, QueryResult, execute_query};
 use rtdb_server::schema::SchemaDef;
 use rtdb_server::txn::{Step, Transaction, TxnOutcome, execute_txn};
@@ -258,6 +267,54 @@ fn assert_result(case: &str, actual: Value, block: &Value, keys: &[String], unor
     assert_expected(&got, &want, unordered, &format!("{case}: result mismatch"));
 }
 
+/// Execute one `op.migrate` case body the way the committer's `RunMigrate` arm
+/// does — `plan_migration` (plus `validate`, the computed-field changeType
+/// re-validation path) then `apply_migration` on a pool transaction, committing
+/// for real or rolling back on `dryRun`. The committer-side machinery the
+/// corpus runner cannot reach (quota gates, schema-history capture, tap
+/// publication) is omitted — the same in-process shape the migrate/computed
+/// integration tests exercise. Returns the derived schema (a follow-up `then`
+/// reads against it) plus the serialized `MigrateResult` (`applied` / derived
+/// `schema` / per-directive reports). Migrate-domain errors (plan, derived-
+/// schema validation, apply) return `Err` so an error case can assert the
+/// envelope; infrastructure failures panic.
+async fn run_migrate(
+    pool: &sqlx::PgPool,
+    db_name: &str,
+    schema: &SchemaDef,
+    req: &MigrateRequest,
+    case_name: &str,
+) -> Result<(SchemaDef, Value), RtDbError> {
+    let derived = plan_migration(schema, &req.directives)?;
+    derived.validate()?;
+    let mut tx = pool
+        .begin()
+        .await
+        .unwrap_or_else(|e| panic!("{case_name}: begin migrate tx: {e:?}"));
+    let fx = match apply_migration(&mut tx, db_name, &req.directives, &derived, req.dry_run).await {
+        Ok(fx) => fx,
+        // The open tx drops here, rolling back — an apply failure is a
+        // migrate-domain error the case may assert, never a partial commit.
+        Err(e) => return Err(e),
+    };
+    if req.dry_run {
+        tx.rollback()
+            .await
+            .unwrap_or_else(|e| panic!("{case_name}: rollback dry-run: {e:?}"));
+    } else {
+        tx.commit()
+            .await
+            .unwrap_or_else(|e| panic!("{case_name}: commit migrate: {e:?}"));
+    }
+    let result = rtdb_server::migrate::MigrateResult {
+        applied: !req.dry_run,
+        schema: derived.clone(),
+        directives: fx.reports,
+    };
+    let value = serde_json::to_value(&result).expect("serialize MigrateResult");
+    Ok((derived, value))
+}
+
 /// Execute one corpus case end to end. Every failure names the case.
 async fn run_case(pool: &sqlx::PgPool, case_name: &str, case: &Value) {
     // Fresh database per case: unique name derived from the case stem, RAII
@@ -269,8 +326,34 @@ async fn run_case(pool: &sqlx::PgPool, case_name: &str, case: &Value) {
         .unwrap_or_else(|e| panic!("{case_name}: create database: {e:?}"));
     let _guard = wrap_test_db(db_name.clone());
 
-    let schema: SchemaDef = serde_json::from_value(case["schema"].clone())
+    let mut schema: SchemaDef = serde_json::from_value(case["schema"].clone())
         .unwrap_or_else(|e| panic!("{case_name}: schema does not parse: {e}"));
+
+    // A `pushError` case asserts the schema PUSH itself fails (README format:
+    // the value carries the same `{code}` object `expect.error` does; only the
+    // code is asserted, never the message). Push is the whole case — a
+    // stray seed/op/then/expect is an authoring error.
+    if let Some(push_err) = case.get("pushError") {
+        for stray in ["seed", "op", "then", "expect"] {
+            assert!(
+                case.get(stray).is_none(),
+                "{case_name}: a pushError case must not carry `{stray}` — push is the whole case"
+            );
+        }
+        let want: ErrorCode = serde_json::from_value(push_err["code"].clone())
+            .unwrap_or_else(|e| panic!("{case_name}: pushError.code does not parse: {e}"));
+        let err = ddl::push_schema(pool, &db_name, schema)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{case_name}: pushError case — the push must fail"));
+        assert_eq!(
+            err.code, want,
+            "{case_name}: push error code mismatch — server message: {}",
+            err.message
+        );
+        return;
+    }
+
     ddl::push_schema(pool, &db_name, schema.clone())
         .await
         .unwrap_or_else(|e| panic!("{case_name}: push_schema: {e:?}"));
@@ -378,8 +461,29 @@ async fn run_case(pool: &sqlx::PgPool, case_name: &str, case: &Value) {
                 return; // a failed op has no `then` follow-up
             }
         }
+    } else if let Some(migrate_json) = case.pointer("/op/migrate") {
+        let req: MigrateRequest = serde_json::from_value(substitute(migrate_json, &ids, case_name))
+            .unwrap_or_else(|e| panic!("{case_name}: op.migrate does not parse: {e}"));
+        match run_migrate(pool, &db_name, &schema, &req, case_name).await {
+            // The derived schema replaces the case schema for `then` follow-ups
+            // — post-migrate reads resolve fields through it.
+            Ok((derived, result)) => {
+                schema = derived;
+                result
+            }
+            Err(e) => {
+                if !expects_error {
+                    panic!(
+                        "{case_name}: unexpected migrate error ({:?}): {}",
+                        e.code, e.message
+                    );
+                }
+                assert_error_code(&e, expect, case_name);
+                return; // a failed op has no `then` follow-up
+            }
+        }
     } else {
-        panic!("{case_name}: op must carry `query` or `txn`");
+        panic!("{case_name}: op must carry `query`, `txn`, or `migrate`");
     };
 
     assert!(

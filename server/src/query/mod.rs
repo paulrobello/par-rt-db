@@ -732,6 +732,7 @@ mod tests {
         fields.insert(field.to_string(), ft);
         TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![IndexDef {
                 name: format!("by_{field}"),
@@ -762,6 +763,7 @@ mod tests {
         }
         TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: fields_map,
             indexes: vec![],
             owner_field: None,
@@ -846,6 +848,7 @@ mod tests {
         fields_map.insert("archivedat".to_string(), FieldType::String);
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: fields_map,
             indexes: vec![],
             owner_field: None,

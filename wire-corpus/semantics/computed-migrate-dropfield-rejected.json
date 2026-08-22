@@ -1,0 +1,33 @@
+{
+  "name": "computed-migrate-dropfield-rejected",
+  "$comment": "ENH-028 migrate interplay: dropField on a field a computed expression reads (`first` feeds fullName) is rejected at plan time with BAD_REQUEST — dropping the input would strand the derivation. Mirrors computed_test.rs (11), first half. An op.migrate error case: only the code is asserted, never the message.",
+  "schema": {
+    "tables": {
+      "users": {
+        "fields": {
+          "first": { "type": "string" },
+          "last": { "type": "string" },
+          "fullName": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_fullName", "fields": ["fullName"] }],
+        "computed": {
+          "fullName": { "op": "concat", "parts": [
+            { "op": "field", "field": "first" },
+            { "op": "literal", "value": " " },
+            { "op": "field", "field": "last" }
+          ] }
+        }
+      }
+    }
+  },
+  "seed": [],
+  "op": {
+    "migrate": {
+      "directives": [
+        { "op": "dropField", "table": "users", "field": "first" }
+      ],
+      "dryRun": false
+    }
+  },
+  "expect": { "error": { "code": "BAD_REQUEST" } }
+}

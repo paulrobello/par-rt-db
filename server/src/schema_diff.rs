@@ -236,6 +236,7 @@ mod tests {
     fn table(fields: &[(&str, FieldType)], indexes: &[IndexDef]) -> TableDef {
         TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: fields
                 .iter()
                 .map(|(n, t)| (n.to_string(), t.clone()))

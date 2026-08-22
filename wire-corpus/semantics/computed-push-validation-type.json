@@ -1,0 +1,22 @@
+{
+  "name": "computed-push-validation-type",
+  "$comment": "ENH-028 push validation, rule 5 (static-kind): a string-producing expression (concat) declared for a NUMBER field fails the schema push with BAD_REQUEST (validate_computed's statically-known-result-kind check — a `pushError` case: the push is the whole case, no seed/op). Field/Coalesce/Case stay untyped and skip this check; concat/lower/trim/arith/now/casts are statically kinded. Mirrors computed_test.rs (9), second half.",
+  "schema": {
+    "tables": {
+      "metrics": {
+        "fields": {
+          "denom": { "type": "optional", "inner": { "type": "number" } },
+          "ratio": { "type": "optional", "inner": { "type": "number" } }
+        },
+        "indexes": [{ "name": "by_denom", "fields": ["denom"] }],
+        "computed": {
+          "ratio": { "op": "concat", "parts": [
+            { "op": "field", "field": "denom" },
+            { "op": "literal", "value": "x" }
+          ] }
+        }
+      }
+    }
+  },
+  "pushError": { "code": "BAD_REQUEST" }
+}

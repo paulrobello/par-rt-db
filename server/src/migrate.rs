@@ -65,101 +65,11 @@ pub enum Directive {
     },
 }
 
-/// Closed set of sound coercions. Shared by `Directive::ChangeType` and
-/// `ValueExpr::Cast` — the four scalar casts that are sound to backfill.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum Cast {
-    ToString,
-    ToNumber,
-    ToInt64,
-    ToBoolean,
-}
-
-/// A closed, typed expression grammar for `Directive::EvalExpr`'s backfill
-/// expression (ENH-020 Stage 1, closing SEC-107). Mirrors `query::FilterExpr`'s
-/// serde conventions: `tag = "op"`, camelCase, `deny_unknown_fields`. Every
-/// `Literal` compiles to a bound `$n` placeholder (as jsonb); every `Field`
-/// resolves through the table's `TableDef` (errors on an unknown field) and
-/// reads `doc->'field'`. There is deliberately **no** subquery node, no
-/// function-call-by-name node, and no raw-SQL escape — the grammar is closed,
-/// so the SEC-107 injection concern cannot arise from a `ValueExpr` payload.
-/// The only way to reach raw SQL is the deprecated `Legacy(String)` source,
-/// which remains gated to the root admin_key (see `admin_migrate`).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]
-pub enum ValueExpr {
-    /// A declared field on this table (validated against `TableDef`). Reads
-    /// `doc->'field'` (jsonb). The field must be declared; the write target
-    /// (`EvalExpr.set`) need not be.
-    Field {
-        field: String,
-    },
-    /// Any JSON literal. Bound as `$n::jsonb`, so objects/arrays/null round-trip.
-    Literal {
-        value: serde_json::Value,
-    },
-    /// String concatenation. Postgres `concat(...)`, which ignores NULL args
-    /// (treats them as empty) — wrap operands in `Coalesce` for explicit control.
-    Concat {
-        parts: Vec<ValueExpr>,
-    },
-    /// Numeric arithmetic. Operands are cast to `::numeric`; the result is a
-    /// JSON number via the surrounding `to_jsonb`. Division by zero errors at
-    /// runtime — guard with `Case`/`Coalesce` when the divisor may be zero.
-    Add {
-        left: Box<ValueExpr>,
-        right: Box<ValueExpr>,
-    },
-    Sub {
-        left: Box<ValueExpr>,
-        right: Box<ValueExpr>,
-    },
-    Mul {
-        left: Box<ValueExpr>,
-        right: Box<ValueExpr>,
-    },
-    Div {
-        left: Box<ValueExpr>,
-        right: Box<ValueExpr>,
-    },
-    /// `COALESCE(parts...)` — first non-null, or NULL.
-    Coalesce {
-        parts: Vec<ValueExpr>,
-    },
-    /// Text casing / trim. Operand cast to `::text`.
-    Lower {
-        value: Box<ValueExpr>,
-    },
-    Upper {
-        value: Box<ValueExpr>,
-    },
-    Trim {
-        value: Box<ValueExpr>,
-    },
-    /// A closed scalar coercion. Reuses `Directive::ChangeType`'s `Cast` enum.
-    Cast {
-        value: Box<ValueExpr>,
-        to: Cast,
-    },
-    /// Current timestamp (`now()`), as jsonb.
-    Now,
-    /// Conditional: first matching `when`'s `then`, else `otherwise`. Each
-    /// `when` is a `FilterExpr` (compiled via the read path's `compile_filter`,
-    /// so its field references are schema-validated and its values bound).
-    Case {
-        whens: Vec<CaseWhen>,
-        otherwise: Box<ValueExpr>,
-    },
-}
-
-/// One branch of `ValueExpr::Case`. Wire shape `{ when, then }`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CaseWhen {
-    pub when: crate::query::FilterExpr,
-    pub then: ValueExpr,
-}
+use crate::value_expr::compile_value_expr;
+/// The `ValueExpr` grammar and its `Cast`/`CaseWhen` companions live in
+/// `crate::value_expr` (shared with computed fields, ENH-028); re-exported so
+/// `crate::migrate::ValueExpr` paths and the `Directive` arms keep resolving.
+pub use crate::value_expr::{CaseWhen, Cast, ValueExpr};
 
 /// Dual-accept source for `EvalExpr.expr`: a typed `ValueExpr` (the safe path)
 /// or a legacy raw-SQL string (the deprecated path, gated to root admin_key).
@@ -186,9 +96,10 @@ pub enum CondSource {
 /// A bind for the migrate expression path. `EqBind`'s four typed variants cover
 /// `FilterExpr` values (compiled via `compile_filter`); `Json` covers
 /// `ValueExpr::Literal` (any JSON value, bound as jsonb). The two coexist in one
-/// UPDATE statement with contiguous `$n` numbering.
+/// UPDATE statement with contiguous `$n` numbering. `pub(crate)` because
+/// `value_expr::compile_value_expr` fills this vec from the migrate call site.
 #[derive(Debug, Clone)]
-enum MigrateBind {
+pub(crate) enum MigrateBind {
     Text(String),
     Num(f64),
     Bool(bool),
@@ -267,6 +178,12 @@ pub fn plan_migration(old: &SchemaDef, directives: &[Directive]) -> Result<Schem
     for d in directives {
         validate_one(&mut schema, d)?;
     }
+    // Directive folding must not be able to invalidate a computed entry —
+    // e.g. `changeType` retyping a computed field so its expression's static
+    // kind no longer fits. Re-validate the derived maps here (pure) so the
+    // plan fails before any DB work; the committer's `derived.validate()`
+    // backstop covers the same rules through `validate_structure`.
+    crate::schema::validate_computed(&schema)?;
     Ok(schema)
 }
 
@@ -302,6 +219,20 @@ fn validate_one(schema: &mut SchemaDef, d: &Directive) -> Result<(), RtDbError> 
             }
             if let Some(expr) = t.authorize.as_mut() {
                 rename_filter_fields(expr, from, to);
+            }
+            // ENH-028: the computed map follows the rename the way `defaults`
+            // does — an entry KEYED on the renamed field moves to the new name
+            // (its declared field moved; leaving it keyed on `from` would fail
+            // `validate_computed`'s declared-field rule on the derived schema),
+            // and every expression's `Field` references (including
+            // `Case.whens` predicates) are rewritten to read the renamed doc
+            // key. Input values are unchanged by the rename, so stored
+            // computed values stay correct; the next write re-stamps.
+            if let Some(expr) = t.computed.remove(from) {
+                t.computed.insert(to.clone(), expr);
+            }
+            for expr in t.computed.values_mut() {
+                rename_value_expr_fields(expr, from, to);
             }
             if let Some(value) = t.defaults.remove(from) {
                 t.defaults.insert(to.clone(), value);
@@ -390,6 +321,33 @@ fn validate_one(schema: &mut SchemaDef, d: &Directive) -> Result<(), RtDbError> 
             if t.auto_increment_field.as_deref() == Some(field.as_str()) {
                 t.auto_increment_field = None;
             }
+            // ENH-028: a computed expression reading the dropped field would
+            // dangle — every future write fails its stamp. Reject, naming the
+            // computed field, so the caller amends the computed map first (a
+            // push removing the entry leaves stored values in place).
+            let mut computed_offender: Option<&String> = None;
+            for (computed_field, expr) in &t.computed {
+                let mut referenced = false;
+                crate::value_expr::walk_value_expr_fields(expr, &mut |f| {
+                    if f == field {
+                        referenced = true;
+                    }
+                });
+                if referenced {
+                    computed_offender = Some(computed_field);
+                    break;
+                }
+            }
+            if let Some(computed_field) = computed_offender {
+                return Err(RtDbError::bad_request(format!(
+                    "cannot drop field '{table}.{field}': it is referenced by computed field '{table}.{computed_field}'; drop the computed field first"
+                )));
+            }
+            // An entry KEYED on the dropped field goes with it (the `defaults`
+            // discipline): the applier removes the stored key from every doc,
+            // so leaving the entry would fail `validate_computed`'s
+            // declared-field rule on the derived schema.
+            t.computed.remove(field);
             t.defaults.remove(field);
         }
         Directive::DropTable { name } => {
@@ -490,6 +448,46 @@ fn rename_filter_fields(expr: &mut crate::query::FilterExpr, from: &str, to: &st
             }
         }
         FilterExpr::Not { expr } => rename_filter_fields(expr, from, to),
+    }
+}
+
+/// The `ValueExpr` half of the rename: rewrites every `Field` reference equal
+/// to `from` to `to`, in place — the `&mut` mirror of
+/// `value_expr::walk_value_expr_fields`. `Case.whens` predicates reuse
+/// `rename_filter_fields` (the same rewrite `authorize` gets), so a rename
+/// carries computed expressions across intact. `to` is fresh (the RenameField
+/// arm rejects an existing target), so no reference set can collide.
+fn rename_value_expr_fields(expr: &mut ValueExpr, from: &str, to: &str) {
+    match expr {
+        ValueExpr::Field { field } => {
+            if field == from {
+                *field = to.to_string();
+            }
+        }
+        ValueExpr::Literal { .. } | ValueExpr::Now => {}
+        ValueExpr::Concat { parts } | ValueExpr::Coalesce { parts } => {
+            for p in parts {
+                rename_value_expr_fields(p, from, to);
+            }
+        }
+        ValueExpr::Add { left, right }
+        | ValueExpr::Sub { left, right }
+        | ValueExpr::Mul { left, right }
+        | ValueExpr::Div { left, right } => {
+            rename_value_expr_fields(left, from, to);
+            rename_value_expr_fields(right, from, to);
+        }
+        ValueExpr::Lower { value } | ValueExpr::Upper { value } | ValueExpr::Trim { value } => {
+            rename_value_expr_fields(value, from, to);
+        }
+        ValueExpr::Cast { value, .. } => rename_value_expr_fields(value, from, to),
+        ValueExpr::Case { whens, otherwise } => {
+            for cw in whens {
+                rename_filter_fields(&mut cw.when, from, to);
+                rename_value_expr_fields(&mut cw.then, from, to);
+            }
+            rename_value_expr_fields(otherwise, from, to);
+        }
     }
 }
 
@@ -652,7 +650,21 @@ async fn apply_one(
             to,
             cast,
             default,
-        } => apply_change_type(tx, schema_name, old, table, field, to, cast, default, fx).await,
+        } => {
+            apply_change_type(
+                tx,
+                schema_name,
+                old,
+                derived,
+                table,
+                field,
+                to,
+                cast,
+                default,
+                fx,
+            )
+            .await
+        }
         Directive::EvalExpr {
             table,
             set,
@@ -964,6 +976,17 @@ async fn apply_set_default(
         let expr = backfill_expr(pg_type, field)?;
         recompute_columns_for_ids(tx, schema_name, &t, &col, &expr, &ids).await?;
     }
+    // ENH-028 invariant (stored computed value == expr over the doc): the
+    // defaulted field may feed a computed expression — after this rewrite the
+    // stored stamp would be stale until each row's next write, so re-derive
+    // the dependent entries for exactly the rows that received the default,
+    // then refresh their typed columns (`recompute_all_indexed` — the
+    // dependent computed fields may be indexed even when `field` is not).
+    let dependents = computed_fields_referencing(derived_table, field);
+    if !dependents.is_empty() {
+        restamp_computed_fields(tx, schema_name, &t, table, derived, &dependents, &ids).await?;
+        recompute_all_indexed(tx, schema_name, &t, table, derived, &ids).await?;
+    }
     let n = ids.len() as i64;
     fx.touched.insert(table.to_string());
     push_ops(&mut fx.ops, table, &ids, OpKind::Patch);
@@ -979,6 +1002,7 @@ async fn apply_change_type(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     schema_name: &str,
     old: &SchemaDef,
+    derived: &SchemaDef,
     table: &str,
     field: &str,
     to: &FieldType,
@@ -1066,6 +1090,18 @@ async fn apply_change_type(
         .execute(&mut **tx)
         .await?;
     }
+    // ENH-028 invariant (stored computed value == expr over the doc): the
+    // cast rewrote the stored values of `field`; every computed expression
+    // reading it must re-derive for the affected rows (the carriers captured
+    // above — untouched rows keep their stamp), then refresh typed columns.
+    // `derived` carries the post-batch computed map, so a directive sequence
+    // (rename, then changeType on the renamed field) resolves dependents by
+    // the field's current name — the same resolution `apply_eval_expr` uses.
+    let dependents = computed_fields_referencing(table_def(derived, table)?, field);
+    if !dependents.is_empty() {
+        restamp_computed_fields(tx, schema_name, &t, table, derived, &dependents, &ids).await?;
+        recompute_all_indexed(tx, schema_name, &t, table, derived, &ids).await?;
+    }
     fx.touched.insert(table.to_string());
     push_ops(&mut fx.ops, table, &ids, OpKind::Patch);
     Ok(DirectiveReport {
@@ -1139,6 +1175,16 @@ async fn apply_eval_expr(
             );
             bind_execute(&update_sql, &all_binds, tx).await?;
 
+            restamp_computed_fields(
+                tx,
+                schema_name,
+                &t,
+                table,
+                derived,
+                &computed_field_names(derived_table),
+                &ids,
+            )
+            .await?;
             recompute_all_indexed(tx, schema_name, &t, table, derived, &ids).await?;
             Ok(report(table, ids, fx))
         }
@@ -1164,10 +1210,137 @@ async fn apply_eval_expr(
             ))
             .execute(&mut **tx)
             .await?;
+            // The legacy rewrite feeds the same computed re-stamp: whichever
+            // path rewrote the doc, computed values derived from pre-rewrite
+            // inputs would be stale until each row's next write.
+            restamp_computed_fields(
+                tx,
+                schema_name,
+                &t,
+                table,
+                derived,
+                &computed_field_names(derived_table),
+                &ids,
+            )
+            .await?;
             recompute_all_indexed(tx, schema_name, &t, table, derived, &ids).await?;
             Ok(report(table, ids, fx))
         }
     }
+}
+
+/// Every computed field name on `table`, in declaration order — the re-stamp
+/// set for a doc rewrite whose expression may feed any of them.
+fn computed_field_names(table: &TableDef) -> Vec<String> {
+    table.computed.keys().cloned().collect()
+}
+
+/// Names of the table's computed entries whose expression reads `field` — the
+/// re-stamp set after a directive (`setDefault`/`changeType`) rewrote that
+/// field's stored values. The walk covers `Field` nodes and `Case.whens`
+/// filter fields, matching what `validate_computed` treats as a reference.
+fn computed_fields_referencing(table: &TableDef, field: &str) -> Vec<String> {
+    table
+        .computed
+        .iter()
+        .filter(|(_, expr)| {
+            let mut referenced = false;
+            crate::value_expr::walk_value_expr_fields(expr, &mut |f| {
+                if f == field {
+                    referenced = true;
+                }
+            });
+            referenced
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Re-derives the named `computed` entries into `doc` for exactly `ids`,
+/// inside the caller's tx (ENH-028). Used by `evalExpr` (whose doc rewrite
+/// changes computed inputs — the stored stamp would be stale until each row's
+/// next write), by `setDefault`/`changeType` (same staleness, scoped to the
+/// dependent entries), and by the push/restore backfill. Each entry runs as
+/// one UPDATE over the ids with the SQL compiler's expression; a SQL-NULL
+/// result REMOVES the key (the write path's `stamp_computed` convention — an
+/// unset optional is an absent key), which a bare `jsonb_set` cannot express:
+/// with a SQL-NULL value it nulls the whole `doc` and trips the column's NOT
+/// NULL.
+async fn restamp_computed_fields(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    schema_name: &str,
+    table_pg: &str,
+    table_logical: &str,
+    derived: &SchemaDef,
+    fields: &[String],
+    ids: &[String],
+) -> Result<(), RtDbError> {
+    if ids.is_empty() || fields.is_empty() {
+        return Ok(());
+    }
+    let derived_table = table_def(derived, table_logical)?;
+    for field in fields {
+        let ve = derived_table.computed.get(field).ok_or_else(|| {
+            // The callers build `fields` from this same map (evalExpr: its
+            // keys; backfill: the old-vs-new diff), so this is unreachable
+            // unless they drift apart.
+            RtDbError::internal(format!(
+                "computed field '{table_logical}.{field}' missing from derived schema"
+            ))
+        })?;
+        // SEC-124 backstop: `field` is interpolated into the jsonb_set path
+        // literal and the `doc - '{field}'` key, like every other site.
+        require_field_ident(field)?;
+        // `id = ANY($1)` binds first; the expression's placeholders start at 2.
+        let mut binds: Vec<MigrateBind> = Vec::new();
+        let expr_sql = compile_value_expr(ve, derived_table, 2, &mut binds)?;
+        let sql = format!(
+            "UPDATE \"{schema_name}\".\"{table_pg}\" \
+             SET doc = CASE WHEN to_jsonb(({expr_sql})) IS NULL \
+                 THEN doc - '{field}' \
+                 ELSE jsonb_set(doc, '{{\"{field}\"}}', to_jsonb(({expr_sql})), true) END \
+             WHERE id = ANY($1)"
+        );
+        let mut q = sqlx::query(&sql).bind(ids);
+        for b in &binds {
+            q = match b {
+                MigrateBind::Text(s) => q.bind(s.as_str()),
+                MigrateBind::Num(f) => q.bind(*f),
+                MigrateBind::Bool(b) => q.bind(*b),
+                MigrateBind::I64(i) => q.bind(*i),
+                MigrateBind::Json(v) => q.bind(sqlx::types::Json(v)),
+            };
+        }
+        q.execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
+/// Push/restore computed backfill (ENH-028 Task 4): re-derives `fields` — the
+/// computed entries this apply ADDED or CHANGED, per the old-vs-new computed
+/// diff in `ddl::apply_schema_additive` — for EVERY row of the table, then
+/// refreshes the typed columns (`recompute_all_indexed`). Runs inside the
+/// push/restore tx, after the new typed columns exist and before index
+/// creation. Entries whose expression did NOT change are excluded, so a pure
+/// re-push rewrites nothing (docs and `version` untouched) and a Now()-bearing
+/// expr refreshes its timestamp only when its expression changed. Removal of a
+/// computed entry backfills nothing — stored values stay and become ordinary
+/// client-writable fields.
+pub(crate) async fn backfill_computed(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pg_schema_name: &str,
+    table_logical: &str,
+    derived: &SchemaDef,
+    fields: &[String],
+) -> Result<(), RtDbError> {
+    let t = pg_table(table_logical);
+    let ids = all_ids(tx, pg_schema_name, &t).await?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    restamp_computed_fields(tx, pg_schema_name, &t, table_logical, derived, fields, &ids).await?;
+    recompute_all_indexed(tx, pg_schema_name, &t, table_logical, derived, &ids).await?;
+    Ok(())
 }
 
 fn report(table: &str, ids: Vec<String>, fx: &mut MigrationEffects) -> DirectiveReport {
@@ -1232,138 +1405,6 @@ pub(crate) fn validate_value_expr_fields(
         }
     }
     Ok(())
-}
-
-/// Compiles a `ValueExpr` into a SQL fragment plus its typed binds, with `$n`
-/// placeholders numbered from 1-based `start_pos`. Every `Literal` emits one
-/// bind (as jsonb); every `Field` inlines `doc->'field'` (the field name is
-/// schema-validated by `validate_value_expr_fields` and a safe jsonb key). The
-/// result is intended for `to_jsonb((<expr>))`, so each branch yields a value
-/// compatible with jsonb coercion. `Case` branches reuse the read path's
-/// `query::compile_filter` for their predicates — no forked compiler, so the
-/// SEC-117 three-valued-logic guards (COALESCE-wrapped negation, etc.) apply.
-/// There is no raw-SQL node — the grammar is closed, which is the SEC-107
-/// boundary.
-fn compile_value_expr(
-    ve: &ValueExpr,
-    table: &TableDef,
-    start_pos: usize,
-    binds: &mut Vec<MigrateBind>,
-) -> Result<String, RtDbError> {
-    Ok(match ve {
-        ValueExpr::Field { field } => {
-            // Text extraction — the expr result feeds `to_jsonb((EXPR))`, so a
-            // field yields text (mirrors the legacy `doc->>'field'` reads). The
-            // field name is schema-validated by `validate_value_expr_fields`.
-            format!("doc->>'{field}'")
-        }
-        ValueExpr::Literal { value } => {
-            // Placeholder numbering is `start_pos + binds.len()` — `start_pos`
-            // is the base for THIS compilation, and `binds.len()` is the offset
-            // accumulated by earlier siblings (the vec is shared across the
-            // recursion, mirroring `compile_filter_node`). Recursive calls pass
-            // `start_pos` unchanged so the offset is not double-counted.
-            let ph = start_pos + binds.len();
-            match value {
-                serde_json::Value::String(s) => {
-                    binds.push(MigrateBind::Text(s.clone()));
-                    format!("${ph}::text")
-                }
-                serde_json::Value::Number(n) => {
-                    binds.push(MigrateBind::Num(n.as_f64().unwrap_or(0.0)));
-                    format!("${ph}::numeric")
-                }
-                serde_json::Value::Bool(b) => {
-                    binds.push(MigrateBind::Bool(*b));
-                    format!("${ph}::boolean")
-                }
-                serde_json::Value::Null => "NULL".to_string(),
-                other => {
-                    binds.push(MigrateBind::Json(other.clone()));
-                    format!("${ph}::jsonb")
-                }
-            }
-        }
-        ValueExpr::Concat { parts } => {
-            let compiled: Vec<String> = parts
-                .iter()
-                .map(|p| compile_value_expr(p, table, start_pos, binds))
-                .collect::<Result<_, _>>()?;
-            format!("concat({})", compiled.join(", "))
-        }
-        ValueExpr::Add { left, right }
-        | ValueExpr::Sub { left, right }
-        | ValueExpr::Mul { left, right }
-        | ValueExpr::Div { left, right } => {
-            let op = match ve {
-                ValueExpr::Add { .. } => "+",
-                ValueExpr::Sub { .. } => "-",
-                ValueExpr::Mul { .. } => "*",
-                ValueExpr::Div { .. } => "/",
-                _ => unreachable!(),
-            };
-            let l = compile_value_expr(left, table, start_pos, binds)?;
-            let r = compile_value_expr(right, table, start_pos, binds)?;
-            format!("(({})::numeric {op} ({}))::numeric", l, r)
-        }
-        ValueExpr::Coalesce { parts } => {
-            let compiled: Vec<String> = parts
-                .iter()
-                .map(|p| compile_value_expr(p, table, start_pos, binds))
-                .collect::<Result<_, _>>()?;
-            format!("COALESCE({})", compiled.join(", "))
-        }
-        ValueExpr::Lower { value } => {
-            format!(
-                "lower(({})::text)",
-                compile_value_expr(value, table, start_pos, binds)?
-            )
-        }
-        ValueExpr::Upper { value } => {
-            format!(
-                "upper(({})::text)",
-                compile_value_expr(value, table, start_pos, binds)?
-            )
-        }
-        ValueExpr::Trim { value } => {
-            format!(
-                "btrim(({})::text)",
-                compile_value_expr(value, table, start_pos, binds)?
-            )
-        }
-        ValueExpr::Cast { value, to } => {
-            let cast_sql = match to {
-                Cast::ToString => "::text",
-                Cast::ToNumber => "::numeric",
-                Cast::ToInt64 => "::bigint",
-                Cast::ToBoolean => "::boolean",
-            };
-            format!(
-                "({}){}",
-                compile_value_expr(value, table, start_pos, binds)?,
-                cast_sql
-            )
-        }
-        ValueExpr::Now => "now()".to_string(),
-        ValueExpr::Case { whens, otherwise } => {
-            let mut fragments: Vec<String> = Vec::with_capacity(whens.len() + 1);
-            for cw in whens {
-                // Compile the predicate from the current tail (`start_pos +
-                // binds.len()`), then push its binds before compiling `then` so
-                // the then-expression numbers after them. `start_pos` is passed
-                // unchanged to the recursive `then`/`otherwise` calls — the
-                // shared `binds.len()` tracks the running offset.
-                let cur = start_pos + binds.len();
-                let (cond_sql, cond_binds) = crate::query::compile_filter(&cw.when, table, cur)?;
-                binds.extend(cond_binds.into_iter().map(Into::into));
-                let then_sql = compile_value_expr(&cw.then, table, start_pos, binds)?;
-                fragments.push(format!("WHEN {cond_sql} THEN {then_sql}"));
-            }
-            let else_sql = compile_value_expr(otherwise, table, start_pos, binds)?;
-            fragments.push(format!("ELSE {else_sql}"));
-            format!("CASE {} END", fragments.join(" "))
-        }
-    })
 }
 
 /// Reads the stored schema from the db's `meta` row inside `tx`. Before Task 6's
@@ -1653,6 +1694,39 @@ mod tests {
         assert!(report.sample_changes.is_empty());
     }
 
+    // ENH-028: directive folding must not be able to invalidate a computed
+    // entry — a changeType that retypes a computed field so the expression's
+    // static kind no longer fits fails the plan before any DB work.
+    #[test]
+    fn plan_migration_revalidates_computed_after_change_type() {
+        let mut old = one_table_schema();
+        let users = old.tables.get_mut("users").expect("users table");
+        users.fields.insert("count".into(), FieldType::Number);
+        users.computed.insert(
+            "age".into(),
+            ValueExpr::Add {
+                left: Box::new(ValueExpr::Field {
+                    field: "count".into(),
+                }),
+                right: Box::new(ValueExpr::Literal {
+                    value: serde_json::json!(1),
+                }),
+            },
+        );
+        let d = vec![Directive::ChangeType {
+            table: "users".into(),
+            field: "age".into(),
+            to: FieldType::String,
+            cast: Cast::ToString,
+            default: None,
+        }];
+        let err = plan_migration(&old, &d).unwrap_err();
+        assert!(err.message.contains("produces a number"), "{}", err.message);
+        // Without the computed entry the same fold still plans fine.
+        let clean = one_table_schema();
+        assert!(plan_migration(&clean, &d).is_ok());
+    }
+
     use std::collections::BTreeMap;
 
     fn one_table_schema() -> SchemaDef {
@@ -1664,6 +1738,7 @@ mod tests {
             "users".into(),
             TableDef {
                 defaults: std::collections::BTreeMap::new(),
+                computed: std::collections::BTreeMap::new(),
                 fields,
                 indexes: vec![],
                 owner_field: None,
@@ -1795,6 +1870,7 @@ mod tests {
             "things".into(),
             TableDef {
                 defaults: std::collections::BTreeMap::new(),
+                computed: std::collections::BTreeMap::new(),
                 fields,
                 indexes: vec![],
                 owner_field: None,
@@ -1870,6 +1946,7 @@ mod tests {
             "users".into(),
             TableDef {
                 defaults: std::collections::BTreeMap::new(),
+                computed: std::collections::BTreeMap::new(),
                 fields,
                 indexes: vec![crate::schema::IndexDef {
                     name: "by_owner".into(),
@@ -2031,6 +2108,127 @@ mod tests {
         assert!(plan_migration(&old, &d2).is_ok());
     }
 
+    // ENH-028: renameField carries the computed map — expression `Field`
+    // references (and `Case.whens` predicate fields) follow the rename, and an
+    // entry KEYED on the renamed field moves to the new name (the `defaults`
+    // discipline; leaving it keyed on the old name would fail
+    // `validate_computed`'s declared-field rule on the derived schema).
+    #[test]
+    fn plan_rename_field_rewrites_computed_refs_and_key() {
+        use crate::query::FilterExpr;
+        let mut old = one_table_schema();
+        let users = old.tables.get_mut("users").expect("users table");
+        users.fields.insert("first".into(), FieldType::String);
+        users.fields.insert("nick".into(), FieldType::String);
+        users.computed.insert(
+            "name".into(),
+            ValueExpr::Concat {
+                parts: vec![
+                    ValueExpr::Field {
+                        field: "age".into(),
+                    },
+                    ValueExpr::Case {
+                        whens: vec![CaseWhen {
+                            when: FilterExpr::Exists {
+                                field: "first".into(),
+                            },
+                            then: ValueExpr::Field {
+                                field: "first".into(),
+                            },
+                        }],
+                        otherwise: Box::new(ValueExpr::Literal {
+                            value: serde_json::json!(""),
+                        }),
+                    },
+                ],
+            },
+        );
+        users.computed.insert(
+            "nick".into(),
+            ValueExpr::Field {
+                field: "age".into(),
+            },
+        );
+        let d = vec![
+            Directive::RenameField {
+                table: "users".into(),
+                from: "first".into(),
+                to: "givenName".into(),
+            },
+            Directive::RenameField {
+                table: "users".into(),
+                from: "nick".into(),
+                to: "handle".into(),
+            },
+        ];
+        let got = plan_migration(&old, &d).unwrap();
+        let t = &got.tables["users"];
+        // `name`'s expr reads the renamed field — in the Case `then` and the
+        // Case `when` predicate alike (the `Field(age)` part is untouched).
+        let name_expr = t.computed.get("name").expect("name entry preserved");
+        let expected = ValueExpr::Concat {
+            parts: vec![
+                ValueExpr::Field {
+                    field: "age".into(),
+                },
+                ValueExpr::Case {
+                    whens: vec![CaseWhen {
+                        when: FilterExpr::Exists {
+                            field: "givenName".into(),
+                        },
+                        then: ValueExpr::Field {
+                            field: "givenName".into(),
+                        },
+                    }],
+                    otherwise: Box::new(ValueExpr::Literal {
+                        value: serde_json::json!(""),
+                    }),
+                },
+            ],
+        };
+        assert_eq!(name_expr, &expected);
+        // The entry keyed on the renamed field moved; the old key is gone.
+        assert!(t.computed.contains_key("handle"));
+        assert!(!t.computed.contains_key("nick"));
+    }
+
+    // ENH-028: dropping a field a computed expression reads is rejected,
+    // naming the computed field; dropping the field an entry is keyed on
+    // removes the entry with it (the applier removes the stored key too).
+    #[test]
+    fn plan_drop_field_rejects_computed_reference_and_drops_keyed_entry() {
+        let mut old = one_table_schema();
+        let users = old.tables.get_mut("users").expect("users table");
+        users.computed.insert(
+            "age".into(),
+            ValueExpr::Field {
+                field: "name".into(),
+            },
+        );
+        // Referenced field: rejected, naming the computed field.
+        let d = vec![Directive::DropField {
+            table: "users".into(),
+            field: "name".into(),
+        }];
+        let err = plan_migration(&old, &d).unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::BadRequest);
+        assert!(
+            err.message.contains("computed field 'users.age'"),
+            "should name the computed field: {}",
+            err.message
+        );
+        // The keyed field: the entry goes with it, plan succeeds.
+        let d2 = vec![Directive::DropField {
+            table: "users".into(),
+            field: "age".into(),
+        }];
+        let got = plan_migration(&old, &d2).unwrap();
+        assert!(
+            got.tables["users"].computed.is_empty(),
+            "entry keyed on the dropped field is removed"
+        );
+    }
+
     // evalExpr `set` is interpolated into the jsonb_set key literal, so a stray
     // quote (the classic injection shape) must be rejected as BAD_REQUEST at plan
     // time — not reach the scoped-raw-SQL applier. Locks `is_valid_identifier`.
@@ -2071,6 +2269,7 @@ mod tests {
             "node".into(),
             TableDef {
                 defaults: std::collections::BTreeMap::new(),
+                computed: std::collections::BTreeMap::new(),
                 fields,
                 indexes: vec![],
                 owner_field: None,
@@ -2119,6 +2318,7 @@ mod tests {
             "user".into(),
             TableDef {
                 defaults: std::collections::BTreeMap::new(),
+                computed: std::collections::BTreeMap::new(),
                 fields: user_fields,
                 indexes: vec![],
                 owner_field: None,
@@ -2135,6 +2335,7 @@ mod tests {
             "account".into(),
             TableDef {
                 defaults: std::collections::BTreeMap::new(),
+                computed: std::collections::BTreeMap::new(),
                 fields: account_fields,
                 indexes: vec![],
                 owner_field: None,

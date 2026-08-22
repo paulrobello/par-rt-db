@@ -33,6 +33,7 @@ use crate::schema::{
     FieldType, OnDeleteAction, SchemaDef, TableDef, indexed_column_type, validate_doc,
     validate_value,
 };
+use crate::value_expr::eval_value_expr;
 
 // ARC-202: the wire types this module used to define live in `dsl.rs` now;
 // re-exported so every `crate::txn::` path (and the integration tests'
@@ -441,6 +442,12 @@ fn apply_patch(
         )));
     }
     for (field_name, field_value) in fields {
+        // A computed key in the patch is dropped, not merged: the stamp below
+        // re-derives it from the final doc, so skipping here also keeps a
+        // wrong-typed client value from failing validate_value first.
+        if table.computed.contains_key(field_name) {
+            continue;
+        }
         let field_type = table
             .fields
             .get(field_name)
@@ -462,6 +469,7 @@ fn apply_patch(
         doc.insert(field_name.clone(), field_value.clone());
     }
 
+    let doc = stamp_computed(table, doc, now_ms())?;
     validate_doc(table, &doc)?;
     Ok(doc)
 }
@@ -501,8 +509,13 @@ async fn do_insert(
     table_name: &str,
     doc: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(String, serde_json::Map<String, serde_json::Value>, i64), RtDbError> {
-    validate_doc(table_def, doc)?;
-    let stripped = strip_unset_optionals(table_def, doc.clone());
+    // Computed stamping is the LAST insert stamp — after the caller's ttl /
+    // updatedAt / defaults / owner / authorize / autoIncrement chain — so
+    // expressions see final inputs, and before validate_doc so a
+    // client-supplied computed value never reaches validation.
+    let doc = stamp_computed(table_def, doc.clone(), now_ms())?;
+    validate_doc(table_def, &doc)?;
+    let stripped = strip_unset_optionals(table_def, doc);
 
     let id = new_id();
     let created_at = now_ms();
@@ -718,6 +731,13 @@ async fn do_replace(
         }
     }
 
+    // Client-supplied computed values are dropped before validation: the
+    // stamp re-derives them from the final doc, and a wrong-typed client
+    // value must not fail validate_doc first.
+    for name in table_def.computed.keys() {
+        new_doc.remove(name);
+    }
+    let new_doc = stamp_computed(table_def, new_doc, now_ms())?;
     validate_doc(table_def, &new_doc)?;
     let new_doc = strip_unset_optionals(table_def, new_doc);
     apply_update(conn, pg_schema_name, table_def, table_name, id, &new_doc).await?;
@@ -1117,6 +1137,42 @@ fn apply_defaults(
         }
     }
     doc
+}
+
+/// Stamps the table's computed fields (ENH-028): every `computed` entry is
+/// re-evaluated against the final doc and stored — a null result REMOVES the
+/// key (an unset optional field is an absent key, `strip_unset_optionals`'
+/// shape convention) and a non-null result overwrites whatever is there (the
+/// ownerField authority model: client-supplied values never survive). An
+/// evaluation error fails the whole write as `bad_request`, naming the field.
+/// Runs last in the stamp chain — after ttl default, updatedAt, defaults,
+/// owner/authorize, and autoIncrement, so expressions see final inputs
+/// (including a freshly stamped updatedAt) — and before `validate_doc` at
+/// every site: `apply_patch` (patch, upsert's update branch, patchByQuery,
+/// and cascade setNull via `do_patch`), `do_insert` (insert + upsert's insert
+/// branch), and `do_replace`. `handle_merge_users` (committer.rs) bypasses
+/// the `do_*` functions and calls this directly on the rewritten doc, so a
+/// computed expr over a principal-bearing field sees the rewritten uid. A
+/// `Case` predicate would need a principal, but push validation rejects
+/// principal markers inside computed expressions, so the bypass ctx is
+/// semantically irrelevant. Snapshot replay (`insert_snapshot_row`) is not a
+/// step path and preserves stored values verbatim — import never re-stamps.
+pub(crate) fn stamp_computed(
+    table_def: &TableDef,
+    mut doc: serde_json::Map<String, serde_json::Value>,
+    now: i64,
+) -> Result<serde_json::Map<String, serde_json::Value>, RtDbError> {
+    for (name, expr) in &table_def.computed {
+        let value = eval_value_expr(expr, &doc, now, &PrincipalCtx::bypass()).map_err(|e| {
+            RtDbError::bad_request(format!("computed field '{name}': {}", e.message))
+        })?;
+        if value.is_null() {
+            doc.remove(name);
+        } else {
+            doc.insert(name.clone(), value);
+        }
+    }
+    Ok(doc)
 }
 
 /// Ownership + authorize pre-check for patch/replace/delete: fetches the doc

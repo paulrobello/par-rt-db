@@ -166,6 +166,80 @@ async fn merge_users_restamps_owner_collaborators_and_bumps_version() -> anyhow:
     Ok(())
 }
 
+/// ENH-028 + FM-27: a computed field over a principal-bearing field. The
+/// merge path bypasses the `do_*` write functions, so the committer must
+/// re-stamp computed fields on the rewritten doc.
+fn computed_owner_schema() -> SchemaDef {
+    serde_json::from_value(json!({
+        "tables": {
+            "docs": {
+                "fields": {
+                    "title": {"type": "string"},
+                    "owner": {"type": "string"},
+                    "ownerLabel": {"type": "string"}
+                },
+                "indexes": [
+                    {"name": "by_owner", "fields": ["owner"]},
+                    {"name": "by_ownerLabel", "fields": ["ownerLabel"]}
+                ],
+                "ownerField": "owner",
+                "computed": {
+                    "ownerLabel": {"op": "concat", "parts": [
+                        {"op": "literal", "value": "owner:"},
+                        {"op": "field", "field": "owner"}
+                    ]}
+                }
+            }
+        }
+    }))
+    .expect("parse computed owner schema")
+}
+
+#[tokio::test]
+async fn merge_users_restamps_computed_fields_over_principal_fields() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(&state.pool, &name).await?;
+    let db = String::from(wrap_test_db(name));
+    push_schema(&state.pool, &db, computed_owner_schema()).await?;
+
+    let anon = "user_anon_1";
+    let real = "user_real_1";
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            insert_doc("docs", json!({"title": "a", "owner": anon})),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+
+    let result = state
+        .realtime
+        .committers
+        .merge_users(&db, anon, real)
+        .await?;
+    assert_eq!(result.tables.get("docs"), Some(&1));
+    assert!(result.conflicts.is_empty());
+
+    // The computed value was re-derived from the REWRITTEN owner, in both the
+    // doc body and the typed column.
+    let expected = format!("owner:{real}");
+    let (doc, col): (Value, Option<String>) = sqlx::query_as(&format!(
+        "SELECT \"doc\", \"f_ownerlabel\" FROM \"{}\".\"t_docs\" \
+         WHERE \"doc\"->'owner' = to_jsonb($1::text)",
+        rtdb_server::ddl::pg_schema(&db)
+    ))
+    .bind(real)
+    .fetch_one(&state.pool)
+    .await?;
+    assert_eq!(doc["ownerLabel"], serde_json::json!(expected));
+    assert_eq!(col.as_deref(), Some(expected.as_str()));
+    Ok(())
+}
+
 #[tokio::test]
 async fn merge_users_skips_unique_conflict_and_reports_it() -> anyhow::Result<()> {
     let state = test_state().await;

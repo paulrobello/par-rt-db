@@ -52,6 +52,27 @@ alongside it: [`../ts-client/`](../ts-client) (browser/Node),
   field. Migrate maintains the map (`renameField` re-keys; `dropField` /
   `changeType` drop the entry). See
   [`../docs/superpowers/specs/2026-08-16-field-defaults-design.md`](../docs/superpowers/specs/2026-08-16-field-defaults-design.md).
+- Computed fields (FEATURE_MATRIX #39, ENH-028): a table may declare
+  `computed`, a map of field name → typed `ValueExpr` (additive wire key,
+  omitted when empty; the closed grammar lives in `src/value_expr.rs` — the
+  same one migrate `evalExpr` uses). The server re-derives every entry on
+  **every write** (insert / patch / replace / upsert both branches /
+  `patchByQuery` / cascade setNull, plus the anon→real merge restamp) into both the doc body and
+  the typed column, so computed fields are indexable; a client-supplied value
+  never survives (dropped before validation), a `null` result leaves the key
+  absent, `Now()` is epoch-ms, and a runtime evaluation error fails the whole
+  write atomically (`BAD_REQUEST` naming the field). Push-time validation in
+  `schema.rs::validate_computed` (declared non-stamped keys; declared,
+  non-computed references; no `$user`/`$email` markers in `Case` `when` filters;
+  static result kind acceptable to the field type; no computed field referenced
+  by the table's `authorize` predicate). Push/restore backfill re-derives
+  existing rows when entries are added or changed (no `_version` bump), and
+  removing an entry leaves stored values as ordinary client-writable fields.
+  Migrate: `renameField` rewrites the expression and re-stamps, `dropField` on
+  a referenced field is rejected, and `evalExpr`/`setDefault`/`changeType`
+  rewrites feeding a computed input re-stamp dependents in the same migrate.
+  Integration tests in `tests/computed_test.rs`; corpus cases
+  `wire-corpus/semantics/computed-*.json`.
 - Cascade delete + soft delete (FEATURE_MATRIX #33): an `id` field may
   declare `onDelete: cascade|restrict|setNull` (top-level or one `optional`
   deep) and a table may declare `softDelete`. Enforced in the app layer
@@ -94,6 +115,7 @@ alongside it: [`../ts-client/`](../ts-client) (browser/Node),
 | Hot config + dynamic CORS | `src/config.rs` (`Arc<ArcSwap<HotConfig>>` on `AppState`) |
 | Health | `src/health.rs` |
 | Schema model + validation | `src/schema.rs` |
+| Computed-field expression grammar + evaluation (ENH-028) | `src/value_expr.rs` (shared by push validation, the write-path stamp in `src/txn.rs`, push/restore backfill, and migrate re-stamps in `src/migrate.rs`) |
 | Schema → Postgres DDL | `src/ddl.rs` |
 | Write / read paths | `src/txn.rs`, `src/query/` (`mod.rs` compile + dispatch, `filter.rs`, `terminals.rs`, `search.rs`, `row_auth.rs`) |
 | Pagination (cursor keyset) | `src/pagination.rs` |

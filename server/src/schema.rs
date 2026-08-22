@@ -13,6 +13,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 use crate::error::RtDbError;
 use crate::query::FilterExpr;
+use crate::value_expr::ValueExpr;
 
 /// Referential action applied to child rows when the referenced parent row is
 /// hard-deleted (FM-33). Carried on the CHILD table's `id` field as an
@@ -262,6 +263,17 @@ pub struct TableDef {
     /// without it deserialize unchanged.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub defaults: BTreeMap<String, serde_json::Value>,
+    /// Computed fields (ENH-028): field name → expression. The server
+    /// re-evaluates each expression on every write and stores the result in
+    /// the doc (overwriting any client-supplied value — the `ownerField`
+    /// authority model); a null result removes the key. Push-time validation
+    /// is `validate_computed`: keys must be declared non-stamped fields,
+    /// referenced fields declared and non-computed, `Case.whens` reject
+    /// principal markers, and a statically-known result kind must be
+    /// acceptable to the field's type. Additive — schemas without it
+    /// deserialize unchanged.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub computed: BTreeMap<String, crate::value_expr::ValueExpr>,
     /// Soft delete (FM-33): `Delete`/`DeleteByQuery` on this table stamp a
     /// real `deleted_at timestamptz` column (row persists, invisible to every
     /// read terminal and write lookup) instead of removing the row; unique
@@ -648,6 +660,7 @@ impl TableDef {
         self.validate_updated_at()?;
         self.validate_auto_increment()?;
         self.validate_defaults(table_name)?;
+        self.validate_computed(table_name)?;
         self.validate_on_delete(table_name)?;
         Ok(())
     }
@@ -987,6 +1000,110 @@ impl TableDef {
         Ok(())
     }
 
+    /// Computed-field push validation (ENH-028). Rules, in order:
+    /// 1. every `computed` key names a declared field;
+    /// 2. the key is not one of the server-stamped declaration fields
+    ///    (`ownerField`/`collaboratorsField`/`autoIncrementField`) — those
+    ///    carry their own stamping authority and a computed entry would fight
+    ///    it on every write;
+    /// 3. every field the expression references (including `Case.when`
+    ///    filter fields) is declared and not itself computed (no chained or
+    ///    cyclic evaluation);
+    /// 4. `Case.when` filters reject principal markers — computed exprs run
+    ///    on every write with no interactive principal, so a `$user`/`$email`
+    ///    marker has no value to resolve;
+    /// 5. when the expression's result kind is statically known, the field's
+    ///    type must accept a value of that kind;
+    /// 6. the table's `authorize` predicate references no computed field —
+    ///    on insert/upsert-insert `verify_authorize_doc` runs before computed
+    ///    stamping, so such a predicate would evaluate forgeable client
+    ///    input instead of the server-derived value.
+    fn validate_computed(&self, table_name: &str) -> Result<(), RtDbError> {
+        for (field, expr) in &self.computed {
+            if !self.fields.contains_key(field) {
+                return Err(RtDbError::bad_request(format!(
+                    "computed field '{table_name}.{field}' is not a declared field"
+                )));
+            }
+            if self.owner_field.as_deref() == Some(field.as_str()) {
+                return Err(RtDbError::bad_request(format!(
+                    "computed field '{table_name}.{field}' must not be the table's ownerField"
+                )));
+            }
+            if self.collaborators_field.as_deref() == Some(field.as_str()) {
+                return Err(RtDbError::bad_request(format!(
+                    "computed field '{table_name}.{field}' must not be the table's collaboratorsField"
+                )));
+            }
+            if self.auto_increment_field.as_deref() == Some(field.as_str()) {
+                return Err(RtDbError::bad_request(format!(
+                    "computed field '{table_name}.{field}' must not be the table's autoIncrementField"
+                )));
+            }
+            // First offense wins; the walk covers `Field` nodes and every
+            // `Case.when` filter field.
+            let mut offender: Option<String> = None;
+            crate::value_expr::walk_value_expr_fields(expr, &mut |referenced| {
+                if offender.is_some() {
+                    return;
+                }
+                if !self.fields.contains_key(referenced) {
+                    offender = Some(format!(
+                        "computed field '{table_name}.{field}' references undeclared field '{referenced}'"
+                    ));
+                } else if self.computed.contains_key(referenced) {
+                    offender = Some(format!(
+                        "computed field '{table_name}.{field}' references computed field '{referenced}' (computed fields may not reference each other)"
+                    ));
+                }
+            });
+            if let Some(message) = offender {
+                return Err(RtDbError::bad_request(message));
+            }
+            validate_computed_case_whens(expr, self)?;
+            if let Some(kind) = infer_static_kind(expr) {
+                let sample = match kind {
+                    StaticKind::String => serde_json::json!("s"),
+                    StaticKind::Number => serde_json::json!(1),
+                    StaticKind::Boolean => serde_json::json!(true),
+                };
+                // `validate_value` is the wire contract, but int64's wire form
+                // is a decimal STRING: a Number-kind result can never validate
+                // (arithmetic yields JSON numbers), while a String-kind one
+                // can ("42") — decimal-ness stays a runtime `validate_doc`
+                // check. Optional unwrapping admits the nullable spelling.
+                let mut inner = &self.fields[field];
+                while let FieldType::Optional { inner: deeper } = inner {
+                    inner = deeper;
+                }
+                let accepts = validate_value(&self.fields[field], &sample)
+                    || (matches!(inner, FieldType::Int64) && matches!(kind, StaticKind::String));
+                if !accepts {
+                    return Err(RtDbError::bad_request(format!(
+                        "computed field '{table_name}.{field}' produces {}, which the field type does not accept",
+                        kind.as_str()
+                    )));
+                }
+            }
+        }
+        // Rule 6: authorize runs pre-stamp on the insert paths, so a
+        // predicate over a computed field would read client input.
+        if let Some(authorize) = &self.authorize {
+            let mut offender: Option<String> = None;
+            crate::value_expr::walk_filter_expr_fields(authorize, &mut |referenced| {
+                if offender.is_none() && self.computed.contains_key(referenced) {
+                    offender = Some(referenced.to_string());
+                }
+            });
+            if let Some(field) = offender {
+                return Err(RtDbError::bad_request(format!(
+                    "computed field '{table_name}.{field}' must not be referenced by the table's authorize predicate (authorize predicates may not reference computed fields)"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// `onDelete` push validation (FM-33). An action is legal only on a
     /// TOP-LEVEL field in one of two shapes — `Id { on_delete: Some(_) }` or
     /// `Optional { inner: Id { on_delete: Some(_) } }` (deeper nesting has no
@@ -1077,6 +1194,109 @@ impl TableDef {
             .find(|index| index.name == name)
             .ok_or_else(|| RtDbError::bad_request(format!("index '{name}' not found")))
     }
+}
+
+/// Walks a computed expression's `Case` nodes validating each `when` filter
+/// with the marker-rejecting mode of `validate_filter_expr_fields` — the same
+/// call the query boundary uses for client filters, and the opposite of the
+/// `authorize` path's marker-allowing call. `then`/`otherwise` recurse so a
+/// `Case` nested inside a branch is covered.
+fn validate_computed_case_whens(ve: &ValueExpr, table: &TableDef) -> Result<(), RtDbError> {
+    match ve {
+        ValueExpr::Case { whens, otherwise } => {
+            for cw in whens {
+                validate_filter_expr_fields(&cw.when, table, false)
+                    .map_err(|e| RtDbError::bad_request(e.message))?;
+                validate_computed_case_whens(&cw.then, table)?;
+            }
+            validate_computed_case_whens(otherwise, table)
+        }
+        ValueExpr::Concat { parts } | ValueExpr::Coalesce { parts } => {
+            for p in parts {
+                validate_computed_case_whens(p, table)?;
+            }
+            Ok(())
+        }
+        ValueExpr::Add { left, right }
+        | ValueExpr::Sub { left, right }
+        | ValueExpr::Mul { left, right }
+        | ValueExpr::Div { left, right } => {
+            validate_computed_case_whens(left, table)?;
+            validate_computed_case_whens(right, table)
+        }
+        ValueExpr::Lower { value }
+        | ValueExpr::Upper { value }
+        | ValueExpr::Trim { value }
+        | ValueExpr::Cast { value, .. } => validate_computed_case_whens(value, table),
+        ValueExpr::Field { .. } | ValueExpr::Literal { .. } | ValueExpr::Now => Ok(()),
+    }
+}
+
+/// The statically-known result kind of a `ValueExpr`, for the computed-field
+/// push check. `None` means the result kind varies by input — `Field` (text
+/// extraction of any JSON value), `Coalesce`/`Case` (whichever branch wins),
+/// and the null / object / array literals whose runtime `validate_doc` check
+/// is the only guard.
+enum StaticKind {
+    String,
+    Number,
+    Boolean,
+}
+
+impl StaticKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            StaticKind::String => "a string",
+            StaticKind::Number => "a number",
+            StaticKind::Boolean => "a boolean",
+        }
+    }
+}
+
+fn infer_static_kind(ve: &ValueExpr) -> Option<StaticKind> {
+    match ve {
+        ValueExpr::Field { .. } | ValueExpr::Coalesce { .. } | ValueExpr::Case { .. } => None,
+        ValueExpr::Literal { value } => match value {
+            serde_json::Value::String(_) => Some(StaticKind::String),
+            serde_json::Value::Number(_) => Some(StaticKind::Number),
+            serde_json::Value::Bool(_) => Some(StaticKind::Boolean),
+            serde_json::Value::Null
+            | serde_json::Value::Object(_)
+            | serde_json::Value::Array(_) => None,
+        },
+        ValueExpr::Concat { .. }
+        | ValueExpr::Lower { .. }
+        | ValueExpr::Upper { .. }
+        | ValueExpr::Trim { .. }
+        | ValueExpr::Cast {
+            to: crate::value_expr::Cast::ToString,
+            ..
+        } => Some(StaticKind::String),
+        ValueExpr::Add { .. }
+        | ValueExpr::Sub { .. }
+        | ValueExpr::Mul { .. }
+        | ValueExpr::Div { .. }
+        | ValueExpr::Cast {
+            to: crate::value_expr::Cast::ToNumber | crate::value_expr::Cast::ToInt64,
+            ..
+        }
+        | ValueExpr::Now => Some(StaticKind::Number),
+        ValueExpr::Cast {
+            to: crate::value_expr::Cast::ToBoolean,
+            ..
+        } => Some(StaticKind::Boolean),
+    }
+}
+
+/// Validates every table's computed-field map (ENH-028) — the schema-level
+/// entry point behind `TableDef::validate_structure`, also called directly by
+/// `migrate::plan_migration` so directive folding (e.g. `changeType`) that
+/// invalidates a computed entry fails at plan time, before any DB work.
+pub fn validate_computed(schema: &SchemaDef) -> Result<(), RtDbError> {
+    for (table_name, table) in &schema.tables {
+        table.validate_computed(table_name)?;
+    }
+    Ok(())
 }
 
 impl SchemaDef {
@@ -1294,6 +1514,7 @@ mod tests {
     fn simple_table() -> TableDef {
         TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
             indexes: vec![],
             owner_field: None,
@@ -1348,6 +1569,7 @@ mod tests {
     fn rejects_field_name_with_invalid_chars() {
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("a-b".to_string(), FieldType::String)]),
             indexes: vec![],
             owner_field: None,
@@ -1388,6 +1610,7 @@ mod tests {
         let field_name = "a".repeat(60);
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([(field_name, FieldType::String)]),
             indexes: vec![],
             owner_field: None,
@@ -1410,6 +1633,7 @@ mod tests {
         let field_name = "a".repeat(61);
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([(field_name, FieldType::String)]),
             indexes: vec![],
             owner_field: None,
@@ -1432,6 +1656,7 @@ mod tests {
         let index_name = "a".repeat(30);
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
             indexes: vec![IndexDef {
                 name: index_name,
@@ -1462,6 +1687,7 @@ mod tests {
         let index_name = "a".repeat(31);
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
             indexes: vec![IndexDef {
                 name: index_name,
@@ -1491,6 +1717,7 @@ mod tests {
     fn rejects_case_insensitive_field_name_collision() {
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([
                 ("status".to_string(), FieldType::String),
                 ("Status".to_string(), FieldType::String),
@@ -1515,6 +1742,7 @@ mod tests {
     fn rejects_case_insensitive_index_name_collision() {
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
             indexes: vec![
                 IndexDef {
@@ -1555,6 +1783,7 @@ mod tests {
     fn rejects_field_name_starting_with_underscore() {
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("_secret".to_string(), FieldType::String)]),
             indexes: vec![],
             owner_field: None,
@@ -1589,6 +1818,7 @@ mod tests {
     fn rejects_index_over_array_field() {
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([(
                 "tags".to_string(),
                 FieldType::Array {
@@ -1623,6 +1853,7 @@ mod tests {
     fn rejects_index_with_empty_fields() {
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
             indexes: vec![IndexDef {
                 name: "by_nothing".to_string(),
@@ -1652,6 +1883,7 @@ mod tests {
     fn rejects_index_with_duplicate_fields() {
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
             indexes: vec![IndexDef {
                 name: "by_name".to_string(),
@@ -1681,6 +1913,7 @@ mod tests {
     fn rejects_duplicate_index_names() {
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
             indexes: vec![
                 IndexDef {
@@ -1721,6 +1954,7 @@ mod tests {
     fn rejects_index_name_with_invalid_chars() {
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
             indexes: vec![IndexDef {
                 name: "by-name".to_string(),
@@ -1750,6 +1984,7 @@ mod tests {
     fn rejects_index_referencing_unknown_field() {
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
             indexes: vec![IndexDef {
                 name: "by_missing".to_string(),
@@ -1779,6 +2014,7 @@ mod tests {
     fn rejects_literal_with_non_scalar_value() {
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([(
                 "x".to_string(),
                 FieldType::Literal {
@@ -1805,6 +2041,7 @@ mod tests {
     fn rejects_empty_union() {
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("x".to_string(), FieldType::Union { variants: vec![] })]),
             indexes: vec![],
             owner_field: None,
@@ -1826,6 +2063,7 @@ mod tests {
     fn rejects_optional_wrapping_optional() {
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([(
                 "x".to_string(),
                 FieldType::Optional {
@@ -2039,6 +2277,7 @@ mod tests {
     fn record_field_validates_structurally_and_recurses() {
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([(
                 "meta".to_string(),
                 FieldType::Record {
@@ -2137,6 +2376,7 @@ mod tests {
     fn rejects_index_over_record_field() {
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([(
                 "meta".to_string(),
                 FieldType::Record {
@@ -2206,6 +2446,7 @@ mod tests {
     fn rejects_search_index_over_non_text_field() {
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([("count".to_string(), FieldType::Number)]),
             indexes: vec![IndexDef {
                 name: "search_count".to_string(),
@@ -2235,6 +2476,7 @@ mod tests {
     fn accepts_search_index_over_optional_text_field() {
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([(
                 "body".to_string(),
                 FieldType::Optional {
@@ -2340,6 +2582,7 @@ mod tests {
         fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 4 });
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![IndexDef {
                 name: "by_emb".to_string(),
@@ -2373,6 +2616,7 @@ mod tests {
         fields.insert("userId".to_string(), FieldType::String);
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![IndexDef {
                 name: "by_emb".to_string(),
@@ -2405,6 +2649,7 @@ mod tests {
         fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 4 });
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![IndexDef {
                 name: "by_emb".to_string(),
@@ -2439,6 +2684,7 @@ mod tests {
         fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 0 });
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![IndexDef {
                 name: "by_emb".to_string(),
@@ -2472,6 +2718,7 @@ mod tests {
         fields.insert("b".to_string(), FieldType::Vector { dimensions: 4 });
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![IndexDef {
                 name: "by_emb".to_string(),
@@ -2504,6 +2751,7 @@ mod tests {
         fields.insert("title".to_string(), FieldType::String);
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![IndexDef {
                 name: "by_title".to_string(),
@@ -2536,6 +2784,7 @@ mod tests {
         fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 4 });
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![IndexDef {
                 name: "by_emb".to_string(),
@@ -2574,6 +2823,7 @@ mod tests {
         );
         let table = TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![IndexDef {
                 name: "by_emb".to_string(),
@@ -2825,6 +3075,7 @@ mod tests {
         fields.insert("expiresAt".to_string(), FieldType::Number);
         TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![IndexDef {
                 name: "by_expiresAt".to_string(),
@@ -2969,6 +3220,7 @@ mod tests {
         fields.insert("count".to_string(), FieldType::Number);
         TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields,
             indexes: vec![],
             owner_field: None,
@@ -3122,5 +3374,445 @@ mod tests {
         };
         assert!(validate_filter_expr_fields(&plain, &table, true).is_ok());
         assert!(validate_filter_expr_fields(&plain, &table, false).is_ok());
+    }
+
+    // ---- computed fields (ENH-028) ----
+
+    fn field(name: &str) -> ValueExpr {
+        ValueExpr::Field {
+            field: name.to_string(),
+        }
+    }
+
+    fn literal(value: serde_json::Value) -> ValueExpr {
+        ValueExpr::Literal { value }
+    }
+
+    /// Base table with a field of every kind the computed rules distinguish.
+    /// Computed targets (`fullName`, `slug`, `total`, `label`, `rankText`) are
+    /// declared but the `computed` map starts empty — each test installs only
+    /// the entries it exercises.
+    fn computed_table() -> TableDef {
+        TableDef {
+            defaults: BTreeMap::new(),
+            fields: BTreeMap::from([
+                ("first".to_string(), FieldType::String),
+                ("last".to_string(), FieldType::String),
+                (
+                    "nickname".to_string(),
+                    FieldType::Optional {
+                        inner: Box::new(FieldType::String),
+                    },
+                ),
+                ("score".to_string(), FieldType::Number),
+                ("rank".to_string(), FieldType::Int64),
+                ("active".to_string(), FieldType::Boolean),
+                (
+                    "status".to_string(),
+                    FieldType::Union {
+                        variants: vec![
+                            FieldType::Literal {
+                                value: serde_json::json!("admin"),
+                            },
+                            FieldType::Literal {
+                                value: serde_json::json!("user"),
+                            },
+                        ],
+                    },
+                ),
+                ("owner".to_string(), FieldType::String),
+                (
+                    "collaborators".to_string(),
+                    FieldType::Array {
+                        element: Box::new(FieldType::String),
+                    },
+                ),
+                ("fullName".to_string(), FieldType::String),
+                (
+                    "slug".to_string(),
+                    FieldType::Optional {
+                        inner: Box::new(FieldType::String),
+                    },
+                ),
+                ("total".to_string(), FieldType::Number),
+                (
+                    "label".to_string(),
+                    FieldType::Union {
+                        variants: vec![
+                            FieldType::Literal {
+                                value: serde_json::json!("staff"),
+                            },
+                            FieldType::Literal {
+                                value: serde_json::json!("guest"),
+                            },
+                        ],
+                    },
+                ),
+                ("rankText".to_string(), FieldType::Int64),
+            ]),
+            indexes: vec![],
+            owner_field: None,
+            collaborators_field: None,
+            ttl: None,
+            updated_at_field: None,
+            auto_increment_field: None,
+            authorize: None,
+            computed: BTreeMap::new(),
+
+            soft_delete: false,
+        }
+    }
+
+    fn computed_schema(table: TableDef) -> SchemaDef {
+        SchemaDef {
+            tables: BTreeMap::from([("users".to_string(), table)]),
+        }
+    }
+
+    fn one_computed(name: &str, expr: ValueExpr) -> BTreeMap<String, ValueExpr> {
+        BTreeMap::from([(name.to_string(), expr)])
+    }
+
+    // (a) a computed key must be a declared field.
+    #[test]
+    fn computed_key_must_be_declared() {
+        let mut table = computed_table();
+        table.computed = one_computed(
+            "bogus",
+            ValueExpr::Concat {
+                parts: vec![field("first"), field("last")],
+            },
+        );
+        let err = validate_computed(&computed_schema(table)).unwrap_err();
+        assert!(
+            err.message.contains("not a declared field"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("users.bogus"), "{}", err.message);
+    }
+
+    // The rule also rides `SchemaDef::validate` (the push/migrate chokepoint).
+    #[test]
+    fn computed_validation_rides_schema_validate() {
+        let mut table = computed_table();
+        table.computed = one_computed("bogus", field("first"));
+        assert!(computed_schema(table).validate().is_err());
+    }
+
+    // (b) every referenced field must be declared.
+    #[test]
+    fn computed_reference_must_be_declared() {
+        let mut table = computed_table();
+        table.computed = one_computed(
+            "fullName",
+            ValueExpr::Concat {
+                parts: vec![field("first"), field("bogus")],
+            },
+        );
+        let err = validate_computed(&computed_schema(table)).unwrap_err();
+        assert!(
+            err.message.contains("references undeclared field 'bogus'"),
+            "{}",
+            err.message
+        );
+    }
+
+    // (c) computed fields may not reference each other.
+    #[test]
+    fn computed_reference_must_not_be_computed() {
+        let mut table = computed_table();
+        table.computed = BTreeMap::from([
+            (
+                "fullName".to_string(),
+                ValueExpr::Concat {
+                    parts: vec![field("first"), field("last")],
+                },
+            ),
+            (
+                "slug".to_string(),
+                ValueExpr::Lower {
+                    value: Box::new(field("fullName")),
+                },
+            ),
+        ]);
+        let err = validate_computed(&computed_schema(table)).unwrap_err();
+        assert!(
+            err.message.contains("references computed field 'fullName'"),
+            "{}",
+            err.message
+        );
+    }
+
+    // The authorize predicate may not reference a computed field: it runs
+    // before computed stamping on the insert paths, so it would evaluate
+    // forgeable client input.
+    #[test]
+    fn authorize_must_not_reference_computed_field() {
+        let mut table = computed_table();
+        table.computed = one_computed(
+            "fullName",
+            ValueExpr::Concat {
+                parts: vec![field("first"), field("last")],
+            },
+        );
+        table.authorize = Some(FilterExpr::Eq {
+            field: "fullName".into(),
+            value: serde_json::json!("x"),
+        });
+        let err = validate_computed(&computed_schema(table)).unwrap_err();
+        assert!(
+            err.message
+                .contains("authorize predicates may not reference computed fields"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("users.fullName"), "{}", err.message);
+        // a predicate over a plain (non-computed) field stays legal
+        let mut table = computed_table();
+        table.computed = one_computed(
+            "fullName",
+            ValueExpr::Concat {
+                parts: vec![field("first"), field("last")],
+            },
+        );
+        table.authorize = Some(FilterExpr::Eq {
+            field: "status".into(),
+            value: serde_json::json!("admin"),
+        });
+        assert!(validate_computed(&computed_schema(table)).is_ok());
+    }
+
+    // (d) principal markers are rejected inside Case.when filters.
+    #[test]
+    fn computed_case_when_rejects_principal_markers() {
+        let mut table = computed_table();
+        table.computed = one_computed(
+            "label",
+            ValueExpr::Case {
+                whens: vec![crate::value_expr::CaseWhen {
+                    when: FilterExpr::Eq {
+                        field: "status".into(),
+                        value: serde_json::json!({"$user": true}),
+                    },
+                    then: literal(serde_json::json!("staff")),
+                }],
+                otherwise: Box::new(literal(serde_json::json!("guest"))),
+            },
+        );
+        let err = validate_computed(&computed_schema(table.clone())).unwrap_err();
+        assert!(err.message.contains("principal markers"), "{}", err.message);
+        // The email marker is rejected the same way.
+        table.computed = one_computed(
+            "label",
+            ValueExpr::Case {
+                whens: vec![crate::value_expr::CaseWhen {
+                    when: FilterExpr::Eq {
+                        field: "status".into(),
+                        value: serde_json::json!({"$email": true}),
+                    },
+                    then: literal(serde_json::json!("staff")),
+                }],
+                otherwise: Box::new(literal(serde_json::json!("guest"))),
+            },
+        );
+        assert!(validate_computed(&computed_schema(table)).is_err());
+    }
+
+    // (e) static-kind rejects: Concat into number, arithmetic into int64,
+    // Lower into boolean.
+    #[test]
+    fn computed_rejects_concat_into_number_field() {
+        let mut table = computed_table();
+        table.computed = one_computed(
+            "total",
+            ValueExpr::Concat {
+                parts: vec![field("first")],
+            },
+        );
+        let err = validate_computed(&computed_schema(table)).unwrap_err();
+        assert!(err.message.contains("produces a string"), "{}", err.message);
+    }
+
+    #[test]
+    fn computed_rejects_arithmetic_into_int64_field() {
+        let mut table = computed_table();
+        table.computed = one_computed(
+            "rank",
+            ValueExpr::Add {
+                left: Box::new(field("score")),
+                right: Box::new(literal(serde_json::json!(1))),
+            },
+        );
+        let err = validate_computed(&computed_schema(table)).unwrap_err();
+        assert!(err.message.contains("produces a number"), "{}", err.message);
+    }
+
+    #[test]
+    fn computed_rejects_lower_into_boolean_field() {
+        let mut table = computed_table();
+        table.computed = one_computed(
+            "active",
+            ValueExpr::Lower {
+                value: Box::new(field("first")),
+            },
+        );
+        let err = validate_computed(&computed_schema(table)).unwrap_err();
+        assert!(err.message.contains("produces a string"), "{}", err.message);
+    }
+
+    // (f) the canonical shapes all pass — one per-shape test each below.
+
+    #[test]
+    fn computed_accepts_concat_on_string() {
+        let mut table = computed_table();
+        table.computed = one_computed(
+            "fullName",
+            ValueExpr::Concat {
+                parts: vec![field("first"), field("last")],
+            },
+        );
+        assert!(validate_computed(&computed_schema(table)).is_ok());
+    }
+
+    #[test]
+    fn computed_accepts_lower_trim_on_optional_string() {
+        let mut table = computed_table();
+        table.computed = one_computed(
+            "slug",
+            ValueExpr::Lower {
+                value: Box::new(ValueExpr::Trim {
+                    value: Box::new(field("nickname")),
+                }),
+            },
+        );
+        assert!(validate_computed(&computed_schema(table)).is_ok());
+    }
+
+    #[test]
+    fn computed_accepts_arithmetic_on_number() {
+        let mut table = computed_table();
+        table.computed = one_computed(
+            "total",
+            ValueExpr::Add {
+                left: Box::new(field("score")),
+                right: Box::new(field("score")),
+            },
+        );
+        assert!(validate_computed(&computed_schema(table)).is_ok());
+    }
+
+    #[test]
+    fn computed_accepts_case_on_union() {
+        let mut table = computed_table();
+        table.computed = one_computed(
+            "label",
+            ValueExpr::Case {
+                whens: vec![crate::value_expr::CaseWhen {
+                    when: FilterExpr::Eq {
+                        field: "status".into(),
+                        value: serde_json::json!("admin"),
+                    },
+                    then: literal(serde_json::json!("staff")),
+                }],
+                otherwise: Box::new(literal(serde_json::json!("guest"))),
+            },
+        );
+        assert!(validate_computed(&computed_schema(table)).is_ok());
+    }
+
+    #[test]
+    fn computed_accepts_now_on_number() {
+        let mut table = computed_table();
+        table.computed = one_computed("total", ValueExpr::Now);
+        assert!(validate_computed(&computed_schema(table)).is_ok());
+    }
+
+    // Int64's wire form is a decimal string, so a String-kind expression is
+    // the accepted shape (the plan's Int64 note) while Number-kind is rejected.
+    #[test]
+    fn computed_accepts_cast_to_string_into_int64() {
+        let mut table = computed_table();
+        table.computed = one_computed(
+            "rankText",
+            ValueExpr::Cast {
+                value: Box::new(field("score")),
+                to: crate::value_expr::Cast::ToString,
+            },
+        );
+        assert!(validate_computed(&computed_schema(table)).is_ok());
+    }
+
+    // (g) computed keys must not collide with the stamped declaration fields.
+    #[test]
+    fn computed_rejects_owner_field_conflict() {
+        let mut table = computed_table();
+        table.owner_field = Some("owner".to_string());
+        table.computed = one_computed("owner", field("first"));
+        let err = validate_computed(&computed_schema(table)).unwrap_err();
+        assert!(err.message.contains("ownerField"), "{}", err.message);
+    }
+
+    #[test]
+    fn computed_rejects_collaborators_field_conflict() {
+        let mut table = computed_table();
+        table.collaborators_field = Some("collaborators".to_string());
+        table.computed = one_computed("collaborators", field("first"));
+        let err = validate_computed(&computed_schema(table)).unwrap_err();
+        assert!(
+            err.message.contains("collaboratorsField"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn computed_rejects_auto_increment_field_conflict() {
+        let mut table = computed_table();
+        table.auto_increment_field = Some("rank".to_string());
+        table.computed = one_computed(
+            "rank",
+            ValueExpr::Cast {
+                value: Box::new(field("score")),
+                to: crate::value_expr::Cast::ToString,
+            },
+        );
+        let err = validate_computed(&computed_schema(table)).unwrap_err();
+        assert!(
+            err.message.contains("autoIncrementField"),
+            "{}",
+            err.message
+        );
+    }
+
+    // Additive wire: `computed` is omitted when empty and absent JSON still
+    // deserializes.
+    #[test]
+    fn computed_wire_is_additive() {
+        let table = simple_table();
+        let json = serde_json::to_value(&table).unwrap();
+        assert!(json.get("computed").is_none());
+        let back: TableDef = serde_json::from_value(json).unwrap();
+        assert!(back.computed.is_empty());
+        // pre-ENH-028 schema JSON (no computed key) deserializes unchanged
+        let legacy: TableDef = serde_json::from_value(serde_json::json!({
+            "fields": {"name": {"type": "string"}}
+        }))
+        .unwrap();
+        assert!(legacy.computed.is_empty());
+    }
+
+    // A computed entry round-trips through the wire with its expr intact.
+    #[test]
+    fn computed_wire_round_trips_expression() {
+        let mut table = simple_table();
+        let expr = ValueExpr::Concat {
+            parts: vec![field("name"), literal(serde_json::json!("!"))],
+        };
+        table.computed = one_computed("name", expr.clone());
+        let json = serde_json::to_value(&table).unwrap();
+        assert_eq!(json["computed"]["name"]["op"], "concat");
+        let back: TableDef = serde_json::from_value(json).unwrap();
+        assert_eq!(back.computed.get("name"), Some(&expr));
     }
 }

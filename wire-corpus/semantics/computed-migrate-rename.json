@@ -1,0 +1,65 @@
+{
+  "name": "computed-migrate-rename",
+  "$comment": "ENH-028 migrate interplay: renameField rewrites the computed expression — the migrate result's derived schema carries `fullName = concat(givenName, \" \", last)` (inputs resolved through the renamed field), and the stored document's key is renamed with the computed value re-derived in the same migrate (the `then` collect reads `givenName`, not `first`, with fullName intact). Directive-report `sampleChanges[].id` is minted, so `id` rides the normalize list. Mirrors computed_test.rs (10).",
+  "schema": {
+    "tables": {
+      "users": {
+        "fields": {
+          "first": { "type": "string" },
+          "last": { "type": "string" },
+          "fullName": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_fullName", "fields": ["fullName"] }],
+        "computed": {
+          "fullName": { "op": "concat", "parts": [
+            { "op": "field", "field": "first" },
+            { "op": "literal", "value": " " },
+            { "op": "field", "field": "last" }
+          ] }
+        }
+      }
+    }
+  },
+  "seed": [
+    { "$id": "ada", "doc": { "first": "Ada", "last": "Lovelace" } }
+  ],
+  "op": {
+    "migrate": {
+      "directives": [
+        { "op": "renameField", "table": "users", "from": "first", "to": "givenName" }
+      ],
+      "dryRun": false
+    }
+  },
+  "expect": {
+    "applied": true,
+    "schema": {
+      "tables": {
+        "users": {
+          "fields": {
+            "givenName": { "type": "string" },
+            "last": { "type": "string" },
+            "fullName": { "type": "string" }
+          },
+          "indexes": [{ "name": "by_fullName", "fields": ["fullName"] }],
+          "computed": {
+            "fullName": { "op": "concat", "parts": [
+              { "op": "field", "field": "givenName" },
+              { "op": "literal", "value": " " },
+              { "op": "field", "field": "last" }
+            ] }
+          }
+        }
+      }
+    },
+    "directives": [{ "op": "renameField", "affectedRows": 1 }]
+  },
+  "normalize": ["_id", "_creationTime", "_version", "id"],
+  "then": {
+    "query": { "table": "users" },
+    "expect": [
+      { "givenName": "Ada", "last": "Lovelace", "fullName": "Ada Lovelace" }
+    ],
+    "unordered": true
+  }
+}

@@ -353,6 +353,7 @@ mod tests {
         }
         TableDef {
             defaults: std::collections::BTreeMap::new(),
+            computed: std::collections::BTreeMap::new(),
             fields: map,
             indexes: vec![],
             owner_field: None,
