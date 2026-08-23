@@ -73,6 +73,18 @@ pub enum CommitterRequest {
         request: crate::migrate::MigrateRequest,
         reply: oneshot::Sender<Result<crate::migrate::MigrateResult, RtDbError>>,
     },
+    /// Apply a schema push on this database. Serialized through the per-db
+    /// committer like `RunMigrate` — a push's backfill UPDATEs (ttl
+    /// `defaultDurationMs`, computed entries) are document writes, so they
+    /// belong inside the single-writer turn; running them on the HTTP task
+    /// raced concurrent committer txns and left subscriptions serving stale
+    /// values until the table's next write. After the apply, the
+    /// backfill-affected tables' subscriptions re-run (table-level, no
+    /// per-doc captures). `reply` carries the applied schema.
+    RunPushSchema {
+        schema: crate::schema::SchemaDef,
+        reply: oneshot::Sender<Result<crate::schema::SchemaDef, RtDbError>>,
+    },
     /// A TTL reaper sweep is due. Fire-and-forget like `RunScheduled`: the
     /// reaper task does not wait for a reply. The committer runs the batch
     /// delete inside its serialized turn and publishes through the four tap
@@ -111,6 +123,117 @@ pub enum CommitterRequest {
     /// not carry a reply: the cascade is fire-and-forget and the task exits
     /// are not joined (ARC-125).
     Shutdown,
+}
+
+/// Stable advisory-lock key for `db`'s ownership lease (ENH-022 Stage 4,
+/// option A1 of docs/superpowers/specs/2026-08-22-multi-instance-stage4-design.md):
+/// the first 8 bytes of the db name's SHA-256, read as an i64.
+fn db_ownership_key(db: &str) -> i64 {
+    let hex = crate::db::sha256_hex(db);
+    u64::from_str_radix(&hex[..16], 16).unwrap_or(0) as i64
+}
+
+/// ENH-022 Stage 4: acquire `db`'s single-writer ownership lease — a dedicated
+/// one-connection pool whose backend takes `pg_try_advisory_lock(key(db))`.
+/// The caller runs the db's committer and its pollers ON this pool, so the
+/// lease and every write share one backend: no other replica can acquire
+/// mid-flight (split-brain is impossible by construction, not by fencing),
+/// and an owner's death (kill -9, container stop) drops the backend's session
+/// and releases the lock — the next replica's acquire is the failover.
+/// `min_connections(1)` + unbounded idle/lifetime keep the locked connection
+/// alive for as long as the pool (its clones in the committer/poller tasks)
+/// lives; eviction/drop-db drops them, closing the session and releasing the
+/// lease. Returns `CONFLICT` when another replica holds the lease.
+async fn acquire_ownership_lease(pool: &PgPool, db: &str) -> Result<PgPool, RtDbError> {
+    let lease = sqlx::pool::PoolOptions::<sqlx::Postgres>::new()
+        .max_connections(1)
+        .min_connections(1)
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .connect_lazy_with((*pool.connect_options()).clone());
+    let key = db_ownership_key(db);
+    let mut conn = lease.acquire().await.map_err(|err| {
+        tracing::error!(db, error = %err, "ownership lease connection failed");
+        RtDbError::internal("failed to establish ownership lease connection")
+    })?;
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(key)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|err| {
+            tracing::error!(db, error = %err, "ownership lease acquire failed");
+            RtDbError::internal("failed to acquire ownership lease")
+        })?;
+    if !acquired {
+        // The connection returns to the pool and is closed with it on drop —
+        // a failed acquire leaves nothing held.
+        return Err(RtDbError::new(
+            crate::error::ErrorCode::Conflict,
+            format!(
+                "database '{db}' is owned by another instance (single-writer lease); \
+                 writes must reach the owning replica until it releases"
+            ),
+        ));
+    }
+    Ok(lease)
+}
+
+/// True for every request whose handling writes documents — the arms a SHADOW
+/// (non-owner) committer must reject, and the submits that attempt the
+/// ownership upgrade in `submit`.
+/// Replies CONFLICT to a write arm that reached a SHADOW (non-owner)
+/// committer (ENH-022 Stage 4). Fire-and-forget arms have no reply — the
+/// shadow runs no scheduler/reaper pollers, so those only arrive from a
+/// submit racing the takeover; log loudly instead.
+async fn reply_ownership_conflict(ctx: &CommitterCtx, req: CommitterRequest) {
+    let err = RtDbError::new(
+        crate::error::ErrorCode::Conflict,
+        format!(
+            "database '{}' is owned by another instance (single-writer lease); \
+             writes must reach the owning replica until it releases",
+            ctx.db
+        ),
+    );
+    match req {
+        CommitterRequest::Mutate { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
+        CommitterRequest::RunMigrate { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
+        CommitterRequest::RunPushSchema { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
+        CommitterRequest::RunMergeUsers { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
+        CommitterRequest::RunRestoreSchema { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
+        CommitterRequest::RunScheduled { .. }
+        | CommitterRequest::RunReaper
+        | CommitterRequest::RunWorkflowAdvance { .. } => {
+            tracing::warn!(
+                db = %ctx.db,
+                "ownership conflict on a fire-and-forget write arm"
+            );
+        }
+        CommitterRequest::Subscribe { .. } | CommitterRequest::Shutdown => {}
+    }
+}
+
+fn request_needs_write(req: &CommitterRequest) -> bool {
+    matches!(
+        req,
+        CommitterRequest::Mutate { .. }
+            | CommitterRequest::RunScheduled { .. }
+            | CommitterRequest::RunMigrate { .. }
+            | CommitterRequest::RunReaper
+            | CommitterRequest::RunWorkflowAdvance { .. }
+            | CommitterRequest::RunMergeUsers { .. }
+            | CommitterRequest::RunPushSchema { .. }
+            | CommitterRequest::RunRestoreSchema { .. }
+    )
 }
 
 /// Owns one serialized committer task per database. Every mutation and every
@@ -171,6 +294,15 @@ struct ChannelEntry {
     /// step 4). `drop_db` does not need this — it deletes the db, so a
     /// concurrent `channel_for` misses `database_exists` and never respawns.
     draining: bool,
+    /// ENH-022 Stage 4: `Some` on the OWNING replica — the one-connection
+    /// lease pool whose backend holds the db's advisory lock; the committer
+    /// and its pollers run on it (writes and lease share one backend, so no
+    /// other replica can ever be mid-write). `None` = a SHADOW committer on a
+    /// non-owner: read arms (Subscribe's initial run) work, every write arm
+    /// rejects with CONFLICT, and a write submit attempts the ownership
+    /// upgrade first (`submit`'s needs-write path) — which is the failover
+    /// path when the owner dies and its backend releases the lock.
+    lease: Option<PgPool>,
 }
 
 /// Config scalars the committer needs (ARC-204): `Committers::new` takes
@@ -297,9 +429,9 @@ impl Committers {
     /// a single `ctx` argument instead of re-receiving 12 individual params
     /// (ARC-002). All fields are `Clone` (`Arc`/`PgPool`/`bool`/`i64`/`u64`),
     /// so this is cheap reference-bumps + primitive copies.
-    fn make_ctx(&self, db: String) -> CommitterCtx {
+    fn make_ctx(&self, db: String, pool: PgPool, owns_writes: bool) -> CommitterCtx {
         CommitterCtx {
-            pool: self.pool.clone(),
+            pool,
             db,
             subs: self.subs.clone(),
             schemas: self.schemas.clone(),
@@ -312,6 +444,7 @@ impl Committers {
             quotas: self.quotas.clone(),
             instance_id: self.instance_id.clone(),
             multi_instance: self.multi_instance,
+            owns_writes,
         }
     }
 
@@ -325,7 +458,7 @@ impl Committers {
     /// — otherwise a concurrent caller already respawned under this db key and
     /// evicting would drop the live replacement instead of the dead one.
     pub async fn submit(&self, db: &str, req: CommitterRequest) -> Result<(), RtDbError> {
-        let sender = self.channel_for(db).await?;
+        let sender = self.channel_for(db, request_needs_write(&req)).await?;
         if sender.send(req).await.is_err() {
             let mut guard = self.channels.lock().await;
             if guard
@@ -354,7 +487,15 @@ impl Committers {
     /// one itself. This bounds the loop so a stuck drain surfaces as an error
     /// instead of a hang, and guarantees the new committer starts only after the
     /// old one is dead — preserving the single-writer invariant.
-    async fn channel_for(&self, db: &str) -> Result<mpsc::Sender<CommitterRequest>, RtDbError> {
+    /// `for_write` marks the caller as a write arm: on multi-instance it
+    /// triggers the ownership upgrade — if the cached entry is a SHADOW
+    /// (non-owner), retire it and loop; the respawn path takes the lease (or
+    /// loses the race to a new owner and replies CONFLICT at the write arm).
+    async fn channel_for(
+        &self,
+        db: &str,
+        for_write: bool,
+    ) -> Result<mpsc::Sender<CommitterRequest>, RtDbError> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             // Fast path: a live (non-draining) entry. Refresh its idle clock
@@ -365,6 +506,17 @@ impl Committers {
                 let mut guard = self.channels.lock().await;
                 if let Some(entry) = guard.get_mut(db) {
                     if entry.draining {
+                        draining = true;
+                    } else if for_write && self.multi_instance && entry.lease.is_none() {
+                        // ENH-022 Stage 4 upgrade path: this db is served by a
+                        // shadow and a write arrived. Retire the shadow (its
+                        // exit clears the entry) and loop — the spawn path
+                        // then takes the ownership lease, which is also the
+                        // failover path when the previous owner has died.
+                        entry.draining = true;
+                        let sender = entry.sender.clone();
+                        drop(guard);
+                        let _ = sender.send(CommitterRequest::Shutdown).await;
                         draining = true;
                     } else {
                         entry.last_activity = std::time::Instant::now();
@@ -401,8 +553,35 @@ impl Committers {
                 return Ok(entry.sender.clone());
             }
 
+            // ENH-022 Stage 4: in multi-instance mode, first writer to a db
+            // takes the ownership lease (advisory lock on a dedicated
+            // one-connection pool) and runs the committer + pollers ON it —
+            // writes and lease share one backend, so no replica can be
+            // mid-write while another owns. A replica that LOSES the acquire
+            // gets a SHADOW committer instead: read arms work, write arms
+            // reject CONFLICT, and a write submit attempts the upgrade (the
+            // failover path once the owner dies).
+            let (ctx_pool, poller_pool, lease, owns_writes) = if self.multi_instance {
+                match acquire_ownership_lease(&self.pool, db).await {
+                    Ok(lease_pool) => (
+                        lease_pool.clone(),
+                        lease_pool.clone(),
+                        Some(lease_pool),
+                        true,
+                    ),
+                    Err(err) if err.code == crate::error::ErrorCode::Conflict => {
+                        (self.pool.clone(), self.pool.clone(), None, false)
+                    }
+                    Err(err) => return Err(err),
+                }
+            } else {
+                (self.pool.clone(), self.pool.clone(), None, true)
+            };
             let (tx, rx) = mpsc::channel(CHANNEL_BUFFER);
-            let committer_handle = tokio::spawn(run_committer(self.make_ctx(db.to_string()), rx));
+            let committer_handle = tokio::spawn(run_committer(
+                self.make_ctx(db.to_string(), ctx_pool, owns_writes),
+                rx,
+            ));
             // SEC-127: supervisor — evicts the cached Sender when the committer
             // task exits (panic or normal completion), so a dead entry is cleared
             // immediately rather than lingering until `submit`'s send-failure path
@@ -425,49 +604,58 @@ impl Committers {
                     }
                 });
             }
-            tokio::spawn(scheduler::run_scheduler(
-                self.pool.clone(),
-                db.to_string(),
-                tx.clone(),
-            ));
+            if owns_writes {
+                tokio::spawn(scheduler::run_scheduler(
+                    poller_pool.clone(),
+                    db.to_string(),
+                    tx.clone(),
+                ));
+            }
             // Per-db dedup-row expiry sweep (ARC-007): owns `mutation_log`'s
             // periodic DELETE so `mutation_log::check` is a pure SELECT on the
             // hot path. Exits when the committer channel closes (same lifecycle
             // signal the scheduler task uses).
-            tokio::spawn(mutation_log::run_cleanup(
-                self.pool.clone(),
-                db.to_string(),
-                tx.clone(),
-            ));
+            if owns_writes {
+                tokio::spawn(mutation_log::run_cleanup(
+                    poller_pool.clone(),
+                    db.to_string(),
+                    tx.clone(),
+                ));
+            }
             // Per-db TTL reaper: enqueues a fire-and-forget `RunReaper` every
             // `ttl_sweep_interval`; the committer's `handle_reaper` performs the
             // batch delete inside its serialized turn. Same lifecycle as the
             // scheduler/cleanup tasks (exits on channel close or db removal).
-            tokio::spawn(crate::reaper::run_reaper(
-                self.pool.clone(),
-                db.to_string(),
-                tx.clone(),
-                self.ttl_sweep_interval,
-                self.schemas.clone(),
-            ));
+            if owns_writes {
+                tokio::spawn(crate::reaper::run_reaper(
+                    poller_pool.clone(),
+                    db.to_string(),
+                    tx.clone(),
+                    self.ttl_sweep_interval,
+                    self.schemas.clone(),
+                ));
+            }
             // Per-db storage-quota cache warmer (ARC-004): periodically re-measures
             // the db's on-disk size off the committer turn so `enforce` is a cheap
             // stale-read. Same lifecycle as the reaper/cleanup tasks (exits on
             // channel close or db removal); a no-op tick when no storage cap is set.
-            tokio::spawn(run_quota_warmer(
-                self.pool.clone(),
-                db.to_string(),
-                self.quotas.clone(),
-                self.hot.clone(),
-                std::time::Duration::from_secs(self.quota_cache_ttl_secs),
-                tx.clone(),
-            ));
+            if owns_writes {
+                tokio::spawn(run_quota_warmer(
+                    poller_pool.clone(),
+                    db.to_string(),
+                    self.quotas.clone(),
+                    self.hot.clone(),
+                    std::time::Duration::from_secs(self.quota_cache_ttl_secs),
+                    tx.clone(),
+                ));
+            }
             guard.insert(
                 db.to_string(),
                 ChannelEntry {
                     sender: tx.clone(),
                     last_activity: std::time::Instant::now(),
                     draining: false,
+                    lease,
                 },
             );
             return Ok(tx);
@@ -481,7 +669,7 @@ impl Committers {
     /// started on a cold db (no Mutate/Subscribe since creation) would
     /// otherwise sit `pending` until unrelated data-plane traffic spawns them.
     pub(crate) async fn ensure_spawned(&self, db: &str) -> Result<(), RtDbError> {
-        self.channel_for(db).await.map(|_| ())
+        self.channel_for(db, false).await.map(|_| ())
     }
 
     /// Executes `txn` on `db` and waits for the fan-out-then-reply cycle to
@@ -557,6 +745,25 @@ impl Committers {
             },
         )
         .await?;
+        reply_rx
+            .await
+            .map_err(|_| RtDbError::internal("committer task dropped the reply"))?
+    }
+
+    /// Applies a schema push on `db` and waits for the commit-then-fan-out
+    /// cycle to complete. Funneled through the per-db committer like `mutate`
+    /// so the push's backfill UPDATEs are serialized with concurrent writes
+    /// (single-writer invariant) and the backfill-affected tables'
+    /// subscriptions re-run on the durable result. Returns the applied
+    /// schema. See `handle_push_schema`.
+    pub async fn push_schema(
+        &self,
+        db: &str,
+        schema: crate::schema::SchemaDef,
+    ) -> Result<crate::schema::SchemaDef, RtDbError> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.submit(db, CommitterRequest::RunPushSchema { schema, reply })
+            .await?;
         reply_rx
             .await
             .map_err(|_| RtDbError::internal("committer task dropped the reply"))?
@@ -775,6 +982,11 @@ struct CommitterCtx {
     /// payload so a receiving instance can skip its own notifications. Only read
     /// when `multi_instance` is true.
     instance_id: String,
+    /// ENH-022 Stage 4: false on a SHADOW committer (a non-owner replica's
+    /// read-only stand-in). Every write arm rejects with CONFLICT; the
+    /// ownership upgrade (the failover path) happens in `submit` before a
+    /// write ever reaches a shadow.
+    pub owns_writes: bool,
     /// When true, `publish_taps` also emits one `pg_notify` per DocOp (ENH-022
     /// Stage 2). False on a single-instance deploy — the publish tap is
     /// zero-cost when off.
@@ -852,6 +1064,14 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
         tracing::error!(db = %ctx.db, error = %err, "committer: storage::ensure_table failed");
     }
     while let Some(req) = rx.recv().await {
+        // ENH-022 Stage 4: a SHADOW committer (non-owner replica) serves read
+        // arms only — a write arm reaching here lost the ownership-upgrade
+        // race in `submit` (another replica holds the lease), so it replies
+        // CONFLICT instead of writing.
+        if !ctx.owns_writes && request_needs_write(&req) {
+            reply_ownership_conflict(&ctx, req).await;
+            continue;
+        }
         // ENH-018: the `db` field on every span is bounded (one per database
         // name, not per document), so it is safe to put on a span attribute —
         // unlike doc ids or content, which would blow up cardinality.
@@ -925,6 +1145,11 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                     dry_run,
                 );
                 let result = handle_migrate(&ctx, request).instrument(span).await;
+                let _ = reply.send(result);
+            }
+            CommitterRequest::RunPushSchema { schema, reply } => {
+                let span = tracing::info_span!("committer.push_schema", db = %ctx.db);
+                let result = handle_push_schema(&ctx, schema).instrument(span).await;
                 let _ = reply.send(result);
             }
             CommitterRequest::RunReaper => {
@@ -2078,6 +2303,33 @@ async fn handle_migrate(
 /// which feeds `fan_out` as a `WriteSet` (table-level re-run, the safe
 /// over-approximation — no per-doc `doc_values` are captured for a shape
 /// change, mirroring `handle_migrate`).
+/// Schema push inside the serialized committer turn. The backfill UPDATEs a
+/// push can run (ttl `defaultDurationMs`, computed entries) are document
+/// writes, so they belong here rather than on the HTTP task; afterwards the
+/// backfill-affected tables' subscriptions re-run table-level (the
+/// restore/migrate over-approximation — no per-doc `doc_values`, no DocOps,
+/// so `publish_taps` runs with `docop_taps=false`: push backfills are
+/// invisible to the op feed/audit/webhooks by the same discipline restore
+/// has).
+async fn handle_push_schema(
+    ctx: &CommitterCtx,
+    schema: crate::schema::SchemaDef,
+) -> Result<crate::schema::SchemaDef, RtDbError> {
+    let (applied, backfilled) = crate::ddl::push_schema(&ctx.pool, &ctx.db, schema).await?;
+    ctx.schemas.put(&ctx.db, applied.clone()).await;
+    if let Err(err) =
+        crate::schema_history::capture(&ctx.pool, &ctx.db, "push", None, &applied).await
+    {
+        tracing::warn!(db = %ctx.db, error = %err, "schema history capture failed");
+    }
+    let write_set = WriteSet {
+        tables: backfilled,
+        ..Default::default()
+    };
+    publish_taps(ctx, &applied, &write_set, None, "push", false, false).await;
+    Ok(applied)
+}
+
 async fn handle_restore_schema(ctx: &CommitterCtx, target_version: i64) -> Result<i64, RtDbError> {
     let current = crate::db::load_schema(&ctx.pool, &ctx.db)
         .await?

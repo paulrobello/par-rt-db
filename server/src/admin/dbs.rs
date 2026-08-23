@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::RtDbError;
 use crate::http_api::ApiJson;
 use crate::schema::SchemaDef;
-use crate::{AppState, db, ddl, schema_history, snapshot};
+use crate::{AppState, db, snapshot};
 
 use super::OkResponse;
 
@@ -84,11 +84,15 @@ pub(super) async fn push_schema(
                 .metrics
                 .record_quota_rejection(&body.db, crate::metrics::QuotaKind::Tables);
         })?;
-    let applied = ddl::push_schema(&state.pool, &body.db, body.schema).await?;
-    state.schemas.put(&body.db, applied.clone()).await;
-    if let Err(err) = schema_history::capture(&state.pool, &body.db, "push", None, &applied).await {
-        tracing::warn!(db = %body.db, error = %err, "schema history capture failed");
-    }
+    // Routed through the committer (not a direct `ddl::push_schema`): a push
+    // can backfill document values (ttl defaultDurationMs, computed fields),
+    // and those writes belong in the single-writer turn — which also re-runs
+    // the backfilled tables' subscriptions (`handle_push_schema`).
+    state
+        .realtime
+        .committers
+        .push_schema(&body.db, body.schema)
+        .await?;
     Ok(Json(OkResponse { ok: true }))
 }
 

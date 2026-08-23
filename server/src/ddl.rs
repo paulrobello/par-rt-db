@@ -288,12 +288,16 @@ async fn validate_search_languages(pool: &PgPool, schema: &SchemaDef) -> Result<
 /// Validates `schema`, diffs it against whatever is currently pushed for `db`
 /// (rejecting destructive changes), and applies the additive DDL — new tables,
 /// new indexed-field columns with backfill, and new indexes — plus the `meta`
-/// upsert, all inside a single transaction. Returns the applied schema.
+/// upsert, all inside a single transaction. Returns the applied schema plus
+/// the set of tables whose EXISTING documents the apply rewrites (the
+/// backfills below) — callers use it to re-run subscriptions, which a
+/// backfill otherwise leaves serving stale values until the table's next
+/// write.
 pub async fn push_schema(
     pool: &PgPool,
     db: &str,
     schema: SchemaDef,
-) -> Result<SchemaDef, RtDbError> {
+) -> Result<(SchemaDef, std::collections::BTreeSet<String>), RtDbError> {
     schema.validate()?;
     validate_db_name(db)?;
     validate_search_languages(pool, &schema).await?;
@@ -306,6 +310,7 @@ pub async fn push_schema(
     if let Some(old_schema) = &previous {
         detect_destructive_changes(old_schema, &schema)?;
     }
+    let backfilled = backfill_affected_tables(previous.as_ref(), &schema);
 
     let pg_schema_name = pg_schema(db);
     let mut tx = pool.begin().await?;
@@ -344,7 +349,37 @@ pub async fn push_schema(
     .await?;
 
     tx.commit().await?;
-    Ok(schema)
+    Ok((schema, backfilled))
+}
+
+/// Tables whose existing documents a push rewrites, derived from the same
+/// conditions the two backfill UPDATEs run under: a computed entry ADDED or
+/// CHANGED (removal backfills nothing — stored values stay), and a ttl
+/// `defaultDurationMs` newly declared or changed (pre-declaration rows lack
+/// the field; the UPDATE's `IS NULL` guard makes a routine re-push a no-op,
+/// so unchanged declarations affect nothing). A brand-new table has no rows,
+/// so it can never be backfill-affected.
+pub(crate) fn backfill_affected_tables(
+    previous: Option<&SchemaDef>,
+    schema: &SchemaDef,
+) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for (name, new_table) in &schema.tables {
+        let Some(old_table) = previous.and_then(|s| s.tables.get(name)) else {
+            continue;
+        };
+        let computed_changed = new_table
+            .computed
+            .iter()
+            .any(|(f, e)| old_table.computed.get(f) != Some(e));
+        let new_ttl_default = new_table.ttl.as_ref().and_then(|t| t.default_duration_ms);
+        let ttl_new = new_ttl_default.is_some()
+            && old_table.ttl.as_ref().and_then(|t| t.default_duration_ms) != new_ttl_default;
+        if computed_changed || ttl_new {
+            out.insert(name.clone());
+        }
+    }
+    out
 }
 
 /// Additive table + index DDL shared by `push_schema` and the destructive

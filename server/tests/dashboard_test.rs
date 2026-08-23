@@ -1161,7 +1161,7 @@ async fn admin_query_bypasses_per_row_owner() -> anyhow::Result<()> {
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &db).await?;
     let db = common::wrap_test_db(db);
-    let schema =
+    let (schema, _) =
         rtdb_server::ddl::push_schema(&pool, &db, serde_json::from_value(owner_schema_json())?)
             .await?;
     seed_owned_note(&pool, &db, &schema, "alice's note", "alice").await;

@@ -979,7 +979,8 @@ async fn drop_field_and_change_type_count_only_field_carriers() {
     .unwrap();
     db.schema = push_schema(&db.state.pool, &db.name, expanded)
         .await
-        .expect("additive push adds `w`");
+        .expect("additive push adds `w`")
+        .0;
     let c1 = insert_doc(&db, "u", r#"{"name":"a","w":"1"}"#).await;
     let c2 = insert_doc(&db, "u", r#"{"name":"b","w":"2"}"#).await;
     let fx = migrate(

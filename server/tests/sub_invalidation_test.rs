@@ -1679,3 +1679,151 @@ async fn projection_suppresses_non_projected_field_push() -> anyhow::Result<()> 
 
     Ok(())
 }
+
+// ---- 15. push-time backfill invalidation (FM-23 ttl default / ENH-028 computed) ----
+// A schema push that backfills document values re-runs the affected tables'
+// subscriptions inside the committer turn (`handle_push_schema`); a push that
+// backfills nothing must not re-run anything.
+
+/// A bare uniquely-named database (no kanban fixture — these tests push their
+/// own schema through the committer's push arm, the same path
+/// `POST /admin/push-schema` takes).
+async fn bare_db(state: &std::sync::Arc<rtdb_server::AppState>) -> anyhow::Result<common::TestDb> {
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&state.pool, &name).await?;
+    Ok(common::wrap_test_db(name))
+}
+
+fn items_schema_json(extra: serde_json::Value) -> serde_json::Value {
+    let mut table = serde_json::json!({
+        "fields": { "title": { "type": "string" } },
+        "indexes": [{ "name": "by_title", "fields": ["title"] }]
+    });
+    if let Some(obj) = extra.as_object() {
+        for (k, v) in obj {
+            if k == "fields" {
+                for (fk, fv) in v.as_object().expect("fields object") {
+                    table["fields"][fk] = fv.clone();
+                }
+            } else {
+                table[k] = v.clone();
+            }
+        }
+    }
+    serde_json::json!({ "tables": { "items": table } })
+}
+
+fn collect_by_title(title: &str) -> Query {
+    let mut q = count_by_status(title);
+    q.table = "items".to_string();
+    q.index = Some("by_title".to_string());
+    q.count = false;
+    q
+}
+
+async fn insert_item(
+    state: &std::sync::Arc<rtdb_server::AppState>,
+    db: &str,
+) -> anyhow::Result<()> {
+    state
+        .realtime
+        .committers
+        .mutate(
+            db,
+            None,
+            Transaction {
+                steps: vec![Step::Insert {
+                    table: "items".to_string(),
+                    doc: serde_json::json!({ "title": "a" })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                }],
+            },
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn push_ttl_default_backfill_invalidates_subscription() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = bare_db(&state).await?;
+
+    // Base push: no ttl. The committer arm is the push surface under test.
+    let base: SchemaDef = serde_json::from_value(items_schema_json(serde_json::json!({})))?;
+    state.realtime.committers.push_schema(&db, base).await?;
+
+    let mut rx = sub(&state, &db, collect_by_title("a")).await;
+    insert_item(&state, &db).await?;
+    expect_update(&mut rx, "insert push").await;
+
+    // Re-push declaring the field, its index, and the ttl default together:
+    // pre-declaration rows get the column as NULL, and the backfill stamps
+    // `expiresAt = created_at + 60s` — the subscription must observe the new
+    // field value without any further write.
+    let with_ttl: SchemaDef = serde_json::from_value(items_schema_json(serde_json::json!({
+        "fields": { "expiresAt": { "type": "number" } },
+        "ttl": { "field": "expiresAt", "defaultDurationMs": 60_000 },
+        "indexes": [
+            { "name": "by_title", "fields": ["title"] },
+            { "name": "by_expiresAt", "fields": ["expiresAt"] }
+        ]
+    })))?;
+    state.realtime.committers.push_schema(&db, with_ttl).await?;
+    expect_update(&mut rx, "ttl backfill re-ran subscription").await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn push_computed_backfill_invalidates_subscription() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = bare_db(&state).await?;
+
+    let base: SchemaDef = serde_json::from_value(items_schema_json(serde_json::json!({
+        "fields": { "upper": { "type": "optional", "inner": { "type": "string" } } }
+    })))?;
+    state.realtime.committers.push_schema(&db, base).await?;
+
+    let mut rx = sub(&state, &db, collect_by_title("a")).await;
+    insert_item(&state, &db).await?;
+    expect_update(&mut rx, "insert push").await;
+
+    // Re-push adding a computed entry: every existing row is re-derived and
+    // the subscription must observe the stamped value.
+    let with_computed: SchemaDef = serde_json::from_value(items_schema_json(serde_json::json!({
+        "fields": { "upper": { "type": "optional", "inner": { "type": "string" } } },
+        "computed": { "upper": { "op": "upper", "value": { "op": "field", "field": "title" } } }
+    })))?;
+    state
+        .realtime
+        .committers
+        .push_schema(&db, with_computed)
+        .await?;
+    expect_update(&mut rx, "computed backfill re-ran subscription").await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unchanged_repush_does_not_push() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = bare_db(&state).await?;
+
+    let base: SchemaDef = serde_json::from_value(items_schema_json(serde_json::json!({})))?;
+    state
+        .realtime
+        .committers
+        .push_schema(&db, base.clone())
+        .await?;
+
+    let mut rx = sub(&state, &db, collect_by_title("a")).await;
+    insert_item(&state, &db).await?;
+    expect_update(&mut rx, "insert push").await;
+
+    // A routine re-push of the identical schema backfills nothing, so no
+    // subscription re-runs and nothing is pushed.
+    state.realtime.committers.push_schema(&db, base).await?;
+    expect_no_update(&mut rx, "unchanged re-push");
+    Ok(())
+}

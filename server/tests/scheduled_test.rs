@@ -225,9 +225,10 @@ async fn push_simple_schema(pool: &PgPool, db: &str) -> SchemaDef {
             "indexes":[{"name":"by_n","fields":["n"]}]}
     }}))
     .expect("parse items schema");
-    ddl::push_schema(pool, db, schema)
+    let (applied, _) = ddl::push_schema(pool, db, schema)
         .await
-        .expect("push items schema")
+        .expect("push items schema");
+    applied
 }
 
 /// Triggers lazy spawn of `db`'s committer + scheduler tasks by submitting a

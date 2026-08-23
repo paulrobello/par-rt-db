@@ -711,7 +711,8 @@ fn decide(read_set: &ReadSet, table: &str, write_set: &WriteSet) -> Decision {
         // that didn't touch it cannot change the result.
         ReadSet::Point { id } => (
             SkipClass::Point,
-            !write_set.docs.contains(&(table.to_string(), id.clone())),
+            !write_set.docs.contains(&(table.to_string(), id.clone()))
+                && !table_touched_without_docs(write_set, table),
         ),
         // count / collect / unique: re-run only if some written doc crossed
         // the eq-prefix/range window boundary. Sound only because every
@@ -735,6 +736,16 @@ fn decide(read_set: &ReadSet, table: &str, write_set: &WriteSet) -> Decision {
     }
 }
 
+/// True when `table` is touched in `write_set` with no per-doc pairs — a
+/// table-level invalidation (push/restore backfill, schema reconcile) that
+/// carries no window information. Same soundness rule as the capture-gap arm
+/// below: no per-doc data ⇒ conservatively affecting, never a silent skip —
+/// a backfilled doc's values are unknowable at decide time, so windowed and
+/// point subscriptions on the table must re-run.
+fn table_touched_without_docs(write_set: &WriteSet, table: &str) -> bool {
+    write_set.tables.iter().any(|t| t == table) && !write_set.docs.iter().any(|(t, _)| t == table)
+}
+
 /// Whether any document written to `table` satisfies `affects`. A written
 /// `(table, id)` with no `doc_values` entry (shouldn't happen — every `touch`
 /// site also captures) counts as affecting, so a capture gap can never turn
@@ -744,6 +755,9 @@ fn any_written_affects(
     table: &str,
     mut affects: impl FnMut(&DocValues) -> bool,
 ) -> bool {
+    if table_touched_without_docs(write_set, table) {
+        return true;
+    }
     for (doc_table, doc_id) in &write_set.docs {
         if doc_table != table {
             continue;

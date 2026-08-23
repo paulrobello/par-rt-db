@@ -46,7 +46,7 @@ async fn fresh_widgets_db(
         .expect("create fresh database");
     let schema: SchemaDef =
         serde_json::from_value(widgets_schema_json()).expect("parse widgets schema fixture");
-    let applied = ddl::push_schema(&state.pool, &name, schema)
+    let (applied, _) = ddl::push_schema(&state.pool, &name, schema)
         .await
         .expect("push widgets schema");
     (common::wrap_test_db(name), applied)
@@ -387,7 +387,7 @@ async fn unique_index_dup_pre_check_returns_conflict() -> anyhow::Result<()> {
             }
         }
     }))?;
-    let schema = ddl::push_schema(&state.pool, &name, base).await?;
+    let (schema, _) = ddl::push_schema(&state.pool, &name, base).await?;
 
     // Insert two rows that collide on the would-be-unique key.
     for _ in 0..2 {

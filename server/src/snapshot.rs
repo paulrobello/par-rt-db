@@ -113,7 +113,9 @@ pub async fn import_database(pool: &PgPool, db: &str, jsonl: &str) -> Result<Sch
         }
     };
 
-    let applied = push_schema(pool, db, schema).await?;
+    // Import replays into a freshly-created database (no subscribers, no
+    // concurrent writers), so the backfill-affected set is always empty here.
+    let (applied, _) = push_schema(pool, db, schema).await?;
     let pg_schema_name = pg_schema(db);
     let mut tx = pool.begin().await?;
 
