@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::{HeaderMap, Method};
+use axum::http::{HeaderMap, HeaderValue, Method};
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -175,8 +175,25 @@ pub(super) async fn require_admin_mw(
     };
     match auth {
         Ok(principal) => {
+            // Mint the SEC-106 nonce for authenticated cookie-mode requests
+            // that lack it (browsers logged in before the CSRF deploy) so the
+            // next mutation can echo it. Computed before `req` moves into
+            // `next`; appended to whatever response comes back.
+            let heal = csrf_heal_cookie(
+                req.headers(),
+                state.config.cookie_secure,
+                state.config.trusted_proxy,
+            );
             req.extensions_mut().insert(principal);
-            next.run(req).await
+            let mut response = next.run(req).await;
+            if let Some(cookie) = heal
+                && response.status().is_success()
+            {
+                response
+                    .headers_mut()
+                    .append(axum::http::header::SET_COOKIE, cookie);
+            }
+            response
         }
         Err(e) => e.into_response(),
     }
@@ -227,6 +244,33 @@ fn admin_csrf_matches(headers: &HeaderMap) -> bool {
 /// through to the normal auth gate (401), don't 403.
 fn has_session_cookie(headers: &HeaderMap) -> bool {
     auth::cookie::session_cookie(headers).is_some()
+}
+
+/// Self-heal for browsers whose login predates SEC-106: they hold a valid
+/// session cookie but no `rtdb-admin-csrf` cookie (it did not exist when they
+/// logged in), so every mutating admin request 403s forever. On an
+/// authenticated cookie-mode request that lacks the nonce cookie, mint one on
+/// the response — the dashboard's 20s `/admin/dbs` poll heals the browser
+/// within one page load, and the next mutation carries the echoed header.
+///
+/// Security: minting requires an already-authenticated admin request, and the
+/// nonce is independent random — a cross-site attacker who caused the mint
+/// still cannot read the cookie (same-origin policy), so the double-submit
+/// defense is unchanged. A MISMATCH (cookie and header both present, different
+/// values) is never healed — that is the attack signal and stays a hard 403.
+fn csrf_heal_cookie(
+    headers: &HeaderMap,
+    cookie_secure: bool,
+    trusted_proxy: bool,
+) -> Option<HeaderValue> {
+    if !has_session_cookie(headers) || has_explicit_bearer(headers) {
+        return None;
+    }
+    if auth::cookie::admin_csrf_cookie(headers).is_some() {
+        return None;
+    }
+    let secure = cookie_secure || auth::cookie::request_is_secure(headers, trusted_proxy);
+    auth::cookie::set_admin_csrf_cookie(&crate::db::random_token(), secure).ok()
 }
 
 /// Middleware: require the admin CSRF double-submit nonce on mutating
@@ -481,5 +525,44 @@ mod tests {
             None
         )));
         assert!(!has_session_cookie(&headers_with(None, None, None)));
+    }
+
+    #[test]
+    fn csrf_heal_mints_nonce_for_stale_cookie_browser() {
+        let h = headers_with(Some("rtdb_session=abc"), None, None);
+        let cookie = csrf_heal_cookie(&h, false, false)
+            .expect("heal mints a nonce when only the session cookie is present");
+        let value = cookie.to_str().unwrap();
+        assert!(value.starts_with("rtdb-admin-csrf="));
+        assert!(
+            !value.contains("HttpOnly"),
+            "dashboard JS must read the nonce"
+        );
+    }
+
+    #[test]
+    fn csrf_heal_skips_when_nonce_cookie_already_present() {
+        let h = headers_with(Some("rtdb_session=abc; rtdb-admin-csrf=xyz"), None, None);
+        assert!(csrf_heal_cookie(&h, false, false).is_none());
+    }
+
+    #[test]
+    fn csrf_heal_skips_bearer_requests() {
+        let h = headers_with(Some("rtdb_session=abc"), None, Some("tok"));
+        assert!(csrf_heal_cookie(&h, false, false).is_none());
+    }
+
+    #[test]
+    fn csrf_heal_skips_when_no_session_cookie() {
+        let h = headers_with(None, None, None);
+        assert!(csrf_heal_cookie(&h, false, false).is_none());
+    }
+
+    #[test]
+    fn csrf_heal_adds_secure_attribute_when_proxied_https() {
+        let mut h = headers_with(Some("rtdb_session=abc"), None, None);
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        let cookie = csrf_heal_cookie(&h, false, true).unwrap();
+        assert!(cookie.to_str().unwrap().contains("Secure"));
     }
 }

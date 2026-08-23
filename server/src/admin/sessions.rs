@@ -52,23 +52,45 @@ pub(super) async fn revoke_session_handler(
 }
 
 #[derive(Deserialize)]
-pub(super) struct RevokeUserParams {
-    user: String,
+pub(super) struct RevokeBulkParams {
+    /// Revoke every session for this user id.
+    #[serde(default)]
+    user: Option<String>,
+    /// `true` — revoke every EXPIRED session instance-wide (the dashboard's
+    /// "remove all expired" action; expired rows otherwise linger until each
+    /// is individually used or revoked).
+    #[serde(default)]
+    expired: Option<bool>,
 }
 
 #[derive(Serialize)]
-pub(super) struct RevokeUserResponse {
+pub(super) struct RevokeBulkResponse {
     ok: bool,
     revoked: u64,
 }
 
-/// Revoke every session for a user. Requires `?user=` — a bare DELETE is a 400
-/// (refuse to revoke every session instance-wide from one unscoped call).
+/// Bulk revoke. Exactly one scope: `?user=` (every session of one user) or
+/// `?expired=true` (every expired session, `sessions` + `admin_sessions`). A
+/// bare DELETE — or both params at once — is a 400: refuse to revoke every
+/// session instance-wide from one unscoped or ambiguous call.
 pub(super) async fn revoke_user_sessions_handler(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
-    QueryParams(params): QueryParams<RevokeUserParams>,
-) -> Result<Json<RevokeUserResponse>, RtDbError> {
-    let revoked = session::delete_sessions_for_user(&state.pool, &params.user).await?;
-    Ok(Json(RevokeUserResponse { ok: true, revoked }))
+    QueryParams(params): QueryParams<RevokeBulkParams>,
+) -> Result<Json<RevokeBulkResponse>, RtDbError> {
+    let revoked = match (params.user.as_deref(), params.expired.unwrap_or(false)) {
+        (Some(user), false) => session::delete_sessions_for_user(&state.pool, user).await?,
+        (None, true) => session::delete_expired_sessions(&state.pool).await?,
+        (Some(_), true) => {
+            return Err(RtDbError::bad_request(
+                "pass exactly one of ?user= or ?expired=true",
+            ));
+        }
+        (None, false) => {
+            return Err(RtDbError::bad_request(
+                "missing scope: pass ?user= or ?expired=true",
+            ));
+        }
+    };
+    Ok(Json(RevokeBulkResponse { ok: true, revoked }))
 }

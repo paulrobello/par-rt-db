@@ -1203,6 +1203,16 @@ describe("RtDbAdminClient sessions", () => {
     expect(init.method).toBe("DELETE");
     expect(init.headers.Authorization).toBe("Bearer k");
   });
+
+  it("revokeExpiredSessions DELETEs /admin/sessions?expired=true and returns {ok, revoked}", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ ok: true, revoked: 7 }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.revokeExpiredSessions()).resolves.toEqual({ ok: true, revoked: 7 });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/sessions?expired=true");
+    expect(init.method).toBe("DELETE");
+    expect(init.headers.Authorization).toBe("Bearer k");
+  });
 });
 
 describe("RtDbAdminClient anonymous access (SEC-103)", () => {

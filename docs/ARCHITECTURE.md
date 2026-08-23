@@ -480,13 +480,16 @@ are machine-side and out of scope. See FEATURE_MATRIX #20.
 
 `admin/sessions.rs`, part of the FEATURE_MATRIX Admin control plane row:
 `GET /admin/sessions` lists every live interactive session
-(OAuth/anonymous/admin-key); `DELETE /admin/sessions` (by `user`) and
+(OAuth/anonymous/admin-key); `DELETE /admin/sessions` (by `user`, or
+`?expired=true` to sweep every expired row from both the `sessions` and
+`admin_sessions` tables — untouched expired rows are never reaped otherwise,
+since lazy deletion fires only when that session is used again) and
 `DELETE /admin/sessions/{token_hash}` (by single session) revoke — and because
 `authorize` re-runs on every Subscribe/Mutate, revocation takes effect on the
 **next op** over an already-open connection (no force-disconnect needed, no
 stale-auth window). The admin dashboard mirrors this at `/sessions`;
-`list_sessions`/`revoke_session`/`revoke_user_sessions` mirror into all three
-client SDKs and the `rtdb sessions list|revoke` CLI.
+`list_sessions`/`revoke_session`/`revoke_user_sessions`/`revoke_expired_sessions`
+mirror into all client SDKs and the `rtdb sessions list|revoke` CLI.
 
 ## File storage
 

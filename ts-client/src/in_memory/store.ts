@@ -2687,6 +2687,12 @@ export class InMemoryAdminClient {
     return Promise.resolve({ ok: true, revoked: 0 });
   }
 
+  /** Revoke every expired session. No-op in-memory (the harness mints no
+   *  sessions); reports zero revoked. */
+  revokeExpiredSessions(): Promise<{ ok: boolean; revoked: number }> {
+    return Promise.resolve({ ok: true, revoked: 0 });
+  }
+
   /** Anon→real account merge. No-op in-memory; resolves an empty report
    *  (nothing re-stamped, nothing repointed, no anon row deleted) — mirroring
    *  `RtDbAdminClient.mergeUsers` for admin consumers unit-tested with no

@@ -587,6 +587,16 @@ public actor RtDbAdminClient {
         )
     }
 
+    /// `DELETE /admin/sessions?expired=true` → `{ok, revoked}`. Revokes every
+    /// EXPIRED session instance-wide (OAuth/anonymous and admin-key login rows
+    /// alike); `revoked` is the count of sessions dropped.
+    public func revokeExpiredSessions() async throws -> RevokeUserSessionsResponse {
+        try await request(
+            "revoke expired sessions", method: "DELETE", path: "/admin/sessions",
+            query: [URLQueryItem(name: "expired", value: "true")]
+        )
+    }
+
     // MARK: Anon→real account merge
 
     /// `POST /admin/merge-users` `{anonUserId, realUserId, confirm}` →

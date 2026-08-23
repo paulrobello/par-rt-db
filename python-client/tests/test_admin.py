@@ -384,6 +384,22 @@ def test_revoke_user_sessions_deletes_with_user_query_and_parses_count() -> None
     assert captured["url"].params["user"] == "u1"
 
 
+def test_revoke_expired_sessions_deletes_with_expired_query_and_parses_count() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["url"] = request.url
+        return httpx.Response(200, json={"ok": True, "revoked": 3})
+
+    with _sync_client(handler) as c:
+        count = c.revoke_expired_sessions()
+    assert count == 3
+    assert captured["method"] == "DELETE"
+    assert captured["url"].path == "/admin/sessions"
+    assert captured["url"].params["expired"] == "true"
+
+
 # --- sync: user merge (POST /admin/merge-users) ---------------------------
 
 
@@ -602,6 +618,22 @@ async def test_async_list_revoke_sessions_mirror_sync() -> None:
     assert ("GET", "/admin/sessions", {"user": "u1"}) in captured["urls"]
     assert ("DELETE", "/admin/sessions/abc", {}) in captured["urls"]
     assert ("DELETE", "/admin/sessions", {"user": "u1"}) in captured["urls"]
+
+
+async def test_async_revoke_expired_sessions_mirrors_sync() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["url"] = request.url
+        return httpx.Response(200, json={"ok": True, "revoked": 4})
+
+    async with _async_client(handler) as c:
+        count = await c.revoke_expired_sessions()
+    assert count == 4
+    assert captured["method"] == "DELETE"
+    assert captured["url"].path == "/admin/sessions"
+    assert captured["url"].params["expired"] == "true"
 
 
 async def test_async_merge_users_mirrors_sync() -> None:

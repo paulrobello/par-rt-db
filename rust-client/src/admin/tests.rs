@@ -1879,6 +1879,21 @@ async fn revoke_user_sessions_deletes_with_user_query_and_parses_count() {
     assert_eq!(r.revoked, 3);
 }
 
+#[tokio::test]
+async fn revoke_expired_sessions_deletes_with_expired_query_and_parses_count() {
+    let (server, client) = setup().await;
+    Mock::given(method("DELETE"))
+        .and(path("/admin/sessions"))
+        .and(query_param("expired", "true"))
+        .and(header("authorization", BEARER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true, "revoked": 5})))
+        .mount(&server)
+        .await;
+    let r = client.revoke_expired_sessions().await.unwrap();
+    assert!(r.ok);
+    assert_eq!(r.revoked, 5);
+}
+
 #[test]
 fn session_info_deserializes_wire_shapes() {
     use crate::wire::admin::SessionInfo;

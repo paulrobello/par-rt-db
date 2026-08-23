@@ -714,6 +714,15 @@ def _op_revoke_user_sessions(user_id: str) -> _AdminRequest:
     )
 
 
+def _op_revoke_expired_sessions() -> _AdminRequest:
+    return _AdminRequest(
+        "DELETE",
+        "/admin/sessions",
+        {"params": {"expired": "true"}},
+        _parse_revoked_count,
+    )
+
+
 def _op_merge_users(anon_user_id: str, real_user_id: str) -> _AdminRequest:
     return _AdminRequest(
         "POST",
@@ -1482,6 +1491,15 @@ class RtDbAdminClient:
         """
         return self._executor.run(_op_revoke_user_sessions(user_id))
 
+    def revoke_expired_sessions(self) -> int:
+        """``DELETE /admin/sessions?expired=true`` → count of sessions dropped.
+
+        Revokes every EXPIRED session instance-wide (OAuth/anonymous and
+        admin-key login rows alike); returns the ``revoked`` count from the
+        server's ``{ok, revoked}`` response.
+        """
+        return self._executor.run(_op_revoke_expired_sessions())
+
     # --- user merge (POST /admin/merge-users) ---
 
     def merge_users(self, anon_user_id: str, real_user_id: str) -> MergeReport:
@@ -2150,6 +2168,13 @@ class AsyncRtDbAdminClient:
         See :meth:`RtDbAdminClient.revoke_user_sessions`.
         """
         return await self._executor.run(_op_revoke_user_sessions(user_id))
+
+    async def revoke_expired_sessions(self) -> int:
+        """``DELETE /admin/sessions?expired=true`` → count of sessions dropped (async).
+
+        See :meth:`RtDbAdminClient.revoke_expired_sessions`.
+        """
+        return await self._executor.run(_op_revoke_expired_sessions())
 
     # --- user merge (POST /admin/merge-users) ---
 

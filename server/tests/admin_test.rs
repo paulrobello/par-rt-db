@@ -1857,6 +1857,84 @@ async fn sec106_logout_without_csrf_clears_both_cookies() -> anyhow::Result<()> 
     Ok(())
 }
 
+// ===== CSRF self-heal for stale-cookie browsers =====
+//
+// A browser whose login predates SEC-106 holds a valid session cookie but no
+// `rtdb-admin-csrf` cookie, so every mutating admin request 403s forever. The
+// fix: an authenticated cookie-mode GET mints the missing nonce on its
+// response, so the dashboard's polling heals the browser and the next mutation
+// carries the echoed header.
+
+#[tokio::test]
+async fn stale_csrf_browser_is_healed_on_admin_get_then_can_mutate() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    // "Browser": logged in (both cookies minted), but the rtdb-admin-csrf
+    // cookie is absent — the pre-SEC-106 state. Send the session cookie only.
+    let (_client, session, _csrf) = admin_login_cookies(addr).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{addr}/admin/dbs"))
+        .header("cookie", format!("rtdb_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // The response mints a readable (non-HttpOnly) nonce cookie.
+    let mut healed = None;
+    for v in resp.headers().get_all(reqwest::header::SET_COOKIE) {
+        let s = v.to_str().expect("set-cookie str");
+        if s.starts_with("rtdb-admin-csrf=") {
+            assert!(
+                !s.contains("HttpOnly"),
+                "healed nonce must stay JS-readable"
+            );
+            healed = Some(extract_cookie_value(s, "rtdb-admin-csrf"));
+        }
+    }
+    let nonce = healed.expect("GET heals the missing rtdb-admin-csrf cookie");
+
+    // A second login gives us a session row to revoke — the very action that
+    // 403'd before the heal.
+    let (_c2, session2, _csrf2) = admin_login_cookies(addr).await;
+    let hash = db::sha256_hex(&session2);
+    let resp = client
+        .delete(format!("http://{addr}/admin/sessions/{hash}"))
+        .header(
+            "cookie",
+            format!("rtdb_session={session}; rtdb-admin-csrf={nonce}"),
+        )
+        .header("x-rtdb-csrf", &nonce)
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "after the heal the browser can mutate again"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn csrf_heal_does_not_fire_for_bearer_requests() -> anyhow::Result<()> {
+    // The heal is for cookie-mode browsers only. A bearer request (CLI) gets
+    // no nonce cookie — it never needs one.
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    let resp = admin_get(addr, "/admin/dbs").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    for v in resp.headers().get_all(reqwest::header::SET_COOKIE) {
+        let s = v.to_str().expect("set-cookie str");
+        assert!(
+            !s.starts_with("rtdb-admin-csrf="),
+            "bearer requests must not mint a nonce"
+        );
+    }
+    Ok(())
+}
+
 // ===== SEC-120: admin-key login mints a hashed, revocable session =====
 //
 // The cookie credential is NO LONGER the raw `config.admin_key` — it is a

@@ -255,3 +255,22 @@ pub async fn delete_sessions_for_user(pool: &PgPool, user_id: &str) -> Result<u6
         .await?;
     Ok(result.rows_affected())
 }
+
+/// Deletes every EXPIRED session row (the admin remove-all-expired path).
+/// Covers both `sessions` (OAuth/anonymous) and `admin_sessions` (admin-key
+/// logins) — `list_sessions` unions both, so the dashboard's expired rows can
+/// come from either. Untouched-but-expired rows are never reaped otherwise
+/// (lazy deletion fires only when that session is used again), so this is the
+/// operator's cleanup for the long tail. Idempotent.
+pub async fn delete_expired_sessions(pool: &PgPool) -> Result<u64, RtDbError> {
+    let now = now_ms();
+    let r1 = sqlx::query("DELETE FROM rtdb_auth.sessions WHERE expires_at <= $1")
+        .bind(now)
+        .execute(pool)
+        .await?;
+    let r2 = sqlx::query("DELETE FROM rtdb_auth.admin_sessions WHERE expires_at <= $1")
+        .bind(now)
+        .execute(pool)
+        .await?;
+    Ok(r1.rows_affected() + r2.rows_affected())
+}

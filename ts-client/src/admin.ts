@@ -713,6 +713,16 @@ export class RtDbAdminClient {
     };
   }
 
+  /** Revoke every EXPIRED session instance-wide (DELETE /admin/sessions?expired=true).
+   *  Sweeps both OAuth/anonymous sessions and admin-key login rows — the
+   *  dashboard's "remove all expired" action. Returns `{ ok, revoked }`. */
+  async revokeExpiredSessions(): Promise<{ ok: boolean; revoked: number }> {
+    return (await this.request("DELETE", "/admin/sessions?expired=true")) as {
+      ok: boolean;
+      revoked: number;
+    };
+  }
+
   /** Run the anon→real account merge synchronously and return the full report
    *  (POST /admin/merge-users). The server's typed guard is applied for you:
    *  `confirm` is sent as `realUserId` (same pattern as `deleteDb`). A 404

@@ -16,6 +16,8 @@ export function SessionsPage() {
   const [userFilter, setUserFilter] = useState("");
   const [pendingHash, setPendingHash] = useState<string | null>(null);
   const [confirmingRevoke, setConfirmingRevoke] = useState<string | null>(null);
+  const [confirmingRemoveAll, setConfirmingRemoveAll] = useState(false);
+  const [bulkBusy, setBulkBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
   // Load once on mount ([client] only — the filter is applied via the Refresh
@@ -32,6 +34,8 @@ export function SessionsPage() {
     [] as SessionRow[],
   );
 
+  const expiredCount = sessions.filter((row) => row.expiresAt <= Date.now()).length;
+
   async function revoke(row: SessionRow) {
     setPendingHash(row.tokenHash);
     setActionError(null);
@@ -43,6 +47,20 @@ export function SessionsPage() {
       setActionError(toErrorMessage(e));
     } finally {
       setPendingHash(null);
+    }
+  }
+
+  async function removeAllExpired() {
+    setBulkBusy(true);
+    setActionError(null);
+    try {
+      await client.revokeExpiredSessions();
+      setConfirmingRemoveAll(false);
+      await refresh();
+    } catch (e) {
+      setActionError(toErrorMessage(e));
+    } finally {
+      setBulkBusy(false);
     }
   }
 
@@ -70,6 +88,25 @@ export function SessionsPage() {
         <Button variant="primary" onClick={() => void refresh()} disabled={loading}>
           {loading ? "refreshing…" : "refresh"}
         </Button>
+        {confirmingRemoveAll ? (
+          <span className={s.confirmInline}>
+            <span className={s.confirmLabel}>remove {expiredCount} expired session(s)?</span>
+            <Button variant="danger" onClick={() => void removeAllExpired()} disabled={bulkBusy}>
+              {bulkBusy ? "…" : "confirm"}
+            </Button>
+            <Button onClick={() => setConfirmingRemoveAll(false)} disabled={bulkBusy}>
+              no
+            </Button>
+          </span>
+        ) : (
+          <Button
+            variant="danger"
+            onClick={() => setConfirmingRemoveAll(true)}
+            disabled={expiredCount === 0 || loading || bulkBusy}
+          >
+            remove all expired{expiredCount > 0 ? ` (${expiredCount})` : ""}
+          </Button>
+        )}
         {loading && <Spinner label="loading sessions" />}
       </div>
 

@@ -894,6 +894,31 @@ impl RtDbAdminClient {
         Err(self.error_response(resp).await)
     }
 
+    /// `DELETE /admin/sessions?expired=true` → `{ok, revoked}`. Revokes every
+    /// EXPIRED session instance-wide (OAuth/anonymous and admin-key login rows
+    /// alike); `revoked` is the count of sessions dropped.
+    pub async fn revoke_expired_sessions(
+        &self,
+    ) -> Result<crate::wire::admin::RevokeUserSessionsResponse, RtDbError> {
+        let resp = self
+            .client
+            .delete(format!("{}/admin/sessions", self.url))
+            .bearer_auth(&self.token)
+            .query(&[("expired", "true")])
+            .send()
+            .await
+            .map_err(|e| {
+                RtDbError::internal(format!("revoke_expired_sessions request failed: {e}"))
+            })?;
+        let status = resp.status();
+        if status.is_success() {
+            return self
+                .deserialize::<crate::wire::admin::RevokeUserSessionsResponse>(resp)
+                .await;
+        }
+        Err(self.error_response(resp).await)
+    }
+
     // ── Anon→real account merge (POST /admin/merge-users) ────────────────────
     //
     // Mirror `ts-client`'s `mergeUsers` one-to-one — path, body, and return

@@ -891,6 +891,21 @@ struct AdminClientTests {
         #expect(response.revoked == 2)
     }
 
+    @Test func revokeExpiredSessionsSendsExpiredTrueQuery() async throws {
+        StubProtocol.handler = { request in
+            try demand(request.httpMethod == "DELETE", "expected DELETE")
+            try demand(
+                request.url?.path == "/admin/sessions",
+                "path mismatch: \(request.url?.path ?? "nil")"
+            )
+            try demand(request.url?.query == "expired=true", "query mismatch")
+            return (200, Data(#"{"ok":true,"revoked":3}"#.utf8))
+        }
+        let response = try await makeAdminClient().revokeExpiredSessions()
+        #expect(response.ok)
+        #expect(response.revoked == 3)
+    }
+
     @Test func mergeUsersSendsConfirmEqualToRealUserId() async throws {
         StubProtocol.handler = { request in
             try demand(request.url?.path == "/admin/merge-users", "expected /admin/merge-users")
