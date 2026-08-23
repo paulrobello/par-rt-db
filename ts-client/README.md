@@ -177,6 +177,20 @@ operator escape hatch that merges an anonymous user into a real one — mirrorin
 `POST /admin/merge-users` (the typed `confirm == realUserId` guard is applied
 for you).
 
+#### The `unreachable` auth state
+
+A cookie-mode app served from an origin the server has not allowlisted gets
+its WS upgrade rejected with HTTP 403 — which the browser surfaces only as a
+close code 1006, indistinguishable from a server outage. To bound that blind
+spot, `getAuthState()` / `onAuthChange` expose a fourth state,
+`"unreachable"`: after `authUnreachableAfterAttempts` consecutive socket
+closes during the auth handshake (default 5; `authUnreachableAfterAttempts: 0`
+disables the signal), the state flips from the eternal `"authenticating"` to
+`"unreachable"` so the app can render "sign-in unavailable" instead of a
+spinner. The client keeps retrying in the background — the state is a
+signal, not a stop — and any completed handshake, a `4401`, or a fresh
+`connect()` / `setToken()` clears it.
+
 ## Node / CLI
 
 ```ts
@@ -205,11 +219,21 @@ Beyond the `collect`/`take` queries above, the builder carries `first()`,
 that narrows the matching set server-side. A filter value whose JSON kind
 contradicts the declared field type (a number against a string field) is
 rejected with `BAD_REQUEST` — on the server and in `InMemoryRtDbClient` alike —
-instead of silently matching nothing. `.fields(...names)` projects each result
-doc to the listed fields (system fields `_id`/`_creationTime`/`_version` are
-always kept; `.fields()` with no args is an ids-only view; unknown names are
-`BAD_REQUEST`) — it composes with every doc-bearing terminal, and a projected
-subscription stays silent when a write changes only non-projected fields.
+instead of silently matching nothing. One more op exists but is not on this
+list: `patchByQuery`/`deleteByQuery` step filters additionally accept the
+execution-time-relative `olderThan` op —
+`{ op: "olderThan", field: "completedAt", ms: 604800000 }` — matching rows
+whose epoch-ms field is strictly older than `now − ms`, with the cutoff derived
+from the clock **at each execution** (a scheduled txn carrying it stays fresh
+on every fire). It is by-query-only — `.filter()`, `authorize` predicates,
+partial-index `where` predicates, and computed `case` whens reject it — and
+requires a declared `number`/`int64` field with `ms >= 0`; `InMemoryRtDbClient`
+evaluates it against its injected `now` clock. `.fields(...names)` projects
+each result doc to the listed fields (system fields
+`_id`/`_creationTime`/`_version` are always kept; `.fields()` with no args is
+an ids-only view; unknown names are `BAD_REQUEST`) — it composes with every
+doc-bearing terminal, and a projected subscription stays silent when a write
+changes only non-projected fields.
 
 ```ts
 // given .index("by_project_status", ["projectId", "status"]) — distinct and

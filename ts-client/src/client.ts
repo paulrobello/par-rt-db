@@ -29,7 +29,16 @@ export interface WebSocketLike {
 }
 
 export type ConnectionState = "idle" | "connecting" | "connected" | "reconnecting" | "closed";
-export type AuthState = "unauthenticated" | "authenticating" | "authenticated";
+/**
+ * `"unreachable"`: the auth endpoint could not be reached — the socket kept
+ * closing before the auth handshake completed (`authOk`/`authErr` never
+ * arrived) for `authUnreachableAfterAttempts` consecutive attempts. The
+ * client keeps retrying in the background (the outage or the origin
+ * misconfiguration may heal), but apps can now render "sign-in unavailable"
+ * instead of an eternal "authenticating" spinner. Any completed handshake,
+ * `4401`, or a fresh `connect()`/`setToken()` clears it.
+ */
+export type AuthState = "unauthenticated" | "authenticating" | "authenticated" | "unreachable";
 
 export interface RtDbClientOptions {
   url: string;
@@ -38,6 +47,16 @@ export interface RtDbClientOptions {
   webSocketFactory?: (url: string) => WebSocketLike;
   backoff?: { baseMs: number; maxMs: number };
   heartbeatMs?: number;
+  /**
+   * After this many consecutive socket closes during the auth handshake
+   * (never reached `authOk`/`authErr`), `authState` becomes `"unreachable"`
+   * (the client keeps reconnecting — the state is a signal, not a stop).
+   * Bounds the blind spot of a cookie-mode app served from a non-allowlisted
+   * origin: the WS upgrade is 403'd, which the browser surfaces only as close
+   * 1006, indistinguishable from an outage without this counter. Default 5;
+   * 0 disables the signal (pre-fix behavior).
+   */
+  authUnreachableAfterAttempts?: number;
   now?: () => number;
   random?: () => number;
   setTimeoutImpl?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
@@ -113,6 +132,7 @@ interface QueuedWorkflow {
 
 const DEFAULT_BACKOFF = { baseMs: 500, maxMs: 15_000 };
 const DEFAULT_HEARTBEAT_MS = 20_000;
+const DEFAULT_AUTH_UNREACHABLE_AFTER = 5;
 /**
  * App-range close code we use for the drops WE initiate (heartbeat timeout,
  * socket error). The WebSocket spec forbids passing the reserved 1006 to
@@ -143,6 +163,9 @@ export class RtDbClient {
   private readonly clearTimeoutImpl: (handle: ReturnType<typeof setTimeout>) => void;
   private readonly backoff: { baseMs: number; maxMs: number };
   private readonly heartbeatMs: number;
+  private readonly authUnreachableAfter: number;
+  /** Consecutive socket closes before the auth handshake ever completed. */
+  private preAuthFailures = 0;
 
   private socket: WebSocketLike | null = null;
   private connState: ConnectionState = "idle";
@@ -214,6 +237,8 @@ export class RtDbClient {
     this.clearTimeoutImpl = options.clearTimeoutImpl ?? ((h) => clearTimeout(h));
     this.backoff = options.backoff ?? DEFAULT_BACKOFF;
     this.heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+    this.authUnreachableAfter =
+      options.authUnreachableAfterAttempts ?? DEFAULT_AUTH_UNREACHABLE_AFTER;
     this.optimistic = options.optimisticUpdates ?? false;
   }
 
@@ -221,6 +246,13 @@ export class RtDbClient {
     this.stopped = false;
     if (this.connState === "connecting" || this.connState === "connected") {
       return;
+    }
+    // An explicit connect() is a fresh attempt (e.g. the user hit retry after
+    // "unreachable") — clear the pre-auth failure count and the surfaced
+    // signal so the next N closes are needed to re-signal.
+    this.preAuthFailures = 0;
+    if (this.authState === "unreachable") {
+      this.setAuthState("authenticating");
     }
     this.openSocket();
   }
@@ -259,6 +291,7 @@ export class RtDbClient {
     this.rejectAllSchedules("connection reset for re-authentication");
     this.rejectAllWorkflows("connection reset for re-authentication");
     this.reconnectAttempt = 0;
+    this.preAuthFailures = 0;
     this.setAuthState("authenticating");
     this.openSocket();
   }
@@ -808,7 +841,12 @@ export class RtDbClient {
     }
     const socket = this.factory(`${httpToWs(this.options.url)}/sync`);
     this.socket = socket;
-    this.setAuthState("authenticating");
+    // Keep a surfaced "unreachable" across retry dials — flipping back to
+    // "authenticating" one backoff after the signal would erase it. Only a
+    // completed handshake, a 4401, or a fresh connect()/setToken() clears it.
+    if (this.authState !== "unreachable") {
+      this.setAuthState("authenticating");
+    }
 
     socket.onopen = () => {
       if (this.token == null && !this.cookieMode) {
@@ -843,6 +881,7 @@ export class RtDbClient {
       case "authOk":
         this.setConnState("connected");
         this.reconnectAttempt = 0;
+        this.preAuthFailures = 0;
         this.user = msg.user;
         // Resubscribe + flush unsent BEFORE notifying auth listeners, so a
         // listener that subscribes synchronously does not get a duplicate frame.
@@ -1012,6 +1051,7 @@ export class RtDbClient {
     this.rejectPendingSchedules("connection closed before the schedule was acknowledged");
     this.rejectPendingWorkflows("connection closed before the workflow call was acknowledged");
     if (code === 4401) {
+      this.preAuthFailures = 0;
       this.setAuthState("unauthenticated");
       this.setConnState("idle"); // an explicit connect() (e.g. after re-login) may revive
       return;
@@ -1020,7 +1060,21 @@ export class RtDbClient {
       this.setConnState("closed");
       return;
     }
-    this.setAuthState("authenticating");
+    if (this.authState === "authenticated") {
+      // A drop AFTER a completed handshake is a connection blip — reconnect
+      // from a clean counter. Only closes that never reached authOk/authErr
+      // count toward "unreachable".
+      this.preAuthFailures = 0;
+    } else {
+      this.preAuthFailures += 1;
+    }
+    this.setAuthState(
+      this.authUnreachableAfter > 0 && this.preAuthFailures >= this.authUnreachableAfter
+        ? "unreachable"
+        : "authenticating",
+    );
+    // Even in "unreachable" the retry continues — the state is a surfaced
+    // signal for the app to render, not a stop.
     this.scheduleReconnect();
   }
 

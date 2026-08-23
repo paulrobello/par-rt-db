@@ -570,3 +570,124 @@ describe("connection state observation", () => {
     expect(seen[seen.length - 1]).toBe("idle");
   });
 });
+
+describe("RtDbClient auth-unreachable signal", () => {
+  /** Cookie-mode harness (no getToken) — the mode a non-allowlisted origin
+   * breaks: the WS upgrade is 403'd, which the browser surfaces only as a
+   * close(1006) with no authOk/authErr ever arriving. */
+  function newCookieClient(overrides: { authUnreachableAfterAttempts?: number } = {}) {
+    const sockets: FakeSocket[] = [];
+    const timers: Array<() => void> = [];
+    const client = new RtDbClient({
+      url: "ws://h:8300",
+      db: "app",
+      webSocketFactory: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s;
+      },
+      heartbeatMs: 0,
+      now: () => 0,
+      random: () => 0.5,
+      setTimeoutImpl: (fn) => {
+        timers.push(fn);
+        return timers.length as unknown as ReturnType<typeof setTimeout>;
+      },
+      clearTimeoutImpl: () => {},
+      ...overrides,
+    });
+    const runTimers = () => {
+      for (const fn of timers.splice(0)) {
+        fn();
+      }
+    };
+    return { client, sockets, runTimers };
+  }
+
+  it("reaches 'unreachable' after N consecutive pre-auth closes, and keeps retrying", () => {
+    const { client, sockets, runTimers } = newCookieClient();
+    client.connect();
+    // Five rejected upgrades: close 1006 before any handshake completes.
+    for (let i = 0; i < 5; i++) {
+      sockets[sockets.length - 1].close(1006, "");
+      expect(client.getAuthState()).toBe(i < 4 ? "authenticating" : "unreachable");
+      runTimers(); // the reconnect timer dials the next socket
+    }
+    expect(sockets.length).toBe(6); // retries continue in "unreachable"
+
+    // A later successful handshake clears the signal.
+    sockets[sockets.length - 1].open();
+    sockets[sockets.length - 1].deliver({
+      type: "authOk",
+      user: { kind: "machine", email: null, name: null },
+    });
+    expect(client.getAuthState()).toBe("authenticated");
+  });
+
+  it("a post-auth drop never counts toward unreachable", () => {
+    const { client, sockets, runTimers } = newCookieClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "machine", email: null, name: null } });
+    // Blips after a completed handshake reset the counter — as long as each
+    // re-dial completes its handshake, the signal never fires.
+    for (let i = 0; i < 6; i++) {
+      sockets[sockets.length - 1].close(1006, "");
+      expect(client.getAuthState()).toBe("authenticating");
+      runTimers();
+      sockets[sockets.length - 1].open();
+      sockets[sockets.length - 1].deliver({
+        type: "authOk",
+        user: { kind: "machine", email: null, name: null },
+      });
+      expect(client.getAuthState()).toBe("authenticated");
+    }
+  });
+
+  it("4401 stays 'unauthenticated' and resets the pre-auth counter", () => {
+    const { client, sockets, runTimers } = newCookieClient();
+    client.connect();
+    for (let i = 0; i < 4; i++) {
+      sockets[sockets.length - 1].close(1006, "");
+      runTimers();
+    }
+    sockets[sockets.length - 1].open();
+    sockets[sockets.length - 1].deliver({
+      type: "authErr",
+      error: { code: "UNAUTHENTICATED", message: "revoked" },
+    });
+    expect(client.getAuthState()).toBe("unauthenticated");
+    // The next four pre-auth closes do not trip the signal (counter reset).
+    for (let i = 0; i < 4; i++) {
+      sockets[sockets.length - 1].close(1006, "");
+      expect(client.getAuthState()).toBe("authenticating");
+      runTimers();
+    }
+  });
+
+  it("an explicit connect() after 'unreachable' starts a fresh attempt", () => {
+    const { client, sockets, runTimers } = newCookieClient();
+    client.connect();
+    for (let i = 0; i < 5; i++) {
+      sockets[sockets.length - 1].close(1006, "");
+      runTimers();
+    }
+    expect(client.getAuthState()).toBe("unreachable");
+    client.connect();
+    expect(client.getAuthState()).toBe("authenticating");
+    sockets[sockets.length - 1].close(1006, "");
+    expect(client.getAuthState()).toBe("authenticating"); // failure 1 of a fresh N
+  });
+
+  it("authUnreachableAfterAttempts: 0 disables the signal", () => {
+    const { client, sockets, runTimers } = newCookieClient({
+      authUnreachableAfterAttempts: 0,
+    });
+    client.connect();
+    for (let i = 0; i < 8; i++) {
+      sockets[sockets.length - 1].close(1006, "");
+      expect(client.getAuthState()).toBe("authenticating");
+      runTimers();
+    }
+  });
+});
