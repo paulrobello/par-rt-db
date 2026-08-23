@@ -200,6 +200,10 @@ impl AppState {
             .clone()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(notify::generate_instance_id);
+        // Read before `config` is destructured into the AppState literal below
+        // (and before `pool` moves into it).
+        let multi_instance = config.multi_instance;
+        let limiter_pool = pool.clone();
         let committers = Committers::new(
             pool.clone(),
             subs.clone(),
@@ -279,6 +283,14 @@ impl AppState {
                 instance_id.clone(),
             ));
         }
+        // ENH-022 Stage 4: rate-counter sweep. In multi-instance mode the
+        // limiter's counters live in `rtdb_auth.rate_counters` (one row per
+        // key per minute); this task drops buckets older than the current
+        // minute so the table stays bounded. Detach like the listeners — runs
+        // for the process lifetime; a failed sweep logs and retries next tick.
+        if config.multi_instance {
+            tokio::spawn(rate_limit::run_counter_sweep(pool.clone()));
+        }
         // ARC-114: one shared HTTP client for every OAuth provider's outbound
         // calls, so logins reuse a warm connection pool instead of building a
         // fresh client (and TLS handshake) per login. Built before the struct
@@ -308,7 +320,15 @@ impl AppState {
             },
             auth: Auth { http },
             limits: Limits {
-                rate_limiter: rate_limit::RateLimiter::new(),
+                // ENH-022 Stage 4: in multi-instance mode the counters live in
+                // Postgres so every replica shares one budget per token/db/ip;
+                // single-instance (the default) keeps the in-memory limiter
+                // and never touches the table.
+                rate_limiter: if multi_instance {
+                    rate_limit::RateLimiter::new_pg(limiter_pool)
+                } else {
+                    rate_limit::RateLimiter::new()
+                },
                 image,
                 quotas,
                 signed_url_key,

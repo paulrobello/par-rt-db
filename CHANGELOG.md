@@ -14,6 +14,66 @@ contract against Convex.
 
 ## [Unreleased]
 
+### Feature: multi-instance Stage 4 — committer ownership lease + cross-process rate limits (ENH-022)
+
+Completes `RTDB_MULTI_INSTANCE=true` as a full single-writer fleet
+(design: docs/superpowers/specs/2026-08-22-multi-instance-stage4-design.md,
+approved). **Ownership (option A1, as-built simplification):** the first
+replica to touch a database acquires `pg_try_advisory_lock` on a dedicated
+one-connection pool and runs that database's committer AND its
+scheduler/reaper/dedup pollers on it — the lease and every write share one
+Postgres backend, so no other replica can be mid-write while one owns
+(split-brain impossible by construction, no fencing tokens needed; the
+doc's per-txn xact-lock fence is superseded by this, which is both simpler
+and avoids session/xact advisory locks conflicting across a process's own
+connections). Non-owners serve a SHADOW committer — reads and subscriptions
+work — while every write arm replies `CONFLICT` naming the lease; a write
+submit on a shadow attempts the takeover first, which is exactly the
+failover path when an owner dies (kill -9 drops the backend session,
+Postgres releases the lock, the next replica's write acquires — proven by
+the two-instance integration test, `ownership_lease_single_writer_and_failover_on_death`).
+**Rate limits (option B1):** in multi-instance mode counters live in
+`rtdb_auth.rate_counters` — one atomic `INSERT … ON CONFLICT … RETURNING`
+per checked request, so a configured ceiling is exact across replicas
+(single-instance keeps the in-memory limiter; the unlimited default never
+queries; a 60s sweep bounds the table). Verified by
+`rate_budget_is_shared_across_replicas`. Writes must still reach the owning
+replica — automatic forwarding of non-owner writes is the staged follow-up.
+
+### Feature: ts-client `unreachable` auth state — bounded pre-auth reconnect signal
+
+A cookie-mode app served from a non-allowlisted origin gets its WS upgrade
+403'd, which the browser surfaces only as close 1006 — the client treated
+every non-4401 close as reconnectable, looping in `authenticating` forever
+with no way for the app to tell "signed out" from "sign-in unreachable".
+`AuthState` gains `"unreachable"`: after `authUnreachableAfterAttempts`
+consecutive closes during the auth handshake (default 5, 0 disables), the
+state flips so apps can render "sign-in unavailable". The retry loop
+continues (the state is a signal, not a stop); a completed handshake, a
+4401, or a fresh `connect()`/`setToken()` clears it, and a post-auth drop
+never counts toward it. Kanban card 01a0281f79a87ee39738145fabeaabc6.
+
+### Feature: execution-time-relative `olderThan` filter op for by-query txn steps (server + all four clients)
+
+`patchByQuery`/`deleteByQuery` filters accept `{"op":"olderThan","field":...,"ms":...}`:
+rows whose epoch-ms field is strictly older than `now − ms` match, with the
+cutoff derived from the clock **at each execution** — a scheduled
+one-shot/cron/interval txn carrying it sweeps with a fresh window on every
+fire, no client re-scheduling (the done-archiver / claim-lease-expiry class
+of job moves server-side). The op is deliberately by-query-only: read/query
+filters reject it (a live subscription would go stale between writes —
+nothing re-evaluates a wall-clock window on a timer), and so do `authorize`
+predicates, partial-index `where` predicates, and computed `case` whens. The
+field must be declared `number`/`int64` (optional-unwrapped; null/absent
+never matches) and `ms ≥ 0`. Server compile: indexed fields compare against
+their typed column (`float8`/`bigint`), unindexed via the jsonb `::float8`
+cast path; SEC-104 caps unchanged. Integration-tested in
+`server/tests/relative_filter_test.rs` (including a scheduled sweep firing on
+the server clock), pinned by eight semantics-corpus cases (five behavioral,
+three `pushError` pinning the per-surface rejection codes: authorize
+`SCHEMA_VIOLATION`; partial-index `where` and computed case-when whens
+`BAD_REQUEST`) and two `wire-corpus.json` entries.
+
 ### Fix: server-stamped fields are optional in the ts-client insert/replace types (FM-36/FM-37)
 
 The server accepts an insert/replace that omits a table's `updatedAtField`

@@ -516,6 +516,16 @@ result `{"workflowId": "<id>"}`; the spec's tables are allowlist-checked at
 submit time) and `cancelWorkflow` (`{"cancelled": <bool>}`, `false` on a
 missing/terminal run — a no-op, not an error) — see `server/src/txn.rs`.
 
+A by-query `filter` additionally accepts the execution-time-relative
+`olderThan` op — `{"op": "olderThan", "field": "completedAt", "ms": 604800000}` —
+matching rows whose epoch-ms field is strictly older than `now − ms`, with the
+cutoff derived from the server clock **at each execution**. A scheduled
+one-shot/cron/interval txn carrying it stays fresh on every fire with no
+client re-scheduling (server-side sweeps: archive done rows older than 7 days,
+expire claim leases). The op is by-query-only — read/query filters, `authorize`
+predicates, partial-index `where` predicates, and computed `case` whens reject
+it — and requires a declared `number`/`int64` field with `ms ≥ 0`.
+
 ### WebSocket example: subscribe, then mutate
 
 Connect to `ws://localhost:8300/sync`. The first frame must be `auth`; every message
@@ -1025,23 +1035,22 @@ that ultimately terminates a connection that never closes on its own.
 
 ## Known MVP limitations
 
-- **Deploy as a single instance — running multiple replicas behind a load
-  balancer is not yet supported.** Of the four pieces of server state that were
-  once in-process, three now coordinate across replicas via Postgres
-  LISTEN/NOTIFY when `RTDB_MULTI_INSTANCE=true` (ENH-022 Stages 1–3): OAuth
-  login state, the op-feed, and presence. Two remaining constraints still make
-  an unscaled deploy **silently** unsafe (no error — it just half-works):
-  - **Rate limiting** — in-process counters multiply the effective budget by the
-    replica count (a silent weakening of the cap). *(ENH-022 Stage 4.)*
-  - **Write funnelling** — writes for a given database are not yet funnelled to
-    a single committer owner across processes. Two replicas both writing the
-    same database would interleave `execute_txn` (READ COMMITTED, no cross-
-    process lock) and break the subscription skip-invalidation logic. A real
-    fix needs a Postgres advisory lock or lease; it is a future stage.
-  The server logs a `WARN` at boot naming these constraints. The single-writer
-  invariant (one committer task per database) is intact and must stay so —
-  multi-instance here means multiple *readers/connection-holders*, not a second
-  writer onto the same database. Horizontal scaling is tracked as ENH-022.
+- **Multi-instance is safe for reads + one writer per database; writes must
+  reach the owning replica.** With `RTDB_MULTI_INSTANCE=true` (ENH-022
+  Stages 1–4), OAuth login state, the op-feed, presence, rate-limit budgets
+  (`rtdb_auth.rate_counters` — one shared ceiling per token/db/ip), and
+  per-database write ownership all coordinate across replicas. Ownership: the
+  first replica to touch a database takes a Postgres advisory-lock lease on a
+  dedicated connection and runs that database's committer (and pollers) on
+  it — no other replica can write the database concurrently, and an owner's
+  death (kill -9, container stop) releases the lease to the next taker. A
+  non-owner replica serves reads and live subscriptions for the database and
+  replies `CONFLICT` to writes; its next write attempt takes over the lease
+  (that path is the failover), so behind a load balancer ownership follows
+  demand. What is NOT there yet: automatic forwarding of non-owner writes
+  (Stage 4c) — a write that lands on a non-owner errors until that replica
+  takes over. Design + as-built notes:
+  `docs/superpowers/specs/2026-08-22-multi-instance-stage4-design.md`.
 - **Session expiry, machine-token revocation, allowlist removal, and admin-role
   revocation all take effect on open WebSocket connections.** The WS handler re-runs
   `authorize` on every `subscribe` and `mutate` (not just at connect) and re-runs
@@ -1082,7 +1091,7 @@ plus an operator SPA and a CLI built on top of them:
 * Q: Is auth required?
   * A: Machine tokens are the baseline. Each of the six OAuth providers is independently optional (blank env ⇒ its routes return 503), and anonymous access is opt-in (off by default).
 * Q: Can I run multiple replicas behind a load balancer?
-  * A: Not yet — deploy as a single instance. Three coordination channels already work across replicas (`RTDB_MULTI_INSTANCE=true`), but rate limiting and write funnelling do not; see [Known MVP limitations](#known-mvp-limitations) (ENH-022).
+  * A: Yes for reads, with one writer per database — set `RTDB_MULTI_INSTANCE=true`. Login state, op-feed, presence, rate budgets, and per-database write ownership (advisory-lock lease with kill-failover) coordinate via Postgres; a non-owner replica replies `CONFLICT` to writes until it takes the lease, and automatic write forwarding is the remaining follow-up. See [Known MVP limitations](#known-mvp-limitations) (ENH-022).
 
 ## Roadmap
 

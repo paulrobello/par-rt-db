@@ -69,6 +69,28 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     .execute(&mut *conn)
     .await?;
 
+    // ENH-022 Stage 4: cross-process rate-limit counters. Only written when
+    // `RTDB_MULTI_INSTANCE=true` AND a limit is configured — the single-instance
+    // in-memory limiter is the default path and never touches this table. The
+    // `minute_bucket` index serves the sweep DELETE; lookups go through the PK.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS rtdb_auth.rate_counters (
+            key_type text NOT NULL,
+            key text NOT NULL,
+            minute_bucket bigint NOT NULL,
+            count bigint NOT NULL,
+            PRIMARY KEY (key_type, key, minute_bucket)
+        )",
+    )
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS rate_counters_bucket_idx \
+         ON rtdb_auth.rate_counters (minute_bucket)",
+    )
+    .execute(&mut *conn)
+    .await?;
+
     // SEC-103: per-database anonymous-auth gate. An anonymous principal is
     // authorized for a given database ONLY when this flag is TRUE for that db.
     // The instance-wide `RTDB_AUTH_ANONYMOUS_ENABLED` remains a master kill

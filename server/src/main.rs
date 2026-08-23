@@ -24,28 +24,23 @@ async fn main() {
     // resolution (held for the process lifetime below).
     let _otel_guard = rtdb_server::tracing_setup::init(&config);
 
-    // ARC-126 / ENH-022: multi-instance status. OAuth login state
-    // (`rtdb_auth.oauth_states`), the op-feed, and presence now coordinate
-    // across replicas via Postgres LISTEN/NOTIFY when `RTDB_MULTI_INSTANCE=true`
-    // (ENH-022 Stages 1–3) — a login begun on one replica completes on another,
-    // and the op-feed/presence fan out across instances. Two pieces remain
-    // instance-local and still make an unscaled deploy unsafe: (1) rate-limit
-    // counters are per-process, so a client's effective budget multiplies by the
-    // replica count (ENH-022 Stage 4), and (2) writes for a given database are
-    // not yet funnelled to a single committer owner across processes — two
-    // replicas both writing the same database would interleave `execute_txn` and
-    // break the subscription skip-invalidation logic (the advisory-lock/lease
-    // fix is a future stage). Until both land, the supported topology is a single
-    // instance. Emitted at WARN because the remaining constraint is silent (no
-    // error — rate limits just weaken and concurrent writes to one db can miss
-    // invalidations), and a single instance needs no action.
-    tracing::warn!(
-        "single-instance topology required: rate-limit counters are still \
-         per-process and writes for a database are not yet funnelled to one \
-         owner across processes — running multiple replicas is unsafe until \
-         ENH-022 Stages 4–5 land (Stages 1–3 fixed OAuth/op-feed/presence when \
-         RTDB_MULTI_INSTANCE=true)"
-    );
+    // ARC-126 / ENH-022: multi-instance status. With `RTDB_MULTI_INSTANCE=true`
+    // (Stages 1–4), OAuth login state, the op-feed, presence, rate-limit
+    // budgets (`rtdb_auth.rate_counters`), and per-database write ownership
+    // (advisory-lock lease on a dedicated connection; the owner runs the db's
+    // committer on it, kill -9 hands the lease to the next taker) all
+    // coordinate across replicas. Remaining limitation (Stage 4c): a
+    // non-owner replica replies CONFLICT to writes until it takes the lease —
+    // writes must reach the owning replica; automatic forwarding is the
+    // follow-up. INFO (not WARN): the constraint is loud (CONFLICT errors, not
+    // silent corruption) and a single instance needs no action.
+    if !config.multi_instance {
+        tracing::info!(
+            "single-instance topology: multi-instance coordination (login \
+             state, op-feed, presence, shared rate budgets, per-db write \
+             ownership) activates with RTDB_MULTI_INSTANCE=true (ENH-022)"
+        );
+    }
 
     let pool = PgPoolOptions::new()
         .max_connections(config.pool_max_connections)

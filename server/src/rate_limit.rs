@@ -69,11 +69,26 @@ pub struct RateLimiter {
     /// critical section is a HashMap get/insert with no `.await` inside, but
     /// tokio matches the rest of this codebase's locking convention.
     inner: Mutex<HashMap<RateKey, (u64, u32)>>,
+    /// ENH-022 Stage 4: when set (multi-instance only), checks go to
+    /// `rtdb_auth.rate_counters` instead of the local map, so every replica
+    /// shares one budget per key. One UPSERT per checked request, only when a
+    /// limit is configured — `None` (single-instance, the default) never
+    /// touches Postgres.
+    pg: Option<sqlx::PgPool>,
 }
 
 impl RateLimiter {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Cross-process mode: counters live in Postgres (ENH-022 Stage 4, option
+    /// B1 of docs/superpowers/specs/2026-08-22-multi-instance-stage4-design.md).
+    pub fn new_pg(pool: sqlx::PgPool) -> Arc<Self> {
+        Arc::new(Self {
+            pg: Some(pool),
+            ..Default::default()
+        })
     }
 
     /// Records one request against `key` and returns whether it was allowed
@@ -82,6 +97,9 @@ impl RateLimiter {
     pub async fn check(&self, key: RateKey, limit_rpm: u32) -> RateDecision {
         if limit_rpm == 0 {
             return RateDecision::Allowed;
+        }
+        if let Some(pool) = &self.pg {
+            return check_pg(pool, &key, limit_rpm).await;
         }
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -138,6 +156,76 @@ impl RateLimiter {
 /// check applies only to `Principal::Machine` (OAuth sessions have no
 /// machine-token identity and skip straight to per-db). Shared by the HTTP
 /// gate (`check_http_rate_limits`) and the WS `Mutate`/`Subscribe` arms.
+/// ENH-022 Stage 4: periodic `rtdb_auth.rate_counters` cleanup — drops
+/// minute buckets older than the previous minute, so the table stays bounded
+/// at (active keys × 2) rows regardless of how long the instance runs.
+/// Spawns only in multi-instance mode (`lib.rs`); errors log and retry on the
+/// next tick rather than killing the task.
+pub async fn run_counter_sweep(pool: sqlx::PgPool) {
+    loop {
+        let cutoff = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() / 60)
+            .unwrap_or(0) as i64
+            - 1;
+        if let Err(err) =
+            sqlx::query("DELETE FROM rtdb_auth.rate_counters WHERE minute_bucket < $1")
+                .bind(cutoff)
+                .execute(&pool)
+                .await
+        {
+            tracing::warn!(error = %err, "rate counter sweep failed");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    }
+}
+
+/// The Postgres-backed `check` (multi-instance): one atomic UPSERT per request
+/// — the increment, the comparison, and the window all live in one row of
+/// `rtdb_auth.rate_counters`, which is what makes the configured ceiling exact
+/// across every replica sharing the Postgres. A denied request still lands its
+/// increment (the decision — `count <= limit` — is identical either way; the
+/// row resets with the next minute bucket). Fail-open on a counter error: a
+/// limiter outage must not take writes down with it (the flood valve the
+/// limiter is would become its own outage).
+async fn check_pg(pool: &sqlx::PgPool, key: &RateKey, limit_rpm: u32) -> RateDecision {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let current_bucket = now_secs / 60;
+    let (key_type, key_text) = match key {
+        RateKey::Token(t) => ("token", t),
+        RateKey::Db(d) => ("db", d),
+        RateKey::Ip(ip) => ("ip", ip),
+    };
+    let count: i64 = match sqlx::query_scalar(
+        "INSERT INTO rtdb_auth.rate_counters (key_type, key, minute_bucket, count) \
+         VALUES ($1, $2, $3, 1) \
+         ON CONFLICT (key_type, key, minute_bucket) \
+         DO UPDATE SET count = rtdb_auth.rate_counters.count + 1 \
+         RETURNING count",
+    )
+    .bind(key_type)
+    .bind(key_text)
+    .bind(current_bucket as i64)
+    .fetch_one(pool)
+    .await
+    {
+        Ok(n) => n,
+        Err(err) => {
+            tracing::warn!(error = %err, "rate counter upsert failed; allowing");
+            return RateDecision::Allowed;
+        }
+    };
+    if count <= i64::from(limit_rpm) {
+        RateDecision::Allowed
+    } else {
+        let retry_after_secs = 60 - (now_secs % 60) as u32;
+        RateDecision::Denied { retry_after_secs }
+    }
+}
+
 pub async fn evaluate(state: &AppState, principal: &Principal, db: &str) -> RateDecision {
     let token_limit = state.config.rate_limit_per_token_rpm;
     if token_limit > 0
