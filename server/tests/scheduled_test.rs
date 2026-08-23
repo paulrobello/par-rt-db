@@ -340,6 +340,7 @@ async fn one_shot_fires_and_writes() {
             idle_reclaim_secs: 0,
             instance_id: String::new(),
             multi_instance: false,
+            forwarder: None,
         },
     );
 
@@ -397,6 +398,7 @@ async fn cron_fires_and_stays_pending() {
             idle_reclaim_secs: 0,
             instance_id: String::new(),
             multi_instance: false,
+            forwarder: None,
         },
     );
 
@@ -459,6 +461,7 @@ async fn failing_cron_reschedules_anyway() {
             idle_reclaim_secs: 0,
             instance_id: String::new(),
             multi_instance: false,
+            forwarder: None,
         },
     );
 
@@ -540,6 +543,7 @@ async fn one_shot_catches_up_after_being_past_due() {
             idle_reclaim_secs: 0,
             instance_id: String::new(),
             multi_instance: false,
+            forwarder: None,
         },
     );
 
@@ -593,6 +597,7 @@ async fn cron_skips_missed_windows() {
             idle_reclaim_secs: 0,
             instance_id: String::new(),
             multi_instance: false,
+            forwarder: None,
         },
     );
 
@@ -685,6 +690,7 @@ async fn failing_txn_marks_error_one_shot() {
             idle_reclaim_secs: 0,
             instance_id: String::new(),
             multi_instance: false,
+            forwarder: None,
         },
     );
 
@@ -807,6 +813,7 @@ async fn interval_fires_repeatedly_and_skips_paused_windows() {
             idle_reclaim_secs: 0,
             instance_id: String::new(),
             multi_instance: false,
+            forwarder: None,
         },
     );
 

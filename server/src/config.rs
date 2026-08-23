@@ -327,6 +327,14 @@ pub struct Config {
     /// NOTIFY self-dedupe. Set to a distinct value per replica in a multi-
     /// instance deploy; when unset, `AppState::new` generates a short hex id.
     pub instance_id: Option<String>,
+    /// RTDB_FORWARD_TIMEOUT_MS (default 5000, clamped to >= 100). ENH-022
+    /// Stage 4c: how long a non-owner replica waits for the lease owner to
+    /// answer a forwarded write before attempting the takeover itself. The
+    /// owner normally answers in milliseconds — this bounds the owner-dead
+    /// failover latency. A reply arriving after the timeout is dropped (the
+    /// write may still have committed; clients needing exactly-once retries
+    /// should use idempotency keys).
+    pub forward_timeout_ms: u64,
 }
 
 /// Boot-time env parse for a typed knob (ARC-118, folded with QA-106). Unset
@@ -889,6 +897,11 @@ impl Config {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        // ENH-022 Stage 4c: forwarded-write reply deadline before the
+        // non-owner attempts the lease takeover. Clamped to a floor of 100ms
+        // so a typo cannot make every forward fall straight through to
+        // takeover (which would ping-pong the lease under a load balancer).
+        let forward_timeout_ms = env_parsed("RTDB_FORWARD_TIMEOUT_MS", 5_000u64)?.max(100);
 
         Ok(Self {
             port,
@@ -967,6 +980,7 @@ impl Config {
             otel_service_name: otel.service_name,
             otel_sample_ratio: otel.sample_ratio,
             multi_instance,
+            forward_timeout_ms,
             instance_id,
         })
     }

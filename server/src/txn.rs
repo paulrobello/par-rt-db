@@ -135,7 +135,9 @@ pub enum OpKind {
 }
 
 /// A single document write recorded by a transaction, with its op kind.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+/// `Deserialize` (Stage 4c): a forwarded write's reply carries the owner's
+/// `TxnOutcome` back to the origin replica.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DocOp {
     pub table: String,
     pub id: String,
@@ -159,7 +161,7 @@ pub struct DocOp {
 /// `WriteSet` does NOT derive `Eq`: `serde_json::Map` is not `Eq` (JSON values
 /// admit NaN-ish comparisons), and the derive is unused — no code compares
 /// `WriteSet` with structural equality. `PartialEq` stays (all fields impl it).
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WriteSet {
     pub tables: BTreeSet<String>,
     pub docs: BTreeSet<(String, String)>,
@@ -259,7 +261,9 @@ impl WriteSet {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+/// `Deserialize` (Stage 4c): the origin replica decodes the owner's forwarded
+/// mutate outcome (results + write_set) out of the NOTIFY reply.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TxnOutcome {
     pub results: Vec<serde_json::Value>,
     pub write_set: WriteSet,

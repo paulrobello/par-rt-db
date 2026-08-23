@@ -20,6 +20,7 @@ pub mod db;
 pub mod ddl;
 pub mod dsl;
 pub mod error;
+pub mod forward;
 pub mod health;
 pub mod http_api;
 pub mod image_transform;
@@ -204,6 +205,21 @@ impl AppState {
         // (and before `pool` moves into it).
         let multi_instance = config.multi_instance;
         let limiter_pool = pool.clone();
+        // ENH-022 Stage 4c: the origin-side forwarding handle. Built before
+        // the committers (they hold it for the shadow-write submit path) and
+        // shared with the forward listener task spawned below, which resolves
+        // its replies. `None` in single-instance mode — the forward path is
+        // unreachable without a shadow, and a single-instance deploy pays for
+        // neither the handle nor the listener.
+        let forwarder = if multi_instance {
+            Some(forward::Forwarder::new(
+                pool.clone(),
+                instance_id.clone(),
+                std::time::Duration::from_millis(config.forward_timeout_ms),
+            ))
+        } else {
+            None
+        };
         let committers = Committers::new(
             pool.clone(),
             subs.clone(),
@@ -211,7 +227,12 @@ impl AppState {
             op_feed.clone(),
             hot.clone(),
             metrics.clone(),
-            committer::CommitterConfig::from_config(&config, quotas.clone(), instance_id.clone()),
+            committer::CommitterConfig::from_config(
+                &config,
+                quotas.clone(),
+                instance_id.clone(),
+                forwarder.clone(),
+            ),
         );
         // ARC-102 step 4: spawn the server-wide idle-reclamation sweep. A no-op
         // when `db_idle_reclaim_secs` is 0 (the default), so a server that does
@@ -280,6 +301,26 @@ impl AppState {
             tokio::spawn(notify::run_presence_listener(
                 pool.clone(),
                 presence.clone(),
+                instance_id.clone(),
+            ));
+        }
+        // ENH-022 Stage 4c: forwarded-write LISTEN task. Only spawned when
+        // `RTDB_MULTI_INSTANCE=true` — a single-instance deploy never pays
+        // the third `PgListener` connection. Unlike the op-feed/presence
+        // listeners this one DOES interact with the committers: it is how a
+        // forwarded write reaches the owning replica's committer turn (the
+        // owner is the single writer; this listener only injects INTO that
+        // existing serialized turn, it never executes a write itself).
+        // Detach like the other listeners — runs for the process lifetime,
+        // reconnects on transient Postgres blips, self-dedupes by
+        // `instance_id`, and drops requests for databases it does not own.
+        if config.multi_instance
+            && let Some(forwarder) = forwarder.as_ref()
+        {
+            tokio::spawn(forward::run_forward_listener(
+                pool.clone(),
+                committers.clone(),
+                forwarder.clone(),
                 instance_id.clone(),
             ));
         }

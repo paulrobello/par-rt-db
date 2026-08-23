@@ -159,3 +159,60 @@ advisory fence, and no forwarding — yet.**
 
 Tests: `server/tests/multi_instance_stage4_test.rs` — T1 single-writer +
 failover-on-leaseholder-death (exactly-once asserted), T2 shared rate budget.
+
+## Stage 4c as built (2026-08-22)
+
+Forwarding landed same day as the follow-up card (kanban
+01a02baadf1475e2bb4a3557f40da939), per the Part A "Non-owners" sketch with
+these concrete decisions:
+
+- *Channels.* Two new NOTIFY channels: `rtdb_write_fwd` (request broadcast —
+  every replica LISTENs; each payload names its origin, the origin skips its
+  own request, and any replica not holding `db`'s lease drops it silently, so
+  exactly one replica — the owner — executes and replies) and
+  `rtdb_write_replies` (reply broadcast filtered by target instance id).
+  One listener task (`forward.rs::run_forward_listener`) serves both.
+- *Which arms forward.* The five reply-carrying write arms: Mutate,
+  RunMigrate, RunPushSchema, RunMergeUsers, RunRestoreSchema. Fire-and-forget
+  arms never forward (they originate only from an owner's own pollers; the
+  `run_committer` CONFLICT backstop remains for the impossible race).
+- *Principal.* `PrincipalCtx` gained serde derives; the origin's principal
+  travels in the payload and the owner re-uses it verbatim (ownerField
+  stamping and per-row authz evaluate against the edge identity). NOTIFY is
+  writable only by Postgrescredential holders — the same trust domain as the
+  data itself.
+- *Reply shape.* `ForwardReply` carries explicit `ok`/`error` fields (not a
+  `Result` — serde externally tags `Result` as `{"Ok": …}`, and explicit
+  fields keep the wire self-describing). A forwarded Mutate reply carries the
+  full `TxnOutcome`, and the origin re-runs `subs::fan_out` locally against
+  the returned `WriteSet` so ITS subscribers push too (the owner fanned out
+  to its own inside its turn). `WriteSet.doc_values` is `#[serde(skip)]`, so
+  Indexed/Ordered subscriptions on the origin degrade to their conservative
+  "unrankable ⇒ re-run" fallback — never a missed push. Admin arms
+  (migrate/push/merge/restore) forward their outcome but do NOT trigger the
+  origin-side fan-out; origin subscribers for those converge on the next
+  local write (the same convergence story as a write that reached the owner
+  through the load balancer directly).
+- *Timeout.* `RTDB_FORWARD_TIMEOUT_MS` (default 5000, 100ms floor). On
+  timeout or notify failure the origin runs the takeover: retire the shadow,
+  respawn with a lease attempt; if another replica still owns, the respawned
+  shadow's write arm replies CONFLICT (retry reaches the owner). The
+  every-write upgrade of Stage 4a is GONE — ownership no longer follows
+  demand; it follows only owner death, which is what keeps a write from
+  ping-ponging the lease under a load balancer.
+- *Timeout ambiguity (documented).* A reply racing the timeout is dropped;
+  the write may have committed while the client saw CONFLICT. Exactly-once
+  retries should carry an idempotency key (the owner's mutation-log dedup
+  makes a keyed retry a replay).
+- *Listener readiness.* NOTIFY delivers only to sessions already LISTENing,
+  so a forward sent before a peer's listener connected is simply lost — the
+  origin's timeout handles it (takeover attempt, CONFLICT if an owner lives,
+  client retry converges). No readiness handshake was added; the owner
+  listener connects at boot and the window is a boot-time edge.
+
+Tests extended in `multi_instance_stage4_test.rs`: T1 now asserts the
+non-owner write COMMITS via forwarding (three writes, exactly-once through
+owner death + takeover); T3 holds the advisory lock on a raw session (a
+live-but-unreachable owner) and asserts CONFLICT with nothing written, then
+takeover-and-commit after release; T4 asserts the origin's principal stamps
+`ownerField` on the owner through a forwarded insert.

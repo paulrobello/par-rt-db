@@ -9,7 +9,7 @@ VPS and no reverse proxy is needed — TLS is terminated at Cloudflare's edge.
 
 - [One-time DNS/tunnel wiring (already done 2026-07-21)](#one-time-dnstunnel-wiring)
 - [Deploy / update](#deploy--update)
-- [Topology: single instance (not horizontally scalable yet)](#topology-single-instance-not-horizontally-scalable-yet)
+- [Topology: single instance by default; multi-instance is opt-in](#topology-single-instance-by-default-multi-instance-is-opt-in)
 - [Postgres image](#postgres-image)
 - [Collation](#collation)
 - [Subscription-invalidation observability](#subscription-invalidation-observability)
@@ -79,28 +79,26 @@ curl -fsS http://127.0.0.1:8300/healthz | jq .
 
 Then verify the public path: `curl -fsS https://rtdb.example.com/healthz | jq .`.
 
-## Topology: single instance (not horizontally scalable yet)
+## Topology: single instance by default; multi-instance is opt-in
 
-**Deploy par-rt-db as a single process — do not run multiple replicas behind a
-load balancer.** The server logs a `WARN` at boot naming this constraint. Three
-of four formerly in-process pieces now coordinate across replicas via Postgres
-LISTEN/NOTIFY when `RTDB_MULTI_INSTANCE=true` (ENH-022 Stages 1–3); two
-remaining constraints still make a second replica **silently** unsafe (there is
-no error — it just half-works):
+**The default and recommended topology is a single process.** With
+`RTDB_MULTI_INSTANCE=true` (ENH-022 Stages 1–4c), every formerly in-process
+concern coordinates across replicas via Postgres LISTEN/NOTIFY, and a replica
+fleet is safe behind one load balancer:
 
 | State | Status with 2 replicas |
 | --- | --- |
 | OAuth login state | ✅ Fixed (ENH-022 Stage 1): `state` lives in the `rtdb_auth.oauth_states` table, so a login begun on one replica completes on another. |
 | Op-feed (`/admin/stream`, dashboard live writes) | ✅ Fixed (ENH-022 Stage 2): fans out across replicas via Postgres `NOTIFY` on the `rtdb_ops` channel. |
 | Presence (ENH-015 "who is online") | ✅ Fixed (ENH-022 Stage 3): per-room membership gossips via the `rtdb_presence` channel with liveness-beat eviction of dead replicas. |
-| Rate-limit counters | ⚠️ Still per-process: in-process counters multiply the effective budget by the replica count (a silent weakening of the cap). *(ENH-022 Stage 4.)* |
-| Write ownership | ⚠️ Not yet funnelled: two replicas both writing the same database would interleave `execute_txn` and break subscription skip-invalidation. A Postgres advisory lock / lease is a future stage. |
+| Rate-limit counters | ✅ Fixed (ENH-022 Stage 4): counters live in `rtdb_auth.rate_counters`; one shared ceiling per token/db/ip regardless of replica count. |
+| Write ownership | ✅ Fixed (ENH-022 Stage 4 + 4c): one replica per database holds a Postgres advisory-lock lease and runs its committer; other replicas serve reads/subscriptions and FORWARD writes to the owner over NOTIFY (or take the lease on owner death — kill -9 releases the lock at the TCP session). |
 
 The single-writer invariant is intact and must stay so: each database has
-exactly one committer task, and correctness depends on that serialized write
-path. Multi-instance here means multiple *readers/connection-holders*, not a
-second writer onto the same database — two committers for one database would be
-a correctness catastrophe. Horizontal scaling is tracked as ENH-022.
+exactly one lease-holding committer, and correctness depends on that serialized
+write path. Multi-instance means multiple *readers/connection-holders* plus
+exactly one writer per database — non-owner writes are injected INTO the
+owner's serialized turn (forwarding), never executed beside it.
 
 When `RTDB_MULTI_INSTANCE=true`, also set `RTDB_INSTANCE_ID` to a stable,
 distinct value per replica (e.g. `rtdb-a`, `rtdb-b`): NOTIFY self-dedupe works

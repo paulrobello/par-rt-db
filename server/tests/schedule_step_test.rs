@@ -160,6 +160,7 @@ async fn make_committers(state: &Arc<AppState>) -> Arc<Committers> {
             idle_reclaim_secs: 0,
             instance_id: String::new(),
             multi_instance: false,
+            forwarder: None,
         },
     ))
 }

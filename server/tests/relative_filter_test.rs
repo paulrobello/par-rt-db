@@ -427,6 +427,7 @@ async fn scheduled_sweep_fires_with_the_server_clock() -> anyhow::Result<()> {
             idle_reclaim_secs: 0,
             instance_id: String::new(),
             multi_instance: false,
+            forwarder: None,
         },
     );
 

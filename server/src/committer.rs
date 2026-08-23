@@ -236,6 +236,93 @@ fn request_needs_write(req: &CommitterRequest) -> bool {
     )
 }
 
+/// The forwardable projection of a write arm (Stage 4c): every reply-carrying
+/// write arm has a `ForwardWrite` variant; fire-and-forget arms (scheduler,
+/// reaper, workflow) return `None` — they originate only from an owner's own
+/// pollers and keep the `run_committer` CONFLICT backstop.
+fn forward_write_of(req: &CommitterRequest) -> Option<crate::forward::ForwardWrite> {
+    match req {
+        CommitterRequest::Mutate {
+            idempotency_key,
+            txn,
+            principal_ctx,
+            ..
+        } => Some(crate::forward::ForwardWrite::Mutate {
+            idempotency_key: idempotency_key.clone(),
+            txn: txn.clone(),
+            principal: principal_ctx.clone(),
+        }),
+        CommitterRequest::RunMigrate { request, .. } => {
+            Some(crate::forward::ForwardWrite::Migrate {
+                request: request.clone(),
+            })
+        }
+        CommitterRequest::RunPushSchema { schema, .. } => {
+            Some(crate::forward::ForwardWrite::PushSchema {
+                schema: schema.clone(),
+            })
+        }
+        CommitterRequest::RunMergeUsers {
+            anon_id, real_id, ..
+        } => Some(crate::forward::ForwardWrite::MergeUsers {
+            anon_id: anon_id.clone(),
+            real_id: real_id.clone(),
+        }),
+        CommitterRequest::RunRestoreSchema { target_version, .. } => {
+            Some(crate::forward::ForwardWrite::RestoreSchema {
+                target_version: *target_version,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Deliver the owner's error verbatim into whatever reply channel the
+/// original request carries (the forward reached a live owner and the write
+/// genuinely failed there — the client should see the owner's error, not a
+/// generic one).
+fn fail_forwarded_reply(req: CommitterRequest, err: RtDbError) {
+    // One arm per type: the oneshot payloads differ, so the arms cannot share
+    // an or-pattern.
+    match req {
+        CommitterRequest::Mutate { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
+        CommitterRequest::RunMigrate { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
+        CommitterRequest::RunPushSchema { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
+        CommitterRequest::RunMergeUsers { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
+        CommitterRequest::RunRestoreSchema { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
+        _ => {}
+    }
+}
+
+/// Decode the owner's serialized outcome into the arm's concrete type. A
+/// decode failure means replica version skew on the result shape — surface
+/// it as an internal error naming the decode, never as a silent success.
+fn decode_or_internal<T: serde::de::DeserializeOwned>(
+    value: serde_json::Value,
+    reply: oneshot::Sender<Result<T, RtDbError>>,
+) {
+    match serde_json::from_value::<T>(value) {
+        Ok(result) => {
+            let _ = reply.send(Ok(result));
+        }
+        Err(err) => {
+            let _ = reply.send(Err(RtDbError::internal(format!(
+                "forwarded reply failed to decode: {err}"
+            ))));
+        }
+    }
+}
+
 /// Owns one serialized committer task per database. Every mutation and every
 /// subscribe for a given database is funneled through that single task, which
 /// processes messages strictly one at a time — see `run_committer` for the
@@ -245,6 +332,11 @@ fn request_needs_write(req: &CommitterRequest) -> bool {
 /// under READ COMMITTED with no row locking; correctness depends on all
 /// writes for a database being serialized through the per-db committer.
 /// Never call `execute_txn` from a non-committer production path.
+///
+/// `Clone` (ENH-022 Stage 4c): every field is a `PgPool`, `Arc`, scalar, or
+/// the shared `channels` map, so a clone is reference bumps — the forward
+/// listener task holds a clone to execute forwarded writes as the owner.
+#[derive(Clone)]
 pub struct Committers {
     pool: PgPool,
     subs: Arc<SubscriptionManager>,
@@ -273,6 +365,12 @@ pub struct Committers {
     /// (ENH-022 Stage 2). Default false — a single-instance deploy never calls
     /// `pg_notify`, so the feature is zero-cost when off.
     multi_instance: bool,
+    /// Stage 4c origin-side forwarding handle. `Some` exactly when
+    /// `multi_instance` is true (built in `AppState::new`, shared with the
+    /// forward listener). A write submitted against a SHADOW committer is
+    /// broadcast through it to the lease owner; a failed/timeout forward
+    /// falls back to the local takeover attempt.
+    forwarder: Option<Arc<crate::forward::Forwarder>>,
     channels: Arc<Mutex<HashMap<String, ChannelEntry>>>,
 }
 
@@ -330,16 +428,21 @@ pub struct CommitterConfig {
     /// than re-derived here so every consumer tags payloads with the same id.
     pub instance_id: String,
     pub multi_instance: bool,
+    /// Stage 4c forwarding handle, `Some` exactly when `multi_instance`.
+    /// Built in `AppState::new` and shared with the forward listener task
+    /// (`forward::run_forward_listener`), which resolves its replies.
+    pub forwarder: Option<Arc<crate::forward::Forwarder>>,
 }
 
 impl CommitterConfig {
     /// Derive the committer's config slice from the boot `Config` in one
-    /// place. `quotas` and `instance_id` are the boot-built handles/ids
-    /// shared with `AppState` (see the field docs).
+    /// place. `quotas`, `instance_id`, and `forwarder` are the boot-built
+    /// handles/ids shared with `AppState` (see the field docs).
     pub fn from_config(
         config: &Config,
         quotas: Arc<crate::quota::UsageCache>,
         instance_id: String,
+        forwarder: Option<Arc<crate::forward::Forwarder>>,
     ) -> Self {
         Self {
             audit_log_enabled: config.audit_log_enabled,
@@ -351,6 +454,7 @@ impl CommitterConfig {
             idle_reclaim_secs: config.db_idle_reclaim_secs,
             instance_id,
             multi_instance: config.multi_instance,
+            forwarder,
         }
     }
 }
@@ -381,6 +485,7 @@ impl Committers {
             idle_threshold: std::time::Duration::from_secs(cfg.idle_reclaim_secs),
             instance_id: cfg.instance_id,
             multi_instance: cfg.multi_instance,
+            forwarder: cfg.forwarder,
             channels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -449,16 +554,50 @@ impl Committers {
     }
 
     /// Submits a request to `db`'s committer task, lazily spawning it on
-    /// first use. Errors `NotFound` if `db` isn't a registered database. If
-    /// the send fails because the committer task is gone (e.g. it panicked),
-    /// evicts `db`'s stale sender from `channels` before returning the
-    /// error, so the next request respawns a fresh task instead of every
-    /// future request to `db` failing forever. The eviction only removes the
-    /// entry if it still holds the same sender that just failed (`same_channel`)
-    /// — otherwise a concurrent caller already respawned under this db key and
-    /// evicting would drop the live replacement instead of the dead one.
+    /// first use. Errors `NotFound` if `db` isn't a registered database.
+    ///
+    /// ENH-022 Stage 4c: under multi-instance, a WRITE arm that lands on a
+    /// SHADOW (non-owner) committer is forwarded to the lease owner over
+    /// NOTIFY (`forward_or_takeover`) instead of replying CONFLICT; only the
+    /// owner executes, and its outcome travels back to this replica's caller.
+    /// Read arms and single-instance submits are unchanged.
     pub async fn submit(&self, db: &str, req: CommitterRequest) -> Result<(), RtDbError> {
-        let sender = self.channel_for(db, request_needs_write(&req)).await?;
+        if self.multi_instance && request_needs_write(&req) {
+            let (sender, is_shadow) = self.channel_for(db, false).await?;
+            if is_shadow {
+                return self.forward_or_takeover(db, req).await;
+            }
+            return self.send_and_evict(db, sender, req).await;
+        }
+        let (sender, _) = self.channel_for(db, false).await?;
+        self.send_and_evict(db, sender, req).await
+    }
+
+    /// Owner-side submit used by the forward listener (`forward.rs`): the
+    /// same send-and-evict path as `submit`, but it NEVER forwards — this
+    /// replica has already been verified to hold `db`'s lease, so
+    /// re-broadcasting would loop the request around the fleet.
+    pub(crate) async fn submit_owned(
+        &self,
+        db: &str,
+        req: CommitterRequest,
+    ) -> Result<(), RtDbError> {
+        let (sender, _) = self.channel_for(db, false).await?;
+        self.send_and_evict(db, sender, req).await
+    }
+
+    /// Send into `db`'s committer channel, evicting the stale entry if the
+    /// task is gone (e.g. it panicked) so the next request respawns a fresh
+    /// task. The eviction only removes the entry if it still holds the same
+    /// sender that just failed (`same_channel`) — otherwise a concurrent
+    /// caller already respawned under this db key and evicting would drop the
+    /// live replacement instead of the dead one.
+    async fn send_and_evict(
+        &self,
+        db: &str,
+        sender: mpsc::Sender<CommitterRequest>,
+        req: CommitterRequest,
+    ) -> Result<(), RtDbError> {
         if sender.send(req).await.is_err() {
             let mut guard = self.channels.lock().await;
             if guard
@@ -470,6 +609,135 @@ impl Committers {
             return Err(RtDbError::internal("committer task is no longer running"));
         }
         Ok(())
+    }
+
+    /// True when THIS replica holds `db`'s ownership lease (a live, non-
+    /// draining entry with `lease: Some`). The forward listener uses this to
+    /// decide whether a broadcast write belongs here — every replica receives
+    /// the NOTIFY, and only the owner executes + replies.
+    pub(crate) async fn is_owner(&self, db: &str) -> bool {
+        let guard = self.channels.lock().await;
+        guard
+            .get(db)
+            .is_some_and(|entry| !entry.draining && entry.lease.is_some())
+    }
+
+    /// Stage 4c: forward a write that landed on this SHADOW (non-owner)
+    /// committer to the lease owner, and on a forward that produced no owner
+    /// reply (owner dead, or notify failed) attempt the lease takeover —
+    /// `channel_for(db, true)` retires the shadow and respawns with an
+    /// acquire attempt; if another replica still owns, the respawn is a
+    /// shadow whose write arm replies CONFLICT (the `run_committer`
+    /// backstop), which is the honest answer: retry reaches the new owner.
+    async fn forward_or_takeover(&self, db: &str, req: CommitterRequest) -> Result<(), RtDbError> {
+        let Some(forwarder) = self.forwarder.clone() else {
+            // multi_instance without a forwarder is a wiring bug (AppState
+            // always builds one); Stage 4a behavior is the safe fallback.
+            return self.takeover_submit(db, req).await;
+        };
+        let Some(write) = forward_write_of(&req) else {
+            // Fire-and-forget write arm reaching a shadow — only possible
+            // when a poller raced the takeover. Submit locally; the shadow's
+            // CONFLICT backstop (`run_committer`) answers it.
+            return self.submit_owned(db, req).await;
+        };
+        match forwarder.forward(db, write).await {
+            Ok(Ok(value)) => {
+                self.complete_forwarded_reply(db, req, value).await;
+                Ok(())
+            }
+            Ok(Err(err)) => {
+                fail_forwarded_reply(req, err);
+                Ok(())
+            }
+            Err(fail) => {
+                tracing::info!(
+                    db = %db,
+                    reason = %match &fail {
+                        crate::forward::ForwardFail::Notify(_) => "notify",
+                        crate::forward::ForwardFail::Timeout => "timeout",
+                    },
+                    "forward: no owner replied; attempting lease takeover"
+                );
+                self.takeover_submit(db, req).await
+            }
+        }
+    }
+
+    /// The takeover half of the Stage 4c failover path: retire any shadow and
+    /// respawn with a lease attempt (`channel_for(db, true)`), then submit the
+    /// original request. Owner acquired → the write executes locally; lease
+    /// still held elsewhere → the respawned shadow replies CONFLICT.
+    async fn takeover_submit(&self, db: &str, req: CommitterRequest) -> Result<(), RtDbError> {
+        let (sender, _) = self.channel_for(db, true).await?;
+        self.send_and_evict(db, sender, req).await
+    }
+
+    /// Deliver the owner's serialized outcome into the original request's
+    /// reply channel, decoding it back into the arm's concrete type. For a
+    /// Mutate, also re-run this replica's local subscriptions against the
+    /// owner's `WriteSet` — the owner fanned out to ITS subscribers inside
+    /// its committer turn; this pass extends the same invalidation to the
+    /// subscribers connected to THIS replica (reads fan out safely under
+    /// READ COMMITTED). `doc_values` did not travel (it is `#[serde(skip)]`),
+    /// so Indexed/Ordered subscriptions degrade to their conservative
+    /// "unrankable ⇒ re-run" fallback — never a missed push.
+    async fn complete_forwarded_reply(
+        &self,
+        db: &str,
+        req: CommitterRequest,
+        value: serde_json::Value,
+    ) {
+        match req {
+            CommitterRequest::Mutate { reply, .. } => {
+                match serde_json::from_value::<TxnOutcome>(value.clone()) {
+                    Ok(outcome) => {
+                        if outcome.write_set != WriteSet::default() {
+                            match self.schemas.get(&self.pool, db).await {
+                                Ok(schema) => {
+                                    self.subs
+                                        .fan_out(&self.pool, db, &schema, &outcome.write_set)
+                                        .await;
+                                }
+                                Err(err) => tracing::warn!(
+                                    db = %db,
+                                    error = %err,
+                                    "forwarded mutate fan-out skipped: schema fetch failed"
+                                ),
+                            }
+                        }
+                        let _ = reply.send(Ok(outcome));
+                    }
+                    Err(err) => {
+                        let _ = reply.send(Err(RtDbError::internal(format!(
+                            "forwarded mutate reply failed to decode: {err}; payload: {value}"
+                        ))));
+                    }
+                }
+            }
+            CommitterRequest::RunMigrate { reply, .. } => {
+                decode_or_internal::<crate::migrate::MigrateResult>(value, reply)
+            }
+            CommitterRequest::RunPushSchema { reply, .. } => {
+                decode_or_internal::<crate::schema::SchemaDef>(value, reply)
+            }
+            CommitterRequest::RunMergeUsers { reply, .. } => {
+                decode_or_internal::<crate::merge::MergeDbResult>(value, reply)
+            }
+            CommitterRequest::RunRestoreSchema { reply, .. } => {
+                decode_or_internal::<i64>(value, reply)
+            }
+            // `forward_write_of` returned Some only for the five arms above;
+            // anything else never reaches this method. Drop it with an
+            // internal error — never resubmit: the owner already executed.
+            other => {
+                tracing::error!("complete_forwarded_reply: unmatched request arm (unreachable)");
+                fail_forwarded_reply(
+                    other,
+                    RtDbError::internal("forwarded reply had no matching arm"),
+                );
+            }
+        }
     }
 
     /// Returns `db`'s committer sender, lazily spawning the task on first use.
@@ -487,15 +755,23 @@ impl Committers {
     /// one itself. This bounds the loop so a stuck drain surfaces as an error
     /// instead of a hang, and guarantees the new committer starts only after the
     /// old one is dead — preserving the single-writer invariant.
-    /// `for_write` marks the caller as a write arm: on multi-instance it
-    /// triggers the ownership upgrade — if the cached entry is a SHADOW
-    /// (non-owner), retire it and loop; the respawn path takes the lease (or
-    /// loses the race to a new owner and replies CONFLICT at the write arm).
+    /// `upgrade` requests the ownership upgrade (ENH-022 Stage 4): if the
+    /// cached entry is a SHADOW (non-owner), retire it and loop; the spawn
+    /// path then takes the lease (or loses the race to a new owner, yielding
+    /// a fresh shadow whose write arm replies CONFLICT). Stage 4c moved the
+    /// every-write upgrade onto the forward-timeout path — `submit` forwards
+    /// a shadow's write to the owner and calls this ONLY when no owner
+    /// answered — so ownership now follows demand solely as the failover
+    /// path, which is what keeps a write from ping-ponging the lease between
+    /// replicas under a load balancer.
+    ///
+    /// Returns the sender plus whether it belongs to a SHADOW (`false` =
+    /// this replica owns `db`'s lease, or the server is single-instance).
     async fn channel_for(
         &self,
         db: &str,
-        for_write: bool,
-    ) -> Result<mpsc::Sender<CommitterRequest>, RtDbError> {
+        upgrade: bool,
+    ) -> Result<(mpsc::Sender<CommitterRequest>, bool), RtDbError> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             // Fast path: a live (non-draining) entry. Refresh its idle clock
@@ -507,12 +783,12 @@ impl Committers {
                 if let Some(entry) = guard.get_mut(db) {
                     if entry.draining {
                         draining = true;
-                    } else if for_write && self.multi_instance && entry.lease.is_none() {
-                        // ENH-022 Stage 4 upgrade path: this db is served by a
-                        // shadow and a write arrived. Retire the shadow (its
-                        // exit clears the entry) and loop — the spawn path
-                        // then takes the ownership lease, which is also the
-                        // failover path when the previous owner has died.
+                    } else if upgrade && self.multi_instance && entry.lease.is_none() {
+                        // ENH-022 Stage 4/4c upgrade (takeover) path: retire
+                        // the shadow (its exit clears the entry) and loop —
+                        // the spawn path then takes the ownership lease,
+                        // which is the failover path when the previous owner
+                        // has died or never answered a forward.
                         entry.draining = true;
                         let sender = entry.sender.clone();
                         drop(guard);
@@ -520,7 +796,7 @@ impl Committers {
                         draining = true;
                     } else {
                         entry.last_activity = std::time::Instant::now();
-                        return Ok(entry.sender.clone());
+                        return Ok((entry.sender.clone(), entry.lease.is_none()));
                     }
                 }
             }
@@ -550,7 +826,7 @@ impl Committers {
                     continue;
                 }
                 entry.last_activity = std::time::Instant::now();
-                return Ok(entry.sender.clone());
+                return Ok((entry.sender.clone(), entry.lease.is_none()));
             }
 
             // ENH-022 Stage 4: in multi-instance mode, first writer to a db
@@ -649,6 +925,7 @@ impl Committers {
                     tx.clone(),
                 ));
             }
+            let is_shadow = lease.is_none();
             guard.insert(
                 db.to_string(),
                 ChannelEntry {
@@ -658,7 +935,7 @@ impl Committers {
                     lease,
                 },
             );
-            return Ok(tx);
+            return Ok((tx, is_shadow));
         }
     }
 

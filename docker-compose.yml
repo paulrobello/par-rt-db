@@ -151,6 +151,10 @@ services:
       # generated. Defaults mirror the server's code defaults.
       RTDB_MULTI_INSTANCE: ${RTDB_MULTI_INSTANCE:-false}
       RTDB_INSTANCE_ID: ${RTDB_INSTANCE_ID:-}
+      # ENH-022 Stage 4c: forwarded-write reply deadline (ms) before the
+      # non-owner attempts the lease takeover. Only meaningful when
+      # RTDB_MULTI_INSTANCE=true.
+      RTDB_FORWARD_TIMEOUT_MS: ${RTDB_FORWARD_TIMEOUT_MS:-5000}
       RTDB_GITHUB_BASE_URL: ${RTDB_GITHUB_BASE_URL:-https://github.com}
       RTDB_GITHUB_API_URL: ${RTDB_GITHUB_API_URL:-https://api.github.com}
       RTDB_GITLAB_BASE_URL: ${RTDB_GITLAB_BASE_URL:-https://gitlab.com}

@@ -270,7 +270,12 @@ pub async fn session_still_valid(pool: &PgPool, principal: &Principal) -> Result
 /// `Default` is the bypass view (`user_id`/`email`/`tables` all `None`); the
 /// `..Default::default()` spread keeps the many test literals that construct a
 /// `PrincipalCtx` for per-row-auth scenarios stable when new fields are added.
-#[derive(Debug, Clone, Default)]
+///
+/// `Serialize`/`Deserialize` (ENH-022 Stage 4c): a forwarded write carries the
+/// origin's principal to the lease owner over NOTIFY so per-row authz
+/// (`ownerField`/`collaboratorsField`, `$user`/`$email` markers) evaluates
+/// against the SAME identity that authorized the write at the edge.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PrincipalCtx {
     pub user_id: Option<String>,
     pub email: Option<String>,

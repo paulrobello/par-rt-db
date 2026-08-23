@@ -25,14 +25,16 @@ pub(crate) struct PrincipalField {
 
 /// Per-db outcome of `RunMergeUsers`: restamped-doc counts per table and the
 /// rows skipped because the restamp would violate a unique index.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+/// `Deserialize` (Stage 4c): a forwarded merge's result decodes back on the
+/// origin replica.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MergeDbResult {
     pub tables: BTreeMap<String, usize>,
     pub conflicts: Vec<MergeConflict>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MergeConflict {
     pub table: String,

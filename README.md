@@ -1035,21 +1035,27 @@ that ultimately terminates a connection that never closes on its own.
 
 ## Known MVP limitations
 
-- **Multi-instance is safe for reads + one writer per database; writes must
-  reach the owning replica.** With `RTDB_MULTI_INSTANCE=true` (ENH-022
-  Stages 1–4), OAuth login state, the op-feed, presence, rate-limit budgets
-  (`rtdb_auth.rate_counters` — one shared ceiling per token/db/ip), and
-  per-database write ownership all coordinate across replicas. Ownership: the
-  first replica to touch a database takes a Postgres advisory-lock lease on a
-  dedicated connection and runs that database's committer (and pollers) on
-  it — no other replica can write the database concurrently, and an owner's
-  death (kill -9, container stop) releases the lease to the next taker. A
-  non-owner replica serves reads and live subscriptions for the database and
-  replies `CONFLICT` to writes; its next write attempt takes over the lease
-  (that path is the failover), so behind a load balancer ownership follows
-  demand. What is NOT there yet: automatic forwarding of non-owner writes
-  (Stage 4c) — a write that lands on a non-owner errors until that replica
-  takes over. Design + as-built notes:
+- **Multi-instance is safe for reads + one writer per database; non-owner
+  writes are forwarded to the owner.** With `RTDB_MULTI_INSTANCE=true`
+  (ENH-022 Stages 1–4c), OAuth login state, the op-feed, presence,
+  rate-limit budgets (`rtdb_auth.rate_counters` — one shared ceiling per
+  token/db/ip), and per-database write ownership all coordinate across
+  replicas. Ownership: the first replica to touch a database takes a Postgres
+  advisory-lock lease on a dedicated connection and runs that database's
+  committer (and pollers) on it — no other replica can write the database
+  concurrently, and an owner's death (kill -9, container stop) releases the
+  lease to the next taker. A non-owner replica serves reads and live
+  subscriptions for the database and FORWARDS writes to the owner over
+  `pg_notify` (Stage 4c): the owner executes the write inside its committer
+  turn, returns the outcome to the non-owner's client, and the non-owner
+  re-runs its local subscriptions against the returned write set — the
+  caller's principal travels with the request, so per-row authz evaluates
+  against the identity that authorized the write at the edge. If no owner
+  answers within `RTDB_FORWARD_TIMEOUT_MS` (default 5s), the non-owner
+  attempts the lease takeover itself — that path is the failover. Note the
+  standard timeout ambiguity: a reply racing the timeout is dropped, so the
+  write may have committed even though the client saw `CONFLICT`; exactly-once
+  retries should carry an idempotency key. Design + as-built notes:
   `docs/superpowers/specs/2026-08-22-multi-instance-stage4-design.md`.
 - **Session expiry, machine-token revocation, allowlist removal, and admin-role
   revocation all take effect on open WebSocket connections.** The WS handler re-runs
@@ -1091,7 +1097,7 @@ plus an operator SPA and a CLI built on top of them:
 * Q: Is auth required?
   * A: Machine tokens are the baseline. Each of the six OAuth providers is independently optional (blank env ⇒ its routes return 503), and anonymous access is opt-in (off by default).
 * Q: Can I run multiple replicas behind a load balancer?
-  * A: Yes for reads, with one writer per database — set `RTDB_MULTI_INSTANCE=true`. Login state, op-feed, presence, rate budgets, and per-database write ownership (advisory-lock lease with kill-failover) coordinate via Postgres; a non-owner replica replies `CONFLICT` to writes until it takes the lease, and automatic write forwarding is the remaining follow-up. See [Known MVP limitations](#known-mvp-limitations) (ENH-022).
+  * A: Yes — set `RTDB_MULTI_INSTANCE=true`. Login state, op-feed, presence, rate budgets, and per-database write ownership (advisory-lock lease with kill-failover) coordinate via Postgres; a non-owner replica serves reads/subscriptions and forwards writes to the owning replica automatically (taking the lease itself if the owner dies within `RTDB_FORWARD_TIMEOUT_MS`). See [Known MVP limitations](#known-mvp-limitations) (ENH-022).
 
 ## Roadmap
 

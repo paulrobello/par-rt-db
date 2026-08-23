@@ -299,6 +299,7 @@ mod tests {
             otel_service_name: String::new(),
             otel_sample_ratio: 0.0,
             multi_instance: false,
+            forward_timeout_ms: 5000,
             instance_id: None,
         };
         assert!(GitlabProvider::from_config(&cfg).is_none());
