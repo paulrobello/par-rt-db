@@ -32,6 +32,12 @@ COPY core/src core/src
 # The rust-client [[test]] entries (ARC-110) name specific test files, which
 # cargo validates at manifest-parse time even when building a different member's
 # --bin — so the stub layer must create empty placeholders for them.
+#
+# ARC-011: this list is no longer maintained by memory. `make checkall` runs
+# scripts/dockerfile-stub-check.sh, which diffs the workspace's declared
+# [[test]] targets against the paths named here and fails on a missing stub.
+# (The server's own [[test]] needs no stub: cargo skips test-target validation
+# for the member it is building — measured, see the script's header.)
 RUN mkdir -p server/src rust-client/src rust-client/tests cli/src \
     && echo 'fn main() {}' > server/src/main.rs \
     && echo '' > rust-client/src/lib.rs \
