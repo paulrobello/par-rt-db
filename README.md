@@ -916,8 +916,8 @@ within that same write. Schema migration stays consistent: `renameField` rewrite
 expression and re-stamps, dropping a referenced field is rejected naming the
 computed field, and `evalExpr`/`setDefault`/`changeType` rewrites that feed a
 computed input re-stamp dependents in the same migrate. See
-[FEATURE_MATRIX #39](FEATURE_MATRIX.md) and
-[`docs/superpowers/specs/2026-07-21-par-rt-db-design.md`](docs/superpowers/specs/2026-07-21-par-rt-db-design.md).
+[FEATURE_MATRIX #39](FEATURE_MATRIX.md) and the `computed-*` cases in
+[`wire-corpus/semantics/`](wire-corpus/semantics/).
 
 ## Realtime presence
 

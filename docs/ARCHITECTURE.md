@@ -4,11 +4,15 @@ How the server is actually built: the committer, the per-database background
 tasks, the data pipeline, transports, auth, storage, quotas, and the admin
 surface. Written for contributors and agents changing server internals;
 [`../CLAUDE.md`](../CLAUDE.md) holds the agent guidance and the invariant list,
-and the root [`../README.md`](../README.md) holds the HTTP/WS surface. The main
-spec
+and the root [`../README.md`](../README.md) holds the HTTP/WS surface.
+
+The protocol and semantics are defined by the code and by three documents that
+track it: [`../README.md`](../README.md) (HTTP/WS surface, DSL, configuration),
+[`../FEATURE_MATRIX.md`](../FEATURE_MATRIX.md) (the Convex-parity contract), and
+[`../wire-corpus/README.md`](../wire-corpus/README.md) (the executable semantics
+corpus every implementation must pass). The 2026-07-21 design spec
 ([`superpowers/specs/2026-07-21-par-rt-db-design.md`](superpowers/specs/2026-07-21-par-rt-db-design.md))
-is the authoritative protocol/semantics source — when code and spec disagree,
-the code wins; fix the spec.
+is a historical record of the original design, not a current reference.
 
 ## Table of contents
 

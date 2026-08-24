@@ -6,7 +6,7 @@ Guidance for Claude Code (claude.ai/code) working in this repository.
 
 par-rt-db is a self-hosted, Convex-inspired realtime document database in Rust (axum/tokio + Postgres 17). Clients send a **declarative JSON DSL** — typed queries and atomic multi-step transactions — over WebSocket (`/sync`) or one-shot HTTP; the server executes them and pushes live query updates on change. One instance hosts many named databases. There is **no embedded JS runtime** and **no per-app server code** — one generic server serves every app.
 
-Authoritative sources: the [spec](docs/superpowers/specs/2026-07-21-par-rt-db-design.md) for protocol and semantics (read it before changing either), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for server internals (the committer, background tasks, auth, storage — with the reasoning behind each invariant), [README.md](README.md) for the HTTP/WS surface and configuration, and [FEATURE_MATRIX.md](FEATURE_MATRIX.md) for the Convex-parity contract.
+Authoritative sources: [README.md](README.md) for the HTTP/WS surface, the DSL, and configuration; [FEATURE_MATRIX.md](FEATURE_MATRIX.md) for the Convex-parity contract; [wire-corpus/README.md](wire-corpus/README.md) for the executable semantics corpus that pins protocol behavior across all five implementations; and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for server internals (the committer, background tasks, auth, storage — with the reasoning behind each invariant). The [2026-07-21 design spec](docs/superpowers/specs/2026-07-21-par-rt-db-design.md) is a historical record of the original design and is superseded by those four — do not treat it as current.
 
 ## Workspace & commands
 

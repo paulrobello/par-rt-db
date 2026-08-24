@@ -56,7 +56,7 @@ Constraints:
 
 ## Evidence on Hand
 
-- Authoritative design spec: `docs/superpowers/specs/2026-07-21-par-rt-db-design.md` (protocol, DSL, semantics).
+- Protocol, DSL, and semantics: `README.md`, `FEATURE_MATRIX.md`, and `wire-corpus/` (the original 2026-07-21 design spec is a historical record, superseded by those).
 - Dashboard backend design: `docs/superpowers/specs/2026-07-24-realtime-dashboard-design.md` (the six-phase surface contract).
 - Server source: `server/src/` (`auth/`, `admin/`, `http_api.rs`, `ws.rs`, `committer.rs`, `schema.rs`, `query.rs`, `txn.rs`, `config.rs`, `storage.rs`).
 - Four client implementations of the wire contract: `server/src/protocol.rs`, `ts-client/src/protocol.ts`, `rust-client/src/wire.rs`, and `python-client/src/par_rt_db/wire.py` (the SPA will speak this protocol via the ts-client SDK).

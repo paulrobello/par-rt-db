@@ -17,8 +17,11 @@ alongside it: [`../ts-client/`](../ts-client) (browser/Node),
 `RTDB_STATIC_DIR` is set, and the [`../cli/`](../cli) package wraps
 `par-rt-db-client` as the `rtdb` operator/CI binary. See the
 [root README](../README.md) for the project overview and
-[`../CLAUDE.md`](../CLAUDE.md) for contributor guidance. Authoritative design:
-[`../docs/superpowers/specs/2026-07-21-par-rt-db-design.md`](../docs/superpowers/specs/2026-07-21-par-rt-db-design.md).
+[`../CLAUDE.md`](../CLAUDE.md) for contributor guidance. The protocol and
+semantics are defined by the root README, [`../FEATURE_MATRIX.md`](../FEATURE_MATRIX.md),
+and the [`../wire-corpus/`](../wire-corpus/README.md) semantics corpus; the
+[2026-07-21 design spec](../docs/superpowers/specs/2026-07-21-par-rt-db-design.md)
+is a historical record of the original design.
 
 ## Stack
 

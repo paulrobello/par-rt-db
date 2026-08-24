@@ -5,9 +5,11 @@
 by utility and level of effort so parity work can be picked off in value order.
 **Perspective:** "Utility" is judged for the apps this instance actually serves (kanban
 board, personal SPAs, CLI/agent tooling) — not for a hypothetical SaaS at scale.
-**Sources:** `docs/superpowers/specs/2026-07-21-par-rt-db-design.md`, the implemented
-server (`server/src/`), the client SDK (`ts-client/src/`), and Convex's documented feature
-set (queries/mutations/actions, scheduling, storage, search, auth, components).
+**Sources:** the implemented server (`server/src/`), the four client SDKs
+(`ts-client/`, `rust-client/`, `python-client/`, `swift-client/`), the
+`wire-corpus/` semantics corpus, and Convex's documented feature set
+(queries/mutations/actions, scheduling, storage, search, auth, components). The
+2026-07-21 design spec is a historical record, not a source for this matrix.
 
 ## Legend
 
