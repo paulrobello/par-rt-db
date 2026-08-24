@@ -622,17 +622,23 @@ export type DocFields<Fields extends Record<string, Validator<unknown, boolean>>
   [K in OptionalFieldKeys<Fields>]?: Infer<Fields[K]>;
 };
 
-export type TableNames<S extends SchemaDefinition<any>> = keyof S["tables"] & string;
+/**
+ * Any schema, without caring which tables it declares — the constraint the
+ * schema-derived helper types below are generic over.
+ */
+export type AnySchema = SchemaDefinition<Record<string, TableDefinition<any, string, any>>>;
 
-type FieldsOf<S extends SchemaDefinition<any>, T extends TableNames<S>> =
+export type TableNames<S extends AnySchema> = keyof S["tables"] & string;
+
+type FieldsOf<S extends AnySchema, T extends TableNames<S>> =
   S["tables"][T] extends TableDefinition<infer F, string, any> ? F : never;
 
-export type IndexNamesOf<S extends SchemaDefinition<any>, T extends TableNames<S>> =
+export type IndexNamesOf<S extends AnySchema, T extends TableNames<S>> =
   S["tables"][T] extends TableDefinition<any, infer I, any> ? I : never;
 
 /** The table's server-stamped insert fields (`updatedAtField` /
  * `autoIncrementField`), carried on the table type's phantom marker. */
-type StampedFieldsOf<S extends SchemaDefinition<any>, T extends TableNames<S>> =
+type StampedFieldsOf<S extends AnySchema, T extends TableNames<S>> =
   S["tables"][T] extends TableDefinition<any, string, infer ST> ? ST : never;
 
 /** Insert/replace input keys that must be supplied: every non-optional field
@@ -647,9 +653,7 @@ type InsertRequiredKeys<Fields, Stamped extends string> = {
 }[keyof Fields];
 
 /** A read document: declared fields plus the merged system fields. */
-export type Doc<S extends SchemaDefinition<any>, T extends TableNames<S>> = DocFields<
-  FieldsOf<S, T>
-> &
+export type Doc<S extends AnySchema, T extends TableNames<S>> = DocFields<FieldsOf<S, T>> &
   SystemFields<T>;
 
 /** An insert/replace input: declared fields only, no system fields. Fields
@@ -657,7 +661,7 @@ export type Doc<S extends SchemaDefinition<any>, T extends TableNames<S>> = DocF
  * omission is accepted and stamped, a supplied value is overwritten — while
  * they stay required in the read type {@link Doc} (every stored doc carries
  * them). */
-export type WithoutSystemFields<S extends SchemaDefinition<any>, T extends TableNames<S>> = {
+export type WithoutSystemFields<S extends AnySchema, T extends TableNames<S>> = {
   [K in InsertRequiredKeys<FieldsOf<S, T>, StampedFieldsOf<S, T>>]: Infer<FieldsOf<S, T>[K]>;
 } & {
   [K in Exclude<

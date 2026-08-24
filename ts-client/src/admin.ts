@@ -17,7 +17,7 @@ import type {
   WorkflowStatus,
 } from "./protocol.js";
 import type { RtQuery } from "./query.js";
-import type { SchemaDefinition } from "./schema.js";
+import type { AnySchema } from "./schema.js";
 
 export interface RtDbAdminClientOptions {
   url: string;
@@ -419,7 +419,7 @@ export interface SlowQueriesResponse {
   capacity: number;
 }
 
-function toSchemaJson(schema: SchemaDefinition<any> | SchemaJson): SchemaJson {
+function toSchemaJson(schema: AnySchema | SchemaJson): SchemaJson {
   return "toJSON" in schema && typeof schema.toJSON === "function"
     ? schema.toJSON()
     : (schema as SchemaJson);
@@ -528,7 +528,7 @@ export class RtDbAdminClient {
   /** Applies an additive-only schema push to `db`: new tables, fields, and
    *  indexes only — never drops or type changes (use {@link Migration} for
    *  those). Safe to call repeatedly with a superset schema. */
-  async pushSchema(db: string, schema: SchemaDefinition<any> | SchemaJson): Promise<void> {
+  async pushSchema(db: string, schema: AnySchema | SchemaJson): Promise<void> {
     await this.request("POST", "/admin/push-schema", { db, schema: toSchemaJson(schema) });
   }
 
@@ -536,10 +536,7 @@ export class RtDbAdminClient {
    *  (POST /admin/db/{db}/schema/preview). Pure/advisory — does NOT apply.
    *  Returns what the push would ADD and what it would REJECT (drops, type
    *  changes the DDL layer refuses). */
-  async previewSchema(
-    db: string,
-    schema: SchemaDefinition<any> | SchemaJson,
-  ): Promise<SchemaPreviewDiff> {
+  async previewSchema(db: string, schema: AnySchema | SchemaJson): Promise<SchemaPreviewDiff> {
     return (await this.request("POST", `/admin/db/${encodeURIComponent(db)}/schema/preview`, {
       schema: toSchemaJson(schema),
     })) as SchemaPreviewDiff;

@@ -126,6 +126,7 @@ export type { ClientApi, RtQuery, TableApi } from "./query.js";
 export { createApi, TableQuery } from "./query.js";
 export { retryOnPrecondition } from "./retry.js";
 export type {
+  AnySchema,
   Doc,
   DocFields,
   Id,
