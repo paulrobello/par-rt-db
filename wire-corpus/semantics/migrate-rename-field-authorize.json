@@ -1,0 +1,49 @@
+{
+  "name": "migrate-rename-field-authorize",
+  "$comment": "QA-002: renameField rewrites the `authorize` predicate's field references — the derived schema's authorize predicate now names `flagged`, not the dropped `flag`. Runs with an admin token (bypasses per-row auth), so this pins the schema-level predicate rewrite (rename_filter_fields), not enforcement itself.",
+  "schema": {
+    "tables": {
+      "items": {
+        "fields": {
+          "flag": { "type": "boolean" },
+          "title": { "type": "string" }
+        },
+        "indexes": [],
+        "authorize": { "op": "eq", "field": "flag", "value": true }
+      }
+    }
+  },
+  "seed": [
+    { "flag": true, "title": "a" }
+  ],
+  "op": {
+    "migrate": {
+      "directives": [
+        { "op": "renameField", "table": "items", "from": "flag", "to": "flagged" }
+      ],
+      "dryRun": false
+    }
+  },
+  "expect": {
+    "applied": true,
+    "schema": {
+      "tables": {
+        "items": {
+          "fields": {
+            "flagged": { "type": "boolean" },
+            "title": { "type": "string" }
+          },
+          "indexes": [],
+          "authorize": { "op": "eq", "field": "flagged", "value": true }
+        }
+      }
+    },
+    "directives": [{ "op": "renameField", "affectedRows": 1 }]
+  },
+  "normalize": ["_id", "_creationTime", "_version", "id"],
+  "then": {
+    "query": { "table": "items" },
+    "expect": [{ "flagged": true, "title": "a" }],
+    "unordered": true
+  }
+}

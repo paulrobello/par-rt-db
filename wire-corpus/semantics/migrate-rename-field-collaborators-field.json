@@ -1,0 +1,49 @@
+{
+  "name": "migrate-rename-field-collaborators-field",
+  "$comment": "QA-002: renameField follows `collaboratorsField` when the renamed field is the one it names — the derived schema's `collaboratorsField` now reads `editors`, not the dropped `collabs`. Runs with an admin token (bypasses per-row auth), so this pins the schema-level rewrite, not the auth predicate itself.",
+  "schema": {
+    "tables": {
+      "docs": {
+        "fields": {
+          "collabs": { "type": "array", "element": { "type": "string" } },
+          "body": { "type": "string" }
+        },
+        "indexes": [],
+        "collaboratorsField": "collabs"
+      }
+    }
+  },
+  "seed": [
+    { "collabs": ["u1", "u2"], "body": "hi" }
+  ],
+  "op": {
+    "migrate": {
+      "directives": [
+        { "op": "renameField", "table": "docs", "from": "collabs", "to": "editors" }
+      ],
+      "dryRun": false
+    }
+  },
+  "expect": {
+    "applied": true,
+    "schema": {
+      "tables": {
+        "docs": {
+          "fields": {
+            "editors": { "type": "array", "element": { "type": "string" } },
+            "body": { "type": "string" }
+          },
+          "indexes": [],
+          "collaboratorsField": "editors"
+        }
+      }
+    },
+    "directives": [{ "op": "renameField", "affectedRows": 1 }]
+  },
+  "normalize": ["_id", "_creationTime", "_version", "id"],
+  "then": {
+    "query": { "table": "docs" },
+    "expect": [{ "editors": ["u1", "u2"], "body": "hi" }],
+    "unordered": true
+  }
+}

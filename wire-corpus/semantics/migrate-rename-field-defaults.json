@@ -1,0 +1,49 @@
+{
+  "name": "migrate-rename-field-defaults",
+  "$comment": "QA-002: renameField moves the `defaults` map entry keyed on the renamed field to the new key — the derived schema's `defaults` now keys the value under `hue`, not the dropped `color` (a declaration move, the same treatment as the `fields`/`computed` map keys, done directly in apply_rename_field rather than rename_field_refs).",
+  "schema": {
+    "tables": {
+      "widgets": {
+        "fields": {
+          "title": { "type": "string" },
+          "color": { "type": "string" }
+        },
+        "indexes": [],
+        "defaults": { "color": "red" }
+      }
+    }
+  },
+  "seed": [
+    { "title": "a", "color": "blue" }
+  ],
+  "op": {
+    "migrate": {
+      "directives": [
+        { "op": "renameField", "table": "widgets", "from": "color", "to": "hue" }
+      ],
+      "dryRun": false
+    }
+  },
+  "expect": {
+    "applied": true,
+    "schema": {
+      "tables": {
+        "widgets": {
+          "fields": {
+            "title": { "type": "string" },
+            "hue": { "type": "string" }
+          },
+          "indexes": [],
+          "defaults": { "hue": "red" }
+        }
+      }
+    },
+    "directives": [{ "op": "renameField", "affectedRows": 1 }]
+  },
+  "normalize": ["_id", "_creationTime", "_version", "id"],
+  "then": {
+    "query": { "table": "widgets" },
+    "expect": [{ "title": "a", "hue": "blue" }],
+    "unordered": true
+  }
+}

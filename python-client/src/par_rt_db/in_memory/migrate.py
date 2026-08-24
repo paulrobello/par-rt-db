@@ -41,6 +41,7 @@ from ..schema import (
     _FUnion,
 )
 from ..value_expr import ValueExpr
+from ..wire import FilterExpr
 from .value_expr import _validate_computed, walk_value_expr_fields
 
 if TYPE_CHECKING:
@@ -450,6 +451,18 @@ def _rename_value_expr_fields(expr: ValueExpr, from_: str, to: str) -> ValueExpr
     return _VE_ADAPTER.validate_python(_rewrite_ve_field(dumped, from_, to))
 
 
+_FILTER_ADAPTER = TypeAdapter(FilterExpr)
+
+
+def _rename_filter_fields(expr: FilterExpr, from_: str, to: str) -> FilterExpr:
+    """The ``authorize`` predicate's ``field`` references rewritten from
+    ``from_`` to ``to``. Mirrors server ``migrate::rename_filter_fields``;
+    reuses the same dict-level ``_rewrite_filter_fields`` the computed
+    ``case.when`` rewrite uses."""
+    dumped = expr.model_dump(by_alias=True, mode="json")
+    return _FILTER_ADAPTER.validate_python(_rewrite_filter_fields(dumped, from_, to))
+
+
 class _MigrateEngine(_Core):
     """``migrate_schema`` and the per-directive appliers over ``self._docs``."""
 
@@ -592,6 +605,21 @@ class _MigrateEngine(_Core):
             t.owner_field = d.to
         if t.collaborators_field == d.from_:
             t.collaborators_field = d.to
+        # QA-002: `auto_increment_field`, `updated_at_field`, and `ttl.field`
+        # are name-bearing surfaces the same way `owner_field`/
+        # `collaborators_field` are — missed here previously. Mirrors server
+        # `migrate::rename_field_refs`.
+        if t.auto_increment_field == d.from_:
+            t.auto_increment_field = d.to
+        if t.updated_at_field == d.from_:
+            t.updated_at_field = d.to
+        if t.ttl is not None and t.ttl.field == d.from_:
+            t.ttl = t.ttl.model_copy(update={"field": d.to})
+        # QA-002: the `authorize` predicate follows the rename the way
+        # `computed` expressions do — missed here previously. Mirrors server
+        # `migrate::rename_field_refs`.
+        if t.authorize is not None:
+            t.authorize = _rename_filter_fields(t.authorize, d.from_, d.to)
         # ENH-028: the computed map follows the rename the way the server's
         # does — an entry KEYED on the renamed field moves to the new name
         # (its declared field moved; leaving it keyed on `from_` would fail
@@ -604,6 +632,10 @@ class _MigrateEngine(_Core):
             t.computed[d.to] = t.computed.pop(d.from_)
         for key in list(t.computed):
             t.computed[key] = _rename_value_expr_fields(t.computed[key], d.from_, d.to)
+        # QA-002: `defaults` is keyed by field name the same way `computed`
+        # is — the entry moves to the new key. Missed here previously.
+        if d.from_ in t.defaults:
+            t.defaults[d.to] = t.defaults.pop(d.from_)
         affected = 0
         for (tname, _), row in self._docs.items():
             if tname != d.table:

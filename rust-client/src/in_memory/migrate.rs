@@ -88,6 +88,26 @@ impl InMemoryRtDbClient {
         if t.collaborators_field.as_deref() == Some(from) {
             t.collaborators_field = Some(to.to_string());
         }
+        // QA-002: `autoIncrementField`, `updatedAtField`, and `ttl.field` are
+        // name-bearing surfaces the same way `ownerField`/`collaboratorsField`
+        // are — missed here previously. Mirrors server `migrate::rename_field_refs`.
+        if t.auto_increment_field.as_deref() == Some(from) {
+            t.auto_increment_field = Some(to.to_string());
+        }
+        if t.updated_at_field.as_deref() == Some(from) {
+            t.updated_at_field = Some(to.to_string());
+        }
+        if let Some(ttl) = t.ttl.as_mut()
+            && ttl.field == from
+        {
+            ttl.field = to.to_string();
+        }
+        // QA-002: the `authorize` predicate follows the rename the way
+        // `computed` expressions do — missed here previously. Mirrors server
+        // `migrate::rename_field_refs`.
+        if let Some(expr) = t.authorize.as_mut() {
+            rename_filter_fields(expr, from, to);
+        }
         // ENH-028: the computed map follows the rename the way the field,
         // indexes, and owner/collaborator hints do — an entry KEYED on the
         // renamed field moves to the new name (its declared field moved;
@@ -103,6 +123,11 @@ impl InMemoryRtDbClient {
         }
         for expr in t.computed.values_mut() {
             rename_value_expr_fields(expr, from, to);
+        }
+        // QA-002: `defaults` is keyed by field name the same way `computed`
+        // is — the entry moves to the new key. Missed here previously.
+        if let Some(value) = t.defaults.remove(from) {
+            t.defaults.insert(to.to_string(), value);
         }
         let mut affected = 0i64;
         for ((tname, _), row) in self.docs.iter_mut() {

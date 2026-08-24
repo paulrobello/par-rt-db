@@ -820,7 +820,42 @@ private func requireMigrateTable(_ schema: SchemaDef, _ name: String) throws {
     }
 }
 
-// swiftlint:disable:next cyclomatic_complexity
+/// Rewrite every reference to field `from` on `table` to `to`, in place. The
+/// single chokepoint for the "reference" half of a field rename — the
+/// `fields`/`computed`/`defaults` map key moves are the *declaration* half
+/// and stay in `applyRenameFieldDirective` alongside it. Every other
+/// name-bearing surface on `TableDef` goes here: index field lists,
+/// `ownerField`, `collaboratorsField`, `autoIncrementField`, `updatedAtField`,
+/// `ttl.field`, and the `authorize` predicate. Mirrors server
+/// `migrate::rename_field_refs`.
+private func renameFieldRefs(_ planned: inout SchemaDef, _ table: String, _ from: String, _ to: String) {
+    if var indexes = planned.tables[table]?.indexes {
+        for position in indexes.indices {
+            indexes[position].fields = indexes[position].fields.map { $0 == from ? to : $0 }
+        }
+        planned.tables[table]?.indexes = indexes
+    }
+    if planned.tables[table]?.ownerField == from {
+        planned.tables[table]?.ownerField = to
+    }
+    if planned.tables[table]?.collaboratorsField == from {
+        planned.tables[table]?.collaboratorsField = to
+    }
+    if planned.tables[table]?.autoIncrementField == from {
+        planned.tables[table]?.autoIncrementField = to
+    }
+    if planned.tables[table]?.updatedAtField == from {
+        planned.tables[table]?.updatedAtField = to
+    }
+    if var ttl = planned.tables[table]?.ttl, ttl.field == from {
+        ttl.field = to
+        planned.tables[table]?.ttl = ttl
+    }
+    if let authorize = planned.tables[table]?.authorize {
+        planned.tables[table]?.authorize = renamedFilterExpr(authorize, from, to)
+    }
+}
+
 private func applyRenameFieldDirective(
     _ planned: inout SchemaDef, _ table: String, _ from: String, _ to: String,
     _ store: MigrationStore
@@ -838,18 +873,7 @@ private func applyRenameFieldDirective(
     }
     planned.tables[table]?.fields.removeValue(forKey: from)
     planned.tables[table]?.fields[to] = fieldType
-    if var indexes = planned.tables[table]?.indexes {
-        for position in indexes.indices {
-            indexes[position].fields = indexes[position].fields.map { $0 == from ? to : $0 }
-        }
-        planned.tables[table]?.indexes = indexes
-    }
-    if planned.tables[table]?.ownerField == from {
-        planned.tables[table]?.ownerField = to
-    }
-    if planned.tables[table]?.collaboratorsField == from {
-        planned.tables[table]?.collaboratorsField = to
-    }
+    renameFieldRefs(&planned, table, from, to)
     // ENH-028: the computed map follows the rename the way `defaults` does —
     // an entry KEYED on the renamed field moves to the new name (its declared
     // field moved; leaving it keyed on `from` would fail validateComputed's
@@ -867,6 +891,15 @@ private func applyRenameFieldDirective(
             }
         }
         planned.tables[table]?.computed = computed
+    }
+    // QA-002: `defaults` is keyed by field name the same way `computed` is —
+    // the entry moves to the new key. Missed here previously (the comment
+    // above referenced this move, but the code never did it).
+    if var defaults = planned.tables[table]?.defaults {
+        if let keyed = defaults.removeValue(forKey: from) {
+            defaults[to] = keyed
+            planned.tables[table]?.defaults = defaults
+        }
     }
     var affected: Int64 = 0
     for row in store.rowsFor(table).values {
