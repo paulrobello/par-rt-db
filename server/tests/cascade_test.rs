@@ -1,6 +1,6 @@
 //! Integration tests for FM-33 — app-level cascade delete (`onDelete`) and
 //! soft delete (`softDelete`). Mirrors the harness conventions of
-//! `defaults_test.rs` / `ttl_test.rs`: `common::test_state()` hands out a
+//! `defaults_test.rs` / `ttl_test.rs`: `crate::common::test_state()` hands out a
 //! pool; each test creates a uniquely-named `t<uuid>` database, pushes a
 //! schema, and drives the document path through `execute_txn` /
 //! `execute_query` directly (no HTTP). The reaper test drives writes through
@@ -11,8 +11,6 @@
 //! `cascade_over_budget_conflicts_and_rolls_back`: >10k children are seeded
 //! with one raw INSERT … generate_series (document txns would need 11+ given
 //! MAX_STEPS 1024), then the initiating Delete runs the full document path.
-
-mod common;
 
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::db;
@@ -194,7 +192,7 @@ fn parse_schema(value: serde_json::Value) -> SchemaDef {
 // Harness helpers
 // ===========================================================================
 
-async fn setup_db(pool: &sqlx::PgPool, schema: SchemaDef) -> common::TestDb {
+async fn setup_db(pool: &sqlx::PgPool, schema: SchemaDef) -> crate::common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(pool, &name)
         .await
@@ -202,7 +200,7 @@ async fn setup_db(pool: &sqlx::PgPool, schema: SchemaDef) -> common::TestDb {
     ddl::push_schema(pool, &name, schema)
         .await
         .expect("push fixture schema");
-    common::wrap_test_db(name)
+    crate::common::wrap_test_db(name)
 }
 
 /// Runs `steps` as one txn under the bypass principal, returning the raw
@@ -434,7 +432,7 @@ async fn typed_col_is_null(
 // the op-feed/audit/webhook/fan-out "every durable write publishes" contract.
 #[tokio::test]
 async fn cascade_delete_removes_children_and_records_every_op() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let schema = parse_schema(fk_schema("cascade"));
     let db = setup_db(&pool, schema.clone()).await;
@@ -514,7 +512,7 @@ async fn cascade_delete_removes_children_and_records_every_op() {
 // childless delete in the same txn does not survive the failure.
 #[tokio::test]
 async fn restrict_delete_conflicts_naming_field_and_rolls_back_whole_txn() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let schema = parse_schema(fk_schema("restrict"));
     let db = setup_db(&pool, schema.clone()).await;
@@ -599,7 +597,7 @@ async fn restrict_delete_conflicts_naming_field_and_rolls_back_whole_txn() {
 // and version bumped — recorded as a patch-shaped op.
 #[tokio::test]
 async fn set_null_clears_column_doc_key_and_bumps_version() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let schema = parse_schema(fk_schema("setNull"));
     let db = setup_db(&pool, schema.clone()).await;
@@ -668,7 +666,7 @@ async fn set_null_clears_column_doc_key_and_bumps_version() {
 // hang off the chain; deleting A removes all three without looping.
 #[tokio::test]
 async fn cascade_self_reference_cycle_terminates() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let schema = parse_schema(self_ref_schema());
     let db = setup_db(&pool, schema.clone()).await;
@@ -733,7 +731,7 @@ async fn cascade_self_reference_cycle_terminates() {
 // and the cascade stops there — the grandchild is untouched.
 #[tokio::test]
 async fn soft_delete_child_is_stamped_and_not_recursed_past() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let schema = parse_schema(soft_child_cascade_schema("cascade"));
     let db = setup_db(&pool, schema.clone()).await;
@@ -801,7 +799,7 @@ async fn soft_delete_child_is_stamped_and_not_recursed_past() {
 // parent delete succeeds and the stamped row is left exactly as it was.
 #[tokio::test]
 async fn soft_deleted_child_is_invisible_to_cascade() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let schema = parse_schema(soft_child_cascade_schema("cascade"));
     let db = setup_db(&pool, schema.clone()).await;
@@ -849,7 +847,7 @@ async fn soft_deleted_child_is_invisible_to_cascade() {
 // succeeds once the only referencing child is stamped.
 #[tokio::test]
 async fn soft_deleted_child_is_invisible_to_restrict() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let schema = parse_schema(soft_child_cascade_schema("restrict"));
     let db = setup_db(&pool, schema.clone()).await;
@@ -894,7 +892,7 @@ async fn soft_deleted_child_is_invisible_to_restrict() {
 // even though bob could not touch the child directly.
 #[tokio::test]
 async fn cascade_child_lookup_bypasses_per_row_owner_auth() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let schema = parse_schema(owner_cascade_schema());
     let db = setup_db(&pool, schema.clone()).await;
@@ -997,7 +995,7 @@ async fn cascade_child_lookup_bypasses_per_row_owner_auth() {
 // path as a per-id Delete — children of every matched parent cascade.
 #[tokio::test]
 async fn delete_by_query_cascades_each_matched_row() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let schema = parse_schema(fk_schema("cascade"));
     let db = setup_db(&pool, schema.clone()).await;
@@ -1069,7 +1067,7 @@ async fn delete_by_query_cascades_each_matched_row() {
 // row.
 #[tokio::test]
 async fn delete_by_query_skips_rows_already_cascaded_this_step() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let schema = parse_schema(self_ref_schema());
     let db = setup_db(&pool, schema.clone()).await;
@@ -1118,7 +1116,7 @@ async fn delete_by_query_skips_rows_already_cascaded_this_step() {
 // stay physically present, invisible to reads.
 #[tokio::test]
 async fn delete_by_query_on_soft_table_stamps_rows() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let schema = parse_schema(soft_tasks_schema());
     let db = setup_db(&pool, schema.clone()).await;
@@ -1193,7 +1191,7 @@ async fn delete_by_query_on_soft_table_stamps_rows() {
 // get / collect / count — the row itself stays physically present.
 #[tokio::test]
 async fn soft_delete_stamps_version_and_hides_from_every_read_terminal() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let schema = parse_schema(soft_tasks_schema());
     let db = setup_db(&pool, schema.clone()).await;
@@ -1281,7 +1279,7 @@ async fn soft_delete_stamps_version_and_hides_from_every_read_terminal() {
 // live duplicate holds the key surfaces the unique violation as Conflict.
 #[tokio::test]
 async fn soft_deleted_row_is_excluded_from_unique_index_and_undelete_conflicts_on_duplicate() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let schema = parse_schema(soft_tasks_schema());
     let db = setup_db(&pool, schema.clone()).await;
@@ -1346,7 +1344,7 @@ async fn soft_deleted_row_is_excluded_from_unique_index_and_undelete_conflicts_o
 // id, and BadRequest on a table that does not declare softDelete.
 #[tokio::test]
 async fn undelete_restores_is_idempotent_and_rejects_absent_or_non_soft_tables() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let schema = parse_schema(soft_tasks_schema());
     let db = setup_db(&pool, schema.clone()).await;
@@ -1464,7 +1462,7 @@ async fn undelete_restores_is_idempotent_and_rejects_absent_or_non_soft_tables()
 // decides insert-vs-update only sees live rows.
 #[tokio::test]
 async fn upsert_over_soft_deleted_key_inserts_fresh_row() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let schema = parse_schema(soft_tasks_schema());
     let db = setup_db(&pool, schema.clone()).await;
@@ -1525,7 +1523,7 @@ async fn upsert_over_soft_deleted_key_inserts_fresh_row() {
 // with PreconditionFailed while a live row holds the key.
 #[tokio::test]
 async fn expect_absent_treats_soft_deleted_row_as_absent() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let schema = parse_schema(soft_tasks_schema());
     let db = setup_db(&pool, schema.clone()).await;
@@ -1578,7 +1576,7 @@ async fn expect_absent_treats_soft_deleted_row_as_absent() {
 // ExpectVersion, Patch, and Replace all surface NotFound on a stamped row.
 #[tokio::test]
 async fn expect_version_and_patch_replace_treat_soft_deleted_row_as_absent() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let schema = parse_schema(soft_tasks_schema());
     let db = setup_db(&pool, schema.clone()).await;
@@ -1650,7 +1648,7 @@ async fn expect_version_and_patch_replace_treat_soft_deleted_row_as_absent() {
 // (false) keeps them hidden.
 #[tokio::test]
 async fn include_deleted_pass_through_surfaces_soft_deleted_rows() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let schema = parse_schema(soft_tasks_schema());
     let db = setup_db(&pool, schema.clone()).await;
@@ -1812,7 +1810,7 @@ async fn push_validation_rejects_unknown_referenced_table() {
 // deciding.
 #[tokio::test]
 async fn adding_or_changing_on_delete_is_an_additive_push() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let schema_v1 = parse_schema(fk_schema_without_on_delete());
     let db = setup_db(&pool, schema_v1).await;
@@ -1836,7 +1834,7 @@ async fn adding_or_changing_on_delete_is_an_additive_push() {
 // same unique key.
 #[tokio::test]
 async fn soft_delete_flag_add_rebuilds_unique_index() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
 
     // v1: tasks WITHOUT softDelete.
@@ -1907,7 +1905,7 @@ async fn soft_delete_flag_add_rebuilds_unique_index() {
 // onDelete children, cascading them (force_hard).
 // ===========================================================================
 
-use common::test_state_with_ttl_sweep;
+use crate::common::test_state_with_ttl_sweep;
 
 // The expired session row on a softDelete table is HARD-deleted by the reaper
 // (not stamped), and its cascade children go with it.
@@ -1993,7 +1991,7 @@ async fn reaper_hard_deletes_soft_delete_table_and_cascades_children() {
 // leave every row in place.
 #[tokio::test]
 async fn cascade_over_budget_conflicts_and_rolls_back() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let schema = parse_schema(fk_schema("cascade"));
     let db = setup_db(&pool, schema.clone()).await;

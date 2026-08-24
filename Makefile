@@ -22,7 +22,7 @@ SWIFT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(1),$(SW
 	dashboard-test \
 	python-client-install python-client-test python-client-lint python-client-fmt \
 	python-client-typecheck python-client-checkall rust-client-check-features rtdb-cli deploy \
-	env-drift-check cli-docs cli-docs-check \
+	env-drift-check dockerfile-stub-check cli-docs cli-docs-check \
 	swift-client-build swift-client-test swift-client-lint swift-client-fmt \
 	swift-client-fmt-check swift-client-typecheck swift-client-checkall
 
@@ -33,6 +33,7 @@ ts-client-build:
 	cd ts-client && bun run build
 
 build: ts-client-build
+	cd core && cargo build
 	cd server && cargo build
 	cd rust-client && cargo build --all-features
 	cd cli && cargo build --all-features
@@ -58,6 +59,7 @@ fmt-check:
 	$(call SWIFT_IF_DARWIN,swiftformat --lint .)
 
 lint:
+	cd core && cargo clippy --all-targets --all-features -- -D warnings
 	cd server && cargo clippy --all-targets --all-features -- -D warnings
 	cd ts-client && bun run lint
 	cd rust-client && cargo clippy --all-targets --all-features -- -D warnings
@@ -67,6 +69,7 @@ lint:
 	$(call SWIFT_IF_DARWIN,swiftlint --strict)
 
 typecheck: ts-client-build
+	cd core && cargo check --all-targets --all-features
 	cd server && cargo check --all-targets
 	cd ts-client && bun run typecheck
 	cd rust-client && cargo check --all-targets --all-features
@@ -88,6 +91,7 @@ dev-db-clean:
 	psql "$(RTDB_TEST_DATABASE_URL)" -f scripts/dev-db-clean.sql
 
 test: dev-db-up
+	cd core && cargo test
 	cd server && cargo test
 	cd ts-client && bun run test
 	cd rust-client && cargo test --all-features
@@ -197,7 +201,13 @@ cli-docs-check:
 env-drift-check:
 	./scripts/env-drift-check.sh
 
-checkall: env-drift-check cli-docs-check fmt-check lint typecheck test rust-client-check-features
+# ARC-011: a `[[test]]` declared in a non-server workspace member must have a
+# stub in the Dockerfile's dependency layer, or `make deploy` fails at cargo's
+# manifest parse — a break `checkall` could not otherwise see.
+dockerfile-stub-check:
+	./scripts/dockerfile-stub-check.sh
+
+checkall: env-drift-check dockerfile-stub-check cli-docs-check fmt-check lint typecheck test rust-client-check-features
 
 pre-commit:
 	pre-commit run --all-files

@@ -10,11 +10,9 @@
 //! exactly the drift class that produced QA-001: the TS `get` guard omitted
 //! `filter`/`search`/`vectorSearch` and silently returned the wrong result).
 
-mod common;
-
 use std::sync::Arc;
 
-use common::test_state;
+use crate::common::test_state;
 use rtdb_server::AppState;
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::ddl::push_schema;
@@ -51,7 +49,7 @@ fn matrix_schema() -> SchemaDef {
     serde_json::from_value(matrix_schema_json()).expect("parse matrix schema")
 }
 
-async fn matrix_db(state: &Arc<AppState>) -> (common::TestDb, SchemaDef) {
+async fn matrix_db(state: &Arc<AppState>) -> (crate::common::TestDb, SchemaDef) {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await
@@ -60,7 +58,7 @@ async fn matrix_db(state: &Arc<AppState>) -> (common::TestDb, SchemaDef) {
     push_schema(&state.pool, &name, schema.clone())
         .await
         .expect("push matrix-test schema");
-    (common::wrap_test_db(name), schema)
+    (crate::common::wrap_test_db(name), schema)
 }
 
 const ID: &str = "0123456789abcdef0123456789abcdef";

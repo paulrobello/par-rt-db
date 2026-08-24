@@ -5,9 +5,7 @@
 //! full `AppState`s with distinct instance ids sharing one Postgres — the
 //! same shape `notify_test.rs` uses for Stage 2/3.
 
-mod common;
-
-use common::{test_config, test_hot};
+use crate::common::{test_config, test_hot};
 use rtdb_server::AppState;
 use rtdb_server::auth::{Principal, PrincipalCtx};
 use rtdb_server::error::ErrorCode;
@@ -34,7 +32,7 @@ async fn replica(
 }
 
 async fn shared_pool() -> PgPool {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     state.pool.clone()
 }
 
@@ -94,7 +92,7 @@ async fn rate_budget_is_shared_across_replicas() -> anyhow::Result<()> {
 
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &db).await?;
-    let db = common::wrap_test_db(db);
+    let db = crate::common::wrap_test_db(db);
 
     let principal = Principal::Machine {
         db: db.as_str().to_string(),
@@ -159,7 +157,7 @@ async fn ownership_lease_forwarding_and_failover_on_death() -> anyhow::Result<()
 
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &name).await?;
-    let db = common::wrap_test_db(name);
+    let db = crate::common::wrap_test_db(name);
 
     // A's push takes the lease (A becomes the owner).
     a.realtime
@@ -212,7 +210,7 @@ async fn forward_timeout_conflicts_then_takes_over_when_lease_frees() -> anyhow:
 
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &name).await?;
-    let db = common::wrap_test_db(name);
+    let db = crate::common::wrap_test_db(name);
     b.realtime
         .committers
         .push_schema(&db, items_schema(false))
@@ -286,7 +284,7 @@ async fn forwarded_write_preserves_principal_on_owner() -> anyhow::Result<()> {
 
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &name).await?;
-    let db = common::wrap_test_db(name);
+    let db = crate::common::wrap_test_db(name);
     a.realtime
         .committers
         .push_schema(&db, items_schema(true))
@@ -308,5 +306,340 @@ async fn forwarded_write_preserves_principal_on_owner() -> anyhow::Result<()> {
         owner, "user-fwd",
         "ownerField stamped with the origin's principal"
     );
+    Ok(())
+}
+
+/// (ARC-002) A forwarded write whose serialized payload exceeds Postgres's
+/// 8000-byte `pg_notify` cap still round-trips: the body travels through the
+/// `rtdb_auth.forward_queue` spool and the NOTIFY carries only the row id.
+/// Before the spool, Postgres rejected the `pg_notify` outright and the write
+/// fell into the takeover path instead of reaching the owner.
+#[tokio::test]
+async fn forwarded_mutate_larger_than_notify_cap_round_trips() -> anyhow::Result<()> {
+    let pool = shared_pool().await;
+    let a = replica(&pool, "arc002-big-a", 0, 0).await;
+    let b = replica(&pool, "arc002-big-b", 0, 0).await;
+
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &name).await?;
+    let db = crate::common::wrap_test_db(name);
+    a.realtime
+        .committers
+        .push_schema(&db, items_schema(false))
+        .await?;
+
+    // 20 KB of title — two and a half times the NOTIFY cap on its own.
+    let big_title = "x".repeat(20 * 1024);
+    let txn = insert_item(&big_title);
+    assert!(
+        serde_json::to_string(&txn)?.len() > 8000,
+        "the fixture must exceed the pg_notify cap to be a regression test"
+    );
+
+    mutate_until_landed(&b, &db, txn, PrincipalCtx::bypass()).await?;
+
+    let (stored,): (String,) = sqlx::query_as(&format!(
+        "SELECT doc->>'title' FROM \"db_{db}\".\"t_items\""
+    ))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(stored.len(), big_title.len(), "the whole body forwarded");
+    Ok(())
+}
+
+/// (ARC-002) The REPLY direction is capped too: a forwarded `RunPushSchema`
+/// answers with the whole `SchemaDef`, which for an 80-table schema is well
+/// past 8000 bytes. Both legs go through the spool.
+#[tokio::test]
+async fn forwarded_push_schema_reply_larger_than_notify_cap() -> anyhow::Result<()> {
+    let pool = shared_pool().await;
+    let a = replica(&pool, "arc002-schema-a", 0, 0).await;
+    let b = replica(&pool, "arc002-schema-b", 0, 0).await;
+
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &name).await?;
+    let db = crate::common::wrap_test_db(name);
+    // A takes the lease with the baseline schema; B's push is forwarded.
+    a.realtime
+        .committers
+        .push_schema(&db, items_schema(false))
+        .await?;
+
+    // Additive-only: keep `items` and add 80 more tables.
+    let mut tables = serde_json::Map::new();
+    tables.insert(
+        "items".to_string(),
+        serde_json::json!({
+            "fields": { "title": { "type": "string" } },
+            "indexes": [{ "name": "by_title", "fields": ["title"] }]
+        }),
+    );
+    for i in 0..80 {
+        tables.insert(
+            format!("wide_table_number_{i}"),
+            serde_json::json!({
+                "fields": {
+                    "alpha": { "type": "string" },
+                    "bravo": { "type": "number" },
+                    "charlie": { "type": "boolean" },
+                    "delta": { "type": "string" }
+                },
+                "indexes": [
+                    { "name": "by_alpha", "fields": ["alpha"] },
+                    { "name": "by_bravo_delta", "fields": ["bravo", "delta"] }
+                ]
+            }),
+        );
+    }
+    let big_schema: rtdb_server::schema::SchemaDef =
+        serde_json::from_value(serde_json::json!({ "tables": tables }))?;
+    assert!(
+        serde_json::to_string(&big_schema)?.len() > 8000,
+        "the fixture must exceed the pg_notify cap to be a regression test"
+    );
+
+    // Retry on CONFLICT the same way `mutate_until_landed` does — the peer's
+    // forward listener may still be connecting.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let pushed = loop {
+        match b
+            .realtime
+            .committers
+            .push_schema(&db, big_schema.clone())
+            .await
+        {
+            Ok(schema) => break schema,
+            Err(err) if err.code == ErrorCode::Conflict => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "forwarded push kept conflicting: {err}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    };
+    assert_eq!(
+        pushed.tables.len(),
+        81,
+        "the owner's full schema came back through the reply spool"
+    );
+    Ok(())
+}
+
+/// Drain `rx` until a `QueryUpdate` for `query_id` arrives or `within` elapses.
+async fn await_query_update(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<rtdb_server::protocol::ServerMessage>,
+    query_id: &str,
+    within: std::time::Duration,
+) -> Option<serde_json::Value> {
+    let deadline = std::time::Instant::now() + within;
+    while std::time::Instant::now() < deadline {
+        match rx.try_recv() {
+            Ok(rtdb_server::protocol::ServerMessage::QueryUpdate {
+                query_id: id,
+                result,
+            }) if id == query_id => {
+                return Some(result);
+            }
+            Ok(_) => continue,
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
+        }
+    }
+    None
+}
+
+/// (ARC-001) A write executed by the OWNER invalidates subscriptions on every
+/// replica, not just its own. Before this, a client subscribed through replica
+/// B saw nothing when replica A — the lease owner — committed a write: the
+/// op-feed NOTIFY only fed the admin activity ring, and the origin-side
+/// fan-out only covered writes B itself had forwarded. B's client stayed stale
+/// until B happened to write.
+#[tokio::test]
+async fn owner_side_write_invalidates_peer_subscriptions() -> anyhow::Result<()> {
+    let pool = shared_pool().await;
+    let a = replica(&pool, "arc001-owner-a", 0, 0).await;
+    let b = replica(&pool, "arc001-peer-b", 0, 0).await;
+
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &name).await?;
+    let db = crate::common::wrap_test_db(name);
+    // A's push takes the lease — A is the owner for the rest of the test.
+    a.realtime
+        .committers
+        .push_schema(&db, items_schema(false))
+        .await?;
+
+    // The subscription lives on B, which owns nothing.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let query: rtdb_server::query::Query =
+        serde_json::from_value(serde_json::json!({ "table": "items" }))?;
+    b.realtime
+        .committers
+        .subscribe(
+            &db,
+            rtdb_server::subs::next_conn_id(),
+            "q-peer".to_string(),
+            query,
+            tx,
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    let initial = await_query_update(&mut rx, "q-peer", std::time::Duration::from_secs(5))
+        .await
+        .expect("initial query update");
+    assert_eq!(
+        initial.as_array().expect("docs array").len(),
+        0,
+        "the table starts empty"
+    );
+
+    // The write goes straight to the OWNER — nothing is forwarded, so the
+    // only path that can reach B's subscriber is the write-set NOTIFY.
+    a.realtime
+        .committers
+        .mutate(&db, None, insert_item("owner-side"), PrincipalCtx::bypass())
+        .await?;
+
+    let pushed = await_query_update(&mut rx, "q-peer", std::time::Duration::from_secs(10))
+        .await
+        .expect("the peer's subscription re-ran for the owner's write");
+    assert_eq!(
+        pushed.as_array().expect("docs array").len(),
+        1,
+        "the peer sees the owner's insert"
+    );
+    Ok(())
+}
+
+/// (ARC-001) The invalidation survives a write set too large to travel inline
+/// in a `pg_notify` payload: a bulk insert's `WriteSet` goes through the spool
+/// (`kind='writeset'`) and the NOTIFY carries only the row id.
+#[tokio::test]
+async fn oversized_write_set_invalidates_peer_subscriptions() -> anyhow::Result<()> {
+    let pool = shared_pool().await;
+    let a = replica(&pool, "arc001-bulk-a", 0, 0).await;
+    let b = replica(&pool, "arc001-bulk-b", 0, 0).await;
+
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &name).await?;
+    let db = crate::common::wrap_test_db(name);
+    a.realtime
+        .committers
+        .push_schema(&db, items_schema(false))
+        .await?;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let query: rtdb_server::query::Query =
+        serde_json::from_value(serde_json::json!({ "table": "items" }))?;
+    b.realtime
+        .committers
+        .subscribe(
+            &db,
+            rtdb_server::subs::next_conn_id(),
+            "q-bulk".to_string(),
+            query,
+            tx,
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    await_query_update(&mut rx, "q-bulk", std::time::Duration::from_secs(5))
+        .await
+        .expect("initial query update");
+
+    // 200 inserts: the resulting WriteSet carries 200 doc ids plus 200 ops,
+    // comfortably past the 7500-byte inline threshold.
+    let bulk = Transaction {
+        steps: (0..200)
+            .map(|i| Step::Insert {
+                table: "items".to_string(),
+                doc: serde_json::json!({ "title": format!("bulk-{i}") })
+                    .as_object()
+                    .expect("json object")
+                    .clone(),
+            })
+            .collect(),
+    };
+    a.realtime
+        .committers
+        .mutate(&db, None, bulk, PrincipalCtx::bypass())
+        .await?;
+
+    let pushed = await_query_update(&mut rx, "q-bulk", std::time::Duration::from_secs(10))
+        .await
+        .expect("the peer's subscription re-ran for the spooled write set");
+    assert_eq!(
+        pushed.as_array().expect("docs array").len(),
+        200,
+        "the peer sees every bulk-inserted doc"
+    );
+    Ok(())
+}
+
+/// (ARC-003) An unkeyed mutate that is FORWARDED gets a server-minted
+/// idempotency key, so the owner records it in the shared `mutations` dedup
+/// table. That row is what makes the timeout→takeover resubmission a replay
+/// rather than a second write: without it, a reply racing the forward timeout
+/// left the origin resubmitting a write that had already committed.
+#[tokio::test]
+async fn forwarded_mutate_is_deduped_by_a_server_minted_key() -> anyhow::Result<()> {
+    let pool = shared_pool().await;
+    let a = replica(&pool, "arc003-key-a", 0, 0).await;
+    let b = replica(&pool, "arc003-key-b", 0, 0).await;
+
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &name).await?;
+    let db = crate::common::wrap_test_db(name);
+    a.realtime
+        .committers
+        .push_schema(&db, items_schema(false))
+        .await?;
+
+    // A local (owner-side) unkeyed mutate is NOT keyed — it has no forward to
+    // be ambiguous about, so it must not pay for a dedup row.
+    a.realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            insert_item("owner-local"),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    let (local_rows,): (i64,) =
+        sqlx::query_as(&format!("SELECT count(*) FROM \"db_{db}\".mutations"))
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(local_rows, 0, "an owner-side write mints no key");
+
+    // The forwarded one is keyed by the server.
+    mutate_until_landed(&b, &db, insert_item("forwarded"), PrincipalCtx::bypass()).await?;
+    let (keyed_rows,): (i64,) =
+        sqlx::query_as(&format!("SELECT count(*) FROM \"db_{db}\".mutations"))
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        keyed_rows, 1,
+        "the forwarded mutate recorded a dedup row under the minted key"
+    );
+
+    // Replaying that exact key returns the recorded outcome instead of
+    // writing again — the property the takeover path relies on.
+    let (mut_id,): (String,) = sqlx::query_as(&format!("SELECT mut_id FROM \"db_{db}\".mutations"))
+        .fetch_one(&pool)
+        .await?;
+    a.realtime
+        .committers
+        .mutate(
+            &db,
+            Some(mut_id),
+            insert_item("forwarded"),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    let (rows,): (i64,) = sqlx::query_as(&format!("SELECT count(*) FROM \"db_{db}\".\"t_items\""))
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(rows, 2, "the replay wrote nothing new");
     Ok(())
 }

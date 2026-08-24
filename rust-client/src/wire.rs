@@ -888,113 +888,11 @@ pub struct AggregateGroup {
     pub value: serde_json::Value,
 }
 
-/// A db-side predicate appended to a query's WHERE clause. Mirrors
-/// `server/src/query.rs::FilterExpr` byte-for-byte: internally tagged by `op`
-/// (lowercase), `deny_unknown_fields`. Leaves compare one declared field to a
-/// value (`In` to a non-empty list); `And`/`Or` nest arbitrarily; `Not` wraps
-/// a nested expr; `Contains` tests membership of `value` in `doc.field[]`
-/// (reverse of `In`); `Exists` tests the field is present and non-null.
-///
-/// Construct variants directly (`FilterExpr::Eq { field, value }`) — inherent
-/// constructors named `eq`/`gt`/`lt` are avoided because they shadow
-/// `PartialEq`/`PartialOrd` trait methods (`clippy::should_implement_trait`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "lowercase", deny_unknown_fields)]
-pub enum FilterExpr {
-    /// `field == value`.
-    Eq {
-        /// The declared field to compare.
-        field: String,
-        /// The value to compare against.
-        value: serde_json::Value,
-    },
-    /// `field != value`.
-    Neq {
-        /// The declared field to compare.
-        field: String,
-        /// The value to compare against.
-        value: serde_json::Value,
-    },
-    /// `field > value`.
-    Gt {
-        /// The declared field to compare.
-        field: String,
-        /// The value to compare against.
-        value: serde_json::Value,
-    },
-    /// `field >= value`.
-    Gte {
-        /// The declared field to compare.
-        field: String,
-        /// The value to compare against.
-        value: serde_json::Value,
-    },
-    /// `field < value`.
-    Lt {
-        /// The declared field to compare.
-        field: String,
-        /// The value to compare against.
-        value: serde_json::Value,
-    },
-    /// `field <= value`.
-    Lte {
-        /// The declared field to compare.
-        field: String,
-        /// The value to compare against.
-        value: serde_json::Value,
-    },
-    /// `field` equals any of `values` (non-empty).
-    In {
-        /// The declared field to compare.
-        field: String,
-        /// The accepted values.
-        values: Vec<serde_json::Value>,
-    },
-    /// Every sub-expression matches.
-    And {
-        /// The conjuncts.
-        exprs: Vec<FilterExpr>,
-    },
-    /// Any sub-expression matches.
-    Or {
-        /// The disjuncts.
-        exprs: Vec<FilterExpr>,
-    },
-    /// Negation.
-    Not {
-        /// The negated expression.
-        expr: Box<FilterExpr>,
-    },
-    /// `value` is a member of `doc.field[]`.
-    Contains {
-        /// The array field to test.
-        field: String,
-        /// The candidate member.
-        value: serde_json::Value,
-    },
-    /// The field is present and non-null.
-    Exists {
-        /// The field to test.
-        field: String,
-    },
-    /// Execution-time-relative age predicate: the field's epoch-ms value is
-    /// strictly older than `now − ms`, with `now` read from the clock AT
-    /// EXECUTION TIME — a scheduled txn's stored filter stays fresh on every
-    /// fire instead of freezing a literal at schedule time (server-side
-    /// sweeps: archive done rows older than 7d, expire claim leases). Valid
-    /// ONLY in the by-query step filters (`patchByQuery`/`deleteByQuery`);
-    /// read-path filters, `authorize` predicates, partial-index `where`
-    /// predicates, and computed `case` whens reject it. The field must be
-    /// declared `number` or `int64` (a null or absent value never matches),
-    /// and `ms >= 0`.
-    #[serde(rename = "olderThan")]
-    OlderThan {
-        /// The declared field to test.
-        field: String,
-        /// Age window in milliseconds (`>= 0`).
-        ms: i64,
-    },
-}
+/// A db-side predicate appended to a query's WHERE clause. Defined once in
+/// `par-rt-db-core` (ARC-004) and re-exported here at its historical path:
+/// the server compiles it to SQL, the Rust client constructs it, and neither
+/// can drift from the other because there is only one definition.
+pub use par_rt_db_core::wire::FilterExpr;
 
 /// One slot of a `POST /api/query-batch` response. Mirrors server
 /// `http_api::BatchQueryOutcome` byte-for-byte (camelCase, omit-when-None). The

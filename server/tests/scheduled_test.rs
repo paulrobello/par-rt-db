@@ -6,8 +6,6 @@
 //! `ensure_table` is still called per test to exercise the idempotent
 //! pre-feature migration path.
 
-mod common;
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,22 +26,22 @@ use rtdb_server::schema::SchemaDef;
 use rtdb_server::subs::SubscriptionManager;
 use rtdb_server::txn::{Step, Transaction};
 
-/// Mirrors `common::test_state()`'s pool setup: connect to the shared dev
+/// Mirrors `crate::common::test_state()`'s pool setup: connect to the shared dev
 /// Postgres and bootstrap `rtdb_auth`. Each test gets its own connection so
 /// they don't share a `PgPool`'s lifetime.
 async fn test_pool() -> PgPool {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     state.pool.clone()
 }
 
-/// Mirrors `common::fresh_db()`'s naming + creation path, minus the schema
+/// Mirrors `crate::common::fresh_db()`'s naming + creation path, minus the schema
 /// push (these tests never query user tables, so no schema is needed).
-async fn unique_db(pool: &PgPool) -> common::TestDb {
+async fn unique_db(pool: &PgPool) -> crate::common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(pool, &name)
         .await
         .expect("create fresh database");
-    common::wrap_test_db(name)
+    crate::common::wrap_test_db(name)
 }
 
 fn empty_txn() -> Transaction {
@@ -217,7 +215,7 @@ async fn pause_resume_one_shot_keeps_due_at() {
 // on the scheduler having started.
 
 /// Pushes a one-table schema (`items` with an indexed number field `n`) so a
-/// firing job has an observable effect. Mirrors `common::fresh_db`'s push path.
+/// firing job has an observable effect. Mirrors `crate::common::fresh_db`'s push path.
 async fn push_simple_schema(pool: &PgPool, db: &str) -> SchemaDef {
     let schema: SchemaDef = serde_json::from_value(serde_json::json!({"tables":{
         "items":{
@@ -328,7 +326,7 @@ async fn one_shot_fires_and_writes() {
         SubscriptionManager::new(),
         SchemaCache::new(),
         OpFeed::new(64, 32),
-        Arc::new(ArcSwap::from_pointee(common::test_hot())),
+        Arc::new(ArcSwap::from_pointee(crate::common::test_hot())),
         Metrics::new(),
         CommitterConfig {
             quotas: Arc::new(quota::UsageCache::new()),
@@ -386,7 +384,7 @@ async fn cron_fires_and_stays_pending() {
         SubscriptionManager::new(),
         SchemaCache::new(),
         OpFeed::new(64, 32),
-        Arc::new(ArcSwap::from_pointee(common::test_hot())),
+        Arc::new(ArcSwap::from_pointee(crate::common::test_hot())),
         Metrics::new(),
         CommitterConfig {
             quotas: Arc::new(quota::UsageCache::new()),
@@ -449,7 +447,7 @@ async fn failing_cron_reschedules_anyway() {
         SubscriptionManager::new(),
         SchemaCache::new(),
         OpFeed::new(64, 32),
-        Arc::new(ArcSwap::from_pointee(common::test_hot())),
+        Arc::new(ArcSwap::from_pointee(crate::common::test_hot())),
         Metrics::new(),
         CommitterConfig {
             quotas: Arc::new(quota::UsageCache::new()),
@@ -531,7 +529,7 @@ async fn one_shot_catches_up_after_being_past_due() {
         SubscriptionManager::new(),
         SchemaCache::new(),
         OpFeed::new(64, 32),
-        Arc::new(ArcSwap::from_pointee(common::test_hot())),
+        Arc::new(ArcSwap::from_pointee(crate::common::test_hot())),
         Metrics::new(),
         CommitterConfig {
             quotas: Arc::new(quota::UsageCache::new()),
@@ -585,7 +583,7 @@ async fn cron_skips_missed_windows() {
         SubscriptionManager::new(),
         SchemaCache::new(),
         OpFeed::new(64, 32),
-        Arc::new(ArcSwap::from_pointee(common::test_hot())),
+        Arc::new(ArcSwap::from_pointee(crate::common::test_hot())),
         Metrics::new(),
         CommitterConfig {
             quotas: Arc::new(quota::UsageCache::new()),
@@ -678,7 +676,7 @@ async fn failing_txn_marks_error_one_shot() {
         SubscriptionManager::new(),
         SchemaCache::new(),
         OpFeed::new(64, 32),
-        Arc::new(ArcSwap::from_pointee(common::test_hot())),
+        Arc::new(ArcSwap::from_pointee(crate::common::test_hot())),
         Metrics::new(),
         CommitterConfig {
             quotas: Arc::new(quota::UsageCache::new()),
@@ -801,7 +799,7 @@ async fn interval_fires_repeatedly_and_skips_paused_windows() {
         SubscriptionManager::new(),
         SchemaCache::new(),
         OpFeed::new(64, 32),
-        Arc::new(ArcSwap::from_pointee(common::test_hot())),
+        Arc::new(ArcSwap::from_pointee(crate::common::test_hot())),
         Metrics::new(),
         CommitterConfig {
             quotas: Arc::new(quota::UsageCache::new()),

@@ -8,9 +8,7 @@
 //! op-feed ring. The self-dedupe contract (instance-id tag) keeps A from
 //! double-publishing its own writes into its own ring.
 
-mod common;
-
-use common::{admin_get, admin_post, spawn_app, test_config, test_hot};
+use crate::common::{admin_get, admin_post, spawn_app, test_config, test_hot};
 use rtdb_server::AppState;
 use serde_json::json;
 
@@ -134,7 +132,7 @@ async fn cross_replica_op_feed_fan_out_and_self_dedupe() -> anyhow::Result<()> {
     // must stay live for the test body so its `Drop` cleanup runs AFTER the test
     // (an unbound `wrap_test_db(...)` drops at end-of-statement, leaking the DB).
     let db_name = fresh_name();
-    let _guard = common::wrap_test_db(db_name.clone());
+    let _guard = crate::common::wrap_test_db(db_name.clone());
     create_db(addr_a, &db_name).await;
     push_widgets_schema(addr_a, &db_name).await;
 
@@ -196,7 +194,7 @@ async fn multi_instance_disabled_does_not_fan_out() -> anyhow::Result<()> {
     let addr_b = spawn_app(state_b.clone()).await;
 
     let db_name = fresh_name();
-    let _guard = common::wrap_test_db(db_name.clone());
+    let _guard = crate::common::wrap_test_db(db_name.clone());
     create_db(addr_a, &db_name).await;
     push_widgets_schema(addr_a, &db_name).await;
 

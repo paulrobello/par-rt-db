@@ -9,106 +9,12 @@
 use crate::auth::PrincipalCtx;
 use crate::error::RtDbError;
 use crate::migrate::MigrateBind;
-use crate::query::FilterExpr;
 use crate::schema::TableDef;
 
-/// Closed set of sound coercions. Shared by `Directive::ChangeType` and
-/// `ValueExpr::Cast` — the four scalar casts that are sound to backfill.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum Cast {
-    ToString,
-    ToNumber,
-    ToInt64,
-    ToBoolean,
-}
-
-/// A closed, typed expression grammar shared by `Directive::EvalExpr`'s
-/// backfill expression (ENH-020 Stage 1, closing SEC-107) and computed fields
-/// (ENH-028). Mirrors `query::FilterExpr`'s serde conventions: `tag = "op"`,
-/// camelCase, `deny_unknown_fields`. Every `Literal` compiles to a bound `$n`
-/// placeholder (as jsonb); every `Field` resolves through the table's
-/// `TableDef` (errors on an unknown field) and reads `doc->'field'`. There is
-/// deliberately **no** subquery node, no function-call-by-name node, and no
-/// raw-SQL escape — the grammar is closed, so the SEC-107 injection concern
-/// cannot arise from a `ValueExpr` payload. The only way to reach raw SQL is
-/// the deprecated `Legacy(String)` source, which remains gated to the root
-/// admin_key (see `admin_migrate`).
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]
-pub enum ValueExpr {
-    /// A declared field on this table (validated against `TableDef`). Reads
-    /// `doc->'field'` (jsonb). The field must be declared; the write target
-    /// (`EvalExpr.set`) need not be.
-    Field {
-        field: String,
-    },
-    /// Any JSON literal. Bound as `$n::jsonb`, so objects/arrays/null round-trip.
-    Literal {
-        value: serde_json::Value,
-    },
-    /// String concatenation. Postgres `concat(...)`, which ignores NULL args
-    /// (treats them as empty) — wrap operands in `Coalesce` for explicit control.
-    Concat {
-        parts: Vec<ValueExpr>,
-    },
-    /// Numeric arithmetic. Operands are cast to `::numeric`; the result is a
-    /// JSON number via the surrounding `to_jsonb`. Division by zero errors at
-    /// runtime — guard with `Case`/`Coalesce` when the divisor may be zero.
-    Add {
-        left: Box<ValueExpr>,
-        right: Box<ValueExpr>,
-    },
-    Sub {
-        left: Box<ValueExpr>,
-        right: Box<ValueExpr>,
-    },
-    Mul {
-        left: Box<ValueExpr>,
-        right: Box<ValueExpr>,
-    },
-    Div {
-        left: Box<ValueExpr>,
-        right: Box<ValueExpr>,
-    },
-    /// `COALESCE(parts...)` — first non-null, or NULL.
-    Coalesce {
-        parts: Vec<ValueExpr>,
-    },
-    /// Text casing / trim. Operand cast to `::text`.
-    Lower {
-        value: Box<ValueExpr>,
-    },
-    Upper {
-        value: Box<ValueExpr>,
-    },
-    Trim {
-        value: Box<ValueExpr>,
-    },
-    /// A closed scalar coercion. Reuses `Directive::ChangeType`'s `Cast` enum.
-    Cast {
-        value: Box<ValueExpr>,
-        to: Cast,
-    },
-    /// Current timestamp as epoch milliseconds (a JSON number) — the same
-    /// value `txn`'s `now_ms()` stamps, on both the SQL and interpreter paths.
-    Now,
-    /// Conditional: first matching `when`'s `then`, else `otherwise`. Each
-    /// `when` is a `FilterExpr` (compiled via the read path's `compile_filter`,
-    /// so its field references are schema-validated and its values bound).
-    Case {
-        whens: Vec<CaseWhen>,
-        otherwise: Box<ValueExpr>,
-    },
-}
-
-/// One branch of `ValueExpr::Case`. Wire shape `{ when, then }`.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CaseWhen {
-    pub when: crate::query::FilterExpr,
-    pub then: ValueExpr,
-}
+/// The closed `ValueExpr` grammar and its `Cast`/`CaseWhen` companions,
+/// defined once in `par-rt-db-core` (ARC-004) and re-exported here at their
+/// historical paths. `ValueExpr`'s builder constructors live with the type.
+pub use par_rt_db_core::wire::{CaseWhen, Cast, ValueExpr};
 
 /// Compiles a `ValueExpr` into a SQL fragment plus its typed binds, with `$n`
 /// placeholders numbered from 1-based `start_pos`. Every `Literal` emits one
@@ -462,67 +368,14 @@ fn cast_to_boolean(v: &serde_json::Value) -> Result<serde_json::Value, RtDbError
     }
 }
 
-/// Visits every field name a `ValueExpr` reads: each `Field` node, every
-/// `Case` branch's `then`/`otherwise`, and every `FilterExpr` field inside
-/// `Case.whens` — the same field set `validate_value_expr_fields` type-checks,
-/// exposed as a callback walk for push-time validation and backfill planning.
-pub fn walk_value_expr_fields(ve: &ValueExpr, f: &mut impl FnMut(&str)) {
-    match ve {
-        ValueExpr::Field { field } => f(field),
-        ValueExpr::Literal { .. } | ValueExpr::Now => {}
-        ValueExpr::Concat { parts } | ValueExpr::Coalesce { parts } => {
-            for p in parts {
-                walk_value_expr_fields(p, f);
-            }
-        }
-        ValueExpr::Add { left, right }
-        | ValueExpr::Sub { left, right }
-        | ValueExpr::Mul { left, right }
-        | ValueExpr::Div { left, right } => {
-            walk_value_expr_fields(left, f);
-            walk_value_expr_fields(right, f);
-        }
-        ValueExpr::Lower { value } | ValueExpr::Upper { value } | ValueExpr::Trim { value } => {
-            walk_value_expr_fields(value, f);
-        }
-        ValueExpr::Cast { value, .. } => walk_value_expr_fields(value, f),
-        ValueExpr::Case { whens, otherwise } => {
-            for cw in whens {
-                walk_filter_expr_fields(&cw.when, f);
-                walk_value_expr_fields(&cw.then, f);
-            }
-            walk_value_expr_fields(otherwise, f);
-        }
-    }
-}
-
-/// The `FilterExpr` half of the walk: `And`/`Or`/`Not` recurse; every leaf
-/// variant carries `field: String` (same shape as the query path's
-/// `collect_unindexed_filter_fields`).
-pub(crate) fn walk_filter_expr_fields(expr: &FilterExpr, f: &mut impl FnMut(&str)) {
-    match expr {
-        FilterExpr::Eq { field, .. }
-        | FilterExpr::Neq { field, .. }
-        | FilterExpr::Gt { field, .. }
-        | FilterExpr::Gte { field, .. }
-        | FilterExpr::Lt { field, .. }
-        | FilterExpr::Lte { field, .. }
-        | FilterExpr::In { field, .. }
-        | FilterExpr::Contains { field, .. }
-        | FilterExpr::Exists { field }
-        | FilterExpr::OlderThan { field, .. } => f(field),
-        FilterExpr::And { exprs } | FilterExpr::Or { exprs } => {
-            for e in exprs {
-                walk_filter_expr_fields(e, f);
-            }
-        }
-        FilterExpr::Not { expr } => walk_filter_expr_fields(expr, f),
-    }
-}
+/// The field walks over the shared grammar, defined once in `par-rt-db-core`
+/// (ARC-004) and re-exported here at their historical paths.
+pub use par_rt_db_core::fields::{walk_filter_expr_fields, walk_value_expr_fields};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query::FilterExpr;
 
     fn doc(pairs: &[(&str, serde_json::Value)]) -> serde_json::Map<String, serde_json::Value> {
         pairs

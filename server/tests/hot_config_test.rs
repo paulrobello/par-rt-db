@@ -13,15 +13,13 @@
 //! loads it (`load_hot` runs only in `main.rs`), so the shared single-row table
 //! cannot carry state between tests.
 
-mod common;
-
 use std::net::SocketAddr;
 
-use common::{admin_get, admin_post, spawn_app, test_state, wrap_test_db};
+use crate::common::{admin_get, admin_post, spawn_app, test_state, wrap_test_db};
 use rtdb_server::db;
 
-/// A PATCH helper, mirroring `common::admin_post` (POST-only): bearer-authed
-/// with the test admin key `common::test_config` seeds.
+/// A PATCH helper, mirroring `crate::common::admin_post` (POST-only): bearer-authed
+/// with the test admin key `crate::common::test_config` seeds.
 async fn admin_patch(addr: SocketAddr, path: &str, body: serde_json::Value) -> reqwest::Response {
     reqwest::Client::new()
         .patch(format!("http://{addr}{path}"))

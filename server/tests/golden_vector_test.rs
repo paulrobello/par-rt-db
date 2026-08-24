@@ -13,9 +13,7 @@
 //! divergence — the audit point is to catch **sort-comparator / boundary /
 //! terminal-cascade** divergence, not id-minting drift.
 
-mod common;
-
-use common::{TestDb, test_state, wrap_test_db};
+use crate::common::{TestDb, test_state, wrap_test_db};
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::db;
 use rtdb_server::ddl;

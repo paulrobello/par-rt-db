@@ -1,8 +1,6 @@
-mod common;
-
 use std::net::SocketAddr;
 
-use common::{
+use crate::common::{
     admin_delete, admin_get, admin_post, admin_post_raw, fresh_db, kanban_schema_json, spawn_app,
     test_state, test_state_with_backup_dir,
 };
@@ -2166,13 +2164,13 @@ async fn sec108_login_and_logout_are_not_gated() -> anyhow::Result<()> {
 // rtdb_admin_auth_failures_total counter.
 #[tokio::test]
 async fn sec109_admin_login_rate_limited_after_threshold() -> anyhow::Result<()> {
-    let mut config = common::test_config();
+    let mut config = crate::common::test_config();
     config.admin_rate_limit_per_ip_rpm = 3;
     let pool = sqlx::PgPool::connect(&config.database_url)
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
-    let state = AppState::new(pool, config, common::test_hot());
+    let state = AppState::new(pool, config, crate::common::test_hot());
     let addr = spawn_app(state.clone()).await;
     let client = reqwest::Client::new();
 

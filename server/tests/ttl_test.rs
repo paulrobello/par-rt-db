@@ -1,11 +1,9 @@
 //! Integration tests for document TTL insert-time default stamping (Task 2 of
 //! the document-TTL feature). Mirrors the harness conventions of `txn_test.rs`
-//! and `scheduled_test.rs`: `common::test_state()` bootstraps `rtdb_auth` and
+//! and `scheduled_test.rs`: `crate::common::test_state()` bootstraps `rtdb_auth` and
 //! hands out a pool; each test creates a uniquely-named `t<uuid>` database,
 //! pushes a schema, and drives the document path through `execute_txn` /
 //! `execute_query` directly (no HTTP).
-
-mod common;
 
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::db;
@@ -59,7 +57,7 @@ fn sessions_minimal_schema() -> SchemaDef {
 
 /// Creates a uniquely-named database and pushes the TTL fixture schema.
 /// Returns the db name.
-async fn setup_ttl_db(pool: &sqlx::PgPool) -> common::TestDb {
+async fn setup_ttl_db(pool: &sqlx::PgPool) -> crate::common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(pool, &name)
         .await
@@ -67,7 +65,7 @@ async fn setup_ttl_db(pool: &sqlx::PgPool) -> common::TestDb {
     ddl::push_schema(pool, &name, sessions_schema())
         .await
         .expect("push sessions schema");
-    common::wrap_test_db(name)
+    crate::common::wrap_test_db(name)
 }
 
 /// Point-read by id. Mirrors the `Query { get: Some(..), .. }` shape used
@@ -113,7 +111,7 @@ async fn get_doc(
 // land within the insert window anchored on the row's own `_creationTime`.
 #[tokio::test]
 async fn insert_stamps_ttl_default_when_field_absent() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let db = setup_ttl_db(&pool).await;
     let schema = sessions_schema();
@@ -164,7 +162,7 @@ async fn insert_stamps_ttl_default_when_field_absent() {
 // the caller's, not `now + defaultDurationMs`.
 #[tokio::test]
 async fn insert_keeps_caller_expires_at_when_field_present() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let db = setup_ttl_db(&pool).await;
     let schema = sessions_schema();
@@ -220,13 +218,13 @@ async fn insert_keeps_caller_expires_at_when_field_present() {
 //       leaves row B untouched (non-NULL, `IS NULL` guard).
 #[tokio::test]
 async fn adding_ttl_backfills_existing_rows() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&pool, &db)
         .await
         .expect("create fresh database");
-    let db = common::wrap_test_db(db);
+    let db = crate::common::wrap_test_db(db);
 
     // v1: minimal sessions table. Insert row A — it has no `expiresAt` field.
     let schema_v1 = sessions_minimal_schema();
@@ -347,7 +345,7 @@ async fn adding_ttl_backfills_existing_rows() {
 // expired row is reaped.
 // ===========================================================================
 
-use common::test_state_with_ttl_sweep;
+use crate::common::test_state_with_ttl_sweep;
 
 /// Point-read by id, returning `true` while the doc is still present. Used by
 /// the reaper poll loop (the existing `get_doc` helper panics on `Doc(None)`).
@@ -465,7 +463,7 @@ async fn reaper_deletes_expired_document() {
 // / per_row_auth_test.rs helper shapes.
 // ===========================================================================
 
-use common::{admin_post, spawn_app, test_state_with_ttl_audit_webhooks};
+use crate::common::{admin_post, spawn_app, test_state_with_ttl_audit_webhooks};
 use rtdb_server::ddl::pg_schema;
 
 /// Polls until `expired_id` is gone from `db`'s `sessions` table, bounded to
@@ -503,7 +501,7 @@ async fn reaper_delete_publishes_to_audit_and_webhooks() -> anyhow::Result<()> {
     let addr = spawn_app(state.clone()).await;
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&pool, &db).await?;
-    let db = common::wrap_test_db(db);
+    let db = crate::common::wrap_test_db(db);
 
     // Push the sessions ttl schema via the admin route (same wire shape the
     // dashboard uses), then register a webhook matching sessions/delete.
@@ -641,7 +639,7 @@ async fn reaper_bypasses_per_row_owner_auth() {
     let pool = state.pool.clone();
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&pool, &db).await.expect("create db");
-    let db = common::wrap_test_db(db);
+    let db = crate::common::wrap_test_db(db);
     // notes table with ownerField=userId AND ttl on expiresAt. The ttl field
     // must carry its own single-field btree index (schema-validator requirement).
     let schema: SchemaDef = serde_json::from_value(serde_json::json!({
@@ -735,7 +733,7 @@ async fn reaper_ignores_tables_without_ttl() {
     let pool = state.pool.clone();
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&pool, &db).await.expect("create db");
-    let db = common::wrap_test_db(db);
+    let db = crate::common::wrap_test_db(db);
     // `with_ttl` declares ttl; `plain` has the same expiresAt field shape but
     // NO ttl block — the reaper must never touch it.
     let schema: SchemaDef = serde_json::from_value(serde_json::json!({
@@ -843,7 +841,7 @@ fn sessions_upsert_schema() -> SchemaDef {
     serde_json::from_value(json).expect("parse upsert sessions schema")
 }
 
-async fn setup_upsert_ttl_db(pool: &sqlx::PgPool) -> common::TestDb {
+async fn setup_upsert_ttl_db(pool: &sqlx::PgPool) -> crate::common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(pool, &name)
         .await
@@ -851,12 +849,12 @@ async fn setup_upsert_ttl_db(pool: &sqlx::PgPool) -> common::TestDb {
     ddl::push_schema(pool, &name, sessions_upsert_schema())
         .await
         .expect("push upsert sessions schema");
-    common::wrap_test_db(name)
+    crate::common::wrap_test_db(name)
 }
 
 #[tokio::test]
 async fn upsert_insert_stamps_ttl_default_when_field_absent() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let db = setup_upsert_ttl_db(&pool).await;
     let schema = sessions_upsert_schema();
@@ -911,7 +909,7 @@ async fn upsert_insert_stamps_ttl_default_when_field_absent() {
 // as it was (spec: "defaultDurationMs is never re-stamped after insert").
 #[tokio::test]
 async fn upsert_update_does_not_restamp_ttl_field() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let db = setup_upsert_ttl_db(&pool).await;
     let schema = sessions_upsert_schema();

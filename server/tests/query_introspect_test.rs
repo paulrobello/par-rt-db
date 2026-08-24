@@ -5,11 +5,9 @@
 //! exercise the compile seam directly; the HTTP tests exercise the admin
 //! routes end-to-end.
 
-mod common;
-
 use std::net::SocketAddr;
 
-use common::{
+use crate::common::{
     admin_get, admin_post, fresh_db, kanban_schema_json, spawn_app, test_state,
     test_state_with_slow_queries,
 };

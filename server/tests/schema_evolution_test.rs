@@ -1,6 +1,4 @@
-mod common;
-
-use common::test_state;
+use crate::common::test_state;
 use rtdb_server::ddl::push_schema;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::query::FilterExpr;
@@ -50,12 +48,12 @@ fn priority_schema(variants: &[&str]) -> SchemaDef {
     SchemaDef { tables }
 }
 
-async fn fresh_empty_db(state: &std::sync::Arc<rtdb_server::AppState>) -> common::TestDb {
+async fn fresh_empty_db(state: &std::sync::Arc<rtdb_server::AppState>) -> crate::common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await
         .expect("create database");
-    common::wrap_test_db(name)
+    crate::common::wrap_test_db(name)
 }
 
 #[tokio::test]

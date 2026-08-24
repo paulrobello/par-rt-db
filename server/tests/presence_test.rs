@@ -1,10 +1,8 @@
-mod common;
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{admin_post, fresh_db, mint_user_session, spawn_app, test_state_with_presence};
+use crate::common::{admin_post, fresh_db, mint_user_session, spawn_app, test_state_with_presence};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
@@ -364,7 +362,7 @@ async fn rooms_are_db_scoped() {
 
 #[tokio::test]
 async fn presence_manager_is_wired_and_disabled_by_default() {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let cfg = state.realtime.presence.config();
     assert!(!cfg.enabled, "test_config defaults presence off");
     // joining is rejected when disabled.

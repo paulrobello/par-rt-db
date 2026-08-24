@@ -109,8 +109,12 @@ cd python-client && uv run pytest -q            # python-client tests
 cd cli && cargo test                            # cli tests (rtdb binary)
 
 # Single test:
-cargo test --test txn_test upsert_multiple_matches   # one integration binary, by name
-cargo test upsert                                     # by name across binaries
+cargo test --test main txn_test::upsert_multiple_matches  # one test
+cargo test --test main txn_test::                         # one test FILE
+cargo test upsert                                         # by name, lib + integration
+# The server's integration tests are ONE binary (`server/tests/main.rs`), so
+# every `tests/<name>.rs` is a module of it and filters are `<name>::<test>`.
+# A NEW test file needs a `mod <name>;` line in `tests/main.rs`.
 cd ts-client && bunx vitest run tests/<file>.test.ts
 cd python-client && uv run pytest -q tests/<file>.py
 ```

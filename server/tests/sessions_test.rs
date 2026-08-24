@@ -1,5 +1,4 @@
-mod common;
-use common::{admin_delete, admin_get, mint_user_session, spawn_app, test_state};
+use crate::common::{admin_delete, admin_get, mint_user_session, spawn_app, test_state};
 use rtdb_server::auth::session::{
     create_admin_session, delete_session_by_hash, delete_sessions_for_user, list_sessions,
 };

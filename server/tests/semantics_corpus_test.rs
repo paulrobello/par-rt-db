@@ -28,12 +28,10 @@
 //! the `MigrateResult` compared like any op result; a follow-up `then` reads
 //! against the DERIVED schema.
 
-mod common;
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use common::{test_state, wrap_test_db};
+use crate::common::{test_state, wrap_test_db};
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::db;
 use rtdb_server::ddl;

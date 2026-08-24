@@ -6,9 +6,7 @@
 //! the ttl default), and snapshot export/import preserves the stored value
 //! verbatim (import is replay, never a re-stamp).
 
-mod common;
-
-use common::{test_state, wrap_test_db};
+use crate::common::{test_state, wrap_test_db};
 use rtdb_server::ddl::push_schema;
 use rtdb_server::dsl::FilterExpr;
 use rtdb_server::schema::SchemaDef;
@@ -36,7 +34,7 @@ fn number_schema() -> serde_json::Value {
 async fn fresh_db_with(
     state: &rtdb_server::AppState,
     schema_json: serde_json::Value,
-) -> (common::TestDb, SchemaDef) {
+) -> (crate::common::TestDb, SchemaDef) {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await
@@ -106,7 +104,7 @@ async fn tick() {
 /// Validation errors surface from `push_schema` itself (structure validation
 /// runs before any DDL), but the target database must still exist — mirror
 /// defaults_test's create-then-fail pattern.
-async fn validation_error_db(state: &rtdb_server::AppState) -> common::TestDb {
+async fn validation_error_db(state: &rtdb_server::AppState) -> crate::common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await

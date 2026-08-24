@@ -7,9 +7,7 @@
 //! (CONFLICT on duplicate imported values), and snapshot import continuing
 //! the sequence past the imported max.
 
-mod common;
-
-use common::{test_state, wrap_test_db};
+use crate::common::{test_state, wrap_test_db};
 use rtdb_server::ddl::push_schema;
 use rtdb_server::schema::SchemaDef;
 use rtdb_server::txn::{Step, Transaction, TxnOutcome, execute_txn};
@@ -56,7 +54,7 @@ fn plain_schema() -> serde_json::Value {
 async fn fresh_db_with(
     state: &rtdb_server::AppState,
     schema_json: serde_json::Value,
-) -> (common::TestDb, SchemaDef) {
+) -> (crate::common::TestDb, SchemaDef) {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await
@@ -119,7 +117,7 @@ async fn fetch_counter(pool: &PgPool, db: &str, id: &str) -> String {
         .to_string()
 }
 
-async fn validation_error_db(state: &rtdb_server::AppState) -> common::TestDb {
+async fn validation_error_db(state: &rtdb_server::AppState) -> crate::common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await

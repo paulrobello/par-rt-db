@@ -1,6 +1,4 @@
-mod common;
-
-use common::{admin_get, fresh_db, spawn_app, test_state};
+use crate::common::{admin_get, fresh_db, spawn_app, test_state};
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::protocol::ServerMessage;

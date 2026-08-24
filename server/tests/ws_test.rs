@@ -1,9 +1,7 @@
-mod common;
-
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use common::{
+use crate::common::{
     admin_post, fresh_db, mint_user_session, spawn_app, test_state, test_state_with_rate_limits,
 };
 use futures_util::{SinkExt, StreamExt};

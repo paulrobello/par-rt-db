@@ -3,15 +3,13 @@
 //! next poll and exit cleanly, rather than logging an error every `MAX_SLEEP`
 //! (2s) forever.
 
-mod common;
-
 use std::time::Duration;
 
 use rtdb_server::{committer::CommitterRequest, db, scheduler, txn::Transaction};
 
 #[tokio::test]
 async fn scheduler_exits_when_its_database_is_deleted() -> anyhow::Result<()> {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&pool, &db).await?;

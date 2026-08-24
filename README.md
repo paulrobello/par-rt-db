@@ -1051,12 +1051,23 @@ that ultimately terminates a connection that never closes on its own.
   turn, returns the outcome to the non-owner's client, and the non-owner
   re-runs its local subscriptions against the returned write set — the
   caller's principal travels with the request, so per-row authz evaluates
-  against the identity that authorized the write at the edge. If no owner
+  against the identity that authorized the write at the edge. Forwarded
+  requests and their replies are spooled in `rtdb_auth.forward_queue` and the
+  NOTIFY carries only a row id, so a write of any size forwards (a `pg_notify`
+  payload itself is capped at 8000 bytes). **Live queries stay correct on
+  every replica:** each durable write also publishes its write set on
+  `rtdb_write_sets`, and every replica re-runs the subscriptions it touched —
+  so a subscriber on replica B is invalidated by a write the owner executed,
+  including scheduled jobs, TTL expiry, and migrations. If no owner
   answers within `RTDB_FORWARD_TIMEOUT_MS` (default 5s), the non-owner
-  attempts the lease takeover itself — that path is the failover. Note the
-  standard timeout ambiguity: a reply racing the timeout is dropped, so the
-  write may have committed even though the client saw `CONFLICT`; exactly-once
-  retries should carry an idempotency key. Design + as-built notes:
+  attempts the lease takeover itself — that path is the failover. A forwarded
+  mutate that carries no client idempotency key is given a server-minted one,
+  so if a reply races the timeout and the takeover resubmits the write, the
+  shared dedup table replays the owner's first outcome instead of writing
+  twice. The standard timeout ambiguity still applies to what the *client*
+  observes — the write may have committed even though the caller saw
+  `CONFLICT` — so a client that must distinguish the two should send its own
+  idempotency key and retry with it. Design + as-built notes:
   `docs/superpowers/specs/2026-08-22-multi-instance-stage4-design.md`.
 - **Session expiry, machine-token revocation, allowlist removal, and admin-role
   revocation all take effect on open WebSocket connections.** The WS handler re-runs

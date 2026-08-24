@@ -6,16 +6,14 @@
 //! chained_schedule_fires_and_enqueues_follow_up`); Tasks 4–5 grow this file
 //! with step-surface coverage.
 
-mod common;
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
-use common::{
+use crate::common::{
     admin_delete, admin_get, admin_post, fresh_db, kanban_schema_json, spawn_app, test_hot,
     test_state, test_state_with_audit,
 };
+use arc_swap::ArcSwap;
 use rtdb_server::AppState;
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::committer::{CommitterConfig, Committers};

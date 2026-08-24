@@ -1,4 +1,16 @@
-//! Cross-instance op-feed fan-out via Postgres LISTEN/NOTIFY (ENH-022 Stage 2).
+//! Cross-instance op-feed fan-out via Postgres LISTEN/NOTIFY (ENH-022 Stage 2),
+//! plus cross-replica presence gossip (Stage 3) and cross-replica subscription
+//! invalidation (ARC-001).
+//!
+//! Three publish/listen pairs live here, all gated on `RTDB_MULTI_INSTANCE`
+//! and all self-deduping on `instance_id`:
+//!
+//! - `rtdb_ops` — the admin activity ring ([`publish_ops`] / [`run_listener`]).
+//! - `rtdb_presence` — per-room member snapshots ([`run_presence_listener`]).
+//! - `rtdb_write_sets` — subscription invalidation
+//!   ([`publish_write_set`] / [`run_write_set_listener`]). This is the one that
+//!   keeps a client's live query correct when the write landed on a different
+//!   replica; the op-feed channel below only feeds the dashboard.
 //!
 //! The op-feed ring (`op_feed::OpFeed`) is in-process and instance-local: a
 //! write committed on replica A publishes into A's ring only, so a dashboard
@@ -50,7 +62,7 @@ use sqlx::postgres::PgListener;
 use crate::db::now_ms;
 use crate::op_feed::{OpEvent, OpFeed};
 use crate::presence::{PresenceManager, PresenceNotifyPayload};
-use crate::txn::{DocOp, OpKind};
+use crate::txn::{DocOp, OpKind, WriteSet};
 
 /// Postgres NOTIFY channel name for op-feed fan-out. Fixed across every
 /// instance — all replicas LISTEN and NOTIFY on the same channel.
@@ -61,6 +73,31 @@ pub const OP_FEED_CHANNEL: &str = "rtdb_ops";
 /// NOTIFY on the same channel. The payload is a [`PresenceNotifyPayload`]:
 /// a full per-room local snapshot. See `presence::gossip_publish`.
 pub const PRESENCE_CHANNEL: &str = "rtdb_presence";
+
+/// Postgres NOTIFY channel for cross-replica subscription invalidation
+/// (ARC-001). Every durable write publishes its `WriteSet` here so replicas
+/// that did not execute the write still re-run the subscriptions it touched.
+/// See [`publish_write_set`] and [`run_write_set_listener`].
+pub const WRITE_SET_CHANNEL: &str = "rtdb_write_sets";
+
+/// Serialized-size threshold above which a write set travels through the
+/// forward spool instead of inline in the NOTIFY. Postgres caps a `pg_notify`
+/// payload at 8000 bytes; 7500 leaves headroom for multi-byte escaping in the
+/// table/id strings.
+const WRITE_SET_INLINE_LIMIT: usize = 7500;
+
+/// One cross-replica subscription-invalidation payload (ARC-001). `write_set`
+/// carries `tables`/`docs`/`ops`; `doc_values` is `#[serde(skip)]` on
+/// `WriteSet` and therefore never travels, so `Indexed`/`Ordered`
+/// subscriptions on the receiving replica degrade to their conservative
+/// "unrankable ⇒ re-run" fallback — never a missed push.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteSetNotifyPayload {
+    pub instance_id: String,
+    pub db: String,
+    pub write_set: WriteSet,
+}
 
 /// One NOTIFY payload per `DocOp`. `camelCase` on the wire for consistency with
 /// `OpEvent`. `instance_id` is the origin replica's id (self-dedupe); `source`
@@ -151,6 +188,165 @@ pub async fn publish_ops(
                 "notify: pg_notify failed (best-effort; write already committed)"
             );
         }
+    }
+}
+
+/// Publish one write set for cross-replica subscription invalidation (ARC-001),
+/// best-effort, once per commit. Called from `publish_taps` inside the
+/// committer's serialized turn, alongside the op-feed NOTIFY.
+///
+/// Without this, a subscription living on replica B never re-runs for a write
+/// the OWNER (replica A) executed: the op-feed NOTIFY only feeds the admin
+/// activity ring, and the origin-side fan-out in `complete_forwarded_reply`
+/// only covers the narrow case where B itself forwarded the write. Every
+/// owner-side write — an HTTP mutate that reached the owner directly, a
+/// scheduled job, the TTL reaper, a migration — was invisible to B's clients
+/// until their next local write.
+///
+/// A `WriteSet` for a bulk write easily exceeds Postgres's 8000-byte
+/// `pg_notify` cap, so payloads at or above [`WRITE_SET_INLINE_LIMIT`] travel
+/// through the forward spool and the NOTIFY carries only the row id. The
+/// receiving side tells the two apart by shape: a JSON object starts with `{`,
+/// a spool reference is a bare uuid.
+pub async fn publish_write_set(pool: &PgPool, instance_id: &str, db: &str, write_set: &WriteSet) {
+    let payload = WriteSetNotifyPayload {
+        instance_id: instance_id.to_string(),
+        db: db.to_string(),
+        write_set: write_set.clone(),
+    };
+    let json = match serde_json::to_string(&payload) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(db = %db, error = %e, "notify: write set failed to serialize; skipping");
+            return;
+        }
+    };
+    let notify_payload = if json.len() < WRITE_SET_INLINE_LIMIT {
+        json
+    } else {
+        match crate::forward::spool_broadcast(pool, "writeset", &json).await {
+            Ok(id) => id.to_string(),
+            Err(_) => return,
+        }
+    };
+    if let Err(e) = sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(WRITE_SET_CHANNEL)
+        .bind(&notify_payload)
+        .execute(pool)
+        .await
+    {
+        tracing::warn!(
+            db = %db,
+            error = %e,
+            "notify: write-set pg_notify failed (best-effort; write already committed)"
+        );
+    }
+}
+
+/// Long-lived LISTEN loop for the `rtdb_write_sets` channel (ARC-001). Spawned
+/// by `AppState::new` only when `RTDB_MULTI_INSTANCE` is true. For each
+/// non-self notification it loads the write set (inline or from the spool),
+/// resolves the database's schema, and re-runs THIS replica's subscriptions
+/// against it — the same `subs.fan_out` call the committer makes locally.
+///
+/// Performs NO write and NO committer interaction: `fan_out` issues read
+/// queries only, and reads are safe outside the serialized turn under READ
+/// COMMITTED. The single-writer invariant is intact — this is a second
+/// *reader*, not a second writer.
+pub async fn run_write_set_listener(
+    pool: PgPool,
+    subs: Arc<crate::subs::SubscriptionManager>,
+    schemas: crate::db::SchemaCache,
+    own_instance_id: String,
+) {
+    let backoff = std::time::Duration::from_secs(2);
+    loop {
+        let mut listener = match PgListener::connect_with(&pool).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "write-set listener: connect_with failed; retrying in {:?}",
+                    backoff
+                );
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+        };
+        if let Err(e) = listener.listen_all([WRITE_SET_CHANNEL]).await {
+            tracing::error!(
+                error = %e,
+                "write-set listener: listen_all failed; retrying in {:?}",
+                backoff
+            );
+            tokio::time::sleep(backoff).await;
+            continue;
+        }
+        tracing::info!(
+            "write-set listener: LISTENing on '{}' for cross-replica subscription invalidation (instance_id={})",
+            WRITE_SET_CHANNEL,
+            own_instance_id
+        );
+        loop {
+            let notif = match listener.recv().await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "write-set listener: recv failed; reconnecting in {:?}",
+                        backoff
+                    );
+                    break;
+                }
+            };
+            let raw = notif.payload().to_string();
+            let json = if raw.starts_with('{') {
+                raw
+            } else {
+                let Ok(id) = raw.parse::<uuid::Uuid>() else {
+                    tracing::warn!("write-set listener: payload was neither JSON nor a row id");
+                    continue;
+                };
+                match crate::forward::spool_load_broadcast(&pool, id, "writeset").await {
+                    Some(body) => body,
+                    None => continue,
+                }
+            };
+            let payload = match serde_json::from_str::<WriteSetNotifyPayload>(&json) {
+                Ok(p) => p,
+                Err(e) => {
+                    // Version skew between replicas — skip, never fatal.
+                    tracing::warn!(
+                        error = %e,
+                        "write-set listener: failed to decode payload; skipping"
+                    );
+                    continue;
+                }
+            };
+            // Self-notification dedupe: this replica already fanned out inside
+            // its own committer turn.
+            if payload.instance_id == own_instance_id {
+                continue;
+            }
+            let schema = match schemas.get(&pool, &payload.db).await {
+                Ok(schema) => schema,
+                Err(e) => {
+                    tracing::warn!(
+                        db = %payload.db,
+                        error = %e,
+                        "write-set listener: schema fetch failed; skipping invalidation"
+                    );
+                    continue;
+                }
+            };
+            subs.fan_out(&pool, &payload.db, &schema, &payload.write_set)
+                .await;
+        }
+        tracing::warn!(
+            "write-set listener: connection lost; reconnecting in {:?}",
+            backoff
+        );
+        tokio::time::sleep(backoff).await;
     }
 }
 

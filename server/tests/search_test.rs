@@ -1,8 +1,6 @@
-mod common;
-
 use std::sync::Arc;
 
-use common::test_state;
+use crate::common::test_state;
 use rtdb_server::AppState;
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::db;
@@ -29,7 +27,7 @@ fn search_schema() -> SchemaDef {
     serde_json::from_value(search_schema_json()).expect("parse search schema")
 }
 
-async fn fresh_search_db(state: &Arc<AppState>) -> (common::TestDb, SchemaDef) {
+async fn fresh_search_db(state: &Arc<AppState>) -> (crate::common::TestDb, SchemaDef) {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&state.pool, &name)
         .await
@@ -38,7 +36,7 @@ async fn fresh_search_db(state: &Arc<AppState>) -> (common::TestDb, SchemaDef) {
     ddl::push_schema(&state.pool, &name, schema.clone())
         .await
         .expect("push schema");
-    (common::wrap_test_db(name), schema)
+    (crate::common::wrap_test_db(name), schema)
 }
 
 fn doc(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
@@ -293,7 +291,7 @@ async fn adding_search_index_backfills_existing_rows() {
     db::create_database(&state.pool, &db)
         .await
         .expect("create db");
-    let db = common::wrap_test_db(db);
+    let db = crate::common::wrap_test_db(db);
 
     let v1: SchemaDef = serde_json::from_value(serde_json::json!({"tables":{"notes":{
         "fields":{"title":{"type":"string"},"body":{"type":"string"}},
@@ -347,7 +345,10 @@ fn lang_search_schema(language: Option<&str>) -> SchemaDef {
     .expect("parse language search schema")
 }
 
-async fn fresh_db_with(state: &Arc<AppState>, schema: SchemaDef) -> (common::TestDb, SchemaDef) {
+async fn fresh_db_with(
+    state: &Arc<AppState>,
+    schema: SchemaDef,
+) -> (crate::common::TestDb, SchemaDef) {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&state.pool, &name)
         .await
@@ -355,7 +356,7 @@ async fn fresh_db_with(state: &Arc<AppState>, schema: SchemaDef) -> (common::Tes
     ddl::push_schema(&state.pool, &name, schema.clone())
         .await
         .expect("push schema");
-    (common::wrap_test_db(name), schema)
+    (crate::common::wrap_test_db(name), schema)
 }
 
 // A `simple`-language index (no stemming, no stop-words) matches an exact word,
@@ -433,7 +434,7 @@ async fn search_index_unknown_language_rejected_at_push() {
     db::create_database(&state.pool, &name)
         .await
         .expect("create db");
-    let name = common::wrap_test_db(name);
+    let name = crate::common::wrap_test_db(name);
     let err = ddl::push_schema(&state.pool, &name, lang_search_schema(Some("nonsense")))
         .await
         .expect_err("unknown language");
@@ -450,7 +451,7 @@ async fn search_index_language_on_non_search_rejected() {
     db::create_database(&state.pool, &name)
         .await
         .expect("create db");
-    let name = common::wrap_test_db(name);
+    let name = crate::common::wrap_test_db(name);
     let schema: SchemaDef = serde_json::from_value(serde_json::json!({"tables":{"notes":{
         "fields":{"title":{"type":"string"}},
         "indexes":[{"name":"by_title","fields":["title"],"language":"english"}]
@@ -505,7 +506,7 @@ fn filter_schema() -> SchemaDef {
     .expect("parse filter schema")
 }
 
-async fn fresh_filter_db(state: &Arc<AppState>) -> (common::TestDb, SchemaDef) {
+async fn fresh_filter_db(state: &Arc<AppState>) -> (crate::common::TestDb, SchemaDef) {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&state.pool, &name)
         .await
@@ -514,7 +515,7 @@ async fn fresh_filter_db(state: &Arc<AppState>) -> (common::TestDb, SchemaDef) {
     ddl::push_schema(&state.pool, &name, schema.clone())
         .await
         .expect("push schema");
-    (common::wrap_test_db(name), schema)
+    (crate::common::wrap_test_db(name), schema)
 }
 
 async fn insert_post(

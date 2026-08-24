@@ -95,7 +95,6 @@ pub fn test_config() -> Config {
 /// Hot-config seed for tests: mirrors the pre-split `test_config` defaults, so
 /// the existing CORS/origin tests (which rely on `http://localhost:5173` being
 /// allowed) keep passing now that origins live behind `state.runtime.hot`.
-#[allow(dead_code)]
 pub fn test_hot() -> HotConfig {
     HotConfig {
         allowed_origins: vec!["http://localhost:5173".into()],
@@ -108,7 +107,6 @@ pub fn test_hot() -> HotConfig {
     }
 }
 
-#[allow(dead_code)]
 pub async fn test_state() -> Arc<AppState> {
     let pool = sqlx::PgPool::connect(&test_config().database_url)
         .await
@@ -123,7 +121,6 @@ pub async fn test_state() -> Arc<AppState> {
 /// `state.config.rate_limit_per_{token,db}_rpm`, so we set them on the Config
 /// before constructing AppState. This is the cleanest override path the
 /// codebase exposes — `test_config()` is already a public helper.
-#[allow(dead_code)]
 pub async fn test_state_with_rate_limits(per_token_rpm: u32, per_db_rpm: u32) -> Arc<AppState> {
     let mut config = test_config();
     config.rate_limit_per_token_rpm = per_token_rpm;
@@ -139,7 +136,6 @@ pub async fn test_state_with_rate_limits(per_token_rpm: u32, per_db_rpm: u32) ->
 /// `rtdb.audit_log` table ensured. Used by `tests/audit_test.rs` to exercise
 /// the durable audit log end-to-end without touching env vars. Mirrors the
 /// `test_state_with_rate_limits` override pattern.
-#[allow(dead_code)]
 pub async fn test_state_with_audit() -> Arc<AppState> {
     let mut config = test_config();
     config.audit_log_enabled = true;
@@ -158,7 +154,6 @@ pub async fn test_state_with_audit() -> Arc<AppState> {
 /// `slow_query_log_params` set to `log_params`. Used by
 /// `tests/query_introspect_test.rs` to exercise the slow-query log end-to-end
 /// without touching env vars. Mirrors the `test_state_with_*` pattern.
-#[allow(dead_code)]
 pub async fn test_state_with_slow_queries(ms: u64, log_params: bool) -> Arc<AppState> {
     let mut config = test_config();
     config.slow_query_ms = ms;
@@ -173,7 +168,6 @@ pub async fn test_state_with_slow_queries(ms: u64, log_params: bool) -> Arc<AppS
 /// Like `test_state` but with `storage_require_signed_urls = true`. Used by
 /// `tests/storage_signed_url_test.rs` (SEC-113) to exercise require-signature
 /// mode without touching env vars. Mirrors the `test_state_with_*` pattern.
-#[allow(dead_code)]
 pub async fn test_state_with_require_signed_urls() -> Arc<AppState> {
     let mut config = test_config();
     config.storage_require_signed_urls = true;
@@ -188,7 +182,6 @@ pub async fn test_state_with_require_signed_urls() -> Arc<AppState> {
 /// `rtdb.webhooks` / `rtdb.webhook_deliveries` tables ensured. Used by
 /// `tests/webhook_test.rs` to exercise the registry end-to-end without touching
 /// env vars. Mirrors the `test_state_with_audit` override pattern.
-#[allow(dead_code)]
 pub async fn test_state_with_webhooks() -> Arc<AppState> {
     let mut config = test_config();
     config.webhooks_enabled = true;
@@ -211,7 +204,6 @@ pub async fn test_state_with_webhooks() -> Arc<AppState> {
 /// invalidation soundness matrix in verified mode: every skip is shadow-checked
 /// against a real re-run, so `subsMissedPushesTotal` must stay 0. Mirrors the
 /// `test_state_with_audit` override pattern.
-#[allow(dead_code)]
 pub async fn test_state_with_skip_verification(every: u64) -> Arc<AppState> {
     let mut config = test_config();
     config.subs_verify_skip_every = every;
@@ -227,7 +219,6 @@ pub async fn test_state_with_skip_verification(every: u64) -> Arc<AppState> {
 /// sweep lands within the test's poll window. The reaper only acts on tables
 /// that declare `ttl`, so the shorter cadence is harmless for other tables.
 /// Mirrors the `test_state_with_rate_limits` override pattern.
-#[allow(dead_code)]
 pub async fn test_state_with_ttl_sweep(secs: u64) -> Arc<AppState> {
     let mut config = test_config();
     config.ttl_sweep_interval_secs = secs;
@@ -242,7 +233,6 @@ pub async fn test_state_with_ttl_sweep(secs: u64) -> Arc<AppState> {
 /// (default is 0 = disabled). Used by `tests/idle_reclaim_test.rs` so the
 /// reclamation sweep + `Committers::reclaim_idle_once` act within the test's
 /// window. Mirrors the `test_state_with_ttl_sweep` override pattern.
-#[allow(dead_code)]
 pub async fn test_state_with_idle_reclaim(secs: u64) -> Arc<AppState> {
     let mut config = test_config();
     config.db_idle_reclaim_secs = secs;
@@ -259,7 +249,6 @@ pub async fn test_state_with_idle_reclaim(secs: u64) -> Arc<AppState> {
 /// not pollute the default `./backups` and break the parallel
 /// `admin_list_backups_returns_empty_when_dir_missing` test, which asserts that
 /// dir does not exist. Mirrors the `test_state_with_*` override pattern.
-#[allow(dead_code)]
 pub async fn test_state_with_backup_dir(dir: String) -> Arc<AppState> {
     let mut config = test_config();
     config.backup_dir = dir;
@@ -275,7 +264,6 @@ pub async fn test_state_with_backup_dir(dir: String) -> Arc<AppState> {
 /// to publish through all four tap sites with `source = "ttl"`. Combines
 /// `test_state_with_audit` + `test_state_with_webhooks` + the sweep override.
 /// Used by `tests/ttl_test.rs`'s audit/webhook coverage test.
-#[allow(dead_code)]
 pub async fn test_state_with_ttl_audit_webhooks(secs: u64) -> Arc<AppState> {
     let mut config = test_config();
     config.ttl_sweep_interval_secs = secs;
@@ -303,7 +291,6 @@ pub async fn test_state_with_ttl_audit_webhooks(secs: u64) -> Arc<AppState> {
 /// `state.realtime.presence.flush_once().await` directly to force a
 /// deterministic snapshot between actions. Mirrors the
 /// `test_state_with_audit` override pattern.
-#[allow(dead_code)]
 pub async fn test_state_with_presence() -> Arc<AppState> {
     let mut config = test_config();
     config.presence_enabled = true;
@@ -317,7 +304,6 @@ pub async fn test_state_with_presence() -> Arc<AppState> {
 
 /// A DELETE helper, mirroring `admin_get`/`admin_post`. Used by webhook CRUD
 /// tests.
-#[allow(dead_code)]
 pub async fn admin_delete(addr: SocketAddr, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .delete(format!("http://{addr}{path}"))
@@ -329,7 +315,6 @@ pub async fn admin_delete(addr: SocketAddr, path: &str) -> reqwest::Response {
 
 /// A PUT helper, mirroring `admin_post`/`admin_delete`. Used by webhook edit
 /// tests.
-#[allow(dead_code)]
 pub async fn admin_put(addr: SocketAddr, path: &str, body: serde_json::Value) -> reqwest::Response {
     reqwest::Client::new()
         .put(format!("http://{addr}{path}"))
@@ -340,7 +325,6 @@ pub async fn admin_put(addr: SocketAddr, path: &str, body: serde_json::Value) ->
         .expect("send admin request")
 }
 
-#[allow(dead_code)]
 pub async fn spawn_app(state: Arc<AppState>) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -359,7 +343,6 @@ pub async fn spawn_app(state: Arc<AppState>) -> SocketAddr {
     addr
 }
 
-#[allow(dead_code)]
 pub fn kanban_schema_json() -> serde_json::Value {
     serde_json::json!({"tables":{
       "projects":{
@@ -389,7 +372,6 @@ pub fn kanban_schema_json() -> serde_json::Value {
     }})
 }
 
-#[allow(dead_code)]
 pub async fn fresh_db(state: &Arc<AppState>) -> TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&state.pool, &name)
@@ -484,7 +466,6 @@ impl Drop for TestDb {
 /// is running first — idempotent, so safe to call even if `fresh_db` or
 /// `test_state` already initialized it. Use when a test cannot use `fresh_db`
 /// because it needs a non-kanban schema or a bare (schema-less) database.
-#[allow(dead_code)]
 pub fn wrap_test_db(name: String) -> TestDb {
     ensure_cleanup_worker(&test_config().database_url);
     TestDb(name)
@@ -533,7 +514,6 @@ pub fn ensure_cleanup_worker(database_url: &str) {
     });
 }
 
-#[allow(dead_code)]
 pub async fn admin_post(
     addr: SocketAddr,
     path: &str,
@@ -548,7 +528,6 @@ pub async fn admin_post(
         .expect("send admin request")
 }
 
-#[allow(dead_code)]
 pub async fn admin_get(addr: SocketAddr, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(format!("http://{addr}{path}"))
@@ -558,7 +537,6 @@ pub async fn admin_get(addr: SocketAddr, path: &str) -> reqwest::Response {
         .expect("send admin request")
 }
 
-#[allow(dead_code)]
 pub async fn admin_post_raw(addr: SocketAddr, path: &str, body: String) -> reqwest::Response {
     reqwest::Client::new()
         .post(format!("http://{addr}{path}"))
@@ -576,7 +554,6 @@ pub async fn admin_post_raw(addr: SocketAddr, path: &str, body: String) -> reqwe
 /// (the `users` table enforces uniqueness) via a stable hash of the id, so two
 /// calls with different ids never collide. Mirrors `oauth_test.rs`'s direct
 /// seed (column names / `sha256_hex` / `now_ms` / `random_token`).
-#[allow(dead_code)]
 pub async fn mint_user_session(pool: &sqlx::PgPool, user_id: &str, email: &str) -> String {
     // Stable distinct github_id per user_id: sha256 of the id gives distinct
     // bytes; 15 hex nibbles = 60 bits, always non-negative and under i64::MAX

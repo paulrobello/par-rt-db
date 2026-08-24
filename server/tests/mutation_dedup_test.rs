@@ -1,6 +1,4 @@
-mod common;
-
-use common::{fresh_db, test_state};
+use crate::common::{fresh_db, test_state};
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::mutation_log;
 use rtdb_server::txn::{Step, Transaction};

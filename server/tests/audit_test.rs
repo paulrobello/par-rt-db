@@ -9,9 +9,9 @@
 //! deterministic despite sharing the global `rtdb.audit_log` table with every
 //! other concurrent test in the suite.
 
-mod common;
-
-use common::{admin_get, admin_post, fresh_db, spawn_app, test_state, test_state_with_audit};
+use crate::common::{
+    admin_get, admin_post, fresh_db, spawn_app, test_state, test_state_with_audit,
+};
 use serde_json::json;
 
 /// POSTs `{txn: {steps}}` to `/admin/db/{db}/mutate` and returns the outcome's

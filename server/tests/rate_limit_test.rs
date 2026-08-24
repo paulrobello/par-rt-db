@@ -6,11 +6,10 @@
 //! Determinism: every request in a single test fires within the same wall-clock
 //! minute (tests run in milliseconds), so the fixed-window bucket is the same
 //! across all N requests — the assertions are deterministic, not flaky.
-mod common;
 
 use std::net::SocketAddr;
 
-use common::{admin_post, fresh_db, spawn_app, test_state_with_rate_limits};
+use crate::common::{admin_post, fresh_db, spawn_app, test_state_with_rate_limits};
 use serde_json::json;
 
 /// POSTs `body` to `path` with a Bearer token; mirrors `http_api_test::api_post`.

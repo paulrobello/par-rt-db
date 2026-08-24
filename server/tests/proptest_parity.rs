@@ -55,12 +55,10 @@
 //! Like every server integration test, the dev Postgres must be up
 //! (`make dev-db-up`).
 
-mod common;
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 
-use common::{test_state, wrap_test_db};
+use crate::common::{test_state, wrap_test_db};
 use par_rt_db_client::in_memory::InMemoryRtDbClientOptions;
 use par_rt_db_client::schema::SchemaDef as ClientSchemaDef;
 use par_rt_db_client::{

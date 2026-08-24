@@ -17,15 +17,27 @@ FROM rust:bookworm AS builder
 WORKDIR /build
 COPY rust-toolchain.toml ./
 COPY Cargo.toml Cargo.lock ./
+COPY core/Cargo.toml core/Cargo.toml
 COPY server/Cargo.toml server/Cargo.toml
 COPY rust-client/Cargo.toml rust-client/Cargo.toml
 COPY cli/Cargo.toml cli/Cargo.toml
+# ARC-004: `core` is a path dependency of the server, so its REAL source has to
+# be present for the dependency layer to compile — a stub lib.rs would make the
+# server's `par_rt_db_core::…` paths unresolvable. It is tiny and changes
+# rarely, so copying it here costs no meaningful cache invalidation.
+COPY core/src core/src
 # Dependency layer: compile the whole dependency tree once, cached unless
 # Cargo.toml or Cargo.lock change. Throwaway main/lib so each member package
 # parses, then build the server deps without the real source (next layer).
 # The rust-client [[test]] entries (ARC-110) name specific test files, which
 # cargo validates at manifest-parse time even when building a different member's
 # --bin — so the stub layer must create empty placeholders for them.
+#
+# ARC-011: this list is no longer maintained by memory. `make checkall` runs
+# scripts/dockerfile-stub-check.sh, which diffs the workspace's declared
+# [[test]] targets against the paths named here and fails on a missing stub.
+# (The server's own [[test]] needs no stub: cargo skips test-target validation
+# for the member it is building — measured, see the script's header.)
 RUN mkdir -p server/src rust-client/src rust-client/tests cli/src \
     && echo 'fn main() {}' > server/src/main.rs \
     && echo '' > rust-client/src/lib.rs \

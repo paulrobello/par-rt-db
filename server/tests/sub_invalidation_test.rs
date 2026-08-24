@@ -18,11 +18,9 @@
 //! section 13 below closes the loop by running the matrix with verification on,
 //! so an unsound skip fails the suite instead of reaching a client.
 
-mod common;
-
 use std::time::Duration;
 
-use common::{fresh_db, test_state};
+use crate::common::{fresh_db, test_state};
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::ddl;
 use rtdb_server::protocol::ServerMessage;
@@ -612,7 +610,7 @@ fn owner_schema_json() -> serde_json::Value {
     }})
 }
 
-async fn fresh_owner_db(state: &std::sync::Arc<rtdb_server::AppState>) -> common::TestDb {
+async fn fresh_owner_db(state: &std::sync::Arc<rtdb_server::AppState>) -> crate::common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await
@@ -622,7 +620,7 @@ async fn fresh_owner_db(state: &std::sync::Arc<rtdb_server::AppState>) -> common
     ddl::push_schema(&state.pool, &name, schema)
         .await
         .expect("push owner schema");
-    common::wrap_test_db(name)
+    crate::common::wrap_test_db(name)
 }
 
 fn note(category: &str, body: &str) -> serde_json::Map<String, serde_json::Value> {
@@ -908,7 +906,7 @@ fn int64_events_schema_json() -> serde_json::Value {
 /// Creates a fresh DB and pushes the int64-events schema (mirrors
 /// `fresh_db`'s shape but with our custom schema, since `fresh_db` is
 /// hardcoded to push the kanban schema).
-async fn fresh_int64_db(state: &std::sync::Arc<rtdb_server::AppState>) -> common::TestDb {
+async fn fresh_int64_db(state: &std::sync::Arc<rtdb_server::AppState>) -> crate::common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await
@@ -918,7 +916,7 @@ async fn fresh_int64_db(state: &std::sync::Arc<rtdb_server::AppState>) -> common
     ddl::push_schema(&state.pool, &name, schema)
         .await
         .expect("push int64 schema");
-    common::wrap_test_db(name)
+    crate::common::wrap_test_db(name)
 }
 
 fn insert_event(ts: &str, kind: &str) -> Transaction {
@@ -1425,7 +1423,7 @@ async fn take_pushes_on_any_delete() -> anyhow::Result<()> {
 //     instead of the bug reaching a client.
 // =====================================================================
 
-use common::test_state_with_skip_verification;
+use crate::common::test_state_with_skip_verification;
 
 /// Snapshot the invalidation counters. `active_subscriptions` needs the subs
 /// manager, so this goes through the same `Metrics::snapshot` the dashboard and
@@ -1688,10 +1686,12 @@ async fn projection_suppresses_non_projected_field_push() -> anyhow::Result<()> 
 /// A bare uniquely-named database (no kanban fixture — these tests push their
 /// own schema through the committer's push arm, the same path
 /// `POST /admin/push-schema` takes).
-async fn bare_db(state: &std::sync::Arc<rtdb_server::AppState>) -> anyhow::Result<common::TestDb> {
+async fn bare_db(
+    state: &std::sync::Arc<rtdb_server::AppState>,
+) -> anyhow::Result<crate::common::TestDb> {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name).await?;
-    Ok(common::wrap_test_db(name))
+    Ok(crate::common::wrap_test_db(name))
 }
 
 fn items_schema_json(extra: serde_json::Value) -> serde_json::Value {

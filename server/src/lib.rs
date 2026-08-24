@@ -290,6 +290,15 @@ impl AppState {
                 op_feed.clone(),
                 instance_id.clone(),
             ));
+            // ARC-001: cross-replica subscription invalidation. Same shape as
+            // the op-feed listener — reads only, no committer interaction, so
+            // the single-writer invariant is untouched.
+            tokio::spawn(notify::run_write_set_listener(
+                pool.clone(),
+                subs.clone(),
+                schemas.clone(),
+                instance_id.clone(),
+            ));
         }
         // ENH-022 Stage 3: cross-instance presence LISTEN task. Only spawned
         // when BOTH `RTDB_MULTI_INSTANCE=true` AND `RTDB_PRESENCE_ENABLED=true`
@@ -322,6 +331,12 @@ impl AppState {
                 committers.clone(),
                 forwarder.clone(),
                 instance_id.clone(),
+            ));
+            // ARC-002: reclaim spool rows nobody consumed. Retention is twice
+            // the forward timeout — past that, no live request can still care.
+            tokio::spawn(forward::run_forward_sweeper(
+                pool.clone(),
+                std::time::Duration::from_millis(config.forward_timeout_ms.saturating_mul(2)),
             ));
         }
         // ENH-022 Stage 4: rate-counter sweep. In multi-instance mode the

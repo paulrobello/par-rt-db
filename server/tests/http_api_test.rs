@@ -1,8 +1,6 @@
-mod common;
-
 use std::net::SocketAddr;
 
-use common::{admin_post, fresh_db, spawn_app, test_state};
+use crate::common::{admin_post, fresh_db, spawn_app, test_state};
 use rtdb_server::auth::{Principal, PrincipalCtx, authorize};
 use rtdb_server::db;
 use rtdb_server::error::ErrorCode;

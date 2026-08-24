@@ -6,9 +6,7 @@
 //! is idempotent and revives a dropped table for databases that predate the
 //! feature. Accessors and HTTP routes land in later tasks.
 
-mod common;
-
-use common::{admin_post, fresh_db, spawn_app, test_state};
+use crate::common::{admin_post, fresh_db, spawn_app, test_state};
 
 #[tokio::test]
 async fn storage_table_created_with_database() -> anyhow::Result<()> {
@@ -916,7 +914,7 @@ async fn sec123_range_uses_substring_and_returns_exact_slice() -> anyhow::Result
 
 // --- SEC-118: per-row authorization on stored blobs ---
 
-use common::mint_user_session;
+use crate::common::mint_user_session;
 
 /// Helper: add `email` to the per-db allowlist so a `Principal::User` resolves
 /// `authorize(db)` successfully (per-row enforcement runs after that gate).
@@ -1149,7 +1147,7 @@ async fn enh021_large_blob_round_trips_byte_identical() -> anyhow::Result<()> {
         .hot
         .store(Arc::new(rtdb_server::config::HotConfig {
             max_file_size: 60 * 1024 * 1024,
-            ..common::test_hot()
+            ..crate::common::test_hot()
         }));
     let addr = spawn_app(state.clone()).await;
     let db = fresh_db(&state).await;
@@ -1416,7 +1414,7 @@ async fn enh021_overquota_upload_returns_507_and_commits_nothing() -> anyhow::Re
         .hot
         .store(Arc::new(rtdb_server::config::HotConfig {
             max_storage_bytes_per_db: 1,
-            ..common::test_hot()
+            ..crate::common::test_hot()
         }));
 
     let resp = reqwest::Client::new()
