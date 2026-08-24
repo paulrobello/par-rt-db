@@ -5,7 +5,11 @@ use std::sync::OnceLock;
 
 use rtdb_server::config::HotConfig;
 use rtdb_server::schema::SchemaDef;
-use rtdb_server::{AppState, build_router, config::Config, db, ddl};
+use rtdb_server::{
+    AppState, build_router,
+    config::{Config, OAuthConfig},
+    db, ddl,
+};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 /// ARC-009: RAII guard that stops an `AppState`'s background tasks (the
@@ -58,27 +62,7 @@ pub fn test_config() -> Config {
             .unwrap_or_else(|_| "postgres://rtdb:rtdb@127.0.0.1:55434/rtdb".into()),
         admin_key: "test-admin-key".into(),
         public_url: "http://localhost:0".into(),
-        github_client_id: None,
-        github_client_secret: None,
-        github_base_url: "https://github.com".into(),
-        github_api_url: "https://api.github.com".into(),
-        google_client_id: None,
-        google_client_secret: None,
-        gitlab_client_id: None,
-        gitlab_client_secret: None,
-        gitlab_base_url: "https://gitlab.com".into(),
-        oidc_client_id: None,
-        oidc_client_secret: None,
-        oidc_authorize_url: None,
-        oidc_token_url: None,
-        oidc_userinfo_url: None,
-        microsoft_client_id: None,
-        microsoft_client_secret: None,
-        microsoft_tenant: "common".into(),
-        apple_client_id: None,
-        apple_team_id: None,
-        apple_key_id: None,
-        apple_private_key: None,
+        oauth: OAuthConfig::default(),
         max_affected_docs: 100,
         static_dir: None,
         pool_max_connections: 75,

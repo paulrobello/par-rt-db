@@ -48,11 +48,11 @@ impl OAuthProvider for OidcProvider {
     }
 
     fn from_config(config: &Config) -> Option<Self> {
-        let client_id = config.oidc_client_id.clone()?;
-        let client_secret = config.oidc_client_secret.clone()?;
-        let authorize_url = config.oidc_authorize_url.clone()?;
-        let token_url = config.oidc_token_url.clone()?;
-        let userinfo_url = config.oidc_userinfo_url.clone()?;
+        let client_id = config.oauth.oidc.client_id.clone()?;
+        let client_secret = config.oauth.oidc.client_secret.clone()?;
+        let authorize_url = config.oauth.oidc.authorize_url.clone()?;
+        let token_url = config.oauth.oidc.token_url.clone()?;
+        let userinfo_url = config.oauth.oidc.userinfo_url.clone()?;
         Some(Self {
             client_id,
             client_secret,
@@ -164,6 +164,7 @@ fn parse_userinfo(value: serde_json::Value) -> Result<OidcIdentity, RtDbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::OAuthConfig;
     use serde_json::json;
 
     #[test]
@@ -228,23 +229,23 @@ mod tests {
     fn from_config_requires_all_five_fields() {
         let mut cfg = base_cfg();
         assert!(OidcProvider::from_config(&cfg).is_none());
-        cfg.oidc_client_id = Some("id".into());
+        cfg.oauth.oidc.client_id = Some("id".into());
         assert!(
             OidcProvider::from_config(&cfg).is_none(),
             "still missing secret+urls"
         );
-        cfg.oidc_client_secret = Some("secret".into());
+        cfg.oauth.oidc.client_secret = Some("secret".into());
         assert!(
             OidcProvider::from_config(&cfg).is_none(),
             "still missing urls"
         );
-        cfg.oidc_authorize_url = Some("https://idp/authorize".into());
-        cfg.oidc_token_url = Some("https://idp/token".into());
+        cfg.oauth.oidc.authorize_url = Some("https://idp/authorize".into());
+        cfg.oauth.oidc.token_url = Some("https://idp/token".into());
         assert!(
             OidcProvider::from_config(&cfg).is_none(),
             "still missing userinfo url"
         );
-        cfg.oidc_userinfo_url = Some("https://idp/userinfo".into());
+        cfg.oauth.oidc.userinfo_url = Some("https://idp/userinfo".into());
         assert!(OidcProvider::from_config(&cfg).is_some());
     }
 
@@ -257,27 +258,7 @@ mod tests {
             database_url: "x".into(),
             admin_key: "k".into(),
             public_url: "http://localhost:0".into(),
-            github_client_id: None,
-            github_client_secret: None,
-            github_base_url: "https://github.com".into(),
-            github_api_url: "https://api.github.com".into(),
-            google_client_id: None,
-            google_client_secret: None,
-            gitlab_client_id: None,
-            gitlab_client_secret: None,
-            gitlab_base_url: "https://gitlab.com".into(),
-            oidc_client_id: None,
-            oidc_client_secret: None,
-            oidc_authorize_url: None,
-            oidc_token_url: None,
-            oidc_userinfo_url: None,
-            microsoft_client_id: None,
-            microsoft_client_secret: None,
-            microsoft_tenant: "common".into(),
-            apple_client_id: None,
-            apple_team_id: None,
-            apple_key_id: None,
-            apple_private_key: None,
+            oauth: OAuthConfig::default(),
             max_affected_docs: 100,
             auth_anonymous_enabled: false,
             anonymous_session_ttl_days: 1,

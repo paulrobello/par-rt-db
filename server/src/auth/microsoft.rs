@@ -108,12 +108,12 @@ impl OAuthProvider for MicrosoftProvider {
     }
 
     fn from_config(config: &Config) -> Option<Self> {
-        let client_id = config.microsoft_client_id.clone()?;
-        let client_secret = config.microsoft_client_secret.clone()?;
+        let client_id = config.oauth.microsoft.client_id.clone()?;
+        let client_secret = config.oauth.microsoft.client_secret.clone()?;
         Some(Self {
             client_id,
             client_secret,
-            tenant: config.microsoft_tenant.clone(),
+            tenant: config.oauth.microsoft.tenant.clone(),
         })
     }
 
@@ -624,6 +624,7 @@ fn is_email_verified(value: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::OAuthConfig;
     use crate::error::ErrorCode;
     use serde_json::json;
 
@@ -807,12 +808,12 @@ mod tests {
     fn from_config_requires_client_id_and_secret() {
         let mut cfg = base_cfg();
         assert!(MicrosoftProvider::from_config(&cfg).is_none());
-        cfg.microsoft_client_id = Some("id".into());
+        cfg.oauth.microsoft.client_id = Some("id".into());
         assert!(
             MicrosoftProvider::from_config(&cfg).is_none(),
             "still missing secret"
         );
-        cfg.microsoft_client_secret = Some("secret".into());
+        cfg.oauth.microsoft.client_secret = Some("secret".into());
         let provider = MicrosoftProvider::from_config(&cfg).expect("configured");
         // tenant defaults to "common" when RTDB_MICROSOFT_TENANT is unset.
         assert_eq!(provider.tenant, "common");
@@ -827,27 +828,7 @@ mod tests {
             database_url: "x".into(),
             admin_key: "k".into(),
             public_url: "http://localhost:0".into(),
-            github_client_id: None,
-            github_client_secret: None,
-            github_base_url: "https://github.com".into(),
-            github_api_url: "https://api.github.com".into(),
-            google_client_id: None,
-            google_client_secret: None,
-            gitlab_client_id: None,
-            gitlab_client_secret: None,
-            gitlab_base_url: "https://gitlab.com".into(),
-            oidc_client_id: None,
-            oidc_client_secret: None,
-            oidc_authorize_url: None,
-            oidc_token_url: None,
-            oidc_userinfo_url: None,
-            microsoft_client_id: None,
-            microsoft_client_secret: None,
-            microsoft_tenant: "common".into(),
-            apple_client_id: None,
-            apple_team_id: None,
-            apple_key_id: None,
-            apple_private_key: None,
+            oauth: OAuthConfig::default(),
             max_affected_docs: 100,
             auth_anonymous_enabled: false,
             anonymous_session_ttl_days: 1,

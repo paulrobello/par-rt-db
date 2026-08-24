@@ -41,12 +41,12 @@ impl OAuthProvider for GitlabProvider {
     }
 
     fn from_config(config: &Config) -> Option<Self> {
-        let client_id = config.gitlab_client_id.clone()?;
-        let client_secret = config.gitlab_client_secret.clone()?;
+        let client_id = config.oauth.gitlab.client_id.clone()?;
+        let client_secret = config.oauth.gitlab.client_secret.clone()?;
         Some(Self {
             client_id,
             client_secret,
-            base_url: config.gitlab_base_url.clone(),
+            base_url: config.oauth.gitlab.base_url.clone(),
         })
     }
 
@@ -146,6 +146,7 @@ fn parse_user(value: serde_json::Value) -> Result<GitlabIdentity, RtDbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::OAuthConfig;
     use serde_json::json;
 
     #[test]
@@ -227,27 +228,7 @@ mod tests {
             database_url: "x".into(),
             admin_key: "k".into(),
             public_url: "http://localhost:0".into(),
-            github_client_id: None,
-            github_client_secret: None,
-            github_base_url: "https://github.com".into(),
-            github_api_url: "https://api.github.com".into(),
-            google_client_id: None,
-            google_client_secret: None,
-            gitlab_client_id: None,
-            gitlab_client_secret: None,
-            gitlab_base_url: "https://gitlab.com".into(),
-            oidc_client_id: None,
-            oidc_client_secret: None,
-            oidc_authorize_url: None,
-            oidc_token_url: None,
-            oidc_userinfo_url: None,
-            microsoft_client_id: None,
-            microsoft_client_secret: None,
-            microsoft_tenant: "common".into(),
-            apple_client_id: None,
-            apple_team_id: None,
-            apple_key_id: None,
-            apple_private_key: None,
+            oauth: OAuthConfig::default(),
             max_affected_docs: 100,
             auth_anonymous_enabled: false,
             anonymous_session_ttl_days: 1,
@@ -306,9 +287,9 @@ mod tests {
             instance_id: None,
         };
         assert!(GitlabProvider::from_config(&cfg).is_none());
-        cfg.gitlab_client_id = Some("id".into());
+        cfg.oauth.gitlab.client_id = Some("id".into());
         assert!(GitlabProvider::from_config(&cfg).is_none());
-        cfg.gitlab_client_secret = Some("secret".into());
+        cfg.oauth.gitlab.client_secret = Some("secret".into());
         assert!(GitlabProvider::from_config(&cfg).is_some());
     }
 }

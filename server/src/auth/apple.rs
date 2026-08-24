@@ -67,10 +67,10 @@ impl OAuthProvider for AppleProvider {
     }
 
     fn from_config(config: &Config) -> Option<Self> {
-        let client_id = config.apple_client_id.clone()?;
-        let team_id = config.apple_team_id.clone()?;
-        let key_id = config.apple_key_id.clone()?;
-        let private_key = config.apple_private_key.clone()?;
+        let client_id = config.oauth.apple.client_id.clone()?;
+        let team_id = config.oauth.apple.team_id.clone()?;
+        let key_id = config.oauth.apple.key_id.clone()?;
+        let private_key = config.oauth.apple.private_key.clone()?;
         Some(Self {
             client_id,
             team_id,
@@ -424,6 +424,7 @@ fn map_conflict(err: sqlx::Error) -> RtDbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::OAuthConfig;
     use serde_json::json;
 
     /// Generates a throwaway P-256 key at runtime and feeds its PKCS#8 DER
@@ -621,14 +622,14 @@ mod tests {
     fn from_config_requires_all_four_fields() {
         let mut cfg = base_cfg();
         assert!(AppleProvider::from_config(&cfg).is_none());
-        cfg.apple_client_id = Some("cid".into());
-        cfg.apple_team_id = Some("team".into());
-        cfg.apple_key_id = Some("key".into());
+        cfg.oauth.apple.client_id = Some("cid".into());
+        cfg.oauth.apple.team_id = Some("team".into());
+        cfg.oauth.apple.key_id = Some("key".into());
         assert!(
             AppleProvider::from_config(&cfg).is_none(),
             "still missing private key"
         );
-        cfg.apple_private_key = Some("dummy-key".into());
+        cfg.oauth.apple.private_key = Some("dummy-key".into());
         assert!(AppleProvider::from_config(&cfg).is_some());
     }
 
@@ -641,27 +642,7 @@ mod tests {
             database_url: "x".into(),
             admin_key: "k".into(),
             public_url: "http://localhost:0".into(),
-            github_client_id: None,
-            github_client_secret: None,
-            github_base_url: "https://github.com".into(),
-            github_api_url: "https://api.github.com".into(),
-            google_client_id: None,
-            google_client_secret: None,
-            gitlab_client_id: None,
-            gitlab_client_secret: None,
-            gitlab_base_url: "https://gitlab.com".into(),
-            oidc_client_id: None,
-            oidc_client_secret: None,
-            oidc_authorize_url: None,
-            oidc_token_url: None,
-            oidc_userinfo_url: None,
-            microsoft_client_id: None,
-            microsoft_client_secret: None,
-            microsoft_tenant: "common".into(),
-            apple_client_id: None,
-            apple_team_id: None,
-            apple_key_id: None,
-            apple_private_key: None,
+            oauth: OAuthConfig::default(),
             max_affected_docs: 100,
             auth_anonymous_enabled: false,
             anonymous_session_ttl_days: 1,

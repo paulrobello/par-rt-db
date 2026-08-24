@@ -1281,10 +1281,10 @@ async fn oauth_login_merges_anon_footprint_end_to_end() -> anyhow::Result<()> {
     .await;
 
     let mut cfg = crate::common::test_config();
-    cfg.github_base_url = mock.uri();
-    cfg.github_api_url = mock.uri();
-    cfg.github_client_id = Some("test-client".into());
-    cfg.github_client_secret = Some("test-secret".into());
+    cfg.oauth.github.base_url = mock.uri();
+    cfg.oauth.github.api_url = mock.uri();
+    cfg.oauth.github.client_id = Some("test-client".into());
+    cfg.oauth.github.client_secret = Some("test-secret".into());
     cfg.auth_anonymous_enabled = true;
 
     let pool = sqlx::PgPool::connect(&cfg.database_url).await?;

@@ -59,18 +59,18 @@ async fn begin(addr: SocketAddr, provider: &str, origin: &str) -> reqwest::Respo
 
 async fn ms_configured_state() -> (Arc<AppState>, SocketAddr) {
     let mut cfg = test_config();
-    cfg.microsoft_client_id = Some("ms-client".into());
-    cfg.microsoft_client_secret = Some("ms-secret".into());
+    cfg.oauth.microsoft.client_id = Some("ms-client".into());
+    cfg.oauth.microsoft.client_secret = Some("ms-secret".into());
     configured_state(cfg).await
 }
 
 async fn apple_configured_state() -> (Arc<AppState>, SocketAddr) {
     let mut cfg = test_config();
-    cfg.apple_client_id = Some("com.example.svc".into());
-    cfg.apple_team_id = Some("TEAM".into());
-    cfg.apple_key_id = Some("KEY".into());
+    cfg.oauth.apple.client_id = Some("com.example.svc".into());
+    cfg.oauth.apple.team_id = Some("TEAM".into());
+    cfg.oauth.apple.key_id = Some("KEY".into());
     // `begin` never touches the key; any non-None value satisfies from_config.
-    cfg.apple_private_key = Some("dummy".into());
+    cfg.oauth.apple.private_key = Some("dummy".into());
     configured_state(cfg).await
 }
 
@@ -103,9 +103,9 @@ async fn microsoft_begin_returns_microsoft_authorizeUrl() -> anyhow::Result<()> 
 #[tokio::test]
 async fn microsoft_begin_honors_configured_tenant() -> anyhow::Result<()> {
     let mut cfg = test_config();
-    cfg.microsoft_client_id = Some("ms-client".into());
-    cfg.microsoft_client_secret = Some("ms-secret".into());
-    cfg.microsoft_tenant = "contoso.onmicrosoft.com".into();
+    cfg.oauth.microsoft.client_id = Some("ms-client".into());
+    cfg.oauth.microsoft.client_secret = Some("ms-secret".into());
+    cfg.oauth.microsoft.tenant = "contoso.onmicrosoft.com".into();
     let (_state, addr) = configured_state(cfg).await;
 
     let resp = begin(addr, "microsoft", ALLOWED_ORIGIN).await;
@@ -201,10 +201,10 @@ async fn apple_begin_unconfigured_returns_service_unavailable() -> anyhow::Resul
 #[tokio::test]
 async fn apple_callback_post_route_parses_form_and_requires_state() -> anyhow::Result<()> {
     let mut cfg = test_config();
-    cfg.apple_client_id = Some("com.example.svc".into());
-    cfg.apple_team_id = Some("TEAM".into());
-    cfg.apple_key_id = Some("KEY".into());
-    cfg.apple_private_key = Some("dummy".into());
+    cfg.oauth.apple.client_id = Some("com.example.svc".into());
+    cfg.oauth.apple.team_id = Some("TEAM".into());
+    cfg.oauth.apple.key_id = Some("KEY".into());
+    cfg.oauth.apple.private_key = Some("dummy".into());
     cfg.oauth_login_csrf = false; // isolate the state check from the CSRF gate
     let (_state, addr) = configured_state(cfg).await;
 
