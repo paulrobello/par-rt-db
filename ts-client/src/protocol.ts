@@ -484,9 +484,18 @@ export interface PresenceMember {
   state: unknown;
 }
 
+/**
+ * The wire protocol version this client speaks (ARC-013). Sent as
+ * `protocolVersion` on the WS `auth` frame and as the `X-Rtdb-Protocol` HTTP
+ * header; a server whose `PROTOCOL_VERSION` is older rejects a value greater
+ * than its own with `UNSUPPORTED_PROTOCOL`. Mirrors server
+ * `protocol::PROTOCOL_VERSION`.
+ */
+export const PROTOCOL_VERSION = 1;
+
 /** Client -> server WS vocabulary. Tags/fields match server `protocol::ClientMessage`. */
 export type ClientMessage =
-  | { type: "auth"; token?: string; db: string }
+  | { type: "auth"; token?: string; db: string; protocolVersion?: number }
   | { type: "subscribe"; queryId: string; query: QueryJson }
   | { type: "unsubscribe"; queryId: string }
   | { type: "mutate"; mutId: string; idempotencyKey?: string; txn: TransactionJson }
@@ -506,7 +515,7 @@ export type ClientMessage =
 
 /** Server -> client WS vocabulary. Tags/fields match server `protocol::ServerMessage`. */
 export type ServerMessage =
-  | { type: "authOk"; user: AuthedUser }
+  | { type: "authOk"; user: AuthedUser; protocolVersion?: number }
   | { type: "authErr"; error: RtDbErrorEnvelope }
   | { type: "queryUpdate"; queryId: string; result: unknown }
   | { type: "mutateOk"; mutId: string; results: unknown[] }

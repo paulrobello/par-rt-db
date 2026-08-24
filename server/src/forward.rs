@@ -56,7 +56,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::postgres::PgListener;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, Semaphore, oneshot};
 
 use crate::auth::PrincipalCtx;
 use crate::committer::{CommitterRequest, Committers};
@@ -403,11 +403,36 @@ async fn recv_forwarded<T>(rx: oneshot::Receiver<Result<T, RtDbError>>) -> Resul
     }
 }
 
+/// The fixed substring of the message the shadow committer's ownership-
+/// conflict backstop emits (`committer::lease::reply_ownership_conflict`,
+/// itself sharing the wording of `committer::lease::acquire_ownership_lease`'s
+/// CONFLICT). `forward.rs` does not own `committer/lease.rs`, so this cannot
+/// be a cross-module shared `const` today — if that message ever changes,
+/// [`is_shadow_ownership_conflict`] must change with it.
+const SHADOW_OWNERSHIP_CONFLICT_MARKER: &str = "is owned by another instance (single-writer lease)";
+
+/// ARC-016: true when `err` is the shadow committer's ownership-conflict
+/// backstop rather than a genuine execution failure. `execute_as_owner`
+/// checks `is_owner` and then submits — a window in which this replica can
+/// lose the lease (the takeover race), landing the write on a freshly
+/// respawned SHADOW committer, which replies this exact CONFLICT. That is
+/// not the forwarded write's real outcome; it is an artifact of the race, and
+/// the correct response is the same as never having been the owner at all:
+/// stay silent so the origin's timeout → takeover path runs, rather than
+/// surfacing a CONFLICT the client would see as a genuine failure.
+fn is_shadow_ownership_conflict(err: &RtDbError) -> bool {
+    err.code == crate::error::ErrorCode::Conflict
+        && err.message.contains(SHADOW_OWNERSHIP_CONFLICT_MARKER)
+}
+
 /// Owner-side half of Stage 4c, run inside the shared listener: execute a
 /// forwarded write on THIS replica's committer. Returns `None` when this
 /// replica does not hold `db`'s ownership lease (checked immediately before
 /// submit) — the silent drop that makes the broadcast exactly-once, since
-/// every non-owner returns `None` and only the owner replies.
+/// every non-owner returns `None` and only the owner replies. Also returns
+/// `None` (ARC-016) when the lease was lost in the window between that check
+/// and `submit_owned` landing on a respawned shadow — see
+/// [`is_shadow_ownership_conflict`].
 async fn execute_as_owner(
     committers: &Committers,
     db: &str,
@@ -487,7 +512,13 @@ async fn execute_as_owner(
             recv_forwarded(reply_rx).await.and_then(serialize_result)
         }
     };
-    Some(result)
+    match result {
+        // ARC-016: the lease slipped away between our `is_owner` check and
+        // `submit_owned` landing — not a genuine failure of this write, so
+        // stay silent like a plain non-owner instead of surfacing CONFLICT.
+        Err(ref err) if is_shadow_ownership_conflict(err) => None,
+        other => Some(other),
+    }
 }
 
 /// Spool a reply and notify its row id (ARC-002). Best-effort in the same
@@ -561,13 +592,25 @@ fn serialize_result<T: serde::Serialize>(value: T) -> Result<serde_json::Value, 
 /// Same resilience contract as the op-feed listener (`notify::run_listener`):
 /// connect/listen errors log and retry on a 2s backoff; a malformed payload
 /// (version skew between replicas) is skipped, never fatal.
+///
+/// ARC-008: `concurrency` (`RTDB_FORWARD_CONCURRENCY`) bounds how many
+/// forwarded-write executions this replica runs at once — the previous
+/// unbounded `tokio::spawn` per request let a burst of forwarded writes pile
+/// up an unbounded number of concurrent committer submits against the owner.
+/// A request that arrives once the cap is saturated gets an immediate
+/// `RATE_LIMITED` reply (retryable) instead of executing or silently timing
+/// out into the origin's lease-takeover path.
 pub async fn run_forward_listener(
     pool: PgPool,
     committers: Committers,
     forwarder: Arc<Forwarder>,
     own_instance_id: String,
+    concurrency: usize,
 ) {
     let backoff = std::time::Duration::from_secs(2);
+    // Shared across reconnects: the cap bounds this replica's total in-flight
+    // forwarded-write executions, not per-connection state.
+    let semaphore = Arc::new(Semaphore::new(concurrency));
     loop {
         let mut listener = match PgListener::connect_with(&pool).await {
             Ok(l) => l,
@@ -642,37 +685,80 @@ pub async fn run_forward_listener(
                     }
                     let committers = committers.clone();
                     let notify_pool = pool.clone();
-                    tokio::spawn(async move {
-                        match execute_as_owner(&committers, &request.db, request.write).await {
-                            Some(result) => {
-                                let reply = match result {
-                                    Ok(value) => ForwardReply::success(
-                                        request.request_id,
-                                        request.origin.clone(),
-                                        value,
-                                    ),
-                                    Err(err) => ForwardReply::failure(
-                                        request.request_id,
-                                        request.origin,
-                                        err,
-                                    ),
-                                };
+                    // ARC-008: acquire a permit BEFORE spawning, so the cap
+                    // bounds actual in-flight executions rather than merely
+                    // throttling inside an already-spawned task.
+                    match semaphore.clone().try_acquire_owned() {
+                        Ok(permit) => {
+                            tokio::spawn(async move {
+                                // Held for the task's lifetime; dropped (and
+                                // the slot freed) when the task ends.
+                                let _permit = permit;
+                                match execute_as_owner(&committers, &request.db, request.write)
+                                    .await
+                                {
+                                    Some(result) => {
+                                        let reply = match result {
+                                            Ok(value) => ForwardReply::success(
+                                                request.request_id,
+                                                request.origin.clone(),
+                                                value,
+                                            ),
+                                            Err(err) => ForwardReply::failure(
+                                                request.request_id,
+                                                request.origin,
+                                                err,
+                                            ),
+                                        };
+                                        publish_reply(&notify_pool, reply).await;
+                                        // The request row's work is done on
+                                        // the only replica that will ever
+                                        // execute it.
+                                        let _ = spool_delete(&notify_pool, id).await;
+                                    }
+                                    None => {
+                                        // Not the owner (or lost the lease
+                                        // between the check and the submit,
+                                        // ARC-016) — stay silent so the
+                                        // origin times out into takeover.
+                                        tracing::debug!(
+                                            db = %request.db,
+                                            "forward listener: not the owner; dropping forwarded write"
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                        Err(_) => {
+                            // ARC-008: concurrency cap saturated. Only the
+                            // OWNER answers — a saturated non-owner would
+                            // have dropped this request silently anyway, and
+                            // replying on its behalf would race the real
+                            // owner's reply and could make the origin
+                            // believe an unexecuted write landed.
+                            if committers.is_owner(&request.db).await {
+                                tracing::warn!(
+                                    db = %request.db,
+                                    concurrency,
+                                    "forward listener: forward concurrency saturated; \
+                                     replying RATE_LIMITED instead of executing"
+                                );
+                                let reply = ForwardReply::failure(
+                                    request.request_id,
+                                    request.origin,
+                                    RtDbError::rate_limited(1),
+                                );
                                 publish_reply(&notify_pool, reply).await;
-                                // The request row's work is done on the only
-                                // replica that will ever execute it.
                                 let _ = spool_delete(&notify_pool, id).await;
-                            }
-                            None => {
-                                // Not the owner (or lost the lease between the
-                                // check and the submit) — stay silent so the
-                                // origin times out into takeover.
+                            } else {
                                 tracing::debug!(
                                     db = %request.db,
-                                    "forward listener: not the owner; dropping forwarded write"
+                                    "forward listener: concurrency saturated and not the \
+                                     owner; dropping forwarded write"
                                 );
                             }
                         }
-                    });
+                    }
                 }
             }
         }
@@ -737,5 +823,30 @@ mod tests {
             }
             Ok(v) => panic!("expected an error reply, got {v}"),
         }
+    }
+
+    #[test]
+    fn shadow_ownership_conflict_is_classified_by_code_and_message() {
+        // The exact wording the shadow backstop emits (mirrored from
+        // `committer::lease::reply_ownership_conflict` /
+        // `acquire_ownership_lease`) — must classify as the TOCTOU race.
+        let shadow = RtDbError::new(
+            crate::error::ErrorCode::Conflict,
+            "database 'db1' is owned by another instance (single-writer lease); \
+             writes must reach the owning replica until it releases",
+        );
+        assert!(is_shadow_ownership_conflict(&shadow));
+
+        // A different CONFLICT (e.g. a unique-index violation inside the
+        // write itself) must NOT be swallowed into a silent drop.
+        let unrelated_conflict = RtDbError::conflict("unique constraint violated");
+        assert!(!is_shadow_ownership_conflict(&unrelated_conflict));
+
+        // Same message text under a different code must not match either —
+        // the classification requires both.
+        let wrong_code = RtDbError::internal(
+            "database 'db1' is owned by another instance (single-writer lease)",
+        );
+        assert!(!is_shadow_ownership_conflict(&wrong_code));
     }
 }

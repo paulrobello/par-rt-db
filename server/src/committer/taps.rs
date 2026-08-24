@@ -65,22 +65,26 @@ pub(in crate::committer) async fn publish_taps(
     }
     // Op-feed completeness: every durable document write publishes here.
     ctx.op_feed.publish(&ctx.db, owner, &write_set.ops).await;
-    // ENH-022 Stage 2: cross-instance op-feed fan-out. When `multi_instance` is
-    // on, emit one `pg_notify` per DocOp so peer replicas sharing this Postgres
-    // inject the event into their own rings. Best-effort, like the audit/webhook
-    // taps below — a `pg_notify` failure logs and never fails the committed
-    // write. NOT a second writer: the write already committed inside this
-    // serialized turn; NOTIFY only notifies.
+    // ENH-022 Stage 2 / ARC-006: cross-instance op-feed fan-out. When
+    // `multi_instance` is on, emit batched `pg_notify`s (chunked under
+    // `notify::OP_NOTIFY_CHUNK_LIMIT`) so peer replicas sharing this Postgres
+    // inject the events into their own rings. Spawned off the committer turn —
+    // mirroring the quota-cache-refresh spawn below — so a 1000-row
+    // deleteByQuery or TTL sweep never holds the serialized turn on a string of
+    // `pg_notify` round trips. Best-effort, like the audit/webhook taps below:
+    // a `pg_notify` failure logs and never fails the committed write. NOT a
+    // second writer: the write already committed inside this serialized turn;
+    // NOTIFY only notifies.
     if ctx.multi_instance {
-        crate::notify::publish_ops(
-            &ctx.pool,
-            &ctx.instance_id,
-            &ctx.db,
-            owner,
-            source,
-            &write_set.ops,
-        )
-        .await;
+        let pool = ctx.pool.clone();
+        let instance_id = ctx.instance_id.clone();
+        let db = ctx.db.clone();
+        let owner = owner.map(|s| s.to_string());
+        let ops = write_set.ops.clone();
+        tokio::spawn(async move {
+            crate::notify::publish_ops(&pool, &instance_id, &db, owner.as_deref(), source, &ops)
+                .await;
+        });
     }
     // Durable audit tap (the persistent counterpart to the op-feed above).
     if ctx.audit_log_enabled

@@ -86,6 +86,59 @@ async fn auth_with_valid_machine_token_returns_auth_ok() -> anyhow::Result<()> {
 
     assert_eq!(msg["type"], json!("authOk"));
     assert_eq!(msg["user"]["kind"], json!("machine"));
+    // ARC-013: a client that never mentions `protocolVersion` gets an
+    // `authOk` with no `protocolVersion` key — byte-identical to a
+    // pre-ARC-013 server for a pre-ARC-013 client.
+    assert!(msg.get("protocolVersion").is_none());
+    Ok(())
+}
+
+// ARC-013: a client that sends `protocolVersion` on `Auth` gets the server's
+// `PROTOCOL_VERSION` echoed back on `authOk`.
+#[tokio::test]
+async fn auth_with_protocol_version_echoes_server_version() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    let mut ws = ws_connect(addr).await;
+    send_json(
+        &mut ws,
+        json!({"type": "auth", "token": token, "db": db, "protocolVersion": 1}),
+    )
+    .await;
+    let msg = recv_json(&mut ws).await;
+
+    assert_eq!(msg["type"], json!("authOk"));
+    assert_eq!(msg["protocolVersion"], json!(1));
+    Ok(())
+}
+
+// ARC-013: a client requesting a protocol version newer than the server's
+// gets `authErr { error: { code: "UNSUPPORTED_PROTOCOL" } }` and the
+// connection closes with the auth-failure close code.
+#[tokio::test]
+async fn auth_with_unsupported_protocol_version_returns_auth_err_and_closes() -> anyhow::Result<()>
+{
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    let mut ws = ws_connect(addr).await;
+    send_json(
+        &mut ws,
+        json!({"type": "auth", "token": token, "db": db, "protocolVersion": 999}),
+    )
+    .await;
+    let msg = recv_json(&mut ws).await;
+
+    assert_eq!(msg["type"], json!("authErr"));
+    assert_eq!(msg["error"]["code"], json!("UNSUPPORTED_PROTOCOL"));
+    // Not a credential failure — closes with the generic protocol-violation
+    // code (4400), not the auth-failure code (4401).
+    expect_close_with_code(&mut ws, 4400).await;
     Ok(())
 }
 

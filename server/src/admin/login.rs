@@ -44,7 +44,7 @@ pub(super) async fn admin_login(
     // non-zero value like 10 means one IP gets 10 attempts/minute before 429.
     // Checked BEFORE the ct_eq so a flood of guesses never reaches the compare.
     let ip_key = crate::http_api::client_ip_key(&headers, addr.ip(), state.config.trusted_proxy);
-    let limit = state.config.admin_rate_limit_per_ip_rpm;
+    let limit = state.config.limits.admin_per_ip_rpm;
     if limit > 0 {
         match state
             .limits

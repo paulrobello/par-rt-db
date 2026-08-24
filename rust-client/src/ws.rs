@@ -1221,6 +1221,7 @@ async fn run_session(
     let auth = ClientMessage::Auth {
         token: Some(token),
         db: driver.inner.db.clone(),
+        protocol_version: Some(crate::wire::PROTOCOL_VERSION),
     };
     let frame = serde_json::to_string(&auth).unwrap_or_default();
     if sink.send(WsMessage::Text(frame.into())).await.is_err() {
@@ -1233,7 +1234,7 @@ async fn run_session(
             match stream.next().await {
                 Some(Ok(WsMessage::Text(t))) => {
                     match serde_json::from_str::<ServerMessage>(t.as_str()) {
-                        Ok(ServerMessage::AuthOk { user }) => return Ok(user),
+                        Ok(ServerMessage::AuthOk { user, .. }) => return Ok(user),
                         Ok(ServerMessage::AuthErr { .. }) => return Err(AuthFail::Failed),
                         Ok(_) => return Err(AuthFail::Reconnect),
                         Err(_) => continue,
@@ -2037,6 +2038,7 @@ mod tests {
         let v = serde_json::to_value(ClientMessage::Auth {
             token: Some("t".into()),
             db: "d".into(),
+            protocol_version: None,
         })
         .unwrap();
         assert_eq!(v, json!({"type":"auth","token":"t","db":"d"}));

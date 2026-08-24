@@ -5,37 +5,62 @@ use std::sync::OnceLock;
 
 use rtdb_server::config::HotConfig;
 use rtdb_server::schema::SchemaDef;
-use rtdb_server::{AppState, build_router, config::Config, db, ddl};
+use rtdb_server::{
+    AppState, build_router,
+    config::{Config, OAuthConfig},
+    db, ddl,
+};
 use tokio::sync::mpsc::{self, UnboundedSender};
+
+/// ARC-009: RAII guard that stops an `AppState`'s background tasks (the
+/// PgListener loops, rate-limit sweep, forward listener/sweeper, and —
+/// via `abort` — the presence flush task; see `BackgroundTasks` in `lib.rs`)
+/// when it drops.
+///
+/// `spawn_app` below detaches the router's server task via `tokio::spawn`
+/// without ever joining it, so a bare `Arc<AppState>` returned from
+/// `test_state()` et al. is kept alive by that detached task for the rest of
+/// the TEST BINARY's life — `AppState`'s own fields never see their last
+/// reference drop at test end, so a `Drop` impl on `AppState` itself would
+/// not fire until the binary exits. This guard sidesteps that: it holds an
+/// `Arc<BackgroundTasks>` clone (obtained via `background_guard`, `Arc`-
+/// independent of `AppState`), so dropping it stops the listener loops (and
+/// their Postgres connections) at test end regardless of how long the
+/// detached server task lives.
+///
+/// Not wired into `test_state()`/`spawn_app` automatically: doing so would
+/// require changing their return type, which would ripple across the ~54
+/// files under `tests/*.rs` (consolidated into ONE binary — see
+/// `tests/main.rs`) that already call `test_state_with_*(...).await` and
+/// `spawn_app(state)` expecting a plain `Arc<AppState>`. A test that wants
+/// deterministic background-task teardown opts in:
+/// ```ignore
+/// let state = test_state_with_presence().await;
+/// let _bg = common::background_guard(&state);
+/// let addr = spawn_app(state.clone()).await;
+/// ```
+#[allow(dead_code)] // opt-in helper (see docs above) — not yet adopted by any test file
+pub struct BackgroundGuard(Arc<rtdb_server::BackgroundTasks>);
+
+impl Drop for BackgroundGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// Build a [`BackgroundGuard`] for `state`. See its docs for why this is an
+/// opt-in helper rather than automatic.
+#[allow(dead_code)] // opt-in helper — not yet adopted by any test file
+pub fn background_guard(state: &AppState) -> BackgroundGuard {
+    BackgroundGuard(state.background.clone())
+}
 
 pub fn test_config() -> Config {
     Config {
         port: 0,
-        database_url: std::env::var("RTDB_TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://rtdb:rtdb@127.0.0.1:55434/rtdb".into()),
         admin_key: "test-admin-key".into(),
         public_url: "http://localhost:0".into(),
-        github_client_id: None,
-        github_client_secret: None,
-        github_base_url: "https://github.com".into(),
-        github_api_url: "https://api.github.com".into(),
-        google_client_id: None,
-        google_client_secret: None,
-        gitlab_client_id: None,
-        gitlab_client_secret: None,
-        gitlab_base_url: "https://gitlab.com".into(),
-        oidc_client_id: None,
-        oidc_client_secret: None,
-        oidc_authorize_url: None,
-        oidc_token_url: None,
-        oidc_userinfo_url: None,
-        microsoft_client_id: None,
-        microsoft_client_secret: None,
-        microsoft_tenant: "common".into(),
-        apple_client_id: None,
-        apple_team_id: None,
-        apple_key_id: None,
-        apple_private_key: None,
+        oauth: OAuthConfig::default(),
         max_affected_docs: 100,
         static_dir: None,
         pool_max_connections: 75,
@@ -43,27 +68,13 @@ pub fn test_config() -> Config {
         slow_query_ms: 0,
         slow_query_capacity: 200,
         slow_query_log_params: false,
-        rate_limit_per_token_rpm: 0,
-        rate_limit_per_db_rpm: 0,
         audit_log_enabled: false,
         oauth_login_csrf: true,
         webhooks_enabled: false,
         webhook_allow_http: false,
-        storage_rate_limit_per_ip_rpm: 0,
-        storage_require_signed_urls: false,
-        backup_enabled: false,
-        backup_cron: "0 3 * * *".into(),
-        backup_dir: "./backups".into(),
-        backup_retention: 7,
         subs_verify_skip_every: 0,
         ttl_sweep_interval_secs: 60,
         ttl_batch: 5000,
-        image_transforms_enabled: true,
-        image_max_dim: 2048,
-        image_max_pixels: 25_000_000,
-        image_cache_bytes: 256 * 1024 * 1024,
-        image_concurrency: 4,
-        image_default_quality: 80,
         presence_enabled: false,
         presence_max_state_bytes: 1024,
         presence_max_room_size: 100,
@@ -76,19 +87,48 @@ pub fn test_config() -> Config {
         presence_beat_timeout_ms: 15000,
         auth_anonymous_enabled: false,
         anonymous_session_ttl_days: 1,
-        anonymous_rate_limit_per_ip_rpm: 0,
         quota_cache_ttl_secs: 60,
         db_idle_reclaim_secs: 0,
-        admin_rate_limit_per_ip_rpm: 0,
         cookie_secure: false,
         trusted_proxy: false,
         otel_enabled: false,
         otel_endpoint: String::new(),
         otel_service_name: String::new(),
         otel_sample_ratio: 0.0,
-        multi_instance: false,
-        forward_timeout_ms: 5000,
-        instance_id: None,
+        limits: rtdb_server::config::LimitsConfig {
+            per_token_rpm: 0,
+            per_db_rpm: 0,
+            exact: false,
+            sync_ms: 1000,
+            storage_per_ip_rpm: 0,
+            anonymous_per_ip_rpm: 0,
+            admin_per_ip_rpm: 0,
+        },
+        storage: rtdb_server::config::StorageConfig {
+            require_signed_urls: false,
+            image: rtdb_server::config::ImageTransformConfig {
+                enabled: true,
+                max_dim: 2048,
+                max_pixels: 25_000_000,
+                cache_bytes: 256 * 1024 * 1024,
+                concurrency: 4,
+                default_quality: 80,
+            },
+        },
+        backup: rtdb_server::config::BackupConfig {
+            enabled: false,
+            cron: "0 3 * * *".into(),
+            dir: "./backups".into(),
+            retention: 7,
+        },
+        multi_instance: rtdb_server::config::MultiInstanceConfig {
+            enabled: false,
+            instance_id: None,
+            forward_timeout_ms: 5000,
+            forward_concurrency: 64,
+        },
+        database_url: std::env::var("RTDB_TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://rtdb:rtdb@127.0.0.1:55434/rtdb".into()),
     }
 }
 
@@ -123,8 +163,8 @@ pub async fn test_state() -> Arc<AppState> {
 /// codebase exposes — `test_config()` is already a public helper.
 pub async fn test_state_with_rate_limits(per_token_rpm: u32, per_db_rpm: u32) -> Arc<AppState> {
     let mut config = test_config();
-    config.rate_limit_per_token_rpm = per_token_rpm;
-    config.rate_limit_per_db_rpm = per_db_rpm;
+    config.limits.per_token_rpm = per_token_rpm;
+    config.limits.per_db_rpm = per_db_rpm;
     let pool = sqlx::PgPool::connect(&config.database_url)
         .await
         .expect("connect to test postgres");
@@ -165,12 +205,12 @@ pub async fn test_state_with_slow_queries(ms: u64, log_params: bool) -> Arc<AppS
     AppState::new(pool, config, test_hot())
 }
 
-/// Like `test_state` but with `storage_require_signed_urls = true`. Used by
+/// Like `test_state` but with `storage.require_signed_urls = true`. Used by
 /// `tests/storage_signed_url_test.rs` (SEC-113) to exercise require-signature
 /// mode without touching env vars. Mirrors the `test_state_with_*` pattern.
 pub async fn test_state_with_require_signed_urls() -> Arc<AppState> {
     let mut config = test_config();
-    config.storage_require_signed_urls = true;
+    config.storage.require_signed_urls = true;
     let pool = sqlx::PgPool::connect(&config.database_url)
         .await
         .expect("connect to test postgres");
@@ -243,15 +283,15 @@ pub async fn test_state_with_idle_reclaim(secs: u64) -> Arc<AppState> {
     AppState::new(pool, config, test_hot())
 }
 
-/// Like `test_state` but with `backup_dir` overridden. Used by ENH-002 Task 3's
+/// Like `test_state` but with `backup.dir` overridden. Used by ENH-002 Task 3's
 /// `/admin/backup` trigger test to point at a tempdir — so the spawned `pg_dump`
-/// (which calls `tokio::fs::create_dir_all` on `backup_dir` before running) does
+/// (which calls `tokio::fs::create_dir_all` on `backup.dir` before running) does
 /// not pollute the default `./backups` and break the parallel
 /// `admin_list_backups_returns_empty_when_dir_missing` test, which asserts that
 /// dir does not exist. Mirrors the `test_state_with_*` override pattern.
 pub async fn test_state_with_backup_dir(dir: String) -> Arc<AppState> {
     let mut config = test_config();
-    config.backup_dir = dir;
+    config.backup.dir = dir;
     let pool = sqlx::PgPool::connect(&config.database_url)
         .await
         .expect("connect to test postgres");
@@ -330,16 +370,24 @@ pub async fn spawn_app(state: Arc<AppState>) -> SocketAddr {
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("read local addr");
+    // ARC-009: this server task is never joined and outlives the test's own
+    // `state` variable (it holds the last `Arc<AppState>` clone for the rest
+    // of the test binary's life), so it is what actually leaks the state's
+    // background listeners in tests that don't call `background_guard`.
+    // Tracking its handle here at least lets `background_guard`/`cancel`/
+    // `shutdown` stop the HTTP server itself, not just the listener loops.
+    let background = state.background.clone();
     // `into_make_service_with_connect_info` provides the peer `SocketAddr` to
     // handlers via the `ConnectInfo<SocketAddr>` extractor — mirrors `main.rs`
     // and is required by `serve_public_handler` (per-IP storage rate limit).
-    tokio::spawn(
-        axum::serve(
-            listener,
-            build_router(state).into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .into_future(),
-    );
+    let serve = axum::serve(
+        listener,
+        build_router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .into_future();
+    background.track(tokio::spawn(async move {
+        let _ = serve.await;
+    }));
     addr
 }
 

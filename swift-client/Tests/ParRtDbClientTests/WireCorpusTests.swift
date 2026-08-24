@@ -271,4 +271,41 @@ struct WireCorpusTests {
         try expectDeepEqual(base, #"{"a":{"keep":"x","list":[1,2,3]}}"#, "key order is not contract")
         try expectDeepEqual(base, #"{"a":{"list":[1,2,3.0],"keep":"x"}}"#, "2 vs 2.0 (integral-double collapse)")
     }
+
+    // MARK: - ARC-017: error-code parity
+
+    /// `wire-corpus/error-codes.json` is the canonical `{code, httpStatus}`
+    /// table generated from the server's `ErrorCode` enum
+    /// (`server/src/error.rs::tests::error_codes_match_wire_corpus`). Swift's
+    /// `ErrorCode` is `CaseIterable`, so `ErrorCode.allCases` enumerates every
+    /// known variant with no manually-kept list to fall out of sync — unlike
+    /// the rust-client/ts-client tests, which hand-maintain an `ALL` array.
+    /// Swift does not model an HTTP status per code (no numeric field on
+    /// `ErrorCode`), so this only asserts the code sets agree, both ways.
+    private func loadErrorCodesCorpus() throws -> [[String: Any]] {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // ParRtDbClientTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // swift-client
+            .deletingLastPathComponent() // repo root
+            .appendingPathComponent("wire-corpus/error-codes.json")
+        guard
+            let top = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any],
+            let codes = top["codes"] as? [[String: Any]]
+        else {
+            throw CorpusFailure("error-codes.json: missing top-level 'codes' array")
+        }
+        return codes
+    }
+
+    @Test func errorCodesKnownToSwiftClient() throws {
+        let corpusCodes = try loadErrorCodesCorpus()
+            .compactMap { $0["code"] as? String }
+            .sorted()
+        let knownCodes = ErrorCode.allCases.map(\.rawValue).sorted()
+        #expect(
+            corpusCodes == knownCodes,
+            "swift ErrorCode drifted from wire-corpus/error-codes.json"
+        )
+    }
 }

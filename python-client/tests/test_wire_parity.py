@@ -382,3 +382,46 @@ def test_migrate_request_parses_server_default_null() -> None:
     )
     parsed = MigrateRequest.model_validate(fixture)
     assert parsed.directives[0].default is None  # type: ignore[union-attr]
+
+
+# --- ARC-017: error-code parity -----------------------------------------------
+#
+# `wire-corpus/error-codes.json` is the canonical `{code, httpStatus}` table
+# generated from the server's `ErrorCode` enum
+# (`server/src/error.rs::tests::error_codes_match_wire_corpus`). `ErrorCode` is
+# a `StrEnum`, so `list(ErrorCode)` enumerates every known variant with no
+# manually-kept list to fall out of sync; `RtDbError(...).status_code` exposes
+# the private `_STATUS` mapping per code.
+
+_ERROR_CODES_PATH = Path(__file__).resolve().parents[2] / "wire-corpus" / "error-codes.json"
+
+
+def _load_error_codes_corpus() -> list[dict[str, Any]]:
+    data = json.loads(_ERROR_CODES_PATH.read_text())
+    codes = data.get("codes")
+    if not isinstance(codes, list):
+        raise TypeError("error-codes.json missing 'codes' array")
+    return codes
+
+
+def test_error_codes_known_to_python_client() -> None:
+    """Every corpus code is a known ``ErrorCode`` and the reverse: no
+    ``ErrorCode`` member is absent from the corpus."""
+    from par_rt_db.errors import ErrorCode
+
+    corpus_codes = sorted(entry["code"] for entry in _load_error_codes_corpus())
+    known_codes = sorted(member.value for member in ErrorCode)
+    assert corpus_codes == known_codes, "python ErrorCode drifted from wire-corpus/error-codes.json"
+
+
+def test_error_codes_http_status_matches_corpus() -> None:
+    """Each corpus ``httpStatus`` matches ``RtDbError(code, "x").status_code``."""
+    from par_rt_db.errors import ErrorCode, RtDbError
+
+    for entry in _load_error_codes_corpus():
+        code = ErrorCode(entry["code"])
+        err = RtDbError(code, "x")
+        assert err.status_code == entry["httpStatus"], (
+            f"{code}: python status_code {err.status_code} "
+            f"!= corpus httpStatus {entry['httpStatus']}"
+        )

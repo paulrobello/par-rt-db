@@ -1154,9 +1154,11 @@ async def _safe_close(ws: Connection, code: int = 1000) -> None:
 
 
 def _auth_frame(token: str, db: str) -> str:
-    from .wire import _ClientAuth
+    from .wire import PROTOCOL_VERSION, _ClientAuth
 
-    return _ClientAuth(token=token, db=db).model_dump_json(by_alias=True)
+    return _ClientAuth(token=token, db=db, protocol_version=PROTOCOL_VERSION).model_dump_json(
+        by_alias=True
+    )
 
 
 def _ping_frame() -> str:

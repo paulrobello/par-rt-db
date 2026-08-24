@@ -43,18 +43,21 @@ async fn build_config_response(state: &AppState) -> Result<ConfigResponse, RtDbE
     Ok(ConfigResponse {
         port: cfg.port,
         public_url: cfg.public_url.clone(),
-        github_base_url: cfg.github_base_url.clone(),
-        github_api_url: cfg.github_api_url.clone(),
+        github_base_url: cfg.oauth.github.base_url.clone(),
+        github_api_url: cfg.oauth.github.api_url.clone(),
         database_url_configured: !cfg.database_url.is_empty(),
         admin_key_configured: !cfg.admin_key.is_empty(),
-        github_configured: cfg.github_client_id.is_some() && cfg.github_client_secret.is_some(),
-        google_configured: cfg.google_client_id.is_some() && cfg.google_client_secret.is_some(),
-        gitlab_configured: cfg.gitlab_client_id.is_some() && cfg.gitlab_client_secret.is_some(),
-        oidc_configured: cfg.oidc_client_id.is_some()
-            && cfg.oidc_client_secret.is_some()
-            && cfg.oidc_authorize_url.is_some()
-            && cfg.oidc_token_url.is_some()
-            && cfg.oidc_userinfo_url.is_some(),
+        github_configured: cfg.oauth.github.client_id.is_some()
+            && cfg.oauth.github.client_secret.is_some(),
+        google_configured: cfg.oauth.google.client_id.is_some()
+            && cfg.oauth.google.client_secret.is_some(),
+        gitlab_configured: cfg.oauth.gitlab.client_id.is_some()
+            && cfg.oauth.gitlab.client_secret.is_some(),
+        oidc_configured: cfg.oauth.oidc.client_id.is_some()
+            && cfg.oauth.oidc.client_secret.is_some()
+            && cfg.oauth.oidc.authorize_url.is_some()
+            && cfg.oauth.oidc.token_url.is_some()
+            && cfg.oauth.oidc.userinfo_url.is_some(),
         hot: (**hot).clone(),
         version: env!("CARGO_PKG_VERSION"),
         git_commit: env!("BUILD_GIT_COMMIT"),

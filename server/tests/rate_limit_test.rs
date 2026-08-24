@@ -57,7 +57,10 @@ async fn sec005_pg_backed_ip_buckets_are_route_namespaced() -> anyhow::Result<()
     use rtdb_server::rate_limit::{RateDecision, RateKey, RateLimiter};
 
     let state = crate::common::test_state().await;
-    let limiter = RateLimiter::new_pg(state.pool.clone());
+    // Exact mode: this test exercises `check_pg`'s route-namespacing directly
+    // against Postgres — the approximate path's convergence is covered
+    // separately below.
+    let limiter = RateLimiter::new_pg(state.pool.clone(), true);
     let ip = format!("198.51.100.{}", rtdb_server::db::new_id());
     let key = |route: &'static str| RateKey::Ip {
         route,
@@ -83,6 +86,120 @@ async fn sec005_pg_backed_ip_buckets_are_route_namespaced() -> anyhow::Result<()
         limiter.check(key("anon_mint"), 10).await,
         RateDecision::Allowed
     );
+    Ok(())
+}
+
+// ARC-007: two "replicas" (independent `RateLimiter::new_pg(.., exact: false)`
+// instances sharing one Postgres table) each admit their local budget without
+// knowing about the other's — that's the documented overshoot, bounded by one
+// sync window per replica. After giving both replicas a couple of flush
+// cycles to reconcile through `rtdb_auth.rate_counters`, the shared count has
+// propagated to both, and further requests on either replica are denied even
+// though neither replica's own local counter ever exceeded the limit.
+#[tokio::test]
+async fn arc007_approx_limiters_converge_within_two_sync_windows() -> anyhow::Result<()> {
+    use rtdb_server::rate_limit::{RateDecision, RateKey, RateLimiter};
+    use std::time::Duration;
+
+    let state = crate::common::test_state().await;
+    let pool = state.pool.clone();
+
+    let sync_every = Duration::from_millis(80);
+    let replica_a = RateLimiter::new_pg(pool.clone(), false);
+    let replica_b = RateLimiter::new_pg(pool.clone(), false);
+    let flush_a = tokio::spawn(rtdb_server::rate_limit::run_approx_flush(
+        replica_a.clone(),
+        sync_every,
+    ));
+    let flush_b = tokio::spawn(rtdb_server::rate_limit::run_approx_flush(
+        replica_b.clone(),
+        sync_every,
+    ));
+
+    let key = RateKey::Db(format!("arc007-{}", rtdb_server::db::new_id()));
+    let limit = 4u32;
+
+    // Each replica admits 3 requests against a limit of 4 purely locally —
+    // 6 total admissions the shared ceiling would never have allowed had
+    // both replicas been checking the same synchronous counter.
+    for i in 1..=3 {
+        assert_eq!(
+            replica_a.check(key.clone(), limit).await,
+            RateDecision::Allowed,
+            "replica A request {i} is within its own local budget"
+        );
+    }
+    for i in 1..=3 {
+        assert_eq!(
+            replica_b.check(key.clone(), limit).await,
+            RateDecision::Allowed,
+            "replica B request {i} is within its own local budget"
+        );
+    }
+
+    // Convergence is polled, not slept for. A fixed sleep makes this test
+    // timing-fragile: a replica only refreshes its `last_seen_shared` on its
+    // OWN next flush, so replica A must flush again *after* replica B's delta
+    // has landed in the shared row. Under a loaded suite that can take more
+    // wall-clock than a couple of nominal sync windows, so both stages below
+    // wait for the observable condition under a generous deadline instead.
+    let key_text = match &key {
+        RateKey::Db(d) => d.clone(),
+        _ => unreachable!("this test uses a Db key"),
+    };
+
+    // Stage 1: both replicas' local deltas reconcile into the shared row.
+    // Queried straight from Postgres so polling does not perturb either
+    // limiter's in-memory state.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let shared = loop {
+        let total: Option<i64> = sqlx::query_scalar(
+            "SELECT SUM(count)::bigint FROM rtdb_auth.rate_counters \
+             WHERE key_type = 'db' AND key = $1",
+        )
+        .bind(&key_text)
+        .fetch_one(&pool)
+        .await?;
+        let total = total.unwrap_or(0);
+        if total >= 6 {
+            break total;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the two replicas' deltas never reconciled into rtdb_auth.rate_counters \
+             (saw {total} of the expected 6)"
+        );
+        tokio::time::sleep(sync_every).await;
+    };
+    assert_eq!(
+        shared, 6,
+        "both replicas flushed exactly their own 3 admissions into the shared row"
+    );
+
+    // Stage 2: each replica picks the converged count up on its next flush and
+    // denies, even though neither one's own local counter ever reached the
+    // limit. A replica may still admit a request or two before its next flush
+    // observes the shared row — that is precisely the documented bounded
+    // overshoot — so poll rather than demanding denial on the first call.
+    for (label, replica) in [("A", &replica_a), ("B", &replica_b)] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if matches!(
+                replica.check(key.clone(), limit).await,
+                RateDecision::Denied { .. }
+            ) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replica {label} never saw the converged shared count and kept admitting"
+            );
+            tokio::time::sleep(sync_every).await;
+        }
+    }
+
+    flush_a.abort();
+    flush_b.abort();
     Ok(())
 }
 

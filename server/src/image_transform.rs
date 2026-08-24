@@ -47,10 +47,10 @@ pub struct TransformConfig {
 impl TransformConfig {
     pub fn from_config(c: &Config) -> Self {
         Self {
-            enabled: c.image_transforms_enabled,
-            max_dim: c.image_max_dim,
-            max_pixels: c.image_max_pixels,
-            default_quality: c.image_default_quality,
+            enabled: c.storage.image.enabled,
+            max_dim: c.storage.image.max_dim,
+            max_pixels: c.storage.image.max_pixels,
+            default_quality: c.storage.image.default_quality,
         }
     }
 }

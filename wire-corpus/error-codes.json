@@ -1,0 +1,16 @@
+{
+  "$comment": "ARC-017: the canonical {code, httpStatus} pairs for every RtDbError wire code, one row per server/src/error.rs ErrorCode variant, in declaration order. server/src/error.rs::tests::error_codes_match_wire_corpus regenerates this table from the enum via an exhaustive match and fails if it drifts. Each of the four clients asserts every code here is known to its own error-code type (and, where the client models an HTTP status, that the status agrees). Update this file in the same change as any ErrorCode add/remove/status change, and mirror the change into all four clients' error-code types.",
+  "codes": [
+    { "code": "UNAUTHORIZED", "httpStatus": 401 },
+    { "code": "FORBIDDEN", "httpStatus": 403 },
+    { "code": "NOT_FOUND", "httpStatus": 404 },
+    { "code": "SCHEMA_VIOLATION", "httpStatus": 422 },
+    { "code": "PRECONDITION_FAILED", "httpStatus": 409 },
+    { "code": "BAD_REQUEST", "httpStatus": 400 },
+    { "code": "INTERNAL", "httpStatus": 500 },
+    { "code": "RATE_LIMITED", "httpStatus": 429 },
+    { "code": "CONFLICT", "httpStatus": 409 },
+    { "code": "QUOTA_EXCEEDED", "httpStatus": 507 },
+    { "code": "UNSUPPORTED_PROTOCOL", "httpStatus": 400 }
+  ]
+}

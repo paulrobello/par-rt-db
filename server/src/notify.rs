@@ -20,19 +20,25 @@
 //! ## How it works
 //!
 //! After every durable write commits inside the committer's serialized turn,
-//! `publish_taps` calls [`publish_ops`] here — best-effort, exactly where the
-//! audit/webhook taps already run, so the "every durable write publishes here"
-//! contract extends to NOTIFY at the same single enforcement point. Each `DocOp`
-//! is serialized to a small JSON payload and sent over `pg_notify('rtdb_ops',
-//! …)`.
+//! `publish_taps` spawns [`publish_ops`] here off the turn — fire-and-forget,
+//! mirroring the storage-quota refresh spawn, so a large batch's NOTIFY round
+//! trips never hold up the next queued request. `DocOp`s are serialized in
+//! chunks (ARC-006): each chunk's JSON array of per-op payload objects stays
+//! under [`OP_NOTIFY_CHUNK_LIMIT`] bytes and is sent as one `pg_notify(
+//! 'rtdb_ops', …)`, so a 1000-row delete or TTL sweep costs a handful of round
+//! trips instead of one per op. All ops in one call share a single `ts`
+//! (mirroring `OpFeed::publish`), so ordering across chunks is preserved by
+//! that timestamp even though a batch spans several NOTIFYs.
 //!
 //! A long-lived listener task ([`run_listener`]) on each instance holds a
 //! `PgListener` subscribed to the `rtdb_ops` channel. On each notification it
-//! reconstructs an [`OpEvent`](crate::op_feed::OpEvent) and feeds it into the
-//! local ring via `OpFeed::publish_injected`. The listener performs NO write
-//! and NO committer interaction — it only mirrors the notification into local
-//! memory — so the single-writer invariant is preserved. A second replica is
-//! not a second writer.
+//! decodes either a single payload object or a batch array (backward
+//! compatible with a peer mid-rolling-deploy still sending one-per-op), and
+//! for each payload reconstructs an [`OpEvent`](crate::op_feed::OpEvent) and
+//! feeds it into the local ring via `OpFeed::publish_injected`. The listener
+//! performs NO write and NO committer interaction — it only mirrors the
+//! notification into local memory — so the single-writer invariant is
+//! preserved. A second replica is not a second writer.
 //!
 //! ## Self-dedupe
 //!
@@ -86,6 +92,14 @@ pub const WRITE_SET_CHANNEL: &str = "rtdb_write_sets";
 /// table/id strings.
 const WRITE_SET_INLINE_LIMIT: usize = 7500;
 
+/// Serialized-size threshold (ARC-006) a chunk of batched [`OpNotifyPayload`]s
+/// stays under before [`publish_ops`] flushes it as one `pg_notify`. Same
+/// 7500-byte headroom under Postgres's 8000-byte `pg_notify` cap as
+/// [`WRITE_SET_INLINE_LIMIT`], kept as a separate constant because the two
+/// payload shapes (a batch of small per-op objects vs. one write set) evolve
+/// independently.
+const OP_NOTIFY_CHUNK_LIMIT: usize = 7500;
+
 /// One cross-replica subscription-invalidation payload (ARC-001). `write_set`
 /// carries `tables`/`docs`/`ops`; `doc_values` is `#[serde(skip)]` on
 /// `WriteSet` and therefore never travels, so `Indexed`/`Ordered`
@@ -116,6 +130,17 @@ pub struct OpNotifyPayload {
     pub source: String,
 }
 
+/// Wire shape `run_listener` decodes (ARC-006): a batch array (current
+/// senders) or a single object (backward compatibility with a peer still
+/// sending one `pg_notify` per op during a rolling deploy). `untagged` picks
+/// whichever variant parses — arrays and objects never collide.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum OpNotifyPayloadOrBatch {
+    Batch(Vec<OpNotifyPayload>),
+    Single(OpNotifyPayload),
+}
+
 /// Generate a short random hex instance id (8 hex chars = 4 bytes). Used when
 /// `RTDB_INSTANCE_ID` is unset; NOT cryptographically significant — it only
 /// needs to be unique among the replicas sharing one Postgres, and to stay
@@ -132,12 +157,16 @@ pub fn generate_instance_id() -> String {
     hex::encode(bytes)
 }
 
-/// Publish one NOTIFY per `DocOp`, best-effort. Called from `publish_taps` after
-/// the local op-feed publish, inside the committer's serialized turn. A failure
-/// logs a `warn!` and continues — the write has already committed (matching the
-/// audit/webhook tap semantics: these taps can never fail the mutation). Uses a
-/// single `ts` for all ops in the call, mirroring `OpFeed::publish` (all ops in
-/// one txn share a timestamp).
+/// Publish one NOTIFY per chunk of `DocOp`s (ARC-006), best-effort. Called
+/// off the committer's serialized turn (`taps::publish_taps` spawns this via
+/// `tokio::spawn`, mirroring the storage-quota refresh spawn) so a large
+/// batch's `pg_notify` round trips never block the next queued request. A
+/// failure logs a `warn!` and continues — the write has already committed
+/// (matching the audit/webhook tap semantics: these taps can never fail the
+/// mutation). Uses a single `ts` for all ops in the call, mirroring
+/// `OpFeed::publish` (all ops in one txn share a timestamp) — this is what
+/// keeps ordering meaningful across chunks even though a large write spans
+/// several NOTIFYs.
 pub async fn publish_ops(
     pool: &PgPool,
     instance_id: &str,
@@ -146,31 +175,35 @@ pub async fn publish_ops(
     source: &str,
     ops: &[DocOp],
 ) {
+    if ops.is_empty() {
+        return;
+    }
     let ts = now_ms();
-    let owner = owner.map(|s| s.to_string());
-    for op in ops {
-        let payload = OpNotifyPayload {
+    let payloads: Vec<OpNotifyPayload> = ops
+        .iter()
+        .map(|op| OpNotifyPayload {
             instance_id: instance_id.to_string(),
             db: db.to_string(),
             table: op.table.clone(),
             doc_id: op.id.clone(),
             kind: op.kind,
             ts,
-            owner: owner.clone(),
+            owner: owner.map(|s| s.to_string()),
             source: source.to_string(),
-        };
-        let payload_json = match serde_json::to_string(&payload) {
+        })
+        .collect();
+    for chunk in chunk_op_payloads(&payloads, OP_NOTIFY_CHUNK_LIMIT) {
+        let payload_json = match serde_json::to_string(chunk) {
             Ok(s) => s,
             Err(e) => {
                 // Serialization cannot fail for this struct in practice (no
                 // custom serialize), but a future field could change that. Log
-                // and move on so one bad op never blocks the committer turn.
+                // and move on so one bad chunk never blocks the others.
                 tracing::warn!(
                     db = %db,
-                    table = %op.table,
-                    doc_id = %op.id,
+                    ops = chunk.len(),
                     error = %e,
-                    "notify: failed to serialize payload; skipping this op"
+                    "notify: failed to serialize op batch; skipping this chunk"
                 );
                 continue;
             }
@@ -183,12 +216,38 @@ pub async fn publish_ops(
         {
             tracing::warn!(
                 db = %db,
-                table = %op.table,
+                ops = chunk.len(),
                 error = %e,
                 "notify: pg_notify failed (best-effort; write already committed)"
             );
         }
     }
+}
+
+/// Split `payloads` into chunks whose serialized JSON array stays under
+/// `limit` bytes (ARC-006), so [`publish_ops`] never builds a `pg_notify`
+/// payload past Postgres's 8000-byte cap regardless of batch size. Sized by
+/// summing each item's individually-serialized length (plus separator/bracket
+/// overhead) rather than round-tripping the whole array repeatedly. A single
+/// item wider than `limit` still gets its own one-item chunk — best-effort
+/// truncation isn't attempted; `pg_notify` itself is the enforcement backstop.
+fn chunk_op_payloads(payloads: &[OpNotifyPayload], limit: usize) -> Vec<&[OpNotifyPayload]> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut running = 2; // "[" + "]"
+    for (i, payload) in payloads.iter().enumerate() {
+        let item_len = serde_json::to_string(payload).map(|s| s.len()).unwrap_or(0) + 1; // +1 for the "," separator
+        if i > start && running + item_len > limit {
+            chunks.push(&payloads[start..i]);
+            start = i;
+            running = 2;
+        }
+        running += item_len;
+    }
+    if start < payloads.len() {
+        chunks.push(&payloads[start..]);
+    }
+    chunks
 }
 
 /// Publish one write set for cross-replica subscription invalidation (ARC-001),
@@ -405,8 +464,14 @@ pub async fn run_listener(pool: PgPool, op_feed: std::sync::Arc<OpFeed>, own_ins
                     break;
                 }
             };
-            let payload = match serde_json::from_str::<OpNotifyPayload>(notif.payload()) {
-                Ok(p) => p,
+            // ARC-006: the payload is either a batch array (the current
+            // shape) or a single object (a peer mid-rolling-deploy still on
+            // the pre-batching one-NOTIFY-per-op sender). `untagged` tries
+            // each variant in turn, so both shapes decode without a version
+            // flag on the wire.
+            let payloads = match serde_json::from_str::<OpNotifyPayloadOrBatch>(notif.payload()) {
+                Ok(OpNotifyPayloadOrBatch::Batch(batch)) => batch,
+                Ok(OpNotifyPayloadOrBatch::Single(single)) => vec![single],
                 Err(e) => {
                     // A malformed payload most likely means a version skew
                     // between replicas (a newer field a peer sends that this
@@ -418,21 +483,23 @@ pub async fn run_listener(pool: PgPool, op_feed: std::sync::Arc<OpFeed>, own_ins
                     continue;
                 }
             };
-            // Self-notification dedupe: a process always receives its own
-            // `pg_notify`. The local `publish` already put this event in the
-            // ring, so re-injecting would double-count it.
-            if payload.instance_id == own_instance_id {
-                continue;
+            for payload in payloads {
+                // Self-notification dedupe: a process always receives its own
+                // `pg_notify`. The local `publish` already put this event in
+                // the ring, so re-injecting would double-count it.
+                if payload.instance_id == own_instance_id {
+                    continue;
+                }
+                let event = OpEvent {
+                    db: payload.db,
+                    table: payload.table,
+                    doc_id: payload.doc_id,
+                    kind: payload.kind,
+                    ts: payload.ts,
+                    owner: payload.owner,
+                };
+                op_feed.publish_injected(event).await;
             }
-            let event = OpEvent {
-                db: payload.db,
-                table: payload.table,
-                doc_id: payload.doc_id,
-                kind: payload.kind,
-                ts: payload.ts,
-                owner: payload.owner,
-            };
-            op_feed.publish_injected(event).await;
         }
         tracing::warn!(
             "notify listener: connection lost; reconnecting in {:?}",

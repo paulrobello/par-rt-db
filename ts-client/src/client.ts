@@ -16,6 +16,7 @@ import type {
   WorkflowSpec,
   WorkflowStatus,
 } from "./protocol.js";
+import { PROTOCOL_VERSION } from "./protocol.js";
 import type { RtQuery } from "./query.js";
 
 /** Minimal surface of a WebSocket the client depends on (browser/Node/bun compatible). */
@@ -898,8 +899,13 @@ export class RtDbClient {
       // authenticates the upgrade.
       this.send(
         this.token == null
-          ? { type: "auth", db: this.options.db }
-          : { type: "auth", token: this.token, db: this.options.db },
+          ? { type: "auth", db: this.options.db, protocolVersion: PROTOCOL_VERSION }
+          : {
+              type: "auth",
+              token: this.token,
+              db: this.options.db,
+              protocolVersion: PROTOCOL_VERSION,
+            },
       );
     };
     socket.onmessage = (ev) => this.handleMessage(ev.data);

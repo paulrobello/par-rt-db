@@ -25,8 +25,8 @@ use tokio::sync::mpsc;
 /// and the dedicated `rtdb_presence` LISTEN task is spawned.
 async fn multi_instance_state(pool: sqlx::PgPool, instance_id: &str) -> std::sync::Arc<AppState> {
     let mut cfg = test_config();
-    cfg.multi_instance = true;
-    cfg.instance_id = Some(instance_id.to_string());
+    cfg.multi_instance.enabled = true;
+    cfg.multi_instance.instance_id = Some(instance_id.to_string());
     cfg.presence_enabled = true;
     // Use a non-zero broadcast interval so the flush task is spawned normally
     // (matches real multi-instance deploy). Tests drive `flush_once` directly

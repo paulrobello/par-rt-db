@@ -114,6 +114,7 @@ from .mutation import StepResult, Transaction
 from .query import Query, TableQuery, _terminal_of, parse_result
 from .schema import SchemaDef
 from .wire import (
+    PROTOCOL_VERSION,
     BatchQueryOutcome,
     ScheduleInfo,
     ScheduleWhen,
@@ -222,7 +223,12 @@ class RtDbHttpClient:
         self._httpx = _httpx
         self._client: httpx.Client = _httpx.Client(
             base_url=base,
-            headers={"Authorization": f"Bearer {token}"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                # ARC-013: lets the server diagnose/reject a version mismatch
+                # instead of a generic 400 from `deny_unknown_fields`.
+                "X-Rtdb-Protocol": str(PROTOCOL_VERSION),
+            },
             transport=transport,
         )
         self._base = base

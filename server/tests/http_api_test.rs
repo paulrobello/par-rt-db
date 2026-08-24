@@ -147,6 +147,48 @@ async fn missing_bearer_is_unauthorized() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ARC-013: `X-Rtdb-Protocol` newer than the server's `PROTOCOL_VERSION` ->
+// 400 `UNSUPPORTED_PROTOCOL`, checked before the bearer token even resolves.
+#[tokio::test]
+async fn unsupported_protocol_header_is_rejected() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/query"))
+        .header("Authorization", "Bearer bogus-token")
+        .header("X-Rtdb-Protocol", "999")
+        .json(&json!({"db": name, "query": {"table": "workItems"}}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], "UNSUPPORTED_PROTOCOL");
+
+    Ok(())
+}
+
+// ARC-013: `X-Rtdb-Protocol` at or below the current version doesn't
+// interfere with normal auth failures (bogus token still 401).
+#[tokio::test]
+async fn supported_protocol_header_does_not_block_auth() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/query"))
+        .header("Authorization", "Bearer bogus-token")
+        .header("X-Rtdb-Protocol", "1")
+        .json(&json!({"db": name, "query": {"table": "workItems"}}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    Ok(())
+}
+
 // (c) bogus token -> 401.
 #[tokio::test]
 async fn bogus_token_is_unauthorized() -> anyhow::Result<()> {

@@ -882,7 +882,13 @@ public actor RtDbClient {
     /// the local backstop. nil when the deadline fired.
     private func authenticate(on transport: any WebSocketTransport, token: String) async -> HandshakeResult? {
         do {
-            try await transport.send(Self.frame(ClientMessage.auth(token: token, db: db)))
+            try await transport.send(
+                Self.frame(
+                    ClientMessage.auth(
+                        token: token, db: db, protocolVersion: WireProtocol.version
+                    )
+                )
+            )
         } catch {
             return .reconnect
         }
@@ -913,7 +919,7 @@ public actor RtDbClient {
             }
             guard let message = decodeServerMessage(frame) else { continue }
             switch message {
-            case let .authOk(user):
+            case let .authOk(user, _):
                 return .ok(user)
             case .authErr:
                 return .authFailed

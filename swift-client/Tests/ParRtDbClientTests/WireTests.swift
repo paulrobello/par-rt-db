@@ -66,14 +66,23 @@ struct WireTests {
     @Test func authMessageRoundTrips() throws {
         // protocol.rs client_message_wire_tags_and_fields: token form and the
         // SEC-001 phase-2 tokenless (cookie-mode) form.
-        let withToken = ClientMessage.auth(token: "t", db: "d")
+        let withToken = ClientMessage.auth(token: "t", db: "d", protocolVersion: nil)
         try expectEncodes(withToken, as: #"{"type":"auth","token":"t","db":"d"}"#)
         #expect(try roundTrip(withToken) == withToken)
 
-        let tokenless = ClientMessage.auth(token: nil, db: "d")
+        let tokenless = ClientMessage.auth(token: nil, db: "d", protocolVersion: nil)
         try expectEncodes(tokenless, as: #"{"type":"auth","db":"d"}"#)
         let parsed = try decode(ClientMessage.self, #"{"type":"auth","db":"d"}"#)
         #expect(parsed == tokenless)
+    }
+
+    @Test func authMessageProtocolVersionRoundTrips() throws {
+        // ARC-013: `protocolVersion` round-trips when present.
+        let versioned = ClientMessage.auth(token: "t", db: "d", protocolVersion: 1)
+        try expectEncodes(
+            versioned, as: #"{"type":"auth","token":"t","db":"d","protocolVersion":1}"#
+        )
+        #expect(try roundTrip(versioned) == versioned)
     }
 
     @Test func mutateOmitsIdempotencyKeyWhenNil() throws {
@@ -258,11 +267,25 @@ struct WireServerMessageTests {
         // AuthedUser.email/name are plain Options — null on the wire when
         // absent (never omitted); githubLogin/githubId are omitted (below).
         let msg = ServerMessage.authOk(
-            user: AuthedUser(kind: .user, email: "a@b.com", name: nil)
+            user: AuthedUser(kind: .user, email: "a@b.com", name: nil),
+            protocolVersion: nil
         )
         try expectEncodes(
             msg,
             as: #"{"type":"authOk","user":{"kind":"user","email":"a@b.com","name":null}}"#
+        )
+        #expect(try roundTrip(msg) == msg)
+    }
+
+    @Test func authOkProtocolVersionRoundTrips() throws {
+        // ARC-013: `protocolVersion` round-trips when present.
+        let msg = ServerMessage.authOk(
+            user: AuthedUser(kind: .machine, email: nil, name: nil),
+            protocolVersion: 1
+        )
+        try expectEncodes(
+            msg,
+            as: #"{"type":"authOk","user":{"kind":"machine","email":null,"name":null},"protocolVersion":1}"#
         )
         #expect(try roundTrip(msg) == msg)
     }

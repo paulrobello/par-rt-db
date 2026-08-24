@@ -14,10 +14,10 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// Like `oauth_state`, but lets a test disable the login-CSRF check (kill-switch).
 async fn oauth_state_with_csrf(mock: &MockServer, csrf: bool) -> (Arc<AppState>, SocketAddr) {
     let mut cfg = test_config();
-    cfg.github_base_url = mock.uri();
-    cfg.github_api_url = mock.uri();
-    cfg.github_client_id = Some("test-client".into());
-    cfg.github_client_secret = Some("test-secret".into());
+    cfg.oauth.github.base_url = mock.uri();
+    cfg.oauth.github.api_url = mock.uri();
+    cfg.oauth.github.client_id = Some("test-client".into());
+    cfg.oauth.github.client_secret = Some("test-secret".into());
     cfg.oauth_login_csrf = csrf;
 
     let pool = sqlx::PgPool::connect(&cfg.database_url)
@@ -861,8 +861,8 @@ async fn expired_session_returns_unauthorized() -> anyhow::Result<()> {
 /// Google constants (not configurable, unlike GitHub's GHE-overrideable URLs).
 async fn google_configured_state() -> (Arc<AppState>, SocketAddr) {
     let mut cfg = test_config();
-    cfg.google_client_id = Some("g-client".into());
-    cfg.google_client_secret = Some("g-secret".into());
+    cfg.oauth.google.client_id = Some("g-client".into());
+    cfg.oauth.google.client_secret = Some("g-secret".into());
     let pool = sqlx::PgPool::connect(&cfg.database_url)
         .await
         .expect("connect to test postgres");
@@ -1200,10 +1200,10 @@ async fn cross_replica_login_completes_on_second_replica() -> anyhow::Result<()>
     .await;
 
     let mut cfg = test_config();
-    cfg.github_base_url = mock.uri();
-    cfg.github_api_url = mock.uri();
-    cfg.github_client_id = Some("test-client".into());
-    cfg.github_client_secret = Some("test-secret".into());
+    cfg.oauth.github.base_url = mock.uri();
+    cfg.oauth.github.api_url = mock.uri();
+    cfg.oauth.github.client_id = Some("test-client".into());
+    cfg.oauth.github.client_secret = Some("test-secret".into());
     cfg.oauth_login_csrf = false;
 
     // One shared pool = one Postgres, as in a real multi-instance deploy.

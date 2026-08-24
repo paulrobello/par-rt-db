@@ -41,6 +41,14 @@ class _Camel(BaseModel):
     )
 
 
+#: The wire protocol version this client speaks (ARC-013). Sent as
+#: ``protocolVersion`` on the WS ``auth`` frame and as the ``X-Rtdb-Protocol``
+#: HTTP header; a server whose ``PROTOCOL_VERSION`` is older rejects a value
+#: greater than its own with ``UNSUPPORTED_PROTOCOL``. Mirrors server
+#: ``protocol::PROTOCOL_VERSION``.
+PROTOCOL_VERSION = 1
+
+
 class AuthedUser(_Camel):
     """Authenticated principal.
 
@@ -563,12 +571,19 @@ class _ClientAuth(_Camel):
     # the server/rust `skip_serializing_if = "Option::is_none"`.
     token: str | None = None
     db: str
+    # ARC-013: the protocol version this client speaks. Absent ⇒ version 1. A
+    # value greater than the server's ``PROTOCOL_VERSION`` is rejected with
+    # ``UNSUPPORTED_PROTOCOL``. Omitted on the wire when ``None``, mirroring
+    # the server/rust ``skip_serializing_if = "Option::is_none"``.
+    protocol_version: int | None = None
 
     @model_serializer(mode="wrap")
     def _drop_none_token(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
         if out.get("token") is None:
             out.pop("token", None)
+        if out.get("protocolVersion") is None:
+            out.pop("protocolVersion", None)
         return out
 
 
@@ -814,6 +829,17 @@ class BatchQueryOutcome(_Camel):
 class _ServerAuthOk(_Camel):
     type: Literal["authOk"] = "authOk"
     user: AuthedUser
+    # ARC-013: the server's ``PROTOCOL_VERSION``, present only when this
+    # client's ``auth`` frame carried ``protocolVersion``. Omitted on the wire
+    # when ``None`` (mirrors server/rust ``skip_serializing_if``).
+    protocol_version: int | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_none_protocol_version(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("protocolVersion") is None:
+            out.pop("protocolVersion", None)
+        return out
 
 
 class _ServerAuthErr(_Camel):

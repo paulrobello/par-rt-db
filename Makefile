@@ -41,39 +41,38 @@ build: ts-client-build
 	$(call SWIFT_IF_DARWIN,swift build)
 
 fmt:
-	cd server && cargo fmt --all
+	cargo fmt --all
 	cd ts-client && bun run fmt
-	cd rust-client && cargo fmt --all
-	cd cli && cargo fmt --all
 	cd dashboard && bun run fmt
 	cd python-client && uv run ruff format .
 	$(call SWIFT_IF_DARWIN,swiftformat .)
 
 fmt-check:
-	cd server && cargo fmt --all -- --check
+	cargo fmt --all -- --check
 	cd ts-client && bun run fmt-check
-	cd rust-client && cargo fmt --all -- --check
-	cd cli && cargo fmt --all -- --check
 	cd dashboard && bun run fmt-check
 	cd python-client && uv run ruff format --check .
 	$(call SWIFT_IF_DARWIN,swiftformat --lint .)
 
+# ARC-014: one workspace-level clippy invocation instead of four per-crate
+# `cd X && cargo clippy` invocations. --all-features was already applied to
+# every crate individually (core/server/rust-client/cli), so this is a
+# behavior-preserving consolidation, not a new feature combination.
 lint:
-	cd core && cargo clippy --all-targets --all-features -- -D warnings
-	cd server && cargo clippy --all-targets --all-features -- -D warnings
+	cargo clippy --workspace --all-targets --all-features -- -D warnings
 	cd ts-client && bun run lint
-	cd rust-client && cargo clippy --all-targets --all-features -- -D warnings
-	cd cli && cargo clippy --all-targets --all-features -- -D warnings
 	cd dashboard && bun run lint
 	cd python-client && uv run ruff check .
 	$(call SWIFT_IF_DARWIN,swiftlint --strict)
 
+# ARC-014: workspace-level `cargo check`. This adds --all-features to core
+# (already had it) and rust-client/cli (already had it) and now also server
+# (previously typechecked with default features only) — aligned with `lint`,
+# which has clippy'd server under --all-features all along, so this is not a
+# new feature combination for the workspace.
 typecheck: ts-client-build
-	cd core && cargo check --all-targets --all-features
-	cd server && cargo check --all-targets
+	cargo check --workspace --all-targets --all-features
 	cd ts-client && bun run typecheck
-	cd rust-client && cargo check --all-targets --all-features
-	cd cli && cargo check --all-targets --all-features
 	cd dashboard && bun run typecheck
 	cd python-client && uv run pyright
 	$(call SWIFT_IF_DARWIN,swift build)
@@ -90,12 +89,18 @@ dev-db-down:
 dev-db-clean:
 	psql "$(RTDB_TEST_DATABASE_URL)" -f scripts/dev-db-clean.sql
 
+# ARC-014: one workspace-level `cargo test` instead of four per-crate
+# invocations. --all-features is REQUIRED, not optional: rust-client declares
+# six [[test]] targets behind `required-features` (golden_vector,
+# query_combinations, semantics_corpus, hot_config_test, ws_integration,
+# http_integration). Without the flag cargo silently SKIPS those targets, which
+# would disable the wire-corpus parity enforcement that every client mirror
+# depends on. The flag also enables the server's `otel` feature, which only
+# compiles the OTLP layer — RTDB_OTEL_ENABLED still gates it at runtime, so a
+# feature-compiled test binary makes zero OTLP calls.
 test: dev-db-up
-	cd core && cargo test
-	cd server && cargo test
+	cargo test --workspace --all-features
 	cd ts-client && bun run test
-	cd rust-client && cargo test --all-features
-	cd cli && cargo test --all-features
 	cd dashboard && bun run test
 	cd python-client && uv run pytest -q
 	$(call SWIFT_IF_DARWIN,swift test)

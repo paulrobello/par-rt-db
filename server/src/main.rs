@@ -5,6 +5,8 @@
 
 use rtdb_server::{AppState, auth, build_router, config::Config, db};
 use sqlx::postgres::PgPoolOptions;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() {
@@ -34,7 +36,7 @@ async fn main() {
     // writes must reach the owning replica; automatic forwarding is the
     // follow-up. INFO (not WARN): the constraint is loud (CONFLICT errors, not
     // silent corruption) and a single instance needs no action.
-    if !config.multi_instance {
+    if !config.multi_instance.enabled {
         tracing::info!(
             "single-instance topology: multi-instance coordination (login \
              state, op-feed, presence, shared rate budgets, per-db write \
@@ -65,6 +67,14 @@ async fn main() {
         std::process::exit(1);
     });
 
+    // ARC-009: cancellation + join handles for the fire-and-forget tasks this
+    // function spawns directly (the oauth-state sweep, the webhook delivery
+    // worker, and the managed-backup task) — separate from `AppState`'s own
+    // `background` field (its tasks are spawned inside `AppState::new`).
+    // Graceful shutdown below cancels and joins both sets.
+    let main_shutdown_token = CancellationToken::new();
+    let mut main_bg_handles: Vec<JoinHandle<()>> = Vec::new();
+
     // ENH-022 Stage 1: gated background sweep of expired OAuth state rows.
     // `rtdb_auth.oauth_states` is the cross-replica login-state table; rows
     // live for the 10-minute login TTL and are also pruned opportunistically at
@@ -75,20 +85,26 @@ async fn main() {
     // best-effort (errors logged, never aborts).
     {
         let sweep_pool = pool.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            interval.tick().await; // skip the immediate first tick
-            loop {
-                interval.tick().await;
-                match auth::provider::sweep_oauth_states(&sweep_pool).await {
-                    Ok(n) if n > 0 => {
-                        tracing::debug!(expired = n, "oauth state sweep: pruned rows");
+        let token = main_shutdown_token.clone();
+        main_bg_handles.push(tokio::spawn(async move {
+            tokio::select! {
+                () = token.cancelled() => {}
+                () = async {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                    interval.tick().await; // skip the immediate first tick
+                    loop {
+                        interval.tick().await;
+                        match auth::provider::sweep_oauth_states(&sweep_pool).await {
+                            Ok(n) if n > 0 => {
+                                tracing::debug!(expired = n, "oauth state sweep: pruned rows");
+                            }
+                            Ok(_) => {}
+                            Err(err) => tracing::warn!(error = %err, "oauth state sweep failed"),
+                        }
                     }
-                    Ok(_) => {}
-                    Err(err) => tracing::warn!(error = %err, "oauth state sweep failed"),
-                }
+                } => {}
             }
-        });
+        }));
     }
 
     // Durable audit log table: only ensured when the feature is enabled at
@@ -117,7 +133,14 @@ async fn main() {
             .unwrap_or_else(|err| {
                 tracing::warn!(error = %err, "failed to backfill webhook secrets");
             });
-        tokio::spawn(rtdb_server::webhook::run_delivery_worker(pool.clone()));
+        let fut = rtdb_server::webhook::run_delivery_worker(pool.clone());
+        let token = main_shutdown_token.clone();
+        main_bg_handles.push(tokio::spawn(async move {
+            tokio::select! {
+                () = token.cancelled() => {}
+                () = fut => {}
+            }
+        }));
     }
 
     // Managed pg_dump backup task: off by default. When on, a single
@@ -125,14 +148,19 @@ async fn main() {
     // retaining the newest `backup_retention` dumps. The task sleeps in bounded
     // chunks and never aborts the server on a pg_dump/prune failure (logged +
     // continued). The connection string is passed as PG* env vars, never argv.
-    if config.backup_enabled {
+    if config.backup.enabled {
         let db_url = config.database_url.clone();
-        let dir = config.backup_dir.clone();
-        let cron = config.backup_cron.clone();
-        let retention = config.backup_retention;
-        tokio::spawn(rtdb_server::backup::run_backup_task(
-            db_url, dir, cron, retention,
-        ));
+        let dir = config.backup.dir.clone();
+        let cron = config.backup.cron.clone();
+        let retention = config.backup.retention;
+        let fut = rtdb_server::backup::run_backup_task(db_url, dir, cron, retention);
+        let token = main_shutdown_token.clone();
+        main_bg_handles.push(tokio::spawn(async move {
+            tokio::select! {
+                () = token.cancelled() => {}
+                () = fut => {}
+            }
+        }));
     } else {
         tracing::info!(
             "managed backups are disabled (RTDB_BACKUP_ENABLED is false); \
@@ -171,6 +199,10 @@ async fn main() {
 
     let port = config.port;
     let state = AppState::new(pool, config, hot);
+    // Cloned so `state` survives past `build_router` (which consumes its
+    // argument into the router's extension state) for the ARC-009 shutdown
+    // drain below — cheap, `AppState` is only ever held behind an `Arc`.
+    let shutdown_state = state.clone();
     let router = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
@@ -198,6 +230,32 @@ async fn main() {
         eprintln!("server error: {err}");
         std::process::exit(1);
     });
+
+    // ARC-009: the axum server itself has already stopped accepting new
+    // connections and drained in-flight requests (that's what
+    // `with_graceful_shutdown` resolving means) — now stop the fire-and-forget
+    // background tasks that outlive it. `AppState`'s own tasks (idle
+    // reclaimer*, presence flush, PgListener loops, rate-limit sweep, forward
+    // listener/sweeper) go through `BackgroundTasks::shutdown`; the tasks
+    // spawned directly in this function (oauth sweep, webhook delivery
+    // worker, backup task) go through `main_shutdown_token`/`main_bg_handles`.
+    // (*idle reclaimer is not yet tracked — see the ARC-009 note in
+    // `AppState::new`.)
+    let shutdown_timeout = std::time::Duration::from_secs(5);
+    main_shutdown_token.cancel();
+    for h in &main_bg_handles {
+        h.abort();
+    }
+    let n = main_bg_handles.len();
+    match tokio::time::timeout(shutdown_timeout, futures::future::join_all(main_bg_handles)).await {
+        Ok(_) => tracing::info!(count = n, "main-owned background tasks exited on shutdown"),
+        Err(_) => tracing::warn!(
+            count = n,
+            "main-owned background tasks did not exit within the shutdown timeout"
+        ),
+    }
+    shutdown_state.background.shutdown(shutdown_timeout).await;
+    tracing::info!("shutdown complete");
 }
 
 /// Resolves on SIGINT or SIGTERM, whichever arrives first. If a signal

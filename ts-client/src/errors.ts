@@ -20,6 +20,9 @@
  *   `retryAfter` (seconds).
  * - `QUOTA_EXCEEDED` (507) — ENH-011 per-database resource quota hit
  *   (tables / storage bytes / subs); carries `retryAfter` when applicable.
+ * - `UNSUPPORTED_PROTOCOL` (400) — ARC-013: the client requested a
+ *   `protocolVersion` (WS `auth` frame or the `X-Rtdb-Protocol` HTTP header)
+ *   newer than the server's.
  */
 
 export type RtDbErrorCode =
@@ -32,9 +35,17 @@ export type RtDbErrorCode =
   | "BAD_REQUEST"
   | "INTERNAL"
   | "RATE_LIMITED"
-  | "QUOTA_EXCEEDED";
+  | "QUOTA_EXCEEDED"
+  | "UNSUPPORTED_PROTOCOL";
 
-const CODES: ReadonlySet<string> = new Set<RtDbErrorCode>([
+/** Every {@link RtDbErrorCode}, in the order declared above. The single
+ *  source of truth for "is this a known code" — {@link CODES} and the
+ *  ARC-017 wire-corpus test both derive from this array, so a code added
+ *  here without a matching `wire-corpus/error-codes.json` row (or vice
+ *  versa) fails that test. TypeScript has no enum reflection, so unlike the
+ *  server's compile-enforced exhaustive match, forgetting to extend this
+ *  array is a test-time, not compile-time, catch. */
+export const ALL_ERROR_CODES: readonly RtDbErrorCode[] = [
   "UNAUTHORIZED",
   "FORBIDDEN",
   "NOT_FOUND",
@@ -45,7 +56,10 @@ const CODES: ReadonlySet<string> = new Set<RtDbErrorCode>([
   "INTERNAL",
   "RATE_LIMITED",
   "QUOTA_EXCEEDED",
-]);
+  "UNSUPPORTED_PROTOCOL",
+];
+
+const CODES: ReadonlySet<string> = new Set<RtDbErrorCode>(ALL_ERROR_CODES);
 
 export interface RtDbErrorEnvelope {
   code: RtDbErrorCode;

@@ -11,6 +11,7 @@ import type {
   WorkflowStatus,
   TransactionJson,
 } from "./protocol.js";
+import { PROTOCOL_VERSION } from "./protocol.js";
 import type { RtQuery } from "./query.js";
 
 export interface RtDbHttpClientOptions {
@@ -305,6 +306,9 @@ export class RtDbHttpClient {
       headers: {
         "content-type": "application/json",
         Authorization: `Bearer ${this.token}`,
+        // ARC-013: lets the server diagnose/reject a version mismatch instead
+        // of a generic 400 from `deny_unknown_fields`.
+        "X-Rtdb-Protocol": String(PROTOCOL_VERSION),
       },
       body: JSON.stringify(payload),
     });

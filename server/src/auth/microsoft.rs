@@ -96,12 +96,12 @@ impl OAuthProvider for MicrosoftProvider {
     }
 
     fn from_config(config: &Config) -> Option<Self> {
-        let client_id = config.microsoft_client_id.clone()?;
-        let client_secret = config.microsoft_client_secret.clone()?;
+        let client_id = config.oauth.microsoft.client_id.clone()?;
+        let client_secret = config.oauth.microsoft.client_secret.clone()?;
         Some(Self {
             client_id,
             client_secret,
-            tenant: config.microsoft_tenant.clone(),
+            tenant: config.oauth.microsoft.tenant.clone(),
         })
     }
 
@@ -559,6 +559,7 @@ fn is_email_verified(value: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::OAuthConfig;
     use crate::error::ErrorCode;
     use serde_json::json;
 
@@ -742,12 +743,12 @@ mod tests {
     fn from_config_requires_client_id_and_secret() {
         let mut cfg = base_cfg();
         assert!(MicrosoftProvider::from_config(&cfg).is_none());
-        cfg.microsoft_client_id = Some("id".into());
+        cfg.oauth.microsoft.client_id = Some("id".into());
         assert!(
             MicrosoftProvider::from_config(&cfg).is_none(),
             "still missing secret"
         );
-        cfg.microsoft_client_secret = Some("secret".into());
+        cfg.oauth.microsoft.client_secret = Some("secret".into());
         let provider = MicrosoftProvider::from_config(&cfg).expect("configured");
         // tenant defaults to "common" when RTDB_MICROSOFT_TENANT is unset.
         assert_eq!(provider.tenant, "common");
@@ -762,58 +763,23 @@ mod tests {
             database_url: "x".into(),
             admin_key: "k".into(),
             public_url: "http://localhost:0".into(),
-            github_client_id: None,
-            github_client_secret: None,
-            github_base_url: "https://github.com".into(),
-            github_api_url: "https://api.github.com".into(),
-            google_client_id: None,
-            google_client_secret: None,
-            gitlab_client_id: None,
-            gitlab_client_secret: None,
-            gitlab_base_url: "https://gitlab.com".into(),
-            oidc_client_id: None,
-            oidc_client_secret: None,
-            oidc_authorize_url: None,
-            oidc_token_url: None,
-            oidc_userinfo_url: None,
-            microsoft_client_id: None,
-            microsoft_client_secret: None,
-            microsoft_tenant: "common".into(),
-            apple_client_id: None,
-            apple_team_id: None,
-            apple_key_id: None,
-            apple_private_key: None,
+            oauth: OAuthConfig::default(),
             max_affected_docs: 100,
             auth_anonymous_enabled: false,
             anonymous_session_ttl_days: 1,
-            anonymous_rate_limit_per_ip_rpm: 0,
             static_dir: None,
             pool_max_connections: 75,
             schema_cache_max_entries: 1024,
             slow_query_ms: 0,
             slow_query_capacity: 200,
             slow_query_log_params: false,
-            rate_limit_per_token_rpm: 0,
-            rate_limit_per_db_rpm: 0,
             audit_log_enabled: false,
             oauth_login_csrf: true,
             webhooks_enabled: false,
             webhook_allow_http: false,
-            storage_rate_limit_per_ip_rpm: 0,
-            storage_require_signed_urls: false,
-            backup_enabled: false,
-            backup_cron: "0 3 * * *".into(),
-            backup_dir: "./backups".into(),
-            backup_retention: 7,
             subs_verify_skip_every: 0,
             ttl_sweep_interval_secs: 60,
             ttl_batch: 5000,
-            image_transforms_enabled: true,
-            image_max_dim: 2048,
-            image_max_pixels: 25_000_000,
-            image_cache_bytes: 256 * 1024 * 1024,
-            image_concurrency: 4,
-            image_default_quality: 80,
             presence_enabled: false,
             presence_max_state_bytes: 1024,
             presence_max_room_size: 100,
@@ -826,16 +792,44 @@ mod tests {
             presence_beat_timeout_ms: 15000,
             quota_cache_ttl_secs: 60,
             db_idle_reclaim_secs: 0,
-            admin_rate_limit_per_ip_rpm: 0,
             cookie_secure: false,
             trusted_proxy: false,
             otel_enabled: false,
             otel_endpoint: String::new(),
             otel_service_name: String::new(),
             otel_sample_ratio: 0.0,
-            multi_instance: false,
-            forward_timeout_ms: 5000,
-            instance_id: None,
+            limits: crate::config::LimitsConfig {
+                per_token_rpm: 0,
+                per_db_rpm: 0,
+                exact: false,
+                sync_ms: 1000,
+                storage_per_ip_rpm: 0,
+                anonymous_per_ip_rpm: 0,
+                admin_per_ip_rpm: 0,
+            },
+            storage: crate::config::StorageConfig {
+                require_signed_urls: false,
+                image: crate::config::ImageTransformConfig {
+                    enabled: true,
+                    max_dim: 2048,
+                    max_pixels: 25_000_000,
+                    cache_bytes: 256 * 1024 * 1024,
+                    concurrency: 4,
+                    default_quality: 80,
+                },
+            },
+            backup: crate::config::BackupConfig {
+                enabled: false,
+                cron: "0 3 * * *".into(),
+                dir: "./backups".into(),
+                retention: 7,
+            },
+            multi_instance: crate::config::MultiInstanceConfig {
+                enabled: false,
+                instance_id: None,
+                forward_timeout_ms: 5000,
+                forward_concurrency: 64,
+            },
         }
     }
 

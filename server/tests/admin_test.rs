@@ -2158,14 +2158,14 @@ async fn sec108_login_and_logout_are_not_gated() -> anyhow::Result<()> {
 }
 
 // SEC-109: rapid bad admin-key logins from one IP are rate-limited after the
-// configured threshold. With admin_rate_limit_per_ip_rpm = 3, the first 3
+// configured threshold. With limits.admin_per_ip_rpm = 3, the first 3
 // attempts are 401 (rate limiter allows, ct_eq rejects), and the 4th is 429
 // (rate limiter denies). Each failure also increments the
 // rtdb_admin_auth_failures_total counter.
 #[tokio::test]
 async fn sec109_admin_login_rate_limited_after_threshold() -> anyhow::Result<()> {
     let mut config = crate::common::test_config();
-    config.admin_rate_limit_per_ip_rpm = 3;
+    config.limits.admin_per_ip_rpm = 3;
     let pool = sqlx::PgPool::connect(&config.database_url)
         .await
         .expect("connect to test postgres");

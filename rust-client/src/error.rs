@@ -31,6 +31,11 @@ pub enum ErrorCode {
     /// Mirrors server `error::ErrorCode::QuotaExceeded` (HTTP 507). Serialized
     /// `"QUOTA_EXCEEDED"`.
     QuotaExceeded,
+    /// ARC-013: requested `protocolVersion` (WS `Auth` frame or the
+    /// `X-Rtdb-Protocol` HTTP header) is newer than the server's (HTTP 400).
+    /// Mirrors server `error::ErrorCode::UnsupportedProtocol`. Serialized
+    /// `"UNSUPPORTED_PROTOCOL"`.
+    UnsupportedProtocol,
 }
 
 /// Raw `{code, message, retryAfter?}` as it appears on the wire (HTTP body /

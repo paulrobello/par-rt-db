@@ -244,8 +244,12 @@ async fn authenticate(
         return None;
     }
 
-    let (token, db) = match serde_json::from_str::<ClientMessage>(&text) {
-        Ok(ClientMessage::Auth { token, db }) => (token, db),
+    let (token, db, protocol_version) = match serde_json::from_str::<ClientMessage>(&text) {
+        Ok(ClientMessage::Auth {
+            token,
+            db,
+            protocol_version,
+        }) => (token, db, protocol_version),
         _ => {
             fail_and_close(
                 socket,
@@ -255,6 +259,22 @@ async fn authenticate(
             return None;
         }
     };
+
+    // ARC-013: reject a client that requests a protocol version newer than
+    // this build speaks. Absent ⇒ version 1 (backward compatible).
+    if let Some(requested) = protocol_version
+        && requested > crate::protocol::PROTOCOL_VERSION
+    {
+        fail_and_close(
+            socket,
+            RtDbError::unsupported_protocol(format!(
+                "requested protocol version {requested} is newer than this server's {}",
+                crate::protocol::PROTOCOL_VERSION
+            )),
+        )
+        .await;
+        return None;
+    }
 
     // SEC-001 phase 2: a tokenless Auth authenticates from the HttpOnly
     // `rtdb_session` cookie the browser sent on the WS upgrade; an explicit
@@ -289,9 +309,18 @@ async fn authenticate(
     }
 
     let user = authed_user(&principal);
-    if send_message(socket, &ServerMessage::AuthOk { user })
-        .await
-        .is_err()
+    // Echo the server's version back only when the client signaled it
+    // understands the field (sent one, even `1`) — see `ServerMessage::AuthOk`.
+    let reported_version = protocol_version.map(|_| crate::protocol::PROTOCOL_VERSION);
+    if send_message(
+        socket,
+        &ServerMessage::AuthOk {
+            user,
+            protocol_version: reported_version,
+        },
+    )
+    .await
+    .is_err()
     {
         return None;
     }

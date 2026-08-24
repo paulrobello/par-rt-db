@@ -132,7 +132,13 @@ async def test_connect_sends_auth_then_marks_connected():
         await client.connect()
         await _drain()
         # The very first frame is the auth handshake.
-        assert json.loads(conn.sent[0]) == {"type": "auth", "token": "tok", "db": "db"}
+        # ARC-013: the client now also sends `protocolVersion` on connect.
+        assert json.loads(conn.sent[0]) == {
+            "type": "auth",
+            "token": "tok",
+            "db": "db",
+            "protocolVersion": 1,
+        }
         assert client.status().state is ConnectionState.CONNECTING
         await conn.deliver('{"type":"authOk","user":{"kind":"machine"}}')
         await _drain()
