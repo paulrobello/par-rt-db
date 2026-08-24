@@ -433,7 +433,15 @@ impl TransformCache {
             apply(&bytes_for_closure, ct_for_closure.as_deref(), &params, &cfg)
         })
         .await
-        .map_err(|e| RtDbError::internal(format!("transform join: {e}")))?;
+        .map_err(|e| {
+            // SEC-002 (same class): a `JoinError` from a panicked blocking task
+            // carries the panic payload in its `Display`, which can name a path
+            // or the input that tripped it. Route it through the same choke
+            // point as `TransformError::Internal` so the unauthenticated serve
+            // path returns only the fixed message.
+            self.metrics.record_image_transform_error();
+            internal_transform_error(db, id, &format!("transform join: {e}"))
+        })?;
         drop(permit);
         match result {
             Ok((tbytes, tct)) => {
@@ -630,6 +638,31 @@ mod tests {
         assert!(
             !err.message.contains("Jpeg") && !err.message.contains("/secret/path"),
             "internal detail leaked into the client envelope: {}",
+            err.message
+        );
+    }
+
+    /// A panicking blocking task yields a `JoinError` whose `Display` carries
+    /// the panic payload. `get_or_transform` routes that through
+    /// `internal_transform_error`, so the unauthenticated serve path sees the
+    /// same fixed message as any other internal transform failure.
+    #[tokio::test]
+    async fn join_error_message_is_generic() {
+        let join_err = tokio::task::spawn_blocking(|| -> () {
+            panic!("/secret/path/blob.jpg tripped the decoder")
+        })
+        .await
+        .expect_err("a panicking blocking task yields a JoinError");
+        let detail = format!("transform join: {join_err}");
+        assert!(
+            detail.contains("/secret/path"),
+            "the panic payload must reach the LOG side, else this test proves nothing: {detail}"
+        );
+        let err = internal_transform_error("acme", "file_123", &detail);
+        assert_eq!(err.message, "image transform failed");
+        assert!(
+            !err.message.contains("/secret/path"),
+            "panic payload leaked into the client envelope: {}",
             err.message
         );
     }
