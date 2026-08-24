@@ -2,15 +2,14 @@
 //! verified with `jsonwebtoken` (RS256 against the tenant JWKS); the
 //! client_secret is app-registered. See `docs/OAUTH_SETUP.md`.
 
-use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use moka::future::Cache;
 use serde::Serialize;
 use sqlx::PgPool;
 
 use crate::AppState;
+use crate::auth::jwks;
 use crate::auth::provider::OAuthProvider;
 use crate::auth::session;
 use crate::config::Config;
@@ -89,17 +88,6 @@ struct MicrosoftIdentity {
     /// allowlist/admin matching and cross-provider linking.
     email_domain_verified: bool,
 }
-
-/// Cached Microsoft JWKS (JSON Web Key Set), keyed by tenant id. Providers are
-/// constructed per request (`from_config`), so a struct field could not hold
-/// the cache across requests — a module-level static does. TTL bounds the
-/// stale-key window; a refresh falls out naturally when an entry expires.
-static JWKS_CACHE: LazyLock<Cache<String, Arc<serde_json::Value>>> = LazyLock::new(|| {
-    Cache::builder()
-        .time_to_live(Duration::from_secs(3600))
-        .max_capacity(64)
-        .build()
-});
 
 #[async_trait]
 impl OAuthProvider for MicrosoftProvider {
@@ -422,85 +410,32 @@ async fn verify_id_token(
         return Err(forbidden("id_token tenant mismatch"));
     }
 
-    let jwks = fetch_jwks(http, tid).await?;
-    let key_obj = jwks
-        .get("keys")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| {
-            arr.iter().find(|k| {
-                k.get("kid").and_then(|v| v.as_str()) == Some(kid)
-                    && k.get("kty").and_then(|v| v.as_str()) == Some("RSA")
-            })
-        })
-        .ok_or_else(|| {
-            tracing::warn!(kid = %kid, tid = %tid, "microsoft id_token kid not in JWKS");
-            forbidden("id_token signature verification failed")
-        })?;
-    let n = key_obj
-        .get("n")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| forbidden("JWKS key missing n"))?;
-    let e = key_obj
-        .get("e")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| forbidden("JWKS key missing e"))?;
-    let decoding_key = jsonwebtoken::DecodingKey::from_rsa_components(n, e).map_err(|err| {
-        tracing::warn!(error = %err, "microsoft JWKS key decode failed");
-        forbidden("id_token signature verification failed")
-    })?;
+    let jwks = jwks::fetch(
+        http,
+        &jwks_url(tid),
+        "microsoft id_token verification failed",
+    )
+    .await?;
+    let key = jwks::select_key(&jwks, kid, "id_token signature verification failed")?;
 
     // Microsoft v2.0 issuer is per-tenant; v1.0 uses sts.windows.net. Accept
     // the v2.0 form (the only form the v2.0 endpoints emit) — a v1.0 token on
     // a v2.0 flow is itself suspicious and rejecting it is the safe posture.
     let expected_iss = format!("https://login.microsoftonline.com/{tid}/v2.0");
 
-    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
-    validation.set_issuer(&[&expected_iss]);
-    validation.set_audience(&[client_id]);
-    // Require iss + aud + exp to be present and valid (exp is required by
-    // default; iss/aud validate-but-not-required by default).
-    validation.required_spec_claims.insert("iss".to_string());
-    validation.required_spec_claims.insert("aud".to_string());
-
-    let token_data =
-        jsonwebtoken::decode::<serde_json::Value>(id_token, &decoding_key, &validation).map_err(
-            |err| {
-                tracing::warn!(error = %err, "microsoft id_token verification failed");
-                forbidden("id_token signature verification failed")
-            },
-        )?;
-
-    Ok(token_data.claims)
+    jwks::decode_verified(
+        id_token,
+        &key,
+        &expected_iss,
+        client_id,
+        "id_token signature verification failed",
+    )
 }
 
-/// Fetches the JWKS for a tenant, caching the parsed key set for one hour. The
-/// cache is keyed by tenant id so multiple tenants (a `common` deployment) do
-/// not collide. Fail-closed: any network/decode error rejects the login.
-async fn fetch_jwks(
-    http: &reqwest::Client,
-    tid: &str,
-) -> Result<Arc<serde_json::Value>, RtDbError> {
-    if let Some(cached) = JWKS_CACHE.get(tid).await {
-        return Ok(cached);
-    }
-    let url = format!("https://login.microsoftonline.com/{tid}/discovery/v2.0/keys");
-    let jwks: serde_json::Value = http
-        .get(&url)
-        .send()
-        .await
-        .map_err(|err| {
-            tracing::warn!(error = %err, "microsoft JWKS fetch request failed");
-            RtDbError::internal("microsoft id_token verification failed")
-        })?
-        .json()
-        .await
-        .map_err(|err| {
-            tracing::warn!(error = %err, "microsoft JWKS decode failed");
-            RtDbError::internal("microsoft id_token verification failed")
-        })?;
-    let jwks = Arc::new(jwks);
-    JWKS_CACHE.insert(tid.to_string(), Arc::clone(&jwks)).await;
-    Ok(jwks)
+/// Microsoft's per-tenant JWKS endpoint. The shared cache is keyed by this URL,
+/// so two tenants (a `common` deployment) cannot collide on one entry.
+fn jwks_url(tid: &str) -> String {
+    format!("https://login.microsoftonline.com/{tid}/discovery/v2.0/keys")
 }
 
 fn forbidden(msg: &'static str) -> RtDbError {
@@ -975,12 +910,7 @@ mod tests {
     /// returns the tid, so `verify_id_token` resolves the key with no network.
     async fn seed_jwks_for(key: &rsa::RsaPrivateKey, kid: &str) -> String {
         let tid = unique_tid();
-        JWKS_CACHE
-            .insert(
-                tid.clone(),
-                Arc::new(json!({"keys": [jwks_entry(key, kid)]})),
-            )
-            .await;
+        jwks::seed_for_test(&jwks_url(&tid), json!({"keys": [jwks_entry(key, kid)]})).await;
         tid
     }
 
@@ -1114,61 +1044,32 @@ mod tests {
         let key = fresh_rsa_key();
         let http = reqwest::Client::new();
 
-        // No "n" component.
-        let tid = unique_tid();
-        JWKS_CACHE
-            .insert(
-                tid.clone(),
-                Arc::new(json!({"keys": [{"kty": "RSA", "kid": "k", "e": "AQAB"}]})),
+        // SEC-004: every malformed-JWKS shape now yields the same generic
+        // message. The old per-field text ("JWKS key missing n"/"…e") told a
+        // caller which component was absent; the shared `jwks::select_key`
+        // logs that detail and returns one fixed string instead.
+        let malformed = [
+            // No "n" component.
+            json!({"keys": [{"kty": "RSA", "kid": "k", "e": "AQAB"}]}),
+            // No "e" component.
+            json!({"keys": [{"kty": "RSA", "kid": "k", "n": b64url(&key.n().to_bytes_be())}]}),
+            // "n" present but not base64 — the decoding key cannot be built.
+            json!({"keys": [{"kty": "RSA", "kid": "k", "n": "!!not-base64!!", "e": "AQAB"}]}),
+        ];
+        for entry in malformed {
+            let tid = unique_tid();
+            jwks::seed_for_test(&jwks_url(&tid), entry).await;
+            let err = verify_id_token(
+                &http,
+                &sign_rs256_jwt(&key, "k", &ms_claims(&tid, 3600)),
+                TEST_CLIENT_ID,
+                "common",
             )
-            .await;
-        let err = verify_id_token(
-            &http,
-            &sign_rs256_jwt(&key, "k", &ms_claims(&tid, 3600)),
-            TEST_CLIENT_ID,
-            "common",
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.message, "JWKS key missing n");
-
-        // No "e" component.
-        let tid = unique_tid();
-        JWKS_CACHE
-            .insert(
-                tid.clone(),
-                Arc::new(json!({"keys": [{"kty": "RSA", "kid": "k",
-                        "n": b64url(&key.n().to_bytes_be())}]})),
-            )
-            .await;
-        let err = verify_id_token(
-            &http,
-            &sign_rs256_jwt(&key, "k", &ms_claims(&tid, 3600)),
-            TEST_CLIENT_ID,
-            "common",
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.message, "JWKS key missing e");
-
-        // "n" present but not base64 — the decoding key cannot be built.
-        let tid = unique_tid();
-        JWKS_CACHE
-            .insert(
-                tid.clone(),
-                Arc::new(json!({"keys": [{"kty": "RSA", "kid": "k",
-                    "n": "!!not-base64!!", "e": "AQAB"}]})),
-            )
-            .await;
-        let err = verify_id_token(
-            &http,
-            &sign_rs256_jwt(&key, "k", &ms_claims(&tid, 3600)),
-            TEST_CLIENT_ID,
-            "common",
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.message, "id_token signature verification failed");
+            .await
+            .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(err.message, "id_token signature verification failed");
+        }
     }
 
     #[tokio::test]
@@ -1231,17 +1132,16 @@ mod tests {
     #[tokio::test]
     async fn fetch_jwks_returns_a_cached_key_set_without_a_network_round_trip() {
         let tid = unique_tid();
-        let jwks = Arc::new(json!({"keys": [{"kty": "RSA", "kid": "k"}]}));
-        JWKS_CACHE.insert(tid.clone(), Arc::clone(&jwks)).await;
+        let url = jwks_url(&tid);
+        jwks::seed_for_test(&url, json!({"keys": [{"kty": "RSA", "kid": "k"}]})).await;
 
-        let fetched = fetch_jwks(&reqwest::Client::new(), &tid)
+        // A cache hit must not touch the network: this client cannot reach
+        // login.microsoftonline.com at all, so a miss would be an error.
+        let fetched = jwks::fetch(&reqwest::Client::new(), &url, "unused")
             .await
             .expect("cache hit");
 
-        assert!(
-            Arc::ptr_eq(&fetched, &jwks),
-            "the cached Arc must be returned as-is, not re-fetched"
-        );
+        assert_eq!(fetched["keys"][0]["kid"], "k");
     }
 
     // --- upsert_user (shared dev Postgres; every value uuid-unique) ---------
