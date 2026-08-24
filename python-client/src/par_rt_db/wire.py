@@ -71,21 +71,51 @@ class AuthedUser(_Camel):
 
 
 class AfterMs(_Camel):
+    """Fire once, ``ms`` milliseconds from now.
+
+    Attributes:
+        ms: Delay in milliseconds from the scheduling moment.
+    """
+
     type: Literal["afterMs"] = "afterMs"
     ms: int
 
 
 class RunAt(_Camel):
+    """Fire once, at a specific UTC epoch-ms instant.
+
+    A timestamp already in the past fires immediately.
+
+    Attributes:
+        ms: Target UTC epoch-ms instant.
+    """
+
     type: Literal["runAt"] = "runAt"
     ms: int
 
 
 class Cron(_Camel):
+    """Fire repeatedly on a 5-field cron schedule (UTC, minute-first).
+
+    Attributes:
+        expr: The cron expression.
+    """
+
     type: Literal["cron"] = "cron"
     expr: str
 
 
 class Interval(_Camel):
+    """Fire repeatedly, every ``every_ms`` milliseconds.
+
+    The first fire is one interval from now. Missed windows (downtime,
+    pause) are skipped, never backfilled — each fire re-arms from its
+    actual fire time, like cron recompute.
+
+    Attributes:
+        every_ms: Fixed recurrence interval in milliseconds.
+    """
+
     type: Literal["interval"] = "interval"
     every_ms: int
 
@@ -729,6 +759,16 @@ ClientMessage = Annotated[
 
 
 class PresenceMember(_Camel):
+    """One entry in a presence room's member list.
+
+    Attributes:
+        connection_id: The opaque, unique-per-session key.
+        user: Display identity for this member.
+        state: Opaque client-supplied blob. Always present on the wire —
+            ``None`` serializes as JSON ``null``, mirroring the server's
+            ``serde_json::Value`` which has no notion of absence.
+    """
+
     connection_id: str
     user: AuthedUser
     state: Any

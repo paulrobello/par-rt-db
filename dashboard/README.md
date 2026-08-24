@@ -44,8 +44,8 @@ make build            # builds the linked SDK, then vite build → dist/
 ```
 
 `dist/` is what gets mounted at `RTDB_STATIC_DIR` on the server (hashed assets
-→ immutable cache; `index.html` → no-cache). See the server `CLAUDE.md` static
-hosting note.
+→ immutable cache; `index.html` → no-cache). See the root `CLAUDE.md` "Dashboard
+SPA" note for how the router serves it as the last fallback route.
 
 ## Verify
 
@@ -66,27 +66,41 @@ sections above.
 
 Two login methods, both funneled through `authenticate_admin` on the server:
 
+Both paths set an HttpOnly `rtdb_session` cookie — `POST /admin/login` for the
+admin key, the OAuth callback for a session token — so no dashboard credential
+is ever readable from JavaScript (`SEC-001`). The browser sends the cookie on
+same-origin requests, including the `/admin/stream` and `/sync` WebSocket
+upgrades, and admin requests carry a matching `X-Rtdb-Csrf` header read from
+the (non-HttpOnly) `rtdb-admin-csrf` cookie.
+
 - **Admin key** — paste a value of `RTDB_ADMIN_KEY` (the boot env var set on
   the server). Covers the control plane (databases, schema, metrics, op feed,
-  config, admins) via the HTTP `/admin/*` API. The raw key is **not** accepted
-  on `/sync`, so the **data browser falls back to ~2s polling** of
-  `POST /admin/db/{db}/query` rather than subscribing.
+  config, admins) via the HTTP `/admin/*` API. The admin-key cookie is **not**
+  accepted on `/sync`, so the **data browser falls back to stream-driven
+  refresh with polling** (see below) instead of subscribing.
 - **OAuth (GitHub / Google / GitLab / Microsoft / Apple / OIDC)** — sign in
   with an account whose email is on the `RTDB_ADMIN_EMAILS` allowlist (or has
   been added via the Admins page since boot). Available providers are those
   whose env-var pairs are set on the server (each is independently optional).
-  The session token issued by `/auth/*` **is** accepted on `/sync`, so the
+  The session cookie issued by `/auth/*` **is** accepted on `/sync`, so the
   **data browser subscribes for true realtime**.
 
 The two methods differ only in how the data browser reads documents; the op
 feed, metrics, and database list stream over the same `/admin/stream`
-WebSocket either way (the admin bearer rides the `Sec-WebSocket-Protocol`
-subprotocol).
+WebSocket either way, authenticated by the same session cookie (no
+subprotocol involved).
 
-Regardless of method, the admin bearer lives only in React state — reload the
-page and you re-authenticate (a deliberate trade-off against `localStorage`
-theft; see `SEC-001`). Sign out clears it from memory and, for OAuth,
-best-effort calls `POST /auth/logout`.
+For the non-OAuth data browser, a matching op frame on `/admin/stream`
+triggers a refresh within the stream's push latency; a 2-second poll only
+arms as a fallback while the stream is not `"connected"` (`ARC-123`), so a
+dropped socket doesn't silently stale the view.
+
+Because the session lives in an HttpOnly cookie, the dashboard restores it on
+reload: on mount it calls `GET /auth/me`, which resolves an OAuth session from
+the cookie automatically. Admin-key sessions have no resolvable identity, so a
+reload re-prompts for the key. Sign out clears local state and, for OAuth,
+best-effort calls `POST /auth/logout` (admin key: `POST /admin/logout`) to
+expire the cookie server-side.
 
 ### The dashboard surfaces
 
@@ -100,7 +114,7 @@ a database. Twenty-one routes mirror the admin API surface:
 | **Schema** | `/dbs/:db/schema` | The pushed schema for one database (tables, fields, indexes, `ownerField`/`collaboratorsField`/`authorize`, `ttl`). |
 | **Schema history** | `/dbs/:db/schema/history` | Newest-first schema snapshots; diff against the current shape; restore-confirm to reconcile. |
 | **Migrate** | `/dbs/:db/migrate` | Guided destructive-shape migrate (dry-run → review → apply); see [Schema migration](#schema-migration-guided) below. |
-| **Data browser** | `/dbs/:db/tables/:table` | Live documents in one table. OAuth = realtime over `/sync`; admin-key = ~2s poll. Insert/patch/delete under the `RTDB_MAX_AFFECTED_DOCS` cap. |
+| **Data browser** | `/dbs/:db/tables/:table` | Live documents in one table. OAuth = realtime over `/sync`; admin-key = stream-driven refresh with a 2-second poll fallback (see [Logging in](#logging-in)). Insert/patch/delete under the `RTDB_MAX_AFFECTED_DOCS` cap. |
 | **Metrics** | `/metrics` | Server-wide gauges (queries, mutations, uploads, pool size/idle, uptime) + quota-rejection counters (`rtdb_quota_rejections_total{kind=tables\|storage\|subs}`). |
 | **Op feed** | `/ops` | Newest-first document operations across all databases (`GET /admin/ops/recent`). Also streamed live into the right rail. |
 | **Scheduled jobs** | `/scheduled` | Lists scheduled/cron jobs across databases; cancel/pause/resume controls. |

@@ -1,5 +1,14 @@
 # par-rt-db — Self-Hosted Realtime Document DB (Design Spec)
 
+> **Historical design record.** This is the original 2026-07-21 design spec, kept
+> for provenance. It is superseded by [`README.md`](../../../README.md),
+> [`FEATURE_MATRIX.md`](../../../FEATURE_MATRIX.md),
+> [`docs/ARCHITECTURE.md`](../../ARCHITECTURE.md), and
+> [`wire-corpus/`](../../../wire-corpus/README.md). Details below — client
+> counts, shipped provider lists, package paths, the "multi-node is a non-goal"
+> position, and the deployment topology — no longer describe the system. Do not
+> use it as a protocol or semantics reference.
+
 **Date:** 2026-07-21
 **Status:** Implemented — server is live at `rtdb.example.com`. See `FEATURE_MATRIX.md` §1 ("At parity today") and §2 (ranked gap matrix, all 26 rows ✅). Originally scoped as MVP-only; every "out of scope" item below has since shipped as a follow-on spec. Authoritative current source of truth: the code (`server/src/`, `ts-client/`, `rust-client/`, `python-client/`) and `FEATURE_MATRIX.md`, not this document.
 **Repo:** `~/Repos/par-rt-db`

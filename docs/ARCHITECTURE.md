@@ -4,11 +4,18 @@ How the server is actually built: the committer, the per-database background
 tasks, the data pipeline, transports, auth, storage, quotas, and the admin
 surface. Written for contributors and agents changing server internals;
 [`../CLAUDE.md`](../CLAUDE.md) holds the agent guidance and the invariant list,
-and the root [`../README.md`](../README.md) holds the HTTP/WS surface. The main
-spec
+and the root [`../README.md`](../README.md) holds the HTTP/WS surface.
+
+The protocol and semantics are defined by the code and by three documents that
+track it: [`../README.md`](../README.md) (HTTP/WS surface, DSL, configuration),
+[`../FEATURE_MATRIX.md`](../FEATURE_MATRIX.md) (the Convex-parity contract), and
+[`../wire-corpus/README.md`](../wire-corpus/README.md) (the executable semantics
+corpus every implementation must pass). The 2026-07-21 design spec
 ([`superpowers/specs/2026-07-21-par-rt-db-design.md`](superpowers/specs/2026-07-21-par-rt-db-design.md))
-is the authoritative protocol/semantics source — when code and spec disagree,
-the code wins; fix the spec.
+is a historical record of the original design, not a current reference.
+
+Unless a path says otherwise, bare `.rs` file references in this document are
+relative to `server/src/`.
 
 ## Table of contents
 
@@ -17,9 +24,11 @@ the code wins; fix the spec.
 - [Data pipeline](#data-pipeline)
 - [Image transforms](#image-transforms)
 - [Transports and rate limiting](#transports-and-rate-limiting)
+- [Multi-instance coordination](#multi-instance-coordination)
 - [Auth](#auth)
 - [File storage](#file-storage)
 - [Per-database resource quotas](#per-database-resource-quotas)
+- [Realtime presence](#realtime-presence)
 - [Wire contract and clients](#wire-contract-and-clients)
 - [Admin surface and the op-feed tap](#admin-surface-and-the-op-feed-tap)
 - [Backups and restore](#backups-and-restore)
@@ -37,6 +46,30 @@ only on change. Subscription registration rides the same queue.
 COMMITTED with no row locking. Never call `execute_txn` outside the committer;
 never add a second writer.
 
+One write, end to end:
+
+```mermaid
+sequenceDiagram
+    participant T as Transport (ws.rs / http_api.rs)
+    participant C as Committer task (per-db)
+    participant PG as Postgres
+    participant S as Subscribers
+
+    T->>C: CommitterRequest::Mutate (via Committers::mutate)
+    Note over C: the queue is the serialization —<br/>one message at a time, no locking needed
+    C->>PG: execute_txn (READ COMMITTED)
+    PG-->>C: write set
+    C->>C: publish_taps — op feed, audit log,<br/>webhook outbox, cross-replica NOTIFY
+    C->>PG: fan_out: re-run affected subscriptions
+    C->>S: push only the queries whose value changed
+    C-->>T: TxnOutcome
+    Note over C: only now does the next message dequeue
+```
+
+Taps and fan-out both happen *before* the next message is dequeued. That
+ordering is why a subscriber can never observe a write out of order with
+respect to a later one.
+
 ```mermaid
 graph TD
     subgraph transports["Two transports, one vocabulary"]
@@ -49,14 +82,15 @@ graph TD
     WS -->|"CommitterRequest::Mutate"| CO
     HTTP -->|"Committers::mutate (same arm)"| CO
 
-    subgraph arms["Seven handle_* arms — every durable-write path"]
+    subgraph arms["Eight handle_* arms — every durable-write path"]
         A1["handle_mutate"]
         A2["handle_scheduled"]
         A3["handle_migrate"]
         A4["handle_reaper"]
-        A5["handle_restore_schema"]
-        A6["handle_merge_users"]
-        A7["handle_workflow_advance"]
+        A5["handle_push_schema"]
+        A6["handle_restore_schema"]
+        A7["handle_merge_users"]
+        A8["handle_workflow_advance"]
     end
 
     CO --> arms
@@ -140,8 +174,8 @@ a correctness defect, not a tuning signal.
 
 ### Schema migrate rides the same queue
 
-Schema migrate is a third committer request arm (`CommitterRequest::RunMigrate`,
-handled by `handle_migrate`) alongside `handle_mutate`/`handle_scheduled`:
+Schema migrate is its own committer request arm (`CommitterRequest::RunMigrate`,
+handled by `handle_migrate`), one of the eight that publish taps:
 `POST /admin/db/{db}/migrate` enqueues an ordered `Directive` list and the
 committer executes the DDL + DML in its serialized turn, then `fan_out`s and
 publishes at the same tap sites — so the op-feed/audit/webhook "every durable
@@ -237,7 +271,7 @@ runs only in `handle_reaper` inside the committer turn.
 
 ## Data pipeline
 
-`schema.rs` → `ddl.rs` → `txn.rs`/`query.rs`. A pushed schema compiles to
+`schema.rs` → `ddl.rs` → `txn.rs`/`query/`. A pushed schema compiles to
 Postgres DDL — one typed column per indexed field, documents stored as `doc`
 jsonb with system fields merged in at read time, schema changes additive-only.
 
@@ -258,6 +292,8 @@ graph LR
     subgraph global["Server-wide schemas"]
         direction TB
         AUTH["rtdb_auth.* — databases, users, sessions, admin_sessions,<br />allowlist, machine_tokens, admins, oauth_states"]
+        RATE["rtdb_auth.rate_counters — fleet-wide rate budgets<br />(one ceiling per route/token/db/ip)"]
+        FWD["rtdb_auth.forward_queue — spooled forward requests + replies<br />(the NOTIFY carries only a row id)"]
         SIDX["rtdb.storage_index — storage id → owning db"]
         CFG["rtdb_config — single-row hot config"]
         AUD["rtdb.audit_log — best-effort per-DocOp rows"]
@@ -271,7 +307,7 @@ graph LR
     classDef glob fill:#1E1E1E,stroke:#FFC107,stroke-width:2px,color:#E6E6E6
     class DOC doc
     class SCHED,WFS,STOR,CHUNK,MUT,HIST,META side
-    class AUTH,SIDX,CFG,AUD,WHK glob
+    class AUTH,RATE,FWD,SIDX,CFG,AUD,WHK glob
 ```
 
 - **Indexes**: a btree index may declare `unique` + a partial `where` predicate
@@ -392,12 +428,150 @@ transport wrote.
 HTTP requests are optionally rate-limited per machine-token and per-db
 (`RTDB_RATE_LIMIT_PER_TOKEN_RPM` / `RTDB_RATE_LIMIT_PER_DB_RPM`, 0 =
 off/default; over-limit → 429 `RATE_LIMITED` + `Retry-After`; in-memory
-fixed-window `RateLimiter` on `AppState`, checked after `authorize`; the same
+fixed-window `RateLimiter` on `AppState`, checked after `authorize`;
+rate-limit keys are namespaced by route as well as principal, so a burst
+against one endpoint cannot exhaust another endpoint's budget; the same
 limiter also covers inbound WS `Mutate`/`Subscribe` frames (after the per-op
 `authorize` re-run): a denial replies with a `RATE_LIMITED` `MutateErr`/
 `SubscribeErr` carrying `retryAfter` and the connection stays open; the
 per-connection WS frame cap (200 msgs/10s, closes the socket) is a separate
 coarse flood valve).
+
+## Multi-instance coordination
+
+Under `RTDB_MULTI_INSTANCE` (default false) several server processes share one
+Postgres and coordinate entirely through it — no consensus layer, no extra
+service, and no second writer. Everything below is inert in a single-instance
+deploy: the publish taps skip the NOTIFY calls and the listener tasks are never
+spawned.
+
+### The ownership lease
+
+`committer/lease.rs`. `db_ownership_key(db)` derives a stable `i64` from the
+first eight bytes of the database name's SHA-256. `acquire_ownership_lease`
+opens a dedicated pool with `max_connections(1)`, `min_connections(1)`, and no
+idle or lifetime timeout, then runs `pg_try_advisory_lock(key)` on it. The
+caller runs that database's committer **and all of its pollers** on this pool,
+so the lease and every write share one Postgres backend.
+
+That single-backend coupling is what makes the guarantee structural rather than
+procedural:
+
+- No other replica can acquire the lock mid-flight, so split-brain is
+  impossible by construction — there is no fencing token to get wrong.
+- An owner's death (`kill -9`, container stop, a partition that drops the
+  session) ends the backend's session, which releases the advisory lock.
+  Failover is the next replica's ordinary acquire path; there is no separate
+  recovery routine.
+- A failed acquire holds nothing: the connection returns to its pool and is
+  closed with it.
+
+A replica that does not hold the lease runs a **shadow** committer for that
+database. A shadow serves reads, live subscriptions, and presence normally. It
+never calls `execute_txn`.
+
+### Forwarding a write to the owner
+
+`committer/forwarding.rs` (origin side) and `forward.rs` (transport). A write
+submitted to a shadow committer is forwarded:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Shadow replica
+    participant Q as rtdb_auth.forward_queue
+    participant O as Owner replica
+
+    C->>S: mutate
+    S->>Q: INSERT request row (payload jsonb)
+    S->>O: NOTIFY rtdb_write_fwd (row id only)
+    Note over O: every replica reads the row;<br/>non-owners drop it silently
+    O->>O: execute inside the committer turn
+    O->>Q: INSERT reply row (TxnOutcome)
+    O->>S: NOTIFY rtdb_write_replies (row id only)
+    S->>Q: DELETE … RETURNING (claim = target filter)
+    S->>C: owner's outcome
+    S->>S: re-run local subscriptions against the write set
+```
+
+Exactly one execution happens per forwarded write regardless of fleet size:
+every replica reads the request row, and every replica that does not hold the
+lease on `request.db` drops it.
+
+**Why the spool.** A `pg_notify` payload is capped at 8000 bytes and Postgres
+rejects anything larger. A full `ForwardRequest` can carry up to 1024
+transaction steps, an entire `SchemaDef`, or a `MigrateRequest`, and a reply
+carries a whole `TxnOutcome` — all of which routinely exceed the cap. Sending
+only a 36-byte row id and keeping the body in `rtdb_auth.forward_queue`
+removes the size ceiling entirely, and it makes forwarded work durable across a
+listener reconnect. `run_forward_sweeper` reclaims rows a crashed consumer left
+behind.
+
+**Trust.** The `PrincipalCtx` that authorized the write at the edge travels in
+the payload and the owner reuses it verbatim, so per-row `ownerField` /
+`authorize` rules evaluate against the identity that actually made the call.
+NOTIFY is writable only by sessions holding Postgres credentials — the same
+trust domain as the tables themselves — so a peer that could forge a forwarded
+write could already write directly. Rate limits stay enforced at the origin
+(the client-facing edge); quotas stay enforced inside the owner's turn.
+
+### Takeover and idempotency
+
+If no owner answers within `RTDB_FORWARD_TIMEOUT_MS` (default 5000, clamped to
+a 100 ms floor), the origin attempts the lease takeover itself and re-submits
+the request. That is the same acquire path as any other failover.
+
+The re-submit is what makes idempotency necessary: an owner that executed and
+then died, or replied late, would otherwise have its write applied twice. So a
+forwarded `Mutate` carrying no client idempotency key is given a server-minted
+UUIDv7 key, threaded through both the forward payload and the takeover
+re-submit. The dedup table is shared by every replica, so the takeover replays
+the owner's first outcome instead of writing again. The non-`Mutate` arms are
+idempotent by construction.
+
+What the *client* observes is still ambiguous in the timeout window — the write
+may have committed even though the caller saw `CONFLICT`. A caller that must
+distinguish the two sends its own idempotency key and retries with it.
+
+### Cross-replica subscription invalidation
+
+`notify.rs`, `publish_write_set` / `run_write_set_listener`. Without this, a
+subscriber connected to replica B would never learn about a write the owner
+executed on replica A — a silently stale live query, which is the one failure
+mode this project treats as a correctness defect rather than a tuning signal.
+
+Every durable write publishes its write set on `rtdb_write_sets`, and each
+replica re-runs the subscriptions that write touched. Scheduled jobs, TTL
+expiry, and migrations invalidate the same way, because they all publish at the
+same tap sites.
+
+Two details shape what the receiving replica can do with the payload:
+
+- **Size.** Write sets serializing above `WRITE_SET_INLINE_LIMIT` (7500 bytes,
+  leaving headroom under the 8000-byte cap for multi-byte escaping) travel
+  through the forward spool instead of inline.
+- **Values.** `WriteSet::doc_values` is `#[serde(skip)]`, so document values
+  never cross the wire. `Indexed` and `Ordered` subscriptions on the receiving
+  replica therefore fall back to their conservative "unrankable ⇒ re-run" path.
+  The cost is extra re-runs; a missed push is not possible.
+
+### Everything else that coordinates
+
+| Channel / table | Carries | Module |
+| --- | --- | --- |
+| `rtdb_ops` | Op-feed events, so `/admin/stream` on any replica shows every replica's writes | `notify.rs` (`publish_ops` / `run_listener`) |
+| `rtdb_presence` | Per-room member snapshots (gated on presence also being enabled) | `notify.rs` (`run_presence_listener`) |
+| `rtdb_write_sets` | Subscription invalidation | `notify.rs` |
+| `rtdb_write_fwd` / `rtdb_write_replies` | Forward request and reply row ids | `forward.rs` |
+| `rtdb_auth.rate_counters` | One rate-limit ceiling per route/token/db/ip across the fleet, rather than one per process | `rate_limit.rs` |
+| `rtdb_auth.forward_queue` | Forward request and reply bodies | `forward.rs`, `db.rs` |
+
+Sessions and OAuth state need no channel — they already live in `rtdb_auth`.
+
+**Self-dedupe.** Postgres delivers a session's own `pg_notify` back to that
+session, so every payload carries its origin `instance_id` and every listener
+skips its own echo. Without it a local write would land in the op-feed ring
+twice and double `/admin/stream`'s event count.
 
 ## Auth
 
@@ -411,7 +585,7 @@ session expiry take effect on open connections.
 
 On top of the db-level gate:
 
-- **`ownerField`** (`schema.rs`, enforced in `query.rs`/`txn.rs`/`subs.rs`): an
+- **`ownerField`** (`schema.rs`, enforced in `query/`/`txn.rs`/`subs.rs`): an
   authenticated user reads/mutates only rows they own, or rows that list them
   in a declared `collaboratorsField` (an optional array-of-strings field) —
   owner OR collaborator (inserts are server-stamped; `patch`/`replace`/
@@ -481,7 +655,7 @@ schema (3F000/42P01 on `meta`) to "no schema", so every schema-loading arm
 reports the db as absent rather than a generic 500. Spec:
 [`superpowers/specs/2026-08-14-anon-merge-design.md`](superpowers/specs/2026-08-14-anon-merge-design.md).
 ts-client exposes it as `useRtDbAuth().signInAnonymous()`; rust/python clients
-are machine-side and out of scope. See FEATURE_MATRIX #20.
+are machine-side and out of scope. See FEATURE_MATRIX #35.
 
 ### Active session management
 
@@ -581,6 +755,29 @@ per-db labels would blow up cardinality). `db_stats` exposes quota+usage;
 mirrored across all four clients (`HotConfig`/`HotConfigPatch` +
 `QUOTA_EXCEEDED`).
 
+## Realtime presence
+
+`presence.rs`. Presence is deliberately the one live subsystem that does **not**
+go through the committer: it is transient, in-memory, and connection-bound.
+Nothing is persisted, so nothing needs serializing against document writes.
+
+A room is a `(db, room)` pair holding one entry per `/sync` connection. State
+arrives on the `presenceState` frame, is broadcast over each connection's
+existing `out_tx`, and disappears when the connection closes — the WS lifecycle
+is the only membership authority. Entries may also carry a `ttlMs` so a
+connection that stops refreshing ages out without disconnecting.
+
+Every dimension is bounded by boot-only `PresenceConfig` fields
+(`RTDB_PRESENCE_*`): state bytes per member, members per room, rooms per
+connection, bytes per room, broadcast interval, updates per second, and maximum
+TTL. Presence is off by default; when disabled the frames answer
+`PRESENCE_DISABLED`.
+
+Under `RTDB_MULTI_INSTANCE` each replica republishes its **full** local
+membership for a room on `rtdb_presence` at a configured cadence. A full
+snapshot rather than a delta, because a snapshot is idempotent and needs no
+reconciliation, and rooms are capped small enough for it to stay cheap.
+
 ## Wire contract and clients
 
 `server/src/protocol.rs`, `ts-client/src/protocol.ts`,
@@ -606,25 +803,48 @@ its HTTP/admin/storage surfaces ship (a sync `httpx` client —
 an in-memory test harness — the four clients are now at feature parity.
 `FEATURE_MATRIX.md` tracks parity vs. Convex.
 
+### The semantics corpus
+
+"Byte-identical" is a claim, and `wire-corpus/` is what tests it. Each case in
+`wire-corpus/semantics/` is a JSON description of a schema, a sequence of
+operations, and the expected outcome, and **five runners execute every case**:
+the real server against Postgres, and the four clients' in-memory engines
+(TypeScript, Rust, Python, Swift). A behavior that differs between any two of
+them fails the corpus rather than surfacing later as a client bug.
+
+The corpus is what makes the "mirror every server change in all four clients"
+rule enforceable instead of aspirational, so every behavior-changing change
+ships with a case. `wire-corpus/README.md` states that authoring rule and the
+case format. `wire-corpus/golden-vector.json` separately pins the exact wire
+encoding of representative frames, catching a serde-tag or casing drift that a
+semantics case would not.
+
 ## Admin surface and the op-feed tap
 
 ### The publish_taps enforcement point
 
 Durable document mutations publish through the committer's single enforcement
-point — the `publish_taps` helper (ARC-001, `committer/taps.rs`) — called from
-**seven** `handle_*` arms: `handle_mutate`, `handle_scheduled`,
-`handle_migrate`, `handle_reaper`, `handle_restore_schema`,
-`handle_merge_users` (the anon→real merge's committed doc restamps,
-`source = "merge"`), and `handle_workflow_advance` (durable workflow step
-commits, `source = "workflow"`). Any future code path that commits a document
-txn must call `publish_taps` too, or the op-feed (and `/admin/stream`) will
-silently miss those writes. TTL deletes are durable writes the same way
-(`handle_reaper`, `source = "ttl"`, `owner = None`) — add new tap sites to
-this list.
+point — the `publish_taps` helper (`committer/taps.rs`) — called from
+**eight** `handle_*` arms:
+
+| Arm | `source` | Emits DocOps | Notes |
+| --- | --- | --- | --- |
+| `handle_mutate` | per-request | yes | The ordinary write path, WS and HTTP alike |
+| `handle_scheduled` | `"scheduled"` | yes | Scheduler-claimed jobs |
+| `handle_workflow_advance` | `"workflow"` | yes | Durable workflow step commits |
+| `handle_migrate` | `"migrate"` | yes | Schema migrate DDL + DML |
+| `handle_reaper` | `"ttl"` | yes | TTL deletes are durable writes, `owner = None` |
+| `handle_merge_users` | `"merge"` | yes | The anon→real merge's committed doc restamps |
+| `handle_push_schema` | `"push"` | no | Schema push runs through the committer; it publishes for audit/webhooks but emits no DocOps |
+| `handle_restore_schema` | `"restore"` | no | Same shape as push, for schema-history restore |
+
+Any future code path that commits a document txn must call `publish_taps` too,
+or the op-feed (and `/admin/stream`) will silently miss those writes. Add new
+tap sites to this table.
 
 Since ARC-005 the committer is a module rather than one file, and the rule is
 enforced structurally: each arm lives in `committer/arms/<name>.rs`,
-`publish_taps` is `pub(super)` in `committer/taps.rs`, and `execute_txn` is
+`publish_taps` is `pub(in crate::committer)` in `committer/taps.rs`, and `execute_txn` is
 called only from inside `arms/`. The rest of the module is `mod.rs` (the
 `Committers` handle, `CommitterRequest`, `CommitterCtx`, `run_committer`),
 `lease.rs` (the ownership lease), `forwarding.rs` (Stage 4c origin-side glue),
@@ -648,6 +868,21 @@ move — no behavior changed.
   per matching `DocOp` (per `rtdb.webhooks` row filtered by db/table/events),
   and a boot worker drains the outbox via reqwest POSTs with exponential
   backoff (at-least-once); admin CRUD at `/admin/db/{db}/webhooks`.
+
+### Admin CSRF
+
+Dashboard admin requests authenticate with an HttpOnly session cookie, so
+mutating admin routes need a CSRF defense: a readable `rtdb-admin-csrf` cookie
+whose value the dashboard echoes back in the `X-Rtdb-Csrf` header
+(double-submit). `admin_csrf_guard` requires the match on mutating methods.
+Bearer-token callers (CLI, automation, machine clients) send no cookie at all,
+so the defense does not apply to them and they are not asked for a nonce.
+
+`require_admin_mw` also **self-heals** a session that predates the CSRF
+deployment: a browser holding a valid session cookie but no `rtdb-admin-csrf`
+cookie is issued one on its next request rather than being logged out.
+`/admin/login`, `/admin/logout`, and `/admin/stream` are exempt — the first two
+mint or clear credentials, and the stream's WS upgrade authenticates inline.
 
 ### Admin document access
 

@@ -172,6 +172,8 @@ rust-client-check-features:
 			cargo check --manifest-path rust-client/Cargo.toml --all-targets --no-default-features --features "$$feats"; \
 		fi; \
 	done
+	@echo "=== rust-client: cargo doc --all-features (deny warnings) ==="
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --manifest-path rust-client/Cargo.toml
 
 rtdb-cli:
 	cd cli && cargo build --release

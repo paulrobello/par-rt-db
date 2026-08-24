@@ -514,6 +514,7 @@ export class RtDbAdminClient {
     return this.cookieMode ? { credentials: "include" } : {};
   }
 
+  /** Creates a new, empty database with no schema pushed yet. */
   async createDb(name: string): Promise<void> {
     await this.request("POST", "/admin/create-db", { name });
   }
@@ -524,6 +525,9 @@ export class RtDbAdminClient {
     await this.request("POST", "/admin/delete-db", { name, confirm });
   }
 
+  /** Applies an additive-only schema push to `db`: new tables, fields, and
+   *  indexes only — never drops or type changes (use {@link Migration} for
+   *  those). Safe to call repeatedly with a superset schema. */
   async pushSchema(db: string, schema: SchemaDefinition<any> | SchemaJson): Promise<void> {
     await this.request("POST", "/admin/push-schema", { db, schema: toSchemaJson(schema) });
   }
@@ -541,11 +545,15 @@ export class RtDbAdminClient {
     })) as SchemaPreviewDiff;
   }
 
+  /** Lists every database on the instance. */
   async listDbs(): Promise<string[]> {
     const body = await this.request("GET", "/admin/dbs");
     return (body as { databases: string[] }).databases;
   }
 
+  /** Mints a new machine token for `db`, named `name`. Returns the token id
+   *  (for later revocation) and the plaintext token, which is shown only
+   *  once — the server stores only its hash. */
   async mintToken(
     db: string,
     name: string,
@@ -555,18 +563,22 @@ export class RtDbAdminClient {
     return body as { tokenId: string; token: string };
   }
 
+  /** Revokes a machine token by id, invalidating it immediately. */
   async revokeToken(tokenId: string): Promise<void> {
     await this.request("POST", "/admin/revoke-token", { tokenId });
   }
 
+  /** Adds `email` to `db`'s OAuth sign-in allowlist. */
   async allowlistAdd(db: string, email: string): Promise<void> {
     await this.request("POST", "/admin/allowlist", { db, action: "add", email });
   }
 
+  /** Removes `email` from `db`'s OAuth sign-in allowlist. */
   async allowlistRemove(db: string, email: string): Promise<void> {
     await this.request("POST", "/admin/allowlist", { db, action: "remove", email });
   }
 
+  /** Lists every email on `db`'s OAuth sign-in allowlist. */
   async allowlistList(db: string): Promise<string[]> {
     const body = await this.request("GET", `/admin/allowlist?db=${encodeURIComponent(db)}`);
     return (body as { emails: string[] }).emails;

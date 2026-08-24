@@ -9,13 +9,29 @@ and query/mutate results deserialize generically into your own serde structs.
 
 Crate name: `par-rt-db-client` → in Rust, `use par_rt_db_client::...`.
 
+## Table of contents
+
+- [Status / features](#status--features)
+- [Install](#install)
+- [Quick start (HTTP)](#quick-start-http)
+- [Scheduling](#scheduling)
+- [Durable workflows](#durable-workflows)
+- [Cascade delete + soft delete (FM-33)](#cascade-delete--soft-delete-fm-33)
+- [Computed fields](#computed-fields)
+- [Schema migration](#schema-migration)
+- [File storage](#file-storage)
+- [Errors](#errors)
+- [Wire contract](#wire-contract)
+- [Full API](#full-api)
+- [Develop](#develop)
+
 ## Status / features
 
 | Feature | Default | Surface |
 | --- | --- | --- |
 | `http` | yes | `RtDbHttpClient` — typed query / mutate / `auth_me` |
 | `ws` | no | `RtDbClient` (`src/ws.rs`) — reactive WebSocket client (live query subscriptions + mutate) |
-| `admin` | no | `RtDbAdminClient` (`src/admin.rs`) — `/admin/*` control-plane client: db create/list/push-schema, schema/stats read-back, token mint/revoke/list, db + server-wide admin allowlist CRUD, metrics, hot config GET/PATCH, op-feed `recent`, owner-bypass query/mutate (incl. `include_deleted` for soft-deleted rows), snapshot export/import, schema preview (advisory additive/reject diff), admin schedules CRUD (list/create/cancel/pause/resume), admin storage (list/upload/delete), per-db anonymous-access toggle (SEC-103). Browser-only `login`/`logout`/`/admin/stream` are excluded (the Rust client is a machine client). Construct via `RtDbAdminClient::new(url, admin_key)` or `RtDbHttpClient::admin_client()` (shares the connection pool). The admin methods also remain on `RtDbHttpClient` as `#[deprecated]` re-exports (ARC-121, non-breaking). |
+| `admin` | no | `RtDbAdminClient` (`src/admin/mod.rs`) — `/admin/*` control-plane client: db create/list/push-schema, schema/stats read-back, token mint/revoke/list, db + server-wide admin allowlist CRUD, metrics, hot config GET/PATCH, op-feed `recent`, owner-bypass query/mutate (incl. `include_deleted` for soft-deleted rows), snapshot export/import, schema preview (advisory additive/reject diff), admin schedules CRUD (list/create/cancel/pause/resume), admin storage (list/upload/delete), per-db anonymous-access toggle (SEC-103). Browser-only `login`/`logout`/`/admin/stream` are excluded (the Rust client is a machine client). Construct via `RtDbAdminClient::new(url, admin_key)` or `RtDbHttpClient::admin_client()` (shares the connection pool). The admin methods also remain on `RtDbHttpClient` as `#[deprecated]` re-exports (ARC-121, non-breaking). |
 | `in_memory` | no | `InMemoryRtDbClient` (`src/in_memory/`) — in-memory test harness (no network, no Postgres). Ports `ts-client/src/in_memory/`: schema push, mutate (with `mut_id` idempotency), one-shot query DSL (`get`/`first`/`unique`/`count`/`take`/`collect`/`distinct`/`aggregate` + index eq + range + `order` + cursor-keyset `paginate`), `filter()` predicate evaluation (validated against the declared schema — a kind-mismatched value, e.g. a number on a string field, errors with `BAD_REQUEST` instead of silently matching nothing, SEC-126), reactive `subscribe` (re-runs and fires `on_update` on change), `schedule`/`cancel_schedule`/`pause_schedule`/`resume_schedule`/`list_schedules` + a timer-less `tick(now_ms)` (one-shot catches up if past due; cron re-arms by `CRON_STEP_MS = 60_000` and skips missed windows), and the `upload`/`delete_file`/`get_file_metadata`/`get_url` storage stubs. `search` approximates server behavior by mode — websearch operator matching (quoted phrases, `or` unions, `-term` exclusion, FM-31) with optional `_searchSnippet` highlights for `tsquery`, substring + similarity ranking for `trgm` (FM-30); `vector_search` over-approximates (no distance model — every table doc is a candidate, narrowed by the carried `filter`); rejected combinations still throw. |
 
 `core` (wire types, schema/query/mutation builders, error model) compiles with
@@ -85,12 +101,32 @@ over-approximates (every table doc is a candidate, narrowed by the carried
 the TS harness's surface so app-level storage flows can be exercised with no
 network.
 
-## Quick start (HTTP)
+## Install
+
+`par-rt-db-client` is not published to crates.io — see
+[`../docs/RELEASING.md`](../docs/RELEASING.md). Depend on it from a path (inside
+this repo) or from git.
+
+Path dependency, for a crate that lives in the `par-rt-db` workspace:
 
 ```toml
 [dependencies]
-par-rt-db-client = { version = "0.1", features = ["http"] }
+par-rt-db-client = { path = "../rust-client", features = ["http"] }
 ```
+
+Git dependency, for a crate outside this repo. `rust-client` is a member of the
+root `[workspace]`, so Cargo resolves the `par-rt-db-client` package name from
+the workspace root without a `package` override; pin to a branch or a release
+tag (tags are cut per [`../docs/RELEASING.md`](../docs/RELEASING.md)):
+
+```toml
+[dependencies]
+par-rt-db-client = { git = "https://github.com/paulrobello/par-rt-db", branch = "main", features = ["http"] }
+# Or pin to a release tag once one exists:
+# par-rt-db-client = { git = "https://github.com/paulrobello/par-rt-db", tag = "v0.x.y", features = ["http"] }
+```
+
+## Quick start (HTTP)
 
 ```rust
 use par_rt_db_client::{Mutation, Order, RtDbHttpClient, TableQuery};
@@ -100,8 +136,8 @@ use serde_json::json;
 #[derive(Debug, Deserialize)]
 struct Item { _id: String, name: String, n: i64 }
 
-# let token = std::env::var("RTDB_TOKEN").unwrap();
-# let db = RtDbHttpClient::new("https://rtdb.example.com", "kanban", &token);
+let token = std::env::var("RTDB_TOKEN").unwrap();
+let db = RtDbHttpClient::new("https://rtdb.example.com", "kanban", &token);
 // Ordered scan into Vec<Item>.
 let rows: Vec<Item> = db.run(
     TableQuery::new("items").with_index("by_n", &[]).order(Order::Asc).take(10),
@@ -182,9 +218,9 @@ use par_rt_db_client::{StepRetry, WorkflowInfo, WorkflowSpec, WorkflowStepSpec};
 let spec = WorkflowSpec {
     name: "onboard".into(),
     steps: vec![
-        WorkflowStepSpec { txn, await_signal: None, retry: None, sleep_before_ms: None },
+        WorkflowStepSpec { txn: Some(txn), await_signal: None, retry: None, sleep_before_ms: None },
         WorkflowStepSpec {
-            txn: txn2,
+            txn: Some(txn2),
             await_signal: None,
             retry: Some(StepRetry { max_attempts: 5, ..Default::default() }),
             sleep_before_ms: Some(60_000),
@@ -318,13 +354,14 @@ but is `#[deprecated]` — ARC-121 — prefer the admin client.)
 use par_rt_db_client::{Cast, FieldType, Migration};
 use serde_json::json;
 
-let result = db.admin_client().migrate_schema("kanban", &Migration::new()
+let migration = Migration::new()
     .rename_field("items", "title", "summary")
     .change_type("items", "order", FieldType::String, Cast::ToString, Some(json!("0")))
     .set_default("items", "status", json!("backlog"))
-    .dry_run(true)   // preview first — returns the report + derived schema
-    .build_request()
-    .directives, true).await?;
+    .build();
+
+// dry_run = true previews first — returns the report + derived schema with no writes.
+let result = db.admin_client().migrate_schema("kanban", &migration, true).await?;
 // re-run with dry_run = false to apply
 ```
 
@@ -372,6 +409,28 @@ serde tags and field names); changing the wire format on any side is a
 breaking change unless mirrored on all four. See
 [`../CLAUDE.md`](../CLAUDE.md) and the design spec
 [`../docs/superpowers/specs/2026-07-22-rust-client-design.md`](../docs/superpowers/specs/2026-07-22-rust-client-design.md).
+
+## Full API
+
+The sections above cover the common paths. The rest of the public surface,
+by source file:
+
+| Symbol | Feature | Source | Notes |
+| --- | --- | --- | --- |
+| `RtDbHttpClient` | `http` | `src/http.rs` | One-shot query/mutate/admin-bridge client |
+| `RtDbClient` | `ws` | `src/ws.rs` | Reactive WebSocket client — live query subscriptions, presence, mutate |
+| `Config` | `ws` | `src/ws.rs` | `RtDbClient` connection/reconnect configuration |
+| `ConnectionState` | `ws` | `src/ws.rs` | Reported connection lifecycle state (`connecting`/`open`/`closed`/…) |
+| `Subscription` | `ws` | `src/ws.rs` | A live query subscription handle — snapshot + on-change updates |
+| `project_optimistic_update` | `ws` | `src/optimistic.rs` | Applies a pending mutation's optimistic projection to a cached query result |
+| `InMemoryRtDbClient` | `in_memory` | `src/in_memory/mod.rs` | No-network, no-Postgres test harness mirroring the live clients |
+| `RtDbAdminClient::explain_query` | `admin` | `src/admin/mod.rs` | Query-plan explain — mirrors server `admin::observability::explain_query` |
+| `RtDbAdminClient::list_webhooks` / `create_webhook` / `delete_webhook` | `admin` | `src/admin/mod.rs` | Webhook subscription CRUD |
+| `RtDbAdminClient::get_audit` | `admin` | `src/admin/mod.rs` | Audit log read-back |
+| `RtDbAdminClient::list_sessions` / `revoke_session` / `revoke_user_sessions` / `revoke_expired_sessions` | `admin` | `src/admin/mod.rs` | OAuth session administration |
+| `RtDbAdminClient::merge_users` | `admin` | `src/admin/mod.rs` | Merges one user's data into another |
+| `RtDbAdminClient::backup_now` / `list_backups` / `download_backup` / `delete_backup` / `restore_backup` | `admin` | `src/admin/mod.rs` | Postgres-backed backup/restore — restore always targets a fresh database |
+| `RtDbAdminClient::clone_db` | `admin` | `src/admin/mod.rs` | Clones one database's schema and documents into a new database |
 
 ## Develop
 

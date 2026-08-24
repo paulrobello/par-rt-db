@@ -163,7 +163,8 @@ impl RtDbAdminClient {
     }
 
     /// `POST /admin/mint-token` `{db, name, expiresAt?, readOnly?, tables?}` →
-    /// `{tokenId, token}`. Fields left `None` on [`MintTokenOptions`] are omitted
+    /// `{tokenId, token}`. Fields left `None` on
+    /// [`MintTokenOptions`](crate::wire::admin::MintTokenOptions) are omitted
     /// from the body so the server applies its defaults (no expiry, read-write,
     /// all tables).
     pub async fn mint_token_with_options(
@@ -498,7 +499,7 @@ impl RtDbAdminClient {
 
     /// `POST /admin/db/{db}/query` `{query, includeDeleted?}` → `{result}`.
     /// Owner-bypass: an admin reads documents across every database regardless
-    /// of `ownerField`. Mirrors [`run`](Self::run) but routes through the admin
+    /// of `ownerField`. Mirrors [`run`](crate::http::RtDbHttpClient::run) but routes through the admin
     /// path with `db` in the URL (singular `db`, not the plural `dbs` of
     /// `get_schema`), so the body omits `db`. Deserialize `{result}` into `T`
     /// the same way `run` does.
@@ -575,7 +576,7 @@ impl RtDbAdminClient {
 
     /// `POST /admin/db/{db}/mutate` `{txn, idempotencyKey?}` → `{results}`.
     /// Owner-bypass: an admin writes documents across every database regardless
-    /// of `ownerField`. Mirrors [`mutate`](Self::mutate) but routes through the
+    /// of `ownerField`. Mirrors [`mutate`](crate::http::RtDbHttpClient::mutate) but routes through the
     /// admin path with `db` in the URL, so the body omits `db`. Returns one
     /// [`StepResult`] per step.
     pub async fn admin_mutate(

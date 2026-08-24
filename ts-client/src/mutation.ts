@@ -39,7 +39,9 @@ export interface StepUpsertResult {
   inserted: boolean;
 }
 
-/** Result of an `insert`/`patch`/`replace`/`delete`(of a present doc) step. */
+/** Result of an `insert` step: the id of the created doc. `patch`, `replace`,
+ * and `delete` (of a present doc) return `null` instead — they never carry
+ * this shape. */
 export interface StepInsertResult {
   id: string;
 }
@@ -78,12 +80,13 @@ export interface StepStartWorkflowResult {
  * Decodes one `mutateOk.results` entry (raw server JSON) into a {@link StepResult}.
  *
  * The server emits these shapes per the contract: `{ id, inserted }` (upsert),
- * `{ id }` (insert/patch/replace/delete of a present doc), `{ patched, truncated }`
- * (patchByQuery), `{ deleted, truncated }` (deleteByQuery), `{ scheduleId }`
- * (schedule), `{ cancelled }` (cancelSchedule, and cancelWorkflow FM-29), or
- * `null` (delete of an absent doc / no-op). Anything else is a server contract
- * violation and is surfaced as an `RtDbError` rather than silently passed
- * through — mirroring the rust/python clients' strict untagged decoding.
+ * `{ id }` (insert only), `{ patched, truncated }` (patchByQuery),
+ * `{ deleted, truncated }` (deleteByQuery), `{ scheduleId }` (schedule),
+ * `{ cancelled }` (cancelSchedule, and cancelWorkflow), or `null` (patch,
+ * replace, delete of a present doc, delete of an absent doc, and any other
+ * no-op). Anything else is a server contract violation and is surfaced as an
+ * `RtDbError` rather than silently passed through — mirroring the
+ * rust/python clients' strict untagged decoding.
  */
 function parseStepResult(value: unknown): StepResult {
   if (value === null) {

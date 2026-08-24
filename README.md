@@ -19,6 +19,7 @@
    * [Admin: dashboard operator surface](#admin-dashboard-operator-surface)
    * [Auth (OAuth + sessions)](#auth-oauth--sessions)
 * [Configuration](#configuration)
+   * [Topology and security](#topology-and-security)
 * [Error envelope](#error-envelope)
 * [Wire protocol](#wire-protocol)
 * [Pagination](#pagination)
@@ -27,7 +28,9 @@
 * [Computed fields](#computed-fields)
 * [Realtime presence](#realtime-presence)
 * [Make targets](#make-targets)
+   * [Verification gates](#verification-gates)
 * [Graceful shutdown](#graceful-shutdown)
+* [Multi-instance](#multi-instance)
 * [Known MVP limitations](#known-mvp-limitations)
 * [Clients](#clients)
 * [FAQ](#faq)
@@ -156,7 +159,7 @@ committer (blobs don't touch document tables). See
 
 ## Prerequisites for dev
 * See [CONTRIBUTING's development setup](CONTRIBUTING.md#development-setup) for the full tool list and first-time setup
-* A GNU-compatible `make` — every target spans all seven packages (swift-client's lines are Darwin-guarded and skip loudly on Linux); first-time installs are `make ts-client-install`, `make dashboard-install`, and `make python-client-install` (see [Make targets](#make-targets))
+* A GNU-compatible `make` — every target spans all eight packages (swift-client's lines are Darwin-guarded and skip loudly on Linux); first-time installs are `make ts-client-install`, `make dashboard-install`, and `make python-client-install` (see [Make targets](#make-targets))
 
 ## Quickstart
 
@@ -215,7 +218,7 @@ curl -s -X POST http://localhost:8300/api/query \
 To run the full test suite instead (dev Postgres must be up):
 
 ```bash
-make test   # dev-db-up + test suites across all six packages (fmt/clippy/typecheck live in make checkall)
+make test   # dev-db-up + test suites across all eight packages (fmt/clippy/typecheck live in make checkall)
 ```
 
 ## Endpoints
@@ -233,7 +236,7 @@ since browsers cannot set headers on a WS handshake.
 | Method & path | Auth | Description |
 | --- | --- | --- |
 | `GET /healthz` | none | Liveness: `{status:"ok"\|"degraded", version, git_commit, build_timestamp, started_at, uptime_seconds, postgres}`. 503 when Postgres is unreachable. |
-| `GET /privacy` | none | par-rt-db's own privacy policy as static HTML (compile-time-embedded from `static/privacy.html`), so an OAuth consent screen's required privacy URL can point at the deployment itself. Public and stateless; works in API-only mode. |
+| `GET /privacy` | none | par-rt-db's own privacy policy as static HTML (compile-time-embedded from `server/src/static/privacy.html`), so an OAuth consent screen's required privacy URL can point at the deployment itself. Public and stateless; works in API-only mode. |
 | `GET /metrics` | none | Prometheus text-exposition scrape endpoint. Content-negotiated on `Accept`: a browser (`text/html`) is served the SPA's `index.html` when `RTDB_STATIC_DIR` is set; everything else (Prometheus sends `application/openmetrics-text`, curl, API-only deploys) gets Prometheus text. Aggregate-only (no per-db, no principal data), same posture as `/healthz`. The admin JSON snapshot stays at `GET /admin/metrics`. |
 | `GET /sync` | first WS frame | WebSocket upgrade. Speaks the realtime protocol (auth, subscribe, mutate, schedule, ping). |
 | `POST /api/query` | Bearer token | One-shot query against a database; see [Query shape](#query-shape). |
@@ -403,9 +406,12 @@ open connections — see [Known MVP limitations](#known-mvp-limitations)).
 ## Configuration
 
 The server reads its configuration from environment variables (prefix `RTDB_`).
-The full, comment-annotated list lives in [`.env.example`](.env.example) — copy
-it to `.env` and edit. The subset below is what most operators tune on first
-boot:
+[`.env.example`](.env.example) is the comment-annotated template for a
+container deploy — copy it to `.env` and edit. It covers the knobs the compose
+file forwards, so a few that the process reads directly (`RTDB_DATABASE_URL`,
+`RTDB_PORT`) are set elsewhere in `docker-compose.yml` and do not appear there;
+`server/src/config.rs` is the complete list. The subset below is what most
+operators tune on first boot:
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
@@ -417,6 +423,23 @@ boot:
 | `RTDB_STATIC_DIR` | no | unset | Directory of static SPA build artifacts. Set/unset existing dir ⇒ dashboard served same-origin at the catch-all route fallback; unset/empty/missing ⇒ API-only. |
 | `RTDB_GITHUB_CLIENT_ID` + `RTDB_GITHUB_CLIENT_SECRET` | no | none | GitHub OAuth app credentials — both required to enable GitHub login. The other five providers (Google, GitLab, Microsoft, Apple, OIDC) follow the same `RTDB_<PROVIDER>_CLIENT_ID` + `_CLIENT_SECRET` pair pattern; see `.env.example` and [`docs/OAUTH_SETUP.md`](docs/OAUTH_SETUP.md). |
 | `RTDB_OTEL_ENABLED` | no | `false` | OpenTelemetry/OTLP tracing master switch (ENH-018). Requires the server built with the `otel` cargo feature; `false` (default) produces zero OTLP calls. Paired with `RTDB_OTEL_ENDPOINT` (default `http://127.0.0.1:4317`), `RTDB_OTEL_SERVICE_NAME` (default `par-rt-db`), and `RTDB_OTEL_SAMPLE_RATIO` (default `0.05`). See [Tracing](deploy/README.md#tracing-opentelemetry--otlp-enh-018). |
+
+### Topology and security
+
+These are boot-only (not hot-reloadable) and matter as soon as the server sits
+behind a proxy or runs as more than one replica.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `RTDB_TRUSTED_PROXY` | `false` | When true, the server trusts `CF-Connecting-IP` / `X-Forwarded-For` for per-IP rate-limit keys and `X-Forwarded-Proto` for cookie `Secure` and HSTS. Leave it `false` on a directly reachable deploy, or a caller can rotate its own rate-limit bucket with a spoofed header. **Set it `true` behind the Cloudflare tunnel**, where every request arrives from the tunnel's address. |
+| `RTDB_COOKIE_SECURE` | `true` | Sets the `Secure` attribute on the session cookie. Only turn it off for plain-HTTP local development. |
+| `RTDB_MULTI_INSTANCE` | `false` | Master switch for cross-replica coordination — see [Multi-instance](#multi-instance). |
+| `RTDB_INSTANCE_ID` | auto-generated | Stable replica id. Set it when you want log lines and notify payloads to name a replica you recognize. |
+| `RTDB_FORWARD_TIMEOUT_MS` | `5000` | How long a non-owner waits for the lease owner's reply before attempting takeover. Clamped to a 100 ms floor. |
+| `RTDB_POOL_MAX_CONNECTIONS` | `75` | Postgres pool ceiling. One committer task plus N subscription re-runs per database, so a many-database instance needs headroom. |
+| `RTDB_ADMIN_EMAILS` | empty | Comma-separated emails seeded into `rtdb_auth.admins` at startup, so an OAuth login can reach the dashboard before any admin exists. |
+| `RTDB_BACKUP_ENABLED` | `false` | Enables scheduled `pg_dump` backups. Paired with `RTDB_BACKUP_CRON` (default daily at 03:00 UTC), `RTDB_BACKUP_DIR`, and `RTDB_BACKUP_RETENTION` (default `7` dumps kept). Defaults and semantics live in `server/src/config.rs`. |
+
 
 The hot-reloadable settings (live on `AppState` as `Arc<ArcSwap<HotConfig>>`,
 seeded from env at first boot, persisted in a single-row `rtdb_config` table,
@@ -456,7 +479,7 @@ mirrored as the HTTP `Retry-After` header); every other code omits it:
 | `CONFLICT`            | 409         | `UNIQUE` index violation (`unique_violation`, SQLSTATE 23505) at `CREATE UNIQUE INDEX` time or on a colliding write. |
 | `PRECONDITION_FAILED` | 409         | `expectVersion` / `expectAbsent` guard failed. |
 | `SCHEMA_VIOLATION`    | 422         | Schema push / type-coercion rejection. |
-| `RATE_LIMITED`        | 429         | Per-token or per-db rate limit hit (HTTP and WS frames). Carries `retryAfter`; the WS connection stays open. |
+| `RATE_LIMITED`        | 429         | Per-token or per-db rate limit hit (HTTP and WS frames). Carries `retryAfter`. The WS connection stays open for this error; the separate per-connection frame-rate limit below closes it instead. |
 | `INTERNAL`            | 500         | Unexpected server error (generic message; detail logged via `tracing`). |
 | `QUOTA_EXCEEDED`      | 507         | Per-database resource cap hit (tables / storage bytes / concurrent subscriptions — ENH-011). |
 
@@ -531,6 +554,22 @@ it — and requires a declared `number`/`int64` field with `ms ≥ 0`.
 
 Connect to `ws://localhost:8300/sync`. The first frame must be `auth`; every message
 after is JSON text, camelCase, tagged by `"type"`.
+
+**Connection limits.** The socket is closed, not just error-replied, when a
+connection crosses one of these:
+
+| Limit | Value | Close code |
+| --- | --- | --- |
+| Frame size | 64 KB per frame | `4400` |
+| Frame rate | 200 frames per rolling 10 s window | `4400` |
+| Malformed or out-of-order frame | — | `4400` |
+| Auth failure (bad, missing, or expired credentials) | — | `4401` |
+| First frame is not `auth` | 10 s handshake timeout | `4401` |
+
+`4400` and `4401` are in the WebSocket private-use range. `4401` is kept
+distinct so a client knows not to blind-retry with the same credentials. A
+connection whose outbound backlog exceeds 1024 unsent frames, or that stalls a
+single send for 30 s, is also dropped.
 
 ```jsonc
 // -> client: authenticate with a machine token scoped to db "myapp"
@@ -916,8 +955,8 @@ within that same write. Schema migration stays consistent: `renameField` rewrite
 expression and re-stamps, dropping a referenced field is rejected naming the
 computed field, and `evalExpr`/`setDefault`/`changeType` rewrites that feed a
 computed input re-stamp dependents in the same migrate. See
-[FEATURE_MATRIX #39](FEATURE_MATRIX.md) and
-[`docs/superpowers/specs/2026-07-21-par-rt-db-design.md`](docs/superpowers/specs/2026-07-21-par-rt-db-design.md).
+[FEATURE_MATRIX #39](FEATURE_MATRIX.md) and the `computed-*` cases in
+[`wire-corpus/semantics/`](wire-corpus/semantics/).
 
 ## Realtime presence
 
@@ -956,19 +995,30 @@ function Cursors({ roomId }: { roomId: string }) {
 The TS client also exposes `RtDbClient.presence(room, state?, onSnapshot?)` /
 `updatePresence(room, state)` / `leavePresence(room)` for non-React callers; the
 Rust and Python reactive clients mirror them as `presence` / `update_presence` /
-`leave_presence`. The wire frames are `presence` / `updatePresence` /
-`leavePresence` (client) and `presenceSnapshot` / `presenceOk` / `presenceErr`
-(server). When presence is disabled, the WS frames reply with a
-`PRESENCE_DISABLED` `presenceErr`.
+`leave_presence`.
+
+Those SDK method names are not the wire tags. On the wire the client sends:
+
+| Frame | Fields | Purpose |
+| --- | --- | --- |
+| `presence` | `room`, optional `state` | Join a room, optionally publishing initial state. |
+| `presenceState` | `room`, `state`, optional `ttlMs` | Replace this connection's state in the room. `ttlMs` sets how long the entry survives without a refresh. |
+| `leavePresence` | `room` | Leave the room. |
+
+The server answers with `presenceSnapshot` (`room`, `members`) or
+`presenceErr`. There is no `presenceOk` frame. When presence is disabled, the
+server replies with a `PRESENCE_DISABLED` `presenceErr`.
 
 ## Make targets
 
-Each `make` target spans **all seven packages** (server, ts-client, rust-client,
-python-client, swift-client, dashboard, cli). The swift-client lines in every
-sweep are Darwin-guarded — on Linux they print `Skipping swift-client (non-Darwin
-host)` and the macOS CI job runs `make swift-client-checkall` instead. The
-composition is summarized below; see the
-[`Makefile`](Makefile) for the canonical commands.
+Every sweep target spans **all eight packages** — `core` (`par-rt-db-core`,
+the shared Rust wire vocabulary), `server`, `ts-client`, `rust-client`,
+`python-client`, `swift-client`, `dashboard`, and `cli`. The swift-client lines
+in every sweep are Darwin-guarded: on Linux they print `Skipping swift-client
+(non-Darwin host)` and a macOS CI job runs `make swift-client-checkall`
+instead. The [`Makefile`](Makefile) holds the canonical commands; this section
+is the canonical *description* of them, and other documents in this repo link
+here rather than restating it.
 
 ### First-time install (per package)
 
@@ -976,55 +1026,73 @@ composition is summarized below; see the
 | --- | --- | --- |
 | `make ts-client-install` | ts-client | `bun install` in `ts-client/`. |
 | `make dashboard-install` | dashboard | `bun install` at repo root + `dashboard/`. |
-| `make python-client-install` | python-client | `uv sync` in `python-client/`. |
+| `make python-client-install` | python-client | `uv sync --all-extras` in `python-client/`, so pyright can resolve the optional `http`/`ws` deps. |
 
-Cargo workspaces (`server/`, `rust-client/`) have no install target — `cargo`
-fetches on first build.
+The Cargo workspace members (`core/`, `server/`, `rust-client/`, `cli/`) and
+`swift-client/` have no install target — `cargo` and SwiftPM fetch on first
+build.
 
-### Build / format / lint / typecheck / test (each runs across all six packages)
+### Sweep targets
 
 | Target | What runs in each package |
 | --- | --- |
-| `make build` | server `cargo build` · rust-client `cargo build --all-features` · dashboard `bun run build` · (also runs `ts-client-build` first because the dashboard resolves `@par-rt-db/client` from `ts-client/dist`, which is gitignored) |
-| `make fmt` | server/rust-client `cargo fmt --all` · ts-client/dashboard `bun run fmt` · python-client `uv run ruff format .` |
-| `make fmt-check` | same as `fmt` but in `--check` mode |
-| `make lint` | server/rust-client `cargo clippy --all-targets --all-features -- -D warnings` · ts-client/dashboard `bun run lint` · python-client `uv run ruff check .` |
-| `make typecheck` | server/rust-client `cargo check` · ts-client/dashboard `bun run typecheck` · python-client `uv run pyright` (also runs `ts-client-build` first) |
-| `make test` | server `cargo test` · ts-client `bun run test` · rust-client `cargo test --all-features` · dashboard `bun run test` · python-client `uv run pytest -q` |
+| `make build` | server `cargo build` · rust-client `cargo build --all-features` · dashboard `bun run build`. Runs `ts-client-build` first, because the dashboard resolves `@par-rt-db/client` from the gitignored `ts-client/dist`. |
+| `make fmt` | server/rust-client/cli `cargo fmt --all` · ts-client/dashboard `bun run fmt` · python-client `uv run ruff format .` · swift-client `swiftformat .` |
+| `make fmt-check` | the same commands in check mode (`--check`, `swiftformat --lint`). |
+| `make lint` | core/server/rust-client/cli `cargo clippy --all-targets --all-features -- -D warnings` · ts-client/dashboard `bun run lint` · python-client `uv run ruff check .` · swift-client `swiftlint --strict` |
+| `make typecheck` | core/server/rust-client/cli `cargo check` · ts-client/dashboard `bun run typecheck` · python-client `uv run pyright` · swift-client `swift build`. Runs `ts-client-build` first. |
+| `make test` | core `cargo test` · server `cargo test` · ts-client `bun run test` · rust-client and cli `cargo test --all-features` · dashboard `bun run test` · python-client `uv run pytest -q` · swift-client `swift test`. Runs `dev-db-up` first. |
 
-`make dev-db-up` (a prerequisite of `make test`) starts the dev Postgres on
-`127.0.0.1:55434` via `docker-compose.dev.yml` and waits for it to be healthy.
-`make dev-db-down` stops it. `make dev-db-clean` drops leaked test artifacts
-from the dev `rtdb` DB — per-test schemas (`db_t<uuid-v7>`; tests self-clean
-via RAII but a bounded tail leaks per binary) and the semantics-corpus
-runner's per-case databases (`sc_<case>_<hex>`, ENH-023) — each `DROP` in
-psql autocommit so a large sweep doesn't accumulate catalog locks. Run it
-periodically; it is scoped to those test patterns and never touches
-`rtdb`/`rtdb_auth`/real databases.
+### Verification gates
+
+`make checkall` is the **definition of done**: it must pass before every
+commit. It runs these stages in order, and a failure in any stage stops the
+run.
+
+| Stage | What it checks | Standalone target |
+| --- | --- | --- |
+| 1. `env-drift-check` | Every `RTDB_*` var read by the server or documented in `.env.example` is forwarded to the container by `docker-compose.yml`'s `environment:` block. The block is an explicit allowlist, so a `.env`-only key silently does nothing. | `make env-drift-check` |
+| 2. `dockerfile-stub-check` | Every `[[test]]` declared by a non-server workspace member has a matching placeholder in the Dockerfile's dependency-caching layer. Without it `make deploy` fails at cargo's manifest parse — a break the rest of `checkall` cannot see. | `make dockerfile-stub-check` |
+| 3. `cli-docs-check` | `cli/README.md` matches what `gen-cli-docs` regenerates, so the CLI reference cannot drift from the CLI. | `make cli-docs-check` |
+| 4. `fmt-check` | Formatting across all eight packages. | `make fmt-check` |
+| 5. `lint` | Clippy under `-D warnings`, biome, ruff, swiftlint `--strict`. | `make lint` |
+| 6. `typecheck` | `cargo check`, `tsc`, pyright, `swift build`. | `make typecheck` |
+| 7. `test` | The full suite across all eight packages, against the dev Postgres. | `make test` |
+| 8. `rust-client-check-features` | The rust-client library **and** its test targets compile under every meaningful feature combination, not just `--all-features`. | `make rust-client-check-features` |
+
+Never `--no-verify` past the gate. If you do, fix the gate before anything
+else.
 
 ### Other workflow targets
 
 | Target | Purpose |
 | --- | --- |
-| `make ts-client-build` | Builds `ts-client/dist` (gitignored). Run on a fresh or stale checkout before `typecheck`/`build` — the dashboard resolves `@par-rt-db/client` from `dist`. `build` and `typecheck` pull this first. |
-| `make env-drift-check` | First stage of `checkall`. Fails when a `RTDB_*` var documented in `.env.example` or read by the server is not forwarded to the container by `docker-compose.yml`'s `environment:` block (an explicit allowlist, so a `.env`-only key silently does nothing). |
+| `make ts-client-build` | Builds `ts-client/dist` (gitignored). Required on a fresh or stale checkout before `typecheck`/`build`; both pull it first. |
+| `make dev-db-up` / `dev-db-down` | Start/stop the dev Postgres on `127.0.0.1:55434` via `docker-compose.dev.yml`, waiting for health. `make test` depends on `dev-db-up`. |
+| `make dev-db-clean` | Drops leaked test artifacts from the dev `rtdb` DB — per-test databases (`db_t<uuid-v7>`; tests self-clean via RAII, but a bounded tail leaks per binary) and the semantics-corpus runner's per-case databases (`sc_<case>_<hex>`). Each `DROP` runs in psql autocommit so a large sweep does not accumulate catalog locks. Scoped to those patterns; it never touches `rtdb`, `rtdb_auth`, or real databases. |
+| `make cli-docs` | Regenerates the CLI reference in `cli/README.md` in place. |
 | `make rtdb-cli` | Builds the `rtdb` CLI release binary (`cli/`, wraps `par-rt-db-client`). |
-| `make dev-db-clean` | Drops leaked test schemas from the dev Postgres (see above). |
-
-### The gate
-
-| Target | Purpose |
-| --- | --- |
-| `make checkall` | `fmt-check` + `lint` + `typecheck` + `test` across all six packages. **Definition of done; must pass before commit.** |
-| `make pre-commit` | `pre-commit run --all-files` (runs `gitleaks`, `detect-private-key`, etc.). |
-| `make pre-commit-update` | `pre-commit autoupdate`. |
+| `make dashboard-test` | Runs the dashboard's Vitest + React Testing Library suite standalone. |
+| `make pre-commit` / `pre-commit-update` | `pre-commit run --all-files` (gitleaks, private-key detection, per-package fmt/lint) and `pre-commit autoupdate`. |
 | `make deploy` | `checkall` → rsync to the Docker host → `docker compose up -d --build` → healthz probe. |
 
-### Granular python-client targets
+### Per-package targets
 
-`make python-client-test | python-client-lint | python-client-fmt | python-client-typecheck | python-client-checkall` run that one stage in `python-client/` only. Equivalent granular targets for the other packages are run directly with the package's tool (`cargo test` in `server/`/`rust-client/`, `bunx vitest run` in `ts-client/`, `bun run test` in `dashboard/`).
+| Package | Targets |
+| --- | --- |
+| python-client | `python-client-fmt`, `python-client-lint`, `python-client-typecheck`, `python-client-test`, `python-client-checkall` |
+| swift-client | `swift-client-fmt`, `swift-client-fmt-check`, `swift-client-lint`, `swift-client-typecheck`, `swift-client-build`, `swift-client-test`, `swift-client-checkall` (Darwin only) |
+| rust-client | `rust-client-check-features` |
+| ts-client | `ts-client-install`, `ts-client-build` |
+| dashboard | `dashboard-install`, `dashboard-test` |
 
-> The dashboard ships a Vitest + React Testing Library suite covering its pages and shared lib/hooks; run it standalone with `make dashboard-test`, or as part of `make checkall`/`make test`.
+Other packages are exercised directly with their own tool: `cargo test` in
+`core/`, `server/`, `rust-client/`, and `cli/`, and `bunx vitest run` in
+`ts-client/`.
+
+Server integration tests are a single consolidated binary, so run one test by
+name with `cargo test --test main <name>` from `server/`, not by test-file
+name.
 
 ## Graceful shutdown
 
@@ -1034,41 +1102,81 @@ includes open WebSocket connections — shutdown waits for them to close rather 
 dropping them, with no timeout of its own; Docker's SIGTERM→SIGKILL window is the backstop
 that ultimately terminates a connection that never closes on its own.
 
+## Multi-instance
+
+par-rt-db runs as a single process by default. Set `RTDB_MULTI_INSTANCE=true`
+and every replica behind a load balancer coordinates through Postgres — no
+extra service, no consensus layer.
+
+**Write ownership is a lease, not a rule.** The first replica to touch a
+database opens a dedicated one-connection pool and takes
+`pg_try_advisory_lock` on a key derived from the database name. That replica
+runs the database's committer and all of its pollers on that same connection,
+so the lease and every write share one Postgres backend: no other replica can
+acquire it mid-flight, which makes split-brain impossible by construction
+rather than by fencing. When an owner dies — `kill -9`, container stop, network
+partition that drops the session — Postgres releases the advisory lock and the
+next replica to try acquires it. Failover is just the acquire path.
+
+**A non-owner replica is a full participant.** It serves reads, live
+subscriptions, and presence for the database, and it forwards writes to the
+owner:
+
+1. The non-owner spools the request into `rtdb_auth.forward_queue` and sends
+   only that row's id over `pg_notify('rtdb_write_fwd', …)`. Every replica
+   reads the row; every replica that does not hold the lease drops it. Exactly
+   one execution happens per forwarded write, whatever the fleet size.
+2. The owner executes the write inside its own committer turn and spools the
+   outcome back, again notifying only a row id on `rtdb_write_replies`. The
+   reply row is claimed with an atomic `DELETE … RETURNING`, which doubles as
+   the target filter.
+3. The origin replica returns the owner's outcome to its client and re-runs its
+   local subscriptions against the returned write set.
+
+The spool exists because a `pg_notify` payload is capped at 8000 bytes and
+Postgres rejects anything larger. Carrying a 36-byte row id instead of the body
+means a write of any size forwards, and it makes forwarded work durable across
+a listener reconnect — `run_forward_sweeper` reclaims rows left behind by a
+crashed consumer.
+
+The principal that authorized the write at the edge travels with the request,
+so per-row `ownerField` / `authorize` rules evaluate against the identity that
+actually made the call. Rate limits stay enforced at the origin; quotas stay
+enforced inside the owner's committer turn.
+
+**Timeout and takeover.** If no owner answers within
+`RTDB_FORWARD_TIMEOUT_MS` (default 5 s, 100 ms floor), the origin attempts the
+lease takeover itself. A forwarded mutate that carries no client idempotency
+key is given a server-minted one, so if a late reply races the timeout and the
+takeover resubmits, the shared dedup table replays the owner's first outcome
+instead of writing twice. The ordinary timeout ambiguity still applies to what
+the *client* observes: the write may have committed even though the caller saw
+`CONFLICT`. A client that must tell the two apart should send its own
+idempotency key and retry with it.
+
+**Live queries stay correct on every replica.** Every durable write also
+publishes its write set on `rtdb_write_sets`, and each replica re-runs the
+subscriptions that write touched. A subscriber on replica B is invalidated by a
+write the owner executed on replica A — including scheduled jobs, TTL expiry,
+and migrations. Write sets over roughly 7.5 KB travel through the same spool
+rather than inline. Document *values* never travel, so `indexed` and `ordered`
+subscriptions on the receiving replica fall back to their conservative
+"unrankable ⇒ re-run" path: extra re-runs are possible, a missed push is not.
+
+**What else coordinates.** OAuth login state and sessions live in Postgres
+already. The op feed fans out over `pg_notify('rtdb_ops', …)` so a dashboard
+streaming `/admin/stream` on any replica sees every replica's writes. Presence
+gossips per-room member snapshots over `rtdb_presence`. Rate-limit budgets
+share `rtdb_auth.rate_counters`, giving one ceiling per route/token/db/ip
+across the fleet rather than one per process. Every channel carries its origin
+`instance_id` and skips its own echo, because Postgres delivers a session's own
+notifications back to it.
+
+Design and as-built notes:
+[`docs/superpowers/specs/2026-08-22-multi-instance-stage4-design.md`](docs/superpowers/specs/2026-08-22-multi-instance-stage4-design.md).
+
 ## Known MVP limitations
 
-- **Multi-instance is safe for reads + one writer per database; non-owner
-  writes are forwarded to the owner.** With `RTDB_MULTI_INSTANCE=true`
-  (ENH-022 Stages 1–4c), OAuth login state, the op-feed, presence,
-  rate-limit budgets (`rtdb_auth.rate_counters` — one shared ceiling per
-  token/db/ip), and per-database write ownership all coordinate across
-  replicas. Ownership: the first replica to touch a database takes a Postgres
-  advisory-lock lease on a dedicated connection and runs that database's
-  committer (and pollers) on it — no other replica can write the database
-  concurrently, and an owner's death (kill -9, container stop) releases the
-  lease to the next taker. A non-owner replica serves reads and live
-  subscriptions for the database and FORWARDS writes to the owner over
-  `pg_notify` (Stage 4c): the owner executes the write inside its committer
-  turn, returns the outcome to the non-owner's client, and the non-owner
-  re-runs its local subscriptions against the returned write set — the
-  caller's principal travels with the request, so per-row authz evaluates
-  against the identity that authorized the write at the edge. Forwarded
-  requests and their replies are spooled in `rtdb_auth.forward_queue` and the
-  NOTIFY carries only a row id, so a write of any size forwards (a `pg_notify`
-  payload itself is capped at 8000 bytes). **Live queries stay correct on
-  every replica:** each durable write also publishes its write set on
-  `rtdb_write_sets`, and every replica re-runs the subscriptions it touched —
-  so a subscriber on replica B is invalidated by a write the owner executed,
-  including scheduled jobs, TTL expiry, and migrations. If no owner
-  answers within `RTDB_FORWARD_TIMEOUT_MS` (default 5s), the non-owner
-  attempts the lease takeover itself — that path is the failover. A forwarded
-  mutate that carries no client idempotency key is given a server-minted one,
-  so if a reply races the timeout and the takeover resubmits the write, the
-  shared dedup table replays the owner's first outcome instead of writing
-  twice. The standard timeout ambiguity still applies to what the *client*
-  observes — the write may have committed even though the caller saw
-  `CONFLICT` — so a client that must distinguish the two should send its own
-  idempotency key and retry with it. Design + as-built notes:
-  `docs/superpowers/specs/2026-08-22-multi-instance-stage4-design.md`.
 - **Session expiry, machine-token revocation, allowlist removal, and admin-role
   revocation all take effect on open WebSocket connections.** The WS handler re-runs
   `authorize` on every `subscribe` and `mutate` (not just at connect) and re-runs
@@ -1091,7 +1199,7 @@ plus an operator SPA and a CLI built on top of them:
 - [`ts-client/`](ts-client/README.md) — `@par-rt-db/client` (browser/Node/React Native): schema builder, reactive WebSocket client, React bindings, HTTP/admin clients, in-memory test harness.
 - [`rust-client/`](rust-client/README.md) — `par-rt-db-client` (Rust): http + reactive ws + admin, `.filter()`/`.search()`/`.vector_search()` builders.
 - [`python-client/`](python-client/README.md) — `par-rt-db` (Python): wire contract + schema/mutation/query DSL + sync HTTP/admin/storage + reactive WS.
-- [`swift-client/`](swift-client/README.md) — `ParRtDbClient`/`ParRtDbUI` (Swift 6, iOS 17+/macOS 14): wire + query/mutation/schema DSL + HTTP + reactive WS + SwiftUI `LiveQuery`; admin/presence/optimistic/in-memory-engine surfaces deferred (see its README's coverage table).
+- [`swift-client/`](swift-client/README.md) — `ParRtDbClient`/`ParRtDbUI` (Swift 6, iOS 17+/macOS 14): wire + query/mutation/schema DSL + HTTP + reactive WS + SwiftUI `LiveQuery`, plus the admin client, presence, optimistic updates, and the in-memory engine (see its README's coverage table).
 - [`dashboard/`](dashboard/README.md) — the operator console SPA (admin/operator UI served same-origin at `RTDB_STATIC_DIR`; consumes `ts-client`).
 - [`cli/`](cli/README.md) — `rtdb` operator/CI binary (wraps `par-rt-db-client`).
 
@@ -1109,7 +1217,7 @@ plus an operator SPA and a CLI built on top of them:
 * Q: Is auth required?
   * A: Machine tokens are the baseline. Each of the six OAuth providers is independently optional (blank env ⇒ its routes return 503), and anonymous access is opt-in (off by default).
 * Q: Can I run multiple replicas behind a load balancer?
-  * A: Yes — set `RTDB_MULTI_INSTANCE=true`. Login state, op-feed, presence, rate budgets, and per-database write ownership (advisory-lock lease with kill-failover) coordinate via Postgres; a non-owner replica serves reads/subscriptions and forwards writes to the owning replica automatically (taking the lease itself if the owner dies within `RTDB_FORWARD_TIMEOUT_MS`). See [Known MVP limitations](#known-mvp-limitations) (ENH-022).
+  * A: Yes — set `RTDB_MULTI_INSTANCE=true`. Login state, op-feed, presence, rate budgets, and per-database write ownership (advisory-lock lease with kill-failover) coordinate via Postgres; a non-owner replica serves reads/subscriptions and forwards writes to the owning replica automatically (taking the lease itself if the owner dies within `RTDB_FORWARD_TIMEOUT_MS`). See [Multi-instance](#multi-instance).
 
 ## Roadmap
 
@@ -1122,17 +1230,18 @@ plus an operator SPA and a CLI built on top of them:
 * [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) is the authoritative Convex-parity contract
 
 ### Where we're going
-* Multi-instance rate limiting and cross-process write funnelling — the remaining ENH-022 stages that make a multi-replica deploy safe
 * The first tagged release (`v0.1.0`, ENH-026): lockstep client versions and the release process
 
 ## What's new
 
-No release has been tagged yet — everything currently lives under `[Unreleased]` in
-[`CHANGELOG.md`](CHANGELOG.md) (the eventual `0.1.0` cut is tracked as ENH-026). Recent
-highlights from the unreleased section: grouped aggregates include the null group key,
-wire-corpus semantic alignment across the server and the three in-memory client engines,
-durable workflows, realtime presence, hybrid search, and schema migration with snapshot
-history and restore.
+`0.1.0` is tagged; everything since lives under `[Unreleased]` in
+[`CHANGELOG.md`](CHANGELOG.md). Highlights: the Swift client (the fourth SDK and
+the fifth implementation of the wire contract), multi-instance write forwarding
+with cross-replica subscription invalidation, computed fields, auto-increment
+counters, `awaitSignal` workflow approval gates, query field projection, and
+interval-recurrence scheduling. Read the **Breaking** group first — signed
+storage URLs minted before this cycle no longer verify, and missing-schema
+database operations now answer `NOT_FOUND` rather than `INTERNAL`.
 
 ## Contributing
 

@@ -58,10 +58,15 @@ public enum UserKind: String, Codable, Sendable {
 /// rejection: the server and rust-client AuthedUser carry no
 /// `deny_unknown_fields`.
 public struct AuthedUser: Equatable, Codable, Sendable {
+    /// Whether this is a human OAuth/anonymous user or a machine token.
     public var kind: UserKind
+    /// Email from the OAuth provider, when the provider supplies one.
     public var email: String?
+    /// Display name from the OAuth provider, when the provider supplies one.
     public var name: String?
+    /// GitHub login, present only for GitHub-authenticated sessions.
     public var githubLogin: String?
+    /// GitHub numeric user id, present only for GitHub-authenticated sessions.
     public var githubId: Int64?
 
     public init(
@@ -103,8 +108,11 @@ public struct AuthedUser: Equatable, Codable, Sendable {
 /// Mirrors server/src/protocol.rs::PresenceMember — camelCase; `connectionId`
 /// is the opaque per-session key, `state` an opaque client-supplied blob.
 public struct PresenceMember: Equatable, Codable, Sendable {
+    /// Opaque per-session key identifying this connection within the room.
     public var connectionId: String
+    /// The authenticated identity that joined the room.
     public var user: AuthedUser
+    /// Client-supplied presence payload (cursor position, status, etc.).
     public var state: JSONValue
 
     public init(connectionId: String, user: AuthedUser, state: JSONValue) {
@@ -733,15 +741,23 @@ public enum ScheduleStatus: String, Codable, Sendable {
 /// unknown-field rejection (the server type carries no
 /// `deny_unknown_fields`).
 public struct ScheduleInfo: Equatable, Codable, Sendable {
+    /// Server-assigned schedule id.
     public var id: String
+    /// One-shot, cron, or interval firing pattern.
     public var kind: ScheduleKind
+    /// Epoch-ms of the next (or, for a fired one-shot, the last) run.
     public var dueAt: Int64
+    /// Cron expression, present only when `kind == .cron`.
     public var cron: String?
     /// Interval jobs only: the fixed recurrence in ms (`kind: "interval"`).
     public var everyMs: Int64?
+    /// Current lifecycle state.
     public var status: ScheduleStatus
+    /// Error from the most recent failed run, present only after a failure.
     public var lastError: String?
+    /// Epoch-ms when the schedule was created.
     public var createdAt: Int64
+    /// Total number of times this schedule has fired.
     public var firedCount: Int64
 
     public init(
@@ -796,8 +812,11 @@ public struct ScheduleInfo: Equatable, Codable, Sendable {
 /// rejected. `maxAttempts` counts TOTAL attempts; the other fields default
 /// (1s initial backoff doubling to a 60s cap) and are ALWAYS serialized.
 public struct StepRetry: Equatable, Codable, Sendable {
+    /// Total attempts allowed, including the first (non-retry) attempt.
     public var maxAttempts: UInt32
+    /// Backoff before the first retry, in ms.
     public var initialRetryMs: UInt64
+    /// Cap on backoff between retries, in ms (doubles from `initialRetryMs` up to this).
     public var maxRetryMs: UInt64
 
     public init(maxAttempts: UInt32, initialRetryMs: UInt64 = 1000, maxRetryMs: UInt64 = 60000) {
@@ -832,7 +851,9 @@ public struct StepRetry: Equatable, Codable, Sendable {
 /// is the escape). CamelCase, unknown fields rejected; `timeoutMs` omitted
 /// when nil.
 public struct AwaitSignalSpec: Equatable, Codable, Sendable {
+    /// The signal name this step waits for.
     public var name: String
+    /// Bound on each wait attempt, in ms; nil waits indefinitely.
     public var timeoutMs: UInt64?
 
     public init(name: String, timeoutMs: UInt64? = nil) {
@@ -864,9 +885,13 @@ public struct AwaitSignalSpec: Equatable, Codable, Sendable {
 /// it at submit; the `awaitSignal(name:timeoutMs:)` factory in
 /// MutationDsl.swift constructs the wait variant).
 public struct WorkflowStepSpec: Equatable, Codable, Sendable {
+    /// The transaction to run, when this is a txn step (mutually exclusive with `awaitSignal`).
     public var txn: Transaction?
+    /// The wait declaration, when this is an `awaitSignal` step.
     public var awaitSignal: AwaitSignalSpec?
+    /// Retry policy for this step; nil means no retry on failure.
     public var retry: StepRetry?
+    /// Delay before this step runs, in ms.
     public var sleepBeforeMs: UInt64?
 
     public init(
@@ -904,7 +929,9 @@ public struct WorkflowStepSpec: Equatable, Codable, Sendable {
 /// Mirrors server/src/protocol.rs::WorkflowSpec — camelCase, unknown fields
 /// rejected. Stored verbatim per run; a run snapshots its spec.
 public struct WorkflowSpec: Equatable, Codable, Sendable {
+    /// Workflow name (not unique — labels the run, does not identify it).
     public var name: String
+    /// Ordered steps the run executes in sequence.
     public var steps: [WorkflowStepSpec]
 
     public init(name: String, steps: [WorkflowStepSpec]) {
@@ -950,11 +977,17 @@ public enum OutcomeStatus: String, Codable, Sendable {
 /// rejected; `error`/`signal` omitted when nil. `signal` carries a delivered
 /// awaitSignal payload verbatim (success outcomes only).
 public struct StepOutcome: Equatable, Codable, Sendable {
+    /// Zero-based index of the step this outcome reports on.
     public var stepIndex: UInt32
+    /// Whether the step ultimately succeeded or failed.
     public var status: OutcomeStatus
+    /// Number of attempts made for this step (1 if it succeeded on the first try).
     public var attempts: UInt32
+    /// Epoch-ms when this outcome was recorded.
     public var at: Int64
+    /// Failure message, present only when `status == .failed`.
     public var error: String?
+    /// The delivered `awaitSignal` payload, present only on a successful signal step.
     public var signal: JSONValue?
 
     public init(
@@ -998,19 +1031,33 @@ public struct StepOutcome: Equatable, Codable, Sendable {
 /// Mirrors server/src/protocol.rs::WorkflowInfo — camelCase, unknown fields
 /// rejected; optional fields omitted when nil.
 public struct WorkflowInfo: Equatable, Codable, Sendable {
+    /// Server-assigned run id.
     public var id: String
+    /// Workflow name from the run's `WorkflowSpec`.
     public var name: String
+    /// Current lifecycle state.
     public var status: WorkflowStatus
+    /// Zero-based index of the step currently executing (or about to).
     public var currentStep: UInt32
+    /// Total number of steps in this run's spec.
     public var stepCount: UInt32
+    /// Attempts made on the current step.
     public var attempts: UInt32
+    /// Epoch-ms the run will wake and retry, present only while sleeping.
     public var sleepUntil: Int64?
+    /// Most recent failure message, present only after a failed step.
     public var lastError: String?
+    /// Name of the signal being awaited, present only in `.waiting` status.
     public var waitingFor: String?
+    /// Epoch-ms the current wait began, present only in `.waiting` status.
     public var waitedSince: Int64?
+    /// Epoch-ms when the run was created.
     public var createdAt: Int64
+    /// Epoch-ms of the last state change.
     public var updatedAt: Int64
+    /// Epoch-ms when the run started executing, present once it has started.
     public var startedAt: Int64?
+    /// Epoch-ms when the run reached a terminal state, present once finished.
     public var finishedAt: Int64?
 
     public init(
@@ -1299,10 +1346,15 @@ public enum SearchMode: String, Codable, Sendable {
 /// Mirrors server/src/dsl.rs::SearchQuery — camelCase, unknown fields
 /// rejected; `filter`/`mode`/`snippet` omitted when nil.
 public struct SearchQuery: Equatable, Codable, Sendable {
+    /// Name of the search index to query.
     public var index: String
+    /// The search text.
     public var query: String
+    /// Optional predicate narrowing results before ranking.
     public var filter: FilterExpr?
+    /// Full-text vs. substring/autocomplete matching; defaults to `.tsquery`.
     public var mode: SearchMode?
+    /// Whether to include highlighted snippets in results.
     public var snippet: Bool?
 
     public init(
@@ -1344,9 +1396,13 @@ public struct SearchQuery: Equatable, Codable, Sendable {
 /// rejected. `vector` is `[Double]` (f64) for wire-precision parity with the
 /// other clients (ARC-008(a)); `filter` omitted when nil.
 public struct VectorSearchQuery: Equatable, Codable, Sendable {
+    /// Name of the vector index to query.
     public var index: String
+    /// Query embedding, compared using the index's configured metric.
     public var vector: [Double]
+    /// Maximum number of nearest neighbors to return.
     public var limit: UInt32
+    /// Optional predicate narrowing candidates before ranking.
     public var filter: FilterExpr?
 
     public init(index: String, vector: [Double], limit: UInt32, filter: FilterExpr? = nil) {
@@ -1381,11 +1437,17 @@ public struct VectorSearchQuery: Equatable, Codable, Sendable {
 /// Mirrors server/src/dsl.rs::HybridSearchQuery — camelCase, unknown fields
 /// rejected; `searchIndex`/`vectorIndex`/`k` omitted when nil.
 public struct HybridSearchQuery: Equatable, Codable, Sendable {
+    /// The search text.
     public var query: String
+    /// Query embedding for the vector side of the fusion.
     public var vector: [Double]
+    /// Maximum number of fused results to return.
     public var limit: UInt32
+    /// Search index to use; defaults to the table's sole search index if omitted.
     public var searchIndex: String?
+    /// Vector index to use; defaults to the table's sole vector index if omitted.
     public var vectorIndex: String?
+    /// Reciprocal-rank-fusion constant; server default applies when omitted.
     public var k: UInt32?
 
     public init(
@@ -1439,7 +1501,9 @@ public enum AggregateOp: String, Codable, Sendable {
 /// rejected; `groupBy` omitted when false (client convention; the server's
 /// `#[serde(default)]` accepts both forms).
 public struct AggregateSpec: Equatable, Codable, Sendable {
+    /// The reduction to apply: sum/avg/min/max/count.
     public var op: AggregateOp
+    /// Whether to group results by the query's index prefix; defaults to `false`.
     public var groupBy: Bool
 
     public init(op: AggregateOp, groupBy: Bool = false) {

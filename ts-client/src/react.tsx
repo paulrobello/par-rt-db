@@ -83,6 +83,7 @@ export function RtDbProvider(props: {
   return createElement(RtDbContext.Provider, { value }, children);
 }
 
+/** Returns the `RtDbClient` instance passed to the enclosing `RtDbProvider`. */
 export function useRtDbClient(): RtDbClient {
   return useContextValue().client;
 }
@@ -160,6 +161,8 @@ export function usePresence(room: string): {
   return { members, updatePresence, leavePresence };
 }
 
+/** Tracks the client's WebSocket connection state, re-rendering on every
+ * change. */
 export function useConnectionState(): ConnectionState {
   const { client } = useContextValue();
   const [state, setState] = useState<ConnectionState>(() => client.getConnectionState());
@@ -266,19 +269,24 @@ export function useRtDbAuth(): {
   return { state, user, signIn, signInAnonymous, signOut };
 }
 
+/** Renders `children` only while the auth state is `"authenticated"`. */
 export function Authenticated(props: { children: ReactNode }): ReactNode {
   return useContextValue().state === "authenticated" ? props.children : null;
 }
 
+/** Renders `children` only while the auth state is `"unauthenticated"`. */
 export function Unauthenticated(props: { children: ReactNode }): ReactNode {
   return useContextValue().state === "unauthenticated" ? props.children : null;
 }
 
+/** Renders `children` only while the auth state is `"authenticating"`. */
 export function AuthLoading(props: { children: ReactNode }): ReactNode {
   return useContextValue().state === "authenticating" ? props.children : null;
 }
 
+/** Interval between `/auth/state` polls during an OAuth sign-in flow. */
 export const OAUTH_POLL_INTERVAL_MS = 800;
+/** Maximum time to poll `/auth/state` before an OAuth sign-in flow times out. */
 export const OAUTH_POLL_TIMEOUT_MS = 180_000;
 
 /** One poll of `/auth/state`; resolves with the token on `complete`.
