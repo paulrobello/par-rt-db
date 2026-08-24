@@ -60,9 +60,19 @@ working with zero providers configured.
   set at `/begin` (SEC-121 — a leaked state URL alone cannot poll), which is
   what makes cross-origin SDK login work where the `SameSite=Lax` session
   cookie would not be sent.
-- Identity is **email-keyed with cross-provider linking**: a user who first
-  logs in via GitHub and later via Google (same verified email) resolves to the
-  same account. Enabling more providers is additive, not fragmenting.
+- Identity is **subject-keyed with cross-provider email linking**. Every
+  provider persists its own stable, provider-side subject —
+  `github_id`, `apple_sub`, `microsoft_sub` (the `{tid}.{sub}` composite),
+  `google_sub`, `gitlab_id`, `oidc_sub` — and a returning login resolves on
+  that column first, so a **provider-side email change follows the account
+  instead of forking a second one**. Only when the subject is not yet on file
+  does resolution fall back to the verified email: a user who first logs in via
+  GitHub and later via Google (same verified email) links to the same account,
+  and that same step adopts accounts created before a provider had its subject
+  column. Enabling more providers is additive, not fragmenting.
+  Since the account's `email` is refreshed from the provider on every login,
+  an email change also moves which `rtdb_auth.allowlist` entry the user
+  matches — grant the new address if you allowlist by email.
 - All providers **require a verified email**. Google requires `email_verified`;
   GitHub picks the primary verified address (falling back to any verified one)
   and never trusts the unverified profile-level email; GitLab requires a
@@ -161,6 +171,10 @@ Data access → Clients** — all scoped with `?project=par-rt-db`.
 5. Set `RTDB_GOOGLE_CLIENT_ID` and `RTDB_GOOGLE_CLIENT_SECRET`
    (see [Applying changes](#applying-changes)).
 
+Identity keys on Google's stable **`sub`** claim (stored as `users.google_sub`),
+not on the email, so a Google-side email change follows the account instead of
+forking a new one.
+
 **Publishing status gotcha:** while the app is in *Testing*, only emails you add
 under *Test users* (on the Audience page) can complete login. For anyone
 (including yourself from any account) to sign in, **Publish app** → *In
@@ -199,6 +213,10 @@ confirmed, `null` otherwise). par-rt-db admits only users whose email is
 confirmed — an unconfirmed GitLab email is rejected with
 `403 "no verified email"`, so have users confirm their address first.
 
+Identity keys on GitLab's numeric user **`id`** (stored as `users.gitlab_id`),
+not on the email, so a GitLab-side email change follows the account instead of
+forking a new one.
+
 **Self-hosted GitLab:** set `RTDB_GITLAB_BASE_URL` (default `https://gitlab.com`)
 to your instance root, e.g. `https://gitlab.example.com`. par-rt-db then uses
 `{base_url}/oauth/authorize`, `/oauth/token`, and `/api/v4/user`.
@@ -234,6 +252,14 @@ required; the IdP must positively assert `email_verified: true` (boolean or
 the string `"true"`) — a missing `email_verified` is rejected as unverified
 (SEC-122). If your IdP genuinely verifies mail but omits the claim, patch its
 userinfo endpoint to emit it rather than relaxing this gate.
+
+The userinfo response must also carry a non-empty **`sub`** — OIDC Core
+requires it, and par-rt-db stores it as `users.oidc_sub`, the stable key that
+keeps an account intact across an IdP-side email change. A response without
+`sub` is rejected with `403 "userinfo missing sub"`; fix the IdP rather than
+work around it. `sub` is unique per issuer, and a deployment configures exactly
+one OIDC issuer, so the bare claim is the key (no issuer prefix, unlike
+Microsoft's multi-tenant `{tid}.{sub}`).
 
 ---
 
@@ -464,6 +490,7 @@ or integrate with par-rt-db:
 | Provider error page: `redirect_uri_mismatch` | The callback URL registered at the provider doesn't exactly match `RTDB_PUBLIC_URL` + the callback path (see the [quick reference](#quick-reference)). Watch the scheme (`https://`) and trailing slash. |
 | `403 "no verified email"` (OIDC/Microsoft: `"email is not verified"`) | The account's email isn't verified at the provider. Verify it, or (Google) ensure the account is a *Test user* while the consent screen is in Testing. |
 | Google login works only for one account | Consent screen still in *Testing*. **Publish app** → *In production*. |
+| `403 "userinfo missing sub"` (OIDC/Google) or `403 "user response missing id"` (GitLab) | The provider returned no stable subject. par-rt-db keys identity on it, so it will not fall back to email. For a generic OIDC IdP this means a non-compliant userinfo endpoint — OIDC Core requires `sub`; fix the IdP. |
 
 ## Adding a new provider (e.g. a future IdP)
 
@@ -476,6 +503,17 @@ Each new provider is a small, self-contained implementation behind the
   verified-email fetch + `session::create_session`). `gitlab.rs` is a worked
   example for a hosted IdP with an overridable base URL; `oidc.rs` is the most
   recent and shows the fully config-supplied-endpoint case.
+- **Give the provider a stable subject column, and key identity on it.** Pick
+  the provider's immutable per-account identifier (an OIDC `sub`, a numeric
+  user id — never the email, which users change). Add a nullable `TEXT` column
+  plus a partial unique index in `db::bootstrap` (copy the `google_sub` /
+  `gitlab_id` / `oidc_sub` loop), add a `PROVIDER_COL_*` constant in
+  `auth/mod.rs`, and pass it with the extracted subject through
+  `ProviderIdentity` to `auth::resolve_user`. Never pass the email as the
+  subject: `resolve_user` uses the verified email only to link an account on a
+  *first* login with the provider, and keying on it forks a new account
+  whenever the provider-side address changes. Reject a provider response that
+  carries no subject rather than falling back to the email.
 - Add the `Config` fields — at minimum `RTDB_<PROVIDER>_CLIENT_ID` /
   `_SECRET`, plus a base/API URL field when the provider is self-hostable
   (`gitlab.rs`/`github.rs`) — and the provider's route pair (`/auth/<provider>/begin`
@@ -492,5 +530,6 @@ Each new provider is a small, self-contained implementation behind the
 `FEATURE_MATRIX.md` rates each additional provider **S effort** — the shared
 plumbing (state tokens, the `rtdb-oauth-csrf` nonce, `/auth/state` polling,
 HttpOnly cookie sessions, `/auth/me`, `/auth/logout`, per-Subscribe/Mutate
-`authorize`, cross-provider email linking) is provider-agnostic and reused
+`authorize`, subject-keyed identity resolution with cross-provider email
+linking) is provider-agnostic and reused
 unchanged; only the authorize-URL and code-exchange dance is provider-specific.

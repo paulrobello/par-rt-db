@@ -200,6 +200,38 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     .execute(&mut *conn)
     .await?;
 
+    // Stable per-provider subject ids for Google, GitLab and the generic OIDC
+    // provider. These three used to key identity on the UNIQUE `email` column
+    // alone, so a provider-side email change forked a second account on the
+    // next login. Each provider's subject is immutable across an email change
+    // (Google's `sub`, GitLab's numeric user `id`, the IdP's `sub`), so it is
+    // the durable key — exactly as `github_id`/`apple_sub`/`microsoft_sub`
+    // already are for the other three providers.
+    //
+    // All three are TEXT, including `gitlab_id`: `github_id` is `bigint` for
+    // historical reasons and forces a `::bigint` cast in `auth::resolve_user`;
+    // keeping these text means the shared resolver needs no per-column cast.
+    //
+    // Additive and idempotent: nullable columns, no backfill. An existing
+    // Google/GitLab/OIDC user has a NULL subject, so their first login after
+    // the upgrade takes the resolver's email-link step and adopts the existing
+    // row instead of inserting a new one; every later login matches on the
+    // now-populated subject. The partial unique index tolerates the many NULLs
+    // of users who signed in through a different provider.
+    for column in ["google_sub", "gitlab_id", "oidc_sub"] {
+        sqlx::query(&format!(
+            "ALTER TABLE rtdb_auth.users ADD COLUMN IF NOT EXISTS {column} TEXT NULL"
+        ))
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(&format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS rtdb_auth_users_{column}_key \
+             ON rtdb_auth.users ({column}) WHERE {column} IS NOT NULL"
+        ))
+        .execute(&mut *conn)
+        .await?;
+    }
+
     // Anonymous auth (2026-08-08): marks a user row minted by
     // `POST /auth/anonymous` (no OAuth identity, no email). `false` for every
     // existing/OAuth user. Idempotent ALTER so a running deployment adds it on

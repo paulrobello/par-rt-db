@@ -21,6 +21,26 @@ alter observable behavior on upgrade.
 
 ### Breaking
 
+- **Google, GitLab, and generic-OIDC identity now keys on a stable
+  provider-side subject instead of the email** (FEATURE_MATRIX #14). These
+  three resolved logins through `INSERT … ON CONFLICT (email) DO UPDATE`, so a
+  provider-side email change forked a second account on the next login while
+  GitHub/Apple/Microsoft (which key on `github_id`/`apple_sub`/`microsoft_sub`)
+  did not. `rtdb_auth.users` gains three nullable columns —
+  `google_sub`, `gitlab_id`, `oidc_sub`, each with a partial unique index — and
+  all six providers now share one three-step resolution in `auth::resolve_user`
+  (subject match, else link a same-verified-email row whose subject is NULL,
+  else insert). The `PROVIDER_COL_EMAIL` sentinel and its upsert path are gone.
+  **Migration:** none — the columns are additive with no backfill, and an
+  existing user's first login after upgrade takes the email-link step, adopting
+  their row rather than forking it. **Behavior to note:** the login now *fails*
+  when the provider returns no subject, rather than silently falling back to
+  the email. Google's userinfo always carries `sub` and GitLab's
+  `/api/v4/user` always carries `id`; a **non-compliant OIDC IdP that omits
+  `sub` from its userinfo response** (OIDC Core requires it) will now get
+  `403 "userinfo missing sub"` where login previously succeeded. Also, because
+  an email change now follows the account instead of creating a new one, an
+  email-based `rtdb_auth.allowlist` entry must be granted to the new address.
 - **Signed storage URLs minted before this release stop verifying.** The HMAC
   now covers the transform parameters as well as `{id}.{exp}`, so one signature
   authorizes one render rather than every render of a blob (`signed_url.rs`,

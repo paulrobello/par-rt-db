@@ -94,16 +94,17 @@ pub trait OAuthProvider: Send + Sync {
 //
 // 1. The common OIDC shape (Google, GitLab, generic OIDC): a standards-form
 //    `authorization_code` token exchange, then a single authenticated userinfo
-//    GET, then an email-keyed upsert. The token-exchange + userinfo-fetch half
+//    GET, then `auth::resolve_user`. The token-exchange + userinfo-fetch half
 //    is byte-identical across these three (only URLs + the error-message slug
 //    differ), so it lives in `oidc_exchange_and_fetch_userinfo` below. Each
-//    provider keeps its own `parse_userinfo` (the verified-email signal differs
-//    — Google's `email_verified`, GitLab's `confirmed_at`, OIDC's required
-//    `email_verified`) and its own upsert.
+//    provider keeps its own `parse_userinfo`, which differs in both the
+//    verified-email signal (Google's `email_verified`, GitLab's `confirmed_at`,
+//    OIDC's required `email_verified`) and the stable subject it extracts
+//    (Google's/OIDC's `sub`, GitLab's numeric `id`).
 //
 // 2. Divergent flows that deliberately do NOT use the helper:
 //    - GitHub fetches `/user` AND `/user/emails` (two GETs, a User-Agent
-//      header, and a github_id-keyed two-phase upsert).
+//      header).
 //    - Microsoft verifies an id_token against a tenant JWKS and keys identity
 //      on `{tid}.{sub}` (SEC-102 — must NOT regress to email keying).
 //    - Apple signs an ES256 client_secret JWT and reads identity from the
@@ -112,10 +113,12 @@ pub trait OAuthProvider: Send + Sync {
 // Forcing those three into a single template would either bloat it with
 // optional hooks or risk the very identity-keying regressions SEC-102 closed.
 // The shared helper below serves the clean trio; the rest keep their own
-// `complete_login`. The email-keyed upsert hoist into `auth/mod.rs` is
-// DEFERRED — only the three email-keyed providers share it, Microsoft/Apple/
-// GitHub diverge, so a unified upsert would be a half-applied abstraction
-// (filed as the ARC-114 residual).
+// `complete_login`.
+//
+// The upsert itself is no longer per-provider: all six resolve through
+// `auth::resolve_user`, which keys on the provider's own stable subject column
+// and never on the email. A new provider MUST supply such a subject — see
+// "Adding a new provider" in `docs/OAUTH_SETUP.md`.
 
 #[derive(Serialize)]
 struct AuthorizationCodeRequest<'a> {
