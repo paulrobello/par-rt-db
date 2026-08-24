@@ -235,6 +235,16 @@ these concrete decisions:
   the write may have committed while the client saw CONFLICT. Exactly-once
   retries should carry an idempotency key (the owner's mutation-log dedup
   makes a keyed retry a replay).
+- *Server-minted idempotency key (ARC-003, 2026-08-23).* The takeover half of
+  that ambiguity is now closed inside the server: `forward_or_takeover`
+  stamps an unkeyed `Mutate` with a minted key before forwarding, on BOTH the
+  forwarded payload and the request the takeover path may resubmit. The owner
+  records it in the per-db `mutations` dedup table, so a resubmission after a
+  lost reply is a replay of the first outcome, not a second write. Only
+  `Mutate` needs it (migrate/push/merge/restore are idempotent by
+  construction); an owner-side write mints nothing, and the key never reaches
+  the client's response. The ambiguity that remains is purely observational:
+  the caller may see CONFLICT for a write that committed.
 - *Listener readiness.* NOTIFY delivers only to sessions already LISTENing,
   so a forward sent before a peer's listener connected is simply lost — the
   origin's timeout handles it (takeover attempt, CONFLICT if an owner lives,

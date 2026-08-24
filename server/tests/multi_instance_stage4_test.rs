@@ -577,3 +577,71 @@ async fn oversized_write_set_invalidates_peer_subscriptions() -> anyhow::Result<
     );
     Ok(())
 }
+
+/// (ARC-003) An unkeyed mutate that is FORWARDED gets a server-minted
+/// idempotency key, so the owner records it in the shared `mutations` dedup
+/// table. That row is what makes the timeout→takeover resubmission a replay
+/// rather than a second write: without it, a reply racing the forward timeout
+/// left the origin resubmitting a write that had already committed.
+#[tokio::test]
+async fn forwarded_mutate_is_deduped_by_a_server_minted_key() -> anyhow::Result<()> {
+    let pool = shared_pool().await;
+    let a = replica(&pool, "arc003-key-a", 0, 0).await;
+    let b = replica(&pool, "arc003-key-b", 0, 0).await;
+
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &name).await?;
+    let db = common::wrap_test_db(name);
+    a.realtime
+        .committers
+        .push_schema(&db, items_schema(false))
+        .await?;
+
+    // A local (owner-side) unkeyed mutate is NOT keyed — it has no forward to
+    // be ambiguous about, so it must not pay for a dedup row.
+    a.realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            insert_item("owner-local"),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    let (local_rows,): (i64,) =
+        sqlx::query_as(&format!("SELECT count(*) FROM \"db_{db}\".mutations"))
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(local_rows, 0, "an owner-side write mints no key");
+
+    // The forwarded one is keyed by the server.
+    mutate_until_landed(&b, &db, insert_item("forwarded"), PrincipalCtx::bypass()).await?;
+    let (keyed_rows,): (i64,) =
+        sqlx::query_as(&format!("SELECT count(*) FROM \"db_{db}\".mutations"))
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        keyed_rows, 1,
+        "the forwarded mutate recorded a dedup row under the minted key"
+    );
+
+    // Replaying that exact key returns the recorded outcome instead of
+    // writing again — the property the takeover path relies on.
+    let (mut_id,): (String,) = sqlx::query_as(&format!("SELECT mut_id FROM \"db_{db}\".mutations"))
+        .fetch_one(&pool)
+        .await?;
+    a.realtime
+        .committers
+        .mutate(
+            &db,
+            Some(mut_id),
+            insert_item("forwarded"),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    let (rows,): (i64,) = sqlx::query_as(&format!("SELECT count(*) FROM \"db_{db}\".\"t_items\""))
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(rows, 2, "the replay wrote nothing new");
+    Ok(())
+}

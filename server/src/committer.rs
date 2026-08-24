@@ -236,6 +236,21 @@ fn request_needs_write(req: &CommitterRequest) -> bool {
     )
 }
 
+/// Stamp a server-minted idempotency key onto an unkeyed `Mutate` about to be
+/// forwarded (ARC-003). Runs BEFORE `forward_write_of` so the forwarded
+/// payload and the request the takeover path may resubmit carry the same key.
+/// A client-supplied key is left alone; an empty one counts as absent
+/// (`handle_mutate` filters empty keys, so it would dedup nothing).
+fn mint_forward_idempotency_key(req: &mut CommitterRequest) {
+    if let CommitterRequest::Mutate {
+        idempotency_key, ..
+    } = req
+        && idempotency_key.as_deref().unwrap_or("").is_empty()
+    {
+        *idempotency_key = Some(uuid::Uuid::now_v7().simple().to_string());
+    }
+}
+
 /// The forwardable projection of a write arm (Stage 4c): every reply-carrying
 /// write arm has a `ForwardWrite` variant; fire-and-forget arms (scheduler,
 /// reaper, workflow) return `None` — they originate only from an owner's own
@@ -629,12 +644,27 @@ impl Committers {
     /// acquire attempt; if another replica still owns, the respawn is a
     /// shadow whose write arm replies CONFLICT (the `run_committer`
     /// backstop), which is the honest answer: retry reaches the new owner.
-    async fn forward_or_takeover(&self, db: &str, req: CommitterRequest) -> Result<(), RtDbError> {
+    async fn forward_or_takeover(
+        &self,
+        db: &str,
+        mut req: CommitterRequest,
+    ) -> Result<(), RtDbError> {
         let Some(forwarder) = self.forwarder.clone() else {
             // multi_instance without a forwarder is a wiring bug (AppState
             // always builds one); Stage 4a behavior is the safe fallback.
             return self.takeover_submit(db, req).await;
         };
+        // ARC-003: mint an idempotency key for an unkeyed forwarded mutate.
+        // The forward path has a documented timeout ambiguity — a reply racing
+        // the timeout is dropped, and the origin then takes over and RESUBMITS
+        // the same write, which without a key executes it a second time. The
+        // minted key is stamped on both the request and the forwarded payload,
+        // so the owner logs it in the shared `mutations` dedup table and the
+        // takeover's resubmission comes back as a replay of the first outcome
+        // instead of a duplicate write. Only `Mutate` needs this: migrate,
+        // push, merge, and restore are idempotent by construction. The key is
+        // internal — it never appears in the client's response.
+        mint_forward_idempotency_key(&mut req);
         let Some(write) = forward_write_of(&req) else {
             // Fire-and-forget write arm reaching a shadow — only possible
             // when a poller raced the takeover. Submit locally; the shadow's
