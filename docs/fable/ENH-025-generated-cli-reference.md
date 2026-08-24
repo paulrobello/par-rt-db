@@ -4,8 +4,9 @@
 
 Stop `cli/README.md` from drifting (audit finding DOC-202 found a false `--url` default and 7 of 16
 commands undocumented) by generating the command-reference section from the CLI's own `--help`
-output and gating it in `make checkall` — the same pattern the kanban CLI uses
-(`tests/cli/skill-sync.test.ts` keeping its skill doc in sync with `USAGE`).
+output and gating it in `make checkall` — the same pattern the kanban CLI uses in its own repo
+(`~/Repos/kanban/tests/cli/skill-sync.test.ts` keeps that project's skill doc in sync with its
+`USAGE`; that file does not exist in this repo and is cited here only as prior art).
 
 ## Current state
 

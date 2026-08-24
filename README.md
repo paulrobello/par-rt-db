@@ -1199,7 +1199,7 @@ plus an operator SPA and a CLI built on top of them:
 - [`ts-client/`](ts-client/README.md) — `@par-rt-db/client` (browser/Node/React Native): schema builder, reactive WebSocket client, React bindings, HTTP/admin clients, in-memory test harness.
 - [`rust-client/`](rust-client/README.md) — `par-rt-db-client` (Rust): http + reactive ws + admin, `.filter()`/`.search()`/`.vector_search()` builders.
 - [`python-client/`](python-client/README.md) — `par-rt-db` (Python): wire contract + schema/mutation/query DSL + sync HTTP/admin/storage + reactive WS.
-- [`swift-client/`](swift-client/README.md) — `ParRtDbClient`/`ParRtDbUI` (Swift 6, iOS 17+/macOS 14): wire + query/mutation/schema DSL + HTTP + reactive WS + SwiftUI `LiveQuery`; admin/presence/optimistic/in-memory-engine surfaces deferred (see its README's coverage table).
+- [`swift-client/`](swift-client/README.md) — `ParRtDbClient`/`ParRtDbUI` (Swift 6, iOS 17+/macOS 14): wire + query/mutation/schema DSL + HTTP + reactive WS + SwiftUI `LiveQuery`, plus the admin client, presence, optimistic updates, and the in-memory engine (see its README's coverage table).
 - [`dashboard/`](dashboard/README.md) — the operator console SPA (admin/operator UI served same-origin at `RTDB_STATIC_DIR`; consumes `ts-client`).
 - [`cli/`](cli/README.md) — `rtdb` operator/CI binary (wraps `par-rt-db-client`).
 
@@ -1234,12 +1234,14 @@ plus an operator SPA and a CLI built on top of them:
 
 ## What's new
 
-No release has been tagged yet — everything currently lives under `[Unreleased]` in
-[`CHANGELOG.md`](CHANGELOG.md) (the eventual `0.1.0` cut is tracked as ENH-026). Recent
-highlights from the unreleased section: grouped aggregates include the null group key,
-wire-corpus semantic alignment across the server and the three in-memory client engines,
-durable workflows, realtime presence, hybrid search, and schema migration with snapshot
-history and restore.
+`0.1.0` is tagged; everything since lives under `[Unreleased]` in
+[`CHANGELOG.md`](CHANGELOG.md). Highlights: the Swift client (the fourth SDK and
+the fifth implementation of the wire contract), multi-instance write forwarding
+with cross-replica subscription invalidation, computed fields, auto-increment
+counters, `awaitSignal` workflow approval gates, query field projection, and
+interval-recurrence scheduling. Read the **Breaking** group first — signed
+storage URLs minted before this cycle no longer verify, and missing-schema
+database operations now answer `NOT_FOUND` rather than `INTERNAL`.
 
 ## Contributing
 

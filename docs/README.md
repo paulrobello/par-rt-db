@@ -6,11 +6,11 @@ contribution.
 
 ## Project guides
 
-- [`DOCUMENTATION_STYLE_GUIDE.md`](DOCUMENTATION_STYLE_GUIDE.md) — formatting, tone, and structure conventions for every doc in this repo and across the six packages.
+- [`DOCUMENTATION_STYLE_GUIDE.md`](DOCUMENTATION_STYLE_GUIDE.md) — formatting, tone, and structure conventions for every doc in this repo and across the eight workspace packages.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — server internals: the single-writer committer, per-database background tasks, data pipeline, transports, auth, storage, quotas, and the admin surface — with the reasoning behind each invariant.
 - [`OAUTH_SETUP.md`](OAUTH_SETUP.md) — register OAuth apps and wire them into par-rt-db (GitHub, Google, GitLab, Microsoft, Apple, generic OIDC). Each provider is independently optional.
 - [`RELEASING.md`](RELEASING.md) — the repeatable release procedure: lockstep version bump, CHANGELOG heading, gate, annotated tag, push (owner-confirmed).
-- [`clients.md`](clients.md) — the three client SDKs (TypeScript/Rust/Python) at a glance: surface comparison, the four-way wire parity contract, and links to each package's detailed README.
+- [`clients.md`](clients.md) — the four client SDKs (TypeScript/Rust/Python/Swift) at a glance: surface comparison, the five-way wire parity contract, and links to each package's detailed README.
 
 ## Top-level docs (repo root)
 
@@ -36,11 +36,15 @@ When the code and a spec disagree, the code wins; fix the spec.
 
 ## Per-package READMEs
 
-Each of the six packages has its own README covering install, usage, and development:
+The workspace holds eight packages (`core`, `server`, `ts-client`, `rust-client`,
+`python-client`, `swift-client`, `dashboard`, `cli`); seven have their own README
+covering install, usage, and development (`core` is an internal wire-types crate
+with no consumer-facing surface of its own):
 
 - [`../server/README.md`](../server/README.md) — Rust axum/tokio server (the committer, transports, auth, storage, admin API).
 - [`../ts-client/README.md`](../ts-client/README.md) — `@par-rt-db/client` (browser/Node): schema builder, reactive WebSocket client, React bindings, HTTP/admin clients, in-memory test harness.
 - [`../rust-client/README.md`](../rust-client/README.md) — `par-rt-db-client` (Rust): `http` + reactive `ws` + `admin` features, `.filter()`/`.search()`/`.vector_search()`/`.hybrid_search()` builders.
 - [`../python-client/README.md`](../python-client/README.md) — `par-rt-db` (Python): wire contract + schema/mutation/query DSL + sync HTTP/admin/storage + async HTTP twin + reactive WS + in-memory harness.
+- [`../swift-client/README.md`](../swift-client/README.md) — `ParRtDbClient` / `ParRtDbUI` (Swift): wire contract + schema/mutation/query DSL + HTTP/admin/storage clients + reactive WS + in-memory harness + SwiftUI `LiveQuery` bindings.
 - [`../dashboard/README.md`](../dashboard/README.md) — Vite + React operator console SPA (databases, schema, live data browser, metrics, op feed, hot config, admin allowlist).
 - [`../cli/README.md`](../cli/README.md) — `rtdb` CLI for CI/operator workflows (list/create dbs, push schema, query/mutate, mint/revoke tokens).

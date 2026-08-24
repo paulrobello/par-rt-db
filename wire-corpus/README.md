@@ -97,7 +97,7 @@ keys projected out:
     a group whose aggregate input is entirely NULL aggregates to
     `value: null` (SQL aggregates ignore NULL rows, so a partially-present
     group aggregates the present values)
-- **txn op** — array of per-step results: `insert` → `{"id", }`; `patch`,
+- **txn op** — array of per-step results: `insert` → `{"id"}`; `patch`,
   `replace`, `delete`, `undelete`, `expectVersion`, `expectAbsent` → `null`;
   `upsert` → `{"id", "inserted"}`; `patchByQuery` → `{"patched", "truncated"}`;
   `deleteByQuery` → `{"deleted", "truncated"}`
@@ -190,5 +190,5 @@ Placeholders never appear in `expect` — expectations use `normalize` instead.
 3. Check the determinism rulings — especially `unordered` and `normalize`.
 4. Name the file for the behavior (`<area>-<specifics>.json`), and make `name`
    match the filename.
-5. `jq . <file>` must parse; the runner count assertion in each package's
-   corpus test should be bumped only by adding files, never by skipping.
+5. `jq . <file>` must parse. Each runner enumerates the corpus directory at
+   test time, so adding a file is picked up automatically — no count to bump.

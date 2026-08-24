@@ -5,7 +5,9 @@ The repeatable cut procedure. Everything versions in **lockstep** — `server`,
 `python-client`, `swift-client`) share one version (see
 [`../CONTRIBUTING.md`'s Versioning section](../CONTRIBUTING.md#versioning)).
 `swift-client` has no manifest version to bump — SPM carries no version field,
-so the release tag itself is its version. Nothing here publishes to a registry;
+so the release tag identifies which commit a build was cut from, though there
+is no root `Package.swift` for a Swift consumer to resolve a remote git
+dependency against; see the note under step 1. Nothing here publishes to a registry;
 a release is a git tag plus the CHANGELOG
 heading. Publishing the SDKs to crates.io / npm / PyPI is a separate,
 user-approved decision.
@@ -18,8 +20,11 @@ user-approved decision.
    - `python-client/pyproject.toml`
    Regenerate the lockfiles (`cargo build` for `Cargo.lock`; `bun install` from
    the root for the bun lockfile) and commit them. `swift-client` is absent
-   from this list on purpose: SPM manifests carry no version field, so the
-   release tag is its version — consumers pin the tag.
+   from this list on purpose: SPM manifests carry no version field, and
+   `Package.swift` lives in `swift-client/`, not the repo root, so a Swift
+   consumer cannot resolve this as a remote git package pinned to a tag —
+   add `swift-client` as a local package dependency (a path to a checkout of
+   this repo) instead.
 2. **Update `CHANGELOG.md`**: move the accumulated `[Unreleased]` entries under
    a new `## [0.x.y] - <date>` heading, leave a fresh empty `## [Unreleased]`
    on top, and update the footer compare links
@@ -40,7 +45,7 @@ user-approved decision.
    ```
 7. **Optionally create the GitHub release** from the tag with the CHANGELOG
    section as notes (`gh release create v0.x.y --title "v0.x.y" --notes-file …`).
-8. **Deploy** per [`deploy/README.md`](deploy/README.md) if this release ships
+8. **Deploy** per [`deploy/README.md`](../deploy/README.md) if this release ships
    to the operator's instance. The deployed binary's version label comes from
    `CARGO_PKG_VERSION` automatically (`/healthz` reports it); no deploy-script
    version to update.

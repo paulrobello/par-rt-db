@@ -14,7 +14,7 @@ is exactly the failure class the memory note "wire-corpus skip_serializing_if dr
 - `wire-corpus/golden-vector.json` + parity tests exist in all four packages:
   `server/tests/golden_vector_test.rs`, `ts-client/tests/wire-corpus.test.ts`,
   `rust-client/tests/wire_corpus.rs`, `python-client/tests/test_golden_vector.py`.
-- The three in-memory engines (`ts-client/src/in_memory.ts`, `python-client/src/par_rt_db/in_memory.py`,
+- The three in-memory engines (`ts-client/src/in_memory/`, `python-client/src/par_rt_db/in_memory/`,
   `rust-client/src/in_memory/`) each have large hand-written unit suites asserting behavior
   independently — thorough but unshared, so a semantic gap in one suite is invisible.
 - Audit finding ARC-201 (2026-08-16) decomposes these engines; this enhancement is the follow-on
