@@ -17,9 +17,15 @@ FROM rust:bookworm AS builder
 WORKDIR /build
 COPY rust-toolchain.toml ./
 COPY Cargo.toml Cargo.lock ./
+COPY core/Cargo.toml core/Cargo.toml
 COPY server/Cargo.toml server/Cargo.toml
 COPY rust-client/Cargo.toml rust-client/Cargo.toml
 COPY cli/Cargo.toml cli/Cargo.toml
+# ARC-004: `core` is a path dependency of the server, so its REAL source has to
+# be present for the dependency layer to compile — a stub lib.rs would make the
+# server's `par_rt_db_core::…` paths unresolvable. It is tiny and changes
+# rarely, so copying it here costs no meaningful cache invalidation.
+COPY core/src core/src
 # Dependency layer: compile the whole dependency tree once, cached unless
 # Cargo.toml or Cargo.lock change. Throwaway main/lib so each member package
 # parses, then build the server deps without the real source (next layer).

@@ -1,0 +1,18 @@
+[package]
+name = "par-rt-db-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Paul Robello <probello@gmail.com>"]
+description = "Shared wire types for par-rt-db's server and Rust client"
+repository = "https://github.com/paulrobello/par-rt-db"
+
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

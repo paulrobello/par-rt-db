@@ -1806,6 +1806,7 @@ dependencies = [
  "base64",
  "bytes",
  "futures-util",
+ "par-rt-db-core",
  "reqwest",
  "serde",
  "serde_json",
@@ -1814,6 +1815,14 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.26.2",
  "wiremock",
+]
+
+[[package]]
+name = "par-rt-db-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2404,6 +2413,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "par-rt-db-client",
+ "par-rt-db-core",
  "percent-encoding",
  "proptest",
  "rand 0.8.7",

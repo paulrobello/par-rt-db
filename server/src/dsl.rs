@@ -279,78 +279,11 @@ pub struct AggregateGroup {
     pub value: serde_json::Value,
 }
 
-/// A db-side predicate appended to a query's WHERE clause. Leaves compare one
-/// declared field to a value (`in` to a non-empty list); `and`/`or` nest
-/// arbitrarily. Compilation: an *indexed* field compares against its typed
-/// column (value typed via the field's declared `FieldType`, exactly like `eq`);
-/// any other *declared* field uses jsonb extraction (`doc->>'field'`, cast for
-/// non-text value kinds). Field names are schema-validated identifiers, so they
-/// are safe to emit inside a quoted column name or a jsonb string literal.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "op", rename_all = "lowercase", deny_unknown_fields)]
-pub enum FilterExpr {
-    Eq {
-        field: String,
-        value: serde_json::Value,
-    },
-    Neq {
-        field: String,
-        value: serde_json::Value,
-    },
-    Gt {
-        field: String,
-        value: serde_json::Value,
-    },
-    Gte {
-        field: String,
-        value: serde_json::Value,
-    },
-    Lt {
-        field: String,
-        value: serde_json::Value,
-    },
-    Lte {
-        field: String,
-        value: serde_json::Value,
-    },
-    In {
-        field: String,
-        values: Vec<serde_json::Value>,
-    },
-    And {
-        exprs: Vec<FilterExpr>,
-    },
-    Or {
-        exprs: Vec<FilterExpr>,
-    },
-    Not {
-        expr: Box<FilterExpr>,
-    },
-    Contains {
-        field: String,
-        value: serde_json::Value,
-    },
-    Exists {
-        field: String,
-    },
-    /// Execution-time-relative age predicate: the named field's epoch-ms
-    /// value is strictly older than `now − ms`, with `now` taken from the
-    /// server clock AT EXECUTION TIME — a scheduled txn's stored filter
-    /// stays fresh on every fire instead of freezing a literal at schedule
-    /// time (server-side sweeps: archive done rows older than 7d, expire
-    /// claim leases). Valid ONLY in the by-query step filters
-    /// (`patchByQuery`/`deleteByQuery`); read-path filters reject it (a live
-    /// subscription would go stale between writes — nothing re-evaluates a
-    /// wall-clock window on a timer), and so do `authorize` predicates,
-    /// partial-index `where` predicates, and computed `case` whens. The
-    /// field must be declared `number` or `int64` (`optional` unwrapped; a
-    /// null or absent value never matches), and `ms >= 0`.
-    #[serde(rename = "olderThan")]
-    OlderThan {
-        field: String,
-        ms: i64,
-    },
-}
+/// A db-side predicate appended to a query's WHERE clause. Defined once in
+/// `par-rt-db-core` (ARC-004) and re-exported here at its historical path:
+/// the server compiles it to SQL, the Rust client constructs it, and neither
+/// can drift from the other because there is only one definition.
+pub use par_rt_db_core::wire::FilterExpr;
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(untagged)]

@@ -33,6 +33,7 @@ ts-client-build:
 	cd ts-client && bun run build
 
 build: ts-client-build
+	cd core && cargo build
 	cd server && cargo build
 	cd rust-client && cargo build --all-features
 	cd cli && cargo build --all-features
@@ -58,6 +59,7 @@ fmt-check:
 	$(call SWIFT_IF_DARWIN,swiftformat --lint .)
 
 lint:
+	cd core && cargo clippy --all-targets --all-features -- -D warnings
 	cd server && cargo clippy --all-targets --all-features -- -D warnings
 	cd ts-client && bun run lint
 	cd rust-client && cargo clippy --all-targets --all-features -- -D warnings
@@ -67,6 +69,7 @@ lint:
 	$(call SWIFT_IF_DARWIN,swiftlint --strict)
 
 typecheck: ts-client-build
+	cd core && cargo check --all-targets --all-features
 	cd server && cargo check --all-targets
 	cd ts-client && bun run typecheck
 	cd rust-client && cargo check --all-targets --all-features
@@ -88,6 +91,7 @@ dev-db-clean:
 	psql "$(RTDB_TEST_DATABASE_URL)" -f scripts/dev-db-clean.sql
 
 test: dev-db-up
+	cd core && cargo test
 	cd server && cargo test
 	cd ts-client && bun run test
 	cd rust-client && cargo test --all-features

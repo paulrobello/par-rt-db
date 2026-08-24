@@ -11,7 +11,7 @@
 # cargo resolves the workspace from the member manifest's location.
 [workspace]
 resolver = "2"
-members = ["server", "rust-client", "cli"]
+members = ["core", "server", "rust-client", "cli"]
 
 # Deps shared by two or more members. Members opt in via `dep.workspace = true`
 # and may ADD features (member features are unioned onto the base declared here)
@@ -19,6 +19,10 @@ members = ["server", "rust-client", "cli"]
 # below is the lowest common denominator; members re-add what they need
 # (e.g. server re-adds `cookies` on reqwest and `std` on sha2).
 [workspace.dependencies]
+# ARC-004: the wire vocabulary the server and the Rust client both speak.
+# Defined once so a drift between them is a compile error rather than a
+# wire-corpus failure. No I/O, no runtime — serde and serde_json only.
+par-rt-db-core = { path = "core" }
 # Shared by server + rust-client (+ cli for serde_json/anyhow).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
