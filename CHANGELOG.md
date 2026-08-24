@@ -10,197 +10,245 @@ carries no manifest version — the repo's release tag is its version.
 
 Feature entries cross-reference the rows in
 [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md), which is the authoritative parity
-contract against Convex.
+contract against Convex. Unless a path says otherwise, bare `.rs` file
+references in server entries are relative to `server/src/`.
 
 ## [Unreleased]
 
-### Feature: multi-instance Stage 4 — committer ownership lease + cross-process rate limits (ENH-022)
+Everything below has landed since `0.1.0`. Entries are grouped Keep a Changelog
+style; **Breaking** collects the changes that require a consumer edit or that
+alter observable behavior on upgrade.
 
-Completes `RTDB_MULTI_INSTANCE=true` as a full single-writer fleet
-(design: docs/superpowers/specs/2026-08-22-multi-instance-stage4-design.md,
-approved). **Ownership (option A1, as-built simplification):** the first
-replica to touch a database acquires `pg_try_advisory_lock` on a dedicated
-one-connection pool and runs that database's committer AND its
-scheduler/reaper/dedup pollers on it — the lease and every write share one
-Postgres backend, so no other replica can be mid-write while one owns
-(split-brain impossible by construction, no fencing tokens needed; the
-doc's per-txn xact-lock fence is superseded by this, which is both simpler
-and avoids session/xact advisory locks conflicting across a process's own
-connections). Non-owners serve a SHADOW committer — reads and subscriptions
-work — while every write arm replies `CONFLICT` naming the lease; a write
-submit on a shadow attempts the takeover first, which is exactly the
-failover path when an owner dies (kill -9 drops the backend session,
-Postgres releases the lock, the next replica's write acquires — proven by
-the two-instance integration test, `ownership_lease_single_writer_and_failover_on_death`).
-**Rate limits (option B1):** in multi-instance mode counters live in
-`rtdb_auth.rate_counters` — one atomic `INSERT … ON CONFLICT … RETURNING`
-per checked request, so a configured ceiling is exact across replicas
-(single-instance keeps the in-memory limiter; the unlimited default never
-queries; a 60s sweep bounds the table). Verified by
-`rate_budget_is_shared_across_replicas`. Writes must still reach the owning
-replica — automatic forwarding of non-owner writes is the staged follow-up.
+### Breaking
 
-### Feature: ts-client `unreachable` auth state — bounded pre-auth reconnect signal
+- **Signed storage URLs minted before this release stop verifying.** The HMAC
+  now covers the transform parameters as well as `{id}.{exp}`, so one signature
+  authorizes one render rather than every render of a blob (`signed_url.rs`,
+  `image_transform.rs`, `http_api.rs`). The mint endpoint accepts transform
+  params and echoes them into the URL it signs. **Migration:** re-mint any
+  signed URL you have handed out or persisted; there is no compatibility window.
+- **Database operations on a registered database whose Postgres schema is
+  missing now answer `NOT_FOUND` instead of `INTERNAL`.** A wire-visible error
+  code change. `db::load_schema` maps `3F000`/`42P01` on the `meta` read to "no
+  schema", so every schema-loading committer arm, the scheduler, and the reaper
+  report the database as absent rather than returning a generic 500. Clients
+  keying retry logic on `NOT_FOUND` will now see it fire.
+- **rust crate: `WorkflowStepSpec.txn` is now `Option<Transaction>`** so a step
+  can carry an `awaitSignal` wait instead of a transaction. Migrate `txn: t` to
+  `txn: Some(t)`, or use `WorkflowStepSpec::await_signal(name, timeout_ms)`.
+  TypeScript, Python, and Swift consumers are unaffected beyond the new optional
+  field.
+- **Per-IP rate-limit buckets are namespaced by route.** Public storage reads,
+  admin login, and anonymous token mint no longer share one per-IP minute
+  bucket, so a client that was implicitly borrowing another route's budget will
+  now be limited on its own. The `rtdb_auth.rate_counters` table schema is
+  unchanged (the route folds into `key_text`), so multi-instance deploys need no
+  migration.
 
-A cookie-mode app served from a non-allowlisted origin gets its WS upgrade
-403'd, which the browser surfaces only as close 1006 — the client treated
-every non-4401 close as reconnectable, looping in `authenticating` forever
-with no way for the app to tell "signed out" from "sign-in unreachable".
-`AuthState` gains `"unreachable"`: after `authUnreachableAfterAttempts`
-consecutive closes during the auth handshake (default 5, 0 disables), the
-state flips so apps can render "sign-in unavailable". The retry loop
-continues (the state is a signal, not a stop); a completed handshake, a
-4401, or a fresh `connect()`/`setToken()` clears it, and a post-auth drop
-never counts toward it. Kanban card 01a0281f79a87ee39738145fabeaabc6.
+### Added
 
-### Feature: execution-time-relative `olderThan` filter op for by-query txn steps (server + all four clients)
+- **Swift client (`ParRtDbClient` / `ParRtDbUI`) — the fourth SDK and the fifth
+  implementation of the wire contract.** Wire types, the query/mutation/schema
+  DSL, HTTP and reactive WebSocket transports, SwiftUI `LiveQuery`, presence,
+  optimistic updates, the admin client and migrate DSL, and a port of the
+  in-memory engine. It runs both corpus runners, so every semantics case and the
+  golden vector now execute against five engines.
+- **Multi-instance Stage 4c — non-owner writes forward to the lease owner.** A
+  write submitted to a replica that does not hold a database's ownership lease
+  is executed by the owner inside its committer turn and its outcome returned to
+  the origin's client, instead of failing with `CONFLICT`. The principal that
+  authorized the write travels with the request, so per-row authorization
+  evaluates against the caller's identity. If no owner answers within
+  `RTDB_FORWARD_TIMEOUT_MS`, the origin attempts the lease takeover — that path
+  is the failover. See [Multi-instance](README.md#multi-instance).
+- **Cross-replica subscription invalidation.** Every durable write publishes its
+  write set on `rtdb_write_sets`, and each replica re-runs the subscriptions
+  that write touched. Before this, a client subscribed through replica B saw
+  nothing when the owner on replica A committed — every owner-side write (a
+  direct HTTP mutate, a scheduled job, TTL expiry, a migration, a restore) was
+  invisible to B's clients. Multi-instance live queries were quietly wrong.
+- **Declarative computed fields** — a table may declare `computed`, a map of
+  field name to a `ValueExpr` the server stamps on every write. Mirrored in all
+  four client SDKs with corpus coverage.
+- **Auto-increment counter fields** — a table may declare `autoIncrementField`,
+  backed by a per-table Postgres sequence. Mirrored in all four SDKs.
+- **`awaitSignal` workflow steps — external approval gates.** A step is either a
+  txn or an `awaitSignal {name, timeoutMs?}` wait. The run parks in a new
+  non-terminal `waiting` status (`waitingFor` / `waitedSince` on
+  `WorkflowInfo`) until a matching signal arrives. Delivery rides three
+  surfaces — `POST /api/workflows/{id}/signal`, the WS `signalWorkflow` frame,
+  and `POST /admin/db/{db}/workflows/{id}/signal` — sharing typed errors (404
+  unknown id, 409 not-waiting or name mismatch) and one 64 KiB serialized
+  payload cap. Delivery is latest-wins, the consumed payload is recorded on the
+  step outcome, an omitted `timeoutMs` parks forever (cancel is the escape), and
+  a timeout counts as a failed attempt routed into the step's `retry` policy,
+  re-parking for the full `timeoutMs` rather than backing off. `awaitSignal`
+  steps write no documents: delivery is one conditional side-table `UPDATE`, so
+  no new committer arm or tap site. The `rtdb workflows signal` subcommand and
+  the dashboard's send-signal form use the same surfaces.
+- **Query field projection — `fields` on any query.** An optional
+  `fields: string[]` projects each result doc to the listed user fields. Every
+  `_`-prefixed key is always kept — the system fields plus synthetic ones like
+  `_searchSnippet` — and `fields: []` is a meaningful ids-only view. Names are
+  validated at compile time against the table, and projection applies at the
+  single `execute_query` seam, so every doc-bearing terminal composes with it on
+  every surface. Sorting, cursors, and snippet rendering happen before
+  projection. A projected subscription's change detection strips the volatile
+  `_version`, so a write touching only non-projected fields re-runs the
+  subscription but pushes nothing. Convex returns full documents
+  ([get-convex/convex-backend#97](https://github.com/get-convex/convex-backend/issues/97)).
+- **Interval recurrence for scheduled transactions** (`when: {type:"interval",
+  everyMs}`) — the third recurrence shape alongside one-shot and cron, for poll
+  loops and cache refreshes where a cron expression is heavyweight. The first
+  `due_at` is `now + everyMs`; each fire re-arms from the actual fire time, and
+  `resume` shifts the next fire to `now + everyMs`. Missed windows are skipped,
+  never backfilled, matching cron. `everyMs` must be positive and at most one
+  year. `scheduled_txns` gains a nullable `every_ms` column via an additive
+  `ALTER … ADD COLUMN IF NOT EXISTS`.
+- **Server-stamped `updatedAtField`** — a table may declare a `number`/`int64`
+  field the server stamps with the current epoch-ms on every version-bumping
+  write (insert, patch, replace, both upsert branches, `patchByQuery`, cascade
+  `setNull`), overwriting any client-supplied value. The value follows the
+  field's wire convention, sits in the typed column when the field is indexed,
+  and wins over a `defaults` entry on the same field. Snapshot import replays
+  stored docs verbatim and never re-stamps.
+- **Execution-time-relative `olderThan` filter op for by-query txn steps.**
+  `patchByQuery` / `deleteByQuery` filters accept
+  `{"op":"olderThan","field":…,"ms":…}`; rows whose epoch-ms field is strictly
+  older than `now − ms` match, with the cutoff taken from the clock **at each
+  execution**. A scheduled transaction carrying it sweeps with a fresh window on
+  every fire, moving the done-archiver and claim-lease-expiry class of job
+  server-side. Deliberately by-query-only: read filters, `authorize` predicates,
+  partial-index `where` predicates, and computed `case` whens all reject it,
+  because nothing re-evaluates a wall-clock window on a timer.
+- **`DELETE /admin/sessions?expired=true`** sweeps every expired row from both
+  the `sessions` and `admin_sessions` tables. Untouched expired sessions were
+  otherwise never reaped, since lazy deletion only fires when a session is used
+  again. Mirrored in the clients.
+- **ts-client `unreachable` auth state** — a bounded pre-auth reconnect signal.
+  A cookie-mode app served from a non-allowlisted origin gets its WS upgrade
+  403'd, which the browser surfaces only as close 1006, so the client looped in
+  `authenticating` forever with no way to distinguish "signed out" from "sign-in
+  unreachable". After `authUnreachableAfterAttempts` consecutive closes during
+  the handshake (default 5, 0 disables), `AuthState` flips to `"unreachable"`.
+  The retry loop continues — the state is a signal, not a stop — and a completed
+  handshake, a 4401, or a fresh `connect()` / `setToken()` clears it.
+- **`dockerfile-stub-check`** — a `checkall` stage that diffs the workspace's
+  declared `[[test]]` targets against the stubs the Dockerfile names. Adding a
+  test target without its stub used to break `make deploy` while `make checkall`
+  stayed green.
+- **`par-rt-db-core`** — a new workspace crate holding the wire vocabulary
+  (`FilterExpr`, `ValueExpr`, `Cast`, `CaseWhen`, their builders, and the field
+  walks) that the server and the Rust client previously kept as two
+  hand-maintained copies. Both crates re-export at their historical paths, so no
+  call site changed. A drift between them is now a compile error rather than a
+  corpus failure.
 
-`patchByQuery`/`deleteByQuery` filters accept `{"op":"olderThan","field":...,"ms":...}`:
-rows whose epoch-ms field is strictly older than `now − ms` match, with the
-cutoff derived from the clock **at each execution** — a scheduled
-one-shot/cron/interval txn carrying it sweeps with a fresh window on every
-fire, no client re-scheduling (the done-archiver / claim-lease-expiry class
-of job moves server-side). The op is deliberately by-query-only: read/query
-filters reject it (a live subscription would go stale between writes —
-nothing re-evaluates a wall-clock window on a timer), and so do `authorize`
-predicates, partial-index `where` predicates, and computed `case` whens. The
-field must be declared `number`/`int64` (optional-unwrapped; null/absent
-never matches) and `ms ≥ 0`. Server compile: indexed fields compare against
-their typed column (`float8`/`bigint`), unindexed via the jsonb `::float8`
-cast path; SEC-104 caps unchanged. Integration-tested in
-`server/tests/relative_filter_test.rs` (including a scheduled sweep firing on
-the server clock), pinned by eight semantics-corpus cases (five behavioral,
-three `pushError` pinning the per-surface rejection codes: authorize
-`SCHEMA_VIOLATION`; partial-index `where` and computed case-when whens
-`BAD_REQUEST`) and two `wire-corpus.json` entries.
+### Changed
 
-### Fix: server-stamped fields are optional in the ts-client insert/replace types (FM-36/FM-37)
+- **Schema push runs through the committer** and invalidates subscriptions on
+  backfilled tables at push time. `handle_push_schema` is the eighth
+  tap-publishing committer arm (`source = "push"`, no DocOps).
+- **`committer.rs` is now the `committer/` module** — `mod.rs`, `lease.rs`,
+  `forwarding.rs`, `supervisor.rs`, `taps.rs`, and one `arms/*.rs` per request
+  arm. A pure move with no behavior change, but it makes two invariants
+  structural instead of conventional: `publish_taps` is visible only to the
+  committer and its arms, and `execute_txn` is called only from inside `arms/`.
+- **Server integration tests are one binary.** `server/tests/main.rs` is the
+  single target and each former `tests/*.rs` is a module of it. Run one test with
+  `cargo test --test main <file_stem>::<test_name>`; a new test file needs a
+  `mod` line in `main.rs`. The 55 separate binaries each opened their own
+  Postgres pool against the shared dev database, which was the documented source
+  of the intermittent `oauth_test` `PoolTimedOut` flake.
+- **Forwarded requests and replies are spooled.** Both forward channels carry
+  only a 36-byte row id into `rtdb_auth.forward_queue`; the JSON body lives in
+  that table. A `pg_notify` payload is capped at 8000 bytes, so forwarding
+  previously failed for any real mutation or schema push — the origin's notify
+  errored, the write fell into the takeover path, and a live owner turned it
+  into `CONFLICT`. Spooling also survives a listener reconnect that would have
+  dropped an in-flight NOTIFY. Payloads over 16 MiB are refused at the origin.
+- **`/admin/clone-db` documentation corrected** — it clones the full snapshot
+  (schema and documents, preserving ids, `createdAt`, and `version`), matching
+  `export-db` / `import-db` exactly. Storage blobs and scheduled transactions
+  are outside the snapshot format and are not copied. Behavior is unchanged;
+  only the `0.1.0` changelog entry was wrong.
 
-The server accepts an insert/replace that omits a table's `updatedAtField`
-or `autoIncrementField` field — the stamp runs before required-field
-validation and supplies the value (the same authority that overwrites a
-supplied one; every engine already mirrored this) — but the ts-client's
-`WithoutSystemFields` insert/replace input type kept the field required,
-forcing callers to pass a dead value the server immediately overwrites.
-`updatedAtField()`/`autoIncrementField()` now record the field on the
-table's type (a phantom type parameter threaded through every builder
-method, chaining in any order), and `WithoutSystemFields` makes exactly
-those fields optional — read types (`Doc`) keep them required, since every
-stored doc carries them. Pinned by type tests
-(`mutation.types.test.ts`) and two new semantics-corpus cases
-(`updated-at-field-omitted-on-insert` / `-on-replace`) pinning the
-engine-level ruling across all five runners.
+### Fixed
 
-### Feature: query field projection — `fields` on any query (FM-38, server + all four clients)
+- **A forwarded mutate carrying no idempotency key is given a server-minted
+  one.** A reply racing the forward timeout is dropped, and the origin then
+  takes over and resubmits the same write — which, for an unkeyed mutate,
+  executed it a second time after the owner had already committed it. The key is
+  stamped on both the forwarded payload and the request the takeover may
+  resubmit, so the resubmission comes back as a replay of the first outcome.
+- **`merge_users` no longer walks stale registry rows.** It iterated every
+  `rtdb_auth.databases` row; rows whose backing schema is gone (leaked from an
+  aborted run) each cost a committer spawn plus ensure-table DDL against a
+  missing schema, so one merge took tens of minutes and looked like a hang. The
+  iteration is now filtered by a single bulk `information_schema.schemata`
+  probe.
+- **Missing admin CSRF cookies self-heal.** A browser holding a valid session
+  cookie but no `rtdb-admin-csrf` cookie (a login predating the CSRF deploy) is
+  issued one on its next request instead of being logged out.
+- **Backup restore is idempotent on retry** — the target is pre-dropped, so a
+  retried restore no longer fails against the leftovers of the first attempt.
+- **Upsert-insert stamps the TTL `defaultDurationMs`.** The server's upsert
+  insert branch applied field defaults but skipped the TTL stamp, so a document
+  born via upsert on a TTL table silently carried no expiry — and diverged from
+  all four client engines, whose shared insert paths stamp it. Upsert-update and
+  replace are unchanged.
+- **ts-client server-stamped fields are optional in insert/replace types.** The
+  server accepts an insert that omits a table's `updatedAtField` or
+  `autoIncrementField` (the stamp runs before required-field validation), but
+  the ts-client's `WithoutSystemFields` type kept them required, forcing callers
+  to pass a dead value the server immediately overwrote. Read types keep them
+  required, since every stored doc carries them.
+- **ts-client and python-client raise `RtDbError` on a 2xx response with no JSON
+  object body**, instead of failing later with a confusing parse error.
+- **Concurrent database creation no longer races `pg_extension_name_index`** —
+  extension installs are serialized.
+- **In-memory `push_schema` parity across the client engines** — index-flip
+  detection, schema validation, and TTL/indexable-field validation now match the
+  server.
 
-An optional `fields: string[]` on the wire `Query` (additive; omitted when
-unset) projects each result doc to the listed user fields. Every `_`-prefixed
-key is always kept — exactly the system fields (`_id`/`_creationTime`/
-`_version`) plus synthetic result fields like `_searchSnippet`, since user
-fields can never be `_`-prefixed — and `fields: []` is a meaningful ids-only
-view. Names are validated at compile time against the table (a declared field
-or one of the three system names; anything else is `BAD_REQUEST`), projection
-applies at the single `execute_query` seam so every doc-bearing terminal
-(`get`/`collect`/`first`/`unique`/`paginate`/`search`/`vectorSearch`/
-`hybridSearch`) composes with it on every surface (HTTP one-shot, WS initial
-subscribe push, subscription re-runs), and doc-less terminals (`count`/
-`distinct`/`aggregate`) are unaffected by construction. Sorting, cursors, and
-snippet rendering are computed before projection, so pagination still works
-and `snippet: true` keeps its `_searchSnippet`. Subscription semantics: a
-projected subscription's change detection strips the volatile `_version`
-(`diff_canonical`), so a write touching only non-projected fields re-runs the
-subscription but pushes nothing — pushed payloads still carry `_version`, and
-unprojected subscriptions keep byte-identical push behavior. All four SDKs
-mirror the `.fields(...)` builder, the in-memory engine projection +
-validation, and the projected-subscription diff semantics; pinned by five
-semantics-corpus cases and a `wire-corpus.json` entry. Convex parity: Convex
-returns full documents (open request
-[get-convex/convex-backend#97](https://github.com/get-convex/convex-backend/issues/97)).
+### Security
 
-### Feature: `awaitSignal` workflow steps — external approval gates (FM-29, server + all four clients)
+- **Webhook SSRF denylist covers IPv4-mapped and IPv4-compatible IPv6
+  addresses.** `is_blocked_ip` evaluated them only against the IPv6 table, so
+  `[::ffff:169.254.169.254]` and friends bypassed the entire IPv4 denylist and
+  reached cloud metadata or loopback services. Both forms now recurse into the
+  IPv4 table, with the compat conversion running after the loopback and
+  unspecified checks so `::1` and `::` stay blocked rather than mapping to
+  unblocked addresses.
+- **Signed storage URLs bind their transform parameters** — see **Breaking**
+  above.
+- **`/admin/stream` re-validates its credential.** It authenticated once at the
+  handshake, leaving a revoked session able to read the op feed indefinitely.
+  The existing one-second gauge tick now re-checks any revocable credential and
+  closes with 4401. The static admin key is exempt: it is configuration, not
+  revocable state.
+- **Per-IP rate-limit keys are namespaced by route** — see **Breaking** above.
+- **Caps on filter nesting (32), `in`-list length (1000), and search query text
+  (4096 bytes)**, enforced at the single choke point every filter passes
+  through.
+- **`/auth/state` omits the session token in cookie mode**, so a completion poll
+  cannot hand a bearer token to a caller that should only ever hold the cookie.
 
-A workflow step is now either a txn or an `awaitSignal {name, timeoutMs?}`
-wait (exactly one of the two per step, submit-time validated): the run parks
-in a new non-terminal `waiting` status — visible as `waitingFor`/
-`waitedSince` on `WorkflowInfo` (omitted otherwise) — until a matching
-signal arrives. Signal delivery rides three surfaces, all mapping onto
-typed errors (404 unknown id; 409 not-waiting or name-mismatch) and one
-shared 64 KiB serialized-payload cap enforced in `workflows::deliver_signal`:
-`POST /api/workflows/{id}/signal`, the WS `signalWorkflow` frame (reply
-reuses `workflowAck`), and admin `POST /admin/db/{db}/workflows/{id}/signal`.
-Delivery is latest-wins (a second delivery into an unconsumed wait
-overwrites the slot), the consumed payload is recorded verbatim on the step
-outcome (`signal`), an omitted `timeoutMs` parks forever (cancel is the
-escape), and a `timeoutMs` expiry counts as a failed attempt routed into
-the step's `retry` policy — but each re-parked attempt waits the FULL
-`timeoutMs` again, never backoff. `awaitSignal` steps write no documents:
-delivery is one conditional side-table UPDATE (`cancel`'s precedent — no
-new committer arm or tap site). The `rtdb workflows signal` CLI subcommand
-and the dashboard Workflows page's send-signal form deliver through the
-same surfaces; all four SDKs mirror the step builder, `signalWorkflow`
-(+ admin variant), and the `waiting` wire shape — pinned by wire-corpus
-entries (`awaitSignal` spec steps and `signalWorkflow` frames with payload/
-timeoutMs present and omitted; a waiting-status `WorkflowInfo`) and server
-tests including the payload-cap rejection (previously pinned only in the
-python harness). **Breaking (rust crate):** `WorkflowStepSpec.txn` is now
-`Option<Transaction>` so a step can carry the wait — migrate `txn: t` to
-`txn: Some(t)`, or use the new `WorkflowStepSpec::await_signal(name,
-timeout_ms)` constructor; TS, python, and swift users are unaffected beyond
-the new optional field.
+### Documentation
 
-### Feature: interval recurrence for scheduled transactions (`when: {type:"interval", everyMs}` — server + all four clients)
-
-The third recurrence shape alongside one-shot (`afterMs`/`runAt`) and cron: a
-fixed interval in milliseconds, for poll loops, cache refreshes, and agent
-tooling where a cron expression is heavyweight (Convex offers both interval and
-cron). First `due_at` = now + `everyMs`; after each fire the job re-arms from
-its actual fire time, and `resume` shifts the next fire to `now + everyMs` —
-missed windows (downtime, pause) are skipped, never backfilled, matching cron's
-no-backfill ruling. `everyMs` must be positive and ≤ 31,536,000,000 (one year —
-`scheduler::MAX_EVERY_MS`, mirrored in every client) else `BadRequest` before
-any row is written. `scheduled_txns` gains a nullable `every_ms` column
-(additive `ALTER ... ADD COLUMN IF NOT EXISTS` for pre-existing databases;
-backups are pg_dump-based and carry it as-is), `ScheduleKind`/`ScheduleInfo`
-gain `"interval"`/`everyMs` on the wire, and all four SDKs mirror the when
-variant, builder, validation, and in-engine `tick()` semantics — pinned by
-wire-corpus entries (interval when + `everyMs` ScheduleInfos) and two
-semantics-corpus error cases (non-positive and over-cap `everyMs`), plus the
-server e2e test `interval_fires_repeatedly_and_skips_paused_windows`.
-
-### Fix: upsert-insert now stamps the ttl `defaultDurationMs` (server; engines already did)
-
-The server's upsert insert branch applied FM-32 defaults but skipped the
-ttl-default stamp, so a document born via upsert on a TTL table silently
-carried no expiry — and the server diverged from all four client engines,
-whose shared insert paths stamp it. The branch now mirrors `step_insert`'s
-exact order (ttl stamp → updatedAt stamp → defaults → owner → authorize).
-Upsert-update and replace are unchanged: after insert the field is ordinary
-(the ttl design's "never re-stamped after insert" ruling). Pinned by
-`server/tests/ttl_test.rs` (upsert-insert stamps within the insert window;
-upsert-update leaves the stored expiry untouched) and two semantics-corpus
-cases — `upsert-insert-stamps-ttl-default` and
-`replace-keeps-supplied-ttl-no-restamp` (which also documents that the spec's
-"replace omitting the field stops expiry" scenario is unreachable: a declared
-ttl field is required, so such a replace is a `SCHEMA_VIOLATION` on every
-runner). Found during the FM-36 client mirrors (two agents independently
-flagged it).
-
-### Feature: server-stamped `updatedAtField` (FM-36, server + ts/rust/python/swift)
-
-A table may declare `updatedAtField`, naming a declared `number`/`int64`
-field the server stamps with the current epoch-ms on every version-bumping
-write — insert, patch, replace, upsert (both branches), `patchByQuery`, and
-cascade `setNull` — overwriting any client-supplied value (the `ownerField`
-authority model). The value follows the field's wire convention (JSON number
-on `number`, decimal string on `int64`), sits in both the doc body and the
-typed column when the field is indexed (so "order by recently updated" works
-with a declared index), and wins over a `defaults` entry on the same field.
-Push-time validation rejects an undeclared, non-numeric, or `ttl.field`-colliding
-declaration. Snapshot export/import replays stored docs verbatim — import
-never re-stamps. Mirrored in all four client SDKs (schema DSL builder +
-in-memory engine stamping at the same seam) with semantics-corpus cases
-pinning the wire shape and stamp authority (`updated-at-field-*`), and the
-dashboard Schema page (and schema history) show an `updatedAt` badge.
+This cycle included a full documentation audit and remediation. The 2026-07-21
+design spec is demoted to a historical record — `README.md`,
+`FEATURE_MATRIX.md`, `docs/ARCHITECTURE.md`, and `wire-corpus/` are the current
+references. `docs/ARCHITECTURE.md` gains a multi-instance coordination section,
+a presence section, a semantics-corpus section, an admin-CSRF note, and write-
+and forward-path sequence diagrams. The README gains a canonical
+[verification gates](README.md#verification-gates) table, a
+[Multi-instance](README.md#multi-instance) section, WebSocket connection-limit
+documentation, corrected presence wire-frame names, and a topology and security
+configuration group. Every client README now states that nothing is published to
+a registry yet and shows a working repo-local install, carries a table of
+contents and a "Full API" table, and has had its non-compiling examples
+corrected against current signatures.
 
 ## [0.1.0] - 2026-08-18
 
@@ -637,7 +685,7 @@ contract.
 - **Audit log** (ENH-004, when `RTDB_AUDIT_LOG_ENABLED=true`) — best-effort `rtdb.audit_log` row per `DocOp` at the committer tap sites (`ts_ms, db, table, op, doc_id, principal, source`); `GET /admin/audit?db=&limit=&offset=`.
 - **Scoped machine tokens** (ENH-005) — optional `expiresAt`/`readOnly`/`tables` scoping with live expiry, mirrored across ts/rust/python clients + dashboard.
 - **Subscription inspector** (ENH-010) — `GET /admin/subscriptions` lists active subscriptions across all dbs with read-set class + skip/re-run counters.
-- **Database clone + delete** (ENH-009) — `POST /admin/clone-db` (schema-only clone); `POST /admin/delete-db` (typed `{name, confirm}` guard, retires the per-db committer/scheduler/reaper tasks cleanly).
+- **Database clone + delete** (ENH-009) — `POST /admin/clone-db` (clones the full snapshot — schema and documents, preserving ids, `createdAt`, and `version`; storage blobs and scheduled transactions are outside the snapshot format and are not copied); `POST /admin/delete-db` (typed `{name, confirm}` guard, retires the per-db committer/scheduler/reaper tasks cleanly).
 - **Search language config** (ENH-006) — `RTDB_SEARCH_LANGUAGE` boot config (Postgres `regconfig` for the generated tsvector + `plainto_tsquery`).
 - **Vector distance metrics** (ENH-007) — per-vector-index `metric: cosine | l2 | ip` (cosine default); HNSW index over `vector_cosine_ops`/`vector_l2_ops`/`vector_ip_ops`, ranking distance `<=>`/`<->`/`<#>`.
 - **Storage dedup** (ENH-008) — `sha256`-keyed dedup at upload; a second upload of the same bytes returns the existing id.
@@ -744,7 +792,7 @@ that is the authoritative parity contract.
 - **`GET /admin/config`** is structurally redacted — `admin_key`, OAuth secrets, and `database_url` are exposed as configured-bools only, never values.
 - **C collation** — Postgres database uses deterministic C collation, eliminating collation-version warnings and making index ordering deterministic.
 - **OAuth callback HTML** — strict origin validator + interpolation escaping (security hardening).
-- **rust-client: `RtDbAdminClient` extracted** (ARC-121) — the admin control-plane methods (`/admin/*`) moved off `RtDbHttpClient` into a dedicated [`RtDbAdminClient`](rust-client/src/admin.rs) type, mirroring `ts-client`'s and `python`'s split between data plane and control plane. **Non-breaking:** every admin method remains on `RtDbHttpClient` as a `#[deprecated(note = "use RtDbAdminClient")]` thin delegation to the new type, so existing consumers (including the `rtdb` CLI, which migrated to `RtDbAdminClient` directly) keep compiling. Migrate by calling `RtDbHttpClient::admin_client()` (shares the connection pool) and invoking the same-named method on the returned `RtDbAdminClient`.
+- **rust-client: `RtDbAdminClient` extracted** (ARC-121) — the admin control-plane methods (`/admin/*`) moved off `RtDbHttpClient` into a dedicated [`RtDbAdminClient`](rust-client/src/admin/mod.rs) type, mirroring `ts-client`'s and `python`'s split between data plane and control plane. **Non-breaking:** every admin method remains on `RtDbHttpClient` as a `#[deprecated(note = "use RtDbAdminClient")]` thin delegation to the new type, so existing consumers (including the `rtdb` CLI, which migrated to `RtDbAdminClient` directly) keep compiling. Migrate by calling `RtDbHttpClient::admin_client()` (shares the connection pool) and invoking the same-named method on the returned `RtDbAdminClient`.
 
 ### Security
 
