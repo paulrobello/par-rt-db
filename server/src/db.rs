@@ -91,6 +91,31 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     .execute(&mut *conn)
     .await?;
 
+    // ARC-002: spool for forwarded writes and their replies (ENH-022 Stage 4c).
+    // A `pg_notify` payload is capped at 8000 bytes, which a real mutation or a
+    // schema push blows through routinely, so the NOTIFY carries only a row id
+    // and the body travels through this table. Instance-level, not per-db:
+    // forwarding is a property of the fleet, not of a database. Rows are
+    // deleted by their consumer and swept on a timer
+    // (`forward::run_forward_sweeper`) so a crashed consumer cannot leak them.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS rtdb_auth.forward_queue (
+            id uuid PRIMARY KEY,
+            kind text NOT NULL CHECK (kind IN ('request','reply')),
+            target text NOT NULL,
+            payload jsonb NOT NULL,
+            created_at timestamptz NOT NULL DEFAULT now()
+        )",
+    )
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS forward_queue_sweep_idx \
+         ON rtdb_auth.forward_queue (kind, target, created_at)",
+    )
+    .execute(&mut *conn)
+    .await?;
+
     // SEC-103: per-database anonymous-auth gate. An anonymous principal is
     // authorized for a given database ONLY when this flag is TRUE for that db.
     // The instance-wide `RTDB_AUTH_ANONYMOUS_ENABLED` remains a master kill

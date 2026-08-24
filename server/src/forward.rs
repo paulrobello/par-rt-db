@@ -21,6 +21,18 @@
 //! - `rtdb_write_replies`: reply broadcast. Payloads name their target
 //!   instance; only the target resolves the pending oneshot.
 //!
+//! ## The spool (ARC-002)
+//!
+//! A `pg_notify` payload is capped at 8000 bytes and Postgres rejects anything
+//! larger, so neither channel carries the body: both carry a 36-byte row id
+//! into `rtdb_auth.forward_queue`, and the request/reply JSON lives in that
+//! table's `payload jsonb` column. A request row is read by every replica (the
+//! lease on `request.db` decides who acts) and deleted by the one that
+//! executed; a reply row is claimed with an atomic `DELETE … RETURNING` that
+//! doubles as the target filter. `run_forward_sweeper` reclaims anything left
+//! behind by a crashed consumer. The request/reply wire structs are unchanged
+//! — only the transport moved.
+//!
 //! ## Trust and authz
 //!
 //! The principal that authorized the write on the origin replica travels in
@@ -60,6 +72,98 @@ pub const WRITE_FORWARD_CHANNEL: &str = "rtdb_write_fwd";
 /// NOTIFY channel for forwarded-write replies. Fixed across every instance;
 /// payloads carry the target instance id and non-targets skip them.
 pub const WRITE_REPLY_CHANNEL: &str = "rtdb_write_replies";
+
+/// Hard ceiling on a spooled forward payload (ARC-002). Postgres would happily
+/// take far more into a `jsonb` column, but a forwarded write this large is a
+/// client bug rather than a workload — reject it at the edge instead of
+/// pushing tens of megabytes through the fleet's shared Postgres.
+const MAX_FORWARD_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
+/// Insert one spool row. `target` is the instance the row is addressed to, or
+/// `""` for a broadcast (every request is a broadcast; only the lease owner
+/// acts on it).
+async fn spool_insert(
+    pool: &PgPool,
+    id: uuid::Uuid,
+    kind: &str,
+    target: &str,
+    payload_json: &str,
+) -> Result<(), RtDbError> {
+    sqlx::query(
+        "INSERT INTO rtdb_auth.forward_queue (id, kind, target, payload) \
+         VALUES ($1::uuid, $2, $3, $4::jsonb)",
+    )
+    .bind(id.to_string())
+    .bind(kind)
+    .bind(target)
+    .bind(payload_json)
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        tracing::warn!(error = %e, kind, "forward: spool insert failed");
+        RtDbError::internal("failed to spool forwarded write")
+    })?;
+    Ok(())
+}
+
+/// Delete one spool row by id. Best-effort: the sweeper is the backstop.
+async fn spool_delete(pool: &PgPool, id: uuid::Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM rtdb_auth.forward_queue WHERE id = $1::uuid")
+        .bind(id.to_string())
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// Load a spooled request body. Every replica reads it (the payload names the
+/// database whose lease decides who executes), so this does NOT delete —
+/// only the executing owner deletes, after it has replied. `None` means the
+/// row is already gone: the owner consumed it, or the sweeper reclaimed it.
+async fn spool_load_request(pool: &PgPool, id: uuid::Uuid) -> Option<ForwardRequest> {
+    let row = sqlx::query_scalar::<_, String>(
+        "SELECT payload::text FROM rtdb_auth.forward_queue \
+         WHERE id = $1::uuid AND kind = 'request'",
+    )
+    .bind(id.to_string())
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "forward: spool request load failed");
+        None
+    })?;
+    match serde_json::from_str::<ForwardRequest>(&row) {
+        Ok(req) => Some(req),
+        Err(e) => {
+            tracing::warn!(error = %e, "forward: spooled request failed to decode; skipping");
+            None
+        }
+    }
+}
+
+/// Claim a spooled reply addressed to `target`. The `DELETE … RETURNING` makes
+/// the claim atomic, so a non-target replica gets `None` in one round trip and
+/// the target can never process the same reply twice.
+async fn spool_claim_reply(pool: &PgPool, id: uuid::Uuid, target: &str) -> Option<ForwardReply> {
+    let row = sqlx::query_scalar::<_, String>(
+        "DELETE FROM rtdb_auth.forward_queue \
+         WHERE id = $1::uuid AND kind = 'reply' AND target = $2 RETURNING payload::text",
+    )
+    .bind(id.to_string())
+    .bind(target)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "forward: spool reply claim failed");
+        None
+    })?;
+    match serde_json::from_str::<ForwardReply>(&row) {
+        Ok(reply) => Some(reply),
+        Err(e) => {
+            tracing::warn!(error = %e, "forward: spooled reply failed to decode; skipping");
+            None
+        }
+    }
+}
 
 /// One forwarded write request. `origin` tags the sending replica (the
 /// origin's own listener skips it); `request_id` correlates the reply.
@@ -194,7 +298,8 @@ impl Forwarder {
         db: &str,
         write: ForwardWrite,
     ) -> Result<Result<serde_json::Value, RtDbError>, ForwardFail> {
-        let request_id = uuid::Uuid::now_v7().simple().to_string();
+        let row_id = uuid::Uuid::now_v7();
+        let request_id = row_id.simple().to_string();
         let payload = ForwardRequest {
             request_id: request_id.clone(),
             origin: self.instance_id.clone(),
@@ -207,15 +312,29 @@ impl Forwarder {
                 "failed to serialize forwarded write: {e}"
             )))
         })?;
+        if payload_json.len() > MAX_FORWARD_PAYLOAD_BYTES {
+            return Err(ForwardFail::Notify(RtDbError::bad_request(
+                "forwarded write too large",
+            )));
+        }
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(request_id.clone(), tx);
+        // ARC-002: spool the body, notify only the row id. The NOTIFY payload
+        // is a 36-byte uuid, comfortably inside Postgres's 8000-byte cap, and
+        // the spooled row also survives a listener reconnect that would have
+        // dropped an in-flight NOTIFY.
+        if let Err(e) = spool_insert(&self.pool, row_id, "request", "", &payload_json).await {
+            self.pending.lock().await.remove(&request_id);
+            return Err(ForwardFail::Notify(e));
+        }
         if let Err(e) = sqlx::query("SELECT pg_notify($1, $2)")
             .bind(WRITE_FORWARD_CHANNEL)
-            .bind(&payload_json)
+            .bind(row_id.to_string())
             .execute(&self.pool)
             .await
         {
             self.pending.lock().await.remove(&request_id);
+            let _ = spool_delete(&self.pool, row_id).await;
             return Err(ForwardFail::Notify(RtDbError::internal(format!(
                 "forward pg_notify failed: {e}"
             ))));
@@ -349,6 +468,56 @@ async fn execute_as_owner(
     Some(result)
 }
 
+/// Spool a reply and notify its row id (ARC-002). Best-effort in the same
+/// sense the old direct `pg_notify` was: a failure here means the origin times
+/// out and takes over, which is the documented failover path.
+async fn publish_reply(pool: &PgPool, reply: ForwardReply) {
+    let target = reply.target.clone();
+    let Ok(json) = serde_json::to_string(&reply) else {
+        tracing::warn!("forward listener: reply failed to serialize");
+        return;
+    };
+    let row_id = uuid::Uuid::now_v7();
+    if spool_insert(pool, row_id, "reply", &target, &json)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if let Err(e) = sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(WRITE_REPLY_CHANNEL)
+        .bind(row_id.to_string())
+        .execute(pool)
+        .await
+    {
+        tracing::warn!(error = %e, "forward listener: reply pg_notify failed");
+        let _ = spool_delete(pool, row_id).await;
+    }
+}
+
+/// Periodic reclaim of spool rows nobody consumed (ARC-002): an origin that
+/// timed out before its request was picked up, a reply whose target died, or a
+/// row orphaned by a listener reconnect. `retention` is derived from the
+/// forward timeout — anything older than twice the timeout can no longer
+/// matter to a live request.
+pub async fn run_forward_sweeper(pool: PgPool, retention: std::time::Duration) {
+    let tick = retention.max(std::time::Duration::from_secs(1));
+    let retention_ms = retention.as_millis().min(i64::MAX as u128) as i64;
+    loop {
+        tokio::time::sleep(tick).await;
+        if let Err(e) = sqlx::query(
+            "DELETE FROM rtdb_auth.forward_queue \
+             WHERE created_at < now() - make_interval(secs => $1::double precision)",
+        )
+        .bind(retention_ms as f64 / 1000.0)
+        .execute(&pool)
+        .await
+        {
+            tracing::warn!(error = %e, "forward sweeper: delete failed; retrying next tick");
+        }
+    }
+}
+
 /// Serialize an arm's concrete result for the reply payload. Infallible for
 /// these plain serde types; a failure still maps to an internal error rather
 /// than panicking inside the listener.
@@ -419,23 +588,29 @@ pub async fn run_forward_listener(
             };
             match notif.channel() {
                 WRITE_REPLY_CHANNEL => {
-                    let Ok(reply) = serde_json::from_str::<ForwardReply>(notif.payload()) else {
-                        tracing::warn!(
-                            "forward listener: failed to decode reply payload; skipping"
-                        );
+                    // ARC-002: the NOTIFY carries only the spool row id; the
+                    // atomic `DELETE … RETURNING` both claims the reply and
+                    // filters out replicas this reply is not addressed to.
+                    let Ok(id) = notif.payload().parse::<uuid::Uuid>() else {
+                        tracing::warn!("forward listener: reply notify was not a row id; skipping");
                         continue;
                     };
-                    if reply.target != own_instance_id {
+                    let Some(reply) = spool_claim_reply(&pool, id, &own_instance_id).await else {
                         continue;
-                    }
+                    };
                     forwarder.handle_reply(reply).await;
                 }
                 _ => {
-                    let Ok(request) = serde_json::from_str::<ForwardRequest>(notif.payload())
-                    else {
+                    let Ok(id) = notif.payload().parse::<uuid::Uuid>() else {
                         tracing::warn!(
-                            "forward listener: failed to decode request payload; skipping"
+                            "forward listener: request notify was not a row id; skipping"
                         );
+                        continue;
+                    };
+                    // Every replica loads the body (the lease on `request.db`
+                    // decides who executes). A miss means the owner already
+                    // consumed it, or the sweeper reclaimed a stale row.
+                    let Some(request) = spool_load_request(&pool, id).await else {
                         continue;
                     };
                     // Self-dedupe: the origin is a non-owner by construction,
@@ -460,18 +635,10 @@ pub async fn run_forward_listener(
                                         err,
                                     ),
                                 };
-                                if let Ok(json) = serde_json::to_string(&reply)
-                                    && let Err(e) = sqlx::query("SELECT pg_notify($1, $2)")
-                                        .bind(WRITE_REPLY_CHANNEL)
-                                        .bind(&json)
-                                        .execute(&notify_pool)
-                                        .await
-                                {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "forward listener: reply pg_notify failed"
-                                    );
-                                }
+                                publish_reply(&notify_pool, reply).await;
+                                // The request row's work is done on the only
+                                // replica that will ever execute it.
+                                let _ = spool_delete(&notify_pool, id).await;
                             }
                             None => {
                                 // Not the owner (or lost the lease between the

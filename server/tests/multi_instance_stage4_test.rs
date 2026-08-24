@@ -310,3 +310,121 @@ async fn forwarded_write_preserves_principal_on_owner() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// (ARC-002) A forwarded write whose serialized payload exceeds Postgres's
+/// 8000-byte `pg_notify` cap still round-trips: the body travels through the
+/// `rtdb_auth.forward_queue` spool and the NOTIFY carries only the row id.
+/// Before the spool, Postgres rejected the `pg_notify` outright and the write
+/// fell into the takeover path instead of reaching the owner.
+#[tokio::test]
+async fn forwarded_mutate_larger_than_notify_cap_round_trips() -> anyhow::Result<()> {
+    let pool = shared_pool().await;
+    let a = replica(&pool, "arc002-big-a", 0, 0).await;
+    let b = replica(&pool, "arc002-big-b", 0, 0).await;
+
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &name).await?;
+    let db = common::wrap_test_db(name);
+    a.realtime
+        .committers
+        .push_schema(&db, items_schema(false))
+        .await?;
+
+    // 20 KB of title — two and a half times the NOTIFY cap on its own.
+    let big_title = "x".repeat(20 * 1024);
+    let txn = insert_item(&big_title);
+    assert!(
+        serde_json::to_string(&txn)?.len() > 8000,
+        "the fixture must exceed the pg_notify cap to be a regression test"
+    );
+
+    mutate_until_landed(&b, &db, txn, PrincipalCtx::bypass()).await?;
+
+    let (stored,): (String,) = sqlx::query_as(&format!(
+        "SELECT doc->>'title' FROM \"db_{db}\".\"t_items\""
+    ))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(stored.len(), big_title.len(), "the whole body forwarded");
+    Ok(())
+}
+
+/// (ARC-002) The REPLY direction is capped too: a forwarded `RunPushSchema`
+/// answers with the whole `SchemaDef`, which for an 80-table schema is well
+/// past 8000 bytes. Both legs go through the spool.
+#[tokio::test]
+async fn forwarded_push_schema_reply_larger_than_notify_cap() -> anyhow::Result<()> {
+    let pool = shared_pool().await;
+    let a = replica(&pool, "arc002-schema-a", 0, 0).await;
+    let b = replica(&pool, "arc002-schema-b", 0, 0).await;
+
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &name).await?;
+    let db = common::wrap_test_db(name);
+    // A takes the lease with the baseline schema; B's push is forwarded.
+    a.realtime
+        .committers
+        .push_schema(&db, items_schema(false))
+        .await?;
+
+    // Additive-only: keep `items` and add 80 more tables.
+    let mut tables = serde_json::Map::new();
+    tables.insert(
+        "items".to_string(),
+        serde_json::json!({
+            "fields": { "title": { "type": "string" } },
+            "indexes": [{ "name": "by_title", "fields": ["title"] }]
+        }),
+    );
+    for i in 0..80 {
+        tables.insert(
+            format!("wide_table_number_{i}"),
+            serde_json::json!({
+                "fields": {
+                    "alpha": { "type": "string" },
+                    "bravo": { "type": "number" },
+                    "charlie": { "type": "boolean" },
+                    "delta": { "type": "string" }
+                },
+                "indexes": [
+                    { "name": "by_alpha", "fields": ["alpha"] },
+                    { "name": "by_bravo_delta", "fields": ["bravo", "delta"] }
+                ]
+            }),
+        );
+    }
+    let big_schema: rtdb_server::schema::SchemaDef =
+        serde_json::from_value(serde_json::json!({ "tables": tables }))?;
+    assert!(
+        serde_json::to_string(&big_schema)?.len() > 8000,
+        "the fixture must exceed the pg_notify cap to be a regression test"
+    );
+
+    // Retry on CONFLICT the same way `mutate_until_landed` does — the peer's
+    // forward listener may still be connecting.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let pushed = loop {
+        match b
+            .realtime
+            .committers
+            .push_schema(&db, big_schema.clone())
+            .await
+        {
+            Ok(schema) => break schema,
+            Err(err) if err.code == ErrorCode::Conflict => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "forwarded push kept conflicting: {err}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    };
+    assert_eq!(
+        pushed.tables.len(),
+        81,
+        "the owner's full schema came back through the reply spool"
+    );
+    Ok(())
+}

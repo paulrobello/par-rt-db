@@ -172,6 +172,20 @@ these concrete decisions:
   exactly one replica — the owner — executes and replies) and
   `rtdb_write_replies` (reply broadcast filtered by target instance id).
   One listener task (`forward.rs::run_forward_listener`) serves both.
+- *Spool (ARC-002, 2026-08-23).* A `pg_notify` payload is capped at 8000
+  bytes, which a real mutation or schema push exceeds routinely, so neither
+  channel carries the body. Both carry a 36-byte row id into
+  `rtdb_auth.forward_queue (id, kind, target, payload jsonb, created_at)`;
+  the request/reply JSON lives in that table. A request row is read by every
+  replica (the lease decides who acts) and deleted by the executing owner; a
+  reply row is claimed with an atomic `DELETE … RETURNING` whose `target`
+  predicate doubles as the addressing filter. `forward::run_forward_sweeper`
+  deletes rows older than twice the forward timeout, so a crashed consumer
+  cannot leak them. Payloads over 16 MiB are refused at the origin with
+  `BAD_REQUEST "forwarded write too large"`. The request/reply wire structs
+  are unchanged — only the transport moved — and spooling also makes a
+  forwarded request survive a listener reconnect that would have dropped an
+  in-flight NOTIFY.
 - *Which arms forward.* The five reply-carrying write arms: Mutate,
   RunMigrate, RunPushSchema, RunMergeUsers, RunRestoreSchema. Fire-and-forget
   arms never forward (they originate only from an owner's own pollers; the

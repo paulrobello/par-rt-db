@@ -323,6 +323,12 @@ impl AppState {
                 forwarder.clone(),
                 instance_id.clone(),
             ));
+            // ARC-002: reclaim spool rows nobody consumed. Retention is twice
+            // the forward timeout — past that, no live request can still care.
+            tokio::spawn(forward::run_forward_sweeper(
+                pool.clone(),
+                std::time::Duration::from_millis(config.forward_timeout_ms.saturating_mul(2)),
+            ));
         }
         // ENH-022 Stage 4: rate-counter sweep. In multi-instance mode the
         // limiter's counters live in `rtdb_auth.rate_counters` (one row per
