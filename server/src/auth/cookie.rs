@@ -12,6 +12,8 @@
 //! untouched; the cookie is an additional source. CLI/automation and machine
 //! tokens keep working exactly as before (they send a header / in-band token).
 
+use std::sync::LazyLock;
+
 use axum::http::{HeaderMap, HeaderValue};
 
 use crate::error::RtDbError;
@@ -60,13 +62,19 @@ pub(crate) fn set_session_cookie(value: &str, secure: bool) -> Result<HeaderValu
     HeaderValue::from_str(&s).map_err(|_| RtDbError::internal("invalid session cookie value"))
 }
 
+/// Fixed `Set-Cookie` value that deletes the session cookie. The literal
+/// cookie name must stay in sync with `SESSION_COOKIE` (checked by
+/// `clear_session_cookie_name_matches_const` below); `from_static` is
+/// infallible so there is nothing to unwrap.
+static CLEAR_SESSION_COOKIE: LazyLock<HeaderValue> = LazyLock::new(|| {
+    HeaderValue::from_static(
+        "rtdb_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+    )
+});
+
 /// Builds the `Set-Cookie` header value that deletes the session cookie.
 pub(crate) fn clear_session_cookie() -> HeaderValue {
-    // `from_str` (not `from_static`): the name interpolates `SESSION_COOKIE`.
-    HeaderValue::from_str(&format!(
-        "{SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
-    ))
-    .expect("static clear-cookie template is a valid header value")
+    CLEAR_SESSION_COOKIE.clone()
 }
 
 /// Cookie name carrying the login-CSRF double-submit nonce. Its value is the
@@ -109,13 +117,19 @@ pub(crate) fn set_oauth_csrf_cookie(value: &str, secure: bool) -> Result<HeaderV
     HeaderValue::from_str(&s).map_err(|_| RtDbError::internal("invalid oauth csrf cookie value"))
 }
 
+/// Fixed `Set-Cookie` value that deletes the CSRF nonce. The literal cookie
+/// name must stay in sync with `OAUTH_CSRF_COOKIE` (checked by
+/// `clear_oauth_csrf_cookie_name_matches_const` below).
+static CLEAR_OAUTH_CSRF_COOKIE: LazyLock<HeaderValue> = LazyLock::new(|| {
+    HeaderValue::from_static(
+        "rtdb-oauth-csrf=; HttpOnly; SameSite=None; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+    )
+});
+
 /// Builds the `Set-Cookie` that deletes the CSRF nonce (single-use hygiene on a
 /// successful callback).
 pub(crate) fn clear_oauth_csrf_cookie() -> HeaderValue {
-    HeaderValue::from_str(&format!(
-        "{OAUTH_CSRF_COOKIE}=; HttpOnly; SameSite=None; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
-    ))
-    .expect("static clear-cookie template is a valid header value")
+    CLEAR_OAUTH_CSRF_COOKIE.clone()
 }
 
 /// SEC-121: cookie name binding the `/auth/state` poll to the browser that
@@ -202,12 +216,18 @@ pub(crate) fn set_admin_csrf_cookie(value: &str, secure: bool) -> Result<HeaderV
     HeaderValue::from_str(&s).map_err(|_| RtDbError::internal("invalid admin csrf cookie value"))
 }
 
+/// Fixed `Set-Cookie` value that deletes the admin CSRF nonce. The literal
+/// cookie name must stay in sync with `ADMIN_CSRF_COOKIE` (checked by
+/// `clear_admin_csrf_cookie_name_matches_const` below).
+static CLEAR_ADMIN_CSRF_COOKIE: LazyLock<HeaderValue> = LazyLock::new(|| {
+    HeaderValue::from_static(
+        "rtdb-admin-csrf=; SameSite=Lax; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+    )
+});
+
 /// Builds the `Set-Cookie` that deletes the admin CSRF nonce.
 pub(crate) fn clear_admin_csrf_cookie() -> HeaderValue {
-    HeaderValue::from_str(&format!(
-        "{ADMIN_CSRF_COOKIE}=; SameSite=Lax; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
-    ))
-    .expect("static clear-cookie template is a valid header value")
+    CLEAR_ADMIN_CSRF_COOKIE.clone()
 }
 
 /// True when the request arrived over HTTPS. The Cloudflare tunnel sets
@@ -394,6 +414,26 @@ mod tests {
         let v = clear_admin_csrf_cookie().to_str().unwrap().to_string();
         assert!(v.contains("rtdb-admin-csrf="));
         assert!(v.contains("Max-Age=0"));
+    }
+
+    #[test]
+    fn clear_session_cookie_name_matches_const() {
+        let v = clear_session_cookie().to_str().unwrap().to_string();
+        assert!(v.starts_with(&format!("{SESSION_COOKIE}=")));
+        assert!(v.contains("Max-Age=0"));
+    }
+
+    #[test]
+    fn clear_oauth_csrf_cookie_name_matches_const() {
+        let v = clear_oauth_csrf_cookie().to_str().unwrap().to_string();
+        assert!(v.starts_with(&format!("{OAUTH_CSRF_COOKIE}=")));
+        assert!(v.contains("Max-Age=0"));
+    }
+
+    #[test]
+    fn clear_admin_csrf_cookie_name_matches_const() {
+        let v = clear_admin_csrf_cookie().to_str().unwrap().to_string();
+        assert!(v.starts_with(&format!("{ADMIN_CSRF_COOKIE}=")));
     }
 
     // SEC-201: X-Forwarded-Proto is only honored behind a trusted proxy —

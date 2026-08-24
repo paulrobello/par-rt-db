@@ -6,14 +6,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Serialize;
-use sqlx::PgPool;
 
 use crate::AppState;
 use crate::auth::jwks;
 use crate::auth::provider::OAuthProvider;
-use crate::auth::session;
+use crate::auth::{self, ConflictStyle, ProviderIdentity, session};
 use crate::config::Config;
-use crate::db::{new_id, now_ms};
 use crate::error::RtDbError;
 
 /// Microsoft (Entra ID / Azure AD v2.0) OAuth provider. This is OIDC with
@@ -186,12 +184,23 @@ impl OAuthProvider for MicrosoftProvider {
         let email = identity.contact_email.to_lowercase();
         let login = identity.name.clone().unwrap_or_else(|| email.clone());
 
-        let user_id = upsert_user(
+        // QA-004: resolution now lives in `auth::resolve_user`, shared with
+        // every other provider. SEC-102's nOAuth defense — email-linking
+        // permitted only when Microsoft's `xms_edov` verified the domain —
+        // is preserved via `allow_email_link: identity.email_domain_verified`;
+        // this is the one provider where `resolve_user`'s generalized
+        // "match id, else link by email, else insert" cannot be applied
+        // uniformly (see `ProviderIdentity::allow_email_link`'s doc).
+        let user_id = auth::resolve_user(
             &state.pool,
-            &identity.microsoft_sub,
-            &login,
-            &email,
-            identity.email_domain_verified,
+            ProviderIdentity {
+                provider_id_column: auth::PROVIDER_COL_MICROSOFT_SUB,
+                provider_id: &identity.microsoft_sub,
+                login: &login,
+                email: &email,
+                allow_email_link: identity.email_domain_verified,
+                conflict_style: ConflictStyle::Precondition,
+            },
         )
         .await?;
 
@@ -201,106 +210,6 @@ impl OAuthProvider for MicrosoftProvider {
             state.runtime.hot.load().session_ttl_days,
         )
         .await
-    }
-}
-
-/// Upserts the Microsoft user into `rtdb_auth.users`. Identity is keyed on
-/// `microsoft_sub` (the immutable `{tid}.{sub}` composite) — NOT on `email`,
-/// which is the nOAuth attack surface.
-///
-/// Resolution order:
-/// 1. An existing user with this `microsoft_sub` (a returning Microsoft user)
-///    is reused, with `login`/`email` refreshed — so a tenant-side email change
-///    follows the account rather than forking it.
-/// 2. Otherwise, **only when the email is domain-verified (`xms_edov == true`)**
-///    and an account with that email exists but is not yet Microsoft-linked
-///    (`microsoft_sub IS NULL`), that account is linked by setting its
-///    `microsoft_sub`. Both Microsoft (DNS-verified domain) and the other
-///    provider verified the email, so this is the same person. When the email
-///    is NOT domain-verified (xms_edov absent) this step is skipped entirely —
-///    a spoofed email can never adopt an existing row.
-/// 3. Otherwise a new row is inserted with `microsoft_sub` set.
-async fn upsert_user(
-    pool: &PgPool,
-    microsoft_sub: &str,
-    login: &str,
-    email: &str,
-    email_domain_verified: bool,
-) -> Result<String, RtDbError> {
-    let mut tx = pool.begin().await?;
-
-    // (1) returning Microsoft user: reuse the account, refresh login/email.
-    if let Some((id,)) =
-        sqlx::query_as::<_, (String,)>("SELECT id FROM rtdb_auth.users WHERE microsoft_sub = $1")
-            .bind(microsoft_sub)
-            .fetch_optional(&mut *tx)
-            .await?
-    {
-        sqlx::query("UPDATE rtdb_auth.users SET login = $1, email = $2 WHERE id = $3")
-            .bind(login)
-            .bind(email)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_conflict)?;
-        tx.commit().await?;
-        return Ok(id);
-    }
-
-    // (2) link an email-keyed account that is not yet Microsoft-linked — but
-    // only when the email is domain-verified. xms_edov absent => skip entirely
-    // (a fresh account is created in step 3 instead). This is the nOAuth
-    // defense: a spoofed email cannot adopt an existing row.
-    if email_domain_verified
-        && let Some((id,)) = sqlx::query_as::<_, (String,)>(
-            "UPDATE rtdb_auth.users \
-             SET microsoft_sub = $1, login = $2 \
-             WHERE email = $3 AND microsoft_sub IS NULL \
-             RETURNING id",
-        )
-        .bind(microsoft_sub)
-        .bind(login)
-        .bind(email)
-        .fetch_optional(&mut *tx)
-        .await?
-    {
-        tx.commit().await?;
-        return Ok(id);
-    }
-
-    // (3) brand-new user.
-    let id = new_id();
-    let now = now_ms();
-    sqlx::query(
-        "INSERT INTO rtdb_auth.users (id, microsoft_sub, login, email, created_at) \
-         VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(&id)
-    .bind(microsoft_sub)
-    .bind(login)
-    .bind(email)
-    .bind(now)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_conflict)?;
-    tx.commit().await?;
-    Ok(id)
-}
-
-/// Maps a Postgres unique-violation (`23505`) from a `users` upsert to a
-/// deliberate 409 conflict — the `microsoft_sub` or email is already linked to
-/// another sign-in method (or a concurrent login just claimed it). Any other
-/// database error passes through as the usual internal-error mapping (logged,
-/// never leaked).
-fn map_conflict(err: sqlx::Error) -> RtDbError {
-    let is_unique_violation = matches!(
-        &err,
-        sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23505")
-    );
-    if is_unique_violation {
-        RtDbError::precondition("microsoft identity already linked to another sign-in method")
-    } else {
-        RtDbError::from(err)
     }
 }
 
@@ -1138,12 +1047,13 @@ mod tests {
         assert_eq!(fetched["keys"][0]["kid"], "k");
     }
 
-    // --- upsert_user (shared dev Postgres; every value uuid-unique) ---------
+    // --- resolve_user via the microsoft_sub column (shared dev Postgres; ----
+    // --- every value uuid-unique) --------------------------------------
 
     /// Connects to the shared dev Postgres (RTDB_TEST_DATABASE_URL override,
     /// default 127.0.0.1:55434/rtdb — the DB is shared, never created/dropped)
     /// and bootstraps rtdb_auth.
-    async fn users_pool() -> PgPool {
+    async fn users_pool() -> sqlx::PgPool {
         let url = std::env::var("RTDB_TEST_DATABASE_URL")
             .unwrap_or_else(|_| "postgres://rtdb:rtdb@127.0.0.1:55434/rtdb".into());
         let pool = sqlx::PgPool::connect(&url)
@@ -1159,7 +1069,7 @@ mod tests {
         format!("{prefix}-{}", uuid::Uuid::now_v7().simple())
     }
 
-    async fn user_row(pool: &PgPool, id: &str) -> (String, String, Option<String>) {
+    async fn user_row(pool: &sqlx::PgPool, id: &str) -> (String, String, Option<String>) {
         sqlx::query_as::<_, (String, String, Option<String>)>(
             "SELECT login, email, microsoft_sub FROM rtdb_auth.users WHERE id = $1",
         )
@@ -1172,8 +1082,8 @@ mod tests {
     /// Direct-inserts a non-Microsoft user (microsoft_sub NULL) keyed on a
     /// unique email — the pre-existing account the link/nOAuth/conflict tests
     /// target.
-    async fn insert_email_user(pool: &PgPool, login: &str, email: &str) -> String {
-        let id = new_id();
+    async fn insert_email_user(pool: &sqlx::PgPool, login: &str, email: &str) -> String {
+        let id = crate::db::new_id();
         sqlx::query(
             "INSERT INTO rtdb_auth.users (id, login, email, created_at) \
              VALUES ($1, $2, $3, $4)",
@@ -1181,21 +1091,39 @@ mod tests {
         .bind(&id)
         .bind(login)
         .bind(email)
-        .bind(now_ms())
+        .bind(crate::db::now_ms())
         .execute(pool)
         .await
         .expect("pre-insert email-keyed user");
         id
     }
 
+    /// Builds the `ProviderIdentity` `complete_login` would, given a resolved
+    /// `email_domain_verified` flag.
+    fn ms_identity<'a>(
+        sub: &'a str,
+        login: &'a str,
+        email: &'a str,
+        email_domain_verified: bool,
+    ) -> ProviderIdentity<'a> {
+        ProviderIdentity {
+            provider_id_column: auth::PROVIDER_COL_MICROSOFT_SUB,
+            provider_id: sub,
+            login,
+            email,
+            allow_email_link: email_domain_verified,
+            conflict_style: ConflictStyle::Precondition,
+        }
+    }
+
     #[tokio::test]
-    async fn upsert_user_inserts_a_brand_new_microsoft_user() {
+    async fn resolve_user_inserts_a_brand_new_microsoft_user() {
         let pool = users_pool().await;
         let sub = uniq("tid.sub");
         let login = uniq("ms-login");
         let email = format!("{}@ms-test.example", uniq("alice"));
 
-        let id = upsert_user(&pool, &sub, &login, &email, false)
+        let id = auth::resolve_user(&pool, ms_identity(&sub, &login, &email, false))
             .await
             .expect("insert brand-new user");
 
@@ -1205,25 +1133,30 @@ mod tests {
         assert_eq!(row_sub.as_deref(), Some(sub.as_str()));
     }
 
+    /// The scenario QA-004 exists to fix: a returning Microsoft user is found
+    /// by their stable `microsoft_sub` even though the tenant-side email
+    /// changed — the row is reused, never forked.
     #[tokio::test]
-    async fn upsert_user_reuses_the_account_and_refreshes_login_and_email() {
+    async fn resolve_user_reuses_the_account_and_refreshes_login_and_email() {
         let pool = users_pool().await;
         let sub = uniq("tid.sub");
-        let first_id = upsert_user(
+        let first_id = auth::resolve_user(
             &pool,
-            &sub,
-            &uniq("ms-login-a"),
-            &format!("{}@ms-test.example", uniq("a")),
-            false,
+            ms_identity(
+                &sub,
+                &uniq("ms-login-a"),
+                &format!("{}@ms-test.example", uniq("a")),
+                false,
+            ),
         )
         .await
         .expect("initial insert");
 
         let new_login = uniq("ms-login-b");
         let new_email = format!("{}@ms-test.example", uniq("b"));
-        let second_id = upsert_user(&pool, &sub, &new_login, &new_email, false)
+        let second_id = auth::resolve_user(&pool, ms_identity(&sub, &new_login, &new_email, false))
             .await
-            .expect("returning-user upsert");
+            .expect("returning-user resolve");
 
         assert_eq!(
             second_id, first_id,
@@ -1236,15 +1169,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_user_links_an_email_keyed_account_when_domain_verified() {
+    async fn resolve_user_links_an_email_keyed_account_when_domain_verified() {
         let pool = users_pool().await;
         let email = format!("{}@ms-test.example", uniq("carol"));
         let existing_id = insert_email_user(&pool, &uniq("gh-carol"), &email).await;
 
         let sub = uniq("tid.sub");
-        let id = upsert_user(&pool, &sub, &uniq("ms-login-carol"), &email, true)
-            .await
-            .expect("link by DNS-verified email");
+        let id = auth::resolve_user(
+            &pool,
+            ms_identity(&sub, &uniq("ms-login-carol"), &email, true),
+        )
+        .await
+        .expect("link by DNS-verified email");
 
         assert_eq!(
             id, existing_id,
@@ -1254,8 +1190,10 @@ mod tests {
         assert_eq!(row_sub.as_deref(), Some(sub.as_str()));
     }
 
+    /// SEC-102 regression guard: `allow_email_link: false` (xms_edov absent)
+    /// must never let a spoofable email adopt an existing account.
     #[tokio::test]
-    async fn upsert_user_never_adopts_an_email_keyed_account_without_domain_verification() {
+    async fn resolve_user_never_adopts_an_email_keyed_account_without_domain_verification() {
         let pool = users_pool().await;
         // nOAuth shape: the token asserts an email a tenant admin can set;
         // xms_edov absent => the contact address is the caller's own (UPN)
@@ -1265,12 +1203,9 @@ mod tests {
 
         let sub = uniq("tid.sub");
         let attacker_email = format!("{}@ms-test.example", uniq("attacker"));
-        let id = upsert_user(
+        let id = auth::resolve_user(
             &pool,
-            &sub,
-            &uniq("ms-login-attacker"),
-            &attacker_email,
-            false,
+            ms_identity(&sub, &uniq("ms-login-attacker"), &attacker_email, false),
         )
         .await
         .expect("a fresh account is created instead");
@@ -1284,17 +1219,14 @@ mod tests {
     /// The step-3 INSERT hits the `users_email_key` UNIQUE index: the incoming
     /// (unverified) identity re-asserts an email another row already owns.
     #[tokio::test]
-    async fn upsert_user_maps_a_unique_violation_on_insert_to_a_precondition_error() {
+    async fn resolve_user_maps_a_unique_violation_on_insert_to_a_precondition_error() {
         let pool = users_pool().await;
         let taken_email = format!("{}@ms-test.example", uniq("taken"));
         let owner_id = insert_email_user(&pool, &uniq("gh-owner"), &taken_email).await;
 
-        let err = upsert_user(
+        let err = auth::resolve_user(
             &pool,
-            &uniq("tid.sub"),
-            &uniq("ms-login"),
-            &taken_email,
-            false,
+            ms_identity(&uniq("tid.sub"), &uniq("ms-login"), &taken_email, false),
         )
         .await
         .unwrap_err();
@@ -1312,19 +1244,25 @@ mod tests {
     /// The step-1 UPDATE refreshes to an email another row already owns — the
     /// other 23505 route through `map_conflict`.
     #[tokio::test]
-    async fn upsert_user_maps_a_unique_violation_on_refresh_to_a_precondition_error() {
+    async fn resolve_user_maps_a_unique_violation_on_refresh_to_a_precondition_error() {
         let pool = users_pool().await;
         let sub = uniq("tid.sub");
         let original_email = format!("{}@ms-test.example", uniq("a"));
-        let id = upsert_user(&pool, &sub, &uniq("ms-login-a"), &original_email, false)
-            .await
-            .expect("initial insert");
+        let id = auth::resolve_user(
+            &pool,
+            ms_identity(&sub, &uniq("ms-login-a"), &original_email, false),
+        )
+        .await
+        .expect("initial insert");
         let taken_email = format!("{}@ms-test.example", uniq("b"));
         insert_email_user(&pool, &uniq("gh-b"), &taken_email).await;
 
-        let err = upsert_user(&pool, &sub, &uniq("ms-login-a2"), &taken_email, false)
-            .await
-            .unwrap_err();
+        let err = auth::resolve_user(
+            &pool,
+            ms_identity(&sub, &uniq("ms-login-a2"), &taken_email, false),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(err.code, ErrorCode::PreconditionFailed);
         assert!(err.message.contains("already linked"), "{}", err.message);

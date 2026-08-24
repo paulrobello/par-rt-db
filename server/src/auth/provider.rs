@@ -158,17 +158,30 @@ fn extract_access_token(
 /// `slug` is the provider name used in generic error bodies and tracing (e.g.
 /// "google"), preserving the per-provider error strings the callers previously
 /// emitted. Returns the userinfo JSON for the provider's own `parse_userinfo`.
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct OidcExchange<'a> {
+    pub http: &'a reqwest::Client,
+    pub slug: &'static str,
+    pub token_url: &'a str,
+    pub userinfo_url: &'a str,
+    pub client_id: &'a str,
+    pub client_secret: &'a str,
+    pub code: &'a str,
+    pub redirect_uri: &'a str,
+}
+
 pub(crate) async fn oidc_exchange_and_fetch_userinfo(
-    http: &reqwest::Client,
-    slug: &'static str,
-    token_url: &str,
-    userinfo_url: &str,
-    client_id: &str,
-    client_secret: &str,
-    code: &str,
-    redirect_uri: &str,
+    req: OidcExchange<'_>,
 ) -> Result<serde_json::Value, RtDbError> {
+    let OidcExchange {
+        http,
+        slug,
+        token_url,
+        userinfo_url,
+        client_id,
+        client_secret,
+        code,
+        redirect_uri,
+    } = req;
     let token_resp: serde_json::Value = http
         .post(token_url)
         .form(&AuthorizationCodeRequest {
