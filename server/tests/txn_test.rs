@@ -1883,3 +1883,48 @@ async fn sec104_rejects_over_budget_aggregate_affected() -> anyhow::Result<()> {
     assert_eq!(count_by_status(&pool, &db, &schema, "backlog").await?, 1);
     Ok(())
 }
+
+// A registered db whose backing schema was dropped outside `delete-db`
+// (leaked test rows, an operator DROP SCHEMA, a restore gone wrong) must
+// answer NOT_FOUND, not the generic INTERNAL a raw 3F000 maps to — clients
+// cannot tell a broken db from a broken server on a 500.
+#[tokio::test]
+async fn ops_on_schema_less_registered_db_are_not_found() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(&state.pool, &name).await?;
+    let db = String::from(common::wrap_test_db(name));
+    // Torn state: keep the registry row, drop the backing schema (what an
+    // aborted run or a manual DROP SCHEMA leaves behind).
+    sqlx::query(&format!("DROP SCHEMA \"{}\" CASCADE", ddl::pg_schema(&db)))
+        .execute(&state.pool)
+        .await?;
+
+    // Schema load answers "no schema" — same as a never-pushed db.
+    let err = state
+        .schemas
+        .get(&state.pool, &db)
+        .await
+        .expect_err("schema load on a schema-less db must fail");
+    assert_eq!(err.code, ErrorCode::NotFound);
+
+    // The committer mutate arm surfaces the same NotFound, not INTERNAL.
+    let err = state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            Transaction {
+                steps: vec![Step::Insert {
+                    table: "t_workitems".to_string(),
+                    doc: doc(serde_json::json!({ "name": "x", "status": "backlog" })),
+                }],
+            },
+            PrincipalCtx::bypass(),
+        )
+        .await
+        .expect_err("mutate on a schema-less db must fail");
+    assert_eq!(err.code, ErrorCode::NotFound);
+    Ok(())
+}

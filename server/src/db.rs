@@ -666,15 +666,35 @@ pub async fn list_databases(pool: &PgPool) -> Result<Vec<String>, RtDbError> {
 
 /// Loads the pushed schema for `db` from its `meta` table (`key = 'schema'`),
 /// or `Ok(None)` if no schema has been pushed yet.
+/// Postgres reports a query against a schema or relation that does not exist
+/// as `3F000` (invalid_schema_name) or `42P01` (undefined_table).
+fn is_missing_relation(err: &sqlx::Error) -> bool {
+    err.as_database_error()
+        .and_then(|d| d.code())
+        .is_some_and(|c| c == "3F000" || c == "42P01")
+}
+
 pub async fn load_schema(pool: &PgPool, db: &str) -> Result<Option<SchemaDef>, RtDbError> {
     validate_db_name(db)?;
     let schema_name = pg_schema(db);
 
-    let row: Option<(serde_json::Value,)> = sqlx::query_as(&format!(
+    let row: Option<(serde_json::Value,)> = match sqlx::query_as(&format!(
         "SELECT value FROM \"{schema_name}\".meta WHERE key = 'schema'"
     ))
     .fetch_optional(pool)
-    .await?;
+    .await
+    {
+        Ok(row) => row,
+        // A registered db whose backing schema is gone (dropped outside
+        // `delete-db`) is indistinguishable from one that was never pushed:
+        // answer "no schema" so callers surface NOT_FOUND instead of the
+        // generic 500 a raw 3F000/42P01 would map to.
+        Err(err) if is_missing_relation(&err) => {
+            tracing::debug!(db, "schema load: backing schema is gone");
+            None
+        }
+        Err(err) => return Err(err.into()),
+    };
 
     match row {
         Some((value,)) => {

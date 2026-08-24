@@ -475,7 +475,10 @@ operator escape hatch; `rtdb_merge_docs_total` counts restamped docs. The
 per-db iteration skips registry rows whose backing schema is gone (one bulk
 `information_schema.schemata` probe) — leaked rows from aborted runs would
 otherwise cost a committer spawn each and surface their missing `meta`
-relation as an INTERNAL merge failure. Spec:
+relation as an INTERNAL merge failure. The same torn shape is answered
+`NOT_FOUND` everywhere else too: `db::load_schema` maps a missing backing
+schema (3F000/42P01 on `meta`) to "no schema", so every schema-loading arm
+reports the db as absent rather than a generic 500. Spec:
 [`superpowers/specs/2026-08-14-anon-merge-design.md`](superpowers/specs/2026-08-14-anon-merge-design.md).
 ts-client exposes it as `useRtDbAuth().signInAnonymous()`; rust/python clients
 are machine-side and out of scope. See FEATURE_MATRIX #20.
