@@ -28,7 +28,7 @@ the code wins; fix the spec.
 
 ## The single-writer committer
 
-The correctness core lives in `committer.rs` + `subs.rs`. Each database has one
+The correctness core lives in `committer/` + `subs.rs`. Each database has one
 task that serializes all writes, then — before dequeuing the next message —
 re-runs affected subscriptions, diffs against the last pushed value, and pushes
 only on change. Subscription registration rides the same queue.
@@ -44,7 +44,7 @@ graph TD
         HTTP["One-shot HTTP — http_api.rs"]
     end
 
-    CO["Committer task (per-db, single writer)<br />committer.rs + subs.rs"]
+    CO["Committer task (per-db, single writer)<br />committer/ + subs.rs"]
 
     WS -->|"CommitterRequest::Mutate"| CO
     HTTP -->|"Committers::mutate (same arm)"| CO
@@ -611,7 +611,7 @@ an in-memory test harness — the four clients are now at feature parity.
 ### The publish_taps enforcement point
 
 Durable document mutations publish through the committer's single enforcement
-point — the `publish_taps` helper (ARC-001, `committer.rs`) — called from
+point — the `publish_taps` helper (ARC-001, `committer/taps.rs`) — called from
 **seven** `handle_*` arms: `handle_mutate`, `handle_scheduled`,
 `handle_migrate`, `handle_reaper`, `handle_restore_schema`,
 `handle_merge_users` (the anon→real merge's committed doc restamps,
@@ -621,6 +621,15 @@ txn must call `publish_taps` too, or the op-feed (and `/admin/stream`) will
 silently miss those writes. TTL deletes are durable writes the same way
 (`handle_reaper`, `source = "ttl"`, `owner = None`) — add new tap sites to
 this list.
+
+Since ARC-005 the committer is a module rather than one file, and the rule is
+enforced structurally: each arm lives in `committer/arms/<name>.rs`,
+`publish_taps` is `pub(super)` in `committer/taps.rs`, and `execute_txn` is
+called only from inside `arms/`. The rest of the module is `mod.rs` (the
+`Committers` handle, `CommitterRequest`, `CommitterCtx`, `run_committer`),
+`lease.rs` (the ownership lease), `forwarding.rs` (Stage 4c origin-side glue),
+and `supervisor.rs` (idle reclamation + quota warmer). The split was a pure
+move — no behavior changed.
 
 - **`/admin/stream` auth**: the WS upgrade gate accepts the admin bearer from
   the `Authorization` header (CLI/automation) **or** the
