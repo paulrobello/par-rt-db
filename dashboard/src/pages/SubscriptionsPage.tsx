@@ -1,9 +1,9 @@
 /** Subscription inspector — live per-database subscriptions with skip/re-run and miss counters. */
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
-import { toErrorMessage } from "../lib/errors";
 import type { DbSubCounters, SubscriptionsResponse } from "../lib/types";
+import { useAsync } from "../lib/useAsync";
 import s from "./SubscriptionsPage.module.css";
 
 /** Auto-refresh interval: the inspector is a *live* view of the registry, so an
@@ -22,27 +22,12 @@ export function SubscriptionsPage() {
   const { client, databases } = useAdmin();
   // "" = all databases (the inspector accepts an optional db filter).
   const [db, setDb] = useState<string>("");
-  const [data, setData] = useState<SubscriptionsResponse | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const { data, loading, error, refresh } = useAsync<SubscriptionsResponse | null>(
+    () => client.listSubscriptions(db ? { db } : {}),
+    [client, db],
+    null,
+  );
 
-  const refresh = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      setData(await client.listSubscriptions(db ? { db } : {}));
-    } catch (e) {
-      setError(toErrorMessage(e));
-      setData(null);
-    } finally {
-      setLoading(false);
-    }
-  }, [client, db]);
-
-  // Fetch on mount and whenever the db filter changes.
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
   // Live: re-poll so the view stays current without a manual click.
   useEffect(() => {
     const id = setInterval(() => void refresh(), REFRESH_MS);

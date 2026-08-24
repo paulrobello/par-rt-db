@@ -1,38 +1,26 @@
 /** Admin allowlist management — add and remove OAuth admin members (email / GitHub / GitLab ids). */
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
 import { toErrorMessage } from "../lib/errors";
 import type { AdminMember } from "../lib/types";
+import { useAsync } from "../lib/useAsync";
 import s from "./AdminsPage.module.css";
 
 export function AdminsPage() {
   const { client } = useAdmin();
-  const [admins, setAdmins] = useState<AdminMember[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const {
+    data: admins,
+    loading,
+    error,
+    refresh: load,
+  } = useAsync(() => client.adminsList(), [client], [] as AdminMember[]);
 
   const [email, setEmail] = useState("");
   const [githubId, setGithubId] = useState("");
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [confirmEmail, setConfirmEmail] = useState<string | null>(null);
-
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      setAdmins(await client.adminsList());
-    } catch (e) {
-      setError(toErrorMessage(e));
-    } finally {
-      setLoading(false);
-    }
-  }, [client]);
-
-  useEffect(() => {
-    void load();
-  }, [load]);
 
   async function add() {
     setFormError(null);

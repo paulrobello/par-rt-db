@@ -1,9 +1,10 @@
 /** Machine-token management — mint and revoke per-database tokens. */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
 import { toErrorMessage } from "../lib/errors";
 import type { TokenRow } from "../lib/types";
+import { useAsync } from "../lib/useAsync";
 import s from "./TokensPage.module.css";
 
 function timeLabel(ms: number): string {
@@ -18,9 +19,6 @@ function isExpired(row: TokenRow): boolean {
 export function TokensPage() {
   const { client, databases } = useAdmin();
   const [db, setDb] = useState<string>("");
-  const [tokens, setTokens] = useState<TokenRow[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [listError, setListError] = useState<string | null>(null);
 
   // Mint-form state.
   const [name, setName] = useState("");
@@ -45,26 +43,22 @@ export function TokensPage() {
     if (!db && databases.length > 0) setDb(databases[0]);
   }, [db, databases]);
 
-  const refresh = useCallback(async () => {
-    if (!db) return;
-    setLoading(true);
-    setListError(null);
-    try {
-      setTokens(await client.listTokens(db));
-    } catch (e) {
-      setListError(toErrorMessage(e));
-      setTokens([]);
-    } finally {
-      setLoading(false);
-    }
-  }, [client, db]);
+  const {
+    data: tokens,
+    loading,
+    error: listError,
+    refresh,
+    setData: setTokens,
+  } = useAsync(() => client.listTokens(db), [client, db], [] as TokenRow[], { enabled: !!db });
 
+  // Switching databases should not show the previous database's tokens while
+  // the new list loads.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: deps mirror the useAsync fetcher's own dep list, not this effect's body
   useEffect(() => {
     setTokens([]);
     setActionError(null);
     setConfirmingRevoke(null);
-    if (db) void refresh();
-  }, [db, refresh]);
+  }, [db, setTokens]);
 
   useEffect(() => {
     return () => {

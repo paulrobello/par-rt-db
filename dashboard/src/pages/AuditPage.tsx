@@ -1,10 +1,10 @@
 /** Durable audit log viewer — filter the optional audit_log by database, op kind, and write source. */
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
-import { toErrorMessage } from "../lib/errors";
 import { formatDateTime } from "../lib/format";
 import type { AuditEntry, GetAuditOptions } from "../lib/types";
+import { useAsync } from "../lib/useAsync";
 import s from "./AuditPage.module.css";
 
 // Known op kinds the server labels rows with. `op` may also be null (system
@@ -39,9 +39,6 @@ function opBadgeClass(op: string): string {
 export function AuditPage() {
   const { client, databases } = useAdmin();
   const [db, setDb] = useState<string>("");
-  const [entries, setEntries] = useState<AuditEntry[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [listError, setListError] = useState<string | null>(null);
 
   // Filter state. `table`/`principal` are free-form text, committed (debounced)
   // into `filters` so typing doesn't fire a request per keystroke. `op`/`source`
@@ -74,29 +71,32 @@ export function AuditPage() {
     return () => clearTimeout(t);
   }, [tableInput, principalInput]);
 
-  const refresh = useCallback(async () => {
-    if (!db) return;
-    setLoading(true);
-    setListError(null);
-    try {
+  const {
+    data: entries,
+    loading,
+    error: listError,
+    refresh,
+    setData: setEntries,
+  } = useAsync(
+    () => {
       const opts: GetAuditOptions = { db, limit, offset };
       if (filters.table) opts.table = filters.table;
       if (filters.op) opts.op = filters.op;
       if (filters.principal) opts.principal = filters.principal;
       if (filters.source) opts.source = filters.source;
-      setEntries(await client.getAudit(opts));
-    } catch (e) {
-      setListError(toErrorMessage(e));
-      setEntries([]);
-    } finally {
-      setLoading(false);
-    }
-  }, [client, db, filters, limit, offset]);
+      return client.getAudit(opts);
+    },
+    [client, db, filters, limit, offset],
+    [] as AuditEntry[],
+    { enabled: !!db },
+  );
 
+  // Switching databases (or any other filter/paging change) should not show
+  // the previous page's rows while the new one loads.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: deps mirror the useAsync fetcher's own dep list, not this effect's body
   useEffect(() => {
     setEntries([]);
-    if (db) void refresh();
-  }, [db, refresh]);
+  }, [db, filters, limit, offset, setEntries]);
 
   function selectDb(name: string) {
     setDb(name);
