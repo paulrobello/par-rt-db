@@ -1227,7 +1227,7 @@ async fn admin_stream_closes_when_session_is_revoked() -> anyhow::Result<()> {
     // Revoke exactly this session's row (sibling tests in this binary hold
     // their own admin-key sessions against the shared rtdb_auth).
     let hash = rtdb_server::db::sha256_hex(&session);
-    let resp = common::admin_delete(addr, &format!("/admin/sessions/{hash}")).await;
+    let resp = crate::common::admin_delete(addr, &format!("/admin/sessions/{hash}")).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
     // The next gauge tick (~1s) must tear the socket down.

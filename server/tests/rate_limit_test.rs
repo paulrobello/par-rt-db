@@ -56,7 +56,7 @@ async fn mint_token(addr: SocketAddr, db: &str) -> (String, String) {
 async fn sec005_pg_backed_ip_buckets_are_route_namespaced() -> anyhow::Result<()> {
     use rtdb_server::rate_limit::{RateDecision, RateKey, RateLimiter};
 
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let limiter = RateLimiter::new_pg(state.pool.clone());
     let ip = format!("198.51.100.{}", rtdb_server::db::new_id());
     let key = |route: &'static str| RateKey::Ip {
