@@ -48,6 +48,45 @@ async fn mint_token(addr: SocketAddr, db: &str) -> (String, String) {
 
 // (a) Per-token ceiling: with limit 3, three requests succeed and the fourth is
 // 429 with a `Retry-After` header and a `RATE_LIMITED` body code.
+// SEC-005: the route namespacing must hold on the Postgres-backed path too —
+// that is the branch multi-instance deploys actually run, and it folds the
+// route into `key_text` rather than into the enum's hash. A unique IP literal
+// per run keeps this safe against the shared `rtdb_auth.rate_counters` table
+// that sibling tests in this binary also write to.
+#[tokio::test]
+async fn sec005_pg_backed_ip_buckets_are_route_namespaced() -> anyhow::Result<()> {
+    use rtdb_server::rate_limit::{RateDecision, RateKey, RateLimiter};
+
+    let state = common::test_state().await;
+    let limiter = RateLimiter::new_pg(state.pool.clone());
+    let ip = format!("198.51.100.{}", rtdb_server::db::new_id());
+    let key = |route: &'static str| RateKey::Ip {
+        route,
+        ip: ip.clone(),
+    };
+
+    for _ in 0..11 {
+        let _ = limiter.check(key("storage"), 10).await;
+    }
+    assert!(
+        matches!(
+            limiter.check(key("storage"), 10).await,
+            RateDecision::Denied { .. }
+        ),
+        "the storage budget for this IP must be exhausted"
+    );
+    assert_eq!(
+        limiter.check(key("admin_login"), 10).await,
+        RateDecision::Allowed,
+        "SEC-005: exhausting one route's per-IP budget must not spend another's"
+    );
+    assert_eq!(
+        limiter.check(key("anon_mint"), 10).await,
+        RateDecision::Allowed
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn per_token_limit_allows_n_then_denials_carry_retry_after() -> anyhow::Result<()> {
     let state = test_state_with_rate_limits(3, 0).await;
