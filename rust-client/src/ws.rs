@@ -300,6 +300,36 @@ struct QueuedWorkflow {
     reply: WfReply,
 }
 
+/// One reply-tracking family: replies awaiting a server ack, keyed by
+/// correlation id (`by_id`), and calls still queued because no session was
+/// open when they were made (`unsent`). `unsent` entries are replayed in
+/// order on the next successful auth (or rejected on terminal teardown);
+/// `by_id` entries were sent but not yet acknowledged, so a mid-session
+/// disconnect rejects them (see `reject_inflight`) while `unsent` survives.
+struct Pending<Q, R> {
+    by_id: HashMap<String, R>,
+    unsent: VecDeque<Q>,
+}
+
+impl<Q, R> Default for Pending<Q, R> {
+    fn default() -> Self {
+        Self {
+            by_id: HashMap::new(),
+            unsent: VecDeque::new(),
+        }
+    }
+}
+
+/// The three structurally-parallel reply-tracking families threaded through
+/// `drive`/`run_session`: mutate, schedule, and workflow calls each have their
+/// own pending-ack map and queued-while-disconnected deque.
+#[derive(Default)]
+struct PendingQueues {
+    mutate: Pending<QueuedMutate, MutReply>,
+    schedule: Pending<QueuedSchedule, SchedReply>,
+    workflow: Pending<QueuedWorkflow, WfReply>,
+}
+
 /// Commands callers send to the driver task.
 enum Cmd {
     /// Nudge the driver to (re)connect / re-auth — `connect()` and token refresh.
@@ -1036,12 +1066,7 @@ enum SessionOutcome {
 
 async fn drive(mut driver: Driver) {
     let mut attempt: u32 = 0;
-    let mut pending: HashMap<String, MutReply> = HashMap::new();
-    let mut unsent: VecDeque<QueuedMutate> = VecDeque::new();
-    let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
-    let mut unsent_schedules: VecDeque<QueuedSchedule> = VecDeque::new();
-    let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
-    let mut unsent_workflows: VecDeque<QueuedWorkflow> = VecDeque::new();
+    let mut queues = PendingQueues::default();
 
     loop {
         if driver.inner.closed.load(Ordering::SeqCst) {
@@ -1063,37 +1088,12 @@ async fn drive(mut driver: Driver) {
         };
 
         driver.set_state(ConnectionState::Connecting);
-        match run_session(
-            &mut driver,
-            epoch,
-            token,
-            &mut pending,
-            &mut unsent,
-            &mut pending_schedules,
-            &mut unsent_schedules,
-            &mut pending_workflows,
-            &mut unsent_workflows,
-        )
-        .await
-        {
+        match run_session(&mut driver, epoch, token, &mut queues).await {
             SessionOutcome::AuthFailed => {
                 driver.set_state(ConnectionState::Idle);
-                reject_all(
-                    &driver.inner,
-                    &mut pending,
-                    &mut unsent,
-                    "authentication failed",
-                );
-                reject_all_schedules(
-                    &mut pending_schedules,
-                    &mut unsent_schedules,
-                    "authentication failed",
-                );
-                reject_all_workflows(
-                    &mut pending_workflows,
-                    &mut unsent_workflows,
-                    "authentication failed",
-                );
+                reject_all(&driver.inner, &mut queues.mutate, "authentication failed");
+                reject_all_schedules(&mut queues.schedule, "authentication failed");
+                reject_all_workflows(&mut queues.workflow, "authentication failed");
                 if !wait_for_poke(&mut driver).await {
                     break;
                 }
@@ -1102,15 +1102,15 @@ async fn drive(mut driver: Driver) {
                 driver.set_state(ConnectionState::Reconnecting);
                 reject_inflight(
                     &driver.inner,
-                    &mut pending,
+                    &mut queues.mutate,
                     "connection closed before acknowledgment",
                 );
                 reject_inflight_schedules(
-                    &mut pending_schedules,
+                    &mut queues.schedule,
                     "connection closed before acknowledgment",
                 );
                 reject_inflight_workflows(
-                    &mut pending_workflows,
+                    &mut queues.workflow,
                     "connection closed before acknowledgment",
                 );
                 match backoff_wait(&mut driver, attempt).await {
@@ -1125,17 +1125,9 @@ async fn drive(mut driver: Driver) {
         }
     }
 
-    reject_all(&driver.inner, &mut pending, &mut unsent, "client is closed");
-    reject_all_schedules(
-        &mut pending_schedules,
-        &mut unsent_schedules,
-        "client is closed",
-    );
-    reject_all_workflows(
-        &mut pending_workflows,
-        &mut unsent_workflows,
-        "client is closed",
-    );
+    reject_all(&driver.inner, &mut queues.mutate, "client is closed");
+    reject_all_schedules(&mut queues.schedule, "client is closed");
+    reject_all_workflows(&mut queues.workflow, "client is closed");
     driver.set_state(ConnectionState::Closed);
 }
 
@@ -1191,19 +1183,11 @@ async fn backoff_wait(driver: &mut Driver, attempt: u32) -> WaitResult {
 
 /// Open, authenticate, and run one session until it ends. Owns the heartbeat and
 /// routes every inbound [`ServerMessage`] through [`apply_server_message`].
-// Nine plumbing params: the mutate/schedule/workflow pending+unsent pairs are
-// structurally parallel and threaded through together.
-#[allow(clippy::too_many_arguments)]
 async fn run_session(
     driver: &mut Driver,
     epoch: u64,
     token: String,
-    pending: &mut HashMap<String, MutReply>,
-    unsent: &mut VecDeque<QueuedMutate>,
-    pending_schedules: &mut HashMap<String, SchedReply>,
-    unsent_schedules: &mut VecDeque<QueuedSchedule>,
-    pending_workflows: &mut HashMap<String, WfReply>,
-    unsent_workflows: &mut VecDeque<QueuedWorkflow>,
+    queues: &mut PendingQueues,
 ) -> SessionOutcome {
     if driver.inner.closed.load(Ordering::SeqCst)
         || driver.inner.generation.load(Ordering::SeqCst) != epoch
@@ -1319,33 +1303,33 @@ async fn run_session(
     }
 
     // Flush mutations queued while disconnected.
-    while let Some(q) = unsent.pop_front() {
-        match deliver_mutate(&mut sink, q, pending).await {
+    while let Some(q) = queues.mutate.unsent.pop_front() {
+        match deliver_mutate(&mut sink, q, &mut queues.mutate.by_id).await {
             Deliver::Sent => {}
             Deliver::Reconnect(q) => {
-                unsent.push_back(q);
+                queues.mutate.unsent.push_back(q);
                 return SessionOutcome::Reconnect;
             }
         }
     }
 
     // Flush schedule/list/manage calls queued while disconnected.
-    while let Some(q) = unsent_schedules.pop_front() {
-        match deliver_schedule(&mut sink, q, pending_schedules).await {
+    while let Some(q) = queues.schedule.unsent.pop_front() {
+        match deliver_schedule(&mut sink, q, &mut queues.schedule.by_id).await {
             Ok(()) => {}
             Err(q) => {
-                unsent_schedules.push_back(q);
+                queues.schedule.unsent.push_back(q);
                 return SessionOutcome::Reconnect;
             }
         }
     }
 
     // Flush workflow calls queued while disconnected.
-    while let Some(q) = unsent_workflows.pop_front() {
-        match deliver_workflow(&mut sink, q, pending_workflows).await {
+    while let Some(q) = queues.workflow.unsent.pop_front() {
+        match deliver_workflow(&mut sink, q, &mut queues.workflow.by_id).await {
             Ok(()) => {}
             Err(q) => {
-                unsent_workflows.push_back(q);
+                queues.workflow.unsent.push_back(q);
                 return SessionOutcome::Reconnect;
             }
         }
@@ -1381,28 +1365,28 @@ async fn run_session(
                     }
                 }
                 Some(Cmd::Mutate(q)) => {
-                    match deliver_mutate(&mut sink, *q, pending).await {
+                    match deliver_mutate(&mut sink, *q, &mut queues.mutate.by_id).await {
                         Deliver::Sent => {}
                         Deliver::Reconnect(q) => {
-                            unsent.push_back(q);
+                            queues.mutate.unsent.push_back(q);
                             return SessionOutcome::Reconnect;
                         }
                     }
                 }
                 Some(Cmd::Schedule(q)) => {
-                    match deliver_schedule(&mut sink, *q, pending_schedules).await {
+                    match deliver_schedule(&mut sink, *q, &mut queues.schedule.by_id).await {
                         Ok(()) => {}
                         Err(q) => {
-                            unsent_schedules.push_back(q);
+                            queues.schedule.unsent.push_back(q);
                             return SessionOutcome::Reconnect;
                         }
                     }
                 }
                 Some(Cmd::Workflow(q)) => {
-                    match deliver_workflow(&mut sink, *q, pending_workflows).await {
+                    match deliver_workflow(&mut sink, *q, &mut queues.workflow.by_id).await {
                         Ok(()) => {}
                         Err(q) => {
-                            unsent_workflows.push_back(q);
+                            queues.workflow.unsent.push_back(q);
                             return SessionOutcome::Reconnect;
                         }
                     }
@@ -1446,13 +1430,7 @@ async fn run_session(
             incoming = stream.next() => match incoming {
                 Some(Ok(WsMessage::Text(t))) => {
                     if let Ok(msg) = serde_json::from_str::<ServerMessage>(t.as_str()) {
-                        apply_server_message(
-                            &driver.inner,
-                            msg,
-                            pending,
-                            pending_schedules,
-                            pending_workflows,
-                        );
+                        apply_server_message(&driver.inner, msg, queues);
                     }
                 }
                 Some(Ok(WsMessage::Ping(p))) => {
@@ -1614,13 +1592,38 @@ where
 /// pending schedule call. Pure with respect to the socket (no I/O) so it is
 /// unit-testable without a server. Pong freshness is tracked by the session's
 /// select arm, not here.
-fn apply_server_message(
-    inner: &Arc<ClientInner>,
-    msg: ServerMessage,
-    pending: &mut HashMap<String, MutReply>,
-    pending_schedules: &mut HashMap<String, SchedReply>,
-    pending_workflows: &mut HashMap<String, WfReply>,
-) {
+fn apply_server_message(inner: &Arc<ClientInner>, msg: ServerMessage, queues: &mut PendingQueues) {
+    match msg {
+        ServerMessage::QueryUpdate { .. } | ServerMessage::SubscribeErr { .. } => {
+            on_query_update(inner, msg);
+        }
+        ServerMessage::MutateOk { .. } | ServerMessage::MutateErr { .. } => {
+            on_mutate_reply(inner, &mut queues.mutate.by_id, msg);
+        }
+        ServerMessage::ScheduleOk { .. }
+        | ServerMessage::ScheduleErr { .. }
+        | ServerMessage::ScheduleAck { .. }
+        | ServerMessage::ListSchedulesOk { .. } => {
+            on_schedule_reply(&mut queues.schedule.by_id, msg);
+        }
+        ServerMessage::StartWorkflowOk { .. }
+        | ServerMessage::StartWorkflowErr { .. }
+        | ServerMessage::WorkflowAck { .. }
+        | ServerMessage::ListWorkflowsOk { .. } => {
+            on_workflow_reply(&mut queues.workflow.by_id, msg);
+        }
+        ServerMessage::PresenceSnapshot { .. } | ServerMessage::PresenceErr { .. } => {
+            on_presence(inner, msg);
+        }
+        // Pong is handled by the session loop; AuthOk/AuthErr arrive only at the
+        // handshake, never mid-session.
+        ServerMessage::Pong | ServerMessage::AuthOk { .. } | ServerMessage::AuthErr { .. } => {}
+    }
+}
+
+/// Route a `queryUpdate`/`subscribeErr` frame to its subscription's watch
+/// channel, reconciling or dropping the shape as appropriate.
+fn on_query_update(inner: &Arc<ClientInner>, msg: ServerMessage) {
     match msg {
         ServerMessage::QueryUpdate { query_id, result } => {
             let maps = inner.subs.lock().unwrap_or_else(|p| p.into_inner());
@@ -1647,6 +1650,18 @@ fn apply_server_message(
                 let _ = sub.tx.send(Snapshot::Error(error));
             }
         }
+        _ => unreachable!("on_query_update called with a non-query message"),
+    }
+}
+
+/// Route a `mutateOk`/`mutateErr` frame to its pending caller, syncing the
+/// optimistic-overlay reverse index for both outcomes.
+fn on_mutate_reply(
+    inner: &Arc<ClientInner>,
+    pending: &mut HashMap<String, MutReply>,
+    msg: ServerMessage,
+) {
+    match msg {
         ServerMessage::MutateOk { mut_id, results } => {
             if let Some(reply) = pending.remove(&mut_id) {
                 let _ = reply.send(Ok(results));
@@ -1664,13 +1679,21 @@ fn apply_server_message(
             let mut maps = inner.subs.lock().unwrap_or_else(|p| p.into_inner());
             revert_overlays_for(&mut maps, &mut_id);
         }
+        _ => unreachable!("on_mutate_reply called with a non-mutate message"),
+    }
+}
+
+/// Route a `scheduleOk`/`scheduleErr`/`scheduleAck`/`listSchedulesOk` frame to
+/// its pending caller.
+fn on_schedule_reply(pending: &mut HashMap<String, SchedReply>, msg: ServerMessage) {
+    match msg {
         ServerMessage::ScheduleOk { schedule_id, id } => {
-            if let Some(reply) = pending_schedules.remove(&schedule_id) {
+            if let Some(reply) = pending.remove(&schedule_id) {
                 let _ = reply.send(Ok(ScheduleOutcome::Id(id)));
             }
         }
         ServerMessage::ScheduleErr { schedule_id, error } => {
-            if let Some(reply) = pending_schedules.remove(&schedule_id) {
+            if let Some(reply) = pending.remove(&schedule_id) {
                 let _ = reply.send(Err(error));
             }
         }
@@ -1679,7 +1702,7 @@ fn apply_server_message(
             ok,
             error,
         } => {
-            if let Some(reply) = pending_schedules.remove(&schedule_id) {
+            if let Some(reply) = pending.remove(&schedule_id) {
                 if ok {
                     let _ = reply.send(Ok(ScheduleOutcome::Ack(true)));
                 } else if let Some(error) = error {
@@ -1695,12 +1718,20 @@ fn apply_server_message(
             schedule_id,
             schedules,
         } => {
-            if let Some(reply) = pending_schedules.remove(&schedule_id) {
+            if let Some(reply) = pending.remove(&schedule_id) {
                 let _ = reply.send(Ok(ScheduleOutcome::List(schedules)));
             }
         }
+        _ => unreachable!("on_schedule_reply called with a non-schedule message"),
+    }
+}
+
+/// Route a `startWorkflowOk`/`startWorkflowErr`/`workflowAck`/
+/// `listWorkflowsOk` frame to its pending caller.
+fn on_workflow_reply(pending: &mut HashMap<String, WfReply>, msg: ServerMessage) {
+    match msg {
         ServerMessage::StartWorkflowOk { workflow_id, info } => {
-            if let Some(reply) = pending_workflows.remove(&workflow_id) {
+            if let Some(reply) = pending.remove(&workflow_id) {
                 let _ = reply.send(Ok(WorkflowOutcome::Info(info)));
             }
         }
@@ -1708,7 +1739,7 @@ fn apply_server_message(
             // Also carries a failed `listWorkflows`' correlation id — the
             // frame vocabulary has no distinct list-error frame, so both the
             // start and list families reject through this arm.
-            if let Some(reply) = pending_workflows.remove(&workflow_id) {
+            if let Some(reply) = pending.remove(&workflow_id) {
                 let _ = reply.send(Err(error));
             }
         }
@@ -1717,7 +1748,7 @@ fn apply_server_message(
             ok,
             error,
         } => {
-            if let Some(reply) = pending_workflows.remove(&workflow_id) {
+            if let Some(reply) = pending.remove(&workflow_id) {
                 if ok {
                     let _ = reply.send(Ok(WorkflowOutcome::Ack(true)));
                 } else if let Some(error) = error {
@@ -1733,10 +1764,17 @@ fn apply_server_message(
             workflow_id,
             workflows,
         } => {
-            if let Some(reply) = pending_workflows.remove(&workflow_id) {
+            if let Some(reply) = pending.remove(&workflow_id) {
                 let _ = reply.send(Ok(WorkflowOutcome::List(workflows)));
             }
         }
+        _ => unreachable!("on_workflow_reply called with a non-workflow message"),
+    }
+}
+
+/// Route a `presenceSnapshot`/`presenceErr` frame to its room's watch channel.
+fn on_presence(inner: &Arc<ClientInner>, msg: ServerMessage) {
+    match msg {
         ServerMessage::PresenceSnapshot { room, members } => {
             // Per-room fan-out, mirroring how QueryUpdate routes to a per-id
             // handler through the subs map. Anyone holding a Presence handle for
@@ -1756,9 +1794,7 @@ fn apply_server_message(
                 let _ = state.tx.send(PresenceSnapshot::Error(error));
             }
         }
-        // Pong is handled by the session loop; AuthOk/AuthErr arrive only at the
-        // handshake, never mid-session.
-        ServerMessage::Pong | ServerMessage::AuthOk { .. } | ServerMessage::AuthErr { .. } => {}
+        _ => unreachable!("on_presence called with a non-presence message"),
     }
 }
 
@@ -1847,12 +1883,12 @@ fn revert_overlays_for(maps: &mut SubMaps, mut_id: &str) {
 /// gets a `MutateOk`/`MutateErr`, so the rollback must happen here).
 fn reject_inflight(
     inner: &Arc<ClientInner>,
-    pending: &mut HashMap<String, MutReply>,
+    pending: &mut Pending<QueuedMutate, MutReply>,
     reason: &str,
 ) {
     let err = RtDbError::new(ErrorCode::Internal, reason);
     let mut maps = inner.subs.lock().unwrap_or_else(|p| p.into_inner());
-    for (mut_id, reply) in pending.drain() {
+    for (mut_id, reply) in pending.by_id.drain() {
         revert_overlays_for(&mut maps, &mut_id);
         let _ = reply.send(Err(err.clone()));
     }
@@ -1861,8 +1897,7 @@ fn reject_inflight(
 /// Reject every mutation, in-flight and queued. Used on terminal teardown.
 fn reject_all(
     inner: &Arc<ClientInner>,
-    pending: &mut HashMap<String, MutReply>,
-    unsent: &mut VecDeque<QueuedMutate>,
+    pending: &mut Pending<QueuedMutate, MutReply>,
     reason: &str,
 ) {
     reject_inflight(inner, pending, reason);
@@ -1871,7 +1906,7 @@ fn reject_all(
     // `RtDbClient::mutate` before the driver even receives the command), so
     // revert them too.
     let mut maps = inner.subs.lock().unwrap_or_else(|p| p.into_inner());
-    for q in unsent.drain(..) {
+    for q in pending.unsent.drain(..) {
         revert_overlays_for(&mut maps, &q.mut_id);
         let _ = q.reply.send(Err(err.clone()));
     }
@@ -1880,22 +1915,18 @@ fn reject_all(
 /// Reject every in-flight (sent, unacked) schedule call. Queued (never-sent)
 /// calls are left intact so they survive the reconnect — see
 /// [`reject_all_schedules`].
-fn reject_inflight_schedules(pending: &mut HashMap<String, SchedReply>, reason: &str) {
+fn reject_inflight_schedules(pending: &mut Pending<QueuedSchedule, SchedReply>, reason: &str) {
     let err = RtDbError::new(ErrorCode::Internal, reason);
-    for (_, reply) in pending.drain() {
+    for (_, reply) in pending.by_id.drain() {
         let _ = reply.send(Err(err.clone()));
     }
 }
 
 /// Reject every schedule call, in-flight and queued. Used on terminal teardown.
-fn reject_all_schedules(
-    pending: &mut HashMap<String, SchedReply>,
-    unsent: &mut VecDeque<QueuedSchedule>,
-    reason: &str,
-) {
+fn reject_all_schedules(pending: &mut Pending<QueuedSchedule, SchedReply>, reason: &str) {
     reject_inflight_schedules(pending, reason);
     let err = RtDbError::new(ErrorCode::Internal, reason);
-    for q in unsent.drain(..) {
+    for q in pending.unsent.drain(..) {
         let _ = q.reply.send(Err(err.clone()));
     }
 }
@@ -1903,22 +1934,18 @@ fn reject_all_schedules(
 /// Reject every in-flight (sent, unacked) workflow call. Queued (never-sent)
 /// calls are left intact so they survive the reconnect — see
 /// [`reject_all_workflows`].
-fn reject_inflight_workflows(pending: &mut HashMap<String, WfReply>, reason: &str) {
+fn reject_inflight_workflows(pending: &mut Pending<QueuedWorkflow, WfReply>, reason: &str) {
     let err = RtDbError::new(ErrorCode::Internal, reason);
-    for (_, reply) in pending.drain() {
+    for (_, reply) in pending.by_id.drain() {
         let _ = reply.send(Err(err.clone()));
     }
 }
 
 /// Reject every workflow call, in-flight and queued. Used on terminal teardown.
-fn reject_all_workflows(
-    pending: &mut HashMap<String, WfReply>,
-    unsent: &mut VecDeque<QueuedWorkflow>,
-    reason: &str,
-) {
+fn reject_all_workflows(pending: &mut Pending<QueuedWorkflow, WfReply>, reason: &str) {
     reject_inflight_workflows(pending, reason);
     let err = RtDbError::new(ErrorCode::Internal, reason);
-    for q in unsent.drain(..) {
+    for q in pending.unsent.drain(..) {
         let _ = q.reply.send(Err(err.clone()));
     }
 }
@@ -2250,18 +2277,14 @@ mod tests {
     #[test]
     fn query_update_delivers_value() {
         let (inner, rx) = rig_with_sub();
-        let mut pending = HashMap::new();
-        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
-        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
+        let mut queues = PendingQueues::default();
         apply_server_message(
             &inner,
             ServerMessage::QueryUpdate {
                 query_id: "sub-1".into(),
                 result: json!([{"_id":"a"}]),
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
         assert!(matches!(rx.borrow().clone(), Snapshot::Value(_)));
     }
@@ -2269,18 +2292,14 @@ mod tests {
     #[test]
     fn subscribe_err_routes_error_and_removes() {
         let (inner, rx) = rig_with_sub();
-        let mut pending = HashMap::new();
-        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
-        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
+        let mut queues = PendingQueues::default();
         apply_server_message(
             &inner,
             ServerMessage::SubscribeErr {
                 query_id: "sub-1".into(),
                 error: RtDbError::new(ErrorCode::BadRequest, "bad index"),
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
         assert!(matches!(rx.borrow().clone(), Snapshot::Error(_)));
         let maps = inner.subs.lock().unwrap();
@@ -2291,13 +2310,11 @@ mod tests {
     #[tokio::test]
     async fn mutate_ok_and_err_resolve_pending() {
         let (inner, _) = rig_with_sub();
-        let mut pending: HashMap<String, MutReply> = HashMap::new();
-        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
-        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
+        let mut queues = PendingQueues::default();
         let (tx_ok, rx_ok) = oneshot::channel();
         let (tx_err, rx_err) = oneshot::channel();
-        pending.insert("mut-1".into(), tx_ok);
-        pending.insert("mut-2".into(), tx_err);
+        queues.mutate.by_id.insert("mut-1".into(), tx_ok);
+        queues.mutate.by_id.insert("mut-2".into(), tx_err);
 
         apply_server_message(
             &inner,
@@ -2305,9 +2322,7 @@ mod tests {
                 mut_id: "mut-1".into(),
                 results: vec![json!({"id":"a"})],
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
         apply_server_message(
             &inner,
@@ -2315,15 +2330,13 @@ mod tests {
                 mut_id: "mut-2".into(),
                 error: RtDbError::new(ErrorCode::NotFound, "x"),
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
         let ok = rx_ok.await.unwrap().unwrap();
         assert_eq!(ok.len(), 1);
         let err = rx_err.await.unwrap().unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
-        assert!(pending.is_empty());
+        assert!(queues.mutate.by_id.is_empty());
     }
 
     // ── presence routing ───────────────────────────────────────────────────
@@ -2367,18 +2380,14 @@ mod tests {
     #[test]
     fn presence_snapshot_routes_to_room() {
         let (inner, rx) = rig_with_presence("doc:1");
-        let mut pending = HashMap::new();
-        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
-        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
+        let mut queues = PendingQueues::default();
         apply_server_message(
             &inner,
             ServerMessage::PresenceSnapshot {
                 room: "doc:1".into(),
                 members: vec![presence_member("c1"), presence_member("c2")],
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
         match rx.borrow().clone() {
             PresenceSnapshot::Members(m) => {
@@ -2393,9 +2402,7 @@ mod tests {
     #[test]
     fn presence_snapshot_ignored_for_unknown_room() {
         let (inner, rx) = rig_with_presence("doc:1");
-        let mut pending = HashMap::new();
-        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
-        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
+        let mut queues = PendingQueues::default();
         // A snapshot for a room we haven't joined should not affect our receiver.
         apply_server_message(
             &inner,
@@ -2403,9 +2410,7 @@ mod tests {
                 room: "doc:other".into(),
                 members: vec![presence_member("c9")],
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
         assert!(matches!(rx.borrow().clone(), PresenceSnapshot::Pending));
     }
@@ -2413,18 +2418,14 @@ mod tests {
     #[test]
     fn presence_err_routes_error_to_room() {
         let (inner, rx) = rig_with_presence("doc:1");
-        let mut pending = HashMap::new();
-        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
-        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
+        let mut queues = PendingQueues::default();
         apply_server_message(
             &inner,
             ServerMessage::PresenceErr {
                 room: "doc:1".into(),
                 error: RtDbError::new(ErrorCode::Forbidden, "presence not enabled"),
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
         match rx.borrow().clone() {
             PresenceSnapshot::Error(e) => {
@@ -2498,18 +2499,14 @@ mod tests {
             opt.active = true;
             opt.server_last = Some(json!([{"_id":"old"}]));
         }
-        let mut pending = HashMap::new();
-        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
-        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
+        let mut queues = PendingQueues::default();
         apply_server_message(
             &inner,
             ServerMessage::QueryUpdate {
                 query_id: "sub-1".into(),
                 result: json!([{"_id":"a"},{"_id":"b"}]),
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
         match rx.borrow().clone() {
             Snapshot::Value(v) => {
@@ -2557,18 +2554,14 @@ mod tests {
             other => panic!("expected overlaid Value pre-rollback, got {other:?}"),
         }
 
-        let mut pending: HashMap<String, MutReply> = HashMap::new();
-        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
-        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
+        let mut queues = PendingQueues::default();
         apply_server_message(
             &inner,
             ServerMessage::MutateErr {
                 mut_id: "mut-1".into(),
                 error: RtDbError::new(ErrorCode::Internal, "boom"),
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
 
         match rx.borrow().clone() {
@@ -2607,20 +2600,16 @@ mod tests {
             maps.overlays.insert("mut-1".into(), set);
         }
 
-        let mut pending: HashMap<String, MutReply> = HashMap::new();
-        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
-        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
+        let mut queues = PendingQueues::default();
         let (reply_tx, _reply_rx) = oneshot::channel();
-        pending.insert("mut-1".into(), reply_tx);
+        queues.mutate.by_id.insert("mut-1".into(), reply_tx);
         apply_server_message(
             &inner,
             ServerMessage::MutateOk {
                 mut_id: "mut-1".into(),
                 results: vec![json!({"id":"a"})],
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
 
         // Receiver is unchanged — the overlaid value stays until the QueryUpdate
@@ -2649,21 +2638,19 @@ mod tests {
     #[tokio::test]
     async fn schedule_replies_resolve_pending() {
         let (inner, _) = rig_with_sub();
-        let mut pending: HashMap<String, MutReply> = HashMap::new();
-        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
-        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
+        let mut queues = PendingQueues::default();
         let (tx_ok, rx_ok) = oneshot::channel();
         let (tx_err, rx_err) = oneshot::channel();
         let (tx_ack_ok, rx_ack_ok) = oneshot::channel();
         let (tx_ack_err, rx_ack_err) = oneshot::channel();
         let (tx_list, rx_list) = oneshot::channel();
         let (tx_ack_noop, rx_ack_noop) = oneshot::channel();
-        pending_schedules.insert("sch-1".into(), tx_ok);
-        pending_schedules.insert("sch-2".into(), tx_err);
-        pending_schedules.insert("sch-3".into(), tx_ack_ok);
-        pending_schedules.insert("sch-4".into(), tx_ack_err);
-        pending_schedules.insert("sch-5".into(), tx_list);
-        pending_schedules.insert("sch-6".into(), tx_ack_noop);
+        queues.schedule.by_id.insert("sch-1".into(), tx_ok);
+        queues.schedule.by_id.insert("sch-2".into(), tx_err);
+        queues.schedule.by_id.insert("sch-3".into(), tx_ack_ok);
+        queues.schedule.by_id.insert("sch-4".into(), tx_ack_err);
+        queues.schedule.by_id.insert("sch-5".into(), tx_list);
+        queues.schedule.by_id.insert("sch-6".into(), tx_ack_noop);
 
         apply_server_message(
             &inner,
@@ -2671,9 +2658,7 @@ mod tests {
                 schedule_id: "sch-1".into(),
                 id: "job-9".into(),
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
         apply_server_message(
             &inner,
@@ -2681,9 +2666,7 @@ mod tests {
                 schedule_id: "sch-2".into(),
                 error: RtDbError::new(ErrorCode::BadRequest, "bad cron"),
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
         apply_server_message(
             &inner,
@@ -2692,9 +2675,7 @@ mod tests {
                 ok: true,
                 error: None,
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
         apply_server_message(
             &inner,
@@ -2703,9 +2684,7 @@ mod tests {
                 ok: false,
                 error: Some(RtDbError::new(ErrorCode::NotFound, "missing job")),
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
         // Bare ok:false (no error envelope) = unknown/terminal job no-op:
         // resolves Ack(false), it must not reject (workflow-ack parity).
@@ -2716,9 +2695,7 @@ mod tests {
                 ok: false,
                 error: None,
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
         apply_server_message(
             &inner,
@@ -2736,9 +2713,7 @@ mod tests {
                     fired_count: 0,
                 }],
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
 
         match rx_ok.await.unwrap().unwrap() {
@@ -2764,7 +2739,7 @@ mod tests {
             }
             other => panic!("expected List, got {other:?}"),
         }
-        assert!(pending_schedules.is_empty());
+        assert!(queues.schedule.by_id.is_empty());
     }
 
     // Mirror of `schedule_replies_resolve_pending` for the workflow track
@@ -2776,9 +2751,7 @@ mod tests {
     #[tokio::test]
     async fn workflow_replies_resolve_pending() {
         let (inner, _) = rig_with_sub();
-        let mut pending: HashMap<String, MutReply> = HashMap::new();
-        let mut pending_schedules: HashMap<String, SchedReply> = HashMap::new();
-        let mut pending_workflows: HashMap<String, WfReply> = HashMap::new();
+        let mut queues = PendingQueues::default();
         let (tx_ok, rx_ok) = oneshot::channel();
         let (tx_err, rx_err) = oneshot::channel();
         let (tx_ack_ok, rx_ack_ok) = oneshot::channel();
@@ -2786,13 +2759,13 @@ mod tests {
         let (tx_list, rx_list) = oneshot::channel();
         let (tx_list_err, rx_list_err) = oneshot::channel();
         let (tx_ack_noop, rx_ack_noop) = oneshot::channel();
-        pending_workflows.insert("wf-1".into(), tx_ok);
-        pending_workflows.insert("wf-2".into(), tx_err);
-        pending_workflows.insert("wf-3".into(), tx_ack_ok);
-        pending_workflows.insert("wf-4".into(), tx_ack_err);
-        pending_workflows.insert("wf-5".into(), tx_list);
-        pending_workflows.insert("wf-6".into(), tx_list_err);
-        pending_workflows.insert("wf-7".into(), tx_ack_noop);
+        queues.workflow.by_id.insert("wf-1".into(), tx_ok);
+        queues.workflow.by_id.insert("wf-2".into(), tx_err);
+        queues.workflow.by_id.insert("wf-3".into(), tx_ack_ok);
+        queues.workflow.by_id.insert("wf-4".into(), tx_ack_err);
+        queues.workflow.by_id.insert("wf-5".into(), tx_list);
+        queues.workflow.by_id.insert("wf-6".into(), tx_list_err);
+        queues.workflow.by_id.insert("wf-7".into(), tx_ack_noop);
 
         let info = WorkflowInfo {
             id: "wf1".into(),
@@ -2816,9 +2789,7 @@ mod tests {
                 workflow_id: "wf-1".into(),
                 info: info.clone(),
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
         apply_server_message(
             &inner,
@@ -2826,9 +2797,7 @@ mod tests {
                 workflow_id: "wf-2".into(),
                 error: RtDbError::new(ErrorCode::BadRequest, "bad spec"),
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
         apply_server_message(
             &inner,
@@ -2837,9 +2806,7 @@ mod tests {
                 ok: true,
                 error: None,
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
         apply_server_message(
             &inner,
@@ -2848,9 +2815,7 @@ mod tests {
                 ok: false,
                 error: Some(RtDbError::new(ErrorCode::NotFound, "no such run")),
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
         apply_server_message(
             &inner,
@@ -2858,9 +2823,7 @@ mod tests {
                 workflow_id: "wf-5".into(),
                 workflows: vec![info],
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
         // The binding ruling: a failed list arrives as startWorkflowErr with
         // the list call's correlation id.
@@ -2870,9 +2833,7 @@ mod tests {
                 workflow_id: "wf-6".into(),
                 error: RtDbError::new(ErrorCode::Internal, "list failed"),
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
         // Bare ok:false (no error envelope) = unknown/terminal run no-op:
         // resolves Ack(false), it must not reject.
@@ -2883,9 +2844,7 @@ mod tests {
                 ok: false,
                 error: None,
             },
-            &mut pending,
-            &mut pending_schedules,
-            &mut pending_workflows,
+            &mut queues,
         );
 
         match rx_ok.await.unwrap().unwrap() {
@@ -2913,7 +2872,7 @@ mod tests {
         }
         let list_err = rx_list_err.await.unwrap().unwrap_err();
         assert_eq!(list_err.code, ErrorCode::Internal);
-        assert!(pending_workflows.is_empty());
+        assert!(queues.workflow.by_id.is_empty());
     }
 
     #[test]

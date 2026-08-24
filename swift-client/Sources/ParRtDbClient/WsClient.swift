@@ -1415,12 +1415,30 @@ public actor RtDbClient {
         return true
     }
 
-    // swiftlint:disable cyclomatic_complexity function_body_length
     /// Route one inbound non-lifecycle `ServerMessage` (rust
-    /// `apply_server_message`): query updates to their shape's sinks, op
-    /// replies to their pending calls by correlation id. Unknown ids (late or
-    /// duplicate replies) are dropped, exactly like rust's `if let` guards.
+    /// `apply_server_message`) to its family handler: query updates to their
+    /// shape's sinks, op replies to their pending calls by correlation id.
+    /// Unknown ids (late or duplicate replies) are dropped, exactly like
+    /// rust's `if let` guards.
     private func route(_ message: ServerMessage) {
+        switch message {
+        case .queryUpdate, .subscribeErr:
+            onQueryUpdate(message)
+        case .mutateOk, .mutateErr:
+            onMutateReply(message)
+        case .scheduleOk, .scheduleErr, .scheduleAck, .listSchedulesOk:
+            onScheduleReply(message)
+        case .startWorkflowOk, .startWorkflowErr, .workflowAck, .listWorkflowsOk:
+            onWorkflowReply(message)
+        case .authOk, .authErr, .pong:
+            break // lifecycle-owned — the receive loop never dispatches these
+        case .presenceSnapshot, .presenceErr:
+            onPresence(message)
+        }
+    }
+
+    /// Route a `queryUpdate`/`subscribeErr` frame to its subscription's sinks.
+    private func onQueryUpdate(_ message: ServerMessage) {
         switch message {
         case let .queryUpdate(queryId, result):
             guard let key = queryIdToKey[queryId], var entry = subscriptionsByKey[key] else { return }
@@ -1444,6 +1462,15 @@ public actor RtDbClient {
                 sink.deliver(.failed(error))
                 sink.finish()
             }
+        default:
+            preconditionFailure("onQueryUpdate called with a non-query message")
+        }
+    }
+
+    /// Route a `mutateOk`/`mutateErr` frame to its pending call, syncing the
+    /// optimistic-overlay reverse index for both outcomes.
+    private func onMutateReply(_ message: ServerMessage) {
+        switch message {
         case let .mutateOk(mutId, results):
             if let call = mutations.pending.removeValue(forKey: mutId) {
                 call.continuation.yield(.success(results))
@@ -1459,6 +1486,15 @@ public actor RtDbClient {
                 call.continuation.finish()
             }
             revertOverlays(forMutId: mutId)
+        default:
+            preconditionFailure("onMutateReply called with a non-mutate message")
+        }
+    }
+
+    /// Route a `scheduleOk`/`scheduleErr`/`scheduleAck`/`listSchedulesOk`
+    /// frame to its pending call.
+    private func onScheduleReply(_ message: ServerMessage) {
+        switch message {
         case let .scheduleOk(scheduleId, id):
             replySchedule(scheduleId, .success(.id(id)))
         case let .scheduleErr(scheduleId, error):
@@ -1475,6 +1511,15 @@ public actor RtDbClient {
             }
         case let .listSchedulesOk(scheduleId, schedules):
             replySchedule(scheduleId, .success(.list(schedules)))
+        default:
+            preconditionFailure("onScheduleReply called with a non-schedule message")
+        }
+    }
+
+    /// Route a `startWorkflowOk`/`startWorkflowErr`/`workflowAck`/
+    /// `listWorkflowsOk` frame to its pending call.
+    private func onWorkflowReply(_ message: ServerMessage) {
+        switch message {
         case let .startWorkflowOk(workflowId, info):
             replyWorkflow(workflowId, .success(.info(info)))
         case let .startWorkflowErr(workflowId, error):
@@ -1491,8 +1536,14 @@ public actor RtDbClient {
             }
         case let .listWorkflowsOk(workflowId, workflows):
             replyWorkflow(workflowId, .success(.list(workflows)))
-        case .authOk, .authErr, .pong:
-            break // lifecycle-owned — the receive loop never dispatches these
+        default:
+            preconditionFailure("onWorkflowReply called with a non-workflow message")
+        }
+    }
+
+    /// Route a `presenceSnapshot`/`presenceErr` frame to its room's sinks.
+    private func onPresence(_ message: ServerMessage) {
+        switch message {
         case let .presenceSnapshot(room, members):
             // Per-room fan-out (rust PresenceSnapshot arm): anyone holding a
             // handle for this room observes the new member list. A snapshot
@@ -1515,10 +1566,10 @@ public actor RtDbClient {
             for sink in presenceRoom.sinks {
                 sink.deliver(.rejected(error))
             }
+        default:
+            preconditionFailure("onPresence called with a non-presence message")
         }
     }
-
-    // swiftlint:enable cyclomatic_complexity function_body_length
 
     private func replySchedule(_ scheduleId: String, _ result: Result<ScheduleReply, RtDbError>) {
         if let call = schedules.pending.removeValue(forKey: scheduleId) {
