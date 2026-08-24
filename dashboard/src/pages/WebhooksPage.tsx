@@ -1,5 +1,5 @@
 /** Webhook management — register webhooks and inspect the delivery outbox with retry state. */
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   timeLabel,
   WebhookCreateForm,
@@ -10,6 +10,7 @@ import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
 import { toErrorMessage } from "../lib/errors";
 import type { Webhook } from "../lib/types";
+import { useAsync } from "../lib/useAsync";
 import s from "./WebhooksPage.module.css";
 
 /** Group events for the table cell — preserves order, joins with `, `. */
@@ -20,9 +21,6 @@ function eventsLabel(events: string[]): string {
 export function WebhooksPage() {
   const { client, databases } = useAdmin();
   const [db, setDb] = useState<string>("");
-  const [webhooks, setWebhooks] = useState<Webhook[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [listError, setListError] = useState<string | null>(null);
 
   // Per-row action state.
   const [actionError, setActionError] = useState<string | null>(null);
@@ -39,28 +37,24 @@ export function WebhooksPage() {
     if (!db && databases.length > 0) setDb(databases[0]);
   }, [db, databases]);
 
-  const refresh = useCallback(async () => {
-    if (!db) return;
-    setLoading(true);
-    setListError(null);
-    try {
-      setWebhooks(await client.listWebhooks(db));
-    } catch (e) {
-      setListError(toErrorMessage(e));
-      setWebhooks([]);
-    } finally {
-      setLoading(false);
-    }
-  }, [client, db]);
+  const {
+    data: webhooks,
+    loading,
+    error: listError,
+    refresh,
+    setData: setWebhooks,
+  } = useAsync(() => client.listWebhooks(db), [client, db], [] as Webhook[], { enabled: !!db });
 
+  // Switching databases should not show the previous database's webhooks
+  // while the new list loads.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: deps mirror the useAsync fetcher's own dep list, not this effect's body
   useEffect(() => {
     setWebhooks([]);
     setActionError(null);
     setConfirmingDelete(null);
     setEditingId(null);
     setDeliveriesForId(null);
-    if (db) void refresh();
-  }, [db, refresh]);
+  }, [db, setWebhooks]);
 
   function startEdit(wh: Webhook) {
     setEditingId(wh.id);

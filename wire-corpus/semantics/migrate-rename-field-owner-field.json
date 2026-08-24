@@ -1,0 +1,49 @@
+{
+  "name": "migrate-rename-field-owner-field",
+  "$comment": "QA-002: renameField follows `ownerField` when the renamed field is the one it names — the derived schema's `ownerField` now reads `owner`, not the dropped `ownerId`. Runs with an admin token (bypasses per-row auth), so this pins the schema-level rewrite, not the auth predicate itself.",
+  "schema": {
+    "tables": {
+      "notes": {
+        "fields": {
+          "ownerId": { "type": "string" },
+          "body": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_owner", "fields": ["ownerId"] }],
+        "ownerField": "ownerId"
+      }
+    }
+  },
+  "seed": [
+    { "ownerId": "u1", "body": "hi" }
+  ],
+  "op": {
+    "migrate": {
+      "directives": [
+        { "op": "renameField", "table": "notes", "from": "ownerId", "to": "owner" }
+      ],
+      "dryRun": false
+    }
+  },
+  "expect": {
+    "applied": true,
+    "schema": {
+      "tables": {
+        "notes": {
+          "fields": {
+            "owner": { "type": "string" },
+            "body": { "type": "string" }
+          },
+          "indexes": [{ "name": "by_owner", "fields": ["owner"] }],
+          "ownerField": "owner"
+        }
+      }
+    },
+    "directives": [{ "op": "renameField", "affectedRows": 1 }]
+  },
+  "normalize": ["_id", "_creationTime", "_version", "id"],
+  "then": {
+    "query": { "table": "notes" },
+    "expect": [{ "owner": "u1", "body": "hi" }],
+    "unordered": true
+  }
+}

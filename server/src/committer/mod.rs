@@ -58,6 +58,12 @@ const CHANNEL_BUFFER: usize = 64;
 /// than hanging forever on a stuck drain.
 const CHANNEL_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Cap on the idle-reclamation sweep's cadence (`spawn_idle_reclaimer`):
+/// `min(idle_threshold, RECLAIM_INTERVAL)`, so a db is retired within roughly
+/// one sweep of going idle without spamming the channel-map lock on huge
+/// configured thresholds.
+const RECLAIM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub enum CommitterRequest {
     Mutate {
         idempotency_key: Option<String>,
@@ -1017,7 +1023,7 @@ impl Committers {
         let subs = Arc::clone(&self.subs);
         let pool = self.pool.clone();
         let threshold = self.idle_threshold;
-        let sweep_interval = threshold.min(std::time::Duration::from_secs(60));
+        let sweep_interval = threshold.min(RECLAIM_INTERVAL);
         Some(tokio::spawn(async move {
             let mut tick = tokio::time::interval(sweep_interval);
             // Skip the immediate first tick — a db just spawned is fresh.

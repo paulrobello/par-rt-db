@@ -437,13 +437,17 @@ pub async fn finalize_recurring_next(
 pub async fn mark_error(pool: &PgPool, db: &str, id: &str, msg: &str) -> Result<(), RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    sqlx::query(&format!(
+    if let Err(e) = sqlx::query(&format!(
         "UPDATE \"{schema}\".scheduled_txns SET status = 'error', last_error = $2 WHERE id = $1"
     ))
     .bind(id)
     .bind(msg)
     .execute(pool)
-    .await?;
+    .await
+    {
+        tracing::warn!(db = %db, id = %id, error = %e, "scheduled_txns mark_error write failed");
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -460,7 +464,7 @@ pub async fn reschedule_recurring_error(
 ) -> Result<(), RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    sqlx::query(&format!(
+    if let Err(e) = sqlx::query(&format!(
         "UPDATE \"{schema}\".scheduled_txns
          SET status = 'pending', due_at = $2, last_error = $3
          WHERE id = $1"
@@ -469,7 +473,11 @@ pub async fn reschedule_recurring_error(
     .bind(next_due)
     .bind(msg)
     .execute(pool)
-    .await?;
+    .await
+    {
+        tracing::warn!(db = %db, id = %id, error = %e, "scheduled_txns reschedule_recurring_error write failed");
+        return Err(e.into());
+    }
     Ok(())
 }
 

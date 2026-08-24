@@ -212,9 +212,12 @@ pub fn compile_query(
         .join(", ");
 
     if let Some(paginate) = &q.paginate {
-        let (cq, _ctx) = compile_paginate_terminal(
-            w, table_def, paginate, sort_cols, dir, &order_by, db, &q.table,
-        )?;
+        let sort = SortSpec {
+            sort_cols,
+            dir,
+            order_by: &order_by,
+        };
+        let (cq, _ctx) = compile_paginate_terminal(w, table_def, paginate, sort, db, &q.table)?;
         return Ok((cq, warnings));
     }
 
@@ -642,28 +645,35 @@ fn compile_aggregate_terminal(
     // text/number/boolean columns uniformly, exactly like `distinct`. A
     // scalar SUM/AVG/MIN/MAX over zero matching rows yields one row with
     // SQL NULL → `serde_json::Value::Null`; COUNT(*) over zero rows yields 0.
+    let filter = FilterBinds {
+        binds,
+        range_binds,
+        where_conditions,
+        filter_binds,
+    };
     if let Some(group_col) = group_col {
         return compile_aggregate_grouped(
             group_col,
             agg_expr,
-            binds,
-            range_binds,
-            where_conditions,
-            filter_binds,
+            filter,
             limit_placeholder,
             &pg_schema_name,
             &table_ident,
         );
     }
-    compile_aggregate_scalar(
-        agg_expr,
-        binds,
-        range_binds,
-        where_conditions,
-        filter_binds,
-        &pg_schema_name,
-        &table_ident,
-    )
+    compile_aggregate_scalar(agg_expr, filter, &pg_schema_name, &table_ident)
+}
+
+/// The eq/range/filter binds and their WHERE clause, carved out of
+/// `QueryWindow` (dropping `index_def`/`eq_len`, which the aggregate
+/// terminals resolve before compiling). Shared by `compile_aggregate_grouped`
+/// and `compile_aggregate_scalar` so each stays under clippy's
+/// argument-count threshold.
+struct FilterBinds {
+    binds: Vec<EqBind>,
+    range_binds: Vec<EqBind>,
+    where_conditions: Vec<String>,
+    filter_binds: Vec<EqBind>,
 }
 
 /// Grouped aggregate SQL compilation:
@@ -673,18 +683,20 @@ fn compile_aggregate_terminal(
 /// null, not fail the decoder. The key is NOT COALESCEd — jsonb `'null'`
 /// sorts before every other scalar, so COALESCEing it would flip the NULLS
 /// LAST order `ORDER BY k` gives the SQL NULL group.
-#[allow(clippy::too_many_arguments)]
 fn compile_aggregate_grouped(
     group_col: String,
     agg_expr: String,
-    binds: Vec<EqBind>,
-    range_binds: Vec<EqBind>,
-    where_conditions: Vec<String>,
-    filter_binds: Vec<EqBind>,
+    filter: FilterBinds,
     limit_placeholder: usize,
     pg_schema_name: &str,
     table_ident: &str,
 ) -> Result<CompiledQuery, RtDbError> {
+    let FilterBinds {
+        binds,
+        range_binds,
+        where_conditions,
+        filter_binds,
+    } = filter;
     let mut sql = format!(
         "SELECT to_jsonb(\"{group_col}\") AS k, COALESCE(to_jsonb({agg_expr}), 'null'::jsonb) AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
     );
@@ -710,16 +722,18 @@ fn compile_aggregate_grouped(
 /// Scalar (ungrouped) aggregate SQL compilation:
 /// `SELECT COALESCE(to_jsonb(OP(agg_col)), 'null'::jsonb) …`.
 /// Verbatim lift of the former scalar branch's SQL builder.
-#[allow(clippy::too_many_arguments)]
 fn compile_aggregate_scalar(
     agg_expr: String,
-    binds: Vec<EqBind>,
-    range_binds: Vec<EqBind>,
-    where_conditions: Vec<String>,
-    filter_binds: Vec<EqBind>,
+    filter: FilterBinds,
     pg_schema_name: &str,
     table_ident: &str,
 ) -> Result<CompiledQuery, RtDbError> {
+    let FilterBinds {
+        binds,
+        range_binds,
+        where_conditions,
+        filter_binds,
+    } = filter;
     let mut sql = format!(
         "SELECT COALESCE(to_jsonb({agg_expr}), 'null'::jsonb) AS v FROM \"{pg_schema_name}\".\"{table_ident}\""
     );
@@ -795,26 +809,38 @@ pub(crate) async fn execute_aggregate_terminal(
     }
 }
 
+/// The sort spec for a paginated scan, computed once by the caller from the
+/// query window's index fields: `sort_cols` (the unbound index fields +
+/// `created_at` + `id`), `dir` (`ASC`/`DESC`), and `order_by` (the joined
+/// `"col" DIR, …` clause). Bundled so `compile_paginate_terminal` stays under
+/// clippy's argument-count threshold.
+struct SortSpec<'a> {
+    sort_cols: Vec<String>,
+    dir: &'a str,
+    order_by: &'a str,
+}
+
 /// Paginate terminal SQL compilation: keyset-paginated scan over the compiled
-/// window's WHERE clause, using `sort_cols` (the unbound index fields +
-/// `created_at` + `id`) and `dir`/`order_by` computed by the caller. Fetches
-/// one extra row to detect a next page; the cursor encodes the last row's
-/// sort-column values. Compile half of the former inline
-/// `if let Some(paginate) = &q.paginate { … }` block — SQL and bind-order
-/// byte-for-byte identical to the pre-refactor cascade. The `index_def` +
-/// `eq_len` are returned alongside the [`CompiledQuery`] so the executor can
-/// build the next-page cursor from the last row's projected fields.
-#[allow(clippy::too_many_arguments)]
+/// window's WHERE clause, using `sort` (see [`SortSpec`]). Fetches one extra
+/// row to detect a next page; the cursor encodes the last row's sort-column
+/// values. Compile half of the former inline `if let Some(paginate) =
+/// &q.paginate { … }` block — SQL and bind-order byte-for-byte identical to
+/// the pre-refactor cascade. The `index_def` + `eq_len` are returned alongside
+/// the [`CompiledQuery`] so the executor can build the next-page cursor from
+/// the last row's projected fields.
 fn compile_paginate_terminal<'a>(
     w: QueryWindow<'a>,
     table_def: &TableDef,
     paginate: &Paginate,
-    sort_cols: Vec<String>,
-    dir: &str,
-    order_by: &str,
+    sort: SortSpec<'_>,
     db: &str,
     table: &str,
 ) -> Result<(CompiledQuery, PaginateExecCtx<'a>), RtDbError> {
+    let SortSpec {
+        sort_cols,
+        dir,
+        order_by,
+    } = sort;
     let QueryWindow {
         index_def,
         binds,

@@ -1,0 +1,46 @@
+{
+  "name": "migrate-rename-field-index",
+  "$comment": "QA-002: renameField rewrites an index's field list — the derived schema's `by_status` index now names `state`, not the dropped `status`, and a query ordered by the renamed index still returns the seeded row (the physical column follows the rename in ddl.rs; this pins the schema-level index rewrite in migrate.rs's rename_field_refs).",
+  "schema": {
+    "tables": {
+      "tickets": {
+        "fields": {
+          "title": { "type": "string" },
+          "status": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_status", "fields": ["status"] }]
+      }
+    }
+  },
+  "seed": [
+    { "title": "a", "status": "open" }
+  ],
+  "op": {
+    "migrate": {
+      "directives": [
+        { "op": "renameField", "table": "tickets", "from": "status", "to": "state" }
+      ],
+      "dryRun": false
+    }
+  },
+  "expect": {
+    "applied": true,
+    "schema": {
+      "tables": {
+        "tickets": {
+          "fields": {
+            "title": { "type": "string" },
+            "state": { "type": "string" }
+          },
+          "indexes": [{ "name": "by_status", "fields": ["state"] }]
+        }
+      }
+    },
+    "directives": [{ "op": "renameField", "affectedRows": 1 }]
+  },
+  "normalize": ["_id", "_creationTime", "_version", "id"],
+  "then": {
+    "query": { "table": "tickets", "index": "by_status", "order": "asc" },
+    "expect": [{ "title": "a", "state": "open" }]
+  }
+}

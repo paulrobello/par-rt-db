@@ -7,9 +7,8 @@ use async_trait::async_trait;
 
 use crate::AppState;
 use crate::auth::provider::OAuthProvider;
-use crate::auth::session;
+use crate::auth::{self, ConflictStyle, ProviderIdentity, session};
 use crate::config::Config;
-use crate::db::{new_id, now_ms};
 use crate::error::RtDbError;
 
 /// GitLab OAuth provider using the standard authorization-code flow:
@@ -68,14 +67,16 @@ impl OAuthProvider for GitlabProvider {
         let userinfo_url = format!("{}/api/v4/user", self.base_url);
 
         let user = crate::auth::provider::oidc_exchange_and_fetch_userinfo(
-            &http,
-            Self::name(),
-            &token_url,
-            &userinfo_url,
-            &self.client_id,
-            &self.client_secret,
-            code,
-            &redirect_uri,
+            crate::auth::provider::OidcExchange {
+                http: &http,
+                slug: Self::name(),
+                token_url: &token_url,
+                userinfo_url: &userinfo_url,
+                client_id: &self.client_id,
+                client_secret: &self.client_secret,
+                code,
+                redirect_uri: &redirect_uri,
+            },
         )
         .await?;
 
@@ -87,20 +88,19 @@ impl OAuthProvider for GitlabProvider {
         // existing row if the same person previously signed in with GitHub or
         // Google (matching on email). There is no `gitlab_id` column — GitLab's
         // numeric id is not persisted, which avoids a schema change and keeps
-        // identity aligned with the email-based authorization model.
-        let id = new_id();
-        let now = now_ms();
-        let (user_id,): (String,) = sqlx::query_as(
-            "INSERT INTO rtdb_auth.users (id, login, email, created_at) \
-             VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (email) DO UPDATE SET login = EXCLUDED.login \
-             RETURNING id",
+        // identity aligned with the email-based authorization model. QA-004:
+        // resolved through the shared `auth::resolve_user` email-keyed path.
+        let user_id = auth::resolve_user(
+            &state.pool,
+            ProviderIdentity {
+                provider_id_column: auth::PROVIDER_COL_EMAIL,
+                provider_id: &email,
+                login: &identity.login,
+                email: &email,
+                allow_email_link: true,
+                conflict_style: ConflictStyle::Conflict,
+            },
         )
-        .bind(&id)
-        .bind(&identity.login)
-        .bind(&email)
-        .bind(now)
-        .fetch_one(&state.pool)
         .await?;
 
         session::create_session(
@@ -301,5 +301,70 @@ mod tests {
         assert!(GitlabProvider::from_config(&cfg).is_none());
         cfg.oauth.gitlab.client_secret = Some("secret".into());
         assert!(GitlabProvider::from_config(&cfg).is_some());
+    }
+
+    // --- QA-004: returning user via the shared email-keyed resolver --------
+
+    async fn users_pool() -> sqlx::PgPool {
+        let url = std::env::var("RTDB_TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://rtdb:rtdb@127.0.0.1:55434/rtdb".into());
+        let pool = sqlx::PgPool::connect(&url)
+            .await
+            .expect("connect to dev postgres");
+        crate::db::bootstrap(&pool)
+            .await
+            .expect("bootstrap rtdb_auth");
+        pool
+    }
+
+    /// GitLab has no persisted per-provider id, so its durable key IS the
+    /// email: a returning login with the same email (but a changed display
+    /// `login`) reuses the row instead of forking a new one.
+    #[tokio::test]
+    async fn returning_user_with_the_same_email_reuses_the_row() {
+        let pool = users_pool().await;
+        let email = format!(
+            "{}@gitlab-resolve-test.example",
+            uuid::Uuid::now_v7().simple()
+        );
+
+        let first_id = auth::resolve_user(
+            &pool,
+            ProviderIdentity {
+                provider_id_column: auth::PROVIDER_COL_EMAIL,
+                provider_id: &email,
+                login: "Bob",
+                email: &email,
+                allow_email_link: true,
+                conflict_style: ConflictStyle::Conflict,
+            },
+        )
+        .await
+        .expect("initial insert");
+
+        let second_id = auth::resolve_user(
+            &pool,
+            ProviderIdentity {
+                provider_id_column: auth::PROVIDER_COL_EMAIL,
+                provider_id: &email,
+                login: "Bob Renamed",
+                email: &email,
+                allow_email_link: true,
+                conflict_style: ConflictStyle::Conflict,
+            },
+        )
+        .await
+        .expect("returning-user resolve");
+
+        assert_eq!(second_id, first_id, "same email reuses the row");
+        let (login,): (String,) = sqlx::query_as("SELECT login FROM rtdb_auth.users WHERE id = $1")
+            .bind(&first_id)
+            .fetch_one(&pool)
+            .await
+            .expect("user row exists");
+        assert_eq!(
+            login, "Bob Renamed",
+            "login follows the provider-side change"
+        );
     }
 }

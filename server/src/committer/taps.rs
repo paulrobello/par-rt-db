@@ -114,7 +114,9 @@ pub(in crate::committer) async fn publish_taps(
         let pool = ctx.pool.clone();
         let db = ctx.db.clone();
         tokio::spawn(async move {
-            let _ = quotas.refresh(&pool, &db).await;
+            if let Err(e) = quotas.refresh(&pool, &db).await {
+                tracing::warn!(db = %db, error = %e, "quota cache refresh failed");
+            }
         });
     }
 }

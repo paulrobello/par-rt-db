@@ -16,11 +16,10 @@
  * `subscribe` (reactive `queryUpdate`s) — so a test can swap it in behind a
  * shared interface.
  *
- * Parity is deliberately scoped to the documented core (schema push, insert /
- * patch / replace / delete / expectVersion / expectAbsent / upsert, point reads,
- * index eq + range queries with order/take/unique/first/count, and reactive
- * subscriptions). Gaps are marked with `TODO` and throw a clear `INTERNAL`
- * error rather than silently misbehaving.
+ * Parity is not aspirational: this engine executes every case in
+ * `wire-corpus/semantics/` as one of the corpus runners, alongside the server
+ * and the Rust, Python, and Swift engines, so a behavior difference fails the
+ * corpus test rather than surfacing later as a silent divergence.
  */
 
 import type {
@@ -32,6 +31,7 @@ import type {
   SubscriptionInfo,
   SubscriptionsResponse,
 } from "../admin.js";
+import { canonical } from "../canonical.js";
 import { RtDbError } from "../errors.js";
 import type { FileMetadata, UploadInput, UploadResult } from "../http.js";
 import { parseStepResults, type StepResult } from "../mutation.js";
@@ -540,20 +540,6 @@ interface CascadeCtx {
   visited: Set<string>;
   rows: number;
   touched: Set<string>;
-}
-
-/** Canonical string form for change detection, independent of key order. */
-function canonical(value: unknown): string {
-  return JSON.stringify(value, (_k, v) => {
-    if (v && typeof v === "object" && !Array.isArray(v)) {
-      const sorted: Record<string, unknown> = {};
-      for (const key of Object.keys(v as Record<string, unknown>).sort()) {
-        sorted[key] = (v as Record<string, unknown>)[key];
-      }
-      return sorted;
-    }
-    return v;
-  });
 }
 
 /** The canonical a subscription diffs against for push decisions (a port of

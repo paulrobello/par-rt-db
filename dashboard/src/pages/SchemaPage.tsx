@@ -1,12 +1,13 @@
 /** Schema viewer and push-schema editor with an additive-only diff preview before apply. */
 import type { SchemaJson } from "@par-rt-db/client";
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { Button, Placard, Spinner } from "../components/ui";
 import { RtDbRequestError, useAdmin } from "../lib/admin";
 import { toErrorMessage } from "../lib/errors";
 import { formatFieldType } from "../lib/format";
 import type { SchemaDiff } from "../lib/types";
+import { useAsync } from "../lib/useAsync";
 import s from "./SchemaPage.module.css";
 
 type Mode = "view" | "push";
@@ -29,36 +30,16 @@ export function SchemaPage() {
   const { db = "" } = useParams();
   const { client } = useAdmin();
   const [mode, setMode] = useState<Mode>("view");
-  const [schema, setSchema] = useState<SchemaJson | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const {
+    data: schema,
+    loading,
+    error,
+    refresh,
+  } = useAsync<SchemaJson | null>(() => client.getSchema(db), [client, db], null);
 
   const [text, setText] = useState(EXAMPLE_SCHEMA);
   const [preview, setPreview] = useState<Preview>(null);
   const [busy, setBusy] = useState(false);
-
-  const refresh = useCallback(() => {
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
-    setSchema(null);
-    client
-      .getSchema(db)
-      .then((sc) => {
-        if (!cancelled) setSchema(sc);
-      })
-      .catch((e) => {
-        if (!cancelled) setError(toErrorMessage(e));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [client, db]);
-
-  useEffect(() => refresh(), [refresh]);
 
   const tables = schema ? Object.entries(schema.tables).sort(([a], [b]) => a.localeCompare(b)) : [];
 
@@ -119,7 +100,7 @@ export function SchemaPage() {
       // Applied — refresh the view and switch to it so the operator sees the result.
       setPreview(null);
       setMode("view");
-      refresh();
+      void refresh();
     } catch (e) {
       if (e instanceof RtDbRequestError) {
         setPreview({

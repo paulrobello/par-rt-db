@@ -203,6 +203,20 @@ pub async fn insert(pool: &PgPool, db: &str, spec: &WorkflowSpec) -> Result<Stri
     insert_on(&mut conn, db, spec, gate).await
 }
 
+// Column order matches the RETURNING list in `claim_due`.
+type ClaimRow = (
+    String,
+    String,
+    serde_json::Value,
+    i32,
+    i32,
+    i64,
+    serde_json::Value,
+    Option<String>,
+    Option<i64>,
+    Option<serde_json::Value>,
+);
+
 /// Atomically claims up to `batch` due rows: `pending`/`waiting` rows whose
 /// `sleep_until <= now` → `running` (a claimed `waiting` row = the wait timed
 /// out — a delivery flips the row to `pending` before it can be due).
@@ -216,19 +230,6 @@ pub async fn claim_due(
 ) -> Result<Vec<WorkflowRow>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    #[allow(clippy::type_complexity)]
-    type ClaimRow = (
-        String,
-        String,
-        serde_json::Value,
-        i32,
-        i32,
-        i64,
-        serde_json::Value,
-        Option<String>,
-        Option<i64>,
-        Option<serde_json::Value>,
-    );
     let rows: Vec<ClaimRow> = sqlx::query_as(&format!(
         "UPDATE \"{schema}\".workflows
              SET status = 'running', started_at = COALESCE(started_at, $2), updated_at = $2
@@ -585,7 +586,7 @@ pub async fn mark_failed(
     let schema = pg_schema(db);
     let outcome_json =
         serde_json::to_value(outcome).map_err(|_| RtDbError::internal("serialize outcome"))?;
-    sqlx::query(&format!(
+    if let Err(e) = sqlx::query(&format!(
         "UPDATE \"{schema}\".workflows
          SET status = 'failed', last_error = $2, attempts = $5,
              step_outcomes = step_outcomes || $3::jsonb, finished_at = $4, updated_at = $4,
@@ -598,7 +599,11 @@ pub async fn mark_failed(
     .bind(now_ms())
     .bind(outcome.attempts as i32)
     .execute(pool)
-    .await?;
+    .await
+    {
+        tracing::warn!(db = %db, id = %id, error = %e, "workflows mark_failed write failed");
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -685,7 +690,6 @@ type InfoRow = (
     Option<i64>,    // finished_at
 );
 
-#[allow(clippy::type_complexity)]
 fn info_from_row(row: InfoRow) -> Result<WorkflowInfo, RtDbError> {
     let (
         id,
@@ -748,29 +752,31 @@ pub async fn list(
     rows.into_iter().map(info_from_row).collect()
 }
 
+// Column order matches the SELECT list in `get`: `InfoRow`'s columns plus
+// the trailing `step_outcomes`.
+type FullRow = (
+    String,
+    String,
+    String,
+    i32,
+    i32,
+    i32,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    i64,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    serde_json::Value,
+);
+
 /// Full row for `GET .../{id}` — the same columns as [`list`] plus the
 /// outcome trail.
 pub async fn get(pool: &PgPool, db: &str, id: &str) -> Result<Option<WorkflowInfoFull>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    #[allow(clippy::type_complexity)]
-    type FullRow = (
-        String,
-        String,
-        String,
-        i32,
-        i32,
-        i32,
-        Option<i64>,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        i64,
-        i64,
-        Option<i64>,
-        Option<i64>,
-        serde_json::Value,
-    );
     let row: Option<FullRow> = sqlx::query_as(&format!(
         "SELECT id, name, status, current_step, jsonb_array_length(spec->'steps'), attempts,
                 sleep_until, last_error, wait_name, waited_since,

@@ -44,6 +44,7 @@ from typing import IO, TYPE_CHECKING, Any, Literal
 
 from pydantic import TypeAdapter
 
+from ._http_common import build_transform_url
 from .admin import (
     _op_admin_mutate,
     _op_admin_query,
@@ -551,20 +552,7 @@ class RtDbHttpClient:
         ``w, h, fit, q, format``; unset params (and ``format="auto"``, the
         server default) are omitted.
         """
-        parts: list[str] = []
-        if w is not None:
-            parts.append(f"w={w}")
-        if h is not None:
-            parts.append(f"h={h}")
-        if fit is not None:
-            parts.append(f"fit={fit}")
-        if q is not None:
-            parts.append(f"q={q}")
-        # "auto" is the server default — omit so the URL stays minimal (rust parity).
-        if format is not None and format != "auto":
-            parts.append(f"format={format}")
-        base = f"{self._base}/storage/{id}"
-        return f"{base}?{'&'.join(parts)}" if parts else base
+        return build_transform_url(self._base, id, w=w, h=h, fit=fit, q=q, format=format)
 
     # --- admin control plane (admin key as the token) ---
     #

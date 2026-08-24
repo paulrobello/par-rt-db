@@ -13,7 +13,7 @@
 //! a short beat timeout, proving the "killing A evicts A's members within the
 //! beat timeout" contract without waiting out a real 15s timeout.
 
-use crate::common::{spawn_app, test_config, test_hot};
+use crate::common::{spawn_app, test_config, test_hot, wait_until};
 use rtdb_server::AppState;
 use rtdb_server::presence::{PresenceConfig, PresenceManager};
 use rtdb_server::protocol::{AuthedUser, PresenceMember, ServerMessage, UserKind};
@@ -69,7 +69,8 @@ async fn cross_replica_presence_union_includes_namespaced_peer_member() -> anyho
     // 1. A LOCAL subscriber on replica B conn 1 in "room-x". This is the
     //    client whose receipt of the union broadcast we assert against. The
     //    `rx` is what receives `PresenceSnapshot` when B flushes.
-    let (tx_b, mut rx_b) = mpsc::unbounded_channel::<ServerMessage>();
+    let (tx_b, rx_b) = mpsc::unbounded_channel::<ServerMessage>();
+    let rx_b = std::cell::RefCell::new(rx_b);
     state_b
         .realtime
         .presence
@@ -78,7 +79,7 @@ async fn cross_replica_presence_union_includes_namespaced_peer_member() -> anyho
         .expect("B local join");
     // Drain the initial local-only snapshot from B's join so the next recv
     // is unambiguously the union after A's gossip arrives.
-    let _ = rx_b.try_recv();
+    let _ = rx_b.borrow_mut().try_recv();
 
     // 2. Join on replica A conn 1 in the SAME room. A's join calls
     //    gossip_publish -> pg_notify('rtdb_presence', …). B's presence LISTEN
@@ -102,41 +103,43 @@ async fn cross_replica_presence_union_includes_namespaced_peer_member() -> anyho
     // 3. Poll: drive B's flush_once until the union broadcast arrives AND
     //    contains the namespaced peer member. NOTIFY delivery is async; bound
     //    the wait at ~5s with 50ms sleeps (matching the broadcast interval).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let mut got_peer = false;
-    while std::time::Instant::now() < deadline {
+    let found: std::cell::RefCell<Option<Vec<PresenceMember>>> = std::cell::RefCell::new(None);
+    let got_peer = wait_until(std::time::Duration::from_secs(5), || async {
         state_b.realtime.presence.flush_once().await;
-        if let Ok(ServerMessage::PresenceSnapshot { members, .. }) = rx_b.try_recv()
+        if let Ok(ServerMessage::PresenceSnapshot { members, .. }) = rx_b.borrow_mut().try_recv()
             && members.iter().any(|m| m.connection_id == "replica-a:1")
         {
-            // Assert the union shape: local member "1" (B's own, plain
-            // conn id) AND the namespaced peer member "replica-a:1".
-            let local = members.iter().find(|m| m.connection_id == "1");
-            let peer = members.iter().find(|m| m.connection_id == "replica-a:1");
-            assert!(
-                local.is_some(),
-                "union must contain B's own local member with plain conn id"
-            );
-            let peer = peer.expect("checked above");
-            assert_eq!(
-                peer.user.email.as_deref(),
-                Some("peer@a.example"),
-                "peer member carries A's user"
-            );
-            assert_eq!(
-                peer.state,
-                json!({"role": "caller"}),
-                "peer member carries A's state"
-            );
-            got_peer = true;
-            break;
+            *found.borrow_mut() = Some(members);
+            true
+        } else {
+            false
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    })
+    .await;
     assert!(
         got_peer,
         "replica B never observed A's join in its union broadcast within the \
          deadline — the rtdb_presence LISTEN path or gossip_publish is broken"
+    );
+    let members = found.borrow_mut().take().expect("checked above");
+    // Assert the union shape: local member "1" (B's own, plain conn id) AND
+    // the namespaced peer member "replica-a:1".
+    let local = members.iter().find(|m| m.connection_id == "1");
+    let peer = members.iter().find(|m| m.connection_id == "replica-a:1");
+    assert!(
+        local.is_some(),
+        "union must contain B's own local member with plain conn id"
+    );
+    let peer = peer.expect("checked above");
+    assert_eq!(
+        peer.user.email.as_deref(),
+        Some("peer@a.example"),
+        "peer member carries A's user"
+    );
+    assert_eq!(
+        peer.state,
+        json!({"role": "caller"}),
+        "peer member carries A's state"
     );
 
     Ok(())
@@ -174,12 +177,13 @@ async fn expire_peers_evicts_dead_replica_members_from_union() -> anyhow::Result
 
     // 1. Local member conn 1 on "self" in "room-y". This is the subscriber
     //    whose received snapshot we assert against.
-    let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let (tx, rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let rx = std::cell::RefCell::new(rx);
     mgr.join("db-y", 1, "room-y", None, user("me@self.example"), tx)
         .await
         .expect("local join");
     // Drain the initial local-only snapshot.
-    let _ = rx.try_recv();
+    let _ = rx.borrow_mut().try_recv();
 
     // 2. Ingest a peer snapshot from "replica-dead" — simulates receiving a
     //    pg_notify from a peer that is about to die. This refreshes last_beat
@@ -195,7 +199,10 @@ async fn expire_peers_evicts_dead_replica_members_from_union() -> anyhow::Result
     // 3. Flush. The union broadcast must include BOTH the local member AND
     //    the namespaced peer member "replica-dead:42".
     mgr.flush_once().await;
-    let snap = rx.try_recv().expect("union snapshot after peer ingest");
+    let snap = rx
+        .borrow_mut()
+        .try_recv()
+        .expect("union snapshot after peer ingest");
     let ServerMessage::PresenceSnapshot { members, .. } = snap else {
         panic!("expected PresenceSnapshot, got {snap:?}")
     };
@@ -230,19 +237,19 @@ async fn expire_peers_evicts_dead_replica_members_from_union() -> anyhow::Result
     // local member, which re-marks dirty without changing membership.
     // Simpler: directly assert via flush loop by joining a second local member
     // to force a fresh dirty+flush cycle.
-    let (tx2, mut rx2) = mpsc::unbounded_channel::<ServerMessage>();
+    let (tx2, rx2) = mpsc::unbounded_channel::<ServerMessage>();
+    let rx2 = std::cell::RefCell::new(rx2);
     mgr.join("db-y", 2, "room-y", None, user("other@self.example"), tx2)
         .await
         .expect("second local join triggers fresh flush");
     // Drain potentially several snapshots until we see one without the peer.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    let mut confirmed_peer_gone = false;
-    while std::time::Instant::now() < deadline {
+    let confirmed_peer_gone = wait_until(std::time::Duration::from_secs(2), || async {
         mgr.flush_once().await;
-        while let Ok(ServerMessage::PresenceSnapshot { members, .. }) = rx.try_recv() {
+        let mut confirmed = false;
+        while let Ok(ServerMessage::PresenceSnapshot { members, .. }) = rx.borrow_mut().try_recv() {
             let has_peer = members.iter().any(|m| m.connection_id == "replica-dead:42");
             if !has_peer {
-                confirmed_peer_gone = true;
+                confirmed = true;
                 // Local members must still be present.
                 assert!(
                     members.iter().any(|m| m.connection_id == "1"),
@@ -250,17 +257,16 @@ async fn expire_peers_evicts_dead_replica_members_from_union() -> anyhow::Result
                 );
             }
         }
-        while let Ok(ServerMessage::PresenceSnapshot { members, .. }) = rx2.try_recv() {
+        while let Ok(ServerMessage::PresenceSnapshot { members, .. }) = rx2.borrow_mut().try_recv()
+        {
             let has_peer = members.iter().any(|m| m.connection_id == "replica-dead:42");
             if !has_peer {
-                confirmed_peer_gone = true;
+                confirmed = true;
             }
         }
-        if confirmed_peer_gone {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+        confirmed
+    })
+    .await;
     assert!(
         confirmed_peer_gone,
         "peer member was not evicted from the union within the deadline — \

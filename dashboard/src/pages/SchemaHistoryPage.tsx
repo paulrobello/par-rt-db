@@ -1,48 +1,29 @@
 /** Schema history — browse past pushed schemas and diff them against the current one. */
 import type { SchemaHistoryEntrySummary } from "@par-rt-db/client";
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { SchemaHistoryList, SchemaVersionDetail } from "../components/schema-history";
 import { Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
-import { toErrorMessage } from "../lib/errors";
+import { useAsync } from "../lib/useAsync";
 import s from "./SchemaHistoryPage.module.css";
 
 export function SchemaHistoryPage() {
   const { db = "" } = useParams();
   const { client } = useAdmin();
 
-  const [history, setHistory] = useState<SchemaHistoryEntrySummary[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [listError, setListError] = useState<string | null>(null);
+  const {
+    data: history,
+    loading,
+    error: listError,
+    refresh,
+  } = useAsync(() => client.getSchemaHistory(db), [client, db], [] as SchemaHistoryEntrySummary[]);
 
   const [selected, setSelected] = useState<number | null>(null);
   // Bumped on every selection (including re-selecting the same version) so the
   // detail panel remounts and its confirm/restore state resets — the behavior
   // the pre-extraction page implemented by resetting that state inline.
   const [selectionEpoch, setSelectionEpoch] = useState(0);
-
-  const refresh = useCallback(() => {
-    let cancelled = false;
-    setLoading(true);
-    setListError(null);
-    client
-      .getSchemaHistory(db)
-      .then((entries) => {
-        if (!cancelled) setHistory(entries);
-      })
-      .catch((e) => {
-        if (!cancelled) setListError(toErrorMessage(e));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [client, db]);
-
-  useEffect(() => refresh(), [refresh]);
 
   function selectVersion(v: number) {
     setSelected(v);

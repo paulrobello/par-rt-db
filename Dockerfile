@@ -38,13 +38,14 @@ COPY core/src core/src
 # [[test]] targets against the paths named here and fails on a missing stub.
 # (The server's own [[test]] needs no stub: cargo skips test-target validation
 # for the member it is building — measured, see the script's header.)
-RUN mkdir -p server/src rust-client/src rust-client/tests cli/src \
+RUN mkdir -p server/src rust-client/src rust-client/tests cli/src cli/tests \
     && echo 'fn main() {}' > server/src/main.rs \
     && echo '' > rust-client/src/lib.rs \
     && echo 'fn main() {}' > cli/src/main.rs \
     && touch rust-client/tests/golden_vector.rs rust-client/tests/query_combinations.rs \
               rust-client/tests/semantics_corpus.rs rust-client/tests/hot_config_test.rs \
               rust-client/tests/ws_integration.rs rust-client/tests/http_integration.rs \
+    && touch cli/tests/live.rs \
     && cargo build --release --locked --manifest-path server/Cargo.toml --bin rtdb-server \
     && rm -rf server/src
 # Bake the live git sha into /healthz. The build context has no .git (rsync

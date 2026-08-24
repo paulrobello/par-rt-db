@@ -938,59 +938,95 @@ export class RtDbClient {
         this.setAuthState("unauthenticated");
         this.socket?.close(4401, "authErr");
         break;
-      case "queryUpdate": {
-        const sub = this.subsById.get(msg.queryId);
-        if (sub) {
-          // Authoritative value: it wins over any optimistic overlay.
-          sub.serverLast = msg.result;
-          sub.optimistic = false;
-          this.pushValue(sub, msg.result);
-        }
+      case "queryUpdate":
+      case "subscribeErr":
+        this.onQueryUpdate(msg);
         break;
-      }
-      case "subscribeErr": {
-        // A malformed query (e.g. unknown index) can never succeed. Remove it
-        // from BOTH maps so it is neither resent on reconnect nor left routing
-        // updates; listeners stay `undefined`.
-        const sub = this.subsById.get(msg.queryId);
-        if (sub) {
-          this.subsById.delete(sub.queryId);
-          this.subsByKey.delete(sub.key);
-        }
+      case "mutateOk":
+      case "mutateErr":
+        this.onMutateReply(msg);
         break;
-      }
-      case "mutateOk": {
-        const pending = this.pendingMutates.get(msg.mutId);
-        this.pendingMutates.delete(msg.mutId);
-        // Succeeded: a queryUpdate will reconcile the overlay, so just drop the
-        // tracking — do not revert.
-        this.optimisticOverlays.delete(msg.mutId);
-        pending?.resolve(parseStepResults(msg.results));
+      case "scheduleOk":
+      case "scheduleErr":
+      case "scheduleAck":
+      case "listSchedulesOk":
+        this.onScheduleReply(msg);
         break;
-      }
-      case "mutateErr": {
-        const pending = this.pendingMutates.get(msg.mutId);
-        this.pendingMutates.delete(msg.mutId);
-        // Failed: the server never applied it, so roll the overlay back.
-        this.revertOptimistic(msg.mutId);
-        pending?.reject(RtDbError.fromEnvelope(msg.error));
+      case "startWorkflowOk":
+      case "startWorkflowErr":
+      case "workflowAck":
+      case "listWorkflowsOk":
+        this.onWorkflowReply(msg);
         break;
+      case "presenceSnapshot":
+      case "presenceErr":
+        this.onPresence(msg);
+        break;
+      case "pong":
+        this.lastPongAt = this.now();
+        break;
+    }
+  }
+
+  /** Route a `queryUpdate`/`subscribeErr` frame to its subscription's listeners. */
+  private onQueryUpdate(
+    msg: Extract<ServerMessage, { type: "queryUpdate" | "subscribeErr" }>,
+  ): void {
+    if (msg.type === "queryUpdate") {
+      const sub = this.subsById.get(msg.queryId);
+      if (sub) {
+        // Authoritative value: it wins over any optimistic overlay.
+        sub.serverLast = msg.result;
+        sub.optimistic = false;
+        this.pushValue(sub, msg.result);
       }
-      case "scheduleOk": {
-        const pending = this.pendingSchedules.get(msg.scheduleId);
-        this.pendingSchedules.delete(msg.scheduleId);
+      return;
+    }
+    // A malformed query (e.g. unknown index) can never succeed. Remove it
+    // from BOTH maps so it is neither resent on reconnect nor left routing
+    // updates; listeners stay `undefined`.
+    const sub = this.subsById.get(msg.queryId);
+    if (sub) {
+      this.subsById.delete(sub.queryId);
+      this.subsByKey.delete(sub.key);
+    }
+  }
+
+  /** Route a `mutateOk`/`mutateErr` frame to its pending caller, syncing the
+   * optimistic-overlay tracking for both outcomes. */
+  private onMutateReply(msg: Extract<ServerMessage, { type: "mutateOk" | "mutateErr" }>): void {
+    const pending = this.pendingMutates.get(msg.mutId);
+    this.pendingMutates.delete(msg.mutId);
+    if (msg.type === "mutateOk") {
+      // Succeeded: a queryUpdate will reconcile the overlay, so just drop the
+      // tracking — do not revert.
+      this.optimisticOverlays.delete(msg.mutId);
+      pending?.resolve(parseStepResults(msg.results));
+      return;
+    }
+    // Failed: the server never applied it, so roll the overlay back.
+    this.revertOptimistic(msg.mutId);
+    pending?.reject(RtDbError.fromEnvelope(msg.error));
+  }
+
+  /** Route a `scheduleOk`/`scheduleErr`/`scheduleAck`/`listSchedulesOk` frame
+   * to its pending caller. */
+  private onScheduleReply(
+    msg: Extract<
+      ServerMessage,
+      { type: "scheduleOk" | "scheduleErr" | "scheduleAck" | "listSchedulesOk" }
+    >,
+  ): void {
+    const pending = this.pendingSchedules.get(msg.scheduleId);
+    this.pendingSchedules.delete(msg.scheduleId);
+    switch (msg.type) {
+      case "scheduleOk":
         pending?.resolve({ id: msg.id });
         break;
-      }
-      case "scheduleErr": {
-        const pending = this.pendingSchedules.get(msg.scheduleId);
-        this.pendingSchedules.delete(msg.scheduleId);
+      case "scheduleErr":
         pending?.reject(RtDbError.fromEnvelope(msg.error));
         break;
-      }
-      case "scheduleAck": {
-        const pending = this.pendingSchedules.get(msg.scheduleId);
-        this.pendingSchedules.delete(msg.scheduleId);
+      case "scheduleAck":
         if (msg.ok) {
           pending?.resolve(true);
         } else if (msg.error) {
@@ -1000,31 +1036,33 @@ export class RtDbClient {
           pending?.resolve(false);
         }
         break;
-      }
-      case "listSchedulesOk": {
-        const pending = this.pendingSchedules.get(msg.scheduleId);
-        this.pendingSchedules.delete(msg.scheduleId);
+      case "listSchedulesOk":
         pending?.resolve(msg.schedules);
         break;
-      }
-      case "startWorkflowOk": {
-        const pending = this.pendingWorkflows.get(msg.workflowId);
-        this.pendingWorkflows.delete(msg.workflowId);
+    }
+  }
+
+  /** Route a `startWorkflowOk`/`startWorkflowErr`/`workflowAck`/
+   * `listWorkflowsOk` frame to its pending caller. */
+  private onWorkflowReply(
+    msg: Extract<
+      ServerMessage,
+      { type: "startWorkflowOk" | "startWorkflowErr" | "workflowAck" | "listWorkflowsOk" }
+    >,
+  ): void {
+    const pending = this.pendingWorkflows.get(msg.workflowId);
+    this.pendingWorkflows.delete(msg.workflowId);
+    switch (msg.type) {
+      case "startWorkflowOk":
         pending?.resolve(msg.info);
         break;
-      }
-      case "startWorkflowErr": {
+      case "startWorkflowErr":
         // Also carries ListWorkflows failures: the server types both replies
         // with this frame (no listWorkflowsErr exists), so a pending list
         // entry under the same correlation id rejects here too.
-        const pending = this.pendingWorkflows.get(msg.workflowId);
-        this.pendingWorkflows.delete(msg.workflowId);
         pending?.reject(RtDbError.fromEnvelope(msg.error));
         break;
-      }
-      case "workflowAck": {
-        const pending = this.pendingWorkflows.get(msg.workflowId);
-        this.pendingWorkflows.delete(msg.workflowId);
+      case "workflowAck":
         if (msg.ok) {
           pending?.resolve(true);
         } else if (msg.error) {
@@ -1034,35 +1072,31 @@ export class RtDbClient {
           pending?.resolve(false);
         }
         break;
-      }
-      case "listWorkflowsOk": {
-        const pending = this.pendingWorkflows.get(msg.workflowId);
-        this.pendingWorkflows.delete(msg.workflowId);
+      case "listWorkflowsOk":
         pending?.resolve(msg.workflows);
         break;
-      }
-      case "presenceSnapshot": {
-        // Per-room fan-out, mirroring how `queryUpdate` routes to per-`queryId`
-        // handlers via `subsById`.
-        const set = this.presenceListeners.get(msg.room);
-        if (set) {
-          for (const fn of set) {
-            fn(msg.members);
-          }
-        }
-        break;
-      }
-      case "presenceErr": {
-        // The server rejected the join (e.g. presence not enabled). Drop local
-        // listeners so a stale room doesn't keep accumulating snapshots the
-        // caller can no longer act on.
-        this.presenceListeners.delete(msg.room);
-        break;
-      }
-      case "pong":
-        this.lastPongAt = this.now();
-        break;
     }
+  }
+
+  /** Route a `presenceSnapshot`/`presenceErr` frame to its room's listeners. */
+  private onPresence(
+    msg: Extract<ServerMessage, { type: "presenceSnapshot" | "presenceErr" }>,
+  ): void {
+    if (msg.type === "presenceSnapshot") {
+      // Per-room fan-out, mirroring how `queryUpdate` routes to per-`queryId`
+      // handlers via `subsById`.
+      const set = this.presenceListeners.get(msg.room);
+      if (set) {
+        for (const fn of set) {
+          fn(msg.members);
+        }
+      }
+      return;
+    }
+    // The server rejected the join (e.g. presence not enabled). Drop local
+    // listeners so a stale room doesn't keep accumulating snapshots the
+    // caller can no longer act on.
+    this.presenceListeners.delete(msg.room);
   }
 
   private flushOnAuth(): void {

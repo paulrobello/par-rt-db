@@ -382,12 +382,414 @@ pub(crate) fn backfill_affected_tables(
     out
 }
 
+/// Column DDL for a brand-new table: fixed columns (`id`, `doc`, `created_at`,
+/// `version`), one typed column per indexed field, plus `deleted_at` when the
+/// table declares soft delete. Returns the single `CREATE TABLE` statement in
+/// a `Vec` so the caller executes it the same way it executes every other
+/// generated statement.
+fn create_table_ddl(
+    pg_schema_name: &str,
+    table_name: &str,
+    table: &TableDef,
+) -> Result<Vec<String>, RtDbError> {
+    let table_ident = pg_table(table_name);
+    let indexed = indexed_fields(table);
+    let mut columns = vec![
+        "\"id\" text PRIMARY KEY".to_string(),
+        "\"doc\" jsonb NOT NULL".to_string(),
+        "\"created_at\" bigint NOT NULL".to_string(),
+        "\"version\" bigint NOT NULL DEFAULT 1".to_string(),
+    ];
+    for field_name in &indexed {
+        let ty = field_type(table, field_name)?;
+        let (pg_type, nullable) = indexed_column_type(ty)?;
+        let col = pg_col(field_name);
+        let not_null = if nullable { "" } else { " NOT NULL" };
+        columns.push(format!("\"{col}\" {pg_type}{not_null}"));
+    }
+    // FM-33 soft delete: the stamp column exists on every soft-delete table
+    // from creation (nullable — NULL = live row).
+    if table.soft_delete {
+        columns.push("\"deleted_at\" timestamptz".to_string());
+    }
+    Ok(vec![format!(
+        "CREATE TABLE \"{pg_schema_name}\".\"{table_ident}\" ({})",
+        columns.join(", ")
+    )])
+}
+
+/// `ALTER TABLE ADD COLUMN IF NOT EXISTS` + backfill for indexed fields
+/// present in `new` but absent from `old`. No-op when `old` is `None` — a
+/// brand-new table's columns are created by `create_table_ddl` instead.
+async fn add_missing_columns(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pg_schema_name: &str,
+    table_name: &str,
+    old: Option<&TableDef>,
+    new: &TableDef,
+) -> Result<(), RtDbError> {
+    let Some(old_table) = old else {
+        return Ok(());
+    };
+    let table_ident = pg_table(table_name);
+    let old_indexed = indexed_fields(old_table);
+    let new_indexed = indexed_fields(new);
+    for field_name in new_indexed.difference(&old_indexed) {
+        let ty = field_type(new, field_name)?;
+        let (pg_type, _nullable) = indexed_column_type(ty)?;
+        let col = pg_col(field_name);
+
+        sqlx::query(&format!(
+            "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" ADD COLUMN IF NOT EXISTS \"{col}\" {pg_type}"
+        ))
+        .execute(&mut **tx)
+        .await?;
+
+        let expr = backfill_expr(pg_type, field_name)?;
+        sqlx::query(&format!(
+            "UPDATE \"{pg_schema_name}\".\"{table_ident}\" SET \"{col}\" = {expr} WHERE doc ? '{field_name}'"
+        ))
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// FM-33: adds the `deleted_at` stamp column to an EXISTING table when
+/// `softDelete` is newly declared (`ADD COLUMN IF NOT EXISTS`, same additive
+/// pattern as the typed columns in `add_missing_columns`). All existing rows
+/// have `deleted_at = NULL` — live — by construction. No-op for a brand-new
+/// table (its column is already part of `create_table_ddl`) or when soft
+/// delete was already declared.
+async fn ensure_soft_delete_column(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pg_schema_name: &str,
+    table_name: &str,
+    old: Option<&TableDef>,
+    new: &TableDef,
+) -> Result<(), RtDbError> {
+    let Some(old_table) = old else {
+        return Ok(());
+    };
+    if new.soft_delete && !old_table.soft_delete {
+        let table_ident = pg_table(table_name);
+        sqlx::query(&format!(
+            "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" \
+             ADD COLUMN IF NOT EXISTS \"deleted_at\" timestamptz"
+        ))
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Computed-field backfill (ENH-028): when this apply ADDED or CHANGED an
+/// entry in the table's computed map, re-derive that field for every existing
+/// row (plus its typed column, which `add_missing_columns` may just have
+/// added — the doc key it backfills from is absent until the stamp runs).
+/// Must run before index creation so a new index builds over final values.
+/// No-op for a brand-new table (nothing to backfill yet) or an unchanged map
+/// (docs and `version` stay untouched on a pure re-push). This is the one
+/// additive-apply site shared by push (`push_schema`) and restore
+/// (`reconcile_schema_destructive` from `handle_restore_schema`), so both
+/// paths backfill. Removing an entry backfills nothing: stored values stay
+/// and become ordinary client-writable fields.
+async fn backfill_computed(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pg_schema_name: &str,
+    table_name: &str,
+    schema: &SchemaDef,
+    old: Option<&TableDef>,
+    new: &TableDef,
+) -> Result<(), RtDbError> {
+    let Some(old_table) = old else {
+        return Ok(());
+    };
+    let changed_computed: Vec<String> = new
+        .computed
+        .iter()
+        .filter(|(f, e)| old_table.computed.get(*f) != Some(*e))
+        .map(|(f, _)| f.clone())
+        .collect();
+    if !changed_computed.is_empty() {
+        crate::migrate::backfill_computed(
+            tx,
+            pg_schema_name,
+            table_name,
+            schema,
+            &changed_computed,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Creates every index in `new.indexes` that is missing from `old` (or, for a
+/// unique index on a table that just gained `softDelete`, rebuilds it — see
+/// `rebuild_for_soft_delete` below). Covers search indexes (generated
+/// `tsvector` column + trigram GIN + text-search GIN), vector indexes (a
+/// write-maintained `vector(N)` column + HNSW), and plain btree/unique
+/// indexes (with the soft-delete partial predicate and the duplicate-key
+/// pre-check).
+async fn create_indexes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pg_schema_name: &str,
+    table_name: &str,
+    old: Option<&TableDef>,
+    new: &TableDef,
+) -> Result<(), RtDbError> {
+    let table_ident = pg_table(table_name);
+    let old_index_names: HashSet<&str> = old
+        .map(|t| t.indexes.iter().map(|index| index.name.as_str()).collect())
+        .unwrap_or_default();
+    for index in &new.indexes {
+        // Trigram GIN over a search index's text `f_` columns (FM-30):
+        // created for NEW and EXISTING search indexes alike — `IF NOT
+        // EXISTS` makes re-pushes a no-op and backfills search indexes that
+        // predate trgm mode (the backing `f_` columns exist by this point
+        // either way). Accelerates `search` mode `trgm` ILIKE; the query
+        // still works without it, just seq-scanned.
+        if index.search {
+            let trgm_ident = format!(
+                "tg_{}_{}",
+                table_name.to_lowercase(),
+                index.name.to_lowercase()
+            );
+            let trgm_cols = index
+                .fields
+                .iter()
+                .map(|field_name| format!("\"{}\" gin_trgm_ops", pg_col(field_name)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            sqlx::query(&format!(
+                "CREATE INDEX IF NOT EXISTS \"{trgm_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" \
+                 USING GIN ({trgm_cols})"
+            ))
+            .execute(&mut **tx)
+            .await?;
+        }
+        // FM-33: adding `softDelete` to an existing table widens every
+        // unique index's partial predicate (`AND "deleted_at" IS NULL`, see
+        // the where_sql composition below). The declared-schema diff sees
+        // no index change (fields/where declared identically), so the
+        // existing-index skip below would silently keep the narrow
+        // predicate — bypass it and physically rebuild the unique ones.
+        let soft_delete_newly_added = new.soft_delete && !old.is_some_and(|t| t.soft_delete);
+        let rebuild_for_soft_delete =
+            soft_delete_newly_added && index.unique && !index.search && index.vector.is_none();
+        if old_index_names.contains(index.name.as_str()) && !rebuild_for_soft_delete {
+            continue;
+        }
+        let index_ident = format!(
+            "i_{}_{}",
+            table_name.to_lowercase(),
+            index.name.to_lowercase()
+        );
+        if rebuild_for_soft_delete {
+            sqlx::query(&format!(
+                "DROP INDEX IF EXISTS \"{pg_schema_name}\".\"{index_ident}\""
+            ))
+            .execute(&mut **tx)
+            .await?;
+        }
+        if index.search {
+            // A full-text search index: a generated `tsvector` column over
+            // its text fields plus a GIN index on it. The referenced
+            // `f_<field>` typed columns are created with the table (new) or
+            // added and backfilled just above (existing), so they already
+            // exist by this point. `to_tsvector(regconfig, text)` is
+            // immutable, so it is allowed in a STORED generated column. The
+            // `regconfig` is the index's declared `language` (default
+            // `english`); the literal is format-validated in
+            // `schema::validate_structure` and existence-checked in
+            // `validate_search_languages`, so it is safe to interpolate.
+            let sv_col = pg_search_col(&index.name);
+            let regconfig = index.language.as_deref().unwrap_or("english");
+            let terms: Vec<String> = index
+                .fields
+                .iter()
+                .map(|field_name| format!("coalesce(\"{}\", '')", pg_col(field_name)))
+                .collect();
+            sqlx::query(&format!(
+                "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" \
+                 ADD COLUMN \"{sv_col}\" tsvector GENERATED ALWAYS AS \
+                 (to_tsvector('{regconfig}'::regconfig, {})) STORED",
+                terms.join(" || ' ' || ")
+            ))
+            .execute(&mut **tx)
+            .await?;
+            sqlx::query(&format!(
+                "CREATE INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" \
+                 USING GIN (\"{sv_col}\")"
+            ))
+            .execute(&mut **tx)
+            .await?;
+        } else if let Some(vec_spec) = &index.vector {
+            // Vector index: a plain `vector(N)` column (write-maintained by
+            // Task 5, not generated — pgvector has no jsonb->vector generated
+            // cast) plus an HNSW index over the declared metric (cosine/l2/ip,
+            // ENH-007). The filterFields' `f_` columns already exist (created
+            // with the table / added+backfilled above).
+            let v_col = pg_vector_col(&index.name);
+            let dim = vec_spec.dimensions;
+            let vfield = index
+                .fields
+                .first()
+                .ok_or_else(|| RtDbError::internal("vector index missing its field"))?;
+            sqlx::query(&format!(
+                "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" \
+                 ADD COLUMN \"{v_col}\" vector({dim})"
+            ))
+            .execute(&mut **tx)
+            .await?;
+            // Backfill from existing rows (no-op on a brand-new table).
+            // `vfield` is a doc field name validated by is_valid_identifier
+            // in Task 3, and lives in a string literal here, not an identifier.
+            sqlx::query(&format!(
+                "UPDATE \"{pg_schema_name}\".\"{table_ident}\" \
+                 SET \"{v_col}\" = (doc->>'{vfield}')::vector \
+                 WHERE doc ? '{vfield}'"
+            ))
+            .execute(&mut **tx)
+            .await?;
+            let opclass = vec_spec.metric.opclass();
+            sqlx::query(&format!(
+                "CREATE INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" \
+                 USING hnsw (\"{v_col}\" {opclass})"
+            ))
+            .execute(&mut **tx)
+            .await?;
+        } else {
+            let cols: Vec<String> = index
+                .fields
+                .iter()
+                .map(|field_name| format!("\"{}\"", pg_col(field_name)))
+                .collect();
+
+            // Partial-index predicate (literal SQL — see
+            // `compile_filter_literal`). `Option<String>` already carries a
+            // leading " WHERE " when present; shadow-bind a `&str` for
+            // interpolation (`Option` has no `Display` impl).
+            let mut where_sql = match &index.r#where {
+                Some(pred) => {
+                    let frag = compile_filter_literal(pred, new)?;
+                    format!(" WHERE {frag}")
+                }
+                None => String::new(),
+            };
+            // FM-33: a unique index on a soft-delete table excludes
+            // soft-deleted rows — a stamped row holding a key must never
+            // conflict with a fresh insert of the same key. The declared
+            // `where` composes (`AND`); a bare unique index gains
+            // `WHERE "deleted_at" IS NULL`. `render_filter_literal_node`
+            // parenthesizes every And/Or node, so appending is
+            // precedence-safe. Non-unique indexes are untouched (their
+            // `where` is scan shaping, not correctness).
+            if index.unique && new.soft_delete {
+                if where_sql.is_empty() {
+                    where_sql = " WHERE \"deleted_at\" IS NULL".to_string();
+                } else {
+                    where_sql.push_str(" AND \"deleted_at\" IS NULL");
+                }
+            }
+            let where_sql = where_sql.as_str();
+
+            // Pre-check for a clear CONFLICT before CREATE UNIQUE INDEX (the
+            // CREATE itself remains the authoritative, race-free guarantee).
+            if index.unique {
+                let grouped = cols.join(", ");
+                let sql = format!(
+                    "SELECT {grouped} FROM \"{pg_schema_name}\".\"{table_ident}\"{where_sql} \
+                     GROUP BY {grouped} HAVING count(*) > 1 LIMIT 5"
+                );
+                match sqlx::query(&sql).fetch_all(&mut **tx).await {
+                    Ok(rows) if !rows.is_empty() => {
+                        return Err(RtDbError::conflict(format!(
+                            "unique index '{}' cannot be created: {} existing row(s) duplicate its key",
+                            index.name,
+                            rows.len()
+                        )));
+                    }
+                    // A pre-check fetch error is unexpected (cols is
+                    // non-empty and the table exists in the tx); warn and
+                    // fall through — CREATE UNIQUE INDEX remains the
+                    // authoritative, race-free check either way.
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "unique-index dup pre-check failed; deferring to CREATE UNIQUE INDEX",
+                    ),
+                    Ok(_) => {}
+                }
+            }
+
+            let unique_kw = if index.unique { "UNIQUE " } else { "" };
+            // A UNIQUE index covers exactly its declared fields — appending a
+            // per-row-distinct column like `created_at` would make every key
+            // distinct and silently defeat the uniqueness guarantee. Non-
+            // unique btree indexes keep the trailing `created_at` tiebreaker
+            // so take/first/paginate scans get a deterministic physical order.
+            let index_cols = if index.unique {
+                cols.join(", ")
+            } else {
+                format!("{}, \"created_at\"", cols.join(", "))
+            };
+            sqlx::query(&format!(
+                "CREATE {unique_kw}INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" ({index_cols}){where_sql}"
+            ))
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Backfills the TTL field on existing rows when a `default_duration_ms` is
+/// declared: stamps `f_<field> = created_at + default` for rows that lack the
+/// field. Runs for both new and existing tables (no NULL rows ⇒ no-op) and
+/// preserves any caller-set value via the `IS NULL` guard. The typed column
+/// is updated alongside the jsonb `doc` because reads (merge_doc) return the
+/// doc, not the column — updating only the column would make the backfill
+/// invisible to queries. Identifiers are validated/lowercased via `pg_*`;
+/// only the duration is bound, never interpolated. The field name baked into
+/// `jsonb_build_object` is a validated identifier (same literal-interpolation
+/// pattern as `backfill_expr` above).
+async fn backfill_ttl_default(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pg_schema_name: &str,
+    table_name: &str,
+    new: &TableDef,
+) -> Result<(), RtDbError> {
+    let Some(ttl) = &new.ttl else {
+        return Ok(());
+    };
+    let Some(d) = ttl.default_duration_ms else {
+        return Ok(());
+    };
+    let table_ident = pg_table(table_name);
+    let col = pg_col(&ttl.field);
+    let field = &ttl.field;
+    sqlx::query(&format!(
+        "UPDATE \"{pg_schema_name}\".\"{table_ident}\" \
+         SET \"{col}\" = created_at + $1, \
+             doc = doc || jsonb_build_object('{field}', created_at + $1) \
+         WHERE \"{col}\" IS NULL"
+    ))
+    .bind(d)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Additive table + index DDL shared by `push_schema` and the destructive
 /// reconcile. `previous` is the currently-applied schema (`None` = fresh); only
 /// NEW tables/columns/indexes (in `schema` but not `previous`) are created.
 /// Runs inside the caller's transaction. No `meta` upsert — the caller owns
-/// that. Pure extraction of the per-table CREATE/ALTER + index-creation loop
-/// that used to live inline in `push_schema`; behavior identical.
+/// that. Orchestrates the per-table create/alter, computed backfill, sequence,
+/// index, and TTL-backfill steps in the order the table must see them: columns
+/// before computed backfill (a computed expr may read a just-added column),
+/// computed backfill before indexes (a new index builds over final values),
+/// indexes before the TTL backfill (order-independent, kept last to match the
+/// pre-decomposition behavior).
 async fn apply_schema_additive(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     pg_schema_name: &str,
@@ -396,100 +798,21 @@ async fn apply_schema_additive(
 ) -> Result<(), RtDbError> {
     for (table_name, new_table) in &schema.tables {
         let old_table = previous.and_then(|s| s.tables.get(table_name));
-        let table_ident = pg_table(table_name);
-        let new_indexed = indexed_fields(new_table);
 
         match old_table {
             None => {
-                let mut columns = vec![
-                    "\"id\" text PRIMARY KEY".to_string(),
-                    "\"doc\" jsonb NOT NULL".to_string(),
-                    "\"created_at\" bigint NOT NULL".to_string(),
-                    "\"version\" bigint NOT NULL DEFAULT 1".to_string(),
-                ];
-                for field_name in &new_indexed {
-                    let ty = field_type(new_table, field_name)?;
-                    let (pg_type, nullable) = indexed_column_type(ty)?;
-                    let col = pg_col(field_name);
-                    let not_null = if nullable { "" } else { " NOT NULL" };
-                    columns.push(format!("\"{col}\" {pg_type}{not_null}"));
+                for stmt in create_table_ddl(pg_schema_name, table_name, new_table)? {
+                    sqlx::query(&stmt).execute(&mut **tx).await?;
                 }
-                // FM-33 soft delete: the stamp column exists on every
-                // soft-delete table from creation (nullable — NULL = live row).
-                if new_table.soft_delete {
-                    columns.push("\"deleted_at\" timestamptz".to_string());
-                }
-                let sql = format!(
-                    "CREATE TABLE \"{pg_schema_name}\".\"{table_ident}\" ({})",
-                    columns.join(", ")
-                );
-                sqlx::query(&sql).execute(&mut **tx).await?;
             }
-            Some(old_table) => {
-                let old_indexed = indexed_fields(old_table);
-                for field_name in new_indexed.difference(&old_indexed) {
-                    let ty = field_type(new_table, field_name)?;
-                    let (pg_type, _nullable) = indexed_column_type(ty)?;
-                    let col = pg_col(field_name);
-
-                    sqlx::query(&format!(
-                        "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" ADD COLUMN IF NOT EXISTS \"{col}\" {pg_type}"
-                    ))
-                    .execute(&mut **tx)
+            Some(_) => {
+                add_missing_columns(tx, pg_schema_name, table_name, old_table, new_table).await?;
+                ensure_soft_delete_column(tx, pg_schema_name, table_name, old_table, new_table)
                     .await?;
-
-                    let expr = backfill_expr(pg_type, field_name)?;
-                    sqlx::query(&format!(
-                        "UPDATE \"{pg_schema_name}\".\"{table_ident}\" SET \"{col}\" = {expr} WHERE doc ? '{field_name}'"
-                    ))
-                    .execute(&mut **tx)
-                    .await?;
-                }
-
-                // FM-33 soft delete: adding the flag to an existing table adds
-                // the stamp column (`ADD COLUMN IF NOT EXISTS`, same additive
-                // pattern as the typed columns above). All existing rows have
-                // `deleted_at = NULL` — live — by construction.
-                if new_table.soft_delete && !old_table.soft_delete {
-                    sqlx::query(&format!(
-                        "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" \
-                         ADD COLUMN IF NOT EXISTS \"deleted_at\" timestamptz"
-                    ))
-                    .execute(&mut **tx)
-                    .await?;
-                }
             }
         }
 
-        // Computed-field backfill (ENH-028): when this apply ADDED or CHANGED
-        // an entry in the table's computed map, re-derive that field for every
-        // existing row (plus its typed column, which the loop above may just
-        // have added — the doc key it backfills from is absent until the
-        // stamp runs). Runs before index creation so a new index builds over
-        // final values. An unchanged map runs no UPDATE — docs and `version`
-        // stay untouched on a pure re-push. This is the one additive-apply
-        // site shared by push (`push_schema`) and restore
-        // (`reconcile_schema_destructive` from `handle_restore_schema`), so
-        // both paths backfill. Removing an entry backfills nothing: stored
-        // values stay and become ordinary client-writable fields.
-        if let Some(old_table) = old_table {
-            let changed_computed: Vec<String> = new_table
-                .computed
-                .iter()
-                .filter(|(f, e)| old_table.computed.get(*f) != Some(*e))
-                .map(|(f, _)| f.clone())
-                .collect();
-            if !changed_computed.is_empty() {
-                crate::migrate::backfill_computed(
-                    tx,
-                    pg_schema_name,
-                    table_name,
-                    schema,
-                    &changed_computed,
-                )
-                .await?;
-            }
-        }
+        backfill_computed(tx, pg_schema_name, table_name, schema, old_table, new_table).await?;
 
         // Auto-increment sequence: created (and repositioned past any stored
         // values) whenever the declaration is newly present — new table,
@@ -498,235 +821,9 @@ async fn apply_schema_additive(
         // disturbs the sequence's position.
         apply_sequence(tx, pg_schema_name, table_name, old_table, new_table).await?;
 
-        let old_index_names: HashSet<&str> = old_table
-            .map(|t| t.indexes.iter().map(|index| index.name.as_str()).collect())
-            .unwrap_or_default();
-        for index in &new_table.indexes {
-            // Trigram GIN over a search index's text `f_` columns (FM-30):
-            // created for NEW and EXISTING search indexes alike — `IF NOT
-            // EXISTS` makes re-pushes a no-op and backfills search indexes that
-            // predate trgm mode (the backing `f_` columns exist by this point
-            // either way). Accelerates `search` mode `trgm` ILIKE; the query
-            // still works without it, just seq-scanned.
-            if index.search {
-                let trgm_ident = format!(
-                    "tg_{}_{}",
-                    table_name.to_lowercase(),
-                    index.name.to_lowercase()
-                );
-                let trgm_cols = index
-                    .fields
-                    .iter()
-                    .map(|field_name| format!("\"{}\" gin_trgm_ops", pg_col(field_name)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                sqlx::query(&format!(
-                    "CREATE INDEX IF NOT EXISTS \"{trgm_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" \
-                     USING GIN ({trgm_cols})"
-                ))
-                .execute(&mut **tx)
-                .await?;
-            }
-            // FM-33: adding `softDelete` to an existing table widens every
-            // unique index's partial predicate (`AND "deleted_at" IS NULL`, see
-            // the where_sql composition below). The declared-schema diff sees
-            // no index change (fields/where declared identically), so the
-            // existing-index skip below would silently keep the narrow
-            // predicate — bypass it and physically rebuild the unique ones.
-            let soft_delete_newly_added =
-                new_table.soft_delete && !old_table.is_some_and(|t| t.soft_delete);
-            let rebuild_for_soft_delete =
-                soft_delete_newly_added && index.unique && !index.search && index.vector.is_none();
-            if old_index_names.contains(index.name.as_str()) && !rebuild_for_soft_delete {
-                continue;
-            }
-            let index_ident = format!(
-                "i_{}_{}",
-                table_name.to_lowercase(),
-                index.name.to_lowercase()
-            );
-            if rebuild_for_soft_delete {
-                sqlx::query(&format!(
-                    "DROP INDEX IF EXISTS \"{pg_schema_name}\".\"{index_ident}\""
-                ))
-                .execute(&mut **tx)
-                .await?;
-            }
-            if index.search {
-                // A full-text search index: a generated `tsvector` column over
-                // its text fields plus a GIN index on it. The referenced
-                // `f_<field>` typed columns are created with the table (new) or
-                // added and backfilled just above (existing), so they already
-                // exist by this point. `to_tsvector(regconfig, text)` is
-                // immutable, so it is allowed in a STORED generated column. The
-                // `regconfig` is the index's declared `language` (default
-                // `english`); the literal is format-validated in
-                // `schema::validate_structure` and existence-checked in
-                // `validate_search_languages`, so it is safe to interpolate.
-                let sv_col = pg_search_col(&index.name);
-                let regconfig = index.language.as_deref().unwrap_or("english");
-                let terms: Vec<String> = index
-                    .fields
-                    .iter()
-                    .map(|field_name| format!("coalesce(\"{}\", '')", pg_col(field_name)))
-                    .collect();
-                sqlx::query(&format!(
-                    "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" \
-                     ADD COLUMN \"{sv_col}\" tsvector GENERATED ALWAYS AS \
-                     (to_tsvector('{regconfig}'::regconfig, {})) STORED",
-                    terms.join(" || ' ' || ")
-                ))
-                .execute(&mut **tx)
-                .await?;
-                sqlx::query(&format!(
-                    "CREATE INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" \
-                     USING GIN (\"{sv_col}\")"
-                ))
-                .execute(&mut **tx)
-                .await?;
-            } else if let Some(vec_spec) = &index.vector {
-                // Vector index: a plain `vector(N)` column (write-maintained by
-                // Task 5, not generated — pgvector has no jsonb->vector generated
-                // cast) plus an HNSW index over the declared metric (cosine/l2/ip,
-                // ENH-007). The filterFields' `f_` columns already exist (created
-                // with the table / added+backfilled above).
-                let v_col = pg_vector_col(&index.name);
-                let dim = vec_spec.dimensions;
-                let vfield = index
-                    .fields
-                    .first()
-                    .ok_or_else(|| RtDbError::internal("vector index missing its field"))?;
-                sqlx::query(&format!(
-                    "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" \
-                     ADD COLUMN \"{v_col}\" vector({dim})"
-                ))
-                .execute(&mut **tx)
-                .await?;
-                // Backfill from existing rows (no-op on a brand-new table).
-                // `vfield` is a doc field name validated by is_valid_identifier
-                // in Task 3, and lives in a string literal here, not an identifier.
-                sqlx::query(&format!(
-                    "UPDATE \"{pg_schema_name}\".\"{table_ident}\" \
-                     SET \"{v_col}\" = (doc->>'{vfield}')::vector \
-                     WHERE doc ? '{vfield}'"
-                ))
-                .execute(&mut **tx)
-                .await?;
-                let opclass = vec_spec.metric.opclass();
-                sqlx::query(&format!(
-                    "CREATE INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" \
-                     USING hnsw (\"{v_col}\" {opclass})"
-                ))
-                .execute(&mut **tx)
-                .await?;
-            } else {
-                let cols: Vec<String> = index
-                    .fields
-                    .iter()
-                    .map(|field_name| format!("\"{}\"", pg_col(field_name)))
-                    .collect();
+        create_indexes(tx, pg_schema_name, table_name, old_table, new_table).await?;
 
-                // Partial-index predicate (literal SQL — see
-                // `compile_filter_literal`). `Option<String>` already carries a
-                // leading " WHERE " when present; shadow-bind a `&str` for
-                // interpolation (`Option` has no `Display` impl).
-                let mut where_sql = match &index.r#where {
-                    Some(pred) => {
-                        let frag = compile_filter_literal(pred, new_table)?;
-                        format!(" WHERE {frag}")
-                    }
-                    None => String::new(),
-                };
-                // FM-33: a unique index on a soft-delete table excludes
-                // soft-deleted rows — a stamped row holding a key must never
-                // conflict with a fresh insert of the same key. The declared
-                // `where` composes (`AND`); a bare unique index gains
-                // `WHERE "deleted_at" IS NULL`. `render_filter_literal_node`
-                // parenthesizes every And/Or node, so appending is
-                // precedence-safe. Non-unique indexes are untouched (their
-                // `where` is scan shaping, not correctness).
-                if index.unique && new_table.soft_delete {
-                    if where_sql.is_empty() {
-                        where_sql = " WHERE \"deleted_at\" IS NULL".to_string();
-                    } else {
-                        where_sql.push_str(" AND \"deleted_at\" IS NULL");
-                    }
-                }
-                let where_sql = where_sql.as_str();
-
-                // Pre-check for a clear CONFLICT before CREATE UNIQUE INDEX (the
-                // CREATE itself remains the authoritative, race-free guarantee).
-                if index.unique {
-                    let grouped = cols.join(", ");
-                    let sql = format!(
-                        "SELECT {grouped} FROM \"{pg_schema_name}\".\"{table_ident}\"{where_sql} \
-                         GROUP BY {grouped} HAVING count(*) > 1 LIMIT 5"
-                    );
-                    match sqlx::query(&sql).fetch_all(&mut **tx).await {
-                        Ok(rows) if !rows.is_empty() => {
-                            return Err(RtDbError::conflict(format!(
-                                "unique index '{}' cannot be created: {} existing row(s) duplicate its key",
-                                index.name,
-                                rows.len()
-                            )));
-                        }
-                        // A pre-check fetch error is unexpected (cols is
-                        // non-empty and the table exists in the tx); warn and
-                        // fall through — CREATE UNIQUE INDEX remains the
-                        // authoritative, race-free check either way.
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            "unique-index dup pre-check failed; deferring to CREATE UNIQUE INDEX",
-                        ),
-                        Ok(_) => {}
-                    }
-                }
-
-                let unique_kw = if index.unique { "UNIQUE " } else { "" };
-                // A UNIQUE index covers exactly its declared fields — appending a
-                // per-row-distinct column like `created_at` would make every key
-                // distinct and silently defeat the uniqueness guarantee. Non-
-                // unique btree indexes keep the trailing `created_at` tiebreaker
-                // so take/first/paginate scans get a deterministic physical order.
-                let index_cols = if index.unique {
-                    cols.join(", ")
-                } else {
-                    format!("{}, \"created_at\"", cols.join(", "))
-                };
-                sqlx::query(&format!(
-                    "CREATE {unique_kw}INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" ({index_cols}){where_sql}"
-                ))
-                .execute(&mut **tx)
-                .await?;
-            }
-        }
-
-        // Backfill the TTL field on existing rows when a `default_duration_ms`
-        // is declared: stamp `f_<field> = created_at + default` for rows that
-        // lack the field. Runs for both new and existing tables (no NULL rows
-        // ⇒ no-op) and preserves any caller-set value via the `IS NULL` guard.
-        // The typed column is updated alongside the jsonb `doc` because reads
-        // (merge_doc) return the doc, not the column — updating only the column
-        // would make the backfill invisible to queries. Identifiers are
-        // validated/lowercased via `pg_*`; only the duration is bound, never
-        // interpolated. The field name baked into `jsonb_build_object` is a
-        // validated identifier (same literal-interpolation pattern as
-        // `backfill_expr` above).
-        if let Some(ttl) = &new_table.ttl
-            && let Some(d) = ttl.default_duration_ms
-        {
-            let col = pg_col(&ttl.field);
-            let field = &ttl.field;
-            sqlx::query(&format!(
-                "UPDATE \"{pg_schema_name}\".\"{table_ident}\" \
-                 SET \"{col}\" = created_at + $1, \
-                     doc = doc || jsonb_build_object('{field}', created_at + $1) \
-                 WHERE \"{col}\" IS NULL"
-            ))
-            .bind(d)
-            .execute(&mut **tx)
-            .await?;
-        }
+        backfill_ttl_default(tx, pg_schema_name, table_name, new_table).await?;
     }
     Ok(())
 }

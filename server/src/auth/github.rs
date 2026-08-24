@@ -6,13 +6,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
 
 use crate::AppState;
 use crate::auth::provider::OAuthProvider;
-use crate::auth::session;
+use crate::auth::{self, ConflictStyle, ProviderIdentity, session};
 use crate::config::Config;
-use crate::db::{new_id, now_ms};
 use crate::error::RtDbError;
 
 /// GitHub OAuth provider. One GitHub OAuth App serves the whole instance
@@ -131,109 +129,30 @@ impl OAuthProvider for GithubProvider {
             .ok_or_else(|| RtDbError::forbidden("no verified email"))?
             .to_lowercase();
 
-        let user_id = upsert_user(&state.pool, user.id, &user.login, &email).await?;
+        // QA-004: resolution (returning-user-by-github_id, then link an
+        // unlinked email-keyed row, then insert) now lives in
+        // `auth::resolve_user`, shared with every other provider. GitHub's
+        // wire-facing conflict code (`PRECONDITION_FAILED`, asserted by
+        // `oauth_test.rs`) is preserved via `ConflictStyle::Precondition`.
+        let github_id_str = user.id.to_string();
+        let user_id = auth::resolve_user(
+            &state.pool,
+            ProviderIdentity {
+                provider_id_column: auth::PROVIDER_COL_GITHUB_ID,
+                provider_id: &github_id_str,
+                login: &user.login,
+                email: &email,
+                allow_email_link: true,
+                conflict_style: ConflictStyle::Precondition,
+            },
+        )
+        .await?;
         session::create_session(
             &state.pool,
             &user_id,
             state.runtime.hot.load().session_ttl_days,
         )
         .await
-    }
-}
-
-/// Upserts the GitHub user into `rtdb_auth.users`, linking across providers by
-/// verified email so a cross-provider same-email login resolves deliberately
-/// instead of surfacing the email UNIQUE constraint as a 500.
-///
-/// Resolution order:
-/// 1. An existing user with this `github_id` (a returning GitHub user) is
-///    reused, with `login`/`email` refreshed — so a GitHub email change follows
-///    the account rather than forking it.
-/// 2. Otherwise, if the verified email already belongs to an account that is
-///    not yet GitHub-linked (`github_id` IS NULL — e.g. one created by a Google
-///    login), that account is linked by setting its `github_id`, reusing the
-///    row. Both providers verified the email, so this is the same person; the
-///    GitHub flow's per-account stability is preserved because step 1 still
-///    keys every returning GitHub user to their own `github_id`.
-/// 3. Otherwise a new row is inserted. A UNIQUE violation here — an email
-///    already linked to a *different* GitHub account, or a concurrent login
-///    racing past the checks — is mapped to a deliberate 409 conflict rather
-///    than leaked as a 500.
-async fn upsert_user(
-    pool: &PgPool,
-    github_id: i64,
-    login: &str,
-    email: &str,
-) -> Result<String, RtDbError> {
-    let mut tx = pool.begin().await?;
-
-    // (1) returning GitHub user: reuse the account, refresh login/email.
-    if let Some((id,)) =
-        sqlx::query_as::<_, (String,)>("SELECT id FROM rtdb_auth.users WHERE github_id = $1")
-            .bind(github_id)
-            .fetch_optional(&mut *tx)
-            .await?
-    {
-        sqlx::query("UPDATE rtdb_auth.users SET login = $1, email = $2 WHERE id = $3")
-            .bind(login)
-            .bind(email)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_email_conflict)?;
-        tx.commit().await?;
-        return Ok(id);
-    }
-
-    // (2) link an email-keyed account that is not yet GitHub-linked.
-    if let Some((id,)) = sqlx::query_as::<_, (String,)>(
-        "UPDATE rtdb_auth.users \
-         SET github_id = $1, login = $2 \
-         WHERE email = $3 AND github_id IS NULL \
-         RETURNING id",
-    )
-    .bind(github_id)
-    .bind(login)
-    .bind(email)
-    .fetch_optional(&mut *tx)
-    .await?
-    {
-        tx.commit().await?;
-        return Ok(id);
-    }
-
-    // (3) brand-new user.
-    let id = new_id();
-    let now = now_ms();
-    sqlx::query(
-        "INSERT INTO rtdb_auth.users (id, github_id, login, email, created_at) \
-         VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(&id)
-    .bind(github_id)
-    .bind(login)
-    .bind(email)
-    .bind(now)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_email_conflict)?;
-    tx.commit().await?;
-    Ok(id)
-}
-
-/// Maps a Postgres unique-violation (`23505`) from a `users` upsert to a
-/// deliberate 409 conflict — the email is already linked to another sign-in
-/// method (or a concurrent login just claimed it). Any other database error
-/// passes through as the usual internal-error mapping (logged, never leaked).
-fn map_email_conflict(err: sqlx::Error) -> RtDbError {
-    let is_unique_violation = matches!(
-        &err,
-        sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23505")
-    );
-    if is_unique_violation {
-        RtDbError::precondition("email already linked to another sign-in method")
-    } else {
-        RtDbError::from(err)
     }
 }
 

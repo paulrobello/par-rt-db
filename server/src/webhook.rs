@@ -323,9 +323,10 @@ pub async fn validate_webhook_url(url: &str, allow_http: bool) -> Result<(), Str
         return Ok(());
     }
     // Hostname: resolve and reject if any address lands in a blocked range.
-    let port = parsed
-        .port_or_known_default()
-        .expect("http(s) always have a default port");
+    // Only https reaches here (the allow_http branch returned above), so the
+    // default is always known; the port merely completes the DNS lookup key and
+    // never affects which addresses resolve.
+    let port = parsed.port_or_known_default().unwrap_or(443);
     let resolved = tokio::net::lookup_host(format!("{host}:{port}"))
         .await
         .map_err(|e| format!("DNS resolution failed for '{host}': {e}"))?;
@@ -695,27 +696,41 @@ pub struct DeliveryRow {
     pub payload: serde_json::Value,
 }
 
-/// Applies a partial update to webhook `id` scoped to `db`, returning the
-/// updated row or `None` if no such `(id, db)` row exists. Each `Option`
-/// argument is itself "unchanged when `None`": `url`/`events`/`enabled` take
-/// `Some(value)` to set, and `tbl` is a nested `Option<Option<&str>>` so the
-/// caller can distinguish "leave the table filter alone" (`None`) from "set it
-/// to all-tables" (`Some(None)`) from "set it to this table" (`Some(Some(t))`.
+/// The partial-update fields accepted by `edit_webhook`, bundled so the
+/// function stays under clippy's argument-count threshold. Each field is
+/// itself "unchanged when `None`": `url`/`events`/`enabled` take `Some(value)`
+/// to set, and `tbl` is a nested `Option<Option<&str>>` so the caller can
+/// distinguish "leave the table filter alone" (`None`) from "set it to
+/// all-tables" (`Some(None)`) from "set it to this table" (`Some(Some(t))`.
 /// `rotate_secret = true` generates a fresh server-side signing secret
-/// (SEC-115); the secret value is never accepted from the client. When every
-/// field is `None`/`false` this short-circuits to a plain SELECT — no empty-SET
-/// SQL is synthesized. Called by `PUT /admin/db/{db}/webhooks/{id}`.
-#[allow(clippy::too_many_arguments)]
+/// (SEC-115); the secret value is never accepted from the client.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WebhookPatch<'a> {
+    pub url: Option<&'a str>,
+    pub tbl: Option<Option<&'a str>>,
+    pub events: Option<&'a [String]>,
+    pub enabled: Option<bool>,
+    pub rotate_secret: bool,
+}
+
+/// Applies a partial update to webhook `id` scoped to `db`, returning the
+/// updated row or `None` if no such `(id, db)` row exists. See `WebhookPatch`
+/// for each field's semantics. When every field is `None`/`false` this
+/// short-circuits to a plain SELECT — no empty-SET SQL is synthesized. Called
+/// by `PUT /admin/db/{db}/webhooks/{id}`.
 pub async fn edit_webhook(
     pool: &PgPool,
     id: i64,
     db: &str,
-    url: Option<&str>,
-    tbl: Option<Option<&str>>,
-    events: Option<&[String]>,
-    enabled: Option<bool>,
-    rotate_secret: bool,
+    patch: WebhookPatch<'_>,
 ) -> Result<Option<Webhook>, RtDbError> {
+    let WebhookPatch {
+        url,
+        tbl,
+        events,
+        enabled,
+        rotate_secret,
+    } = patch;
     type Row = (
         i64,
         String,

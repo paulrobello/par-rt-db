@@ -6,6 +6,7 @@ import { useAdmin } from "../lib/admin";
 import { toErrorMessage } from "../lib/errors";
 import { formatDateTime, formatDuration } from "../lib/format";
 import type { WorkflowInfo, WorkflowInfoFull, WorkflowSpec } from "../lib/types";
+import { useAsync } from "../lib/useAsync";
 import s from "./WorkflowsPage.module.css";
 
 /** Auto-refresh interval, the subscription inspector's cadence: runs advance
@@ -100,9 +101,6 @@ export function WorkflowsPage() {
   const { client, databases } = useAdmin();
   const [db, setDb] = useState<string>("");
   const [filter, setFilter] = useState<StatusFilter>("all");
-  const [runs, setRuns] = useState<WorkflowInfo[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [listError, setListError] = useState<string | null>(null);
 
   // Expanded row → full run (info + step outcome trail), lazy-fetched on expand.
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -135,25 +133,27 @@ export function WorkflowsPage() {
     if (!db && databases.length > 0) setDb(databases[0]);
   }, [db, databases]);
 
-  const refresh = useCallback(async () => {
-    if (!db) return;
-    setLoading(true);
-    setListError(null);
-    try {
+  const {
+    data: runs,
+    loading,
+    error: listError,
+    refresh,
+    setData: setRuns,
+  } = useAsync(
+    async () => {
       const opts = filter === "all" || filter === "stuck" ? {} : { status: filter };
       let list = await client.adminListWorkflows(db, opts);
       if (filter === "stuck") list = list.filter(isStuck);
-      setRuns(list);
-    } catch (e) {
-      setListError(toErrorMessage(e));
-      setRuns([]);
-    } finally {
-      setLoading(false);
-    }
-  }, [client, db, filter]);
+      return list;
+    },
+    [client, db, filter],
+    [] as WorkflowInfo[],
+    { enabled: !!db },
+  );
 
-  // Fetch on db/filter change (`refresh` is keyed on both, so its identity
-  // changes re-run this effect); live: re-poll on the shared cadence.
+  // Switching databases or the status filter should not show the previous
+  // page's runs while the new list loads.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: deps mirror the useAsync fetcher's own dep list, not this effect's body
   useEffect(() => {
     setRuns([]);
     setActionError(null);
@@ -163,8 +163,7 @@ export function WorkflowsPage() {
     setDetailError(null);
     setSignalFor(null);
     setSignalError(null);
-    if (db) void refresh();
-  }, [db, refresh]);
+  }, [db, filter, setRuns]);
   useEffect(() => {
     const id = setInterval(() => void refresh(), REFRESH_MS);
     return () => clearInterval(id);

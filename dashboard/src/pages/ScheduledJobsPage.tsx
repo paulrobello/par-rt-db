@@ -1,11 +1,12 @@
 /** Scheduled jobs — create, list, and manage one-shot, cron, and interval transactions. */
 
 import type { TransactionJson } from "@par-rt-db/client";
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
 import { toErrorMessage } from "../lib/errors";
 import type { ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen } from "../lib/types";
+import { useAsync } from "../lib/useAsync";
 import s from "./ScheduledJobsPage.module.css";
 
 type CreateMode = "afterMs" | "cron" | "interval";
@@ -35,9 +36,6 @@ function statusClass(status: ScheduleStatus): string {
 export function ScheduledJobsPage() {
   const { client, databases } = useAdmin();
   const [db, setDb] = useState<string>("");
-  const [jobs, setJobs] = useState<ScheduleInfo[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [listError, setListError] = useState<string | null>(null);
 
   // Create-form state.
   const [mode, setMode] = useState<CreateMode>("afterMs");
@@ -59,26 +57,24 @@ export function ScheduledJobsPage() {
     if (!db && databases.length > 0) setDb(databases[0]);
   }, [db, databases]);
 
-  const refresh = useCallback(async () => {
-    if (!db) return;
-    setLoading(true);
-    setListError(null);
-    try {
-      setJobs(await client.listSchedules(db));
-    } catch (e) {
-      setListError(toErrorMessage(e));
-      setJobs([]);
-    } finally {
-      setLoading(false);
-    }
-  }, [client, db]);
+  const {
+    data: jobs,
+    loading,
+    error: listError,
+    refresh,
+    setData: setJobs,
+  } = useAsync(() => client.listSchedules(db), [client, db], [] as ScheduleInfo[], {
+    enabled: !!db,
+  });
 
+  // Switching databases should not show the previous database's jobs while
+  // the new list loads.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: deps mirror the useAsync fetcher's own dep list, not this effect's body
   useEffect(() => {
     setJobs([]);
     setActionError(null);
     setConfirmingCancel(null);
-    if (db) void refresh();
-  }, [db, refresh]);
+  }, [db, setJobs]);
 
   function buildWhen(): ScheduleWhen | { error: string } {
     if (mode === "afterMs") {

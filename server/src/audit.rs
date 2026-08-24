@@ -73,23 +73,36 @@ pub struct AuditEntry {
     pub source: String,
 }
 
+/// The optional equality filters accepted by `fetch_audit_rows`, bundled so
+/// the function stays under clippy's argument-count threshold. Each field
+/// filters when `Some` (combined with AND); an absent filter matches all rows.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AuditRowFilter<'a> {
+    pub db: Option<&'a str>,
+    pub table: Option<&'a str>,
+    pub op: Option<&'a str>,
+    pub principal: Option<&'a str>,
+    pub source: Option<&'a str>,
+}
+
 /// Reads audit rows newest-first (by `ts_ms DESC`, then `id DESC` as a stable
-/// tie-breaker). `db`/`table`/`op`/`principal`/`source` each filter when
-/// `Some` (equality, combined with AND); an absent filter matches all rows.
-/// `limit`/`offset` page. Called by the admin endpoint; returns an empty `Vec`
-/// when the table does not exist (audit disabled at boot) — the caller need not
-/// distinguish.
-#[allow(clippy::too_many_arguments)]
+/// tie-breaker). `filter`'s fields each restrict the result when `Some`,
+/// combined with AND; an absent filter matches all rows. `limit`/`offset`
+/// page. Called by the admin endpoint; returns an empty `Vec` when the table
+/// does not exist (audit disabled at boot) — the caller need not distinguish.
 pub async fn fetch_audit_rows(
     pool: &PgPool,
-    db: Option<&str>,
-    table: Option<&str>,
-    op: Option<&str>,
-    principal: Option<&str>,
-    source: Option<&str>,
+    filter: AuditRowFilter<'_>,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<AuditEntry>, RtDbError> {
+    let AuditRowFilter {
+        db,
+        table,
+        op,
+        principal,
+        source,
+    } = filter;
     // Factored into a type alias so the `query_as` annotation stays readable
     // (clippy::type_complexity) and the SELECT column order is self-documenting
     // at the call site.

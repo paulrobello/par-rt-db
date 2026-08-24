@@ -1,12 +1,13 @@
 /** File storage browser — list blobs, inspect metadata, and preview on-the-fly image transforms. */
 
 import { appendImageParams, type TransformOpts } from "@par-rt-db/client";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
 import { toErrorMessage } from "../lib/errors";
 import { formatBytes } from "../lib/format";
 import type { FileMeta } from "../lib/types";
+import { useAsync } from "../lib/useAsync";
 import s from "./StoragePage.module.css";
 
 function timeLabel(ms: number): string {
@@ -24,9 +25,6 @@ const SIZE_OPTS: Record<Exclude<ImageSize, "orig">, TransformOpts> = {
 export function StoragePage() {
   const { client, databases } = useAdmin();
   const [db, setDb] = useState<string>("");
-  const [files, setFiles] = useState<FileMeta[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [listError, setListError] = useState<string | null>(null);
 
   // Upload state.
   const [selected, setSelected] = useState<File | null>(null);
@@ -52,26 +50,22 @@ export function StoragePage() {
     if (!db && databases.length > 0) setDb(databases[0]);
   }, [db, databases]);
 
-  const refresh = useCallback(async () => {
-    if (!db) return;
-    setLoading(true);
-    setListError(null);
-    try {
-      setFiles(await client.listFiles(db));
-    } catch (e) {
-      setListError(toErrorMessage(e));
-      setFiles([]);
-    } finally {
-      setLoading(false);
-    }
-  }, [client, db]);
+  const {
+    data: files,
+    loading,
+    error: listError,
+    refresh,
+    setData: setFiles,
+  } = useAsync(() => client.listFiles(db), [client, db], [] as FileMeta[], { enabled: !!db });
 
+  // Switching databases should not show the previous database's files while
+  // the new list loads.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: deps mirror the useAsync fetcher's own dep list, not this effect's body
   useEffect(() => {
     setFiles([]);
     setActionError(null);
     setConfirmingDelete(null);
-    if (db) void refresh();
-  }, [db, refresh]);
+  }, [db, setFiles]);
 
   useEffect(() => {
     return () => {

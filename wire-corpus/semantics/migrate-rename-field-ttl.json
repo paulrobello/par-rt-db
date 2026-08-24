@@ -1,0 +1,49 @@
+{
+  "name": "migrate-rename-field-ttl",
+  "$comment": "QA-002: renameField follows `ttl.field` when the renamed field is the one it names — the derived schema's `ttl.field` now reads `expiry`, not the dropped `expiresAt`. Before the fix this surface was NOT rewritten by rename_field_refs, so the derived schema kept naming a field that no longer existed. The follow-up read confirms the row survives the rename under the new key (reaping is async/out of scope, mirroring ttl-expired-row-visible-before-reap.json).",
+  "schema": {
+    "tables": {
+      "sessions": {
+        "fields": {
+          "token": { "type": "string" },
+          "expiresAt": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_expires_at", "fields": ["expiresAt"] }],
+        "ttl": { "field": "expiresAt" }
+      }
+    }
+  },
+  "seed": [
+    { "token": "t1", "expiresAt": 4102444800000 }
+  ],
+  "op": {
+    "migrate": {
+      "directives": [
+        { "op": "renameField", "table": "sessions", "from": "expiresAt", "to": "expiry" }
+      ],
+      "dryRun": false
+    }
+  },
+  "expect": {
+    "applied": true,
+    "schema": {
+      "tables": {
+        "sessions": {
+          "fields": {
+            "token": { "type": "string" },
+            "expiry": { "type": "number" }
+          },
+          "indexes": [{ "name": "by_expires_at", "fields": ["expiry"] }],
+          "ttl": { "field": "expiry" }
+        }
+      }
+    },
+    "directives": [{ "op": "renameField", "affectedRows": 1 }]
+  },
+  "normalize": ["_id", "_creationTime", "_version", "id"],
+  "then": {
+    "query": { "table": "sessions" },
+    "expect": [{ "token": "t1", "expiry": 4102444800000 }],
+    "unordered": true
+  }
+}

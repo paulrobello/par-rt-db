@@ -1,3 +1,4 @@
+import { canonical } from "./canonical.js";
 import type { QueryJson, TransactionJson } from "./protocol.js";
 
 /**
@@ -45,20 +46,6 @@ function hasFilter(q: QueryJson): boolean {
     q.lt !== undefined ||
     q.lte !== undefined
   );
-}
-
-/** Canonical string form (key-sorted) so a no-op projection is detected regardless of key order. */
-function canonical(value: unknown): string {
-  return JSON.stringify(value, (_k, v) => {
-    if (v && typeof v === "object" && !Array.isArray(v)) {
-      const sorted: Record<string, unknown> = {};
-      for (const key of Object.keys(v as Record<string, unknown>).sort()) {
-        sorted[key] = (v as Record<string, unknown>)[key];
-      }
-      return sorted;
-    }
-    return v;
-  });
 }
 
 /** A clearly-branded temporary id for an optimistically-inserted doc (replaced on reconcile). */

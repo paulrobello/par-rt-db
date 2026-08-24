@@ -7,11 +7,11 @@
 //! with step-surface coverage.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::common::{
     admin_delete, admin_get, admin_post, fresh_db, kanban_schema_json, spawn_app, test_hot,
-    test_state, test_state_with_audit,
+    test_state, test_state_with_audit, wait_until,
 };
 use arc_swap::ArcSwap;
 use rtdb_server::AppState;
@@ -247,19 +247,25 @@ async fn await_status(
     id: &str,
     pred: impl Fn(&WorkflowInfo) -> bool,
 ) -> WorkflowInfoFull {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
+    let found: std::cell::RefCell<Option<WorkflowInfoFull>> = std::cell::RefCell::new(None);
+    let reached = wait_until(Duration::from_secs(10), || async {
         if let Ok(Some(full)) = workflows::get(pool, db, id).await
             && pred(&full.info)
         {
-            return full;
+            *found.borrow_mut() = Some(full);
+            return true;
         }
-        assert!(
-            Instant::now() < deadline,
-            "workflow never reached expected status (still not met after 10s)"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+        false
+    })
+    .await;
+    assert!(
+        reached,
+        "workflow never reached expected status (still not met after 10s)"
+    );
+    found
+        .borrow_mut()
+        .take()
+        .expect("workflow status captured on success")
 }
 
 /// Row count of `db`'s `projects` table — the durable side effect of every
@@ -363,11 +369,15 @@ async fn sleep_before_ms_gates_next_step() {
     // Wait for step 0's doc, then observe the gate still closed: only one
     // doc, run back to `pending` with a future `sleepUntil`. (300ms is safely
     // inside the 1500ms gate from the moment step 0's doc becomes visible.)
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while projects_count(&pool, &db).await < 1 {
-        assert!(Instant::now() < deadline, "step 0 never executed");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            projects_count(&pool, &db).await >= 1
+        })
+        .await,
+        "step 0 never executed"
+    );
+    // Deliberate interval-elapse: let 300ms of the 1500ms gate pass and
+    // confirm step 1 still hasn't run, not a wait for a condition.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         projects_count(&pool, &db).await,
@@ -717,20 +727,20 @@ async fn workflow_step_writes_publish_to_audit_tap() -> anyhow::Result<()> {
     // The tap writes land in the same committer turn AFTER each step txn
     // commits, each on its own await — poll for the audit rows before
     // asserting their content (ttl_test.rs's pattern).
-    let mut count: i64 = 0;
-    for _ in 0..100 {
-        count = sqlx::query_scalar(
+    let count: std::cell::Cell<i64> = std::cell::Cell::new(0);
+    wait_until(Duration::from_millis(5_000), || async {
+        let c: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM rtdb.audit_log WHERE db = $1 AND source = 'workflow'",
         )
         .bind(db.as_str())
         .fetch_one(&pool)
-        .await?;
-        if count == 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(count, 2, "one audit row per workflow step write");
+        .await
+        .expect("count workflow audit rows");
+        count.set(c);
+        c == 2
+    })
+    .await;
+    assert_eq!(count.get(), 2, "one audit row per workflow step write");
 
     // owner = None in the tap payload ⇒ `principal` is NULL on every row.
     let principals: Vec<(Option<String>,)> = sqlx::query_as(

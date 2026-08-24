@@ -146,6 +146,21 @@ alter observable behavior on upgrade.
 
 ### Changed
 
+- **All six OAuth providers resolve their user through one `resolve_user`.**
+  GitHub, Apple, and Microsoft previously carried three near-identical
+  `upsert_user` blocks and Google, GitLab, and OIDC three inline
+  `ON CONFLICT (email)` inserts; `auth/mod.rs` now owns a single
+  `ProviderIdentity` + `resolve_user` pair. Each provider's existing semantics
+  were preserved deliberately rather than unified: Microsoft still refuses to
+  link by email unless `xms_edov` reports the domain verified (the nOAuth
+  defense), and GitHub/Microsoft still answer `PRECONDITION_FAILED` where Apple
+  answers `CONFLICT` on a unique-violation race. The one user-visible text
+  change is Microsoft's conflict message, now the shared "email already linked
+  to another sign-in method"; its wire code is unchanged.
+  **Not fixed by this change:** Google, GitLab, and OIDC persist no stable
+  per-provider subject id, so a provider-side email change still forks a new
+  user row. Closing that needs new `google_sub`/`gitlab_id`/`oidc_sub` columns
+  and a migration.
 - **Schema push runs through the committer** and invalidates subscriptions on
   backfilled tables at push time. `handle_push_schema` is the eighth
   tap-publishing committer arm (`source = "push"`, no DocOps).

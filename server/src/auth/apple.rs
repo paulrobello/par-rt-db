@@ -9,14 +9,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::Serialize;
-use sqlx::PgPool;
 
 use crate::AppState;
 use crate::auth::jwks;
 use crate::auth::provider::OAuthProvider;
-use crate::auth::session;
+use crate::auth::{self, ConflictStyle, ProviderIdentity, session};
 use crate::config::Config;
-use crate::db::{new_id, now_ms};
 use crate::error::RtDbError;
 
 /// Sign in with Apple. Two things make this unlike the other OIDC providers:
@@ -36,8 +34,8 @@ use crate::error::RtDbError;
 /// may relay the email through `@privaterelay.appleid.com` and rotate it if the
 /// user re-hides their address, so `sub` is the durable key, not email. The
 /// `email` from the id_token is still stored (UNIQUE; the relay address is
-/// unique per user) and links to an existing email-keyed account when it matches
-/// — mirroring the GitHub provider's two-phase upsert.
+/// unique per user) and links to an existing email-keyed account when it
+/// matches — resolved through the shared `auth::resolve_user` (QA-004).
 pub struct AppleProvider {
     client_id: String,
     team_id: String,
@@ -154,7 +152,21 @@ impl OAuthProvider for AppleProvider {
         let email = identity.email.to_lowercase();
         let login = email.clone();
 
-        let user_id = upsert_apple_user(&state.pool, &identity.sub, &login, &email).await?;
+        // QA-004: resolution (returning-user-by-sub, then link an unlinked
+        // email-keyed row, then insert) now lives in `auth::resolve_user`,
+        // shared with every other provider.
+        let user_id = auth::resolve_user(
+            &state.pool,
+            ProviderIdentity {
+                provider_id_column: auth::PROVIDER_COL_APPLE_SUB,
+                provider_id: &identity.sub,
+                login: &login,
+                email: &email,
+                allow_email_link: true,
+                conflict_style: ConflictStyle::Conflict,
+            },
+        )
+        .await?;
 
         session::create_session(
             &state.pool,
@@ -308,88 +320,6 @@ fn parse_identity(value: serde_json::Value) -> Result<AppleIdentity, RtDbError> 
     }
 
     Ok(AppleIdentity { sub, email })
-}
-
-/// Two-phase upsert mirroring `github::upsert_user`, keyed on Apple's stable
-/// `sub`: (1) a returning Apple user reuses the row, refreshing login/email;
-/// (2) an email-keyed account that is not yet Apple-linked claims `apple_sub`;
-/// (3) otherwise a brand-new user. A unique violation (the email already linked
-/// to a different account, or a concurrent login) is a deliberate 409.
-async fn upsert_apple_user(
-    pool: &PgPool,
-    apple_sub: &str,
-    login: &str,
-    email: &str,
-) -> Result<String, RtDbError> {
-    let mut tx = pool.begin().await?;
-
-    // (1) returning Apple user.
-    if let Some((id,)) =
-        sqlx::query_as::<_, (String,)>("SELECT id FROM rtdb_auth.users WHERE apple_sub = $1")
-            .bind(apple_sub)
-            .fetch_optional(&mut *tx)
-            .await?
-    {
-        sqlx::query("UPDATE rtdb_auth.users SET login = $1, email = $2 WHERE id = $3")
-            .bind(login)
-            .bind(email)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_conflict)?;
-        tx.commit().await?;
-        return Ok(id);
-    }
-
-    // (2) link an email-keyed account that is not yet Apple-linked.
-    if let Some((id,)) = sqlx::query_as::<_, (String,)>(
-        "UPDATE rtdb_auth.users \
-         SET apple_sub = $1, login = $2 \
-         WHERE email = $3 AND apple_sub IS NULL \
-         RETURNING id",
-    )
-    .bind(apple_sub)
-    .bind(login)
-    .bind(email)
-    .fetch_optional(&mut *tx)
-    .await?
-    {
-        tx.commit().await?;
-        return Ok(id);
-    }
-
-    // (3) brand-new user.
-    let id = new_id();
-    let now = now_ms();
-    sqlx::query(
-        "INSERT INTO rtdb_auth.users (id, apple_sub, login, email, created_at) \
-         VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(&id)
-    .bind(apple_sub)
-    .bind(login)
-    .bind(email)
-    .bind(now)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_conflict)?;
-    tx.commit().await?;
-    Ok(id)
-}
-
-/// Maps a Postgres unique-violation (`23505`) from an Apple upsert to a
-/// deliberate 409 — the email/`apple_sub` is already linked to another account
-/// (or a concurrent login just claimed it). Any other db error passes through.
-fn map_conflict(err: sqlx::Error) -> RtDbError {
-    let is_unique_violation = matches!(
-        &err,
-        sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23505")
-    );
-    if is_unique_violation {
-        RtDbError::conflict("account conflict")
-    } else {
-        RtDbError::from(err)
-    }
 }
 
 #[cfg(test)]

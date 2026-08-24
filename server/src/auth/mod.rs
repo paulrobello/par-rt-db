@@ -18,7 +18,7 @@ pub mod tokens;
 
 use sqlx::PgPool;
 
-use crate::db::{now_ms, sha256_hex};
+use crate::db::{new_id, now_ms, sha256_hex};
 use crate::error::RtDbError;
 use crate::protocol::{AuthedUser, UserKind};
 
@@ -428,6 +428,216 @@ pub fn authed_user(p: &Principal) -> AuthedUser {
     }
 }
 
+// --- QA-004: one `resolve_user` for every OAuth provider -------------------
+//
+// Every provider used to hand-roll its own "find or create the user" block.
+// Three (GitHub, Apple, Microsoft) persist a stable per-provider identifier
+// (`github_id`/`apple_sub`/`microsoft_sub`) and resolve by that column first,
+// falling back to linking an existing email-keyed row; three (Google, GitLab,
+// OIDC) persist no such column and resolve purely by the UNIQUE `email`
+// column. `resolve_user` below serves both shapes through one call so the
+// resolution rules can't silently drift between providers again.
+
+/// The fixed set of columns `resolve_user` may splice into SQL as
+/// `provider_id_column`. Every provider passes one of these `&'static str`
+/// constants — never a caller-supplied string — so the interpolation can
+/// never carry attacker-controlled text; the identifier *value* still binds
+/// through `$n` like any other parameter.
+pub const PROVIDER_COL_GITHUB_ID: &str = "github_id";
+pub const PROVIDER_COL_APPLE_SUB: &str = "apple_sub";
+pub const PROVIDER_COL_MICROSOFT_SUB: &str = "microsoft_sub";
+/// Sentinel for the three providers with no persisted per-provider id
+/// (Google, GitLab, OIDC): `resolve_user` recognizes this value and takes the
+/// single email-keyed upsert path instead of the three-step resolution.
+pub const PROVIDER_COL_EMAIL: &str = "email";
+
+/// How `resolve_user` reports a unique-violation race on the final
+/// insert/update. The three providers disagreed before consolidation
+/// (GitHub and Microsoft returned `PRECONDITION_FAILED`, Apple returned
+/// `CONFLICT`); both are preserved verbatim here per provider — GitHub's is
+/// asserted by `oauth_test.rs`, Microsoft's by its own DB-level tests — so no
+/// existing wire contract shifts. Google/GitLab/OIDC (previously unmapped;
+/// their `ON CONFLICT (email) DO UPDATE` couldn't 23505 on email) get
+/// `Conflict` as the more descriptive default for the one dormant path this
+/// still leaves (a same-transaction race on another constraint).
+#[derive(Debug, Clone, Copy)]
+pub enum ConflictStyle {
+    Precondition,
+    Conflict,
+}
+
+/// The identity a provider extracted from its token exchange / claims,
+/// normalized for `resolve_user`. `provider_id_column`/`provider_id` are
+/// meaningless (and ignored) when `provider_id_column == PROVIDER_COL_EMAIL`.
+pub struct ProviderIdentity<'a> {
+    pub provider_id_column: &'static str,
+    pub provider_id: &'a str,
+    pub login: &'a str,
+    pub email: &'a str,
+    /// Whether step (b) below — linking an existing email-keyed row that has
+    /// no value for `provider_id_column` — is permitted at all. `true` for
+    /// every provider except Microsoft, which passes
+    /// `xms_edov` ("email domain owner verified"): SEC-102's nOAuth defense
+    /// requires that a tenant-spoofable, domain-unverified email can never
+    /// adopt an existing account. This is a deliberate deviation from the
+    /// audit's literal 4-field struct sketch — the plan's flat "match by
+    /// provider_id_column, else email-link, else insert" would have silently
+    /// reintroduced the nOAuth hole for Microsoft if applied uniformly.
+    pub allow_email_link: bool,
+    pub conflict_style: ConflictStyle,
+}
+
+/// Resolves (finds or creates) the `rtdb_auth.users` row for a completed
+/// OAuth login and returns its id.
+///
+/// Two resolution shapes, chosen by `id.provider_id_column`:
+///
+/// **Id-keyed** (GitHub/Apple/Microsoft — `provider_id_column` is
+/// `github_id`/`apple_sub`/`microsoft_sub`):
+/// 1. An existing user with this `provider_id_column` value (a returning
+///    user of this provider) is reused, with `login`/`email` refreshed — so a
+///    provider-side email change follows the account instead of forking it.
+/// 2. Otherwise, when `id.allow_email_link` is true and the verified email
+///    already belongs to an account not yet linked to this provider
+///    (`provider_id_column IS NULL`), that account is linked by setting its
+///    `provider_id_column`. Both providers verified the email, so this is the
+///    same person.
+/// 3. Otherwise a new row is inserted.
+///
+/// **Email-keyed** (Google/GitLab/OIDC — `provider_id_column ==
+/// PROVIDER_COL_EMAIL`, no persisted per-provider id): a single upsert keyed
+/// on the UNIQUE `email` column, identical to each provider's pre-
+/// consolidation `ON CONFLICT (email) DO UPDATE`.
+///
+/// A UNIQUE violation on the final write — the email already linked to a
+/// *different* account, or a concurrent login racing past the checks — is
+/// mapped to a deliberate conflict per `id.conflict_style` rather than leaked
+/// as a 500.
+pub async fn resolve_user(pool: &PgPool, id: ProviderIdentity<'_>) -> Result<String, RtDbError> {
+    if id.provider_id_column == PROVIDER_COL_EMAIL {
+        return resolve_by_email_only(pool, &id).await;
+    }
+
+    // Only `github_id` is a non-text column (bigint); the value still arrives
+    // as `&str` (the plan's struct shape), so it is cast explicitly rather
+    // than bound as a mismatched type. `apple_sub`/`microsoft_sub` are text
+    // and need no cast.
+    let cast = if id.provider_id_column == PROVIDER_COL_GITHUB_ID {
+        "::bigint"
+    } else {
+        ""
+    };
+
+    let mut tx = pool.begin().await?;
+
+    // (1) returning user of this provider: reuse the row, refresh login/email.
+    let select_sql = format!(
+        "SELECT id FROM rtdb_auth.users WHERE {col} = $1{cast}",
+        col = id.provider_id_column,
+    );
+    if let Some((row_id,)) = sqlx::query_as::<_, (String,)>(&select_sql)
+        .bind(id.provider_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    {
+        sqlx::query("UPDATE rtdb_auth.users SET login = $1, email = $2 WHERE id = $3")
+            .bind(id.login)
+            .bind(id.email)
+            .bind(&row_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_conflict(e, id.conflict_style))?;
+        tx.commit().await?;
+        return Ok(row_id);
+    }
+
+    // (2) link an email-keyed account not yet linked to this provider.
+    if id.allow_email_link {
+        let link_sql = format!(
+            "UPDATE rtdb_auth.users \
+             SET {col} = $1{cast}, login = $2 \
+             WHERE email = $3 AND {col} IS NULL \
+             RETURNING id",
+            col = id.provider_id_column,
+        );
+        if let Some((row_id,)) = sqlx::query_as::<_, (String,)>(&link_sql)
+            .bind(id.provider_id)
+            .bind(id.login)
+            .bind(id.email)
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            tx.commit().await?;
+            return Ok(row_id);
+        }
+    }
+
+    // (3) brand-new user.
+    let row_id = new_id();
+    let now = now_ms();
+    let insert_sql = format!(
+        "INSERT INTO rtdb_auth.users (id, {col}, login, email, created_at) \
+         VALUES ($1, $2{cast}, $3, $4, $5)",
+        col = id.provider_id_column,
+    );
+    sqlx::query(&insert_sql)
+        .bind(&row_id)
+        .bind(id.provider_id)
+        .bind(id.login)
+        .bind(id.email)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| map_conflict(e, id.conflict_style))?;
+    tx.commit().await?;
+    Ok(row_id)
+}
+
+/// The email-keyed resolution path for providers with no persisted
+/// per-provider id (Google/GitLab/OIDC): identical to each provider's
+/// pre-consolidation single-statement upsert.
+async fn resolve_by_email_only(
+    pool: &PgPool,
+    id: &ProviderIdentity<'_>,
+) -> Result<String, RtDbError> {
+    let row_id = new_id();
+    let now = now_ms();
+    let (user_id,): (String,) = sqlx::query_as(
+        "INSERT INTO rtdb_auth.users (id, login, email, created_at) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (email) DO UPDATE SET login = EXCLUDED.login \
+         RETURNING id",
+    )
+    .bind(&row_id)
+    .bind(id.login)
+    .bind(id.email)
+    .bind(now)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| map_conflict(e, id.conflict_style))?;
+    Ok(user_id)
+}
+
+/// Maps a Postgres unique-violation (`23505`) from a `resolve_user` write to
+/// a deliberate conflict response per `style` (see `ConflictStyle`). Any
+/// other database error passes through as the usual internal-error mapping
+/// (logged, never leaked).
+fn map_conflict(err: sqlx::Error, style: ConflictStyle) -> RtDbError {
+    let is_unique_violation = matches!(
+        &err,
+        sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23505")
+    );
+    if !is_unique_violation {
+        return RtDbError::from(err);
+    }
+    match style {
+        ConflictStyle::Precondition => {
+            RtDbError::precondition("email already linked to another sign-in method")
+        }
+        ConflictStyle::Conflict => RtDbError::conflict("account conflict"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,5 +691,267 @@ mod tests {
         let user = authed_user(&principal);
         assert_eq!(user.github_id, Some(42));
         assert_eq!(user.github_login, Some("alice".to_string()));
+    }
+}
+
+/// QA-004 `resolve_user` coverage. Shared dev Postgres (never
+/// created/dropped); every value is uuid-unique so tests never collide.
+#[cfg(test)]
+mod resolve_user_tests {
+    use super::*;
+    use crate::error::ErrorCode;
+
+    async fn users_pool() -> PgPool {
+        let url = std::env::var("RTDB_TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://rtdb:rtdb@127.0.0.1:55434/rtdb".into());
+        let pool = sqlx::PgPool::connect(&url)
+            .await
+            .expect("connect to dev postgres");
+        crate::db::bootstrap(&pool)
+            .await
+            .expect("bootstrap rtdb_auth");
+        pool
+    }
+
+    fn uniq(prefix: &str) -> String {
+        format!("{prefix}-{}", uuid::Uuid::now_v7().simple())
+    }
+
+    async fn user_row(
+        pool: &PgPool,
+        id: &str,
+    ) -> (String, String, Option<i64>, Option<String>, Option<String>) {
+        sqlx::query_as::<_, (String, String, Option<i64>, Option<String>, Option<String>)>(
+            "SELECT login, email, github_id, apple_sub, microsoft_sub \
+             FROM rtdb_auth.users WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("user row exists")
+    }
+
+    async fn insert_email_user(pool: &PgPool, login: &str, email: &str) -> String {
+        let id = new_id();
+        sqlx::query(
+            "INSERT INTO rtdb_auth.users (id, login, email, created_at) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(&id)
+        .bind(login)
+        .bind(email)
+        .bind(now_ms())
+        .execute(pool)
+        .await
+        .expect("pre-insert email-keyed user");
+        id
+    }
+
+    fn apple_identity<'a>(sub: &'a str, login: &'a str, email: &'a str) -> ProviderIdentity<'a> {
+        ProviderIdentity {
+            provider_id_column: PROVIDER_COL_APPLE_SUB,
+            provider_id: sub,
+            login,
+            email,
+            allow_email_link: true,
+            conflict_style: ConflictStyle::Conflict,
+        }
+    }
+
+    // --- id-keyed path (github_id / apple_sub / microsoft_sub) -------------
+
+    #[tokio::test]
+    async fn id_keyed_insert_creates_a_brand_new_user() {
+        let pool = users_pool().await;
+        let sub = uniq("sub");
+        let login = uniq("login");
+        let email = format!("{}@resolve-user-test.example", uniq("a"));
+
+        let id = resolve_user(&pool, apple_identity(&sub, &login, &email))
+            .await
+            .expect("insert brand-new user");
+
+        let (row_login, row_email, _, row_sub, _) = user_row(&pool, &id).await;
+        assert_eq!(row_login, login);
+        assert_eq!(row_email, email);
+        assert_eq!(row_sub.as_deref(), Some(sub.as_str()));
+    }
+
+    /// The scenario QA-004 exists to fix: a returning user is found by their
+    /// stable provider id even though the provider's email for them changed —
+    /// the row is reused and the email follows the account instead of
+    /// forking a new row.
+    #[tokio::test]
+    async fn id_keyed_returning_user_is_reused_when_provider_email_changed() {
+        let pool = users_pool().await;
+        let sub = uniq("sub");
+        let old_email = format!("{}@resolve-user-test.example", uniq("old"));
+        let first_id = resolve_user(&pool, apple_identity(&sub, &uniq("login-a"), &old_email))
+            .await
+            .expect("initial insert");
+
+        let new_login = uniq("login-b");
+        let new_email = format!("{}@resolve-user-test.example", uniq("new"));
+        let second_id = resolve_user(&pool, apple_identity(&sub, &new_login, &new_email))
+            .await
+            .expect("returning-user resolve");
+
+        assert_eq!(second_id, first_id, "same provider id reuses the row");
+        let (row_login, row_email, _, row_sub, _) = user_row(&pool, &first_id).await;
+        assert_eq!(
+            row_login, new_login,
+            "login follows the provider-side change"
+        );
+        assert_eq!(
+            row_email, new_email,
+            "email follows the provider-side change"
+        );
+        assert_eq!(row_sub.as_deref(), Some(sub.as_str()));
+    }
+
+    #[tokio::test]
+    async fn id_keyed_links_an_unlinked_email_keyed_account_when_allowed() {
+        let pool = users_pool().await;
+        let email = format!("{}@resolve-user-test.example", uniq("carol"));
+        let existing_id = insert_email_user(&pool, &uniq("gh-carol"), &email).await;
+
+        let sub = uniq("sub");
+        let id = resolve_user(&pool, apple_identity(&sub, &uniq("login-carol"), &email))
+            .await
+            .expect("link by email");
+
+        assert_eq!(
+            id, existing_id,
+            "the existing account is adopted, not forked"
+        );
+        let (_, _, _, row_sub, _) = user_row(&pool, &existing_id).await;
+        assert_eq!(row_sub.as_deref(), Some(sub.as_str()));
+    }
+
+    /// SEC-102 regression guard: with `allow_email_link: false` (Microsoft's
+    /// nOAuth defense), the victim's existing row must never be adopted even
+    /// though the identity's provider id is new — a fresh account is created
+    /// instead. Mirrors the real caller contract: a provider that cannot
+    /// verify the email domain (`microsoft.rs::parse_identity`) never passes
+    /// the raw, potentially spoofed victim email through to `resolve_user`
+    /// in the first place — it substitutes a safe, provider-namespaced
+    /// contact address (the UPN) — so the identity here uses a distinct
+    /// email, exactly as every real caller does.
+    #[tokio::test]
+    async fn id_keyed_never_links_by_email_when_link_is_disallowed() {
+        let pool = users_pool().await;
+        let victim_email = format!("{}@resolve-user-test.example", uniq("victim"));
+        let victim_id = insert_email_user(&pool, &uniq("gh-victim"), &victim_email).await;
+
+        let sub = uniq("sub");
+        let login = uniq("login-attacker");
+        let safe_email = format!("{}@resolve-user-test.example", uniq("attacker"));
+        let mut identity = apple_identity(&sub, &login, &safe_email);
+        identity.allow_email_link = false;
+        let id = resolve_user(&pool, identity)
+            .await
+            .expect("a fresh account is created instead");
+
+        assert_ne!(id, victim_id, "the victim account is never adopted");
+        let (_, row_email, _, row_sub, _) = user_row(&pool, &victim_id).await;
+        assert_eq!(row_email, victim_email);
+        assert_eq!(row_sub, None, "the victim row stays unlinked");
+    }
+
+    #[tokio::test]
+    async fn id_keyed_insert_conflict_maps_to_the_requested_style() {
+        let pool = users_pool().await;
+        let taken_email = format!("{}@resolve-user-test.example", uniq("taken"));
+        insert_email_user(&pool, &uniq("gh-owner"), &taken_email).await;
+
+        let sub = uniq("sub");
+        let login = uniq("login");
+        let mut identity = apple_identity(&sub, &login, &taken_email);
+        identity.allow_email_link = false; // force the race onto the INSERT
+        identity.conflict_style = ConflictStyle::Precondition;
+        let err = resolve_user(&pool, identity).await.unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::PreconditionFailed);
+        assert_ne!(err.code, ErrorCode::Internal);
+    }
+
+    #[tokio::test]
+    async fn github_id_column_casts_the_text_provider_id_to_bigint() {
+        let pool = users_pool().await;
+        let github_id: i64 = 900_000_000 + (uuid::Uuid::now_v7().as_u128() % 90_000_000) as i64;
+        let github_id_str = github_id.to_string();
+        let login = uniq("gh-login");
+        let email = format!("{}@resolve-user-test.example", uniq("gh"));
+
+        let id = resolve_user(
+            &pool,
+            ProviderIdentity {
+                provider_id_column: PROVIDER_COL_GITHUB_ID,
+                provider_id: &github_id_str,
+                login: &login,
+                email: &email,
+                allow_email_link: true,
+                conflict_style: ConflictStyle::Precondition,
+            },
+        )
+        .await
+        .expect("insert with a bigint-cast provider id");
+
+        let (_, _, row_github_id, _, _) = user_row(&pool, &id).await;
+        assert_eq!(row_github_id, Some(github_id));
+    }
+
+    // --- email-keyed path (Google / GitLab / OIDC: no persisted id) --------
+
+    fn email_identity<'a>(login: &'a str, email: &'a str) -> ProviderIdentity<'a> {
+        ProviderIdentity {
+            provider_id_column: PROVIDER_COL_EMAIL,
+            provider_id: email,
+            login,
+            email,
+            allow_email_link: true,
+            conflict_style: ConflictStyle::Conflict,
+        }
+    }
+
+    #[tokio::test]
+    async fn email_keyed_insert_creates_a_brand_new_user() {
+        let pool = users_pool().await;
+        let login = uniq("login");
+        let email = format!("{}@resolve-user-test.example", uniq("g"));
+
+        let id = resolve_user(&pool, email_identity(&login, &email))
+            .await
+            .expect("insert brand-new user");
+
+        let (row_login, row_email, ..) = user_row(&pool, &id).await;
+        assert_eq!(row_login, login);
+        assert_eq!(row_email, email);
+    }
+
+    /// Google/GitLab/OIDC persist no per-provider id, so their durable key
+    /// IS the email: a second login with the same email always reuses the
+    /// row (this is the pre-consolidation `ON CONFLICT (email) DO UPDATE`
+    /// behavior, preserved verbatim) and refreshes the display login.
+    #[tokio::test]
+    async fn email_keyed_returning_user_with_the_same_email_reuses_the_row() {
+        let pool = users_pool().await;
+        let email = format!("{}@resolve-user-test.example", uniq("h"));
+        let first_id = resolve_user(&pool, email_identity(&uniq("login-a"), &email))
+            .await
+            .expect("initial insert");
+
+        let new_login = uniq("login-b");
+        let second_id = resolve_user(&pool, email_identity(&new_login, &email))
+            .await
+            .expect("returning-user resolve");
+
+        assert_eq!(second_id, first_id, "same email reuses the row");
+        let (row_login, row_email, ..) = user_row(&pool, &first_id).await;
+        assert_eq!(
+            row_login, new_login,
+            "login follows the provider-side change"
+        );
+        assert_eq!(row_email, email);
     }
 }

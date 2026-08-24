@@ -1,45 +1,27 @@
 /** Single-database overview — stats, quota/usage, and links into schema, data, and storage. */
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
 import { toErrorMessage } from "../lib/errors";
 import { formatBytes, formatNumber } from "../lib/format";
 import type { DbStats } from "../lib/types";
+import { useAsync } from "../lib/useAsync";
 import s from "./DbPage.module.css";
 
 export function DbPage() {
   const { db = "" } = useParams();
   const { client, refreshDatabases } = useAdmin();
   const navigate = useNavigate();
-  const [stats, setStats] = useState<DbStats | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const {
+    data: stats,
+    loading,
+    error,
+  } = useAsync<DbStats | null>(() => client.dbStats(db), [client, db], null);
   const [confirming, setConfirming] = useState(false);
   const [confirmText, setConfirmText] = useState("");
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
-    setStats(null);
-    client
-      .dbStats(db)
-      .then((st) => {
-        if (!cancelled) setStats(st);
-      })
-      .catch((e) => {
-        if (!cancelled) setError(toErrorMessage(e));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [client, db]);
 
   async function deleteDb() {
     setDeleting(true);

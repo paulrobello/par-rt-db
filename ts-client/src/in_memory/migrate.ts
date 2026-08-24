@@ -654,6 +654,16 @@ function applyRenameFieldDirective(
   }
   if (t.ownerField === d.from) t.ownerField = d.to;
   if (t.collaboratorsField === d.from) t.collaboratorsField = d.to;
+  // QA-002: `autoIncrementField`, `updatedAtField`, and `ttl.field` are
+  // name-bearing surfaces the same way `ownerField`/`collaboratorsField` are
+  // — missed here previously. Mirrors server `migrate::rename_field_refs`.
+  if (t.autoIncrementField === d.from) t.autoIncrementField = d.to;
+  if (t.updatedAtField === d.from) t.updatedAtField = d.to;
+  if (t.ttl !== undefined && t.ttl.field === d.from) t.ttl = { ...t.ttl, field: d.to };
+  // QA-002: the `authorize` predicate follows the rename the way `computed`
+  // expressions do — missed here previously. Mirrors server
+  // `migrate::rename_field_refs`.
+  if (t.authorize !== undefined) renameFilterFields(t.authorize, d.from, d.to);
   // ENH-028: the computed map follows the rename the way owner/collaborators
   // do — an entry KEYED on the renamed field moves to the new name (leaving
   // it keyed on `from` would fail push validation's declared-field rule on
@@ -669,6 +679,15 @@ function applyRenameFieldDirective(
     }
     for (const expr of Object.values(t.computed)) {
       renameValueExprFields(expr, d.from, d.to);
+    }
+  }
+  // QA-002: `defaults` is keyed by field name the same way `computed` is —
+  // the entry moves to the new key. Missed here previously.
+  if (t.defaults !== undefined) {
+    const keyed = t.defaults[d.from];
+    if (keyed !== undefined) {
+      delete t.defaults[d.from];
+      t.defaults[d.to] = keyed;
     }
   }
   let affected = 0;

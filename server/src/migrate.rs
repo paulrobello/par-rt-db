@@ -189,228 +189,298 @@ pub fn plan_migration(old: &SchemaDef, directives: &[Directive]) -> Result<Schem
 
 fn validate_one(schema: &mut SchemaDef, d: &Directive) -> Result<(), RtDbError> {
     match d {
-        Directive::RenameField { table, from, to } => {
-            let t = table_mut(schema, table)?;
-            if t.fields.contains_key(to) {
-                return Err(RtDbError::bad_request(format!(
-                    "rename target '{table}.{to}' already exists"
-                )));
-            }
-            let ft = t.fields.remove(from).ok_or_else(|| {
-                RtDbError::bad_request(format!("renamed field '{table}.{from}' does not exist"))
-            })?;
-            t.fields.insert(to.clone(), ft);
-            // fix index references that used `from`
-            for ix in t.indexes.iter_mut() {
-                for f in ix.fields.iter_mut() {
-                    if f == from {
-                        *f = to.clone();
-                    }
-                }
-            }
-            if t.owner_field.as_deref() == Some(from.as_str()) {
-                t.owner_field = Some(to.clone());
-            }
-            if t.collaborators_field.as_deref() == Some(from.as_str()) {
-                t.collaborators_field = Some(to.clone());
-            }
-            if t.auto_increment_field.as_deref() == Some(from.as_str()) {
-                t.auto_increment_field = Some(to.clone());
-            }
-            if let Some(expr) = t.authorize.as_mut() {
-                rename_filter_fields(expr, from, to);
-            }
-            // ENH-028: the computed map follows the rename the way `defaults`
-            // does — an entry KEYED on the renamed field moves to the new name
-            // (its declared field moved; leaving it keyed on `from` would fail
-            // `validate_computed`'s declared-field rule on the derived schema),
-            // and every expression's `Field` references (including
-            // `Case.whens` predicates) are rewritten to read the renamed doc
-            // key. Input values are unchanged by the rename, so stored
-            // computed values stay correct; the next write re-stamps.
-            if let Some(expr) = t.computed.remove(from) {
-                t.computed.insert(to.clone(), expr);
-            }
-            for expr in t.computed.values_mut() {
-                rename_value_expr_fields(expr, from, to);
-            }
-            if let Some(value) = t.defaults.remove(from) {
-                t.defaults.insert(to.clone(), value);
-            }
-        }
-        Directive::RenameTable { from, to } => {
-            if schema.tables.contains_key(to) {
-                return Err(RtDbError::bad_request(format!(
-                    "rename target table '{to}' already exists"
-                )));
-            }
-            let mut def = schema.tables.remove(from).ok_or_else(|| {
-                RtDbError::bad_request(format!("renamed table '{from}' does not exist"))
-            })?;
-            // Id references to `from` follow the rename. The renamed table was
-            // just removed from the map, so the loop over the remaining tables
-            // would skip its own self-referential `Id { table: from }` fields —
-            // rewrite those here first, lest the rename leave a dangling ref.
-            for ft in def.fields.values_mut() {
-                if let FieldType::Id { table, .. } = ft
-                    && table == from
-                {
-                    *table = to.clone();
-                }
-            }
-            for t in schema.tables.values_mut() {
-                for ft in t.fields.values_mut() {
-                    if let FieldType::Id { table, .. } = ft
-                        && table == from
-                    {
-                        *table = to.clone();
-                    }
-                }
-            }
-            schema.tables.insert(to.clone(), def);
-        }
+        Directive::RenameField { table, from, to } => plan_rename_field(schema, table, from, to),
+        Directive::RenameTable { from, to } => plan_rename_table(schema, from, to),
         Directive::ChangeType {
             table,
             field,
             to: new_ty,
             cast,
             ..
-        } => {
-            let t = table_mut(schema, table)?;
-            let old_ty = t.fields.get(field).ok_or_else(|| {
-                RtDbError::bad_request(format!("changed field '{table}.{field}' does not exist"))
-            })?;
-            if !cast_valid_for(*cast, old_ty) {
-                return Err(RtDbError::bad_request(format!(
-                    "cast {cast:?} is not valid for {table}.{field}"
-                )));
-            }
-            t.fields.insert(field.clone(), new_ty.clone());
-            // A default was validated against the OLD type; the retyped field
-            // may no longer accept it, so the entry goes rather than risking a
-            // push-time-invalid derived schema (re-declare it on a later push).
-            t.defaults.remove(field);
-        }
-        Directive::DropField { table, field } => {
-            let t = table_mut(schema, table)?;
-            // `authorize` is load-bearing for auth: silently clearing it (as
-            // ownerField/collaboratorsField are below) would widen access. A
-            // field the predicate still references must be untied explicitly —
-            // reject the migration so the caller amends `authorize` first.
-            if let Some(expr) = &t.authorize
-                && filter_expr_references_field(expr, field)
-            {
-                return Err(RtDbError::bad_request(format!(
-                    "cannot drop field '{table}.{field}': still referenced by the authorize predicate (amend authorize first)"
-                )));
-            }
-            if t.fields.remove(field).is_none() {
-                return Err(RtDbError::bad_request(format!(
-                    "dropped field '{table}.{field}' does not exist"
-                )));
-            }
-            for ix in t.indexes.iter_mut() {
-                ix.fields.retain(|f| f != field);
-            }
-            if t.owner_field.as_deref() == Some(field.as_str()) {
-                t.owner_field = None;
-            }
-            if t.collaborators_field.as_deref() == Some(field.as_str()) {
-                t.collaborators_field = None;
-            }
-            if t.auto_increment_field.as_deref() == Some(field.as_str()) {
-                t.auto_increment_field = None;
-            }
-            // ENH-028: a computed expression reading the dropped field would
-            // dangle — every future write fails its stamp. Reject, naming the
-            // computed field, so the caller amends the computed map first (a
-            // push removing the entry leaves stored values in place).
-            let mut computed_offender: Option<&String> = None;
-            for (computed_field, expr) in &t.computed {
-                let mut referenced = false;
-                crate::value_expr::walk_value_expr_fields(expr, &mut |f| {
-                    if f == field {
-                        referenced = true;
-                    }
-                });
-                if referenced {
-                    computed_offender = Some(computed_field);
-                    break;
-                }
-            }
-            if let Some(computed_field) = computed_offender {
-                return Err(RtDbError::bad_request(format!(
-                    "cannot drop field '{table}.{field}': it is referenced by computed field '{table}.{computed_field}'; drop the computed field first"
-                )));
-            }
-            // An entry KEYED on the dropped field goes with it (the `defaults`
-            // discipline): the applier removes the stored key from every doc,
-            // so leaving the entry would fail `validate_computed`'s
-            // declared-field rule on the derived schema.
-            t.computed.remove(field);
-            t.defaults.remove(field);
-        }
-        Directive::DropTable { name } => {
-            if schema.tables.remove(name).is_none() {
-                return Err(RtDbError::bad_request(format!(
-                    "dropped table '{name}' does not exist"
-                )));
-            }
-        }
-        Directive::DropIndex { table, name } => {
-            let t = table_mut(schema, table)?;
-            if !t.indexes.iter().any(|ix| &ix.name == name) {
-                return Err(RtDbError::bad_request(format!(
-                    "dropped index '{table}.{name}' does not exist"
-                )));
-            }
-            t.indexes.retain(|ix| &ix.name != name);
-        }
-        Directive::SetDefault { table, field, .. } => {
-            let t = table_mut(schema, table)?;
-            if !t.fields.contains_key(field) {
-                return Err(RtDbError::bad_request(format!(
-                    "setDefault target '{table}.{field}' does not exist"
-                )));
-            }
-            // data-only; schema unchanged
-        }
+        } => plan_change_type(schema, table, field, new_ty, *cast),
+        Directive::DropField { table, field } => plan_drop_field(schema, table, field),
+        Directive::DropTable { name } => plan_drop_table(schema, name),
+        Directive::DropIndex { table, name } => plan_drop_index(schema, table, name),
+        Directive::SetDefault { table, field, .. } => plan_set_default(schema, table, field),
         Directive::EvalExpr {
             table,
             set,
             expr,
             where_clause,
-        } => {
-            let t = table_mut(schema, table)?; // table must exist
-            // `set` is a field path; the field need not exist (evalExpr may populate a
-            // new key the caller adds via a later additive push), but the name must be
-            // a valid identifier. It is interpolated into the `jsonb_set` key literal,
-            // so a stray quote or backslash would otherwise break the SQL string.
-            if !crate::schema::is_valid_identifier(set, crate::schema::MAX_FIELD_NAME_LEN) {
-                return Err(RtDbError::bad_request(format!(
-                    "evalExpr 'set' must be a valid field name, got '{set}'"
-                )));
-            }
-            // ENH-020 / SEC-107: a typed `ValueExpr` payload is validated here —
-            // every `Field` must name a declared field on this table, and the
-            // grammar is closed (no subquery / function-call-by-name / raw-SQL
-            // node), so a typed `expr` cannot carry an injection by construction.
-            // The typed `where` (a `FilterExpr`) is likewise field-validated here
-            // via the same `validate_filter_expr_fields` chokepoint the read path
-            // uses. The legacy string `expr`/`where` forms remain raw SQL
-            // interpolated unbound — their containment boundary is the admin gate
-            // (`admin_migrate` admits a legacy `evalExpr` only to the root
-            // admin_key holder, whose reach it does not expand), retained for one
-            // deprecation cycle under the dual-accept rollout.
-            match expr {
-                ExprSource::Typed(ve) => validate_value_expr_fields(ve, t)?,
-                ExprSource::Legacy(_) => {}
-            }
-            if let Some(CondSource::Typed(f)) = where_clause {
-                crate::schema::validate_filter_expr_fields(f, t, false, false)
-                    .map_err(|e| RtDbError::bad_request(e.message))?;
+        } => plan_eval_expr(schema, table, set, expr, where_clause.as_ref()),
+    }
+}
+
+/// Rewrite every reference to field `from` on `table` to `to`, in place. This
+/// is the single chokepoint for the "reference" half of a field rename — the
+/// `fields` map key move and the `computed`/`defaults` map key moves are the
+/// *declaration* half and stay in `plan_rename_field` alongside it. Every
+/// other name-bearing surface on `TableDef` that can name a field goes here:
+/// index field lists, `ownerField`, `collaboratorsField`, `autoIncrementField`,
+/// `updatedAtField`, `ttl.field`, the `authorize` predicate, and every
+/// `computed` expression's `Field` references (including `Case.whens`
+/// predicates). Enumerated directly from the `TableDef` struct in
+/// `schema.rs` — if a new name-bearing field is added there, add its rewrite
+/// here too.
+fn rename_field_refs(table: &mut TableDef, from: &str, to: &str) {
+    for ix in table.indexes.iter_mut() {
+        for f in ix.fields.iter_mut() {
+            if f == from {
+                *f = to.to_string();
             }
         }
+    }
+    if table.owner_field.as_deref() == Some(from) {
+        table.owner_field = Some(to.to_string());
+    }
+    if table.collaborators_field.as_deref() == Some(from) {
+        table.collaborators_field = Some(to.to_string());
+    }
+    if table.auto_increment_field.as_deref() == Some(from) {
+        table.auto_increment_field = Some(to.to_string());
+    }
+    if table.updated_at_field.as_deref() == Some(from) {
+        table.updated_at_field = Some(to.to_string());
+    }
+    if let Some(ttl) = table.ttl.as_mut()
+        && ttl.field == from
+    {
+        ttl.field = to.to_string();
+    }
+    if let Some(expr) = table.authorize.as_mut() {
+        rename_filter_fields(expr, from, to);
+    }
+    for expr in table.computed.values_mut() {
+        rename_value_expr_fields(expr, from, to);
+    }
+}
+
+fn plan_rename_field(
+    schema: &mut SchemaDef,
+    table: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), RtDbError> {
+    let t = table_mut(schema, table)?;
+    if t.fields.contains_key(to) {
+        return Err(RtDbError::bad_request(format!(
+            "rename target '{table}.{to}' already exists"
+        )));
+    }
+    let ft = t.fields.remove(from).ok_or_else(|| {
+        RtDbError::bad_request(format!("renamed field '{table}.{from}' does not exist"))
+    })?;
+    t.fields.insert(to.to_string(), ft);
+    // ENH-028: the computed map follows the rename the way `defaults` does —
+    // an entry KEYED on the renamed field moves to the new name (its declared
+    // field moved; leaving it keyed on `from` would fail `validate_computed`'s
+    // declared-field rule on the derived schema). Input values are unchanged
+    // by the rename, so stored computed values stay correct; the next write
+    // re-stamps.
+    if let Some(expr) = t.computed.remove(from) {
+        t.computed.insert(to.to_string(), expr);
+    }
+    if let Some(value) = t.defaults.remove(from) {
+        t.defaults.insert(to.to_string(), value);
+    }
+    rename_field_refs(t, from, to);
+    Ok(())
+}
+
+fn plan_rename_table(schema: &mut SchemaDef, from: &str, to: &str) -> Result<(), RtDbError> {
+    if schema.tables.contains_key(to) {
+        return Err(RtDbError::bad_request(format!(
+            "rename target table '{to}' already exists"
+        )));
+    }
+    let mut def = schema
+        .tables
+        .remove(from)
+        .ok_or_else(|| RtDbError::bad_request(format!("renamed table '{from}' does not exist")))?;
+    // Id references to `from` follow the rename. The renamed table was just
+    // removed from the map, so the loop over the remaining tables would skip
+    // its own self-referential `Id { table: from }` fields — rewrite those
+    // here first, lest the rename leave a dangling ref.
+    for ft in def.fields.values_mut() {
+        if let FieldType::Id { table, .. } = ft
+            && table == from
+        {
+            *table = to.to_string();
+        }
+    }
+    for t in schema.tables.values_mut() {
+        for ft in t.fields.values_mut() {
+            if let FieldType::Id { table, .. } = ft
+                && table == from
+            {
+                *table = to.to_string();
+            }
+        }
+    }
+    schema.tables.insert(to.to_string(), def);
+    Ok(())
+}
+
+fn plan_change_type(
+    schema: &mut SchemaDef,
+    table: &str,
+    field: &str,
+    new_ty: &FieldType,
+    cast: Cast,
+) -> Result<(), RtDbError> {
+    let t = table_mut(schema, table)?;
+    let old_ty = t.fields.get(field).ok_or_else(|| {
+        RtDbError::bad_request(format!("changed field '{table}.{field}' does not exist"))
+    })?;
+    if !cast_valid_for(cast, old_ty) {
+        return Err(RtDbError::bad_request(format!(
+            "cast {cast:?} is not valid for {table}.{field}"
+        )));
+    }
+    t.fields.insert(field.to_string(), new_ty.clone());
+    // A default was validated against the OLD type; the retyped field may no
+    // longer accept it, so the entry goes rather than risking a
+    // push-time-invalid derived schema (re-declare it on a later push).
+    t.defaults.remove(field);
+    Ok(())
+}
+
+fn plan_drop_field(schema: &mut SchemaDef, table: &str, field: &str) -> Result<(), RtDbError> {
+    let t = table_mut(schema, table)?;
+    // `authorize` is load-bearing for auth: silently clearing it (as
+    // ownerField/collaboratorsField are below) would widen access. A field
+    // the predicate still references must be untied explicitly — reject the
+    // migration so the caller amends `authorize` first.
+    if let Some(expr) = &t.authorize
+        && filter_expr_references_field(expr, field)
+    {
+        return Err(RtDbError::bad_request(format!(
+            "cannot drop field '{table}.{field}': still referenced by the authorize predicate (amend authorize first)"
+        )));
+    }
+    if t.fields.remove(field).is_none() {
+        return Err(RtDbError::bad_request(format!(
+            "dropped field '{table}.{field}' does not exist"
+        )));
+    }
+    for ix in t.indexes.iter_mut() {
+        ix.fields.retain(|f| f != field);
+    }
+    if t.owner_field.as_deref() == Some(field) {
+        t.owner_field = None;
+    }
+    if t.collaborators_field.as_deref() == Some(field) {
+        t.collaborators_field = None;
+    }
+    if t.auto_increment_field.as_deref() == Some(field) {
+        t.auto_increment_field = None;
+    }
+    if t.updated_at_field.as_deref() == Some(field) {
+        t.updated_at_field = None;
+    }
+    // Cleared the way `ownerField`/`collaboratorsField`/`autoIncrementField`
+    // are above — the dropped field is gone, so the `ttl` declaration naming
+    // it can no longer resolve.
+    if t.ttl.as_ref().is_some_and(|ttl| ttl.field == field) {
+        t.ttl = None;
+    }
+    // ENH-028: a computed expression reading the dropped field would dangle —
+    // every future write fails its stamp. Reject, naming the computed field,
+    // so the caller amends the computed map first (a push removing the entry
+    // leaves stored values in place).
+    let mut computed_offender: Option<&String> = None;
+    for (computed_field, expr) in &t.computed {
+        let mut referenced = false;
+        crate::value_expr::walk_value_expr_fields(expr, &mut |f| {
+            if f == field {
+                referenced = true;
+            }
+        });
+        if referenced {
+            computed_offender = Some(computed_field);
+            break;
+        }
+    }
+    if let Some(computed_field) = computed_offender {
+        return Err(RtDbError::bad_request(format!(
+            "cannot drop field '{table}.{field}': it is referenced by computed field '{table}.{computed_field}'; drop the computed field first"
+        )));
+    }
+    // An entry KEYED on the dropped field goes with it (the `defaults`
+    // discipline): the applier removes the stored key from every doc, so
+    // leaving the entry would fail `validate_computed`'s declared-field rule
+    // on the derived schema.
+    t.computed.remove(field);
+    t.defaults.remove(field);
+    Ok(())
+}
+
+fn plan_drop_table(schema: &mut SchemaDef, name: &str) -> Result<(), RtDbError> {
+    if schema.tables.remove(name).is_none() {
+        return Err(RtDbError::bad_request(format!(
+            "dropped table '{name}' does not exist"
+        )));
+    }
+    Ok(())
+}
+
+fn plan_drop_index(schema: &mut SchemaDef, table: &str, name: &str) -> Result<(), RtDbError> {
+    let t = table_mut(schema, table)?;
+    if !t.indexes.iter().any(|ix| ix.name == name) {
+        return Err(RtDbError::bad_request(format!(
+            "dropped index '{table}.{name}' does not exist"
+        )));
+    }
+    t.indexes.retain(|ix| ix.name != name);
+    Ok(())
+}
+
+fn plan_set_default(schema: &mut SchemaDef, table: &str, field: &str) -> Result<(), RtDbError> {
+    let t = table_mut(schema, table)?;
+    if !t.fields.contains_key(field) {
+        return Err(RtDbError::bad_request(format!(
+            "setDefault target '{table}.{field}' does not exist"
+        )));
+    }
+    // data-only; schema unchanged
+    Ok(())
+}
+
+fn plan_eval_expr(
+    schema: &mut SchemaDef,
+    table: &str,
+    set: &str,
+    expr: &ExprSource,
+    where_clause: Option<&CondSource>,
+) -> Result<(), RtDbError> {
+    let t = table_mut(schema, table)?; // table must exist
+    // `set` is a field path; the field need not exist (evalExpr may populate a
+    // new key the caller adds via a later additive push), but the name must be
+    // a valid identifier. It is interpolated into the `jsonb_set` key literal,
+    // so a stray quote or backslash would otherwise break the SQL string.
+    if !crate::schema::is_valid_identifier(set, crate::schema::MAX_FIELD_NAME_LEN) {
+        return Err(RtDbError::bad_request(format!(
+            "evalExpr 'set' must be a valid field name, got '{set}'"
+        )));
+    }
+    // ENH-020 / SEC-107: a typed `ValueExpr` payload is validated here — every
+    // `Field` must name a declared field on this table, and the grammar is
+    // closed (no subquery / function-call-by-name / raw-SQL node), so a typed
+    // `expr` cannot carry an injection by construction. The typed `where` (a
+    // `FilterExpr`) is likewise field-validated here via the same
+    // `validate_filter_expr_fields` chokepoint the read path uses. The legacy
+    // string `expr`/`where` forms remain raw SQL interpolated unbound — their
+    // containment boundary is the admin gate (`admin_migrate` admits a legacy
+    // `evalExpr` only to the root admin_key holder, whose reach it does not
+    // expand), retained for one deprecation cycle under the dual-accept
+    // rollout.
+    match expr {
+        ExprSource::Typed(ve) => validate_value_expr_fields(ve, t)?,
+        ExprSource::Legacy(_) => {}
+    }
+    if let Some(CondSource::Typed(f)) = where_clause {
+        crate::schema::validate_filter_expr_fields(f, t, false, false)
+            .map_err(|e| RtDbError::bad_request(e.message))?;
     }
     Ok(())
 }
@@ -584,6 +654,17 @@ pub struct MigrationEffects {
     pub ops: Vec<DocOp>,
 }
 
+/// Bundles the per-directive apply context (the tx, the schema names, and the
+/// effects accumulator) shared by every `apply_*` DB-applier and `apply_one`,
+/// replacing the repeated argument tuple each used to carry individually.
+struct MigrateCtx<'a, 'c> {
+    tx: &'a mut sqlx::Transaction<'c, sqlx::Postgres>,
+    schema_name: &'a str,
+    old: &'a SchemaDef,
+    derived: &'a SchemaDef,
+    fx: &'a mut MigrationEffects,
+}
+
 /// Applies already-validated `directives` inside `tx` against `db`'s physical
 /// tables. `derived` is the post-migration schema (from `plan_migration`).
 /// Bulk casts mirror `ddl::backfill_expr`. Does NOT commit; on `dry_run` the
@@ -609,7 +690,14 @@ pub async fn apply_migration(
     let mut working = old.clone();
     let mut fx = MigrationEffects::default();
     for d in directives {
-        let report = apply_one(tx, &schema_name, &working, derived, d, &mut fx).await?;
+        let mut ctx = MigrateCtx {
+            tx: &mut *tx,
+            schema_name: &schema_name,
+            old: &working,
+            derived,
+            fx: &mut fx,
+        };
+        let report = apply_one(&mut ctx, d).await?;
         // Advance `working` past this directive. `plan_migration` already proved
         // the whole sequence folds cleanly on `old`, so this cannot error here.
         validate_one(&mut working, d)?;
@@ -620,71 +708,48 @@ pub async fn apply_migration(
 }
 
 async fn apply_one(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    schema_name: &str,
-    old: &SchemaDef,
-    derived: &SchemaDef,
+    ctx: &mut MigrateCtx<'_, '_>,
     d: &Directive,
-    fx: &mut MigrationEffects,
 ) -> Result<DirectiveReport, RtDbError> {
     match d {
         Directive::RenameField { table, from, to } => {
-            apply_rename_field(tx, schema_name, old, table, from, to, fx).await
+            apply_rename_field(ctx, table, from, to).await
         }
-        Directive::RenameTable { from, to } => {
-            apply_rename_table(tx, schema_name, from, to, fx).await
-        }
-        Directive::DropField { table, field } => {
-            apply_drop_field(tx, schema_name, old, table, field, fx).await
-        }
-        Directive::DropTable { name } => apply_drop_table(tx, schema_name, name, fx).await,
-        Directive::DropIndex { table, name } => {
-            apply_drop_index(tx, schema_name, old, derived, table, name, fx).await
-        }
+        Directive::RenameTable { from, to } => apply_rename_table(ctx, from, to).await,
+        Directive::DropField { table, field } => apply_drop_field(ctx, table, field).await,
+        Directive::DropTable { name } => apply_drop_table(ctx, name).await,
+        Directive::DropIndex { table, name } => apply_drop_index(ctx, table, name).await,
         Directive::SetDefault {
             table,
             field,
             value,
-        } => apply_set_default(tx, schema_name, derived, table, field, value, fx).await,
+        } => apply_set_default(ctx, table, field, value).await,
         Directive::ChangeType {
             table,
             field,
             to,
             cast,
             default,
-        } => {
-            apply_change_type(
-                tx,
-                schema_name,
-                old,
-                derived,
-                table,
-                field,
-                to,
-                cast,
-                default,
-                fx,
-            )
-            .await
-        }
+        } => apply_change_type(ctx, table, field, to, cast, default).await,
         Directive::EvalExpr {
             table,
             set,
             expr,
             where_clause,
-        } => apply_eval_expr(tx, schema_name, derived, table, set, expr, where_clause, fx).await,
+        } => apply_eval_expr(ctx, table, set, expr, where_clause).await,
     }
 }
 
 async fn apply_rename_field(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    schema_name: &str,
-    old: &SchemaDef,
+    ctx: &mut MigrateCtx<'_, '_>,
     table: &str,
     from: &str,
     to: &str,
-    fx: &mut MigrationEffects,
 ) -> Result<DirectiveReport, RtDbError> {
+    let tx = &mut *ctx.tx;
+    let schema_name = ctx.schema_name;
+    let old = ctx.old;
+    let fx = &mut *ctx.fx;
     // SEC-124: `from` and `to` are interpolated into the SQL string literals
     // below (`doc ? '{from}'`, `doc - '{from}'`, `doc->'{from}'`, and the
     // `jsonb_set` path literal in `rewrite_doc_key`). A real check — the prior
@@ -721,12 +786,13 @@ async fn apply_rename_field(
 }
 
 async fn apply_rename_table(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    schema_name: &str,
+    ctx: &mut MigrateCtx<'_, '_>,
     from: &str,
     to: &str,
-    fx: &mut MigrationEffects,
 ) -> Result<DirectiveReport, RtDbError> {
+    let tx = &mut *ctx.tx;
+    let schema_name = ctx.schema_name;
+    let fx = &mut *ctx.fx;
     // SEC-124: `from`/`to` flow into a `pg_table()` physical ident inside a
     // double-quoted DDL literal; `pg_table` only lowercases + prefixes, so a
     // quote-bearing name would still break out of the `"..."` quoting. Real
@@ -761,13 +827,14 @@ async fn apply_rename_table(
 }
 
 async fn apply_drop_field(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    schema_name: &str,
-    old: &SchemaDef,
+    ctx: &mut MigrateCtx<'_, '_>,
     table: &str,
     field: &str,
-    fx: &mut MigrationEffects,
 ) -> Result<DirectiveReport, RtDbError> {
+    let tx = &mut *ctx.tx;
+    let schema_name = ctx.schema_name;
+    let old = ctx.old;
+    let fx = &mut *ctx.fx;
     // SEC-124: see RenameField. `field` is interpolated unbound into
     // `doc ? '{field}'` and `doc - '{field}'` literals.
     require_field_ident(field)?;
@@ -823,11 +890,12 @@ async fn apply_drop_field(
 }
 
 async fn apply_drop_table(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    schema_name: &str,
+    ctx: &mut MigrateCtx<'_, '_>,
     name: &str,
-    fx: &mut MigrationEffects,
 ) -> Result<DirectiveReport, RtDbError> {
+    let tx = &mut *ctx.tx;
+    let schema_name = ctx.schema_name;
+    let fx = &mut *ctx.fx;
     let t = pg_table(name);
     let ids = all_ids(tx, schema_name, &t).await?;
     sqlx::query(&format!("DROP TABLE \"{schema_name}\".\"{t}\""))
@@ -851,14 +919,15 @@ async fn apply_drop_table(
 }
 
 async fn apply_drop_index(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    schema_name: &str,
-    old: &SchemaDef,
-    derived: &SchemaDef,
+    ctx: &mut MigrateCtx<'_, '_>,
     table: &str,
     name: &str,
-    fx: &mut MigrationEffects,
 ) -> Result<DirectiveReport, RtDbError> {
+    let tx = &mut *ctx.tx;
+    let schema_name = ctx.schema_name;
+    let old = ctx.old;
+    let derived = ctx.derived;
+    let fx = &mut *ctx.fx;
     // SEC-124: `table` and `name` are composed into the `i_{table}_{name}`
     // index ident (both lowercased) and dropped inside a `"..."` literal;
     // a quote-bearing value would still escape the quoting (prior site had
@@ -939,14 +1008,15 @@ async fn apply_drop_index(
 }
 
 async fn apply_set_default(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    schema_name: &str,
-    derived: &SchemaDef,
+    ctx: &mut MigrateCtx<'_, '_>,
     table: &str,
     field: &str,
     value: &serde_json::Value,
-    fx: &mut MigrationEffects,
 ) -> Result<DirectiveReport, RtDbError> {
+    let tx = &mut *ctx.tx;
+    let schema_name = ctx.schema_name;
+    let derived = ctx.derived;
+    let fx = &mut *ctx.fx;
     // SEC-124: see RenameField. `field` is interpolated unbound into
     // `NOT doc ? '{field}'` and a jsonb_set path literal.
     require_field_ident(field)?;
@@ -999,19 +1069,19 @@ async fn apply_set_default(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn apply_change_type(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    schema_name: &str,
-    old: &SchemaDef,
-    derived: &SchemaDef,
+    ctx: &mut MigrateCtx<'_, '_>,
     table: &str,
     field: &str,
     to: &FieldType,
     cast: &Cast,
     default: &Option<serde_json::Value>,
-    fx: &mut MigrationEffects,
 ) -> Result<DirectiveReport, RtDbError> {
+    let tx = &mut *ctx.tx;
+    let schema_name = ctx.schema_name;
+    let old = ctx.old;
+    let derived = ctx.derived;
+    let fx = &mut *ctx.fx;
     // SEC-124: see RenameField. `field` is interpolated unbound into
     // `doc ? '{field}'`, `doc->'{field}'`, and a jsonb_set path literal.
     require_field_ident(field)?;
@@ -1113,17 +1183,17 @@ async fn apply_change_type(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn apply_eval_expr(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    schema_name: &str,
-    derived: &SchemaDef,
+    ctx: &mut MigrateCtx<'_, '_>,
     table: &str,
     set: &str,
     expr: &ExprSource,
     where_clause: &Option<CondSource>,
-    fx: &mut MigrationEffects,
 ) -> Result<DirectiveReport, RtDbError> {
+    let tx = &mut *ctx.tx;
+    let schema_name = ctx.schema_name;
+    let derived = ctx.derived;
+    let fx = &mut *ctx.fx;
     // Capture the affected ids BEFORE the rewrite using the same predicate so
     // DocOps cover exactly the rows about to change. Scoping the indexed-column
     // recompute by these ids (not by re-evaluating the predicate) is strictly

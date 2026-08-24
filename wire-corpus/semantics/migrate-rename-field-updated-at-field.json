@@ -1,0 +1,53 @@
+{
+  "name": "migrate-rename-field-updated-at-field",
+  "$comment": "QA-002: renameField follows `updatedAtField` when the renamed field is the one it names — the derived schema's `updatedAtField` now reads `modifiedAt`, not the dropped `updatedAt`, and the server keeps stamping the renamed key on later writes (the follow-up filter matches the migrated row under the new field name).",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "title": { "type": "string" },
+          "updatedAt": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_title", "fields": ["title"] }],
+        "updatedAtField": "updatedAt"
+      }
+    }
+  },
+  "seed": [
+    { "title": "a" }
+  ],
+  "op": {
+    "migrate": {
+      "directives": [
+        { "op": "renameField", "table": "tasks", "from": "updatedAt", "to": "modifiedAt" }
+      ],
+      "dryRun": false
+    }
+  },
+  "expect": {
+    "applied": true,
+    "schema": {
+      "tables": {
+        "tasks": {
+          "fields": {
+            "title": { "type": "string" },
+            "modifiedAt": { "type": "number" }
+          },
+          "indexes": [{ "name": "by_title", "fields": ["title"] }],
+          "updatedAtField": "modifiedAt"
+        }
+      }
+    },
+    "directives": [{ "op": "renameField", "affectedRows": 1 }]
+  },
+  "normalize": ["_id", "_creationTime", "_version", "id"],
+  "then": {
+    "query": {
+      "table": "tasks",
+      "filter": { "op": "gt", "field": "modifiedAt", "value": 0 }
+    },
+    "expect": [{ "title": "a" }],
+    "normalize": ["_id", "_creationTime", "_version", "modifiedAt"],
+    "unordered": true
+  }
+}

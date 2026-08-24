@@ -2,6 +2,7 @@ use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use rtdb_server::config::HotConfig;
 use rtdb_server::schema::SchemaDef;
@@ -642,4 +643,28 @@ pub async fn mint_user_session(pool: &sqlx::PgPool, user_id: &str, email: &str) 
     .expect("insert rtdb_auth.sessions row");
 
     token
+}
+
+/// Poll `pred` every 25ms until it returns `true` or `timeout` elapses.
+/// Returns `true` if the condition was observed, `false` on timeout.
+///
+/// Prefer this over `sleep(N)` + assert whenever a test is waiting on an
+/// asynchronous condition (a background task landing a write, a scheduled
+/// job firing) rather than deliberately advancing a TTL/interval.
+pub async fn wait_until<F, Fut>(timeout: Duration, mut pred: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    const POLL_INTERVAL: Duration = Duration::from_millis(25);
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if pred().await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }

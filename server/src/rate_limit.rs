@@ -55,6 +55,11 @@ use crate::error::RtDbError;
 /// first sweeps stale (last-minute) entries, then evicts an arbitrary entry.
 pub const MAX_BUCKETS: usize = 100_000;
 
+/// Cadence of `run_counter_sweep`'s cross-replica `rate_counters` cleanup
+/// (multi-instance mode only) — deletes minute buckets older than the
+/// previous minute so the table stays bounded.
+const RATE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// What the limiter is bucketing: a single machine token (per-token ceiling),
 /// every request against one database (per-db ceiling shared across all
 /// principals), or an unauthenticated caller's client IP. `String` is the
@@ -396,7 +401,7 @@ pub async fn run_counter_sweep(pool: sqlx::PgPool) {
         {
             tracing::warn!(error = %err, "rate counter sweep failed");
         }
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        tokio::time::sleep(RATE_SWEEP_INTERVAL).await;
     }
 }
 

@@ -1,0 +1,49 @@
+{
+  "name": "migrate-rename-field-auto-increment-field",
+  "$comment": "QA-002: renameField follows `autoIncrementField` when the renamed field is the one it names — the derived schema's `autoIncrementField` now reads `num`, not the dropped `seqNum`, and the per-table sequence keeps assigning after the rename (the follow-up insert gets '2').",
+  "schema": {
+    "tables": {
+      "tickets": {
+        "fields": {
+          "title": { "type": "string" },
+          "seqNum": { "type": "int64" }
+        },
+        "indexes": [{ "name": "by_title", "fields": ["title"] }],
+        "autoIncrementField": "seqNum"
+      }
+    }
+  },
+  "seed": [
+    { "title": "a" }
+  ],
+  "op": {
+    "migrate": {
+      "directives": [
+        { "op": "renameField", "table": "tickets", "from": "seqNum", "to": "num" }
+      ],
+      "dryRun": false
+    }
+  },
+  "expect": {
+    "applied": true,
+    "schema": {
+      "tables": {
+        "tickets": {
+          "fields": {
+            "title": { "type": "string" },
+            "num": { "type": "int64" }
+          },
+          "indexes": [{ "name": "by_title", "fields": ["title"] }],
+          "autoIncrementField": "num"
+        }
+      }
+    },
+    "directives": [{ "op": "renameField", "affectedRows": 1 }]
+  },
+  "normalize": ["_id", "_creationTime", "_version", "id"],
+  "then": {
+    "query": { "table": "tickets" },
+    "expect": [{ "title": "a", "num": "1" }],
+    "unordered": true
+  }
+}
