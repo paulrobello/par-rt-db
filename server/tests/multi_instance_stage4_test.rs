@@ -27,6 +27,13 @@ async fn replica(
     cfg.instance_id = Some(instance_id.to_string());
     cfg.rate_limit_per_token_rpm = per_token_rpm;
     cfg.rate_limit_per_db_rpm = per_db_rpm;
+    // ARC-007: this helper's one rate-limiting test
+    // (`rate_budget_is_shared_across_replicas`) asserts the budget is shared
+    // *synchronously* across replicas with no flush delay — that's the exact
+    // path's guarantee, not the (now-default) approximate path's. The other
+    // callers all pass 0/0 (rate limiting disabled), so this is a no-op for
+    // them.
+    cfg.rate_limit_exact = true;
     cfg.forward_timeout_ms = 300;
     AppState::new(pool.clone(), cfg, test_hot())
 }
@@ -641,5 +648,103 @@ async fn forwarded_mutate_is_deduped_by_a_server_minted_key() -> anyhow::Result<
         .fetch_one(&pool)
         .await?;
     assert_eq!(rows, 2, "the replay wrote nothing new");
+    Ok(())
+}
+
+/// (ARC-008) `run_forward_listener` bounds concurrent forwarded-write
+/// executions with `RTDB_FORWARD_CONCURRENCY`. With the owner's cap set to 1,
+/// firing several forwarded writes at once must not spawn an unbounded pile
+/// of committer submits: everything past the single in-flight slot gets an
+/// immediate RATE_LIMITED reply — bounded and retryable — instead of hanging
+/// until the forward timeout drives the origin into a lease takeover.
+#[tokio::test]
+async fn forward_concurrency_cap_rate_limits_excess_requests() -> anyhow::Result<()> {
+    let pool = shared_pool().await;
+    let mut cfg_a = test_config();
+    cfg_a.multi_instance = true;
+    cfg_a.instance_id = Some("arc008-cap-a".to_string());
+    cfg_a.forward_timeout_ms = 2000;
+    cfg_a.forward_concurrency = 1;
+    let a = AppState::new(pool.clone(), cfg_a, test_hot());
+
+    let mut cfg_b = test_config();
+    cfg_b.multi_instance = true;
+    cfg_b.instance_id = Some("arc008-cap-b".to_string());
+    cfg_b.forward_timeout_ms = 2000;
+    let b = AppState::new(pool.clone(), cfg_b, test_hot());
+
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &name).await?;
+    let db = crate::common::wrap_test_db(name);
+    // A's push takes the lease — A is the owner for the rest of the test.
+    a.realtime
+        .committers
+        .push_schema(&db, items_schema(false))
+        .await?;
+
+    // Let both replicas' forward listeners finish LISTENing before the burst
+    // so the saturation this test targets isn't masked by the unrelated
+    // listener-connecting startup window `mutate_until_landed` retries past
+    // elsewhere in this file.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Fire more forwarded writes at once than A's single permit — B is a
+    // non-owner throughout, so every one of these forwards.
+    let n = 8;
+    let mut handles = Vec::with_capacity(n);
+    for i in 0..n {
+        let b = b.clone();
+        // NOT `db.clone()`: `TestDb::Drop` schedules a real `DROP SCHEMA` for
+        // every clone, so 8 of them would race the writes with real cleanup.
+        // A plain owned `String` carries the name with no cleanup attached —
+        // the original `db` still owns the one teardown, at end of test.
+        let db_name = db.as_str().to_string();
+        handles.push(tokio::spawn(async move {
+            b.realtime
+                .committers
+                .mutate(
+                    &db_name,
+                    None,
+                    insert_item(&format!("burst-{i}")),
+                    PrincipalCtx::bypass(),
+                )
+                .await
+        }));
+    }
+
+    // Bounded wait: a hang here (rather than a bounded RATE_LIMITED reply)
+    // is exactly the regression ARC-008 fixes.
+    let results = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        futures::future::join_all(handles),
+    )
+    .await
+    .expect("the whole burst must resolve well inside the forward timeout, not hang");
+
+    let mut rate_limited = 0;
+    let mut landed = 0;
+    for r in results {
+        match r.expect("task panicked") {
+            Ok(_) => landed += 1,
+            Err(err) if err.code == ErrorCode::RateLimited => rate_limited += 1,
+            Err(err) => panic!("unexpected error: {err}"),
+        }
+    }
+    assert!(
+        rate_limited > 0,
+        "at least one of {n} concurrent forwards past the concurrency=1 cap must be \
+         RATE_LIMITED instead of executing or hanging"
+    );
+    assert!(landed >= 1, "at least one write should still land");
+
+    let (n_rows,): (i64,) =
+        sqlx::query_as(&format!("SELECT count(*) FROM \"db_{db}\".\"t_items\""))
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        n_rows, landed as i64,
+        "row count matches the writes that actually landed — no phantom commit behind a \
+         RATE_LIMITED reply"
+    );
     Ok(())
 }

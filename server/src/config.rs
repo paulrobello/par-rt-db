@@ -110,6 +110,24 @@ pub struct Config {
     // carry no token id and are rate-limited per-db only.
     pub rate_limit_per_token_rpm: u32,
     pub rate_limit_per_db_rpm: u32, // RTDB_RATE_LIMIT_PER_DB_RPM, shared across all principals of one db
+    // ARC-007: multi-instance-only knobs governing which `RateLimiter::check`
+    // path a Postgres-backed limiter uses. Both are inert in single-instance
+    // mode (no `pg` pool on the limiter, so `check` never reaches either
+    // branch).
+    /// RTDB_RATE_LIMIT_EXACT (default false). false = each replica counts
+    /// locally and reconciles with `rtdb_auth.rate_counters` every
+    /// `rate_limit_sync_ms` (approximate, no per-request Postgres round
+    /// trip); overshoot is bounded by roughly (replica count × one sync
+    /// window) of extra allowance, since a replica can admit up to its local
+    /// budget before reconciling — see `rate_limit::RateLimiter` docs. true =
+    /// every checked request pays a synchronous UPSERT for an exact shared
+    /// ceiling (the pre-ARC-007 behavior).
+    pub rate_limit_exact: bool,
+    /// RTDB_RATE_LIMIT_SYNC_MS (default 1000, clamped to >= 50). How often
+    /// the approximate limiter (`rate_limit_exact == false`) flushes local
+    /// deltas into Postgres and refreshes its shared-count view. Unused when
+    /// `rate_limit_exact` is true.
+    pub rate_limit_sync_ms: u64,
     // Durable audit log (global `rtdb.audit_log` table): when true, the
     // committer writes one row per durable DocOp at both tap sites
     // (`handle_mutate`/`handle_scheduled`). Off by default — the ephemeral
@@ -335,6 +353,12 @@ pub struct Config {
     /// write may still have committed; clients needing exactly-once retries
     /// should use idempotency keys).
     pub forward_timeout_ms: u64,
+    /// RTDB_FORWARD_CONCURRENCY (default 64, clamped to >= 1). ARC-008: caps
+    /// the number of forwarded-write executions `run_forward_listener` runs
+    /// concurrently (one `tokio::spawn` per in-flight forwarded request).
+    /// A request that arrives once the cap is saturated gets an immediate
+    /// RATE_LIMITED reply instead of an unbounded task pile-up.
+    pub forward_concurrency: usize,
 }
 
 /// Boot-time env parse for a typed knob (ARC-118, folded with QA-106). Unset
@@ -544,6 +568,8 @@ struct RateLimitsEnv {
     storage_per_ip_rpm: u32,
     anonymous_per_ip_rpm: u32,
     admin_per_ip_rpm: u32,
+    exact: bool,
+    sync_ms: u64,
 }
 
 impl RateLimitsEnv {
@@ -552,6 +578,14 @@ impl RateLimitsEnv {
         // today's behavior.
         let per_token_rpm = env_parsed("RTDB_RATE_LIMIT_PER_TOKEN_RPM", 0u32)?;
         let per_db_rpm = env_parsed("RTDB_RATE_LIMIT_PER_DB_RPM", 0u32)?;
+
+        // ARC-007: multi-instance-only. false (the default) picks the
+        // approximate local-counter path; true keeps the pre-ARC-007 exact
+        // per-request Postgres UPSERT.
+        let exact = env_bool("RTDB_RATE_LIMIT_EXACT", false);
+        // Approximate-limiter flush interval; clamped so a typo'd tiny value
+        // can't turn the flush into a tight loop.
+        let sync_ms = env_parsed("RTDB_RATE_LIMIT_SYNC_MS", 1000u64)?.max(50);
 
         // Per-IP rate limit on the public storage route (SEC-004). 0 = off,
         // matching the existing per-token/per-db limiter convention.
@@ -573,6 +607,8 @@ impl RateLimitsEnv {
             storage_per_ip_rpm,
             anonymous_per_ip_rpm,
             admin_per_ip_rpm,
+            exact,
+            sync_ms,
         })
     }
 }
@@ -902,6 +938,10 @@ impl Config {
         // so a typo cannot make every forward fall straight through to
         // takeover (which would ping-pong the lease under a load balancer).
         let forward_timeout_ms = env_parsed("RTDB_FORWARD_TIMEOUT_MS", 5_000u64)?.max(100);
+        // ARC-008: bound `run_forward_listener`'s concurrent forwarded-write
+        // executions so a burst of forwarded writes cannot spawn an unbounded
+        // number of tasks against one owner's committer.
+        let forward_concurrency = env_parsed("RTDB_FORWARD_CONCURRENCY", 64usize)?.max(1);
 
         Ok(Self {
             port,
@@ -938,6 +978,8 @@ impl Config {
             slow_query_log_params,
             rate_limit_per_token_rpm: rate_limits.per_token_rpm,
             rate_limit_per_db_rpm: rate_limits.per_db_rpm,
+            rate_limit_exact: rate_limits.exact,
+            rate_limit_sync_ms: rate_limits.sync_ms,
             audit_log_enabled,
             oauth_login_csrf,
             webhooks_enabled,
@@ -981,6 +1023,7 @@ impl Config {
             otel_sample_ratio: otel.sample_ratio,
             multi_instance,
             forward_timeout_ms,
+            forward_concurrency,
             instance_id,
         })
     }

@@ -88,6 +88,7 @@ from .http_client import (
     UploadResult,
 )
 from .wire import (
+    PROTOCOL_VERSION,
     BatchQueryOutcome,
     ScheduleInfo,
     ScheduleWhen,
@@ -145,7 +146,12 @@ class RtDbAsyncHttpClient:
         self._token = token
         self._client = httpx.AsyncClient(
             base_url=self._base,
-            headers={"Authorization": f"Bearer {token}"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                # ARC-013: lets the server diagnose/reject a version mismatch
+                # instead of a generic 400 from `deny_unknown_fields`.
+                "X-Rtdb-Protocol": str(PROTOCOL_VERSION),
+            },
             transport=transport,
         )
         self._admin_executor = _AsyncAdminExecutor(self._client)

@@ -155,6 +155,9 @@ services:
       # non-owner attempts the lease takeover. Only meaningful when
       # RTDB_MULTI_INSTANCE=true.
       RTDB_FORWARD_TIMEOUT_MS: ${RTDB_FORWARD_TIMEOUT_MS:-5000}
+      # ARC-008: caps concurrent forwarded-write executions per replica.
+      # Only meaningful when RTDB_MULTI_INSTANCE=true.
+      RTDB_FORWARD_CONCURRENCY: ${RTDB_FORWARD_CONCURRENCY:-64}
       RTDB_GITHUB_BASE_URL: ${RTDB_GITHUB_BASE_URL:-https://github.com}
       RTDB_GITHUB_API_URL: ${RTDB_GITHUB_API_URL:-https://api.github.com}
       RTDB_GITLAB_BASE_URL: ${RTDB_GITLAB_BASE_URL:-https://gitlab.com}
@@ -207,6 +210,12 @@ services:
       # per-db only.
       RTDB_RATE_LIMIT_PER_TOKEN_RPM: ${RTDB_RATE_LIMIT_PER_TOKEN_RPM:-0}
       RTDB_RATE_LIMIT_PER_DB_RPM: ${RTDB_RATE_LIMIT_PER_DB_RPM:-0}
+      # ARC-007: multi-instance-only. false (default) counts locally per
+      # replica and reconciles with Postgres every RTDB_RATE_LIMIT_SYNC_MS
+      # instead of a synchronous per-request round trip; true keeps the exact
+      # per-request Postgres UPSERT.
+      RTDB_RATE_LIMIT_EXACT: ${RTDB_RATE_LIMIT_EXACT:-false}
+      RTDB_RATE_LIMIT_SYNC_MS: ${RTDB_RATE_LIMIT_SYNC_MS:-1000}
       # Document TTL reaper. Sweep cadence per db and rows deleted per
       # table per sweep. Best-effort, boot-only. Defaults mirror the server.
       RTDB_TTL_SWEEP_INTERVAL_SECS: ${RTDB_TTL_SWEEP_INTERVAL_SECS:-60}

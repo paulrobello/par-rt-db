@@ -250,6 +250,8 @@ mod tests {
             slow_query_log_params: false,
             rate_limit_per_token_rpm: 0,
             rate_limit_per_db_rpm: 0,
+            rate_limit_exact: false,
+            rate_limit_sync_ms: 1000,
             audit_log_enabled: false,
             oauth_login_csrf: true,
             webhooks_enabled: false,
@@ -290,6 +292,7 @@ mod tests {
             otel_sample_ratio: 0.0,
             multi_instance: false,
             forward_timeout_ms: 5000,
+            forward_concurrency: 64,
             instance_id: None,
         };
         assert!(GoogleProvider::from_config(&cfg).is_none());

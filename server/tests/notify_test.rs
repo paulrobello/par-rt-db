@@ -20,6 +20,21 @@ async fn multi_instance_state(pool: sqlx::PgPool, instance_id: &str) -> std::syn
     AppState::new(pool, cfg, test_hot())
 }
 
+/// Like [`multi_instance_state`], but with `max_affected_docs` raised so a
+/// large single-transaction batch write (ARC-006) isn't rejected by the
+/// admin-mutate guardrail (`RTDB_MAX_AFFECTED_DOCS`, default 100).
+async fn multi_instance_state_with_cap(
+    pool: sqlx::PgPool,
+    instance_id: &str,
+    max_affected_docs: usize,
+) -> std::sync::Arc<AppState> {
+    let mut cfg = test_config();
+    cfg.multi_instance = true;
+    cfg.instance_id = Some(instance_id.to_string());
+    cfg.max_affected_docs = max_affected_docs;
+    AppState::new(pool, cfg, test_hot())
+}
+
 /// POST `/admin/create-db` with `{name}` and assert OK.
 async fn create_db(addr: std::net::SocketAddr, db: &str) {
     let resp = admin_post(addr, "/admin/create-db", json!({"name": db})).await;
@@ -102,6 +117,27 @@ async fn ops_recent(addr: std::net::SocketAddr, db: &str, table: &str) -> Vec<se
 /// do not need to tear them down inline.
 fn fresh_name() -> String {
     format!("t{}", uuid::Uuid::now_v7().simple())
+}
+
+/// POST a mutate txn with `n` distinct `widgets` inserts in ONE transaction
+/// (ARC-006's "1000-row write" case, scaled down for test runtime) and return
+/// OK/err.
+async fn insert_widgets_batch(addr: std::net::SocketAddr, db: &str, n: usize) {
+    let steps: Vec<serde_json::Value> = (0..n)
+        .map(|i| json!({"op": "insert", "table": "widgets", "doc": {"label": format!("w{i}")}}))
+        .collect();
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{db}/mutate"),
+        json!({"txn": {"steps": steps}}),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "batch insert mutate should succeed: {:?}",
+        resp.text().await
+    );
 }
 
 /// ENH-022 Stage 2: a write on replica A appears in replica B's op-feed ring via
@@ -211,6 +247,114 @@ async fn multi_instance_disabled_does_not_fan_out() -> anyhow::Result<()> {
         b_match_count, 0,
         "with multi_instance=false, replica B must NOT see A's write \
          (no NOTIFY emitted; got {b_match_count} occurrences)"
+    );
+
+    Ok(())
+}
+
+/// ARC-006: a large multi-op write must batch its `pg_notify`s (one per
+/// `OP_NOTIFY_CHUNK_LIMIT`-sized chunk of ops, not one per op), and every op
+/// must still reach a peer replica's op-feed ring despite the batching.
+///
+/// The test opens its own raw `PgListener` on `rtdb_ops` (a fourth party,
+/// distinct from replica A/B) to count actual NOTIFY messages, since the
+/// admin `/ops/recent` API only exposes the *decoded* per-op events, not how
+/// many wire notifications produced them. Postgres NOTIFY is scoped to the
+/// physical Postgres database, which every test in this binary shares, so
+/// messages are filtered to this test's unique `db_name` to avoid
+/// cross-test contamination.
+#[tokio::test]
+async fn large_batch_write_coalesces_notifications() -> anyhow::Result<()> {
+    let cfg = test_config();
+    let pool = sqlx::PgPool::connect(&cfg.database_url)
+        .await
+        .expect("connect to test postgres");
+    rtdb_server::db::bootstrap(&pool)
+        .await
+        .expect("bootstrap rtdb_auth");
+
+    const N: usize = 250;
+    let state_a = multi_instance_state_with_cap(pool.clone(), "replica-a", N).await;
+    let state_b = multi_instance_state(pool.clone(), "replica-b").await;
+    let addr_a = spawn_app(state_a.clone()).await;
+    let addr_b = spawn_app(state_b.clone()).await;
+
+    let db_name = fresh_name();
+    let _guard = crate::common::wrap_test_db(db_name.clone());
+    create_db(addr_a, &db_name).await;
+    push_widgets_schema(addr_a, &db_name).await;
+
+    // A raw listener on the same channel the server uses, so the test can
+    // count wire-level pg_notify messages independent of how the listener
+    // task decodes them.
+    let mut raw_listener = sqlx::postgres::PgListener::connect_with(&pool)
+        .await
+        .expect("connect raw notify listener");
+    raw_listener
+        .listen_all([rtdb_server::notify::OP_FEED_CHANNEL])
+        .await
+        .expect("listen on rtdb_ops");
+
+    insert_widgets_batch(addr_a, &db_name, N).await;
+
+    // Collect every notification scoped to this test's db within a bounded
+    // window, tracking both the number of wire messages and the total op
+    // count they carry (a message may be a single object or a batch array).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut message_count = 0usize;
+    let mut op_count = 0usize;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let notif = match tokio::time::timeout(remaining, raw_listener.recv()).await {
+            Ok(Ok(n)) => n,
+            _ => break,
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(notif.payload()).expect("valid JSON notify payload");
+        let items: Vec<&serde_json::Value> = match &payload {
+            serde_json::Value::Array(items) => items.iter().collect(),
+            other => vec![other],
+        };
+        let matching: Vec<&&serde_json::Value> =
+            items.iter().filter(|v| v["db"] == db_name).collect();
+        if matching.is_empty() {
+            continue; // notification from a concurrently-running test's db
+        }
+        message_count += 1;
+        op_count += matching.len();
+        if op_count >= N {
+            break;
+        }
+    }
+
+    assert_eq!(
+        op_count, N,
+        "every op must reach the raw listener across the batched notifications"
+    );
+    assert!(
+        message_count < N / 4,
+        "a {N}-op write must coalesce into far fewer than {N} pg_notify \
+         messages (ARC-006); got {message_count} messages for {op_count} ops"
+    );
+
+    // And the decoded side: replica B's op-feed ring must contain every op
+    // (batching must not drop or truncate anything the listener decodes).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut b_ops: Vec<serde_json::Value> = Vec::new();
+    while std::time::Instant::now() < deadline {
+        b_ops = ops_recent(addr_b, &db_name, "widgets").await;
+        if b_ops.len() >= N {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        b_ops.len(),
+        N,
+        "replica B's op-feed ring must contain every op from the batched write"
     );
 
     Ok(())

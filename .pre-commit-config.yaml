@@ -10,25 +10,28 @@ repos:
       - id: check-merge-conflict
   - repo: local
     hooks:
+      # ARC-014: run cargo fmt/clippy directly (workspace-level) instead of
+      # `make fmt`/`make lint`, which also sweep ts-client, dashboard, and
+      # python-client on every Rust-only commit.
       - id: cargo-fmt
         name: cargo fmt
-        entry: make fmt
+        entry: cargo fmt --all
         language: system
-        types: [rust]
+        files: \.rs$
         pass_filenames: false
       - id: cargo-clippy
         name: cargo clippy
-        entry: make lint
+        entry: cargo clippy --workspace --all-targets --all-features -- -D warnings
         language: system
-        types: [rust]
+        files: \.rs$
         pass_filenames: false
       # ARC-014: biome + ruff ran only in CI; add local hooks scoped to the
       # files each tool owns. Each hook runs that client's lint + format-check
       # so a typo'd file is caught at `git commit`, not at `make checkall` or
       # in CI. `make fmt`/`make lint` already include these, but those targets
-      # run every package on every Rust commit (the cargo-fmt/clippy hooks
-      # above are scoped by `types: [rust]`), so a TS/Python-only commit would
-      # otherwise skip them.
+      # run every package on every Rust commit, so a TS/Python-only commit
+      # would otherwise skip them (the cargo-fmt/clippy hooks above are now
+      # scoped to `files: \.rs$` the same way).
       - id: biome-ts-client
         name: biome (ts-client)
         entry: bash -c 'cd ts-client && bun run lint && bun run fmt-check'

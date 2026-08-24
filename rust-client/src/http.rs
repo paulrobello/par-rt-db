@@ -4,8 +4,13 @@ use crate::error::{ErrorEnvelope, RtDbError, retry_on_precondition};
 use crate::mutation::{Mutation, StepResult, Transaction};
 use crate::query::{Query, TableQuery, parse_result};
 use crate::wire::{
-    AuthedUser, ScheduleInfo, ScheduleWhen, WorkflowInfo, WorkflowSpec, WorkflowStatus,
+    AuthedUser, PROTOCOL_VERSION, ScheduleInfo, ScheduleWhen, WorkflowInfo, WorkflowSpec,
+    WorkflowStatus,
 };
+
+/// ARC-013: header name carrying the requesting client's protocol version on
+/// the one-shot HTTP API — mirrors the WS `Auth` frame's `protocolVersion`.
+const PROTOCOL_HEADER: &str = "X-Rtdb-Protocol";
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::future::Future;
@@ -188,6 +193,7 @@ impl RtDbHttpClient {
             .client
             .post(format!("{}/api/query", self.url))
             .bearer_auth(&self.token)
+            .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
             .json(&body)
             .send()
             .await
@@ -251,6 +257,7 @@ impl RtDbHttpClient {
             .client
             .post(format!("{}/api/query-batch", self.url))
             .bearer_auth(&self.token)
+            .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
             .json(&body)
             .send()
             .await
@@ -286,6 +293,7 @@ impl RtDbHttpClient {
             .client
             .post(format!("{}/api/mutate", self.url))
             .bearer_auth(&self.token)
+            .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
             .json(&body)
             .send()
             .await

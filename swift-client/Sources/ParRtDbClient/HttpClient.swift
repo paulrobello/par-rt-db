@@ -514,6 +514,9 @@ extension RtDbHttpClient {
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        // ARC-013: lets the server diagnose/reject a version mismatch instead
+        // of a generic 400 from `deny_unknown_fields`.
+        request.setValue(String(WireProtocol.version), forHTTPHeaderField: "X-Rtdb-Protocol")
         if let contentType {
             request.setValue(contentType, forHTTPHeaderField: "Content-Type")
         }

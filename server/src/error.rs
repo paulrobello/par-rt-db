@@ -21,6 +21,10 @@ pub enum ErrorCode {
     RateLimited,
     Conflict,
     QuotaExceeded,
+    /// ARC-013: a client requested a `protocolVersion` (WS `Auth` frame or
+    /// the HTTP one-shot API's `X-Rtdb-Protocol` header) greater than this
+    /// build's `protocol::PROTOCOL_VERSION`. Wire code `UNSUPPORTED_PROTOCOL`.
+    UnsupportedProtocol,
 }
 
 /// Optional `Retry-After` hint, in seconds, attached to a `RateLimited` error.
@@ -104,6 +108,12 @@ impl RtDbError {
         Self::new(ErrorCode::QuotaExceeded, msg)
     }
 
+    /// A client requested a `protocolVersion` newer than this build supports
+    /// (HTTP 400). Wire code `UNSUPPORTED_PROTOCOL`.
+    pub fn unsupported_protocol(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::UnsupportedProtocol, msg)
+    }
+
     pub fn status(&self) -> StatusCode {
         match self.code {
             ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
@@ -116,6 +126,7 @@ impl RtDbError {
             ErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             ErrorCode::Conflict => StatusCode::CONFLICT,
             ErrorCode::QuotaExceeded => StatusCode::INSUFFICIENT_STORAGE,
+            ErrorCode::UnsupportedProtocol => StatusCode::BAD_REQUEST,
         }
     }
 }
@@ -256,5 +267,86 @@ mod tests {
         let json = serde_json::to_value(&err).unwrap();
         assert_eq!(json["code"], "QUOTA_EXCEEDED");
         assert_eq!(json["message"], "db over cap");
+    }
+
+    /// ARC-017: `{code, httpStatus}` for every `ErrorCode` variant, regenerated
+    /// from the enum. `wire_str` is an EXHAUSTIVE match (no catch-all) over
+    /// `ErrorCode` — adding a variant fails this function to compile until a
+    /// row is added here; `RtDbError::status` (used for the HTTP status half)
+    /// is exhaustive the same way, so both halves of a new variant must be
+    /// filled in before the crate builds. `ALL` is a plain array and is not
+    /// itself compiler-enforced complete — the paired
+    /// `error_codes_match_wire_corpus` test below is what actually catches a
+    /// variant present in the enum but missing from `ALL` or from
+    /// `wire-corpus/error-codes.json`.
+    fn generate_error_code_table() -> Vec<(&'static str, u16)> {
+        const ALL: [ErrorCode; 11] = [
+            ErrorCode::Unauthorized,
+            ErrorCode::Forbidden,
+            ErrorCode::NotFound,
+            ErrorCode::SchemaViolation,
+            ErrorCode::PreconditionFailed,
+            ErrorCode::BadRequest,
+            ErrorCode::Internal,
+            ErrorCode::RateLimited,
+            ErrorCode::Conflict,
+            ErrorCode::QuotaExceeded,
+            ErrorCode::UnsupportedProtocol,
+        ];
+        fn wire_str(code: ErrorCode) -> &'static str {
+            match code {
+                ErrorCode::Unauthorized => "UNAUTHORIZED",
+                ErrorCode::Forbidden => "FORBIDDEN",
+                ErrorCode::NotFound => "NOT_FOUND",
+                ErrorCode::SchemaViolation => "SCHEMA_VIOLATION",
+                ErrorCode::PreconditionFailed => "PRECONDITION_FAILED",
+                ErrorCode::BadRequest => "BAD_REQUEST",
+                ErrorCode::Internal => "INTERNAL",
+                ErrorCode::RateLimited => "RATE_LIMITED",
+                ErrorCode::Conflict => "CONFLICT",
+                ErrorCode::QuotaExceeded => "QUOTA_EXCEEDED",
+                ErrorCode::UnsupportedProtocol => "UNSUPPORTED_PROTOCOL",
+            }
+        }
+        ALL.iter()
+            .map(|&code| {
+                let status = RtDbError::new(code, String::new()).status().as_u16();
+                (wire_str(code), status)
+            })
+            .collect()
+    }
+
+    /// Diffs the generated `{code, httpStatus}` table against the committed
+    /// `wire-corpus/error-codes.json` — the fixture all four clients also
+    /// assert against. A drift here means either the enum changed without the
+    /// corpus file being updated, or vice versa.
+    #[test]
+    fn error_codes_match_wire_corpus() {
+        let generated = generate_error_code_table();
+        let corpus: serde_json::Value =
+            serde_json::from_str(include_str!("../../wire-corpus/error-codes.json"))
+                .expect("parse wire-corpus/error-codes.json");
+        let entries = corpus["codes"]
+            .as_array()
+            .expect("wire-corpus/error-codes.json missing 'codes' array");
+        let corpus_pairs: Vec<(String, u16)> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e["code"].as_str().expect("entry.code").to_string(),
+                    e["httpStatus"].as_u64().expect("entry.httpStatus") as u16,
+                )
+            })
+            .collect();
+        let generated_pairs: Vec<(String, u16)> = generated
+            .into_iter()
+            .map(|(code, status)| (code.to_string(), status))
+            .collect();
+        assert_eq!(
+            generated_pairs, corpus_pairs,
+            "ErrorCode drifted from wire-corpus/error-codes.json — update the \
+             corpus file (and every client's error-code type) after changing \
+             ErrorCode"
+        );
     }
 }

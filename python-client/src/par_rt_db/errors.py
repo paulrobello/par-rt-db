@@ -21,6 +21,9 @@ class ErrorCode(StrEnum):
     INTERNAL = "INTERNAL"
     RATE_LIMITED = "RATE_LIMITED"
     QUOTA_EXCEEDED = "QUOTA_EXCEEDED"
+    #: ARC-013: requested ``protocolVersion`` (WS ``auth`` frame or the
+    #: ``X-Rtdb-Protocol`` HTTP header) is newer than the server's.
+    UNSUPPORTED_PROTOCOL = "UNSUPPORTED_PROTOCOL"
 
 
 _STATUS: dict[ErrorCode, int] = {
@@ -34,6 +37,7 @@ _STATUS: dict[ErrorCode, int] = {
     ErrorCode.INTERNAL: 500,
     ErrorCode.RATE_LIMITED: 429,
     ErrorCode.QUOTA_EXCEEDED: 507,
+    ErrorCode.UNSUPPORTED_PROTOCOL: 400,
 }
 
 

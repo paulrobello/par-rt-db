@@ -20,6 +20,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
+import { ALL_ERROR_CODES } from "../src/errors.js";
 import { MAX_STEPS } from "../src/in_memory/index.js";
 import type {
   AuthedUser,
@@ -461,5 +462,35 @@ describe("wire-corpus: protocol_constants match the implementation (ARC-104)", (
   const corpus = loadCorpus();
   it("MAX_STEPS matches the canonical corpus value", () => {
     expect(corpus.protocol_constants.max_steps).toBe(MAX_STEPS);
+  });
+});
+
+/**
+ * ARC-017: `wire-corpus/error-codes.json` is the canonical `{code,
+ * httpStatus}` table generated from the server's `ErrorCode` enum
+ * (`server/src/error.rs::tests::error_codes_match_wire_corpus`). ts-client
+ * does not model an HTTP status per code (see `RtDbError.status` in
+ * `errors.ts` — it threads the transport's HTTP status through instead), so
+ * this only asserts the code set itself agrees, in both directions: every
+ * corpus code is a known `RtDbErrorCode`, and `ALL_ERROR_CODES` carries no
+ * code the corpus doesn't.
+ */
+describe("wire-corpus: error codes match the server (ARC-017)", () => {
+  interface ErrorCodesCorpus {
+    codes: Array<{ code: string; httpStatus: number }>;
+  }
+
+  const ERROR_CODES_PATH = resolve(__dirname, "../../wire-corpus/error-codes.json");
+
+  function loadErrorCodesCorpus(): ErrorCodesCorpus {
+    return JSON.parse(readFileSync(ERROR_CODES_PATH, "utf8")) as ErrorCodesCorpus;
+  }
+
+  it("every corpus code and every client code agree, set-for-set", () => {
+    const corpusCodes = loadErrorCodesCorpus()
+      .codes.map((e) => e.code)
+      .sort();
+    const clientCodes = [...ALL_ERROR_CODES].sort();
+    expect(clientCodes).toStrictEqual(corpusCodes);
   });
 });

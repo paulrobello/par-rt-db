@@ -19,6 +19,13 @@ implementations honest against each other. Three artifacts live here:
   and the same unknown fields must be rejected. Run by the server and all four
   clients (ts/rust/python/swift), so a drifted wire type fails whichever
   package drifted.
+- [`error-codes.json`](error-codes.json) — the **error-code parity corpus**
+  (ARC-017): the full `{code, httpStatus}` list for every `RtDbError` wire
+  code, generated from `server/src/error.rs`'s `ErrorCode` enum. The
+  `ErrorCode` enum is a sixth hand-mirrored surface (server + four clients);
+  this corpus is what checks the five lists actually agree, so a code added to
+  the server can't silently go unknown to a client. See
+  [Error-code parity](#error-code-parity) below.
 
 **Runner scope:** the server and all four client in-memory engines
 (`ts-client`, `rust-client`, `python-client`, `swift-client`) execute
@@ -38,6 +45,7 @@ layers. A divergence between any client engine and these fixtures is a bug in th
 - [Determinism rulings](#determinism-rulings)
 - [Substitution placeholders](#substitution-placeholders)
 - [Adding a case](#adding-a-case)
+- [Error-code parity](#error-code-parity)
 
 ## The authoring rule
 
@@ -192,3 +200,38 @@ Placeholders never appear in `expect` — expectations use `normalize` instead.
    match the filename.
 5. `jq . <file>` must parse; the runner count assertion in each package's
    corpus test should be bumped only by adding files, never by skipping.
+
+## Error-code parity
+
+`error-codes.json` is a flat `{code, httpStatus}` table, one row per
+`server/src/error.rs::ErrorCode` variant, in enum declaration order — not a
+`semantics/` case (it has no schema/seed/op) and not part of
+`wire-corpus.json` (whose `error_envelopes` section pins a handful of sample
+envelopes for wire round-trip, not the full closed set with statuses).
+
+**Authoring rule:** any change to `ErrorCode` (add, remove, rename a wire code,
+or change its HTTP status) ships with an update to `error-codes.json` in the
+same commit, and a matching update to every client's error-code type
+(`ts-client/src/errors.ts`, `rust-client/src/error.rs`,
+`python-client/src/par_rt_db/errors.py`,
+`swift-client/Sources/ParRtDbClient/Errors.swift`). This mirrors the semantics
+corpus's authoring rule above.
+
+**Enforcement:**
+
+- **Server** (`server/src/error.rs::tests::error_codes_match_wire_corpus`):
+  regenerates the table from the enum through an exhaustive match — no
+  catch-all arm — so adding a variant fails the crate to compile until the
+  match (and `RtDbError::status`, itself already exhaustive) is updated; the
+  test then diffs the regenerated table against the committed JSON.
+- **Clients**: each of the four client corpus test files
+  (`rust-client/tests/wire_corpus.rs`, `ts-client/tests/wire-corpus.test.ts`,
+  `python-client/tests/test_wire_parity.py`,
+  `swift-client/Tests/ParRtDbClientTests/WireCorpusTests.swift`) asserts every
+  corpus code is known to that client's error-code type, and vice versa
+  (Python's `StrEnum` and Swift's `CaseIterable` enumerate their own variants
+  automatically; TS and Rust hand-maintain a parallel `ALL` list, so a
+  forgotten update there is a test-time catch, not a compile-time one). Python
+  additionally asserts its per-code HTTP status against `httpStatus`
+  (`RtDbError.status_code`); TS and Rust don't model an HTTP status per code,
+  so they check the code set only.

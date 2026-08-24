@@ -1,5 +1,14 @@
 import Foundation
 
+/// The wire protocol version this client speaks (ARC-013). Sent as
+/// `protocolVersion` on the WS `auth` frame and as the `X-Rtdb-Protocol` HTTP
+/// header; a server whose `PROTOCOL_VERSION` is older rejects a value greater
+/// than its own with `unsupportedProtocol`. Mirrors server
+/// `protocol::PROTOCOL_VERSION`.
+public enum WireProtocol {
+    public static let version: UInt32 = 1
+}
+
 // MARK: - Internally tagged enum decode helpers (serde parity)
 
 /// serde's internally-tagged-enum prelude: reads the discriminant and the full
@@ -140,8 +149,9 @@ public struct PresenceMember: Equatable, Codable, Sendable {
 public enum ClientMessage: Equatable, Codable, Sendable {
     /// Authenticate the socket (first frame). `token` is optional — a browser
     /// dashboard authenticates from the HttpOnly session cookie, sending only
-    /// `db` (SEC-001 phase 2).
-    case auth(token: String?, db: String)
+    /// `db` (SEC-001 phase 2). `protocolVersion` is ARC-013: the protocol
+    /// version this client speaks; absent means version 1.
+    case auth(token: String?, db: String, protocolVersion: UInt32?)
     /// Start a live query subscription.
     case subscribe(queryId: String, query: Query)
     /// Stop a subscription.
@@ -177,7 +187,7 @@ public enum ClientMessage: Equatable, Codable, Sendable {
     case ping
 
     enum CodingKeys: String, CodingKey, CaseIterable {
-        case type, token, db, queryId, query, mutId, idempotencyKey, txn
+        case type, token, db, protocolVersion, queryId, query, mutId, idempotencyKey, txn
         case scheduleId, when, id, workflowId, spec, status, name, payload
         case room, state, ttlMs
     }
@@ -190,11 +200,12 @@ public enum ClientMessage: Equatable, Codable, Sendable {
         case "auth":
             try rejectUnknownVariantFields(
                 "ClientMessage", variant: payload.tag, keys: payload.keys,
-                allowed: ["type", "token", "db"]
+                allowed: ["type", "token", "db", "protocolVersion"]
             )
             self = try .auth(
                 token: container.decodeIfPresent(String.self, forKey: .token),
-                db: container.decode(String.self, forKey: .db)
+                db: container.decode(String.self, forKey: .db),
+                protocolVersion: container.decodeIfPresent(UInt32.self, forKey: .protocolVersion)
             )
         case "subscribe":
             try rejectUnknownVariantFields(
@@ -347,10 +358,11 @@ public enum ClientMessage: Equatable, Codable, Sendable {
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
-        case let .auth(token, db):
+        case let .auth(token, db, protocolVersion):
             try container.encode("auth", forKey: .type)
             try container.encodeIfPresent(token, forKey: .token)
             try container.encode(db, forKey: .db)
+            try container.encodeIfPresent(protocolVersion, forKey: .protocolVersion)
         case let .subscribe(queryId, query):
             try container.encode("subscribe", forKey: .type)
             try container.encode(queryId, forKey: .queryId)
@@ -427,8 +439,10 @@ public enum ClientMessage: Equatable, Codable, Sendable {
 /// `deny_unknown_fields` so a newer server can add fields without breaking
 /// older clients (client-side forward compatibility).
 public enum ServerMessage: Equatable, Codable, Sendable {
-    /// Authentication succeeded.
-    case authOk(user: AuthedUser)
+    /// Authentication succeeded. `protocolVersion` (ARC-013) is the server's
+    /// `PROTOCOL_VERSION`, present only when this client's `auth` frame
+    /// carried one.
+    case authOk(user: AuthedUser, protocolVersion: UInt32?)
     /// Authentication failed; the socket closes.
     case authErr(error: RtDbError)
     /// A live query's new full result (sent only on change).
@@ -465,6 +479,7 @@ public enum ServerMessage: Equatable, Codable, Sendable {
     enum CodingKeys: String, CodingKey, CaseIterable {
         case type, user, error, queryId, result, mutId, results, schedules
         case scheduleId, id, ok, workflowId, info, workflows, room, members
+        case protocolVersion
     }
 
     // swiftlint:disable:next cyclomatic_complexity function_body_length
@@ -473,7 +488,10 @@ public enum ServerMessage: Equatable, Codable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         switch payload.tag {
         case "authOk":
-            self = try .authOk(user: container.decode(AuthedUser.self, forKey: .user))
+            self = try .authOk(
+                user: container.decode(AuthedUser.self, forKey: .user),
+                protocolVersion: container.decodeIfPresent(UInt32.self, forKey: .protocolVersion)
+            )
         case "authErr":
             self = try .authErr(error: container.decode(RtDbError.self, forKey: .error))
         case "queryUpdate":
@@ -564,9 +582,10 @@ public enum ServerMessage: Equatable, Codable, Sendable {
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
-        case let .authOk(user):
+        case let .authOk(user, protocolVersion):
             try container.encode("authOk", forKey: .type)
             try container.encode(user, forKey: .user)
+            try container.encodeIfPresent(protocolVersion, forKey: .protocolVersion)
         case let .authErr(error):
             try container.encode("authErr", forKey: .type)
             try container.encode(error, forKey: .error)

@@ -417,6 +417,9 @@ boot:
 | `RTDB_STATIC_DIR` | no | unset | Directory of static SPA build artifacts. Set/unset existing dir ⇒ dashboard served same-origin at the catch-all route fallback; unset/empty/missing ⇒ API-only. |
 | `RTDB_GITHUB_CLIENT_ID` + `RTDB_GITHUB_CLIENT_SECRET` | no | none | GitHub OAuth app credentials — both required to enable GitHub login. The other five providers (Google, GitLab, Microsoft, Apple, OIDC) follow the same `RTDB_<PROVIDER>_CLIENT_ID` + `_CLIENT_SECRET` pair pattern; see `.env.example` and [`docs/OAUTH_SETUP.md`](docs/OAUTH_SETUP.md). |
 | `RTDB_OTEL_ENABLED` | no | `false` | OpenTelemetry/OTLP tracing master switch (ENH-018). Requires the server built with the `otel` cargo feature; `false` (default) produces zero OTLP calls. Paired with `RTDB_OTEL_ENDPOINT` (default `http://127.0.0.1:4317`), `RTDB_OTEL_SERVICE_NAME` (default `par-rt-db`), and `RTDB_OTEL_SAMPLE_RATIO` (default `0.05`). See [Tracing](deploy/README.md#tracing-opentelemetry--otlp-enh-018). |
+| `RTDB_FORWARD_CONCURRENCY` | no | `64` | ENH-022 Stage 4c / ARC-008: caps how many forwarded-write executions a replica runs concurrently. A forwarded write that arrives once the cap is saturated gets an immediate retryable `RATE_LIMITED` reply instead of executing. Only meaningful with `RTDB_MULTI_INSTANCE=true`. |
+| `RTDB_RATE_LIMIT_EXACT` | no | `false` | ARC-007: multi-instance-only (`RTDB_MULTI_INSTANCE=true`). `false` (default) has each replica count `RTDB_RATE_LIMIT_PER_TOKEN_RPM`/`RTDB_RATE_LIMIT_PER_DB_RPM` locally and reconcile with `rtdb_auth.rate_counters` every `RTDB_RATE_LIMIT_SYNC_MS` instead of a synchronous Postgres round trip per request. Overshoot is bounded by roughly (number of replicas × one sync window) of extra allowance — every replica can admit up to its own local budget before its next flush reconciles the shared count — and a request is never denied below the configured limit, only possibly over-admitted within that bound. `true` keeps the pre-ARC-007 exact path: one synchronous UPSERT per checked request, no overshoot. |
+| `RTDB_RATE_LIMIT_SYNC_MS` | no | `1000` | ARC-007: how often the approximate limiter (`RTDB_RATE_LIMIT_EXACT=false`) flushes local deltas into Postgres and refreshes its shared-count view; clamped to >= 50. Unused when `RTDB_RATE_LIMIT_EXACT=true` or in single-instance mode. |
 
 The hot-reloadable settings (live on `AppState` as `Arc<ArcSwap<HotConfig>>`,
 seeded from env at first boot, persisted in a single-row `rtdb_config` table,
@@ -450,6 +453,7 @@ mirrored as the HTTP `Retry-After` header); every other code omits it:
 | `code`                | HTTP status | Notes |
 | --------------------- | ----------- | --- |
 | `BAD_REQUEST`         | 400         | Validation or step/budget rejection (e.g. over `MAX_STEPS` / `MAX_AFFECTED_ROWS_PER_TXN`). |
+| `UNSUPPORTED_PROTOCOL`| 400         | Requested `protocolVersion` (WS `auth` frame or `X-Rtdb-Protocol` HTTP header) is newer than the server's `PROTOCOL_VERSION` (ARC-013). |
 | `UNAUTHORIZED`        | 401         | Missing/invalid/expired token or session. |
 | `FORBIDDEN`           | 403         | Per-row `ownerField`/`authorize` denial; anonymous auth disabled; signed-URL verification failure. |
 | `NOT_FOUND`           | 404         | Unknown document/file/route; cross-db storage mismatch is reported as 404 (no existence disclosure). |
@@ -532,12 +536,21 @@ it — and requires a declared `number`/`int64` field with `ms ≥ 0`.
 Connect to `ws://localhost:8300/sync`. The first frame must be `auth`; every message
 after is JSON text, camelCase, tagged by `"type"`.
 
+`auth` and the one-shot HTTP API (`X-Rtdb-Protocol` request header) both accept an
+optional `protocolVersion` (ARC-013) so a client can declare the wire version it
+speaks. Omitting it is backward-compatible (treated as version `1`, the current
+`PROTOCOL_VERSION`); a client requesting a version *newer* than the server's is
+rejected with `UNSUPPORTED_PROTOCOL` (400) instead of a generic `deny_unknown_fields`
+400, so a version skew is diagnosable. When the `auth` frame carries
+`protocolVersion`, `authOk` echoes the server's `PROTOCOL_VERSION` back (also
+omitted otherwise, so an older client's `authOk` bytes never change):
+
 ```jsonc
 // -> client: authenticate with a machine token scoped to db "myapp"
-{"type": "auth", "token": "<machine-token>", "db": "myapp"}
+{"type": "auth", "token": "<machine-token>", "db": "myapp", "protocolVersion": 1}
 
 // <- server
-{"type": "authOk", "user": {"kind": "machine", "email": null, "name": null}}
+{"type": "authOk", "user": {"kind": "machine", "email": null, "name": null}, "protocolVersion": 1}
 
 // -> client: subscribe to all not-done tasks via the "by_done" index
 {"type": "subscribe", "queryId": "q1", "query": {"table": "tasks", "index": "by_done", "eq": [false]}}

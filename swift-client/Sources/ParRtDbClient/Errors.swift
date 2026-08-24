@@ -23,6 +23,9 @@ public enum ErrorCode: String, Codable, Sendable, CaseIterable {
     case rateLimited = "RATE_LIMITED"
     /// Per-database resource quota exceeded (HTTP 507).
     case quotaExceeded = "QUOTA_EXCEEDED"
+    /// ARC-013: requested `protocolVersion` (WS `auth` frame or the
+    /// `X-Rtdb-Protocol` HTTP header) is newer than the server's (HTTP 400).
+    case unsupportedProtocol = "UNSUPPORTED_PROTOCOL"
 }
 
 /// Every failure is this envelope: `{code, message, retryAfter?}` on the wire

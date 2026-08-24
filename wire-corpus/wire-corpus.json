@@ -3,6 +3,7 @@
   "client_messages": [
     { "type": "auth", "token": "t", "db": "d" },
     { "type": "auth", "db": "d" },
+    { "type": "auth", "token": "t", "db": "d", "protocolVersion": 1 },
     { "type": "subscribe", "queryId": "q1", "query": { "table": "workItems" } },
     { "type": "subscribe", "queryId": "q-filter", "query": { "table": "workItems", "filter": { "op": "and", "exprs": [ { "op": "eq", "field": "status", "value": "done" }, { "op": "gt", "field": "order", "value": 0 } ] } } },
     { "type": "subscribe", "queryId": "q-search", "query": { "table": "notes", "search": { "index": "search_body", "query": "hello world" } } },
@@ -41,6 +42,7 @@
   "server_messages": [
     { "type": "authOk", "user": { "kind": "user", "email": "a@b.com", "name": null, "githubLogin": "alice", "githubId": 12345 } },
     { "type": "authOk", "user": { "kind": "machine", "email": null, "name": null } },
+    { "type": "authOk", "user": { "kind": "machine", "email": null, "name": null }, "protocolVersion": 1 },
     { "type": "authErr", "error": { "code": "UNAUTHORIZED", "message": "bad token" } },
     { "type": "queryUpdate", "queryId": "q1", "result": null },
     { "type": "queryUpdate", "queryId": "q1", "result": { "_id": "abc", "title": "first" } },
@@ -110,7 +112,8 @@
     { "code": "UNAUTHORIZED", "message": "bad token" },
     { "code": "NOT_FOUND", "message": "missing doc" },
     { "code": "PRECONDITION_FAILED", "message": "version conflict" },
-    { "code": "FORBIDDEN", "message": "not owner" }
+    { "code": "FORBIDDEN", "message": "not owner" },
+    { "code": "UNSUPPORTED_PROTOCOL", "message": "requested protocol version 999 is newer than this server's 1" }
   ],
   "queries": [
     { "table": "workItems" },

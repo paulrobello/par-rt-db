@@ -14,7 +14,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use sqlx::PgPool;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tracing::Instrument;
 
 use crate::auth::PrincipalCtx;
@@ -52,6 +52,11 @@ use taps::publish_taps;
 
 /// Bound on each per-db committer task's inbox.
 const CHANNEL_BUFFER: usize = 64;
+
+/// Bound on how long `channel_for` waits for a draining entry's committer
+/// task to exit (ARC-015) before giving up and surfacing an error, rather
+/// than hanging forever on a stuck drain.
+const CHANNEL_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub enum CommitterRequest {
     Mutate {
@@ -215,6 +220,12 @@ struct ChannelEntry {
     /// step 4). `drop_db` does not need this — it deletes the db, so a
     /// concurrent `channel_for` misses `database_exists` and never respawns.
     draining: bool,
+    /// Notified (ARC-015) when the entry's committer task has exited and the
+    /// supervisor closure has removed it from `channels`. A `channel_for`
+    /// caller waiting on a draining entry awaits this instead of sleep-polling
+    /// the map every 2ms. See `channel_for`'s drain-wait for the
+    /// missed-wakeup-safe registration order.
+    drained: Arc<Notify>,
     /// ENH-022 Stage 4: `Some` on the OWNING replica — the one-connection
     /// lease pool whose backend holds the db's advisory lock; the committer
     /// and its pollers run on it (writes and lease share one backend, so no
@@ -610,46 +621,70 @@ impl Committers {
         db: &str,
         upgrade: bool,
     ) -> Result<(mpsc::Sender<CommitterRequest>, bool), RtDbError> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + CHANNEL_DRAIN_DEADLINE;
         loop {
             // Fast path: a live (non-draining) entry. Refresh its idle clock
             // (ARC-102 step 4) and return. A draining entry falls through to
             // the wait; an absent entry falls through to the spawn.
-            let mut draining = false;
-            {
-                let mut guard = self.channels.lock().await;
-                if let Some(entry) = guard.get_mut(db) {
-                    if entry.draining {
-                        draining = true;
-                    } else if upgrade && self.multi_instance && entry.lease.is_none() {
-                        // ENH-022 Stage 4/4c upgrade (takeover) path: retire
-                        // the shadow (its exit clears the entry) and loop —
-                        // the spawn path then takes the ownership lease,
-                        // which is the failover path when the previous owner
-                        // has died or never answered a forward.
-                        entry.draining = true;
-                        let sender = entry.sender.clone();
-                        drop(guard);
-                        let _ = sender.send(CommitterRequest::Shutdown).await;
-                        draining = true;
-                    } else {
-                        entry.last_activity = std::time::Instant::now();
-                        return Ok((entry.sender.clone(), entry.lease.is_none()));
+            let mut guard = self.channels.lock().await;
+            if let Some(entry) = guard.get_mut(db) {
+                if entry.draining {
+                    // ARC-015: register interest in this entry's
+                    // drain-completion `Notify` — via `notified()` +
+                    // `enable()` — while STILL holding the lock, then await
+                    // it (bounded by `deadline`) after releasing. The
+                    // supervisor closure that removes a draining entry and
+                    // calls `notify_waiters()` (see `channel_for`'s spawn
+                    // site below) also needs this same lock, so whichever
+                    // side acquires it second is guaranteed to observe the
+                    // other's effect: `enable()` can never miss a concurrent
+                    // `notify_waiters()`. `enable()` (not a bare `.await` on
+                    // `notified()`) is required here — a `Notified` future
+                    // only registers as a waiter once polled/enabled, so
+                    // constructing it is not by itself race-safe. This
+                    // replaces the old 2ms sleep-poll without reintroducing
+                    // its race.
+                    let notify = entry.drained.clone();
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    drop(guard);
+                    if std::time::Instant::now() >= deadline {
+                        return Err(RtDbError::internal(
+                            "committer for database is draining and did not exit in time",
+                        ));
                     }
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    let _ = tokio::time::timeout(remaining, notified).await;
+                    continue;
+                } else if upgrade && self.multi_instance && entry.lease.is_none() {
+                    // ENH-022 Stage 4/4c upgrade (takeover) path: retire
+                    // the shadow (its exit clears the entry) and loop —
+                    // the spawn path then takes the ownership lease,
+                    // which is the failover path when the previous owner
+                    // has died or never answered a forward.
+                    entry.draining = true;
+                    let sender = entry.sender.clone();
+                    let notify = entry.drained.clone();
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    drop(guard);
+                    let _ = sender.send(CommitterRequest::Shutdown).await;
+                    if std::time::Instant::now() >= deadline {
+                        return Err(RtDbError::internal(
+                            "committer for database is draining and did not exit in time",
+                        ));
+                    }
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    let _ = tokio::time::timeout(remaining, notified).await;
+                    continue;
+                } else {
+                    entry.last_activity = std::time::Instant::now();
+                    return Ok((entry.sender.clone(), entry.lease.is_none()));
                 }
             }
-            if draining {
-                if std::time::Instant::now() >= deadline {
-                    return Err(RtDbError::internal(
-                        "committer for database is draining and did not exit in time",
-                    ));
-                }
-                // The supervisor removes the draining entry once the task exits;
-                // retry to either observe its removal (→ spawn) or pick up a
-                // concurrent respawn.
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-                continue;
-            }
+            drop(guard);
 
             // Miss: confirm the db exists, then spawn under the lock with a
             // double-check (another caller may have spawned while we queried).
@@ -713,8 +748,13 @@ impl Committers {
                     if guard
                         .get(&db_owned)
                         .is_some_and(|current| current.sender.same_channel(&supervised))
+                        && let Some(entry) = guard.remove(&db_owned)
                     {
-                        guard.remove(&db_owned);
+                        // ARC-015: wake any `channel_for` caller parked on this
+                        // entry's drain-wait. Done under the same lock as the
+                        // removal so it races correctly against a waiter's
+                        // registration (see `channel_for`'s drain-wait comment).
+                        entry.drained.notify_waiters();
                     }
                 });
             }
@@ -770,6 +810,7 @@ impl Committers {
                     sender: tx.clone(),
                     last_activity: std::time::Instant::now(),
                     draining: false,
+                    drained: Arc::new(Notify::new()),
                     lease,
                 },
             );
@@ -962,16 +1003,22 @@ impl Committers {
     /// cadence is `min(idle_threshold, 60s)` so a db is retired within roughly
     /// one sweep of going idle without spamming the lock on huge thresholds.
     /// Called once from `AppState::new` after the `Committers` is constructed.
-    pub fn spawn_idle_reclaimer(&self) {
+    ///
+    /// ARC-009: returns the sweep's `JoinHandle` (`None` when the sweep is
+    /// disabled) so `AppState::new` can register it with `BackgroundTasks` and
+    /// have it stop on shutdown. Previously this spawned and dropped the
+    /// handle, leaving one untracked loop alive past graceful shutdown.
+    #[must_use]
+    pub fn spawn_idle_reclaimer(&self) -> Option<tokio::task::JoinHandle<()>> {
         if self.idle_threshold.is_zero() {
-            return;
+            return None;
         }
         let channels = Arc::clone(&self.channels);
         let subs = Arc::clone(&self.subs);
         let pool = self.pool.clone();
         let threshold = self.idle_threshold;
         let sweep_interval = threshold.min(std::time::Duration::from_secs(60));
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut tick = tokio::time::interval(sweep_interval);
             // Skip the immediate first tick — a db just spawned is fresh.
             tick.tick().await;
@@ -979,7 +1026,7 @@ impl Committers {
                 tick.tick().await;
                 reclaim_idle_pass(&pool, &subs, &channels, threshold).await;
             }
-        });
+        }))
     }
 }
 

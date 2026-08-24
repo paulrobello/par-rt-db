@@ -11,6 +11,14 @@
 use crate::dsl::{Query, Transaction};
 use crate::error::RtDbError;
 
+/// The wire protocol version this build speaks (ARC-013). A client that omits
+/// `protocolVersion` on its `Auth` frame (or the `X-Rtdb-Protocol` header for
+/// the one-shot HTTP API) is treated as version 1 for backward compatibility.
+/// A requested version GREATER than this is rejected with
+/// `ErrorCode::UnsupportedProtocol` rather than a generic 400/`deny_unknown_fields`
+/// failure — mirrored by all four client SDKs.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// Full WS client vocabulary. Consumed by the WS handler (Task 9) and mirrored
 /// by the TS client — wire tags and field names are load-bearing.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -30,6 +38,11 @@ pub enum ClientMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
         db: String,
+        // ARC-013: optional protocol version the client speaks. Absent ⇒
+        // version 1. A value greater than `PROTOCOL_VERSION` is rejected with
+        // `UNSUPPORTED_PROTOCOL`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol_version: Option<u32>,
     },
     Subscribe {
         query_id: String,
@@ -114,6 +127,13 @@ pub enum ClientMessage {
 pub enum ServerMessage {
     AuthOk {
         user: AuthedUser,
+        // ARC-013: the server's `PROTOCOL_VERSION`, echoed back only when the
+        // client's `Auth` frame carried a `protocolVersion` (signaling it
+        // understands the field) — so a pre-ARC-013 client's `AuthOk` bytes
+        // are unchanged and a `deny_unknown_fields`/`extra="forbid"` decoder
+        // on the older side never sees the new key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol_version: Option<u32>,
     },
     AuthErr {
         error: RtDbError,
@@ -559,7 +579,8 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ClientMessage::Auth {
                 token: Some("t".to_string()),
-                db: "d".to_string()
+                db: "d".to_string(),
+                protocol_version: None,
             })
             .unwrap(),
             serde_json::json!({"type": "auth", "token": "t", "db": "d"})
@@ -569,7 +590,8 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ClientMessage::Auth {
                 token: None,
-                db: "d".to_string()
+                db: "d".to_string(),
+                protocol_version: None,
             })
             .unwrap(),
             serde_json::json!({"type": "auth", "db": "d"})
@@ -577,12 +599,27 @@ mod tests {
         let parsed: ClientMessage =
             serde_json::from_value(serde_json::json!({"type": "auth", "db": "d"})).unwrap();
         match parsed {
-            ClientMessage::Auth { token, db } => {
+            ClientMessage::Auth {
+                token,
+                db,
+                protocol_version,
+            } => {
                 assert!(token.is_none());
                 assert_eq!(db, "d");
+                assert!(protocol_version.is_none());
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+        // ARC-013: `protocolVersion` round-trips when present.
+        assert_eq!(
+            serde_json::to_value(ClientMessage::Auth {
+                token: Some("t".to_string()),
+                db: "d".to_string(),
+                protocol_version: Some(1),
+            })
+            .unwrap(),
+            serde_json::json!({"type": "auth", "token": "t", "db": "d", "protocolVersion": 1})
+        );
         assert_eq!(
             serde_json::to_value(ClientMessage::Subscribe {
                 query_id: "q1".to_string(),
@@ -643,10 +680,42 @@ mod tests {
                     name: None,
                     github_login: None,
                     github_id: None
-                }
+                },
+                protocol_version: None,
             })
             .unwrap()["type"],
             serde_json::json!("authOk")
+        );
+        // ARC-013: `protocolVersion` is omitted when the client didn't signal
+        // support, present (as the server's `PROTOCOL_VERSION`) when it did.
+        assert_eq!(
+            serde_json::to_value(ServerMessage::AuthOk {
+                user: AuthedUser {
+                    kind: UserKind::User,
+                    email: Some("a@b.com".to_string()),
+                    name: None,
+                    github_login: None,
+                    github_id: None
+                },
+                protocol_version: None,
+            })
+            .unwrap()
+            .get("protocolVersion"),
+            None
+        );
+        assert_eq!(
+            serde_json::to_value(ServerMessage::AuthOk {
+                user: AuthedUser {
+                    kind: UserKind::User,
+                    email: Some("a@b.com".to_string()),
+                    name: None,
+                    github_login: None,
+                    github_id: None
+                },
+                protocol_version: Some(PROTOCOL_VERSION),
+            })
+            .unwrap()["protocolVersion"],
+            serde_json::json!(PROTOCOL_VERSION)
         );
         assert_eq!(
             serde_json::to_value(ServerMessage::QueryUpdate {

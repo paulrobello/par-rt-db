@@ -36,6 +36,27 @@ use crate::storage;
 use crate::txn::Transaction;
 use crate::workflows;
 
+/// ARC-013: parse the optional `X-Rtdb-Protocol` request header and reject a
+/// version newer than this build's `PROTOCOL_VERSION`. Absent or non-numeric
+/// (never sent by a real client) is treated as version 1 — mirrors the WS
+/// `Auth` frame's `protocolVersion` handling in `ws::authenticate`.
+fn check_protocol_version(headers: &HeaderMap) -> Result<(), RtDbError> {
+    let Some(requested) = headers
+        .get("x-rtdb-protocol")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u32>().ok())
+    else {
+        return Ok(());
+    };
+    if requested > crate::protocol::PROTOCOL_VERSION {
+        return Err(RtDbError::unsupported_protocol(format!(
+            "requested protocol version {requested} is newer than this server's {}",
+            crate::protocol::PROTOCOL_VERSION
+        )));
+    }
+    Ok(())
+}
+
 fn bearer_token(headers: &HeaderMap) -> Result<&str, RtDbError> {
     if let Some(v) = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -63,6 +84,7 @@ async fn authed(
     headers: &HeaderMap,
     db: &str,
 ) -> Result<Principal, RtDbError> {
+    check_protocol_version(headers)?;
     let token = bearer_token(headers)?;
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, db).await?;

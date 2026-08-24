@@ -54,8 +54,8 @@ pub mod workflows;
 pub mod ws;
 
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use arc_swap::ArcSwap;
@@ -68,10 +68,120 @@ use committer::Committers;
 use config::{Config, HotConfig};
 use db::SchemaCache;
 use subs::SubscriptionManager;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tower::ServiceBuilder;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
+
+/// ARC-009: handle to every fire-and-forget task `AppState::new` spawns (the
+/// idle reclaimer, presence flush, the `PgListener` loops, the rate-limit
+/// sweep, and the forward listener/sweeper), plus the [`CancellationToken`]
+/// that stops them. Nothing joined or cancelled these before this type
+/// existed — a graceful shutdown in `main.rs` only stopped the axum server,
+/// and each of the ~15 `test_state_*` helpers in `tests/common/mod.rs` leaked
+/// a fresh set of listeners (and their Postgres connections) for the whole
+/// test-binary lifetime.
+///
+/// Most of the spawned loops live in `notify.rs`/`forward.rs`/`rate_limit.rs`/
+/// `presence.rs`/`committer/` and are not written to poll a token themselves,
+/// so [`BackgroundTasks::spawn`] races each future against
+/// `token.cancelled()` from the outside: cancellation drops the inner future
+/// at its current await point (closing sockets/listeners via their own `Drop`
+/// impls) without requiring the task body to cooperate. [`BackgroundTasks::track`]
+/// is for a handle obtained elsewhere (`PresenceManager::run_flush_task`
+/// already returns its own `JoinHandle`) — those rely on `abort` instead of a
+/// wrapping `select!`.
+pub struct BackgroundTasks {
+    pub token: CancellationToken,
+    handles: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl BackgroundTasks {
+    fn new() -> Self {
+        Self {
+            token: CancellationToken::new(),
+            handles: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Spawn `fut`, racing it against `token.cancelled()`. Cancellation drops
+    /// `fut` immediately rather than waiting for it to notice — the intended
+    /// shape for the existing listener/sweep loops, none of which currently
+    /// poll a token themselves.
+    fn spawn<F>(&self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let token = self.token.clone();
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                () = token.cancelled() => {}
+                () = fut => {}
+            }
+        });
+        self.push(handle);
+    }
+
+    /// Track a `JoinHandle` obtained elsewhere. Shutdown relies on `abort`
+    /// for these rather than cooperative polling. `pub` so callers outside
+    /// this crate that spawn their own task against `AppState` (the test
+    /// harness's `spawn_app` tracks its detached server task this way) can
+    /// still have it stopped by `cancel`/`shutdown`.
+    pub fn track(&self, handle: JoinHandle<()>) {
+        self.push(handle);
+    }
+
+    fn push(&self, handle: JoinHandle<()>) {
+        self.handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(handle);
+    }
+
+    /// Synchronous shutdown signal: cancel the token and abort every tracked
+    /// handle. Safe to call from `Drop` (no `.await`) — this is what the test
+    /// harness's wrapper type uses so a test's listeners die with the test
+    /// even though `Drop` cannot await the join.
+    pub fn cancel(&self) {
+        self.token.cancel();
+        for h in self
+            .handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            h.abort();
+        }
+    }
+
+    /// `main.rs` graceful shutdown: `cancel()`, then wait up to `timeout` for
+    /// every task to actually finish, logging what did or did not exit in
+    /// time. Aborted tasks resolve quickly, so `timeout` only guards against
+    /// one wedged in a non-cancellable await (e.g. a stuck Postgres call).
+    pub async fn shutdown(&self, timeout: Duration) {
+        self.cancel();
+        let handles: Vec<_> = self
+            .handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
+        let n = handles.len();
+        if n == 0 {
+            return;
+        }
+        match tokio::time::timeout(timeout, futures::future::join_all(handles)).await {
+            Ok(_) => tracing::info!(count = n, "background tasks exited on shutdown"),
+            Err(_) => tracing::warn!(
+                count = n,
+                timeout_ms = timeout.as_millis() as u64,
+                "background tasks did not all exit within the shutdown timeout"
+            ),
+        }
+    }
+}
 
 /// Realtime execution core: subscription state, the per-db committer tasks,
 /// and the live op-feed tap they publish to. Grouped so handlers that only
@@ -171,6 +281,14 @@ pub struct AppState {
     pub runtime: Runtime,
     pub auth: Auth,
     pub limits: Limits,
+    /// ARC-009: cancellation + join handles for every task `AppState::new`
+    /// spawns. `main.rs` drains this on graceful shutdown; tests cancel it
+    /// via a `Drop` guard (`tests/common/mod.rs`'s `background_guard`) so
+    /// listeners die with the test instead of leaking for the whole
+    /// test-binary lifetime. `Arc`-wrapped so that guard can hold its own
+    /// clone independent of the (often leaked — see `spawn_app`) `AppState`
+    /// itself.
+    pub background: Arc<BackgroundTasks>,
 }
 
 impl AppState {
@@ -205,6 +323,19 @@ impl AppState {
         // (and before `pool` moves into it).
         let multi_instance = config.multi_instance;
         let limiter_pool = pool.clone();
+        let rate_limit_exact = config.rate_limit_exact;
+        let rate_limit_sync_ms = config.rate_limit_sync_ms;
+        // ENH-022 Stage 4 / ARC-007: in multi-instance mode the counters live
+        // in Postgres so every replica shares one budget per token/db/ip;
+        // single-instance (the default) keeps the in-memory limiter and
+        // never touches the table. Built here (not inline in the `Limits`
+        // literal below) so the approximate flush task spawned further down
+        // can hold its own `Arc` clone.
+        let rate_limiter = if multi_instance {
+            rate_limit::RateLimiter::new_pg(limiter_pool, rate_limit_exact)
+        } else {
+            rate_limit::RateLimiter::new()
+        };
         // ENH-022 Stage 4c: the origin-side forwarding handle. Built before
         // the committers (they hold it for the shadow-write submit path) and
         // shared with the forward listener task spawned below, which resolves
@@ -234,10 +365,20 @@ impl AppState {
                 forwarder.clone(),
             ),
         );
+        // ARC-009: cancellation + join handles for every background task
+        // spawned below. Built here so every `background.spawn`/`.track` call
+        // that follows can reach it.
+        let background = Arc::new(BackgroundTasks::new());
         // ARC-102 step 4: spawn the server-wide idle-reclamation sweep. A no-op
         // when `db_idle_reclaim_secs` is 0 (the default), so a server that does
         // not opt in pays zero background cost.
-        committers.spawn_idle_reclaimer();
+        //
+        // ARC-009: the sweep hands back its `JoinHandle` (`None` when
+        // disabled) so it is tracked here and stops with every other
+        // background task on shutdown.
+        if let Some(handle) = committers.spawn_idle_reclaimer() {
+            background.track(handle);
+        }
         // Image transform cache shares the same `Arc<Metrics>` as Runtime and
         // the committers so its hit/miss/error counters surface on the dashboard.
         // Built before the struct literal so `metrics` can still move into Runtime.
@@ -275,17 +416,19 @@ impl AppState {
             },
         );
         if presence_cfg.enabled {
-            // Detach: the flush task runs for the lifetime of the process,
-            // self-terminates if it ever errors, and nothing awaits its handle.
-            let _handle = presence.clone().run_flush_task();
+            // ARC-009: `run_flush_task` already returns its own `JoinHandle`
+            // (unlike the `tokio::spawn` sites below), so it is `track`ed
+            // rather than wrapped in `background.spawn`'s `select!` —
+            // cancellation relies on `abort` in `BackgroundTasks::cancel`.
+            background.track(presence.clone().run_flush_task());
         }
         // ENH-022 Stage 2: cross-instance op-feed LISTEN task. Only spawned when
         // `RTDB_MULTI_INSTANCE=true` — a single-instance deploy never pays the
-        // `PgListener` connection. Detach like the presence flush: the task runs
-        // for the process lifetime, reconnects on transient Postgres blips, and
-        // self-dedupe is handled inside it via `instance_id`.
+        // `PgListener` connection. Runs for the process lifetime (or until
+        // `background.token` cancels), reconnects on transient Postgres blips,
+        // and self-dedupe is handled inside it via `instance_id`.
         if config.multi_instance {
-            tokio::spawn(notify::run_listener(
+            background.spawn(notify::run_listener(
                 pool.clone(),
                 op_feed.clone(),
                 instance_id.clone(),
@@ -293,7 +436,7 @@ impl AppState {
             // ARC-001: cross-replica subscription invalidation. Same shape as
             // the op-feed listener — reads only, no committer interaction, so
             // the single-writer invariant is untouched.
-            tokio::spawn(notify::run_write_set_listener(
+            background.spawn(notify::run_write_set_listener(
                 pool.clone(),
                 subs.clone(),
                 schemas.clone(),
@@ -303,11 +446,11 @@ impl AppState {
         // ENH-022 Stage 3: cross-instance presence LISTEN task. Only spawned
         // when BOTH `RTDB_MULTI_INSTANCE=true` AND `RTDB_PRESENCE_ENABLED=true`
         // — a single-instance deploy never pays the second `PgListener`
-        // connection. Detach like the op-feed listener: runs for the process
-        // lifetime, reconnects on transient Postgres blips, self-dedupes by
+        // connection. Runs for the process lifetime (or until `background.token`
+        // cancels), reconnects on transient Postgres blips, self-dedupes by
         // `instance_id`. Performs NO write and NO committer interaction.
         if config.multi_instance && presence_cfg.enabled {
-            tokio::spawn(notify::run_presence_listener(
+            background.spawn(notify::run_presence_listener(
                 pool.clone(),
                 presence.clone(),
                 instance_id.clone(),
@@ -320,21 +463,22 @@ impl AppState {
         // forwarded write reaches the owning replica's committer turn (the
         // owner is the single writer; this listener only injects INTO that
         // existing serialized turn, it never executes a write itself).
-        // Detach like the other listeners — runs for the process lifetime,
+        // Runs for the process lifetime (or until `background.token` cancels),
         // reconnects on transient Postgres blips, self-dedupes by
         // `instance_id`, and drops requests for databases it does not own.
         if config.multi_instance
             && let Some(forwarder) = forwarder.as_ref()
         {
-            tokio::spawn(forward::run_forward_listener(
+            background.spawn(forward::run_forward_listener(
                 pool.clone(),
                 committers.clone(),
                 forwarder.clone(),
                 instance_id.clone(),
+                config.forward_concurrency,
             ));
             // ARC-002: reclaim spool rows nobody consumed. Retention is twice
             // the forward timeout — past that, no live request can still care.
-            tokio::spawn(forward::run_forward_sweeper(
+            background.spawn(forward::run_forward_sweeper(
                 pool.clone(),
                 std::time::Duration::from_millis(config.forward_timeout_ms.saturating_mul(2)),
             ));
@@ -342,10 +486,22 @@ impl AppState {
         // ENH-022 Stage 4: rate-counter sweep. In multi-instance mode the
         // limiter's counters live in `rtdb_auth.rate_counters` (one row per
         // key per minute); this task drops buckets older than the current
-        // minute so the table stays bounded. Detach like the listeners — runs
-        // for the process lifetime; a failed sweep logs and retries next tick.
+        // minute so the table stays bounded. Runs for the process lifetime
+        // (or until `background.token` cancels); a failed sweep logs and
+        // retries next tick.
         if config.multi_instance {
-            tokio::spawn(rate_limit::run_counter_sweep(pool.clone()));
+            background.spawn(rate_limit::run_counter_sweep(pool.clone()));
+            // ARC-007: approximate limiter flush. Only when the limiter is
+            // NOT running the exact per-request `check_pg` path — the exact
+            // path never accumulates local deltas, so there is nothing to
+            // flush. Runs for the process lifetime (or until
+            // `background.token` cancels).
+            if !rate_limit_exact {
+                background.spawn(rate_limit::run_approx_flush(
+                    rate_limiter.clone(),
+                    Duration::from_millis(rate_limit_sync_ms),
+                ));
+            }
         }
         // ARC-114: one shared HTTP client for every OAuth provider's outbound
         // calls, so logins reuse a warm connection pool instead of building a
@@ -376,19 +532,12 @@ impl AppState {
             },
             auth: Auth { http },
             limits: Limits {
-                // ENH-022 Stage 4: in multi-instance mode the counters live in
-                // Postgres so every replica shares one budget per token/db/ip;
-                // single-instance (the default) keeps the in-memory limiter
-                // and never touches the table.
-                rate_limiter: if multi_instance {
-                    rate_limit::RateLimiter::new_pg(limiter_pool)
-                } else {
-                    rate_limit::RateLimiter::new()
-                },
+                rate_limiter,
                 image,
                 quotas,
                 signed_url_key,
             },
+            background,
         })
     }
 }

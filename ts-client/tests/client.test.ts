@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { type ConnectionState, RtDbClient, type WebSocketLike } from "../src/client.js";
+import { PROTOCOL_VERSION } from "../src/protocol.js";
 import type { RtQuery } from "../src/query.js";
 
 /** A controllable fake socket. Records sent frames; lets the test drive open/message/close. */
@@ -92,7 +93,13 @@ describe("RtDbClient", () => {
     const { client, sockets } = newClient();
     client.connect();
     sockets[0].open();
-    expect(sockets[0].sentParsed[0]).toEqual({ type: "auth", token: "tok", db: "kanban" });
+    // ARC-013: the auth frame also carries the negotiated protocolVersion.
+    expect(sockets[0].sentParsed[0]).toEqual({
+      type: "auth",
+      token: "tok",
+      db: "kanban",
+      protocolVersion: PROTOCOL_VERSION,
+    });
   });
 
   it("subscribes after authOk and delivers queryUpdate to the listener", () => {

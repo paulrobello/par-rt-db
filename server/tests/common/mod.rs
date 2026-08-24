@@ -8,6 +8,49 @@ use rtdb_server::schema::SchemaDef;
 use rtdb_server::{AppState, build_router, config::Config, db, ddl};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
+/// ARC-009: RAII guard that stops an `AppState`'s background tasks (the
+/// PgListener loops, rate-limit sweep, forward listener/sweeper, and —
+/// via `abort` — the presence flush task; see `BackgroundTasks` in `lib.rs`)
+/// when it drops.
+///
+/// `spawn_app` below detaches the router's server task via `tokio::spawn`
+/// without ever joining it, so a bare `Arc<AppState>` returned from
+/// `test_state()` et al. is kept alive by that detached task for the rest of
+/// the TEST BINARY's life — `AppState`'s own fields never see their last
+/// reference drop at test end, so a `Drop` impl on `AppState` itself would
+/// not fire until the binary exits. This guard sidesteps that: it holds an
+/// `Arc<BackgroundTasks>` clone (obtained via `background_guard`, `Arc`-
+/// independent of `AppState`), so dropping it stops the listener loops (and
+/// their Postgres connections) at test end regardless of how long the
+/// detached server task lives.
+///
+/// Not wired into `test_state()`/`spawn_app` automatically: doing so would
+/// require changing their return type, which would ripple across the ~54
+/// files under `tests/*.rs` (consolidated into ONE binary — see
+/// `tests/main.rs`) that already call `test_state_with_*(...).await` and
+/// `spawn_app(state)` expecting a plain `Arc<AppState>`. A test that wants
+/// deterministic background-task teardown opts in:
+/// ```ignore
+/// let state = test_state_with_presence().await;
+/// let _bg = common::background_guard(&state);
+/// let addr = spawn_app(state.clone()).await;
+/// ```
+#[allow(dead_code)] // opt-in helper (see docs above) — not yet adopted by any test file
+pub struct BackgroundGuard(Arc<rtdb_server::BackgroundTasks>);
+
+impl Drop for BackgroundGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// Build a [`BackgroundGuard`] for `state`. See its docs for why this is an
+/// opt-in helper rather than automatic.
+#[allow(dead_code)] // opt-in helper — not yet adopted by any test file
+pub fn background_guard(state: &AppState) -> BackgroundGuard {
+    BackgroundGuard(state.background.clone())
+}
+
 pub fn test_config() -> Config {
     Config {
         port: 0,
@@ -45,6 +88,8 @@ pub fn test_config() -> Config {
         slow_query_log_params: false,
         rate_limit_per_token_rpm: 0,
         rate_limit_per_db_rpm: 0,
+        rate_limit_exact: false,
+        rate_limit_sync_ms: 1000,
         audit_log_enabled: false,
         oauth_login_csrf: true,
         webhooks_enabled: false,
@@ -88,6 +133,7 @@ pub fn test_config() -> Config {
         otel_sample_ratio: 0.0,
         multi_instance: false,
         forward_timeout_ms: 5000,
+        forward_concurrency: 64,
         instance_id: None,
     }
 }
@@ -330,16 +376,24 @@ pub async fn spawn_app(state: Arc<AppState>) -> SocketAddr {
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("read local addr");
+    // ARC-009: this server task is never joined and outlives the test's own
+    // `state` variable (it holds the last `Arc<AppState>` clone for the rest
+    // of the test binary's life), so it is what actually leaks the state's
+    // background listeners in tests that don't call `background_guard`.
+    // Tracking its handle here at least lets `background_guard`/`cancel`/
+    // `shutdown` stop the HTTP server itself, not just the listener loops.
+    let background = state.background.clone();
     // `into_make_service_with_connect_info` provides the peer `SocketAddr` to
     // handlers via the `ConnectInfo<SocketAddr>` extractor — mirrors `main.rs`
     // and is required by `serve_public_handler` (per-IP storage rate limit).
-    tokio::spawn(
-        axum::serve(
-            listener,
-            build_router(state).into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .into_future(),
-    );
+    let serve = axum::serve(
+        listener,
+        build_router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .into_future();
+    background.track(tokio::spawn(async move {
+        let _ = serve.await;
+    }));
     addr
 }
 

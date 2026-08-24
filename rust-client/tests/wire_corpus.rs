@@ -418,3 +418,59 @@ fn protocol_constants_max_steps_matches_corpus() {
         "MAX_STEPS drifted from wire-corpus protocol_constants.max_steps"
     );
 }
+
+/// ARC-017: `wire-corpus/error-codes.json` is the canonical
+/// `{code, httpStatus}` table generated from the server's `ErrorCode` enum
+/// (`server/src/error.rs::tests::error_codes_match_wire_corpus`). This asserts
+/// every code the corpus lists is known to `par_rt_db_client::ErrorCode` (round
+/// trips through serde) and that the client's closed set carries no code the
+/// corpus doesn't — a code added to the server without a matching client
+/// variant would otherwise fail silently. `ALL` is not itself compiler-checked
+/// complete; adding a variant to `ErrorCode` without adding it here fails this
+/// test (not a compile error) — see the server test for the actual
+/// compile-time exhaustiveness guard.
+#[test]
+fn error_codes_known_to_rust_client() {
+    use par_rt_db_client::ErrorCode;
+
+    const ALL: [ErrorCode; 11] = [
+        ErrorCode::Unauthorized,
+        ErrorCode::Forbidden,
+        ErrorCode::NotFound,
+        ErrorCode::SchemaViolation,
+        ErrorCode::PreconditionFailed,
+        ErrorCode::BadRequest,
+        ErrorCode::Internal,
+        ErrorCode::Conflict,
+        ErrorCode::RateLimited,
+        ErrorCode::QuotaExceeded,
+        ErrorCode::UnsupportedProtocol,
+    ];
+
+    let corpus: Value = serde_json::from_str(include_str!("../../wire-corpus/error-codes.json"))
+        .unwrap_or_else(|e| panic!("parse error-codes.json: {e}"));
+    let mut corpus_codes: Vec<String> = corpus["codes"]
+        .as_array()
+        .expect("error-codes.json missing 'codes' array")
+        .iter()
+        .map(|e| e["code"].as_str().expect("entry.code").to_string())
+        .collect();
+    corpus_codes.sort();
+
+    let mut known_codes: Vec<String> = ALL
+        .iter()
+        .map(|c| {
+            serde_json::to_value(c)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    known_codes.sort();
+
+    assert_eq!(
+        corpus_codes, known_codes,
+        "rust-client ErrorCode drifted from wire-corpus/error-codes.json"
+    );
+}
