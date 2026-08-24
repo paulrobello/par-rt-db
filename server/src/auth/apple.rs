@@ -1,17 +1,18 @@
 //! Apple OAuth provider (`/auth/apple/*`): an ES256 JWT `client_secret` minted
 //! from the private key, `response_mode=form_post` callbacks, and user/email
 //! derived from the first `id_token` (name only on first authorization).
-//! Stable identity keys on Apple's `sub`.
+//! Stable identity keys on Apple's `sub`. The `id_token` signature is verified
+//! against Apple's JWKS (SEC-004), sharing the cache in `auth::jwks`.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use base64::Engine;
 use serde::Serialize;
 use sqlx::PgPool;
 
 use crate::AppState;
+use crate::auth::jwks;
 use crate::auth::provider::OAuthProvider;
 use crate::auth::session;
 use crate::config::Config;
@@ -52,6 +53,10 @@ impl AppleProvider {
     const AUTHORIZE_URL: &'static str = "https://appleid.apple.com/auth/authorize";
     const TOKEN_URL: &'static str = "https://appleid.apple.com/auth/token";
     const AUDIENCE: &'static str = "https://appleid.apple.com";
+    /// Apple's rotating public key set, used to verify the `id_token`
+    /// signature (SEC-004). Keys rotate, so this is fetched and cached, never
+    /// pinned.
+    const JWKS_URL: &'static str = "https://appleid.apple.com/auth/keys";
 }
 
 /// Normalized identity extracted from Apple's id_token claims.
@@ -103,16 +108,10 @@ impl OAuthProvider for AppleProvider {
         let client = state.auth.http.clone();
         let redirect_uri = self.redirect_uri(&state.config.public_url);
 
-        // SEC-002R: the id_token read below arrives ONLY from this
-        // server-initiated TLS POST to Apple's token endpoint, authenticated by
-        // the operator's ES256 client_secret JWT built above. It is never
-        // accepted from a client-controlled channel, which is why the deferred
-        // JWKS signature verification (SEC-002) is hardening rather than a
-        // missing control — forgery requires a TLS-path compromise. LATENT
-        // RISK: adding any future endpoint that accepts a client-supplied
-        // id_token (e.g. "sign in with the id_token I already have") would make
-        // the unverified signature trivially forgeable overnight. Such an
-        // endpoint MUST land JWKS verification first.
+        // SEC-004: the id_token read below is verified against Apple's JWKS by
+        // `verify_id_token`, so its authenticity no longer rests on the
+        // transport. A future endpoint that accepts a client-supplied id_token
+        // would therefore be safe to add on this path.
         let token_resp: serde_json::Value = client
             .post(Self::TOKEN_URL)
             .form(&TokenExchangeRequest {
@@ -150,7 +149,8 @@ impl OAuthProvider for AppleProvider {
                 RtDbError::internal("apple token exchange failed")
             })?;
 
-        let identity = parse_identity(decode_id_token_claims(id_token, &self.client_id)?)?;
+        let claims = verify_id_token(&client, id_token, &self.client_id).await?;
+        let identity = parse_identity(claims)?;
         let email = identity.email.to_lowercase();
         let login = email.clone();
 
@@ -230,76 +230,47 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Decodes the payload claims of Apple's id_token and validates the OIDC claims
-/// (`iss`, `aud`, `exp`) that defend against a token minted for a different
-/// client or used after its short lifetime. The token was received over TLS
-/// directly from Apple's token endpoint using our confidential `client_secret`
-/// JWT, so it is authentic by transport — the same trust model the google/oidc
-/// providers apply to their userinfo fetch (they don't verify a signature
-/// either). **Signature verification** (fetching Apple's rotating JWKS and
-/// validating the ES256 signature against the token's `kid`) is therefore a
-/// defense-in-depth hardening, not a missing control, and is out of scope for
-/// v1 — see SEC-002. The claim checks below are the partial fix: a stolen code
-/// replay against the wrong client_id, or a token past its 10-minute `exp`,
-/// is rejected before any account upsert.
-fn decode_id_token_claims(
+/// Rejection text for every id_token failure. One message for all of them:
+/// which check failed (bad signature, wrong `aud`, expired) is a detail the
+/// caller must not be able to enumerate. The specific cause is logged.
+const ID_TOKEN_REJECTED: &str = "apple id_token rejected";
+
+/// Verifies Apple's `id_token` (SEC-004) and returns its claims.
+///
+/// The token's `kid` — read from the **unverified** header purely as a lookup
+/// key — selects a public key from Apple's rotating JWKS, and a single
+/// `jsonwebtoken::decode` then checks the signature together with `iss`, `aud`,
+/// and `exp`. Nothing in the token is trusted until that call returns, so a
+/// forged token cannot select its own verification algorithm.
+///
+/// Apple publishes RS256 keys today. `jwks::select_key` derives the algorithm
+/// from the published key material rather than the token header, so an EC
+/// (ES256) rotation verifies with no code change, while an unexpected key type
+/// is rejected instead of guessed at.
+async fn verify_id_token(
+    http: &reqwest::Client,
     id_token: &str,
     expected_client_id: &str,
 ) -> Result<serde_json::Value, RtDbError> {
-    let payload = id_token.split('.').nth(1).ok_or_else(|| {
-        tracing::warn!("apple id_token malformed (no payload segment)");
-        RtDbError::internal("apple token exchange failed")
-    })?;
-    // JWT segments are base64url without padding; strip stray '=' defensively.
-    let payload = payload.trim_end_matches('=');
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|err| {
-            tracing::warn!(error = %err, "apple id_token payload decode failed");
-            RtDbError::internal("apple token exchange failed")
-        })?;
-    let claims: serde_json::Value = serde_json::from_slice(&bytes).map_err(|err| {
-        tracing::warn!(error = %err, "apple id_token json decode failed");
-        RtDbError::internal("apple token exchange failed")
-    })?;
-
-    // iss MUST be Apple's sole issuer — a token from any other issuer is not an
-    // Apple id_token regardless of how it reached us.
-    let iss = claims.get("iss").and_then(|v| v.as_str()).unwrap_or("");
-    if iss != AppleProvider::AUDIENCE {
-        tracing::warn!(iss, "apple id_token has unexpected issuer");
-        return Err(RtDbError::forbidden("apple id_token rejected"));
-    }
-    // aud MUST equal our client_id — a token minted for a different app cannot
-    // be redeemed for our user's identity, even if a stolen code reaches our
-    // token endpoint. Apple also sends `aud` as an array in some flows, so
-    // accept both shapes.
-    let aud_matches = match claims.get("aud") {
-        Some(serde_json::Value::String(s)) => s == expected_client_id,
-        Some(serde_json::Value::Array(arr)) => arr
-            .iter()
-            .filter_map(|v| v.as_str())
-            .any(|s| s == expected_client_id),
-        _ => false,
-    };
-    if !aud_matches {
-        tracing::warn!("apple id_token audience does not match client_id");
-        return Err(RtDbError::forbidden("apple id_token rejected"));
-    }
-    // exp MUST be in the future (strict — Apple tokens carry a 10-minute
-    // lifetime; a small clock skew would still be inside the window). Reject
-    // any expired or malformed-exp token rather than trusting its claims.
-    let exp = claims.get("exp").and_then(|v| v.as_i64());
-    let now = now_secs();
-    match exp {
-        Some(exp) if exp > now => {}
-        _ => {
-            tracing::warn!(exp, now, "apple id_token missing or expired exp");
-            return Err(RtDbError::forbidden("apple id_token rejected"));
-        }
-    }
-
-    Ok(claims)
+    let kid = jwks::unverified_kid(id_token, ID_TOKEN_REJECTED)?;
+    let key_set = jwks::fetch(
+        http,
+        AppleProvider::JWKS_URL,
+        "apple id_token verification failed",
+    )
+    .await?;
+    let key = jwks::select_key(&key_set, &kid, ID_TOKEN_REJECTED)?;
+    // `iss` must be Apple's sole issuer and `aud` our own client_id: a token
+    // minted for a different app cannot be redeemed for our user's identity
+    // even if a stolen code reaches our token endpoint. Apple sends `aud` as a
+    // string or a one-element array; `jsonwebtoken` accepts both shapes.
+    jwks::decode_verified(
+        id_token,
+        &key,
+        AppleProvider::AUDIENCE,
+        expected_client_id,
+        ID_TOKEN_REJECTED,
+    )
 }
 
 /// `email_verified` arrives as a JSON boolean or the string `"true"` (Apple
@@ -424,6 +395,9 @@ fn map_conflict(err: sqlx::Error) -> RtDbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the test helpers base64-encode now that `verify_id_token` delegates
+    // decoding to `jwks`.
+    use base64::Engine;
     use serde_json::json;
 
     /// Generates a throwaway P-256 key at runtime and feeds its PKCS#8 DER
@@ -444,12 +418,113 @@ mod tests {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     }
 
-    /// Builds a fake Apple id_token (header.payload.sig) for decode tests. The
-    /// signature is a placeholder — `decode_id_token_claims` does not verify it.
-    fn fake_id_token(payload: &serde_json::Value) -> String {
-        let header = b64url(br#"{"alg":"ES256","kid":"TESTKEY"}"#);
-        let payload = b64url(serde_json::to_vec(payload).unwrap().as_slice());
-        format!("{header}.{payload}.sig")
+    // --- SEC-004: id_token signature verification --------------------------
+    // Apple's JWKS URL is a single constant, so every test in this module
+    // shares one cache entry. `apple_test_keys` seeds it exactly once with both
+    // a P-256 (ES256) and an RSA (RS256) key under distinct kids; a test that
+    // needs a rejection signs with a kid or a key that is not in that set.
+    // Keys are generated at runtime — no PEM or key literal lives in the repo,
+    // so gitleaks / detect-private-key stay meaningful.
+
+    const CLIENT_ID: &str = "com.example.svc";
+    const EC_KID: &str = "apple-ec-kid";
+    const RSA_KID: &str = "apple-rsa-kid";
+
+    struct TestKeys {
+        ec_pkcs8: Vec<u8>,
+        rsa: rsa::RsaPrivateKey,
+    }
+
+    /// Generates the key pair set once per test binary and seeds Apple's JWKS
+    /// URL in the shared cache with both public halves.
+    async fn apple_test_keys() -> &'static TestKeys {
+        static KEYS: tokio::sync::OnceCell<TestKeys> = tokio::sync::OnceCell::const_new();
+        KEYS.get_or_init(|| async {
+            use ring::signature::KeyPair;
+            use rsa::traits::PublicKeyParts;
+
+            let rng = ring::rand::SystemRandom::new();
+            let ec_pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
+                &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+                &rng,
+            )
+            .expect("generate a P-256 key for the test")
+            .as_ref()
+            .to_vec();
+            let ec_pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+                &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+                &ec_pkcs8,
+                &rng,
+            )
+            .expect("parse the generated P-256 key");
+            // ring hands out the uncompressed SEC1 point: 0x04 || x(32) || y(32).
+            let point = ec_pair.public_key().as_ref().to_vec();
+            let (x, y) = point[1..].split_at(32);
+
+            let rsa = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048)
+                .expect("generate RSA-2048 key");
+
+            jwks::seed_for_test(
+                AppleProvider::JWKS_URL,
+                json!({"keys": [
+                    {"kty": "EC", "use": "sig", "kid": EC_KID, "crv": "P-256",
+                     "x": b64url(x), "y": b64url(y)},
+                    {"kty": "RSA", "use": "sig", "kid": RSA_KID, "alg": "RS256",
+                     "n": b64url(&rsa.n().to_bytes_be()), "e": b64url(&rsa.e().to_bytes_be())},
+                ]}),
+            )
+            .await;
+
+            TestKeys { ec_pkcs8, rsa }
+        })
+        .await
+    }
+
+    /// Signs `claims` as a real ES256 JWT under `kid`.
+    fn sign_es256(pkcs8: &[u8], kid: &str, claims: &serde_json::Value) -> String {
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        header.kid = Some(kid.to_string());
+        jsonwebtoken::encode(
+            &header,
+            claims,
+            &jsonwebtoken::EncodingKey::from_ec_der(pkcs8),
+        )
+        .expect("sign the test id_token")
+    }
+
+    /// Signs `claims` as a real RS256 JWT under `kid` — Apple's actual
+    /// algorithm today.
+    fn sign_rs256(key: &rsa::RsaPrivateKey, kid: &str, claims: &serde_json::Value) -> String {
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::{SignatureEncoding, Signer};
+        use sha2::Sha256;
+
+        let header = json!({"alg": "RS256", "typ": "JWT", "kid": kid});
+        let signing_input = format!(
+            "{}.{}",
+            b64url(&serde_json::to_vec(&header).unwrap()),
+            b64url(&serde_json::to_vec(claims).unwrap()),
+        );
+        let signature = SigningKey::<Sha256>::new(key.clone()).sign(signing_input.as_bytes());
+        format!("{signing_input}.{}", b64url(&signature.to_vec()))
+    }
+
+    /// Claims of a well-formed Apple id_token.
+    fn apple_claims() -> serde_json::Value {
+        json!({
+            "iss": "https://appleid.apple.com",
+            "aud": CLIENT_ID,
+            "exp": now_secs() + 600,
+            "iat": now_secs(),
+            "sub": "000123.abc",
+            "email": "Alice@Example.com",
+            "email_verified": "true",
+            "is_private_email": "false"
+        })
+    }
+
+    async fn verify(token: &str) -> Result<serde_json::Value, RtDbError> {
+        verify_id_token(&reqwest::Client::new(), token, CLIENT_ID).await
     }
 
     #[test]
@@ -485,82 +560,125 @@ mod tests {
         assert!(claims["exp"].as_i64().unwrap() > claims["iat"].as_i64().unwrap());
     }
 
-    #[test]
-    fn decode_id_token_extracts_sub_and_email() {
-        let token = fake_id_token(&json!({
-            "iss": "https://appleid.apple.com",
-            "aud": "com.example.svc",
-            "exp": now_secs() + 600,
-            "sub": "000123.abc",
-            "email": "Alice@Example.com",
-            "email_verified": "true",
-            "is_private_email": "false"
-        }));
-        let claims = decode_id_token_claims(&token, "com.example.svc").unwrap();
-        let id = parse_identity(claims).unwrap();
+    /// SEC-004: a genuinely RS256-signed token — Apple's algorithm today —
+    /// verifies against the published JWKS and yields its claims.
+    #[tokio::test]
+    async fn verify_id_token_accepts_a_valid_rs256_token() {
+        let keys = apple_test_keys().await;
+        let token = sign_rs256(&keys.rsa, RSA_KID, &apple_claims());
+        let id = parse_identity(verify(&token).await.unwrap()).unwrap();
         assert_eq!(id.sub, "000123.abc");
         assert_eq!(id.email, "Alice@Example.com");
     }
 
-    /// SEC-002: a token whose `aud` does not match our `client_id` is rejected,
-    /// even though the transport is trusted — defense against a stolen code
-    /// redeemed against the wrong app being used to log in here.
-    #[test]
-    fn decode_id_token_rejects_wrong_audience() {
-        let token = fake_id_token(&json!({
-            "iss": "https://appleid.apple.com",
-            "aud": "com.someone.else",
-            "exp": now_secs() + 600,
-            "sub": "s",
-            "email": "x@y.com",
-            "email_verified": "true"
-        }));
-        let err = decode_id_token_claims(&token, "com.example.svc").unwrap_err();
-        assert!(err.message.contains("rejected") || err.message.contains("forbidden"));
+    /// SEC-004: the EC path. `select_key` reads ES256 off the `crv` of the JWKS
+    /// entry, so an Apple key rotation to P-256 verifies with no code change.
+    #[tokio::test]
+    async fn verify_id_token_accepts_a_valid_es256_token() {
+        let keys = apple_test_keys().await;
+        let token = sign_es256(&keys.ec_pkcs8, EC_KID, &apple_claims());
+        let id = parse_identity(verify(&token).await.unwrap()).unwrap();
+        assert_eq!(id.sub, "000123.abc");
     }
 
-    /// SEC-002: an id_token past its `exp` is rejected.
-    #[test]
-    fn decode_id_token_rejects_expired_exp() {
-        let token = fake_id_token(&json!({
-            "iss": "https://appleid.apple.com",
-            "aud": "com.example.svc",
-            "exp": now_secs() - 1,
-            "sub": "s",
-            "email": "x@y.com",
-            "email_verified": "true"
-        }));
-        assert!(decode_id_token_claims(&token, "com.example.svc").is_err());
+    /// SEC-004, the control this whole change exists for: a token whose claims
+    /// are perfect but whose signature was made by a key Apple never published
+    /// is rejected. Before JWKS verification this token was accepted.
+    #[tokio::test]
+    async fn verify_id_token_rejects_a_signature_from_a_foreign_key() {
+        apple_test_keys().await;
+        let rng = ring::rand::SystemRandom::new();
+        let attacker = ring::signature::EcdsaKeyPair::generate_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &rng,
+        )
+        .expect("generate the attacker key")
+        .as_ref()
+        .to_vec();
+
+        // Signed with the attacker's key but claiming Apple's published kid.
+        let forged = sign_es256(&attacker, EC_KID, &apple_claims());
+        let err = verify(&forged).await.unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Forbidden);
+        assert_eq!(err.message, ID_TOKEN_REJECTED);
     }
 
-    /// SEC-002: an id_token from an unexpected issuer is rejected.
-    #[test]
-    fn decode_id_token_rejects_wrong_issuer() {
-        let token = fake_id_token(&json!({
-            "iss": "https://evil.example.com",
-            "aud": "com.example.svc",
-            "exp": now_secs() + 600,
-            "sub": "s",
-            "email": "x@y.com",
-            "email_verified": "true"
-        }));
-        assert!(decode_id_token_claims(&token, "com.example.svc").is_err());
+    /// SEC-004: tampering with the payload of an otherwise valid token breaks
+    /// the signature over `header.payload`.
+    #[tokio::test]
+    async fn verify_id_token_rejects_a_tampered_payload() {
+        let keys = apple_test_keys().await;
+        let token = sign_rs256(&keys.rsa, RSA_KID, &apple_claims());
+        let mut parts: Vec<&str> = token.split('.').collect();
+
+        let mut escalated = apple_claims();
+        escalated["sub"] = json!("999999.attacker");
+        let swapped = b64url(&serde_json::to_vec(&escalated).unwrap());
+        parts[1] = &swapped;
+
+        let err = verify(&parts.join(".")).await.unwrap_err();
+        assert_eq!(err.message, ID_TOKEN_REJECTED);
     }
 
-    /// SEC-002: Apple occasionally sends `aud` as an array — accept it as long
-    /// as our `client_id` is one of the entries.
-    #[test]
-    fn decode_id_token_accepts_array_audience_containing_client_id() {
-        let token = fake_id_token(&json!({
-            "iss": "https://appleid.apple.com",
-            "aud": ["com.example.svc", "com.example.svc.alt"],
-            "exp": now_secs() + 600,
-            "sub": "s",
-            "email": "x@y.com",
-            "email_verified": "true"
-        }));
-        let claims = decode_id_token_claims(&token, "com.example.svc").unwrap();
-        assert_eq!(claims["sub"], "s");
+    /// SEC-004: a `kid` Apple has not published cannot select a key.
+    #[tokio::test]
+    async fn verify_id_token_rejects_an_unknown_kid() {
+        let keys = apple_test_keys().await;
+        let token = sign_rs256(&keys.rsa, "not-a-published-kid", &apple_claims());
+        assert!(verify(&token).await.is_err());
+    }
+
+    /// A token whose `aud` does not match our `client_id` is rejected — defense
+    /// against a stolen code redeemed against a different app.
+    #[tokio::test]
+    async fn verify_id_token_rejects_wrong_audience() {
+        let keys = apple_test_keys().await;
+        let mut claims = apple_claims();
+        claims["aud"] = json!("com.someone.else");
+        let err = verify(&sign_rs256(&keys.rsa, RSA_KID, &claims))
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, ID_TOKEN_REJECTED);
+    }
+
+    /// An id_token past its `exp` is rejected.
+    #[tokio::test]
+    async fn verify_id_token_rejects_expired_exp() {
+        let keys = apple_test_keys().await;
+        let mut claims = apple_claims();
+        // An hour in the past, well beyond the default validation leeway.
+        claims["exp"] = json!(now_secs() - 3600);
+        assert!(
+            verify(&sign_rs256(&keys.rsa, RSA_KID, &claims))
+                .await
+                .is_err()
+        );
+    }
+
+    /// An id_token from an unexpected issuer is rejected.
+    #[tokio::test]
+    async fn verify_id_token_rejects_wrong_issuer() {
+        let keys = apple_test_keys().await;
+        let mut claims = apple_claims();
+        claims["iss"] = json!("https://evil.example.com");
+        assert!(
+            verify(&sign_rs256(&keys.rsa, RSA_KID, &claims))
+                .await
+                .is_err()
+        );
+    }
+
+    /// Apple sends `aud` as an array in some flows — accept it as long as our
+    /// `client_id` is one of the entries.
+    #[tokio::test]
+    async fn verify_id_token_accepts_array_audience_containing_client_id() {
+        let keys = apple_test_keys().await;
+        let mut claims = apple_claims();
+        claims["aud"] = json!([CLIENT_ID, "com.example.svc.alt"]);
+        let verified = verify(&sign_rs256(&keys.rsa, RSA_KID, &claims))
+            .await
+            .unwrap();
+        assert_eq!(verified["sub"], "000123.abc");
     }
 
     #[test]

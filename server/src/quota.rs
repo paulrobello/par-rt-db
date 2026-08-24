@@ -79,7 +79,12 @@ impl UsageCache {
         .bind(&schema)
         .fetch_one(pool)
         .await
-        .map_err(|e| RtDbError::internal(format!("measure db storage: {e}")))?;
+        .map_err(|e| {
+            // SEC-002: the sqlx error text can name schemas/roles/relations.
+            // Log it; return a fixed message to the caller.
+            tracing::error!(db = %db, error = %e, "measure db storage failed");
+            RtDbError::internal("failed to measure storage")
+        })?;
         Ok(bytes.max(0) as u64)
     }
 

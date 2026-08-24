@@ -342,6 +342,14 @@ Two protocol-mandated differences from the other providers:
    callback with a dedicated `POST /auth/apple/callback` (the `rtdb-oauth-csrf`
    nonce cookie is `SameSite=None`, so it survives the cross-site POST).
 
+The `id_token` Apple returns from the token exchange is **signature-verified**
+against Apple's published JWKS (`https://appleid.apple.com/auth/keys`, cached
+for an hour, shared with the Microsoft verifier), together with its `iss`,
+`aud`, and `exp` claims. Identity is read only from a token that passes all
+four checks. The verifier takes the algorithm from the published key material
+rather than the token header, so an Apple key rotation between RS256 and ES256
+needs no configuration change. No operator setup is required for this.
+
 Identity keys on Apple's stable **`sub`** (not email): Apple may relay the email
 through `@privaterelay.appleid.com` and rotate it if a user re-hides their
 address. par-rt-db stores `apple_sub` (mirroring `github_id`) and links to an

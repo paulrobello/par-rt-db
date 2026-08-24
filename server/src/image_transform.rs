@@ -59,6 +59,10 @@ impl TransformConfig {
 pub enum TransformError {
     NotImage,
     TooLarge,
+    /// SEC-002: the payload is a **diagnostic only** — it carries `image` crate
+    /// error text that can name codecs and internal buffer state. It is logged
+    /// at the single call site in `resolve` and never placed in an `RtDbError`
+    /// message, which is a fixed string.
     Internal(String),
 }
 
@@ -300,6 +304,14 @@ pub struct CachedImage {
     pub content_type: &'static str,
 }
 
+/// SEC-002: the single place a `TransformError::Internal` becomes a client
+/// error. The `image` crate's error text is logged against the blob it came
+/// from; the returned envelope carries a fixed message (CWE-209).
+fn internal_transform_error(db: &str, id: &str, detail: &str) -> RtDbError {
+    tracing::warn!(db = %db, file_id = %id, detail = %detail, "image transform failed");
+    RtDbError::internal("image transform failed")
+}
+
 /// Outcome of a transform-or-passthrough request.
 pub enum Resolved {
     Transformed(CachedImage),
@@ -412,9 +424,9 @@ impl TransformCache {
                     "image exceeds max pixels for transform",
                 ))
             }
-            Err(TransformError::Internal(m)) => {
+            Err(TransformError::Internal(detail)) => {
                 self.metrics.record_image_transform_error();
-                Err(RtDbError::internal(m))
+                Err(internal_transform_error(db, id, &detail))
             }
         }
     }
@@ -572,5 +584,46 @@ mod tests {
             apply(&src, Some("image/png"), &p, &c),
             Err(TransformError::TooLarge)
         ));
+    }
+
+    /// SEC-002 (CWE-209): the `image` crate's error text must never reach the
+    /// client. `internal_transform_error` is the sole place a
+    /// `TransformError::Internal` becomes an `RtDbError`, so asserting its
+    /// message is fixed covers every leak path out of `apply`.
+    #[test]
+    fn internal_transform_error_message_is_generic() {
+        let detail = "Format error decoding Jpeg: /secret/path/blob.jpg: invalid marker 0xFF";
+        let err = internal_transform_error("acme", "file_123", detail);
+        assert_eq!(err.message, "image transform failed");
+        assert!(
+            !err.message.contains("Jpeg") && !err.message.contains("/secret/path"),
+            "internal detail leaked into the client envelope: {}",
+            err.message
+        );
+    }
+
+    /// A corrupt image body is classified as `NotImage` (served raw), not as an
+    /// `Internal` carrying decoder text.
+    #[test]
+    fn apply_on_corrupt_jpeg_does_not_produce_internal() {
+        let c = cfg();
+        let p = TransformParams {
+            w: Some(10),
+            h: None,
+            fit: Fit::Contain,
+            q: None,
+            format: OutFormat::Auto,
+        };
+        // A valid JPEG SOI marker followed by garbage: sniffs as JPEG, fails to
+        // decode.
+        let mut corrupt = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        corrupt.extend_from_slice(&[0u8; 64]);
+        assert!(
+            !matches!(
+                apply(&corrupt, Some("image/jpeg"), &p, &c),
+                Err(TransformError::Internal(_))
+            ),
+            "a corrupt source must not surface decoder text as Internal"
+        );
     }
 }

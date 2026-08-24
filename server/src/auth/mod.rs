@@ -9,6 +9,7 @@ pub mod cookie;
 pub mod github;
 pub mod gitlab;
 pub mod google;
+pub mod jwks;
 pub mod microsoft;
 pub mod oidc;
 pub mod provider;
