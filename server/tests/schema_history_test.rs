@@ -1,19 +1,17 @@
 //! Integration tests for schema change history (ENH-013).
 
-mod common;
-
-use common::{admin_get, admin_post, spawn_app, test_state};
+use crate::common::{admin_get, admin_post, spawn_app, test_state};
 use serde_json::json;
 
 /// Create a bare database (no schema push) and register RAII cleanup. The brief
 /// assumes a freshly-created db has no schema history yet, so we cannot use
-/// `common::fresh_db` (which pushes the kanban fixture as part of its setup).
-async fn bare_db(state: &std::sync::Arc<rtdb_server::AppState>) -> common::TestDb {
+/// `crate::common::fresh_db` (which pushes the kanban fixture as part of its setup).
+async fn bare_db(state: &std::sync::Arc<rtdb_server::AppState>) -> crate::common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await
         .expect("create bare database");
-    common::wrap_test_db(name)
+    crate::common::wrap_test_db(name)
 }
 
 /// POST `/admin/push-schema` and assert success.

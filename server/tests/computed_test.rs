@@ -9,9 +9,7 @@
 //! The later tests (9–14) cover Task 4: the migrate interplay (renameField /
 //! dropField / changeType / evalExpr) and the push backfill.
 
-mod common;
-
-use common::{test_state, wrap_test_db};
+use crate::common::{test_state, wrap_test_db};
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::ddl::push_schema;
 use rtdb_server::error::ErrorCode;
@@ -52,7 +50,7 @@ fn computed_schema_json() -> serde_json::Value {
     }})
 }
 
-async fn computed_db(state: &rtdb_server::AppState) -> (common::TestDb, SchemaDef) {
+async fn computed_db(state: &rtdb_server::AppState) -> (crate::common::TestDb, SchemaDef) {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await
@@ -607,7 +605,7 @@ fn migrate_schema_json() -> serde_json::Value {
 async fn computed_db_with(
     state: &rtdb_server::AppState,
     schema_json: serde_json::Value,
-) -> (common::TestDb, SchemaDef) {
+) -> (crate::common::TestDb, SchemaDef) {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await
@@ -999,7 +997,7 @@ async fn push_backfills_computed_and_pure_push_rewinds_nothing() -> anyhow::Resu
 // the stored value is an ordinary client-writable field again.
 #[tokio::test]
 async fn restore_backfills_computed_and_removal_unlocks_client_writes() -> anyhow::Result<()> {
-    use common::{admin_post, spawn_app};
+    use crate::common::{admin_post, spawn_app};
 
     let state = test_state().await;
     let pool = state.pool.clone();
@@ -1086,7 +1084,7 @@ async fn restore_backfills_computed_and_removal_unlocks_client_writes() -> anyho
     assert_eq!(doc["fullName"], "Ada Lovelace");
 
     // Capture v2's history version (newest entry right after the push).
-    let resp = common::admin_get(addr, &format!("/admin/db/{db}/schema/history")).await;
+    let resp = crate::common::admin_get(addr, &format!("/admin/db/{db}/schema/history")).await;
     let body: serde_json::Value = resp.json().await?;
     let entries = body["entries"].as_array().expect("entries array");
     let v2 = entries[0]["version"].as_i64().expect("version");

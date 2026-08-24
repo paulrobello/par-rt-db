@@ -1,6 +1,4 @@
-mod common;
-
-use common::{admin_post, mint_user_session, spawn_app, test_state};
+use crate::common::{admin_post, mint_user_session, spawn_app, test_state};
 use futures_util::{SinkExt, StreamExt};
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::ddl::push_schema;
@@ -95,14 +93,14 @@ fn user(id: &str) -> rtdb_server::auth::Principal {
 }
 
 /// Creates a fresh uniquely-named database and pushes the owner schema.
-async fn setup() -> (sqlx::PgPool, common::TestDb, SchemaDef) {
+async fn setup() -> (sqlx::PgPool, crate::common::TestDb, SchemaDef) {
     let state = test_state().await;
     let pool = state.pool.clone();
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &db).await.unwrap();
     let schema = owner_schema();
     push_schema(&pool, &db, owner_schema()).await.unwrap();
-    (pool, common::wrap_test_db(db), schema)
+    (pool, crate::common::wrap_test_db(db), schema)
 }
 
 /// Inserts a `notes` row owned by `uid` and returns the new doc id.
@@ -424,7 +422,7 @@ async fn fan_out_does_not_push_cross_user_rows() -> anyhow::Result<()> {
     let state = test_state().await;
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &db).await?;
-    let db = common::wrap_test_db(db);
+    let db = crate::common::wrap_test_db(db);
     push_schema(&state.pool, &db, owner_schema()).await?;
 
     // Alice and Bob each open a `notes` subscription carrying their own owner.
@@ -531,7 +529,7 @@ async fn search_filters_to_own_rows() -> anyhow::Result<()> {
     let pool = state.pool.clone();
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &db).await?;
-    let db = common::wrap_test_db(db);
+    let db = crate::common::wrap_test_db(db);
     let mut notes_fields = BTreeMap::new();
     notes_fields.insert("title".to_string(), FieldType::String);
     notes_fields.insert("body".to_string(), FieldType::String);
@@ -651,7 +649,7 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
     let pool = state.pool.clone();
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &db).await?;
-    let db = common::wrap_test_db(db);
+    let db = crate::common::wrap_test_db(db);
     let mut docs_fields = BTreeMap::new();
     docs_fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 3 });
     docs_fields.insert("userId".to_string(), FieldType::String);
@@ -786,7 +784,7 @@ async fn vector_search_composes_filter_fields_with_owner() -> anyhow::Result<()>
     let pool = state.pool.clone();
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &db).await?;
-    let db = common::wrap_test_db(db);
+    let db = crate::common::wrap_test_db(db);
     let mut docs_fields = BTreeMap::new();
     docs_fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 3 });
     docs_fields.insert("userId".to_string(), FieldType::String);
@@ -1337,7 +1335,7 @@ async fn patch_owner_change_does_not_inject_into_other_users_feed() -> anyhow::R
     let pool = state.pool.clone();
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &db).await?;
-    let db = common::wrap_test_db(db);
+    let db = crate::common::wrap_test_db(db);
     let schema = owner_schema();
     push_schema(&pool, &db, schema.clone()).await?;
 
@@ -1447,7 +1445,7 @@ async fn patch_owner_change_does_not_inject_into_other_users_feed() -> anyhow::R
 // End-to-end over the real wire (HTTP + WebSocket) — Task 7 capstone.
 //
 // These exercise the full property through `spawn_app`: two real OAuth-style
-// `Principal::User` sessions minted via `common::mint_user_session`, each
+// `Principal::User` sessions minted via `crate::common::mint_user_session`, each
 // resolving to its own `user_id`, with allowlisting, schema push, and reads /
 // writes all going over HTTP / WS exactly as a client SDK would.
 // ===========================================================================
@@ -1524,14 +1522,14 @@ fn bob_uid(db_name: &str) -> String {
     format!("bob-{db_name}")
 }
 
-async fn wire_setup_two_users() -> (SocketAddr, common::TestDb, String, String) {
+async fn wire_setup_two_users() -> (SocketAddr, crate::common::TestDb, String, String) {
     let state = test_state().await;
     let addr = spawn_app(state.clone()).await;
     let db_name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &db_name)
         .await
         .expect("create db");
-    let db_name = common::wrap_test_db(db_name);
+    let db_name = crate::common::wrap_test_db(db_name);
 
     let push = admin_post(
         addr,
@@ -1785,14 +1783,14 @@ fn collab_schema() -> SchemaDef {
 }
 
 /// Creates a fresh uniquely-named database and pushes the collab schema.
-async fn setup_collab() -> (sqlx::PgPool, common::TestDb, SchemaDef) {
+async fn setup_collab() -> (sqlx::PgPool, crate::common::TestDb, SchemaDef) {
     let state = test_state().await;
     let pool = state.pool.clone();
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &db).await.unwrap();
     let schema = collab_schema();
     push_schema(&pool, &db, collab_schema()).await.unwrap();
-    (pool, common::wrap_test_db(db), schema)
+    (pool, crate::common::wrap_test_db(db), schema)
 }
 
 /// Inserts a `notes` row owned by `uid` with the given collaborators list.
@@ -2198,7 +2196,7 @@ async fn collab_fan_out_reaches_owner_and_collaborator() -> anyhow::Result<()> {
     let pool = state.pool.clone();
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &db).await?;
-    let db = common::wrap_test_db(db);
+    let db = crate::common::wrap_test_db(db);
     let schema = collab_schema();
     push_schema(&pool, &db, schema.clone()).await?;
 
@@ -2441,14 +2439,14 @@ fn authorize_schema() -> SchemaDef {
 }
 
 /// Creates a fresh uniquely-named database and pushes the authorize schema.
-async fn setup_authorize() -> (sqlx::PgPool, common::TestDb, SchemaDef) {
+async fn setup_authorize() -> (sqlx::PgPool, crate::common::TestDb, SchemaDef) {
     let state = test_state().await;
     let pool = state.pool.clone();
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &db).await.unwrap();
     let schema = authorize_schema();
     push_schema(&pool, &db, schema.clone()).await.unwrap();
-    (pool, common::wrap_test_db(db), schema)
+    (pool, crate::common::wrap_test_db(db), schema)
 }
 
 /// Inserts a `posts` row with the given owner/visibility; returns its doc id.
@@ -3206,14 +3204,14 @@ fn insert_stamp_schema() -> SchemaDef {
 }
 
 /// Creates a fresh uniquely-named database and pushes the insert-stamp schema.
-async fn setup_insert_stamp() -> (sqlx::PgPool, common::TestDb, SchemaDef) {
+async fn setup_insert_stamp() -> (sqlx::PgPool, crate::common::TestDb, SchemaDef) {
     let state = test_state().await;
     let pool = state.pool.clone();
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &db).await.unwrap();
     let schema = insert_stamp_schema();
     push_schema(&pool, &db, schema.clone()).await.unwrap();
-    (pool, common::wrap_test_db(db), schema)
+    (pool, crate::common::wrap_test_db(db), schema)
 }
 
 /// Fetches a single doc by id with a bypass caller (sees every row), on an
@@ -3976,14 +3974,14 @@ fn composed_schema() -> SchemaDef {
     SchemaDef { tables }
 }
 
-async fn setup_composed() -> (sqlx::PgPool, common::TestDb, SchemaDef) {
+async fn setup_composed() -> (sqlx::PgPool, crate::common::TestDb, SchemaDef) {
     let state = test_state().await;
     let pool = state.pool.clone();
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &db).await.unwrap();
     let schema = composed_schema();
     push_schema(&pool, &db, schema.clone()).await.unwrap();
-    (pool, common::wrap_test_db(db), schema)
+    (pool, crate::common::wrap_test_db(db), schema)
 }
 
 /// Seeds a `docs` row (bypass caller) with explicit owner/visibility; returns id.
@@ -4613,13 +4611,13 @@ fn sec117_schema(authorize: FilterExpr) -> SchemaDef {
 }
 
 /// Creates a fresh uniquely-named DB and pushes the given authorize schema.
-async fn sec117_setup(schema: SchemaDef) -> (sqlx::PgPool, common::TestDb, SchemaDef) {
+async fn sec117_setup(schema: SchemaDef) -> (sqlx::PgPool, crate::common::TestDb, SchemaDef) {
     let state = test_state().await;
     let pool = state.pool.clone();
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &db).await.unwrap();
     push_schema(&pool, &db, schema.clone()).await.unwrap();
-    (pool, common::wrap_test_db(db), schema)
+    (pool, crate::common::wrap_test_db(db), schema)
 }
 
 /// Inserts an `items` row that OMITS the `flag` field. The txn layer would

@@ -6,9 +6,9 @@
 //! `config.public_url` (`http://localhost:0` in tests), so tests extract the
 //! `/storage/...?...` path+query and re-fetch against the ephemeral test addr.
 
-mod common;
-
-use common::{admin_post, fresh_db, spawn_app, test_state, test_state_with_require_signed_urls};
+use crate::common::{
+    admin_post, fresh_db, spawn_app, test_state, test_state_with_require_signed_urls,
+};
 use rtdb_server::signed_url;
 use rtdb_server::storage;
 use serde_json::json;

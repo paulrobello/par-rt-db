@@ -13,9 +13,7 @@
 //! a short beat timeout, proving the "killing A evicts A's members within the
 //! beat timeout" contract without waiting out a real 15s timeout.
 
-mod common;
-
-use common::{spawn_app, test_config, test_hot};
+use crate::common::{spawn_app, test_config, test_hot};
 use rtdb_server::AppState;
 use rtdb_server::presence::{PresenceConfig, PresenceManager};
 use rtdb_server::protocol::{AuthedUser, PresenceMember, ServerMessage, UserKind};

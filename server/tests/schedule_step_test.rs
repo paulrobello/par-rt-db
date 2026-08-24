@@ -6,15 +6,15 @@
 //! `tests/scheduled_test.rs`: a real `Committers` so the per-db scheduler
 //! claims the enqueued row and the committer executes it end-to-end.
 
-mod common;
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use sqlx::PgPool;
 
-use common::{TestDb, admin_get, admin_post, fresh_db, kanban_schema_json, spawn_app, test_state};
+use crate::common::{
+    TestDb, admin_get, admin_post, fresh_db, kanban_schema_json, spawn_app, test_state,
+};
 use rtdb_server::AppState;
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::committer::{CommitterConfig, Committers};
@@ -148,7 +148,7 @@ async fn make_committers(state: &Arc<AppState>) -> Arc<Committers> {
         SubscriptionManager::new(),
         SchemaCache::new(),
         OpFeed::new(64, 32),
-        Arc::new(ArcSwap::from_pointee(common::test_hot())),
+        Arc::new(ArcSwap::from_pointee(crate::common::test_hot())),
         Metrics::new(),
         CommitterConfig {
             quotas: Arc::new(quota::UsageCache::new()),

@@ -5,9 +5,7 @@
 //! full `AppState`s with distinct instance ids sharing one Postgres — the
 //! same shape `notify_test.rs` uses for Stage 2/3.
 
-mod common;
-
-use common::{test_config, test_hot};
+use crate::common::{test_config, test_hot};
 use rtdb_server::AppState;
 use rtdb_server::auth::{Principal, PrincipalCtx};
 use rtdb_server::error::ErrorCode;
@@ -34,7 +32,7 @@ async fn replica(
 }
 
 async fn shared_pool() -> PgPool {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     state.pool.clone()
 }
 
@@ -94,7 +92,7 @@ async fn rate_budget_is_shared_across_replicas() -> anyhow::Result<()> {
 
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &db).await?;
-    let db = common::wrap_test_db(db);
+    let db = crate::common::wrap_test_db(db);
 
     let principal = Principal::Machine {
         db: db.as_str().to_string(),
@@ -159,7 +157,7 @@ async fn ownership_lease_forwarding_and_failover_on_death() -> anyhow::Result<()
 
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &name).await?;
-    let db = common::wrap_test_db(name);
+    let db = crate::common::wrap_test_db(name);
 
     // A's push takes the lease (A becomes the owner).
     a.realtime
@@ -212,7 +210,7 @@ async fn forward_timeout_conflicts_then_takes_over_when_lease_frees() -> anyhow:
 
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &name).await?;
-    let db = common::wrap_test_db(name);
+    let db = crate::common::wrap_test_db(name);
     b.realtime
         .committers
         .push_schema(&db, items_schema(false))
@@ -286,7 +284,7 @@ async fn forwarded_write_preserves_principal_on_owner() -> anyhow::Result<()> {
 
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &name).await?;
-    let db = common::wrap_test_db(name);
+    let db = crate::common::wrap_test_db(name);
     a.realtime
         .committers
         .push_schema(&db, items_schema(true))
@@ -324,7 +322,7 @@ async fn forwarded_mutate_larger_than_notify_cap_round_trips() -> anyhow::Result
 
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &name).await?;
-    let db = common::wrap_test_db(name);
+    let db = crate::common::wrap_test_db(name);
     a.realtime
         .committers
         .push_schema(&db, items_schema(false))
@@ -360,7 +358,7 @@ async fn forwarded_push_schema_reply_larger_than_notify_cap() -> anyhow::Result<
 
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &name).await?;
-    let db = common::wrap_test_db(name);
+    let db = crate::common::wrap_test_db(name);
     // A takes the lease with the baseline schema; B's push is forwarded.
     a.realtime
         .committers
@@ -465,7 +463,7 @@ async fn owner_side_write_invalidates_peer_subscriptions() -> anyhow::Result<()>
 
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &name).await?;
-    let db = common::wrap_test_db(name);
+    let db = crate::common::wrap_test_db(name);
     // A's push takes the lease — A is the owner for the rest of the test.
     a.realtime
         .committers
@@ -525,7 +523,7 @@ async fn oversized_write_set_invalidates_peer_subscriptions() -> anyhow::Result<
 
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &name).await?;
-    let db = common::wrap_test_db(name);
+    let db = crate::common::wrap_test_db(name);
     a.realtime
         .committers
         .push_schema(&db, items_schema(false))
@@ -591,7 +589,7 @@ async fn forwarded_mutate_is_deduped_by_a_server_minted_key() -> anyhow::Result<
 
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &name).await?;
-    let db = common::wrap_test_db(name);
+    let db = crate::common::wrap_test_db(name);
     a.realtime
         .committers
         .push_schema(&db, items_schema(false))

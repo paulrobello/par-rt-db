@@ -11,19 +11,17 @@
 //! - **Admin CRUD**: create → list → delete → gone. A non-admin bearer gets 403;
 //!   a missing/invalid bearer gets 401.
 
-mod common;
-
 use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::common::{
+    admin_delete, admin_get, admin_post, admin_put, fresh_db, spawn_app, test_state_with_webhooks,
+};
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::{Json, Router};
-use common::{
-    admin_delete, admin_get, admin_post, admin_put, fresh_db, spawn_app, test_state_with_webhooks,
-};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -446,7 +444,7 @@ async fn webhook_admin_crud_and_non_admin_forbidden() -> anyhow::Result<()> {
     // uniqueness on both and is shared across the whole suite (a fixed value
     // would collide with prior runs).
     let suffix = uuid::Uuid::now_v7().simple();
-    let session = common::mint_user_session(
+    let session = crate::common::mint_user_session(
         &state.pool,
         &format!("u-{suffix}"),
         &format!("u-{suffix}@example.com"),

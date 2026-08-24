@@ -5,13 +5,11 @@
 //! deterministic match margins: OLD (1) is below any cutoff for centuries,
 //! FUTURE (9e15) is above it, so the wall-clock's exact value never matters.
 
-mod common;
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::common::test_state;
 use arc_swap::ArcSwap;
-use common::test_state;
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::committer::{CommitterConfig, Committers};
 use rtdb_server::db::SchemaCache;
@@ -64,12 +62,12 @@ fn int64_indexed_schema_json() -> serde_json::Value {
 
 /// Mirrors `scheduled_test.rs`'s `unique_db`: a bare uniquely-named database
 /// (no kanban fixture — each test pushes its own schema).
-async fn unique_db(pool: &PgPool) -> common::TestDb {
+async fn unique_db(pool: &PgPool) -> crate::common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(pool, &name)
         .await
         .expect("create fresh database");
-    common::wrap_test_db(name)
+    crate::common::wrap_test_db(name)
 }
 
 async fn push(
@@ -415,7 +413,7 @@ async fn scheduled_sweep_fires_with_the_server_clock() -> anyhow::Result<()> {
         SubscriptionManager::new(),
         SchemaCache::new(),
         OpFeed::new(64, 32),
-        Arc::new(ArcSwap::from_pointee(common::test_hot())),
+        Arc::new(ArcSwap::from_pointee(crate::common::test_hot())),
         Metrics::new(),
         CommitterConfig {
             quotas: Arc::new(quota::UsageCache::new()),

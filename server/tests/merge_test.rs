@@ -5,9 +5,7 @@
 //! Task 3: `merge::merge_users` orchestrates the per-db committer merges plus
 //! storage owner swap, session re-point, and the guarded anon-row delete.
 
-mod common;
-
-use common::{test_state, wrap_test_db};
+use crate::common::{test_state, wrap_test_db};
 use rtdb_server::AppState;
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::db;
@@ -662,11 +660,11 @@ async fn merge_users_aborts_on_scan_failure_and_publishes_committed_restamps() -
     sqlx::query(&format!("CREATE DATABASE \"{pg_db}\""))
         .execute(&base_pool)
         .await?;
-    let mut config = common::test_config();
+    let mut config = crate::common::test_config();
     config.database_url = format!("{server}/{pg_db}");
     let pool = sqlx::PgPool::connect(&config.database_url).await?;
     db::bootstrap(&pool).await?;
-    let state = rtdb_server::AppState::new(pool, config, common::test_hot());
+    let state = rtdb_server::AppState::new(pool, config, crate::common::test_hot());
 
     let result: anyhow::Result<()> = async {
         let name = format!("t{}", uuid::Uuid::now_v7().simple());
@@ -1069,7 +1067,7 @@ async fn admin_merge_users_endpoint_requires_confirm_and_runs_merge() -> anyhow:
         )
         .await?;
 
-    let addr = common::spawn_app(state.clone()).await;
+    let addr = crate::common::spawn_app(state.clone()).await;
     let client = reqwest::Client::new();
 
     // Wrong confirm -> 400, nothing merged.
@@ -1282,7 +1280,7 @@ async fn oauth_login_merges_anon_footprint_end_to_end() -> anyhow::Result<()> {
     )
     .await;
 
-    let mut cfg = common::test_config();
+    let mut cfg = crate::common::test_config();
     cfg.github_base_url = mock.uri();
     cfg.github_api_url = mock.uri();
     cfg.github_client_id = Some("test-client".into());
@@ -1291,8 +1289,8 @@ async fn oauth_login_merges_anon_footprint_end_to_end() -> anyhow::Result<()> {
 
     let pool = sqlx::PgPool::connect(&cfg.database_url).await?;
     db::bootstrap(&pool).await?;
-    let state = AppState::new(pool, cfg, common::test_hot());
-    let addr = common::spawn_app(state.clone()).await;
+    let state = AppState::new(pool, cfg, crate::common::test_hot());
+    let addr = crate::common::spawn_app(state.clone()).await;
 
     let db_name = owned_db(&state, false).await?;
 

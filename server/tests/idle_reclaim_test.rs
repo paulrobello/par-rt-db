@@ -17,11 +17,9 @@
 //! is also running but is a no-op for the protected cases and reaches the same
 //! outcome for the idle case, so the assertions are robust either way.
 
-mod common;
-
 use std::time::{Duration, Instant};
 
-use common::{fresh_db, test_state_with_idle_reclaim};
+use crate::common::{fresh_db, test_state_with_idle_reclaim};
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::db::now_ms;
 use rtdb_server::protocol::ServerMessage;

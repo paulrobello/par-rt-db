@@ -12,12 +12,10 @@
 //! so it is wrapped in a `TestDb` via `wrap_test_db` to schedule RAII cleanup
 //! — otherwise the dev DB would accumulate `db_t<uuid>` schemas.
 
-mod common;
-
 use std::sync::Arc;
 
+use crate::common::{admin_post, fresh_db, spawn_app, test_hot, test_state, wrap_test_db};
 use axum::http::StatusCode;
-use common::{admin_post, fresh_db, spawn_app, test_hot, test_state, wrap_test_db};
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::config::HotConfig;
 use rtdb_server::db;
@@ -38,10 +36,10 @@ fn schema_with_n_tables(n: usize) -> serde_json::Value {
 
 #[tokio::test]
 async fn push_schema_over_table_cap_is_rejected() -> anyhow::Result<()> {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     state.runtime.hot.store(Arc::new(HotConfig {
         max_tables_per_db: 3,
-        ..common::test_hot()
+        ..crate::common::test_hot()
     }));
     let addr = spawn_app(state.clone()).await;
     // Created directly (not via `fresh_db`), so wrap for RAII cleanup — same
@@ -148,8 +146,8 @@ fn insert_work_item(status: &str, order: f64) -> Transaction {
 
 #[tokio::test]
 async fn mutate_over_storage_cap_is_rejected() -> anyhow::Result<()> {
-    let state = common::test_state().await;
-    let db = common::fresh_db(&state).await;
+    let state = crate::common::test_state().await;
+    let db = crate::common::fresh_db(&state).await;
 
     // seed a doc so the table has non-zero on-disk size (deterministic)
     state
@@ -166,7 +164,7 @@ async fn mutate_over_storage_cap_is_rejected() -> anyhow::Result<()> {
     // now a 1-byte cap: the seeded table's footprint already exceeds it
     state.runtime.hot.store(Arc::new(HotConfig {
         max_storage_bytes_per_db: 1,
-        ..common::test_hot()
+        ..crate::common::test_hot()
     }));
 
     let err = state
@@ -190,7 +188,7 @@ async fn mutate_over_storage_cap_is_rejected() -> anyhow::Result<()> {
 // in `common`. `fresh_db` brings up a bare db; the storage side table is
 // ensured lazily inside `upload_handler`.
 async fn mint_token(addr: std::net::SocketAddr, db: &str) -> String {
-    let resp = common::admin_post(
+    let resp = crate::common::admin_post(
         addr,
         "/admin/mint-token",
         serde_json::json!({ "db": db, "name": "test-token" }),
@@ -205,15 +203,15 @@ async fn mint_token(addr: std::net::SocketAddr, db: &str) -> String {
 
 #[tokio::test]
 async fn upload_over_storage_cap_is_rejected() -> anyhow::Result<()> {
-    let state = common::test_state().await;
-    let db = common::fresh_db(&state).await;
-    let addr = common::spawn_app(state.clone()).await;
+    let state = crate::common::test_state().await;
+    let db = crate::common::fresh_db(&state).await;
+    let addr = crate::common::spawn_app(state.clone()).await;
     let token = mint_token(addr, &db).await;
 
     // 1-byte cap: any upload (5 bytes) exceeds it (0 used + 5 > 1)
     state.runtime.hot.store(Arc::new(HotConfig {
         max_storage_bytes_per_db: 1,
-        ..common::test_hot()
+        ..crate::common::test_hot()
     }));
 
     let resp = reqwest::Client::new()

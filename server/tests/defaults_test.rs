@@ -5,9 +5,7 @@
 //! stamps (ttl default, ownerField, authorize `$user`) win over a defaults
 //! entry on the same field. Design: docs/superpowers/specs/2026-08-16-field-defaults-design.md.
 
-mod common;
-
-use common::{test_state, wrap_test_db};
+use crate::common::{test_state, wrap_test_db};
 use rtdb_server::ddl::push_schema;
 use rtdb_server::migrate::{Directive, plan_migration};
 use rtdb_server::schema::SchemaDef;
@@ -32,7 +30,7 @@ const USUAL_DEFAULTS: &str = r#"{"status":"backlog","priority":0.0}"#;
 async fn fresh_defaults_db(
     state: &rtdb_server::AppState,
     defaults_json: serde_json::Value,
-) -> (common::TestDb, SchemaDef) {
+) -> (crate::common::TestDb, SchemaDef) {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await

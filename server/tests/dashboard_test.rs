@@ -1,5 +1,3 @@
-mod common;
-
 /// Serializes tests that touch the global single-row `rtdb_config` table
 /// (id = 1). That row is shared across the whole dev Postgres, so without this
 /// guard two such tests running in parallel race — one test's `DELETE` can be
@@ -11,7 +9,7 @@ static RTDB_CONFIG_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new
 // Seeding lowercases emails, is idempotent, and stores them with a NULL github_id.
 #[tokio::test]
 async fn seed_admin_emails_lowercases_and_is_idempotent() -> anyhow::Result<()> {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
 
     rtdb_server::auth::seed_admin_emails(
@@ -95,7 +93,7 @@ async fn resolve_principal(
 // `oauth_test`, which suffix emails with a uuid).
 #[tokio::test]
 async fn is_admin_matches_email_or_github_id() -> anyhow::Result<()> {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
     let uid = uuid::Uuid::now_v7().simple().to_string();
     let gh_id: i64 = i64::from_str_radix(&uid[..15], 16).expect("parse hex as i64");
@@ -142,10 +140,10 @@ async fn is_admin_matches_email_or_github_id() -> anyhow::Result<()> {
 // The admin-key path still authorizes after the require_admin rewrite.
 #[tokio::test]
 async fn admin_key_path_still_authorizes() -> anyhow::Result<()> {
-    let state = common::test_state().await;
-    let addr = common::spawn_app(state).await;
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state).await;
 
-    let resp = common::admin_get(addr, "/admin/dbs").await;
+    let resp = crate::common::admin_get(addr, "/admin/dbs").await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     Ok(())
 }
@@ -167,11 +165,11 @@ async fn admin_delete(
 
 #[tokio::test]
 async fn admins_crud_round_trip() -> anyhow::Result<()> {
-    let state = common::test_state().await;
-    let addr = common::spawn_app(state).await;
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state).await;
 
     // Add by email.
-    let resp = common::admin_post(
+    let resp = crate::common::admin_post(
         addr,
         "/admin/admins",
         serde_json::json!({"email": "Crew@Example.com"}),
@@ -180,7 +178,7 @@ async fn admins_crud_round_trip() -> anyhow::Result<()> {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
     // Listed, lowercased. (Other parallel tests may add rows; assert membership.)
-    let body: serde_json::Value = common::admin_get(addr, "/admin/admins")
+    let body: serde_json::Value = crate::common::admin_get(addr, "/admin/admins")
         .await
         .json()
         .await?;
@@ -201,7 +199,7 @@ async fn admins_crud_round_trip() -> anyhow::Result<()> {
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    let body: serde_json::Value = common::admin_get(addr, "/admin/admins")
+    let body: serde_json::Value = crate::common::admin_get(addr, "/admin/admins")
         .await
         .json()
         .await?;
@@ -218,9 +216,10 @@ async fn admins_crud_round_trip() -> anyhow::Result<()> {
 // Adding an admin with a blank email is a 400, not a silent no-op.
 #[tokio::test]
 async fn add_admin_requires_email() -> anyhow::Result<()> {
-    let state = common::test_state().await;
-    let addr = common::spawn_app(state).await;
-    let resp = common::admin_post(addr, "/admin/admins", serde_json::json!({"email": "  "})).await;
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state).await;
+    let resp =
+        crate::common::admin_post(addr, "/admin/admins", serde_json::json!({"email": "  "})).await;
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
     Ok(())
 }
@@ -243,8 +242,8 @@ async fn bearer_get(addr: std::net::SocketAddr, path: &str, token: &str) -> reqw
 // above, and `per_row_auth_test` / `oauth_test`).
 #[tokio::test]
 async fn oauth_admin_session_is_admitted() -> anyhow::Result<()> {
-    let state = common::test_state().await;
-    let addr = common::spawn_app(state.clone()).await;
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state.clone()).await;
     let pool = state.pool.clone();
     let email = format!("dash-{}@example.com", uuid::Uuid::now_v7().simple());
 
@@ -263,8 +262,8 @@ async fn oauth_admin_session_is_admitted() -> anyhow::Result<()> {
 // A valid OAuth session NOT on the admin allowlist is rejected (403).
 #[tokio::test]
 async fn non_admin_session_is_forbidden() -> anyhow::Result<()> {
-    let state = common::test_state().await;
-    let addr = common::spawn_app(state.clone()).await;
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state.clone()).await;
     let email = format!("nobody-{}@example.com", uuid::Uuid::now_v7().simple());
 
     let token = user_session(&state, &email, None).await;
@@ -276,8 +275,8 @@ async fn non_admin_session_is_forbidden() -> anyhow::Result<()> {
 // A missing bearer is rejected (401).
 #[tokio::test]
 async fn missing_bearer_is_unauthorized() -> anyhow::Result<()> {
-    let state = common::test_state().await;
-    let addr = common::spawn_app(state).await;
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state).await;
 
     let resp = reqwest::Client::new()
         .get(format!("http://{addr}/admin/admins"))
@@ -290,13 +289,13 @@ async fn missing_bearer_is_unauthorized() -> anyhow::Result<()> {
 // A machine token is never an admin, even if it reaches an admin route.
 #[tokio::test]
 async fn machine_token_is_not_admin() -> anyhow::Result<()> {
-    let state = common::test_state().await;
-    let addr = common::spawn_app(state).await;
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state).await;
 
     // Create a db + mint a machine token through the admin API.
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
-    common::admin_post(addr, "/admin/create-db", serde_json::json!({"name": name})).await;
-    let resp: serde_json::Value = common::admin_post(
+    crate::common::admin_post(addr, "/admin/create-db", serde_json::json!({"name": name})).await;
+    let resp: serde_json::Value = crate::common::admin_post(
         addr,
         "/admin/mint-token",
         serde_json::json!({"db": name, "name": "tok"}),
@@ -314,11 +313,11 @@ async fn machine_token_is_not_admin() -> anyhow::Result<()> {
 // GET /admin/dbs/{db}/schema returns the pushed schema back.
 #[tokio::test]
 async fn get_schema_returns_pushed_schema() -> anyhow::Result<()> {
-    let state = common::test_state().await;
-    let addr = common::spawn_app(state.clone()).await;
-    let db = common::fresh_db(&state).await;
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state.clone()).await;
+    let db = crate::common::fresh_db(&state).await;
 
-    let resp = common::admin_get(addr, &format!("/admin/dbs/{db}/schema")).await;
+    let resp = crate::common::admin_get(addr, &format!("/admin/dbs/{db}/schema")).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: serde_json::Value = resp.json().await?;
     // fresh_db pushes the kanban fixture, which has a `projects` table.
@@ -327,7 +326,7 @@ async fn get_schema_returns_pushed_schema() -> anyhow::Result<()> {
         "schema missing projects table: {body}"
     );
     // Unknown db → 404 (NotFound), not 500.
-    let resp = common::admin_get(addr, "/admin/dbs/does-not-exist/schema").await;
+    let resp = crate::common::admin_get(addr, "/admin/dbs/does-not-exist/schema").await;
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
     Ok(())
 }
@@ -335,19 +334,19 @@ async fn get_schema_returns_pushed_schema() -> anyhow::Result<()> {
 // GET /admin/tokens?db= lists tokens by id/name/revoked and never exposes the secret hash.
 #[tokio::test]
 async fn list_tokens_omits_secret() -> anyhow::Result<()> {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let pool = state.pool.clone();
-    let addr = common::spawn_app(state.clone()).await;
-    let db = common::fresh_db(&state).await;
+    let addr = crate::common::spawn_app(state.clone()).await;
+    let db = crate::common::fresh_db(&state).await;
 
-    let _resp = common::admin_post(
+    let _resp = crate::common::admin_post(
         addr,
         "/admin/mint-token",
         serde_json::json!({"db": db, "name": "ci"}),
     )
     .await;
 
-    let resp = common::admin_get(addr, &format!("/admin/tokens?db={db}")).await;
+    let resp = crate::common::admin_get(addr, &format!("/admin/tokens?db={db}")).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: serde_json::Value = resp.json().await?;
     let tokens = body["tokens"].as_array().expect("tokens array");
@@ -379,11 +378,11 @@ async fn list_tokens_omits_secret() -> anyhow::Result<()> {
 // correctness is inherent; this verifies the endpoint enumerates tables and queries each.
 #[tokio::test]
 async fn db_stats_reports_table_counts_and_sizes() -> anyhow::Result<()> {
-    let state = common::test_state().await;
-    let addr = common::spawn_app(state.clone()).await;
-    let db = common::fresh_db(&state).await;
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state.clone()).await;
+    let db = crate::common::fresh_db(&state).await;
 
-    let resp = common::admin_get(addr, &format!("/admin/dbs/{db}/stats")).await;
+    let resp = crate::common::admin_get(addr, &format!("/admin/dbs/{db}/stats")).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: serde_json::Value = resp.json().await?;
     let tables = body["tables"].as_array().expect("tables array");
@@ -412,7 +411,7 @@ async fn db_stats_reports_table_counts_and_sizes() -> anyhow::Result<()> {
     );
 
     // Unknown db → 404.
-    let resp = common::admin_get(addr, "/admin/dbs/does-not-exist/stats").await;
+    let resp = crate::common::admin_get(addr, "/admin/dbs/does-not-exist/stats").await;
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
     Ok(())
 }
@@ -425,7 +424,7 @@ async fn metrics_counters_and_subs_count() -> anyhow::Result<()> {
     m.record_query();
     m.record_mutation();
 
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     // count() is 0 before any subscribe on a fresh manager.
     assert_eq!(state.realtime.subs.count().await, 0);
 
@@ -449,11 +448,11 @@ async fn metrics_counters_and_subs_count() -> anyhow::Result<()> {
 // GET /admin/metrics returns the snapshot; a real mutation bumps mutationsTotal.
 #[tokio::test]
 async fn metrics_endpoint_reflects_a_mutation() -> anyhow::Result<()> {
-    let state = common::test_state().await;
-    let addr = common::spawn_app(state.clone()).await;
-    let db = common::fresh_db(&state).await;
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state.clone()).await;
+    let db = crate::common::fresh_db(&state).await;
 
-    let before: serde_json::Value = common::admin_get(addr, "/admin/metrics")
+    let before: serde_json::Value = crate::common::admin_get(addr, "/admin/metrics")
         .await
         .json()
         .await?;
@@ -463,7 +462,7 @@ async fn metrics_endpoint_reflects_a_mutation() -> anyhow::Result<()> {
     );
 
     // Mint a token + run one insert via /api/mutate.
-    let mint: serde_json::Value = common::admin_post(
+    let mint: serde_json::Value = crate::common::admin_post(
         addr,
         "/admin/mint-token",
         serde_json::json!({"db": db, "name": "t"}),
@@ -483,7 +482,7 @@ async fn metrics_endpoint_reflects_a_mutation() -> anyhow::Result<()> {
         .await?;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    let after: serde_json::Value = common::admin_get(addr, "/admin/metrics")
+    let after: serde_json::Value = crate::common::admin_get(addr, "/admin/metrics")
         .await
         .json()
         .await?;
@@ -500,12 +499,12 @@ async fn metrics_endpoint_reflects_a_mutation() -> anyhow::Result<()> {
 // values are nondeterministic; assert structure + ordering + presence.
 #[tokio::test]
 async fn metrics_endpoint_reflects_query_latency() -> anyhow::Result<()> {
-    let state = common::test_state().await;
-    let addr = common::spawn_app(state.clone()).await;
-    let db = common::fresh_db(&state).await;
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state.clone()).await;
+    let db = crate::common::fresh_db(&state).await;
 
     // Mint a token + insert one doc so a query has something to read.
-    let mint: serde_json::Value = common::admin_post(
+    let mint: serde_json::Value = crate::common::admin_post(
         addr,
         "/admin/mint-token",
         serde_json::json!({"db": db, "name": "t"}),
@@ -537,7 +536,7 @@ async fn metrics_endpoint_reflects_query_latency() -> anyhow::Result<()> {
         assert_eq!(q.status(), reqwest::StatusCode::OK);
     }
 
-    let snap: serde_json::Value = common::admin_get(addr, "/admin/metrics")
+    let snap: serde_json::Value = crate::common::admin_get(addr, "/admin/metrics")
         .await
         .json()
         .await?;
@@ -586,12 +585,12 @@ async fn metrics_endpoint_reflects_query_latency() -> anyhow::Result<()> {
 // branch), and a prior /api/query is reflected in the rtdb_queries_total sample.
 #[tokio::test]
 async fn metrics_prometheus_endpoint() -> anyhow::Result<()> {
-    let state = common::test_state().await;
-    let addr = common::spawn_app(state.clone()).await;
-    let db = common::fresh_db(&state).await;
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state.clone()).await;
+    let db = crate::common::fresh_db(&state).await;
 
     // Mint a token, insert one doc, then run one query (bumps queries_total).
-    let mint: serde_json::Value = common::admin_post(
+    let mint: serde_json::Value = crate::common::admin_post(
         addr,
         "/admin/mint-token",
         serde_json::json!({"db": db, "name": "t"}),
@@ -709,11 +708,11 @@ async fn op_feed_publishes_and_replays() -> anyhow::Result<()> {
 // A committed insert publishes an op event WITH its kind; /admin/ops/recent returns it.
 #[tokio::test]
 async fn op_feed_tapped_on_commit() -> anyhow::Result<()> {
-    let state = common::test_state().await;
-    let addr = common::spawn_app(state.clone()).await;
-    let db = common::fresh_db(&state).await;
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state.clone()).await;
+    let db = crate::common::fresh_db(&state).await;
 
-    let mint: serde_json::Value = common::admin_post(
+    let mint: serde_json::Value = crate::common::admin_post(
         addr,
         "/admin/mint-token",
         serde_json::json!({"db": db, "name": "t"}),
@@ -729,7 +728,7 @@ async fn op_feed_tapped_on_commit() -> anyhow::Result<()> {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
     let body: serde_json::Value =
-        common::admin_get(addr, &format!("/admin/ops/recent?db={db}&n=10"))
+        crate::common::admin_get(addr, &format!("/admin/ops/recent?db={db}&n=10"))
             .await
             .json()
             .await?;
@@ -745,8 +744,8 @@ async fn op_feed_tapped_on_commit() -> anyhow::Result<()> {
 // /admin/stream rejects a missing bearer at the upgrade (no 101).
 #[tokio::test]
 async fn admin_stream_requires_admin() -> anyhow::Result<()> {
-    let state = common::test_state().await;
-    let addr = common::spawn_app(state).await;
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state).await;
     let resp = reqwest::Client::new()
         .get(format!("http://{addr}/admin/stream"))
         .send()
@@ -769,8 +768,8 @@ async fn admin_stream_authenticates_via_subprotocol() -> anyhow::Result<()> {
     use std::time::Duration;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    let state = common::test_state().await;
-    let addr = common::spawn_app(state).await;
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state).await;
 
     let mut req = format!("ws://{addr}/admin/stream").into_client_request()?;
     req.headers_mut().insert(
@@ -809,8 +808,8 @@ async fn admin_stream_authenticates_via_subprotocol() -> anyhow::Result<()> {
 async fn admin_stream_rejects_bad_subprotocol() -> anyhow::Result<()> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    let state = common::test_state().await;
-    let addr = common::spawn_app(state).await;
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state).await;
 
     let mut req = format!("ws://{addr}/admin/stream").into_client_request()?;
     req.headers_mut().insert(
@@ -831,13 +830,13 @@ async fn admin_stream_rejects_bad_subprotocol() -> anyhow::Result<()> {
 #[tokio::test]
 async fn hot_config_round_trips_through_rtdb_config() -> anyhow::Result<()> {
     let _rtdb_config_guard = RTDB_CONFIG_GUARD.lock().await;
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
 
     sqlx::query("DELETE FROM rtdb_config WHERE id = 1")
         .execute(&state.pool)
         .await?;
     assert!(
-        rtdb_server::config::load_hot(&state.pool, &common::test_hot())
+        rtdb_server::config::load_hot(&state.pool, &crate::common::test_hot())
             .await?
             .is_none()
     );
@@ -855,7 +854,7 @@ async fn hot_config_round_trips_through_rtdb_config() -> anyhow::Result<()> {
         max_subs_per_db: 0,
     };
     rtdb_server::config::save_hot(&state.pool, &hot).await?;
-    let loaded = rtdb_server::config::load_hot(&state.pool, &common::test_hot())
+    let loaded = rtdb_server::config::load_hot(&state.pool, &crate::common::test_hot())
         .await?
         .unwrap();
     assert_eq!(loaded.allowed_origins, hot.allowed_origins);
@@ -880,7 +879,7 @@ async fn hot_config_round_trips_through_rtdb_config() -> anyhow::Result<()> {
 #[tokio::test]
 async fn hot_config_row_missing_a_newer_field_still_loads() -> anyhow::Result<()> {
     let _rtdb_config_guard = RTDB_CONFIG_GUARD.lock().await;
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
 
     // Write the row shape as it actually existed in prod: no idempotencyTtlMs.
     sqlx::query("DELETE FROM rtdb_config WHERE id = 1")
@@ -895,7 +894,7 @@ async fn hot_config_row_missing_a_newer_field_still_loads() -> anyhow::Result<()
         .execute(&state.pool)
         .await?;
 
-    let defaults = common::test_hot();
+    let defaults = crate::common::test_hot();
     let loaded = rtdb_server::config::load_hot(&state.pool, &defaults)
         .await?
         .expect("an older row must load, not error");
@@ -923,8 +922,8 @@ async fn hot_config_row_missing_a_newer_field_still_loads() -> anyhow::Result<()
 #[tokio::test]
 async fn config_get_and_patch_round_trip() -> anyhow::Result<()> {
     let _rtdb_config_guard = RTDB_CONFIG_GUARD.lock().await;
-    let state = common::test_state().await;
-    let addr = common::spawn_app(state.clone()).await;
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state.clone()).await;
     let bearer = "Bearer test-admin-key";
 
     sqlx::query("DELETE FROM rtdb_config WHERE id = 1")
@@ -965,7 +964,7 @@ async fn config_get_and_patch_round_trip() -> anyhow::Result<()> {
         resp.json::<serde_json::Value>().await?["hot"]["sessionTtlDays"],
         7
     );
-    let loaded = rtdb_server::config::load_hot(&state.pool, &common::test_hot())
+    let loaded = rtdb_server::config::load_hot(&state.pool, &crate::common::test_hot())
         .await?
         .unwrap();
     assert_eq!(loaded.session_ttl_days, 7);
@@ -996,7 +995,7 @@ async fn config_get_and_patch_round_trip() -> anyhow::Result<()> {
         resp.json::<serde_json::Value>().await?["hot"]["idempotencyTtlMs"],
         60000
     );
-    let loaded = rtdb_server::config::load_hot(&state.pool, &common::test_hot())
+    let loaded = rtdb_server::config::load_hot(&state.pool, &crate::common::test_hot())
         .await?
         .unwrap();
     assert_eq!(loaded.idempotency_ttl_ms, 60000);
@@ -1060,8 +1059,8 @@ async fn config_get_and_patch_round_trip() -> anyhow::Result<()> {
 #[tokio::test]
 async fn config_cors_hot_reloads_allowed_origins() -> anyhow::Result<()> {
     let _rtdb_config_guard = RTDB_CONFIG_GUARD.lock().await;
-    let state = common::test_state().await;
-    let addr = common::spawn_app(state.clone()).await;
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state.clone()).await;
     let bearer = "Bearer test-admin-key";
 
     // Add an origin via the hot-reload path (replaces the test_hot seed entirely).
@@ -1155,12 +1154,12 @@ async fn seed_owned_note(
 // table regardless of owner (a scoped user query would see only their own).
 #[tokio::test]
 async fn admin_query_bypasses_per_row_owner() -> anyhow::Result<()> {
-    let state = common::test_state().await;
-    let addr = common::spawn_app(state.clone()).await;
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state.clone()).await;
     let pool = state.pool.clone();
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &db).await?;
-    let db = common::wrap_test_db(db);
+    let db = crate::common::wrap_test_db(db);
     let (schema, _) =
         rtdb_server::ddl::push_schema(&pool, &db, serde_json::from_value(owner_schema_json())?)
             .await?;
@@ -1194,12 +1193,12 @@ async fn admin_query_bypasses_per_row_owner() -> anyhow::Result<()> {
 // reaches the committer, so it writes nothing.
 #[tokio::test]
 async fn admin_mutate_writes_and_cap_rejects() -> anyhow::Result<()> {
-    let state = common::test_state().await;
-    let addr = common::spawn_app(state.clone()).await;
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state.clone()).await;
     let pool = state.pool.clone();
     let db = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&pool, &db).await?;
-    let db = common::wrap_test_db(db);
+    let db = crate::common::wrap_test_db(db);
     rtdb_server::ddl::push_schema(&pool, &db, serde_json::from_value(items_schema_json())?).await?;
     let bearer = "Bearer test-admin-key";
 
@@ -1251,12 +1250,12 @@ async fn static_dir_serves_index_and_assets() -> anyhow::Result<()> {
     )?;
     std::fs::write(dir.join("assets").join("app.js"), "console.log(1)")?;
 
-    let mut cfg = common::test_config();
+    let mut cfg = crate::common::test_config();
     cfg.static_dir = Some(dir.to_string_lossy().to_string());
     let pool = sqlx::PgPool::connect(&cfg.database_url).await?;
     rtdb_server::db::bootstrap(&pool).await?;
-    let state = rtdb_server::AppState::new(pool, cfg, common::test_hot());
-    let addr = common::spawn_app(state).await;
+    let state = rtdb_server::AppState::new(pool, cfg, crate::common::test_hot());
+    let addr = crate::common::spawn_app(state).await;
 
     // GET / -> index.html, no-cache.
     let resp = reqwest::get(format!("http://{addr}/")).await?;
@@ -1304,14 +1303,14 @@ async fn static_dir_serves_index_and_assets() -> anyhow::Result<()> {
 // index.html) and the API routes are unaffected.
 #[tokio::test]
 async fn no_static_dir_is_api_only() -> anyhow::Result<()> {
-    let state = common::test_state().await; // static_dir = None
-    let addr = common::spawn_app(state.clone()).await;
+    let state = crate::common::test_state().await; // static_dir = None
+    let addr = crate::common::spawn_app(state.clone()).await;
 
     let resp = reqwest::get(format!("http://{addr}/")).await?;
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 
     // API still works.
-    let resp = common::admin_get(addr, "/admin/dbs").await;
+    let resp = crate::common::admin_get(addr, "/admin/dbs").await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     Ok(())
 }
@@ -1322,7 +1321,7 @@ async fn no_static_dir_is_api_only() -> anyhow::Result<()> {
 // totalSizeBytes sum; subsUsed comes from SubscriptionManager::count_for_db.
 #[tokio::test]
 async fn db_stats_reports_quota_and_usage() -> anyhow::Result<()> {
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     state
         .runtime
         .hot
@@ -1330,12 +1329,12 @@ async fn db_stats_reports_quota_and_usage() -> anyhow::Result<()> {
             max_tables_per_db: 9,
             max_storage_bytes_per_db: 1000,
             max_subs_per_db: 5,
-            ..common::test_hot()
+            ..crate::common::test_hot()
         }));
-    let db = common::fresh_db(&state).await;
-    let addr = common::spawn_app(state).await;
+    let db = crate::common::fresh_db(&state).await;
+    let addr = crate::common::spawn_app(state).await;
 
-    let resp = common::admin_get(addr, &format!("/admin/dbs/{db}/stats")).await;
+    let resp = crate::common::admin_get(addr, &format!("/admin/dbs/{db}/stats")).await;
     assert_eq!(resp.status(), axum::http::StatusCode::OK);
     let body: serde_json::Value = resp.json().await?;
     assert_eq!(body["tablesQuota"], 9);

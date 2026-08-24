@@ -6,11 +6,9 @@
 //! inside a single tx and asserts against the physical tables. Later tasks
 //! reuse this harness.
 
-mod common;
-
 use std::sync::Arc;
 
-use common::{admin_post, spawn_app, test_state, test_state_with_audit};
+use crate::common::{admin_post, spawn_app, test_state, test_state_with_audit};
 use rtdb_server::AppState;
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::db;
@@ -26,7 +24,7 @@ use rtdb_server::txn::{OpKind, Step, Transaction, execute_txn};
 /// builds one via `setup_db_with_schema` and drops it at the end.
 struct Db {
     state: Arc<AppState>,
-    name: common::TestDb,
+    name: crate::common::TestDb,
     schema: SchemaDef,
 }
 
@@ -47,7 +45,7 @@ async fn setup_db_with_schema_in(state: Arc<AppState>, schema_json: &str) -> Db 
     push_schema(&state.pool, &name, schema.clone())
         .await
         .expect("push schema");
-    let name = common::wrap_test_db(name);
+    let name = crate::common::wrap_test_db(name);
     Db {
         state,
         name,
@@ -1777,7 +1775,7 @@ async fn seed_oauth_allowlist_admin(state: &Arc<AppState>) -> String {
     let suffix = uuid::Uuid::now_v7().simple();
     let email = format!("migrate-admin-{suffix}@example.com");
     let user_id = format!("u{suffix}");
-    let token = common::mint_user_session(&state.pool, &user_id, &email).await;
+    let token = crate::common::mint_user_session(&state.pool, &user_id, &email).await;
     sqlx::query("INSERT INTO rtdb_auth.admins (email, github_id, added_at) VALUES ($1, NULL, $2)")
         .bind(&email)
         .bind(rtdb_server::db::now_ms())

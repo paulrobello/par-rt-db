@@ -8,11 +8,9 @@
 //! returns. This test PROVES that by dropping a `TestDb` and polling
 //! `db::database_exists` until it returns false within ~5s.
 
-mod common;
-
 use std::time::Duration;
 
-use common::{TestDb, ensure_cleanup_worker, kanban_schema_json, test_state};
+use crate::common::{TestDb, ensure_cleanup_worker, kanban_schema_json, test_state};
 use rtdb_server::db;
 
 /// Regression: `CREATE EXTENSION IF NOT EXISTS` is check-then-insert — two

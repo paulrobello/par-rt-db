@@ -1,6 +1,4 @@
-mod common;
-
-use common::test_state;
+use crate::common::test_state;
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::ddl::push_schema;
 use rtdb_server::error::ErrorCode;
@@ -66,7 +64,7 @@ fn vector_schema_with_metric(dim: u32, with_filter: bool, metric: DistanceMetric
 async fn pgvector_extension_available_after_db_create() {
     let state = test_state().await;
     // fresh_db creates a database, which now runs CREATE EXTENSION vector.
-    let db_name = common::fresh_db(&state).await;
+    let db_name = crate::common::fresh_db(&state).await;
 
     let row = sqlx::query("SELECT extversion FROM pg_extension WHERE extname = 'vector'")
         .fetch_one(&state.pool)
@@ -95,7 +93,7 @@ async fn push_schema_creates_vector_column_and_hnsw_index() {
     rtdb_server::db::create_database(&state.pool, &db)
         .await
         .expect("create database");
-    let db = common::wrap_test_db(db);
+    let db = crate::common::wrap_test_db(db);
     push_schema(&state.pool, &db, vector_schema(3, true))
         .await
         .expect("push vector schema");
@@ -171,7 +169,7 @@ async fn changing_vector_dims_is_rejected() {
     rtdb_server::db::create_database(&state.pool, &db)
         .await
         .expect("create database");
-    let db = common::wrap_test_db(db);
+    let db = crate::common::wrap_test_db(db);
     push_schema(&state.pool, &db, vector_schema(3, false))
         .await
         .expect("push initial vector schema");
@@ -203,7 +201,7 @@ fn vec_doc(emb: Vec<f64>) -> serde_json::Map<String, serde_json::Value> {
         .clone()
 }
 
-async fn vec_db(state: &std::sync::Arc<rtdb_server::AppState>) -> common::TestDb {
+async fn vec_db(state: &std::sync::Arc<rtdb_server::AppState>) -> crate::common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await
@@ -211,7 +209,7 @@ async fn vec_db(state: &std::sync::Arc<rtdb_server::AppState>) -> common::TestDb
     push_schema(&state.pool, &name, vector_schema(3, false))
         .await
         .expect("push vector schema");
-    common::wrap_test_db(name)
+    crate::common::wrap_test_db(name)
 }
 
 /// Like `vec_db` but with a caller-chosen metric and dimension (ENH-007). The
@@ -221,7 +219,7 @@ async fn vec_db_with_metric(
     state: &std::sync::Arc<rtdb_server::AppState>,
     dim: u32,
     metric: DistanceMetric,
-) -> common::TestDb {
+) -> crate::common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await
@@ -233,7 +231,7 @@ async fn vec_db_with_metric(
     )
     .await
     .expect("push vector schema");
-    common::wrap_test_db(name)
+    crate::common::wrap_test_db(name)
 }
 
 /// Task 5: an insert must maintain the `v_<index>` column — writing the doc's
@@ -572,7 +570,7 @@ async fn vector_search_applies_eq_filter() {
     rtdb_server::db::create_database(&state.pool, &db)
         .await
         .expect("create database");
-    let db = common::wrap_test_db(db);
+    let db = crate::common::wrap_test_db(db);
     push_schema(&state.pool, &db, vector_schema(3, true))
         .await
         .expect("push vector schema with filterField");
@@ -707,7 +705,9 @@ fn hybrid_schema() -> SchemaDef {
     serde_json::from_value(hybrid_schema_json()).expect("parse hybrid schema")
 }
 
-async fn hybrid_db(state: &std::sync::Arc<rtdb_server::AppState>) -> (common::TestDb, SchemaDef) {
+async fn hybrid_db(
+    state: &std::sync::Arc<rtdb_server::AppState>,
+) -> (crate::common::TestDb, SchemaDef) {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await
@@ -716,7 +716,7 @@ async fn hybrid_db(state: &std::sync::Arc<rtdb_server::AppState>) -> (common::Te
     push_schema(&state.pool, &name, schema.clone())
         .await
         .expect("push hybrid schema");
-    (common::wrap_test_db(name), schema)
+    (crate::common::wrap_test_db(name), schema)
 }
 
 fn hybrid_doc(
@@ -919,7 +919,7 @@ async fn hybrid_search_requires_a_vector_index() {
     rtdb_server::db::create_database(&state.pool, &name)
         .await
         .expect("create db");
-    let name = common::wrap_test_db(name);
+    let name = crate::common::wrap_test_db(name);
     push_schema(&state.pool, &name, schema.clone())
         .await
         .expect("push schema");
@@ -1050,7 +1050,7 @@ async fn push_schema_compiles_declared_metric_opclass() {
         rtdb_server::db::create_database(&state.pool, &raw)
             .await
             .expect("create database");
-        let db = common::wrap_test_db(raw);
+        let db = crate::common::wrap_test_db(raw);
         push_schema(
             &state.pool,
             &db,

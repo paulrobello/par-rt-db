@@ -1,9 +1,7 @@
-mod common;
-
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use common::{spawn_app, test_config, test_hot, wrap_test_db};
+use crate::common::{spawn_app, test_config, test_hot, wrap_test_db};
 use rtdb_server::AppState;
 use rtdb_server::auth::{Principal, PrincipalCtx, authorize, resolve_bearer};
 use rtdb_server::ddl::push_schema;
@@ -285,7 +283,7 @@ async fn sec103_anon_mint_is_ip_rate_limited() -> anyhow::Result<()> {
 // when RTDB_AUTH_ANONYMOUS_ENABLED is off — criterion 2.
 #[tokio::test]
 async fn anonymous_disabled_returns_forbidden() -> anyhow::Result<()> {
-    let state = common::test_state().await; // auth_anonymous_enabled defaults false
+    let state = crate::common::test_state().await; // auth_anonymous_enabled defaults false
     let addr = spawn_app(state.clone()).await;
 
     let resp = reqwest::Client::new()

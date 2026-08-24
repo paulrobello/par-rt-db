@@ -25,7 +25,7 @@ Seven packages run from the root `Makefile` (swift-client's lines are Darwin-gua
 - `make checkall` — the full gate (fmt-check + clippy `-D warnings` + typecheck + tests). **Definition of done; must pass before commit.**
 - `make dev-db-up` / `dev-db-down` — start/stop the dev Postgres on `127.0.0.1:55434`. **Required for any test run** — integration tests hit a real DB. `make dev-db-clean` periodically drops leaked test artifacts (per-test `db_t…` schemas and the corpus runner's `sc_…` databases; scoped to those patterns, never touches real DBs).
 - `make test` — dev-db-up then the whole suite. First-time setup: `make ts-client-install`, `make dashboard-install`, `make python-client-install`.
-- Single test: `cargo test --test txn_test upsert_multiple_matches` (from `server/`), `cd ts-client && bunx vitest run tests/<file>.test.ts`, or `cd python-client && uv run pytest -q tests/<file>.py`.
+- Single test: `cargo test --test main txn_test::upsert_multiple_matches` (from `server/`), `cd ts-client && bunx vitest run tests/<file>.test.ts`, or `cd python-client && uv run pytest -q tests/<file>.py`. Since ARC-010 the server's integration tests are ONE binary (`tests/main.rs`); each `tests/<name>.rs` is a module of it, so a filter is `<file_stem>::<test_name>` and a whole file is `--test main <file_stem>::`. A new test file needs a `mod` line in `tests/main.rs`.
 - `build` and `typecheck` pull `ts-client-build` first — the dashboard resolves `@par-rt-db/client` from `ts-client/dist` (gitignored); build it on a fresh or stale checkout or the gate fails at dashboard typecheck.
 - Live-server tests are opt-in (`#[ignore]`, need `RTDB_TEST_SERVER_URL` + `RTDB_TEST_ADMIN_KEY`, run with `--ignored`).
 

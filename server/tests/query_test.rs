@@ -1,9 +1,7 @@
-mod common;
-
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{fresh_db, kanban_schema_json, test_state};
+use crate::common::{fresh_db, kanban_schema_json, test_state};
 use rtdb_server::AppState;
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::db;
@@ -4247,7 +4245,7 @@ fn int64_schema() -> SchemaDef {
     .expect("parse int64 schema")
 }
 
-async fn fresh_int64_db(state: &Arc<AppState>) -> common::TestDb {
+async fn fresh_int64_db(state: &Arc<AppState>) -> crate::common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     db::create_database(&state.pool, &name)
         .await
@@ -4255,7 +4253,7 @@ async fn fresh_int64_db(state: &Arc<AppState>) -> common::TestDb {
     ddl::push_schema(&state.pool, &name, int64_schema())
         .await
         .expect("push int64 schema");
-    common::wrap_test_db(name)
+    crate::common::wrap_test_db(name)
 }
 
 async fn insert_event(

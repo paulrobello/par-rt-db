@@ -1,6 +1,4 @@
-mod common;
-
-use common::{fresh_db, spawn_app, test_state};
+use crate::common::{fresh_db, spawn_app, test_state};
 use rtdb_server::auth::{self, Principal};
 use rtdb_server::error::ErrorCode;
 use serde_json::json;

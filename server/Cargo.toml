@@ -3,6 +3,15 @@ name = "rtdb-server"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+# ARC-010: one integration-test binary instead of one per file. Auto-discovery
+# would still make every `tests/*.rs` its own target, so it is off and the
+# single target is declared explicitly; `tests/main.rs` declares each file as a
+# module.
+autotests = false
+
+[[test]]
+name = "main"
+path = "tests/main.rs"
 
 [features]
 # Default build carries no OpenTelemetry code (ENH-018). `otel` pulls in the

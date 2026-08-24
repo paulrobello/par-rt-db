@@ -16,8 +16,6 @@
 //! is reachable and parses the form body into the state-claim flow. That is the
 //! focus of the Apple callback test below.
 
-mod common;
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -25,7 +23,7 @@ use rtdb_server::config::Config;
 use rtdb_server::{AppState, db};
 use serde_json::Value;
 
-use common::{spawn_app, test_config, test_hot};
+use crate::common::{spawn_app, test_config, test_hot};
 
 const ALLOWED_ORIGIN: &str = "http://localhost:5173";
 
@@ -135,7 +133,7 @@ async fn microsoft_begin_with_disallowed_origin_returns_forbidden() -> anyhow::R
 #[tokio::test]
 async fn microsoft_begin_unconfigured_returns_service_unavailable() -> anyhow::Result<()> {
     // test_config() leaves microsoft_client_id/secret as None.
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let addr = spawn_app(state).await;
 
     let resp = begin(addr, "microsoft", ALLOWED_ORIGIN).await;
@@ -185,7 +183,7 @@ async fn apple_begin_with_disallowed_origin_returns_forbidden() -> anyhow::Resul
 #[tokio::test]
 async fn apple_begin_unconfigured_returns_service_unavailable() -> anyhow::Result<()> {
     // test_config() leaves all apple_* fields as None.
-    let state = common::test_state().await;
+    let state = crate::common::test_state().await;
     let addr = spawn_app(state).await;
 
     let resp = begin(addr, "apple", ALLOWED_ORIGIN).await;

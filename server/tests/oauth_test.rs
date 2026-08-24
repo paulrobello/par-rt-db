@@ -1,9 +1,7 @@
-mod common;
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use common::{admin_post, fresh_db, spawn_app, test_config, test_state};
+use crate::common::{admin_post, fresh_db, spawn_app, test_config, test_state};
 use futures_util::{SinkExt, StreamExt};
 use rtdb_server::{AppState, db};
 use serde_json::{Value, json};
@@ -27,7 +25,7 @@ async fn oauth_state_with_csrf(mock: &MockServer, csrf: bool) -> (Arc<AppState>,
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
 
-    let state = AppState::new(pool, cfg, common::test_hot());
+    let state = AppState::new(pool, cfg, crate::common::test_hot());
     let addr = spawn_app(state.clone()).await;
     (state, addr)
 }
@@ -869,7 +867,7 @@ async fn google_configured_state() -> (Arc<AppState>, SocketAddr) {
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
-    let state = AppState::new(pool, cfg, common::test_hot());
+    let state = AppState::new(pool, cfg, crate::common::test_hot());
     let addr = spawn_app(state.clone()).await;
     (state, addr)
 }
@@ -1215,9 +1213,9 @@ async fn cross_replica_login_completes_on_second_replica() -> anyhow::Result<()>
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
 
     // Replica A and replica B: distinct AppStates, same pool.
-    let state_a = AppState::new(pool.clone(), cfg.clone(), common::test_hot());
+    let state_a = AppState::new(pool.clone(), cfg.clone(), crate::common::test_hot());
     let addr_a = spawn_app(state_a.clone()).await;
-    let state_b = AppState::new(pool.clone(), cfg, common::test_hot());
+    let state_b = AppState::new(pool.clone(), cfg, crate::common::test_hot());
     let addr_b = spawn_app(state_b.clone()).await;
 
     let client = no_redirect_client();

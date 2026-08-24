@@ -6,9 +6,7 @@
 //! The decode → resize → encode pipeline itself is unit-tested in
 //! `src/image_transform.rs`.
 
-mod common;
-
-use common::{admin_post, spawn_app, test_state, wrap_test_db};
+use crate::common::{admin_post, spawn_app, test_state, wrap_test_db};
 use std::net::SocketAddr;
 
 use axum::http::StatusCode;
@@ -59,7 +57,7 @@ async fn upload_png(addr: &SocketAddr, db: &str, token: &str, w: u32, h: u32) ->
 /// Create a bare (schema-less) test database. Storage uses its own side table
 /// (created by `db::create_database`), so no document schema is needed; using
 /// `fresh_db` would unnecessarily push the kanban fixture.
-async fn bare_db(state: &rtdb_server::AppState) -> common::TestDb {
+async fn bare_db(state: &rtdb_server::AppState) -> crate::common::TestDb {
     let name = format!("t{}", uuid::Uuid::now_v7().simple());
     rtdb_server::db::create_database(&state.pool, &name)
         .await
