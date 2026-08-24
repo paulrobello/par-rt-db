@@ -258,7 +258,36 @@ pub async fn merge_users(
     }
 
     let mut report = MergeReport::default();
-    for db in crate::db::list_databases(&state.pool).await? {
+    let dbs = crate::db::list_databases(&state.pool).await?;
+    // Skip registry rows whose backing schema is gone before touching the
+    // committer. Such rows leak from aborted runs (RAII never fires on
+    // SIGKILL) or from a schema dropped outside `delete-db`, and per stale
+    // row the loop would otherwise spawn a committer whose ensure-table DDL
+    // fails against the missing schema — and whose arm surfaces the raw
+    // undefined_table on `meta` as INTERNAL (not NotFound), which the
+    // `database_exists` guard below then propagates as a real merge failure.
+    // A schema-less db holds no documents and no storage rows, so skipping
+    // here is semantically identical to the NotFound / undefined-table
+    // tolerations inside the loop. One bulk schemata probe keeps the check
+    // to a single round trip for the whole registry.
+    let live_schemas: std::collections::HashSet<String> = if dbs.is_empty() {
+        Default::default()
+    } else {
+        let physical: Vec<String> = dbs.iter().map(|d| crate::ddl::pg_schema(d)).collect();
+        sqlx::query_as(
+            "SELECT schema_name FROM information_schema.schemata WHERE schema_name = ANY($1)",
+        )
+        .bind(&physical)
+        .fetch_all(&state.pool)
+        .await?
+        .into_iter()
+        .map(|(s,)| s)
+        .collect()
+    };
+    for db in dbs {
+        if !live_schemas.contains(&crate::ddl::pg_schema(&db)) {
+            continue;
+        }
         match state
             .realtime
             .committers

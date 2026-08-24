@@ -195,6 +195,123 @@ fn computed_owner_schema() -> SchemaDef {
     .expect("parse computed owner schema")
 }
 
+/// `merge::merge_users` iterates every `rtdb_auth.databases` row. Aborted test
+/// runs leak rows whose backing schema is gone (RAII never fires on SIGKILL),
+/// and each stale row cost a full committer spawn plus ensure-table DDL round
+/// trips inside the loop — at 3,575 leaked rows one merge_users took tens of
+/// minutes and merge_test appeared to hang (2026-08-23). The loop must skip
+/// schema-less rows up front: a db with no schema holds no docs and no storage
+/// rows, so skipping is semantically identical to the NotFound /
+/// undefined-table tolerations inside the loop.
+#[tokio::test]
+async fn merge_users_skips_stale_registry_rows_without_paying_a_committer_spawn()
+-> anyhow::Result<()> {
+    let state = test_state().await;
+    let suffix = uuid::Uuid::now_v7().simple().to_string();
+
+    // 50 leaked-row shapes: registry rows whose `db_<name>` schema does not
+    // exist. Inserted directly (never via create_database) and NOT wrapped in
+    // TestDb — they have nothing to drop, and the test cleans its own rows.
+    for i in 0..50 {
+        sqlx::query("INSERT INTO rtdb_auth.databases (name, created_at) VALUES ($1, $2)")
+            .bind(format!("stale{i}{}", &suffix[..10]))
+            .bind(db::now_ms())
+            .execute(&state.pool)
+            .await?;
+    }
+
+    // One real db so the merge still does (and reports) real work amid the
+    // stale rows, plus two anon/real pairs so the differential below can run
+    // the baseline and the measured pass without the first merge consuming
+    // the second pair's anon row.
+    let db = owned_db(&state, false).await?;
+    let anon = format!("anon_stale_{}", &suffix[..16]);
+    let real = format!("real_stale_{}", &suffix[..16]);
+    let anon2 = format!("anon2_stale_{}", &suffix[..15]);
+    let real2 = format!("real2_stale_{}", &suffix[..15]);
+    for (id, is_anon) in [
+        (&anon, true),
+        (&real, false),
+        (&anon2, true),
+        (&real2, false),
+    ] {
+        sqlx::query(
+            "INSERT INTO rtdb_auth.users (id, login, email, anonymous, created_at) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(id)
+        .bind(if is_anon { "anonymous" } else { "github" })
+        .bind(if is_anon {
+            None
+        } else {
+            Some(format!("{id}@example.com"))
+        })
+        .bind(is_anon)
+        .bind(db::now_ms())
+        .execute(&state.pool)
+        .await?;
+    }
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            insert_doc(
+                "docs",
+                json!({ "title": "a", "owner": anon, "editors": [] }),
+            ),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+
+    // The regression guard is a DIFFERENTIAL, not a wall-clock: a full merge
+    // legitimately costs real work per LIVE sibling-test db (spawns, schema
+    // scans, storage swaps) and that cost swings with machine load and
+    // parallel-test population. Run the same merge twice — baseline before
+    // the stale rows exist, then with 50 of them — and bound only the DELTA.
+    // Pre-fix each stale row cost a committer spawn + failed DDL round trips
+    // (~0.2–0.3s each, and worse: its INTERNAL error aborted the whole
+    // merge); the filtered pass skips them in one bulk schemata probe.
+    let started = std::time::Instant::now();
+    rtdb_server::merge::merge_users(&state, &anon, &real).await?;
+    let baseline = started.elapsed();
+
+    let started = std::time::Instant::now();
+    let report = rtdb_server::merge::merge_users(&state, &anon2, &real2).await?;
+    let with_stale = started.elapsed();
+    assert!(
+        with_stale < baseline + std::time::Duration::from_secs(3),
+        "50 stale registry rows added {:?} over the {:?} baseline — \
+         stale rows must be skipped without committer spawns",
+        with_stale - baseline,
+        baseline
+    );
+
+    // The real db was still merged and reported. Sibling tests run in
+    // parallel against the shared registry and their live dbs legitimately
+    // appear (as zero-restamp entries) — but no STALE name may: nothing is
+    // restamped in a schema-less db.
+    assert!(report.dbs.contains_key(&db));
+    assert!(
+        report.dbs.keys().all(|name| !name.starts_with("stale")),
+        "a schema-less db leaked into the merge report: {:?}",
+        report.dbs.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(owned_doc_count(&state.pool, &db, &real).await, 1);
+    assert_eq!(
+        report.sessions_repointed, 0,
+        "the anon rows were created directly, not via sessions"
+    );
+
+    // Clean up: these rows were inserted outside RAII on purpose.
+    sqlx::query("DELETE FROM rtdb_auth.databases WHERE name LIKE $1")
+        .bind(format!("stale%{}", &suffix[..10]))
+        .execute(&state.pool)
+        .await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn merge_users_restamps_computed_fields_over_principal_fields() -> anyhow::Result<()> {
     let state = test_state().await;

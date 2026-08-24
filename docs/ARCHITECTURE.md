@@ -471,7 +471,11 @@ re-point (an open WS or stored SDK token promotes to the real principal on its
 next op), then a guarded anon-row delete; every step is idempotent, and any
 interruption is recovered by signing in again. `POST /admin/merge-users` (typed
 confirm, 404 on a missing anon row) runs the merge synchronously as the
-operator escape hatch; `rtdb_merge_docs_total` counts restamped docs. Spec:
+operator escape hatch; `rtdb_merge_docs_total` counts restamped docs. The
+per-db iteration skips registry rows whose backing schema is gone (one bulk
+`information_schema.schemata` probe) — leaked rows from aborted runs would
+otherwise cost a committer spawn each and surface their missing `meta`
+relation as an INTERNAL merge failure. Spec:
 [`superpowers/specs/2026-08-14-anon-merge-design.md`](superpowers/specs/2026-08-14-anon-merge-design.md).
 ts-client exposes it as `useRtDbAuth().signInAnonymous()`; rust/python clients
 are machine-side and out of scope. See FEATURE_MATRIX #20.
