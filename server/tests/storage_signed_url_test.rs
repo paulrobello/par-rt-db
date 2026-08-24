@@ -73,6 +73,67 @@ async fn mint_then_serve_returns_bytes() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn signature_is_bound_to_the_transform_it_was_minted_for() -> anyhow::Result<()> {
+    // SEC-003: the signature covers the canonical transform params, so one
+    // signature authorizes exactly one render. A URL minted for `w=100` must
+    // not serve `w=200`, nor the un-transformed blob, and a plain signature
+    // must not authorize a transform.
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let addr = spawn_app(state.clone()).await;
+    let (id, _) = seed(&state, &db).await;
+    let token = mint_token(addr, &db).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/storage/{db}/{id}/signed-url?w=100"
+        ))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await?;
+    let url = body["url"].as_str().expect("url present").to_string();
+    assert!(
+        url.contains("w=100"),
+        "the mint must echo the render it signed: {url}"
+    );
+    let path = url[url.find("/storage/").expect("path present")..].to_string();
+    let exp = body["expiresAt"].as_i64().expect("expiresAt present");
+    let sig = url.rsplit("sig=").next().expect("sig in url").to_string();
+
+    // Widening the render invalidates the signature.
+    let widened = path.replace("w=100", "w=200");
+    let resp = reqwest::get(format!("http://{addr}{widened}")).await?;
+    assert_eq!(
+        resp.status(),
+        403,
+        "a signature minted for w=100 must not serve w=200"
+    );
+
+    // Dropping the transform (full-resolution fetch) invalidates it too.
+    let resp = reqwest::get(format!("http://{addr}/storage/{id}?exp={exp}&sig={sig}")).await?;
+    assert_eq!(
+        resp.status(),
+        403,
+        "a signature minted for a thumbnail must not serve the original"
+    );
+
+    // And the reverse: a plain signature must not authorize a transform.
+    let plain_sig = signed_url::sign(&state.limits.signed_url_key, &id, exp, "");
+    let resp = reqwest::get(format!(
+        "http://{addr}/storage/{id}?w=100&exp={exp}&sig={plain_sig}"
+    ))
+    .await?;
+    assert_eq!(
+        resp.status(),
+        403,
+        "an un-transformed signature must not authorize a render"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn expired_signature_returns_403() -> anyhow::Result<()> {
     let state = test_state().await;
     let db = fresh_db(&state).await;
@@ -80,7 +141,7 @@ async fn expired_signature_returns_403() -> anyhow::Result<()> {
     let (id, _) = seed(&state, &db).await;
 
     let past = rtdb_server::db::now_ms() - 1000;
-    let sig = signed_url::sign(&state.limits.signed_url_key, &id, past);
+    let sig = signed_url::sign(&state.limits.signed_url_key, &id, past, "");
     let resp = reqwest::get(format!("http://{addr}/storage/{id}?exp={past}&sig={sig}")).await?;
     assert_eq!(resp.status(), 403);
     Ok(())
@@ -94,7 +155,7 @@ async fn tampered_signature_returns_403() -> anyhow::Result<()> {
     let (id, _) = seed(&state, &db).await;
 
     let exp = rtdb_server::db::now_ms() + 60_000;
-    let sig = signed_url::sign(&state.limits.signed_url_key, &id, exp);
+    let sig = signed_url::sign(&state.limits.signed_url_key, &id, exp, "");
     let mut chars: Vec<char> = sig.chars().collect();
     let last_idx = chars.len() - 1;
     let last = chars[last_idx];
@@ -114,7 +175,7 @@ async fn tampered_id_returns_403() -> anyhow::Result<()> {
     let (id, _) = seed(&state, &db).await;
 
     let exp = rtdb_server::db::now_ms() + 60_000;
-    let sig = signed_url::sign(&state.limits.signed_url_key, &id, exp);
+    let sig = signed_url::sign(&state.limits.signed_url_key, &id, exp, "");
     // Valid sig for `id`, fetched against a different id in the path.
     let resp = reqwest::get(format!(
         "http://{addr}/storage/other-id?exp={exp}&sig={sig}"
@@ -132,7 +193,7 @@ async fn tampered_exp_returns_403() -> anyhow::Result<()> {
     let (id, _) = seed(&state, &db).await;
 
     let exp = rtdb_server::db::now_ms() + 60_000;
-    let sig = signed_url::sign(&state.limits.signed_url_key, &id, exp);
+    let sig = signed_url::sign(&state.limits.signed_url_key, &id, exp, "");
     // The sig was computed over `exp`; fetching with a different exp fails verify.
     let tampered_exp = exp + 1;
     let resp = reqwest::get(format!(
@@ -151,7 +212,7 @@ async fn partial_signature_returns_403() -> anyhow::Result<()> {
     let (id, _) = seed(&state, &db).await;
 
     let exp = rtdb_server::db::now_ms() + 60_000;
-    let sig = signed_url::sign(&state.limits.signed_url_key, &id, exp);
+    let sig = signed_url::sign(&state.limits.signed_url_key, &id, exp, "");
 
     // exp without sig
     let r1 = reqwest::get(format!("http://{addr}/storage/{id}?exp={exp}")).await?;

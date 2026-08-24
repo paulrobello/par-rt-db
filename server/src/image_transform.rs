@@ -62,6 +62,38 @@ pub enum TransformError {
     Internal(String),
 }
 
+impl TransformParams {
+    /// SEC-003: deterministic textual form of this render, mixed into the
+    /// signed-URL HMAC so a signature authorizes exactly one render rather than
+    /// every render of the blob. Keys are emitted in sorted order with absent
+    /// optionals omitted; `fit`/`format` are always present because `parse` has
+    /// already resolved their defaults, so mint and serve agree byte-for-byte.
+    /// An un-transformed serve (`parse` ⇒ `None`) canonicalizes to `""`.
+    pub fn canonical(&self) -> String {
+        let fit = match self.fit {
+            Fit::Cover => "cover",
+            Fit::Contain => "contain",
+            Fit::ScaleDown => "scale-down",
+        };
+        let format = match self.format {
+            OutFormat::Jpeg => "jpeg",
+            OutFormat::Png => "png",
+            OutFormat::Auto => "auto",
+        };
+        let mut out = format!("fit={fit}&format={format}");
+        if let Some(h) = self.h {
+            out.push_str(&format!("&h={h}"));
+        }
+        if let Some(q) = self.q {
+            out.push_str(&format!("&q={q}"));
+        }
+        if let Some(w) = self.w {
+            out.push_str(&format!("&w={w}"));
+        }
+        out
+    }
+}
+
 /// Parse transform params from a query map. `Ok(None)` ⇒ passthrough (no
 /// transform requested). `Err(BadRequest)` ⇒ invalid value.
 impl TransformParams {

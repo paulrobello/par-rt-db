@@ -465,6 +465,16 @@ fn check_field_declared(field: &str, table: &TableDef) -> Result<(), RtDbError> 
     Ok(())
 }
 
+/// SEC-007: hard ceiling on `and`/`or`/`not` nesting in a filter expression.
+/// `serde_json`'s 128-level recursion limit and the 64 KiB WS frame cap bound
+/// this incidentally today; this is the project-owned limit, enforced in the
+/// one place every filter passes through.
+pub const MAX_FILTER_DEPTH: usize = 32;
+
+/// SEC-007: hard ceiling on `in` list length. Each value becomes one bound
+/// placeholder, so an unbounded list is an unbounded query plan.
+pub const MAX_IN_VALUES: usize = 1000;
+
 /// Walk `expr` validating its field references against `table`'s declared
 /// fields. Reused by `validate_structure` (for the server-declared `authorize`
 /// predicate, `allow_principal_markers = true`) and by the query boundary in
@@ -489,6 +499,21 @@ pub fn validate_filter_expr_fields(
     allow_principal_markers: bool,
     allow_relative_time: bool,
 ) -> Result<(), RtDbError> {
+    validate_filter_expr_fields_at(expr, table, allow_principal_markers, allow_relative_time, 1)
+}
+
+fn validate_filter_expr_fields_at(
+    expr: &FilterExpr,
+    table: &TableDef,
+    allow_principal_markers: bool,
+    allow_relative_time: bool,
+    depth: usize,
+) -> Result<(), RtDbError> {
+    if depth > MAX_FILTER_DEPTH {
+        return Err(RtDbError::bad_request(format!(
+            "filter nesting exceeds {MAX_FILTER_DEPTH} levels"
+        )));
+    }
     match expr {
         FilterExpr::Eq { field, value }
         | FilterExpr::Neq { field, value }
@@ -541,6 +566,11 @@ pub fn validate_filter_expr_fields(
         }
         FilterExpr::In { field, values } => {
             check_field_declared(field, table)?;
+            if values.len() > MAX_IN_VALUES {
+                return Err(RtDbError::bad_request(format!(
+                    "in: at most {MAX_IN_VALUES} values"
+                )));
+            }
             if !allow_principal_markers {
                 for v in values {
                     if is_principal_marker(v) {
@@ -570,16 +600,23 @@ pub fn validate_filter_expr_fields(
         }
         FilterExpr::And { exprs } | FilterExpr::Or { exprs } => {
             for e in exprs {
-                validate_filter_expr_fields(
+                validate_filter_expr_fields_at(
                     e,
                     table,
                     allow_principal_markers,
                     allow_relative_time,
+                    depth + 1,
                 )?;
             }
         }
         FilterExpr::Not { expr } => {
-            validate_filter_expr_fields(expr, table, allow_principal_markers, allow_relative_time)?;
+            validate_filter_expr_fields_at(
+                expr,
+                table,
+                allow_principal_markers,
+                allow_relative_time,
+                depth + 1,
+            )?;
         }
     }
     Ok(())
@@ -3406,6 +3443,49 @@ mod tests {
         };
         assert!(validate_filter_expr_fields(&plain, &table, true, false).is_ok());
         assert!(validate_filter_expr_fields(&plain, &table, false, false).is_ok());
+    }
+
+    #[test]
+    fn sec007_filter_depth_and_in_length_are_capped() {
+        let table = table_with_string_fields(&["visibility"]);
+        let leaf = || FilterExpr::Eq {
+            field: "visibility".into(),
+            value: serde_json::json!("public"),
+        };
+        // Nest `not` to exactly the cap, then one level past it.
+        let nest = |levels: usize| {
+            let mut expr = leaf();
+            for _ in 1..levels {
+                expr = FilterExpr::Not {
+                    expr: Box::new(expr),
+                };
+            }
+            expr
+        };
+        assert!(
+            validate_filter_expr_fields(&nest(MAX_FILTER_DEPTH), &table, false, false).is_ok(),
+            "a filter exactly at the depth cap must be accepted"
+        );
+        let err = validate_filter_expr_fields(&nest(MAX_FILTER_DEPTH + 1), &table, false, false)
+            .expect_err("one level past the cap must be rejected");
+        assert!(err.to_string().contains("nesting"), "got {err}");
+
+        // `in` list length.
+        let values = |n: usize| -> Vec<serde_json::Value> {
+            (0..n).map(|i| serde_json::json!(format!("v{i}"))).collect()
+        };
+        let at_cap = FilterExpr::In {
+            field: "visibility".into(),
+            values: values(MAX_IN_VALUES),
+        };
+        assert!(validate_filter_expr_fields(&at_cap, &table, false, false).is_ok());
+        let over = FilterExpr::In {
+            field: "visibility".into(),
+            values: values(MAX_IN_VALUES + 1),
+        };
+        let err = validate_filter_expr_fields(&over, &table, false, false)
+            .expect_err("an over-long in list must be rejected");
+        assert!(err.to_string().contains("at most"), "got {err}");
     }
 
     // ---- computed fields (ENH-028) ----

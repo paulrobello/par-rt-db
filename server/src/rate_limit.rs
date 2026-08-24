@@ -43,14 +43,20 @@ pub const MAX_BUCKETS: usize = 100_000;
 
 /// What the limiter is bucketing: a single machine token (per-token ceiling),
 /// every request against one database (per-db ceiling shared across all
-/// principals), or an unauthenticated caller's client IP (per-IP ceiling on
-/// the public storage serve route — SEC-004). `String` is the token id, db
-/// name, or IP literal/textual key respectively.
+/// principals), or an unauthenticated caller's client IP. `String` is the
+/// token id or db name respectively.
+///
+/// `Ip` carries a `route` alongside the address: without it, every per-IP
+/// route (public storage serve, admin login, anonymous token mint) shares one
+/// minute bucket, so cheap traffic on one route can exhaust the budget that
+/// protects another — or, worse, mask a credential-stuffing burst behind
+/// ordinary storage reads. The route is a `&'static str` chosen at the call
+/// site, never caller-controlled.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum RateKey {
     Token(String),
     Db(String),
-    Ip(String),
+    Ip { route: &'static str, ip: String },
 }
 
 /// Outcome of a `RateLimiter::check`. `Denied` carries a `retry_after_secs`
@@ -194,10 +200,13 @@ async fn check_pg(pool: &sqlx::PgPool, key: &RateKey, limit_rpm: u32) -> RateDec
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let current_bucket = now_secs / 60;
+    // `key_text` is owned so the route-namespaced IP key can be built here
+    // without changing the shared `rate_counters(key_type, key, ...)` schema —
+    // multi-instance deployments need no migration.
     let (key_type, key_text) = match key {
-        RateKey::Token(t) => ("token", t),
-        RateKey::Db(d) => ("db", d),
-        RateKey::Ip(ip) => ("ip", ip),
+        RateKey::Token(t) => ("token", t.clone()),
+        RateKey::Db(d) => ("db", d.clone()),
+        RateKey::Ip { route, ip } => ("ip", format!("{route}:{ip}")),
     };
     let count: i64 = match sqlx::query_scalar(
         "INSERT INTO rtdb_auth.rate_counters (key_type, key, minute_bucket, count) \
@@ -207,7 +216,7 @@ async fn check_pg(pool: &sqlx::PgPool, key: &RateKey, limit_rpm: u32) -> RateDec
          RETURNING count",
     )
     .bind(key_type)
-    .bind(key_text)
+    .bind(&key_text)
     .bind(current_bucket as i64)
     .fetch_one(pool)
     .await
@@ -292,7 +301,13 @@ pub async fn check_storage_public_rate_limit(
     match state
         .limits
         .rate_limiter
-        .check(RateKey::Ip(ip_key.to_string()), limit)
+        .check(
+            RateKey::Ip {
+                route: "storage",
+                ip: ip_key.to_string(),
+            },
+            limit,
+        )
         .await
     {
         RateDecision::Denied { retry_after_secs } => Err(RtDbError::rate_limited(retry_after_secs)),
@@ -303,6 +318,13 @@ pub async fn check_storage_public_rate_limit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ip_key(route: &'static str, ip: &str) -> RateKey {
+        RateKey::Ip {
+            route,
+            ip: ip.to_string(),
+        }
+    }
 
     fn deny_secs(d: RateDecision) -> Option<u32> {
         match d {
@@ -364,24 +386,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ip_key_buckets_independently_per_route() {
+        // SEC-005: one IP exhausting the public storage budget must not spend
+        // the admin-login or anonymous-mint budget for the same address — those
+        // protect a credential-guessing surface, not a read surface.
+        let limiter = RateLimiter::new();
+        for _ in 0..11 {
+            let _ = limiter.check(ip_key("storage", "203.0.113.7"), 10).await;
+        }
+        assert!(deny_secs(limiter.check(ip_key("storage", "203.0.113.7"), 10).await).is_some());
+        assert_eq!(
+            limiter
+                .check(ip_key("admin_login", "203.0.113.7"), 10)
+                .await,
+            RateDecision::Allowed
+        );
+        assert_eq!(
+            limiter.check(ip_key("anon_mint", "203.0.113.7"), 10).await,
+            RateDecision::Allowed
+        );
+    }
+
+    #[tokio::test]
     async fn ip_key_buckets_independently_of_token_and_db() {
         // SEC-004: per-IP budget is a separate axis from per-token / per-db so
         // an unauthenticated public-storage flood can be capped without
         // affecting authenticated traffic budgets on the same limiter.
         let limiter = RateLimiter::new();
         assert_eq!(
-            limiter.check(RateKey::Ip("203.0.113.9".into()), 2).await,
+            limiter.check(ip_key("storage", "203.0.113.9"), 2).await,
             RateDecision::Allowed
         );
         assert_eq!(
-            limiter.check(RateKey::Ip("203.0.113.9".into()), 2).await,
+            limiter.check(ip_key("storage", "203.0.113.9"), 2).await,
             RateDecision::Allowed
         );
         // Third hit same minute is denied; a different IP is unaffected, and
         // the token/db budgets remain untouched.
-        assert!(deny_secs(limiter.check(RateKey::Ip("203.0.113.9".into()), 2).await).is_some());
+        assert!(deny_secs(limiter.check(ip_key("storage", "203.0.113.9"), 2).await).is_some());
         assert_eq!(
-            limiter.check(RateKey::Ip("198.51.100.42".into()), 2).await,
+            limiter.check(ip_key("storage", "198.51.100.42"), 2).await,
             RateDecision::Allowed
         );
         assert_eq!(
@@ -403,7 +447,9 @@ mod tests {
     async fn sec112_map_is_hard_bounded_under_distinct_key_flood() {
         let limiter = RateLimiter::new();
         for i in 0..(MAX_BUCKETS + 50) {
-            let _ = limiter.check(RateKey::Ip(format!("10.0.0.{i}")), 5).await;
+            let _ = limiter
+                .check(ip_key("storage", &format!("10.0.0.{i}")), 5)
+                .await;
         }
         let len = limiter.inner.lock().await.len();
         assert!(
@@ -412,7 +458,7 @@ mod tests {
         );
         // A key never seen before is still tracked correctly: first call opens
         // the bucket, second exceeds the 1/min limit.
-        let fresh = RateKey::Ip("203.0.113.42".to_string());
+        let fresh = ip_key("storage", "203.0.113.42");
         assert_eq!(
             limiter.check(fresh.clone(), 1).await,
             RateDecision::Allowed,

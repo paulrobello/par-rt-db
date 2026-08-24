@@ -879,7 +879,13 @@ async fn anonymous(
         match state
             .limits
             .rate_limiter
-            .check(crate::rate_limit::RateKey::Ip(ip_key.clone()), limit)
+            .check(
+                crate::rate_limit::RateKey::Ip {
+                    route: "anon_mint",
+                    ip: ip_key.clone(),
+                },
+                limit,
+            )
             .await
         {
             crate::rate_limit::RateDecision::Denied { retry_after_secs } => {

@@ -1,7 +1,12 @@
 //! Signed, time-limited storage URLs.
 //!
 //! A signed URL is `GET /storage/{id}?exp=<unix-ms>&sig=<hex>` where
-//! `sig = HMAC-SHA256(signing_key, "{id}.{exp}")`. The signing key is derived
+//! `sig = HMAC-SHA256(signing_key, "{id}.{exp}.{transform}")`. `transform` is
+//! the canonical form of the image-transform params the URL renders with
+//! (`TransformParams::canonical`), empty for an un-transformed serve — SEC-003:
+//! without it one signature authorized every render of the blob, so a caller
+//! could turn a thumbnail capability into a full-resolution one, or into an
+//! unbounded set of distinct decode/encode jobs. The signing key is derived
 //! once at boot from the server's required `admin_key` and held on `AppState`,
 //! so the feature needs no extra configuration. Rotating `admin_key` changes the
 //! derived key and invalidates every outstanding signed URL (a desirable
@@ -33,22 +38,30 @@ pub fn derive_key(admin_key: &str) -> ring::hmac::Key {
     ring::hmac::Key::new(ring::hmac::HMAC_SHA256, seed.as_ref())
 }
 
-/// Hex HMAC-SHA256 over `"{id}.{exp}"`. Hex (not base64) keeps the URL free of
-/// `+/=` URL-encoding hazards.
-pub fn sign(key: &ring::hmac::Key, id: &str, exp_ms: i64) -> String {
-    let msg = format!("{id}.{exp_ms}");
+/// Hex HMAC-SHA256 over `"{id}.{exp}.{transform}"`. Hex (not base64) keeps the
+/// URL free of `+/=` URL-encoding hazards. `transform` is
+/// `TransformParams::canonical()`, or `""` for an un-transformed serve.
+pub fn sign(key: &ring::hmac::Key, id: &str, exp_ms: i64, transform: &str) -> String {
+    let msg = format!("{id}.{exp_ms}.{transform}");
     hex::encode(ring::hmac::sign(key, msg.as_bytes()).as_ref())
 }
 
 /// Constant-time verification. Returns `false` for a non-hex signature, a
-/// mismatched key, or any difference in `id`/`exp` (the compare itself is
-/// constant-time via `ring::hmac::verify`; the `false` return for bad hex is
-/// not timing-sensitive because it reveals only "malformed", not a near-miss).
-pub fn verify(key: &ring::hmac::Key, id: &str, exp_ms: i64, sig_hex: &str) -> bool {
+/// mismatched key, or any difference in `id`/`exp`/`transform` (the compare
+/// itself is constant-time via `ring::hmac::verify`; the `false` return for bad
+/// hex is not timing-sensitive because it reveals only "malformed", not a
+/// near-miss).
+pub fn verify(
+    key: &ring::hmac::Key,
+    id: &str,
+    exp_ms: i64,
+    transform: &str,
+    sig_hex: &str,
+) -> bool {
     let Ok(sig_bytes) = hex::decode(sig_hex) else {
         return false;
     };
-    let msg = format!("{id}.{exp_ms}");
+    let msg = format!("{id}.{exp_ms}.{transform}");
     ring::hmac::verify(key, msg.as_bytes(), &sig_bytes).is_ok()
 }
 
@@ -61,46 +74,78 @@ mod tests {
     #[test]
     fn sign_verify_roundtrip() {
         let key = derive_key("secret-admin-key");
-        let sig = sign(&key, "fileid123", EXP);
-        assert!(verify(&key, "fileid123", EXP, &sig));
+        let sig = sign(&key, "fileid123", EXP, "");
+        assert!(verify(&key, "fileid123", EXP, "", &sig));
     }
 
     #[test]
     fn verify_rejects_tampered_signature() {
         let key = derive_key("secret-admin-key");
-        let sig = sign(&key, "fileid123", EXP);
+        let sig = sign(&key, "fileid123", EXP, "");
         // Flip the last hex digit to a different valid hex char.
         let mut chars: Vec<char> = sig.chars().collect();
         let last_idx = chars.len() - 1;
         let last = chars[last_idx];
         chars[last_idx] = if last == '0' { '1' } else { '0' };
         let tampered: String = chars.into_iter().collect();
-        assert!(!verify(&key, "fileid123", EXP, &tampered));
+        assert!(!verify(&key, "fileid123", EXP, "", &tampered));
     }
 
     #[test]
     fn verify_rejects_tampered_id() {
         let key = derive_key("secret-admin-key");
-        let sig = sign(&key, "fileid123", EXP);
-        assert!(!verify(&key, "tampered", EXP, &sig));
+        let sig = sign(&key, "fileid123", EXP, "");
+        assert!(!verify(&key, "tampered", EXP, "", &sig));
     }
 
     #[test]
     fn verify_rejects_tampered_exp() {
         let key = derive_key("secret-admin-key");
-        let sig = sign(&key, "fileid123", EXP);
-        assert!(!verify(&key, "fileid123", EXP + 1, &sig));
+        let sig = sign(&key, "fileid123", EXP, "");
+        assert!(!verify(&key, "fileid123", EXP + 1, "", &sig));
     }
 
     #[test]
     fn verify_rejects_different_key() {
-        let sig = sign(&derive_key("key-a"), "fileid123", EXP);
-        assert!(!verify(&derive_key("key-b"), "fileid123", EXP, &sig));
+        let sig = sign(&derive_key("key-a"), "fileid123", EXP, "");
+        assert!(!verify(&derive_key("key-b"), "fileid123", EXP, "", &sig));
+    }
+
+    #[test]
+    fn verify_rejects_mismatched_transform() {
+        // SEC-003: a signature minted for one render must not verify for a
+        // different render, nor for the un-transformed blob.
+        let key = derive_key("secret-admin-key");
+        let sig = sign(&key, "fileid123", EXP, "fit=cover&format=auto&w=100");
+        assert!(verify(
+            &key,
+            "fileid123",
+            EXP,
+            "fit=cover&format=auto&w=100",
+            &sig
+        ));
+        assert!(!verify(
+            &key,
+            "fileid123",
+            EXP,
+            "fit=cover&format=auto&w=200",
+            &sig
+        ));
+        assert!(!verify(&key, "fileid123", EXP, "", &sig));
+        // And an un-transformed signature must not authorize a transform.
+        let plain = sign(&key, "fileid123", EXP, "");
+        assert!(!verify(
+            &key,
+            "fileid123",
+            EXP,
+            "fit=cover&format=auto&w=100",
+            &plain
+        ));
     }
 
     #[test]
     fn verify_rejects_non_hex_signature() {
         let key = derive_key("secret-admin-key");
-        assert!(!verify(&key, "fileid123", EXP, "not-hex!!"));
+        assert!(!verify(&key, "fileid123", EXP, "", "not-hex!!"));
     }
 }
