@@ -931,6 +931,15 @@ async fn serve_public_handler(
         let transform = TransformParams::parse(&q, state.limits.image.cfg())?
             .map(|p| p.canonical())
             .unwrap_or_default();
+        // The transform kill switch widens a signature's scope if ignored here:
+        // `serve_bytes` skips the transform when `enabled` is false and hands
+        // back the ORIGINAL bytes, while `canonical()` — derived from `parse`
+        // alone — still verifies. A signature minted for `w=100` would then
+        // authorize the full-resolution blob. Reject the signed request instead;
+        // the unsigned kill-switch path (public by opaque id) is unchanged.
+        if !transform.is_empty() && !state.limits.image.cfg().enabled {
+            return Err(RtDbError::forbidden("invalid or expired signature"));
+        }
         if !signed_url::verify(&state.limits.signed_url_key, &id, exp, &transform, sig) {
             return Err(RtDbError::forbidden("invalid or expired signature"));
         }

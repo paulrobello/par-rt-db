@@ -8,6 +8,7 @@
 
 use crate::common::{
     admin_post, fresh_db, spawn_app, test_state, test_state_with_require_signed_urls,
+    test_state_with_transforms_disabled,
 };
 use rtdb_server::signed_url;
 use rtdb_server::storage;
@@ -130,6 +131,65 @@ async fn signature_is_bound_to_the_transform_it_was_minted_for() -> anyhow::Resu
         403,
         "an un-transformed signature must not authorize a render"
     );
+    Ok(())
+}
+
+// A signature minted for a render must not survive the transform kill switch.
+// `TransformParams::canonical()` is derived from `parse()` alone, which does
+// not consult `RTDB_IMAGE_TRANSFORMS_ENABLED`; without an explicit check the
+// signature for `w=100` still verifies while `serve_bytes` skips the transform
+// and hands back the ORIGINAL full-resolution bytes — the thumbnail capability
+// silently widens to the whole blob.
+#[tokio::test]
+async fn transform_signature_rejected_when_transforms_disabled() -> anyhow::Result<()> {
+    let state = test_state_with_transforms_disabled().await;
+    let db = fresh_db(&state).await;
+    let addr = spawn_app(state.clone()).await;
+    let (id, bytes) = seed(&state, &db).await;
+    let token = mint_token(addr, &db).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/storage/{db}/{id}/signed-url?w=100"
+        ))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let url = resp.json::<serde_json::Value>().await?["url"]
+        .as_str()
+        .expect("url present")
+        .to_string();
+    let path = &url[url.find("/storage/").expect("path present")..];
+
+    let served = reqwest::get(format!("http://{addr}{path}")).await?;
+    assert_eq!(
+        served.status(),
+        403,
+        "a w=100 signature must not serve the full-resolution original once \
+         transforms are killswitched off"
+    );
+    assert_ne!(
+        served.bytes().await?.as_ref(),
+        &bytes[..],
+        "the original bytes must not leak through the rejected render"
+    );
+
+    // A plain (un-transformed) signed URL is unaffected by the kill switch.
+    let plain = reqwest::Client::new()
+        .get(format!("http://{addr}/api/storage/{db}/{id}/signed-url"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    assert_eq!(plain.status(), 200);
+    let plain_url = plain.json::<serde_json::Value>().await?["url"]
+        .as_str()
+        .expect("url present")
+        .to_string();
+    let plain_path = &plain_url[plain_url.find("/storage/").expect("path present")..];
+    let served = reqwest::get(format!("http://{addr}{plain_path}")).await?;
+    assert_eq!(served.status(), 200);
+    assert_eq!(served.bytes().await?.as_ref(), &bytes[..]);
     Ok(())
 }
 
