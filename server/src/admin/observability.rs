@@ -18,6 +18,9 @@ use crate::error::RtDbError;
 
 use super::{authenticate_admin, bearer_from_subprotocol, bearer_value};
 
+/// Cadence of the op-feed stream's periodic connection-alive gauge tick.
+const GAUGE_TICK: Duration = Duration::from_secs(1);
+
 pub(super) async fn metrics_handler(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
@@ -104,11 +107,13 @@ pub(super) async fn audit_recent(
     let offset = params.offset.max(0);
     let entries = crate::audit::fetch_audit_rows(
         &state.pool,
-        params.db.as_deref(),
-        params.table.as_deref(),
-        params.op.as_deref(),
-        params.principal.as_deref(),
-        params.source.as_deref(),
+        crate::audit::AuditRowFilter {
+            db: params.db.as_deref(),
+            table: params.table.as_deref(),
+            op: params.op.as_deref(),
+            principal: params.principal.as_deref(),
+            source: params.source.as_deref(),
+        },
         limit,
         offset,
     )
@@ -287,7 +292,7 @@ async fn run_admin_stream(
         }
     }
     let mut rx = state.realtime.op_feed.subscribe();
-    let mut gauge_tick = tokio::time::interval(Duration::from_secs(1));
+    let mut gauge_tick = tokio::time::interval(GAUGE_TICK);
     gauge_tick.tick().await; // skip immediate
     loop {
         tokio::select! {

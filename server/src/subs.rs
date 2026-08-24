@@ -1251,7 +1251,7 @@ impl SubscriptionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{DistanceMetric, IndexDef, VectorIndexSpec};
+    use crate::schema::IndexDef;
     use std::collections::BTreeMap;
 
     fn q(value: serde_json::Value) -> Query {
@@ -1307,17 +1307,6 @@ mod tests {
             auto_increment_field: None,
             authorize: None,
             soft_delete: false,
-        }
-    }
-
-    // Suppress the unused warning for VectorIndexSpec: it's part of IndexDef's
-    // construction shape (search/vector defaults) but the test table is btree-only.
-    #[allow(dead_code)]
-    fn _unused_vector_spec() -> VectorIndexSpec {
-        VectorIndexSpec {
-            dimensions: 1,
-            filter_fields: vec![],
-            metric: DistanceMetric::Cosine,
         }
     }
 

@@ -21,6 +21,9 @@ pub(in crate::committer) async fn handle_workflow_advance(
         Ok(schema) => schema,
         Err(err) => {
             let outcome = failed_outcome(&row, "schema load failed");
+            // mark_failed logs internally on its own write failure; this
+            // discard is intentional — `err` (the schema-load failure) is
+            // already returned below and is the one that matters to the caller.
             let _ = crate::workflows::mark_failed(
                 &ctx.pool,
                 &ctx.db,

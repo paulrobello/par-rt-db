@@ -520,7 +520,10 @@ pub fn stream_chunks(
         // Validate inside the task; a bad db name surfaces as an error on the
         // channel. The serve path has already validated via `resolve_db`.
         if let Err(e) = validate_db_name(&db) {
-            let _ = tx.send(Err(std::io::Error::other(format!("{e:?}")))).await;
+            tracing::warn!(error = ?e, "storage stream read failed");
+            let _ = tx
+                .send(Err(std::io::Error::other("storage read failed")))
+                .await;
             return;
         }
         let schema = pg_schema(&db);
@@ -540,7 +543,10 @@ pub fn stream_chunks(
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(std::io::Error::other(format!("{e:?}")))).await;
+                    tracing::warn!(error = ?e, "storage stream read failed");
+                    let _ = tx
+                        .send(Err(std::io::Error::other("storage read failed")))
+                        .await;
                     break;
                 }
             }

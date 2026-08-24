@@ -1267,17 +1267,15 @@ fn resolve_served_content_type(stored: &str) -> (&'static str, bool) {
         .unwrap_or(stored)
         .trim()
         .to_ascii_lowercase();
-    if INLINE_SAFE_CONTENT_TYPES.iter().any(|safe| *safe == ess) {
-        // Return the canonical static slice matching the allowlist entry so
-        // the header value borrows 'static — case-normalized.
-        let canonical = INLINE_SAFE_CONTENT_TYPES
-            .iter()
-            .copied()
-            .find(|safe| *safe == ess)
-            .expect("matched above");
-        (canonical, false)
-    } else {
-        ("application/octet-stream", true)
+    // Return the canonical static slice matching the allowlist entry so the
+    // header value borrows 'static — case-normalized.
+    match INLINE_SAFE_CONTENT_TYPES
+        .iter()
+        .copied()
+        .find(|safe| *safe == ess)
+    {
+        Some(canonical) => (canonical, false),
+        None => ("application/octet-stream", true),
     }
 }
 

@@ -10,7 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 
-use chrono::{Datelike, NaiveDateTime, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, NaiveDateTime, TimeZone, Timelike, Utc};
 use tokio::time::{Duration, timeout};
 
 use crate::db::now_ms;
@@ -128,12 +128,13 @@ fn parse_pg_env(database_url: &str) -> Result<PgEnv, RtDbError> {
 /// codebase already depends on it for `scheduler::next_fire`) without the
 /// `clock` feature.
 fn format_timestamp_utc(ms: i64) -> String {
-    let dt = Utc.timestamp_millis_opt(ms).single().unwrap_or_else(|| {
-        // `now_ms()` can in principle produce a value outside chrono's
-        // representable range on exotic platforms; fall back to the epoch
-        // rather than panicking. The fallback is not load-bearing in practice.
-        Utc.timestamp_millis_opt(0).unwrap()
-    });
+    // `now_ms()` can in principle produce a value outside chrono's
+    // representable range on exotic platforms; fall back to the epoch rather
+    // than panicking. The fallback is not load-bearing in practice.
+    let dt = Utc
+        .timestamp_millis_opt(ms)
+        .single()
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
     format!(
         "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
         dt.year(),

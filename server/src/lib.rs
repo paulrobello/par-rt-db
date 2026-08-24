@@ -10,6 +10,11 @@
 //! authoritative design lives in
 //! `docs/superpowers/specs/2026-07-21-par-rt-db-design.md`.
 
+// Production code answers every failure with the `RtDbError` envelope; a panic
+// in a request path takes the whole server's tokio worker with it. Test code is
+// exempt because a panic there IS the failure report.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod admin;
 pub mod audit;
 pub mod auth;

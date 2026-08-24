@@ -256,11 +256,13 @@ pub(super) async fn admin_edit_webhook(
         &state.pool,
         id,
         &db,
-        url,
-        tbl_ref,
-        events.as_deref(),
-        body.enabled,
-        body.rotate_secret,
+        crate::webhook::WebhookPatch {
+            url,
+            tbl: tbl_ref,
+            events: events.as_deref(),
+            enabled: body.enabled,
+            rotate_secret: body.rotate_secret,
+        },
     )
     .await?
     .ok_or_else(|| RtDbError::not_found("webhook not found for this database"))?;
