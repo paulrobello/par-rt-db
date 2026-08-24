@@ -1,0 +1,40 @@
+{
+  "name": "filter-depth-at-cap",
+  "$comment": "SEC-007 boundary (permissive side): a filter nested exactly MAX_FILTER_DEPTH (32) levels \u2014 the `eq` leaf plus 31 single-child `and` wrappers \u2014 is ACCEPTED and evaluates normally. Pinned alongside error-filter-depth-over-cap so an engine that is off-by-one in either direction fails. Cap constant: server/src/schema/filter.rs::MAX_FILTER_DEPTH.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_name",
+            "fields": [
+              "name"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "seed": [
+    {
+      "name": "a"
+    }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "filter": {"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "eq", "field": "name", "value": "a"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}
+    }
+  },
+  "expect": [
+    {
+      "name": "a"
+    }
+  ],
+  "unordered": true
+}

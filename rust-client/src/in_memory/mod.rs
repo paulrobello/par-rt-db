@@ -148,6 +148,10 @@ pub const CRON_STEP_MS: i64 = 60_000;
 /// `server/src/scheduler.rs::MAX_EVERY_MS`.
 pub const MAX_EVERY_MS: i64 = 365 * 24 * 60 * 60 * 1000;
 
+/// SEC-007: hard ceiling on the raw `search.query` text, in UTF-8 bytes.
+/// Mirrors `server/src/query/search.rs::MAX_SEARCH_QUERY_BYTES`.
+pub const MAX_SEARCH_QUERY_BYTES: usize = 4096;
+
 /// A stored row: the user doc plus its identity/history, kept separate so the
 /// system fields (`_id`/`_creationTime`/`_version`) are merged in only at read
 /// time — exactly as the server stores `doc` jsonb alongside `id`/`created_at`/

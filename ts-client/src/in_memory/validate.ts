@@ -138,6 +138,16 @@ export function coerceIndexValue(table: TableJson, fieldName: string, value: unk
 
 type FilterLeafOp = "eq" | "neq" | "gt" | "gte" | "lt" | "lte";
 
+/** SEC-007: hard ceiling on `and`/`or`/`not` nesting in a filter expression,
+ * mirroring server `MAX_FILTER_DEPTH` (`filter.rs`). Depth starts at 1 for the
+ * top-level expr and increments for each child of `and`/`or`/`not`. */
+export const MAX_FILTER_DEPTH = 32;
+
+/** SEC-007: hard ceiling on `in` list length, mirroring server `MAX_IN_VALUES`
+ * (`filter.rs`). Each value becomes one bound placeholder, so an unbounded
+ * list is an unbounded query plan. */
+export const MAX_IN_VALUES = 1000;
+
 /**
  * Structural validation of a `FilterExpr` against a table's declared fields,
  * mirroring server `query::compile_filter_node` / `field_lhs_and_bind`
@@ -159,17 +169,32 @@ export function validateFilter(
   table: TableJson,
   allowRelativeTime = false,
 ): void {
+  validateFilterAt(node, table, allowRelativeTime, 1);
+}
+
+function validateFilterAt(
+  node: FilterExpr,
+  table: TableJson,
+  allowRelativeTime: boolean,
+  depth: number,
+): void {
+  if (depth > MAX_FILTER_DEPTH) {
+    throw new RtDbError("BAD_REQUEST", `filter nesting exceeds ${MAX_FILTER_DEPTH} levels`);
+  }
   switch (node.op) {
     case "and":
     case "or":
       if (node.exprs.length === 0) {
         throw new RtDbError("BAD_REQUEST", `${node.op} filter requires at least one expr`);
       }
-      for (const e of node.exprs) validateFilter(e, table, allowRelativeTime);
+      for (const e of node.exprs) validateFilterAt(e, table, allowRelativeTime, depth + 1);
       return;
     case "in": {
       if (node.values.length === 0) {
         throw new RtDbError("BAD_REQUEST", "in filter requires at least one value");
+      }
+      if (node.values.length > MAX_IN_VALUES) {
+        throw new RtDbError("BAD_REQUEST", `in: at most ${MAX_IN_VALUES} values`);
       }
       for (const v of node.values) checkLeafValue(node.field, v, table);
       const firstKind = inValueKind(node.values[0]);
@@ -181,7 +206,7 @@ export function validateFilter(
       return;
     }
     case "not":
-      validateFilter(node.expr, table, allowRelativeTime);
+      validateFilterAt(node.expr, table, allowRelativeTime, depth + 1);
       return;
     case "olderThan": {
       // The server's OlderThan arm of validate_filter_expr_fields, in its

@@ -411,6 +411,14 @@ pub fn validate_filter(expr: &FilterExpr, table: &TableDef) -> Result<(), RtDbEr
     validate_filter_expr_fields(expr, table, false)
 }
 
+/// SEC-007: hard ceiling on `and`/`or`/`not` nesting in a filter expression.
+/// Mirrors `server/src/schema/filter.rs::MAX_FILTER_DEPTH`.
+pub const MAX_FILTER_DEPTH: usize = 32;
+
+/// SEC-007: hard ceiling on `in` list length. Mirrors
+/// `server/src/schema/filter.rs::MAX_IN_VALUES`.
+pub const MAX_IN_VALUES: usize = 1000;
+
 /// The by-query step-filter chokepoint (`patchByQuery`/`deleteByQuery`) — the
 /// ONE filter context that accepts the execution-time-relative `olderThan`
 /// leaf, mirroring server `compile_scan_where`'s
@@ -429,6 +437,24 @@ fn validate_filter_expr_fields(
     table: &TableDef,
     allow_relative_time: bool,
 ) -> Result<(), RtDbError> {
+    validate_filter_expr_fields_at(expr, table, allow_relative_time, 1)
+}
+
+/// Depth-tracking walk behind [`validate_filter_expr_fields`]. `depth` starts
+/// at 1 for the top-level expr and increments for each child of `And`/`Or`/
+/// `Not`, mirroring server `validate_filter_expr_fields_at`.
+fn validate_filter_expr_fields_at(
+    expr: &FilterExpr,
+    table: &TableDef,
+    allow_relative_time: bool,
+    depth: usize,
+) -> Result<(), RtDbError> {
+    if depth > MAX_FILTER_DEPTH {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            format!("filter nesting exceeds {MAX_FILTER_DEPTH} levels"),
+        ));
+    }
     match expr {
         FilterExpr::And { exprs } => {
             if exprs.is_empty() {
@@ -438,7 +464,7 @@ fn validate_filter_expr_fields(
                 ));
             }
             for e in exprs {
-                validate_filter_expr_fields(e, table, allow_relative_time)?;
+                validate_filter_expr_fields_at(e, table, allow_relative_time, depth + 1)?;
             }
             Ok(())
         }
@@ -450,7 +476,7 @@ fn validate_filter_expr_fields(
                 ));
             }
             for e in exprs {
-                validate_filter_expr_fields(e, table, allow_relative_time)?;
+                validate_filter_expr_fields_at(e, table, allow_relative_time, depth + 1)?;
             }
             Ok(())
         }
@@ -459,6 +485,12 @@ fn validate_filter_expr_fields(
                 return Err(RtDbError::new(
                     ErrorCode::BadRequest,
                     "in filter requires at least one value",
+                ));
+            }
+            if values.len() > MAX_IN_VALUES {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    format!("in: at most {MAX_IN_VALUES} values"),
                 ));
             }
             for v in values {
@@ -515,7 +547,9 @@ fn validate_filter_expr_fields(
             }
             Ok(())
         }
-        FilterExpr::Not { expr } => validate_filter_expr_fields(expr, table, allow_relative_time),
+        FilterExpr::Not { expr } => {
+            validate_filter_expr_fields_at(expr, table, allow_relative_time, depth + 1)
+        }
         FilterExpr::Exists { field } => {
             leaf_field_type(field, table)?;
             Ok(())

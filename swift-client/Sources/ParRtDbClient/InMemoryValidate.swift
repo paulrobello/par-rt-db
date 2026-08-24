@@ -240,9 +240,10 @@ public func coerceIndexValue(
 /// Structural validation of a `FilterExpr` against a table's declared fields,
 /// mirroring server `query::compile_filter_node` / `field_lhs_and_bind`
 /// (validate.ts `validateFilter`). Throws BAD_REQUEST for an unknown field, an
-/// empty `and`/`or`, an empty `in`, a non-scalar leaf value, or — SEC-126 — a
-/// value whose JSON kind does not match the field's declared type. Call once
-/// before evaluating per row.
+/// empty `and`/`or`, an empty `in`, a non-scalar leaf value, — SEC-126 — a
+/// value whose JSON kind does not match the field's declared type, or — SEC-007
+/// — `and`/`or`/`not` nesting past `maxFilterDepth` or an `in` list longer than
+/// `maxInValues`. Call once before evaluating per row.
 ///
 /// `allowRelativeTime` admits the `olderThan` leaf — the mirror of the server
 /// `validate_filter_expr_fields` 4th param. Only the by-query step filters
@@ -251,6 +252,25 @@ public func coerceIndexValue(
 public func validateFilter(
     _ node: FilterExpr, _ table: TableDef, allowRelativeTime: Bool = false
 ) throws {
+    try validateFilterAt(node, table, allowRelativeTime: allowRelativeTime, depth: 1)
+}
+
+/// SEC-007: hard ceiling on `and`/`or`/`not` nesting in a filter expression.
+/// Mirrors server `filter::MAX_FILTER_DEPTH`.
+let maxFilterDepth = 32
+
+/// SEC-007: hard ceiling on `in` list length. Mirrors server
+/// `filter::MAX_IN_VALUES`.
+let maxInValues = 1000
+
+private func validateFilterAt(
+    _ node: FilterExpr, _ table: TableDef, allowRelativeTime: Bool, depth: Int
+) throws {
+    if depth > maxFilterDepth {
+        throw RtDbError(
+            code: .badRequest, message: "filter nesting exceeds \(maxFilterDepth) levels"
+        )
+    }
     switch node {
     case let .and(exprs), let .or(exprs):
         if exprs.isEmpty {
@@ -262,7 +282,7 @@ public func validateFilter(
             throw RtDbError(code: .badRequest, message: "\(op) filter requires at least one expr")
         }
         for expr in exprs {
-            try validateFilter(expr, table, allowRelativeTime: allowRelativeTime)
+            try validateFilterAt(expr, table, allowRelativeTime: allowRelativeTime, depth: depth + 1)
         }
     case let .olderThan(field, ms):
         // Server `validate_filter_expr_fields`'s OlderThan arm, in its order:
@@ -298,6 +318,9 @@ public func validateFilter(
         if values.isEmpty {
             throw RtDbError(code: .badRequest, message: "in filter requires at least one value")
         }
+        if values.count > maxInValues {
+            throw RtDbError(code: .badRequest, message: "in: at most \(maxInValues) values")
+        }
         for value in values {
             try checkLeafValue(field, value, table)
         }
@@ -309,7 +332,7 @@ public func validateFilter(
             )
         }
     case let .not(expr):
-        try validateFilter(expr, table, allowRelativeTime: allowRelativeTime)
+        try validateFilterAt(expr, table, allowRelativeTime: allowRelativeTime, depth: depth + 1)
     case let .contains(field, value):
         try checkLeafValue(field, value, table)
     case let .exists(field):
