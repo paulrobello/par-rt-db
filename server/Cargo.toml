@@ -95,7 +95,7 @@ tokio-stream = "0.1"
 # arg from `with_batch_exporter`, and replaces `Resource::new` with a builder —
 # the pre-0.27 sketch in the plan doc no longer compiles.
 opentelemetry = { version = "0.31", default-features = false, optional = true }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = [
+opentelemetry_sdk = { version = "0.32", default-features = false, features = [
     "trace",
     "rt-tokio",
 ], optional = true }
