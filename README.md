@@ -1051,7 +1051,14 @@ that ultimately terminates a connection that never closes on its own.
   turn, returns the outcome to the non-owner's client, and the non-owner
   re-runs its local subscriptions against the returned write set — the
   caller's principal travels with the request, so per-row authz evaluates
-  against the identity that authorized the write at the edge. If no owner
+  against the identity that authorized the write at the edge. Forwarded
+  requests and their replies are spooled in `rtdb_auth.forward_queue` and the
+  NOTIFY carries only a row id, so a write of any size forwards (a `pg_notify`
+  payload itself is capped at 8000 bytes). **Live queries stay correct on
+  every replica:** each durable write also publishes its write set on
+  `rtdb_write_sets`, and every replica re-runs the subscriptions it touched —
+  so a subscriber on replica B is invalidated by a write the owner executed,
+  including scheduled jobs, TTL expiry, and migrations. If no owner
   answers within `RTDB_FORWARD_TIMEOUT_MS` (default 5s), the non-owner
   attempts the lease takeover itself — that path is the failover. Note the
   standard timeout ambiguity: a reply racing the timeout is dropped, so the

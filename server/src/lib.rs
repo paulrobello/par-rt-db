@@ -290,6 +290,15 @@ impl AppState {
                 op_feed.clone(),
                 instance_id.clone(),
             ));
+            // ARC-001: cross-replica subscription invalidation. Same shape as
+            // the op-feed listener — reads only, no committer interaction, so
+            // the single-writer invariant is untouched.
+            tokio::spawn(notify::run_write_set_listener(
+                pool.clone(),
+                subs.clone(),
+                schemas.clone(),
+                instance_id.clone(),
+            ));
         }
         // ENH-022 Stage 3: cross-instance presence LISTEN task. Only spawned
         // when BOTH `RTDB_MULTI_INSTANCE=true` AND `RTDB_PRESENCE_ENABLED=true`

@@ -186,6 +186,23 @@ these concrete decisions:
   are unchanged — only the transport moved — and spooling also makes a
   forwarded request survive a listener reconnect that would have dropped an
   in-flight NOTIFY.
+- *Cross-replica subscription invalidation (ARC-001, 2026-08-23).* Every
+  durable write publishes its `WriteSet` on a third channel,
+  `rtdb_write_sets`, from `publish_taps` — one NOTIFY per commit, not per op.
+  Each replica's `notify::run_write_set_listener` resolves the database's
+  schema and re-runs `subs::fan_out` locally. **The guarantee: an owner-side
+  write invalidates every replica's subscriptions**, whichever replica
+  executed it — an HTTP mutate that reached the owner directly, a scheduled
+  job, the TTL reaper, a migration, or a restore. Previously only writes a
+  replica had itself forwarded reached its own subscribers (the origin-side
+  fan-out in `complete_forwarded_reply`, which is kept as the earlier,
+  lower-latency path for exactly that case; `fan_out` is idempotent, so the
+  duplicate re-run pushes nothing on no change). `WriteSet.doc_values` is
+  `#[serde(skip)]` and does not travel, so Indexed/Ordered subscriptions on
+  the receiving replica degrade to the conservative "unrankable ⇒ re-run"
+  fallback — never a missed push. Payloads at or above 7500 bytes go through
+  the ARC-002 spool as `kind='writeset'`. The listener reads only; it never
+  touches a committer, so the single-writer invariant holds.
 - *Which arms forward.* The five reply-carrying write arms: Mutate,
   RunMigrate, RunPushSchema, RunMergeUsers, RunRestoreSchema. Fire-and-forget
   arms never forward (they originate only from an owner's own pollers; the

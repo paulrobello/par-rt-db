@@ -91,7 +91,8 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     .execute(&mut *conn)
     .await?;
 
-    // ARC-002: spool for forwarded writes and their replies (ENH-022 Stage 4c).
+    // ARC-002/ARC-001: spool for forwarded writes, their replies, and
+    // oversized cross-replica write sets (ENH-022 Stage 4c).
     // A `pg_notify` payload is capped at 8000 bytes, which a real mutation or a
     // schema push blows through routinely, so the NOTIFY carries only a row id
     // and the body travels through this table. Instance-level, not per-db:
@@ -101,11 +102,27 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS rtdb_auth.forward_queue (
             id uuid PRIMARY KEY,
-            kind text NOT NULL CHECK (kind IN ('request','reply')),
+            kind text NOT NULL CHECK (kind IN ('request','reply','writeset')),
             target text NOT NULL,
             payload jsonb NOT NULL,
             created_at timestamptz NOT NULL DEFAULT now()
         )",
+    )
+    .execute(&mut *conn)
+    .await?;
+    // The `kind` domain widens as new spool users land (ARC-001 added
+    // 'writeset'), and `CREATE TABLE IF NOT EXISTS` cannot revise a constraint
+    // on a table that already exists. Drop-then-add is the idempotent form:
+    // the DROP is a no-op on a fresh database, and on an existing one it
+    // replaces the older, narrower domain.
+    sqlx::query(
+        "ALTER TABLE rtdb_auth.forward_queue DROP CONSTRAINT IF EXISTS forward_queue_kind_check",
+    )
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE rtdb_auth.forward_queue ADD CONSTRAINT forward_queue_kind_check \
+         CHECK (kind IN ('request','reply','writeset'))",
     )
     .execute(&mut *conn)
     .await?;

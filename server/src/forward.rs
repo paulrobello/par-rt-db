@@ -115,22 +115,44 @@ async fn spool_delete(pool: &PgPool, id: uuid::Uuid) -> Result<(), sqlx::Error> 
         .map(|_| ())
 }
 
-/// Load a spooled request body. Every replica reads it (the payload names the
-/// database whose lease decides who executes), so this does NOT delete —
-/// only the executing owner deletes, after it has replied. `None` means the
-/// row is already gone: the owner consumed it, or the sweeper reclaimed it.
-async fn spool_load_request(pool: &PgPool, id: uuid::Uuid) -> Option<ForwardRequest> {
-    let row = sqlx::query_scalar::<_, String>(
-        "SELECT payload::text FROM rtdb_auth.forward_queue \
-         WHERE id = $1::uuid AND kind = 'request'",
+/// Spool a broadcast row (no single addressee) and return its id for the
+/// NOTIFY payload. Shared by forwarded requests and ARC-001 write sets: both
+/// are read by every replica, so neither can be claimed with a delete.
+pub(crate) async fn spool_broadcast(
+    pool: &PgPool,
+    kind: &str,
+    payload_json: &str,
+) -> Result<uuid::Uuid, RtDbError> {
+    let id = uuid::Uuid::now_v7();
+    spool_insert(pool, id, kind, "", payload_json).await?;
+    Ok(id)
+}
+
+/// Load a spooled broadcast body without consuming it. `None` means the row is
+/// already gone: its consumer deleted it, or the sweeper reclaimed it.
+pub(crate) async fn spool_load_broadcast(
+    pool: &PgPool,
+    id: uuid::Uuid,
+    kind: &str,
+) -> Option<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT payload::text FROM rtdb_auth.forward_queue WHERE id = $1::uuid AND kind = $2",
     )
     .bind(id.to_string())
+    .bind(kind)
     .fetch_optional(pool)
     .await
     .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "forward: spool request load failed");
+        tracing::warn!(error = %e, kind, "forward: spool broadcast load failed");
         None
-    })?;
+    })
+}
+
+/// Load a spooled request body. Every replica reads it (the payload names the
+/// database whose lease decides who executes), so this does NOT delete —
+/// only the executing owner deletes, after it has replied.
+async fn spool_load_request(pool: &PgPool, id: uuid::Uuid) -> Option<ForwardRequest> {
+    let row = spool_load_broadcast(pool, id, "request").await?;
     match serde_json::from_str::<ForwardRequest>(&row) {
         Ok(req) => Some(req),
         Err(e) => {

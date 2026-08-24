@@ -428,3 +428,152 @@ async fn forwarded_push_schema_reply_larger_than_notify_cap() -> anyhow::Result<
     );
     Ok(())
 }
+
+/// Drain `rx` until a `QueryUpdate` for `query_id` arrives or `within` elapses.
+async fn await_query_update(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<rtdb_server::protocol::ServerMessage>,
+    query_id: &str,
+    within: std::time::Duration,
+) -> Option<serde_json::Value> {
+    let deadline = std::time::Instant::now() + within;
+    while std::time::Instant::now() < deadline {
+        match rx.try_recv() {
+            Ok(rtdb_server::protocol::ServerMessage::QueryUpdate {
+                query_id: id,
+                result,
+            }) if id == query_id => {
+                return Some(result);
+            }
+            Ok(_) => continue,
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
+        }
+    }
+    None
+}
+
+/// (ARC-001) A write executed by the OWNER invalidates subscriptions on every
+/// replica, not just its own. Before this, a client subscribed through replica
+/// B saw nothing when replica A — the lease owner — committed a write: the
+/// op-feed NOTIFY only fed the admin activity ring, and the origin-side
+/// fan-out only covered writes B itself had forwarded. B's client stayed stale
+/// until B happened to write.
+#[tokio::test]
+async fn owner_side_write_invalidates_peer_subscriptions() -> anyhow::Result<()> {
+    let pool = shared_pool().await;
+    let a = replica(&pool, "arc001-owner-a", 0, 0).await;
+    let b = replica(&pool, "arc001-peer-b", 0, 0).await;
+
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &name).await?;
+    let db = common::wrap_test_db(name);
+    // A's push takes the lease — A is the owner for the rest of the test.
+    a.realtime
+        .committers
+        .push_schema(&db, items_schema(false))
+        .await?;
+
+    // The subscription lives on B, which owns nothing.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let query: rtdb_server::query::Query =
+        serde_json::from_value(serde_json::json!({ "table": "items" }))?;
+    b.realtime
+        .committers
+        .subscribe(
+            &db,
+            rtdb_server::subs::next_conn_id(),
+            "q-peer".to_string(),
+            query,
+            tx,
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    let initial = await_query_update(&mut rx, "q-peer", std::time::Duration::from_secs(5))
+        .await
+        .expect("initial query update");
+    assert_eq!(
+        initial.as_array().expect("docs array").len(),
+        0,
+        "the table starts empty"
+    );
+
+    // The write goes straight to the OWNER — nothing is forwarded, so the
+    // only path that can reach B's subscriber is the write-set NOTIFY.
+    a.realtime
+        .committers
+        .mutate(&db, None, insert_item("owner-side"), PrincipalCtx::bypass())
+        .await?;
+
+    let pushed = await_query_update(&mut rx, "q-peer", std::time::Duration::from_secs(10))
+        .await
+        .expect("the peer's subscription re-ran for the owner's write");
+    assert_eq!(
+        pushed.as_array().expect("docs array").len(),
+        1,
+        "the peer sees the owner's insert"
+    );
+    Ok(())
+}
+
+/// (ARC-001) The invalidation survives a write set too large to travel inline
+/// in a `pg_notify` payload: a bulk insert's `WriteSet` goes through the spool
+/// (`kind='writeset'`) and the NOTIFY carries only the row id.
+#[tokio::test]
+async fn oversized_write_set_invalidates_peer_subscriptions() -> anyhow::Result<()> {
+    let pool = shared_pool().await;
+    let a = replica(&pool, "arc001-bulk-a", 0, 0).await;
+    let b = replica(&pool, "arc001-bulk-b", 0, 0).await;
+
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&pool, &name).await?;
+    let db = common::wrap_test_db(name);
+    a.realtime
+        .committers
+        .push_schema(&db, items_schema(false))
+        .await?;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let query: rtdb_server::query::Query =
+        serde_json::from_value(serde_json::json!({ "table": "items" }))?;
+    b.realtime
+        .committers
+        .subscribe(
+            &db,
+            rtdb_server::subs::next_conn_id(),
+            "q-bulk".to_string(),
+            query,
+            tx,
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    await_query_update(&mut rx, "q-bulk", std::time::Duration::from_secs(5))
+        .await
+        .expect("initial query update");
+
+    // 200 inserts: the resulting WriteSet carries 200 doc ids plus 200 ops,
+    // comfortably past the 7500-byte inline threshold.
+    let bulk = Transaction {
+        steps: (0..200)
+            .map(|i| Step::Insert {
+                table: "items".to_string(),
+                doc: serde_json::json!({ "title": format!("bulk-{i}") })
+                    .as_object()
+                    .expect("json object")
+                    .clone(),
+            })
+            .collect(),
+    };
+    a.realtime
+        .committers
+        .mutate(&db, None, bulk, PrincipalCtx::bypass())
+        .await?;
+
+    let pushed = await_query_update(&mut rx, "q-bulk", std::time::Duration::from_secs(10))
+        .await
+        .expect("the peer's subscription re-ran for the spooled write set");
+    assert_eq!(
+        pushed.as_array().expect("docs array").len(),
+        200,
+        "the peer sees every bulk-inserted doc"
+    );
+    Ok(())
+}

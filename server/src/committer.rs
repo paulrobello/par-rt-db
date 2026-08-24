@@ -1528,6 +1528,16 @@ async fn publish_taps(
     ctx.subs
         .fan_out(&ctx.pool, &ctx.db, schema, write_set)
         .await;
+    // ARC-001: cross-replica subscription invalidation. The local `fan_out`
+    // above only reaches subscribers connected to THIS replica; peers holding
+    // subscriptions over the same database need the write set too, or their
+    // clients stay stale until their own replica happens to write. Published
+    // once per commit (not per op) and before the `docop_taps` early return —
+    // a DDL-only write (`handle_restore_schema`) invalidates subscriptions on
+    // every replica exactly as it does locally.
+    if ctx.multi_instance {
+        crate::notify::publish_write_set(&ctx.pool, &ctx.instance_id, &ctx.db, write_set).await;
+    }
     if !docop_taps {
         return;
     }
