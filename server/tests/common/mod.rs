@@ -58,8 +58,6 @@ pub fn background_guard(state: &AppState) -> BackgroundGuard {
 pub fn test_config() -> Config {
     Config {
         port: 0,
-        database_url: std::env::var("RTDB_TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://rtdb:rtdb@127.0.0.1:55434/rtdb".into()),
         admin_key: "test-admin-key".into(),
         public_url: "http://localhost:0".into(),
         oauth: OAuthConfig::default(),
@@ -70,29 +68,13 @@ pub fn test_config() -> Config {
         slow_query_ms: 0,
         slow_query_capacity: 200,
         slow_query_log_params: false,
-        rate_limit_per_token_rpm: 0,
-        rate_limit_per_db_rpm: 0,
-        rate_limit_exact: false,
-        rate_limit_sync_ms: 1000,
         audit_log_enabled: false,
         oauth_login_csrf: true,
         webhooks_enabled: false,
         webhook_allow_http: false,
-        storage_rate_limit_per_ip_rpm: 0,
-        storage_require_signed_urls: false,
-        backup_enabled: false,
-        backup_cron: "0 3 * * *".into(),
-        backup_dir: "./backups".into(),
-        backup_retention: 7,
         subs_verify_skip_every: 0,
         ttl_sweep_interval_secs: 60,
         ttl_batch: 5000,
-        image_transforms_enabled: true,
-        image_max_dim: 2048,
-        image_max_pixels: 25_000_000,
-        image_cache_bytes: 256 * 1024 * 1024,
-        image_concurrency: 4,
-        image_default_quality: 80,
         presence_enabled: false,
         presence_max_state_bytes: 1024,
         presence_max_room_size: 100,
@@ -105,20 +87,48 @@ pub fn test_config() -> Config {
         presence_beat_timeout_ms: 15000,
         auth_anonymous_enabled: false,
         anonymous_session_ttl_days: 1,
-        anonymous_rate_limit_per_ip_rpm: 0,
         quota_cache_ttl_secs: 60,
         db_idle_reclaim_secs: 0,
-        admin_rate_limit_per_ip_rpm: 0,
         cookie_secure: false,
         trusted_proxy: false,
         otel_enabled: false,
         otel_endpoint: String::new(),
         otel_service_name: String::new(),
         otel_sample_ratio: 0.0,
-        multi_instance: false,
-        forward_timeout_ms: 5000,
-        forward_concurrency: 64,
-        instance_id: None,
+        limits: rtdb_server::config::LimitsConfig {
+            per_token_rpm: 0,
+            per_db_rpm: 0,
+            exact: false,
+            sync_ms: 1000,
+            storage_per_ip_rpm: 0,
+            anonymous_per_ip_rpm: 0,
+            admin_per_ip_rpm: 0,
+        },
+        storage: rtdb_server::config::StorageConfig {
+            require_signed_urls: false,
+            image: rtdb_server::config::ImageTransformConfig {
+                enabled: true,
+                max_dim: 2048,
+                max_pixels: 25_000_000,
+                cache_bytes: 256 * 1024 * 1024,
+                concurrency: 4,
+                default_quality: 80,
+            },
+        },
+        backup: rtdb_server::config::BackupConfig {
+            enabled: false,
+            cron: "0 3 * * *".into(),
+            dir: "./backups".into(),
+            retention: 7,
+        },
+        multi_instance: rtdb_server::config::MultiInstanceConfig {
+            enabled: false,
+            instance_id: None,
+            forward_timeout_ms: 5000,
+            forward_concurrency: 64,
+        },
+        database_url: std::env::var("RTDB_TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://rtdb:rtdb@127.0.0.1:55434/rtdb".into()),
     }
 }
 
@@ -153,8 +163,8 @@ pub async fn test_state() -> Arc<AppState> {
 /// codebase exposes — `test_config()` is already a public helper.
 pub async fn test_state_with_rate_limits(per_token_rpm: u32, per_db_rpm: u32) -> Arc<AppState> {
     let mut config = test_config();
-    config.rate_limit_per_token_rpm = per_token_rpm;
-    config.rate_limit_per_db_rpm = per_db_rpm;
+    config.limits.per_token_rpm = per_token_rpm;
+    config.limits.per_db_rpm = per_db_rpm;
     let pool = sqlx::PgPool::connect(&config.database_url)
         .await
         .expect("connect to test postgres");
@@ -195,12 +205,12 @@ pub async fn test_state_with_slow_queries(ms: u64, log_params: bool) -> Arc<AppS
     AppState::new(pool, config, test_hot())
 }
 
-/// Like `test_state` but with `storage_require_signed_urls = true`. Used by
+/// Like `test_state` but with `storage.require_signed_urls = true`. Used by
 /// `tests/storage_signed_url_test.rs` (SEC-113) to exercise require-signature
 /// mode without touching env vars. Mirrors the `test_state_with_*` pattern.
 pub async fn test_state_with_require_signed_urls() -> Arc<AppState> {
     let mut config = test_config();
-    config.storage_require_signed_urls = true;
+    config.storage.require_signed_urls = true;
     let pool = sqlx::PgPool::connect(&config.database_url)
         .await
         .expect("connect to test postgres");
@@ -273,15 +283,15 @@ pub async fn test_state_with_idle_reclaim(secs: u64) -> Arc<AppState> {
     AppState::new(pool, config, test_hot())
 }
 
-/// Like `test_state` but with `backup_dir` overridden. Used by ENH-002 Task 3's
+/// Like `test_state` but with `backup.dir` overridden. Used by ENH-002 Task 3's
 /// `/admin/backup` trigger test to point at a tempdir — so the spawned `pg_dump`
-/// (which calls `tokio::fs::create_dir_all` on `backup_dir` before running) does
+/// (which calls `tokio::fs::create_dir_all` on `backup.dir` before running) does
 /// not pollute the default `./backups` and break the parallel
 /// `admin_list_backups_returns_empty_when_dir_missing` test, which asserts that
 /// dir does not exist. Mirrors the `test_state_with_*` override pattern.
 pub async fn test_state_with_backup_dir(dir: String) -> Arc<AppState> {
     let mut config = test_config();
-    config.backup_dir = dir;
+    config.backup.dir = dir;
     let pool = sqlx::PgPool::connect(&config.database_url)
         .await
         .expect("connect to test postgres");

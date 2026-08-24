@@ -287,7 +287,7 @@ impl CommitterConfig {
             quota_cache_ttl_secs: config.quota_cache_ttl_secs,
             idle_reclaim_secs: config.db_idle_reclaim_secs,
             instance_id,
-            multi_instance: config.multi_instance,
+            multi_instance: config.multi_instance.enabled,
             forwarder,
         }
     }

@@ -315,16 +315,17 @@ impl AppState {
         // notifications (self-dedupe). Generated before the committers so it can
         // be threaded into `Committers::new`.
         let instance_id = config
+            .multi_instance
             .instance_id
             .clone()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(notify::generate_instance_id);
         // Read before `config` is destructured into the AppState literal below
         // (and before `pool` moves into it).
-        let multi_instance = config.multi_instance;
+        let multi_instance = config.multi_instance.enabled;
         let limiter_pool = pool.clone();
-        let rate_limit_exact = config.rate_limit_exact;
-        let rate_limit_sync_ms = config.rate_limit_sync_ms;
+        let rate_limit_exact = config.limits.exact;
+        let rate_limit_sync_ms = config.limits.sync_ms;
         // ENH-022 Stage 4 / ARC-007: in multi-instance mode the counters live
         // in Postgres so every replica shares one budget per token/db/ip;
         // single-instance (the default) keeps the in-memory limiter and
@@ -346,7 +347,7 @@ impl AppState {
             Some(forward::Forwarder::new(
                 pool.clone(),
                 instance_id.clone(),
-                std::time::Duration::from_millis(config.forward_timeout_ms),
+                std::time::Duration::from_millis(config.multi_instance.forward_timeout_ms),
             ))
         } else {
             None
@@ -385,8 +386,8 @@ impl AppState {
         let signed_url_key = Arc::new(signed_url::derive_key(&config.admin_key));
         let image = Arc::new(image_transform::TransformCache::new(
             image_transform::TransformConfig::from_config(&config),
-            config.image_cache_bytes,
-            config.image_concurrency,
+            config.storage.image.cache_bytes,
+            config.storage.image.concurrency,
             metrics.clone(),
         ));
         // Presence manager (ENH-015) shares the same `Arc<Metrics>` so its
@@ -407,9 +408,9 @@ impl AppState {
         let presence = presence::PresenceManager::new(
             Some(metrics.clone()),
             presence_cfg,
-            config.multi_instance,
+            config.multi_instance.enabled,
             instance_id.clone(),
-            if config.multi_instance {
+            if config.multi_instance.enabled {
                 Some(pool.clone())
             } else {
                 None
@@ -427,7 +428,7 @@ impl AppState {
         // `PgListener` connection. Runs for the process lifetime (or until
         // `background.token` cancels), reconnects on transient Postgres blips,
         // and self-dedupe is handled inside it via `instance_id`.
-        if config.multi_instance {
+        if config.multi_instance.enabled {
             background.spawn(notify::run_listener(
                 pool.clone(),
                 op_feed.clone(),
@@ -449,7 +450,7 @@ impl AppState {
         // connection. Runs for the process lifetime (or until `background.token`
         // cancels), reconnects on transient Postgres blips, self-dedupes by
         // `instance_id`. Performs NO write and NO committer interaction.
-        if config.multi_instance && presence_cfg.enabled {
+        if config.multi_instance.enabled && presence_cfg.enabled {
             background.spawn(notify::run_presence_listener(
                 pool.clone(),
                 presence.clone(),
@@ -466,7 +467,7 @@ impl AppState {
         // Runs for the process lifetime (or until `background.token` cancels),
         // reconnects on transient Postgres blips, self-dedupes by
         // `instance_id`, and drops requests for databases it does not own.
-        if config.multi_instance
+        if config.multi_instance.enabled
             && let Some(forwarder) = forwarder.as_ref()
         {
             background.spawn(forward::run_forward_listener(
@@ -474,13 +475,15 @@ impl AppState {
                 committers.clone(),
                 forwarder.clone(),
                 instance_id.clone(),
-                config.forward_concurrency,
+                config.multi_instance.forward_concurrency,
             ));
             // ARC-002: reclaim spool rows nobody consumed. Retention is twice
             // the forward timeout — past that, no live request can still care.
             background.spawn(forward::run_forward_sweeper(
                 pool.clone(),
-                std::time::Duration::from_millis(config.forward_timeout_ms.saturating_mul(2)),
+                std::time::Duration::from_millis(
+                    config.multi_instance.forward_timeout_ms.saturating_mul(2),
+                ),
             ));
         }
         // ENH-022 Stage 4: rate-counter sweep. In multi-instance mode the
@@ -489,7 +492,7 @@ impl AppState {
         // minute so the table stays bounded. Runs for the process lifetime
         // (or until `background.token` cancels); a failed sweep logs and
         // retries next tick.
-        if config.multi_instance {
+        if config.multi_instance.enabled {
             background.spawn(rate_limit::run_counter_sweep(pool.clone()));
             // ARC-007: approximate limiter flush. Only when the limiter is
             // NOT running the exact per-request `check_pg` path — the exact

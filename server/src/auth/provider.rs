@@ -871,10 +871,10 @@ async fn anonymous(
     // this endpoint in a loop. The IP key is canonicalized by `client_ip_key`
     // (CF-Connecting-IP preferred, rightmost XFF fallback, then the connection
     // peer) — the same canonicalization the public storage route uses. Disabled
-    // when `anonymous_rate_limit_per_ip_rpm == 0` (code default; the shipped
+    // when `limits.anonymous_per_ip_rpm == 0` (code default; the shipped
     // `.env.example`/`docker-compose.yml` set a non-zero default).
     let ip_key = crate::http_api::client_ip_key(&headers, addr.ip(), state.config.trusted_proxy);
-    let limit = state.config.anonymous_rate_limit_per_ip_rpm;
+    let limit = state.config.limits.anonymous_per_ip_rpm;
     if limit > 0 {
         match state
             .limits

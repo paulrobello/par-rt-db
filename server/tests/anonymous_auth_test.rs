@@ -237,7 +237,7 @@ async fn sec103_anon_session_uses_short_ttl() -> anyhow::Result<()> {
 }
 
 // (anon-sec103-ratelimit) POST /auth/anonymous is per-IP rate-limited when
-// `anonymous_rate_limit_per_ip_rpm > 0`: after the limit is exhausted within
+// `limits.anonymous_per_ip_rpm > 0`: after the limit is exhausted within
 // one minute, further calls return 429 RATE_LIMITED. Closes the "unbounded
 // anon mint" flood vector.
 #[tokio::test]
@@ -246,7 +246,7 @@ async fn sec103_anon_mint_is_ip_rate_limited() -> anyhow::Result<()> {
     // fast test). The default test_config sets it to 0 (off); override here.
     let mut config = test_config();
     config.auth_anonymous_enabled = true;
-    config.anonymous_rate_limit_per_ip_rpm = 2;
+    config.limits.anonymous_per_ip_rpm = 2;
     let pool = sqlx::PgPool::connect(&config.database_url)
         .await
         .expect("connect to test postgres");

@@ -15,8 +15,8 @@ use serde_json::json;
 /// Build a multi-instance `AppState` with the given instance id, sharing `pool`.
 async fn multi_instance_state(pool: sqlx::PgPool, instance_id: &str) -> std::sync::Arc<AppState> {
     let mut cfg = test_config();
-    cfg.multi_instance = true;
-    cfg.instance_id = Some(instance_id.to_string());
+    cfg.multi_instance.enabled = true;
+    cfg.multi_instance.instance_id = Some(instance_id.to_string());
     AppState::new(pool, cfg, test_hot())
 }
 
@@ -29,8 +29,8 @@ async fn multi_instance_state_with_cap(
     max_affected_docs: usize,
 ) -> std::sync::Arc<AppState> {
     let mut cfg = test_config();
-    cfg.multi_instance = true;
-    cfg.instance_id = Some(instance_id.to_string());
+    cfg.multi_instance.enabled = true;
+    cfg.multi_instance.instance_id = Some(instance_id.to_string());
     cfg.max_affected_docs = max_affected_docs;
     AppState::new(pool, cfg, test_hot())
 }

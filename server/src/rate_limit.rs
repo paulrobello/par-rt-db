@@ -443,7 +443,7 @@ async fn check_pg(pool: &sqlx::PgPool, key: &RateKey, limit_rpm: u32) -> RateDec
 }
 
 pub async fn evaluate(state: &AppState, principal: &Principal, db: &str) -> RateDecision {
-    let token_limit = state.config.rate_limit_per_token_rpm;
+    let token_limit = state.config.limits.per_token_rpm;
     if token_limit > 0
         && let Principal::Machine { token_id, .. } = principal
         && let RateDecision::Denied { retry_after_secs } = state
@@ -455,7 +455,7 @@ pub async fn evaluate(state: &AppState, principal: &Principal, db: &str) -> Rate
         return RateDecision::Denied { retry_after_secs };
     }
 
-    let db_limit = state.config.rate_limit_per_db_rpm;
+    let db_limit = state.config.limits.per_db_rpm;
     if db_limit > 0
         && let RateDecision::Denied { retry_after_secs } = state
             .limits
@@ -494,14 +494,14 @@ pub async fn check_http_rate_limits(
 /// so the caller's IP is the only available identity. `ip_key` is the textual
 /// client IP already canonicalized by `client_ip_key` (CF-Connecting-IP
 /// preferred, rightmost XFF fallback, then the connection peer). Disabled when
-/// `Config::storage_rate_limit_per_ip_rpm == 0` (the code default; the shipped
+/// `Config::limits.storage_per_ip_rpm == 0` (the code default; the shipped
 /// `docker-compose.yml` and `.env.example` set a non-zero default so the
 /// mitigation is on out-of-the-box).
 pub async fn check_storage_public_rate_limit(
     state: &AppState,
     ip_key: &str,
 ) -> Result<(), RtDbError> {
-    let limit = state.config.storage_rate_limit_per_ip_rpm;
+    let limit = state.config.limits.storage_per_ip_rpm;
     if limit == 0 {
         return Ok(());
     }

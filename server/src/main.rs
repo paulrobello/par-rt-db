@@ -36,7 +36,7 @@ async fn main() {
     // writes must reach the owning replica; automatic forwarding is the
     // follow-up. INFO (not WARN): the constraint is loud (CONFLICT errors, not
     // silent corruption) and a single instance needs no action.
-    if !config.multi_instance {
+    if !config.multi_instance.enabled {
         tracing::info!(
             "single-instance topology: multi-instance coordination (login \
              state, op-feed, presence, shared rate budgets, per-db write \
@@ -148,11 +148,11 @@ async fn main() {
     // retaining the newest `backup_retention` dumps. The task sleeps in bounded
     // chunks and never aborts the server on a pg_dump/prune failure (logged +
     // continued). The connection string is passed as PG* env vars, never argv.
-    if config.backup_enabled {
+    if config.backup.enabled {
         let db_url = config.database_url.clone();
-        let dir = config.backup_dir.clone();
-        let cron = config.backup_cron.clone();
-        let retention = config.backup_retention;
+        let dir = config.backup.dir.clone();
+        let cron = config.backup.cron.clone();
+        let retention = config.backup.retention;
         let fut = rtdb_server::backup::run_backup_task(db_url, dir, cron, retention);
         let token = main_shutdown_token.clone();
         main_bg_handles.push(tokio::spawn(async move {

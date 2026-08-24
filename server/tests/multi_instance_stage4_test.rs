@@ -23,18 +23,18 @@ async fn replica(
     per_db_rpm: u32,
 ) -> std::sync::Arc<AppState> {
     let mut cfg = test_config();
-    cfg.multi_instance = true;
-    cfg.instance_id = Some(instance_id.to_string());
-    cfg.rate_limit_per_token_rpm = per_token_rpm;
-    cfg.rate_limit_per_db_rpm = per_db_rpm;
+    cfg.multi_instance.enabled = true;
+    cfg.multi_instance.instance_id = Some(instance_id.to_string());
+    cfg.limits.per_token_rpm = per_token_rpm;
+    cfg.limits.per_db_rpm = per_db_rpm;
     // ARC-007: this helper's one rate-limiting test
     // (`rate_budget_is_shared_across_replicas`) asserts the budget is shared
     // *synchronously* across replicas with no flush delay — that's the exact
     // path's guarantee, not the (now-default) approximate path's. The other
     // callers all pass 0/0 (rate limiting disabled), so this is a no-op for
     // them.
-    cfg.rate_limit_exact = true;
-    cfg.forward_timeout_ms = 300;
+    cfg.limits.exact = true;
+    cfg.multi_instance.forward_timeout_ms = 300;
     AppState::new(pool.clone(), cfg, test_hot())
 }
 
@@ -661,16 +661,16 @@ async fn forwarded_mutate_is_deduped_by_a_server_minted_key() -> anyhow::Result<
 async fn forward_concurrency_cap_rate_limits_excess_requests() -> anyhow::Result<()> {
     let pool = shared_pool().await;
     let mut cfg_a = test_config();
-    cfg_a.multi_instance = true;
-    cfg_a.instance_id = Some("arc008-cap-a".to_string());
-    cfg_a.forward_timeout_ms = 2000;
-    cfg_a.forward_concurrency = 1;
+    cfg_a.multi_instance.enabled = true;
+    cfg_a.multi_instance.instance_id = Some("arc008-cap-a".to_string());
+    cfg_a.multi_instance.forward_timeout_ms = 2000;
+    cfg_a.multi_instance.forward_concurrency = 1;
     let a = AppState::new(pool.clone(), cfg_a, test_hot());
 
     let mut cfg_b = test_config();
-    cfg_b.multi_instance = true;
-    cfg_b.instance_id = Some("arc008-cap-b".to_string());
-    cfg_b.forward_timeout_ms = 2000;
+    cfg_b.multi_instance.enabled = true;
+    cfg_b.multi_instance.instance_id = Some("arc008-cap-b".to_string());
+    cfg_b.multi_instance.forward_timeout_ms = 2000;
     let b = AppState::new(pool.clone(), cfg_b, test_hot());
 
     let name = format!("t{}", uuid::Uuid::now_v7().simple());

@@ -903,7 +903,7 @@ async fn serve_public_handler(
     let has_sig = q.contains_key("sig");
     // SEC-113: require-signature mode flips the default — without a complete,
     // valid signature, the request is rejected before resolving the blob.
-    if state.config.storage_require_signed_urls && !(has_exp && has_sig) {
+    if state.config.storage.require_signed_urls && !(has_exp && has_sig) {
         return Err(RtDbError::forbidden("signed url required"));
     }
     // Additive signed-URL verification: if either `exp` or `sig` is present,

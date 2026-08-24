@@ -27,7 +27,7 @@ pub(super) struct BackupsResponse {
 }
 
 /// `GET /admin/backups` — lists the managed `pg_dump` files in
-/// `config.backup_dir` newest-first, with size and parsed created-time, plus
+/// `config.backup.dir` newest-first, with size and parsed created-time, plus
 /// the in-progress flag for the manual trigger. A missing dir (no run yet, or
 /// backups disabled) returns an empty list rather than 404/500 — the endpoint
 /// describes what is on disk, not what is configured. Whether the scheduler is
@@ -36,7 +36,7 @@ pub(super) async fn list_backups(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
 ) -> Result<Json<BackupsResponse>, RtDbError> {
-    let backups = crate::backup::list_backups(&state.config.backup_dir).await?;
+    let backups = crate::backup::list_backups(&state.config.backup.dir).await?;
     let running = state.runtime.backup_running.load(Ordering::Acquire);
     Ok(Json(BackupsResponse { running, backups }))
 }
@@ -66,7 +66,7 @@ pub(super) async fn create_backup(
         return Err(RtDbError::conflict("backup already running"));
     }
     let url = state.config.database_url.clone();
-    let dir = state.config.backup_dir.clone();
+    let dir = state.config.backup.dir.clone();
     let flag = state.runtime.backup_running.clone();
     tokio::spawn(async move {
         let _guard = BackupRunningGuard(flag);
@@ -88,7 +88,7 @@ pub(super) async fn download_backup(
     Path(name): Path<String>,
 ) -> Result<Response, RtDbError> {
     crate::backup::validate_dump_name(&name)?;
-    let mut path = PathBuf::from(&state.config.backup_dir);
+    let mut path = PathBuf::from(&state.config.backup.dir);
     path.push(&name);
     let file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
@@ -122,7 +122,7 @@ pub(super) async fn delete_backup(
     Path(name): Path<String>,
 ) -> Result<StatusCode, RtDbError> {
     crate::backup::validate_dump_name(&name)?;
-    let mut path = PathBuf::from(&state.config.backup_dir);
+    let mut path = PathBuf::from(&state.config.backup.dir);
     path.push(&name);
     match tokio::fs::remove_file(&path).await {
         Ok(_) => Ok(StatusCode::NO_CONTENT),
@@ -163,7 +163,7 @@ pub(super) async fn restore_backup(
     }
     let target = crate::backup::restore_to_new_db(
         &state.config.database_url,
-        &state.config.backup_dir,
+        &state.config.backup.dir,
         &body.name,
     )
     .await?;
