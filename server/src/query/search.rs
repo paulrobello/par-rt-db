@@ -18,6 +18,11 @@ use crate::error::RtDbError;
 use crate::schema::TableDef;
 
 /// Hard cap on `vectorSearch` `limit`.
+/// SEC-007: hard ceiling on the raw `search.query` text. Rejected before
+/// compilation so an oversized string never reaches `websearch_to_tsquery` or
+/// the `%…%` ILIKE pattern builder.
+pub const MAX_SEARCH_QUERY_BYTES: usize = 4096;
+
 const VECTOR_SEARCH_MAX_LIMIT: u32 = 256;
 
 /// Server-fixed `ts_headline` options for `snippet: true` search results
@@ -126,6 +131,13 @@ pub(crate) fn compile_search(
         return Err(RtDbError::bad_request(
             "search query text must not be empty",
         ));
+    }
+    // SEC-007: bound the text handed to `websearch_to_tsquery`/`ILIKE` before
+    // any compilation work happens.
+    if search.query.len() > MAX_SEARCH_QUERY_BYTES {
+        return Err(RtDbError::bad_request(format!(
+            "search query text must be at most {MAX_SEARCH_QUERY_BYTES} bytes"
+        )));
     }
     let owner = ctx.user_id.as_deref();
     let index_def = table_def

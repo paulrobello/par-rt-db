@@ -807,6 +807,11 @@ struct SignedUrlResponse {
 /// serve route is unauthenticated by design. Cross-db mismatch returns 404
 /// (matching the authed-serve behavior for a foreign id) rather than 403, so
 /// the existence of an id in another db is not disclosed.
+///
+/// SEC-003: image-transform params supplied on the mint request (`w`, `h`,
+/// `q`, `fit`, `format`) are bound into the signature and echoed into the
+/// returned URL, so one signature authorizes exactly one render. A mint with no
+/// transform params yields a URL valid only for the un-transformed blob.
 async fn signed_url_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -830,9 +835,19 @@ async fn signed_url_handler(
         .map(|v| v.clamp(1, signed_url::MAX_SIGNED_URL_TTL_SECS as i64) as u64)
         .unwrap_or(signed_url::DEFAULT_SIGNED_URL_TTL_SECS);
     let exp = now_ms() + (ttl as i64) * 1000;
-    let sig = signed_url::sign(&state.limits.signed_url_key, &id, exp);
+    // Canonicalize whatever render was requested; `None` (no transform params)
+    // canonicalizes to the empty string, which is what the serve path computes
+    // for a plain fetch.
+    let transform = TransformParams::parse(&q, state.limits.image.cfg())?
+        .map(|p| p.canonical())
+        .unwrap_or_default();
+    let sig = signed_url::sign(&state.limits.signed_url_key, &id, exp, &transform);
     let base = state.config.public_url.trim_end_matches('/');
-    let url = format!("{base}/storage/{id}?exp={exp}&sig={sig}");
+    let url = if transform.is_empty() {
+        format!("{base}/storage/{id}?exp={exp}&sig={sig}")
+    } else {
+        format!("{base}/storage/{id}?{transform}&exp={exp}&sig={sig}")
+    };
     Ok(Json(SignedUrlResponse {
         url,
         expires_at: exp,
@@ -888,7 +903,13 @@ async fn serve_public_handler(
         if now_ms() > exp {
             return Err(RtDbError::forbidden("invalid or expired signature"));
         }
-        if !signed_url::verify(&state.limits.signed_url_key, &id, exp, sig) {
+        // SEC-003: verify against the render this request actually asks for.
+        // A signature minted for `w=100` does not authorize `w=200` or a
+        // full-resolution fetch.
+        let transform = TransformParams::parse(&q, state.limits.image.cfg())?
+            .map(|p| p.canonical())
+            .unwrap_or_default();
+        if !signed_url::verify(&state.limits.signed_url_key, &id, exp, &transform, sig) {
             return Err(RtDbError::forbidden("invalid or expired signature"));
         }
     }

@@ -1187,6 +1187,69 @@ async fn sync_upgrade_admits_absent_origin() -> anyhow::Result<()> {
     Ok(())
 }
 
+// SEC-006: /admin/stream authenticates once at the handshake, so without a
+// periodic re-check a revoked session keeps reading the op feed until the
+// client disconnects. The gauge tick re-validates the credential and closes
+// the socket with 4401.
+#[tokio::test]
+async fn admin_stream_closes_when_session_is_revoked() -> anyhow::Result<()> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    // Mint an admin-key login session (SEC-120) and use its opaque token as the
+    // stream's subprotocol bearer — the dashboard's path.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .cookie_store(true)
+        .build()?;
+    let resp = client
+        .post(format!("http://{addr}/admin/login"))
+        .json(&json!({"adminKey": "test-admin-key"}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    let session = resp
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|s| s.strip_prefix("rtdb_session="))
+        .map(|s| s.split(';').next().unwrap_or_default().to_string())
+        .expect("login set rtdb_session cookie");
+
+    let mut req = format!("ws://{addr}/admin/stream").into_client_request()?;
+    req.headers_mut().insert(
+        "sec-websocket-protocol",
+        reqwest::header::HeaderValue::from_str(&format!("rtdb-admin.{session}"))?,
+    );
+    let (mut ws, _) = connect_async(req).await.expect("admin stream upgrades");
+
+    // Revoke exactly this session's row (sibling tests in this binary hold
+    // their own admin-key sessions against the shared rtdb_auth).
+    let hash = rtdb_server::db::sha256_hex(&session);
+    let resp = common::admin_delete(addr, &format!("/admin/sessions/{hash}")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // The next gauge tick (~1s) must tear the socket down.
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(frame) = ws.next().await {
+            match frame {
+                Ok(Message::Close(_)) | Err(_) => return true,
+                Ok(_) => continue,
+            }
+        }
+        true
+    })
+    .await;
+    assert!(
+        closed.unwrap_or(false),
+        "SEC-006: a revoked admin session must not keep an open /admin/stream"
+    );
+    Ok(())
+}
+
 // SEC-105: the /admin/stream WS upgrade applies the same Origin check. A
 // disallowed Origin is rejected before WS negotiation begins, regardless of
 // whether the bearer is offered via the subprotocol.

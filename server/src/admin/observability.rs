@@ -6,11 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
-use axum::extract::ws::{WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequest, Path, Query as QueryParams, Request, State};
 use axum::http::HeaderMap;
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use crate::AppState;
 use crate::error::RtDbError;
@@ -244,13 +245,25 @@ pub(super) async fn admin_stream(
         }
     };
     let _ = authenticate_admin(&state, token).await?;
+    // SEC-006: an admin stream is long-lived, so the handshake check alone lets
+    // a revoked session keep reading the op feed indefinitely. Carry the
+    // credential into the loop and re-validate it on the gauge tick. The static
+    // admin key is config, not revocable state, so it is exempted here rather
+    // than costing a DB round-trip every second.
+    let revocable_token = if bool::from(token.as_bytes().ct_eq(state.config.admin_key.as_bytes())) {
+        None
+    } else {
+        Some(token.to_string())
+    };
     let mut ws = WebSocketUpgrade::from_request(req, &state)
         .await
         .map_err(|_| RtDbError::bad_request("expected websocket upgrade request"))?;
     if let Some(proto) = offered_subprotocol {
         ws = ws.protocols([proto]);
     }
-    Ok(ws.on_upgrade(move |socket| run_admin_stream(socket, state, params.db, params.table)))
+    Ok(ws.on_upgrade(move |socket| {
+        run_admin_stream(socket, state, params.db, params.table, revocable_token)
+    }))
 }
 
 async fn run_admin_stream(
@@ -258,6 +271,7 @@ async fn run_admin_stream(
     state: Arc<AppState>,
     db: Option<String>,
     table: Option<String>,
+    revocable_token: Option<String>,
 ) {
     for ev in state
         .realtime
@@ -289,6 +303,20 @@ async fn run_admin_stream(
                 }
             }
             _ = gauge_tick.tick() => {
+                // SEC-006: revocation, expiry, and admin-list removal take
+                // effect on an already-open stream, mirroring the `/sync`
+                // re-authorize invariant.
+                if let Some(tok) = &revocable_token
+                    && authenticate_admin(&state, tok).await.is_err()
+                {
+                    let _ = socket
+                        .send(Message::Close(Some(CloseFrame {
+                            code: 4401,
+                            reason: "admin credential no longer valid".into(),
+                        })))
+                        .await;
+                    break;
+                }
                 let (presence_rooms, presence_sessions) =
                     state.realtime.presence.counts().await;
                 let snap = state
@@ -317,7 +345,6 @@ async fn send_stream_json(
     socket: &mut WebSocket,
     value: &serde_json::Value,
 ) -> Result<(), axum::Error> {
-    use axum::extract::ws::Message;
     let text = serde_json::to_string(value).unwrap_or_else(|_| "{}".into());
     socket.send(Message::Text(text.into())).await
 }

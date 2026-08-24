@@ -236,6 +236,29 @@ async fn search_empty_query_is_bad_request() {
     assert!(err.message.contains("must not be empty"));
 }
 
+// SEC-007: query text past the project-owned byte cap is rejected before
+// compilation.
+#[tokio::test]
+async fn search_over_long_query_is_bad_request() {
+    let state = test_state().await;
+    let (db, schema) = fresh_search_db(&state).await;
+    // One byte past `search::MAX_SEARCH_QUERY_BYTES` (the module is private, so
+    // the cap is spelled out here; the server-side const is the source of truth).
+    let long = "a".repeat(4097);
+    let err = execute_query(
+        &state.pool,
+        &db,
+        &schema,
+        &search_query("search_content", &long),
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .expect_err("over-long query");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(err.message.contains("at most"), "got {}", err.message);
+}
+
 // Combining search with an index-based terminal is a BadRequest.
 #[tokio::test]
 async fn search_combined_with_index_is_bad_request() {

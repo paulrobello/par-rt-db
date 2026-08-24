@@ -150,16 +150,33 @@ pub fn is_blocked_ip(ip: IpAddr) -> bool {
             || (oct[0] == 255 && oct[1] == 255 && oct[2] == 255 && oct[3] == 255)
         }
         IpAddr::V6(v) => {
-            // ::1 — loopback.
-            v.is_loopback()
-            // :: — unspecified.
-            || v.is_unspecified()
-            // fe80::/10 — link-local.
-            || v.is_unicast_link_local()
-            // ff00::/8 — multicast.
-            || v.is_multicast()
-            // fc00::/7 — unique-local (RFC4193), the IPv6 RFC1918 analog.
-            || (v.octets()[0] & 0xfe) == 0xfc
+            // ::ffff:a.b.c.d — IPv4-mapped. The `url` crate parses
+            // `[::ffff:169.254.169.254]` as an Ipv6 host, so without this the
+            // V4 table below would never be consulted for it.
+            if let Some(v4) = v.to_ipv4_mapped() {
+                return is_blocked_ip(IpAddr::V4(v4));
+            }
+            let blocked =
+                // ::1 — loopback.
+                v.is_loopback()
+                // :: — unspecified.
+                || v.is_unspecified()
+                // fe80::/10 — link-local.
+                || v.is_unicast_link_local()
+                // ff00::/8 — multicast.
+                || v.is_multicast()
+                // fc00::/7 — unique-local (RFC4193), the IPv6 RFC1918 analog.
+                || (v.octets()[0] & 0xfe) == 0xfc;
+            if blocked {
+                return true;
+            }
+            // ::a.b.c.d — deprecated IPv4-compatible form, still routable on
+            // some stacks. Must stay after the checks above: `to_ipv4` also
+            // matches `::1`/`::`, which map to V4 addresses the table allows.
+            if let Some(v4) = v.to_ipv4() {
+                return is_blocked_ip(IpAddr::V4(v4));
+            }
+            false
         }
     }
 }
@@ -980,6 +997,26 @@ mod tests {
     }
 
     #[test]
+    fn is_blocked_ip_catches_ipv4_mapped_and_compat_forms() {
+        // `[::ffff:a.b.c.d]` parses as an Ipv6 host, so the V4 table has to be
+        // consulted through the mapping or the whole denylist is bypassable.
+        assert!(is_blocked_ip("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(is_blocked_ip("::ffff:169.254.169.254".parse().unwrap()));
+        assert!(is_blocked_ip("::ffff:10.0.0.1".parse().unwrap()));
+        assert!(is_blocked_ip("::ffff:192.168.1.1".parse().unwrap()));
+        assert!(is_blocked_ip("::ffff:172.16.0.1".parse().unwrap()));
+        // A public address stays reachable through the mapped spelling.
+        assert!(!is_blocked_ip("::ffff:8.8.8.8".parse().unwrap()));
+        // Deprecated `::a.b.c.d` compat form resolves through the V4 table too.
+        assert!(is_blocked_ip("::10.0.0.1".parse().unwrap()));
+        assert!(is_blocked_ip("::169.254.169.254".parse().unwrap()));
+        // The compat conversion must not un-block ::1 / :: (they map to
+        // 0.0.0.1 / 0.0.0.0, and 0.0.0.1 is not in the V4 table).
+        assert!(is_blocked_ip("::1".parse().unwrap()));
+        assert!(is_blocked_ip("::".parse().unwrap()));
+    }
+
+    #[test]
     fn is_blocked_ip_allows_public_addresses() {
         use std::net::Ipv4Addr;
         // A documented public DNS resolver (8.8.8.8) and a generic 203.0.113/24
@@ -1031,6 +1068,9 @@ mod tests {
             "https://169.254.169.254/latest/meta-data/",
             "https://[::1]/hook",
             "https://[fe80::1]/hook",
+            "https://[::ffff:169.254.169.254]/latest/meta-data/",
+            "https://[::ffff:127.0.0.1]/hook",
+            "https://[::ffff:10.0.0.1]/hook",
         ];
         for url in cases {
             let err = validate_webhook_url(url, false).await.unwrap_err();
