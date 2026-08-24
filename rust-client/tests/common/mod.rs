@@ -1,10 +1,10 @@
 //! Shared harness for opt-in live-server integration tests.
 //! Creates a uniquely-named `t<uuid>` database, pushes a tiny schema, and mints
 //! a machine token. Tests never touch a db they didn't create.
+#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 
-#[allow(dead_code)]
 pub struct Ctx {
     pub url: String,
     pub db: String,
@@ -31,7 +31,6 @@ pub async fn setup() -> Ctx {
         name: &'a str,
     }
     #[derive(Deserialize)]
-    #[allow(dead_code)]
     struct OkResp {
         ok: bool,
     }
@@ -72,7 +71,6 @@ pub async fn setup() -> Ctx {
         name: &'a str,
     }
     #[derive(Deserialize)]
-    #[allow(dead_code)]
     struct Minted {
         #[serde(rename = "tokenId")]
         token_id: String,

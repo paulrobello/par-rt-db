@@ -11,7 +11,6 @@
 
 use crate::error::{ErrorEnvelope, RtDbError};
 use crate::mutation::{StepResult, Transaction};
-use crate::query::parse_result;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -112,8 +111,7 @@ impl RtDbAdminClient {
                 &crate::wire::admin::PreviewSchemaRequest { schema },
             )
             .await?;
-        self.deserialize::<crate::wire::admin::SchemaPreviewDiff>(resp)
-            .await
+        crate::http_common::deserialize::<crate::wire::admin::SchemaPreviewDiff>(resp).await
     }
 
     /// `POST /admin/db/{db}/migrate` `{directives, dryRun}` → `MigrateResult`.
@@ -137,8 +135,7 @@ impl RtDbAdminClient {
                 },
             )
             .await?;
-        self.deserialize::<crate::wire::admin::MigrateResult>(resp)
-            .await
+        crate::http_common::deserialize::<crate::wire::admin::MigrateResult>(resp).await
     }
 
     /// `GET /admin/dbs` → `{databases:[...]}`.
@@ -185,8 +182,7 @@ impl RtDbAdminClient {
                 },
             )
             .await?;
-        self.deserialize::<crate::wire::admin::MintedToken>(resp)
-            .await
+        crate::http_common::deserialize::<crate::wire::admin::MintedToken>(resp).await
     }
 
     /// `POST /admin/revoke-token` `{tokenId}` → `{ok:true}`.
@@ -412,7 +408,9 @@ impl RtDbAdminClient {
                 &Body { version, confirm },
             )
             .await?;
-        Ok(self.deserialize::<Resp>(resp).await?.restored_to)
+        Ok(crate::http_common::deserialize::<Resp>(resp)
+            .await?
+            .restored_to)
     }
 
     /// `GET /admin/dbs/{db}/stats` → per-table row counts + sizes.
@@ -467,8 +465,7 @@ impl RtDbAdminClient {
         &self,
         patch: &crate::wire::admin::HotConfigPatch,
     ) -> Result<crate::wire::admin::ConfigResponse, RtDbError> {
-        self.deserialize(self.patch_json("/admin/config", patch).await?)
-            .await
+        crate::http_common::deserialize(self.patch_json("/admin/config", patch).await?).await
     }
 
     /// `GET /admin/ops/recent?db=<db>&table=<t>&n=<n>` → recent document-op
@@ -530,7 +527,7 @@ impl RtDbAdminClient {
                 },
             )
             .await?;
-        self.json_result::<T>(resp).await
+        crate::http_common::json_result::<T>(resp).await
     }
 
     /// `POST /admin/db/{db}/explain` `{query}` → `{sql, params, terminal,
@@ -549,7 +546,7 @@ impl RtDbAdminClient {
         let resp = self
             .post_json(&format!("/admin/db/{}/explain", db), &Body { query })
             .await?;
-        self.deserialize(resp).await
+        crate::http_common::deserialize(resp).await
     }
 
     /// `GET /admin/slow-queries?db=<optional>&limit=<n>` → the slow-query log
@@ -605,7 +602,7 @@ impl RtDbAdminClient {
         struct Resp {
             results: Vec<serde_json::Value>,
         }
-        let parsed = self.deserialize::<Resp>(resp).await?;
+        let parsed = crate::http_common::deserialize::<Resp>(resp).await?;
         crate::mutation::parse_step_results(parsed.results)
     }
 
@@ -686,8 +683,7 @@ impl RtDbAdminClient {
                 },
             )
             .await?;
-        self.deserialize::<crate::wire::admin::RestoreResult>(resp)
-            .await
+        crate::http_common::deserialize::<crate::wire::admin::RestoreResult>(resp).await
     }
 
     // ── Webhook management (GET/POST/PUT/DELETE /admin/db/{db}/webhooks[...]) ──
@@ -721,7 +717,8 @@ impl RtDbAdminClient {
         let resp = self
             .post_json(&format!("/admin/db/{db}/webhooks"), opts)
             .await?;
-        let parsed: crate::wire::admin::CreateWebhookResponse = self.deserialize(resp).await?;
+        let parsed: crate::wire::admin::CreateWebhookResponse =
+            crate::http_common::deserialize(resp).await?;
         Ok(parsed.id)
     }
 
@@ -740,7 +737,7 @@ impl RtDbAdminClient {
         let resp = self
             .put_json(&format!("/admin/db/{db}/webhooks/{id}"), opts)
             .await?;
-        self.deserialize::<crate::wire::admin::Webhook>(resp).await
+        crate::http_common::deserialize::<crate::wire::admin::Webhook>(resp).await
     }
 
     /// `DELETE /admin/db/{db}/webhooks/{id}` → `{ok:true}`. Cascades the
@@ -888,9 +885,7 @@ impl RtDbAdminClient {
             })?;
         let status = resp.status();
         if status.is_success() {
-            return self
-                .deserialize::<crate::wire::admin::RevokeUserSessionsResponse>(resp)
-                .await;
+            return crate::http_common::deserialize::<crate::wire::admin::RevokeUserSessionsResponse>(resp).await;
         }
         Err(self.error_response(resp).await)
     }
@@ -913,9 +908,7 @@ impl RtDbAdminClient {
             })?;
         let status = resp.status();
         if status.is_success() {
-            return self
-                .deserialize::<crate::wire::admin::RevokeUserSessionsResponse>(resp)
-                .await;
+            return crate::http_common::deserialize::<crate::wire::admin::RevokeUserSessionsResponse>(resp).await;
         }
         Err(self.error_response(resp).await)
     }
@@ -945,8 +938,7 @@ impl RtDbAdminClient {
                 },
             )
             .await?;
-        self.deserialize::<crate::wire::admin::MergeReport>(resp)
-            .await
+        crate::http_common::deserialize::<crate::wire::admin::MergeReport>(resp).await
     }
 
     // ── Workflow-run management (FM-29:
@@ -1008,7 +1000,7 @@ impl RtDbAdminClient {
         struct Resp {
             id: String,
         }
-        Ok(self.deserialize::<Resp>(resp).await?.id)
+        Ok(crate::http_common::deserialize::<Resp>(resp).await?.id)
     }
 
     /// `POST /admin/db/{db}/workflows/{id}/cancel` → `{ok}`. `Ok(false)` = an
@@ -1021,7 +1013,7 @@ impl RtDbAdminClient {
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("cancel_workflow request failed: {e}")))?;
-        let parsed: crate::wire::admin::OkResponse = self.deserialize(resp).await?;
+        let parsed: crate::wire::admin::OkResponse = crate::http_common::deserialize(resp).await?;
         Ok(parsed.ok)
     }
 
@@ -1045,7 +1037,7 @@ impl RtDbAdminClient {
                 &crate::wire::admin::WorkflowSignalRequest { name, payload },
             )
             .await?;
-        let parsed: crate::wire::admin::OkResponse = self.deserialize(resp).await?;
+        let parsed: crate::wire::admin::OkResponse = crate::http_common::deserialize(resp).await?;
         Ok(parsed.ok)
     }
 
@@ -1060,7 +1052,7 @@ impl RtDbAdminClient {
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("delete_workflow request failed: {e}")))?;
-        let parsed: crate::wire::admin::OkResponse = self.deserialize(resp).await?;
+        let parsed: crate::wire::admin::OkResponse = crate::http_common::deserialize(resp).await?;
         Ok(parsed.ok)
     }
 
@@ -1114,7 +1106,7 @@ impl RtDbAdminClient {
         let resp = self
             .post_json(&format!("/admin/db/{db}/schedules"), &Body { when, txn })
             .await?;
-        Ok(self.deserialize::<Resp>(resp).await?.id)
+        Ok(crate::http_common::deserialize::<Resp>(resp).await?.id)
     }
 
     /// `POST /admin/db/{db}/schedules/{id}/cancel` → `{ok}`. `Ok(false)` = an
@@ -1153,7 +1145,7 @@ impl RtDbAdminClient {
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("manage_schedule request failed: {e}")))?;
-        let parsed: crate::wire::admin::OkResponse = self.deserialize(resp).await?;
+        let parsed: crate::wire::admin::OkResponse = crate::http_common::deserialize(resp).await?;
         Ok(parsed.ok)
     }
 
@@ -1204,7 +1196,7 @@ impl RtDbAdminClient {
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("upload_file request failed: {e}")))?;
-        Ok(self.deserialize::<Resp>(resp).await?.id)
+        Ok(crate::http_common::deserialize::<Resp>(resp).await?.id)
     }
 
     /// `DELETE /admin/db/{db}/storage/{id}` → `{ok:true}`. Idempotent — the
@@ -1333,11 +1325,11 @@ impl RtDbAdminClient {
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("admin request failed: {e}")))?;
-        self.deserialize::<Resp>(resp).await
+        crate::http_common::deserialize::<Resp>(resp).await
     }
 
     async fn expect_ok(&self, resp: reqwest::Response) -> Result<(), RtDbError> {
-        let parsed: crate::wire::admin::OkResponse = self.deserialize(resp).await?;
+        let parsed: crate::wire::admin::OkResponse = crate::http_common::deserialize(resp).await?;
         if !parsed.ok {
             return Err(RtDbError::internal("admin request returned ok=false"));
         }
@@ -1351,39 +1343,6 @@ impl RtDbAdminClient {
             Err(_) => {
                 RtDbError::internal(format!("request failed with status {}", status.as_u16()))
             }
-        }
-    }
-
-    async fn json_result<T: DeserializeOwned>(
-        &self,
-        resp: reqwest::Response,
-    ) -> Result<T, RtDbError> {
-        #[derive(serde::Deserialize)]
-        struct QueryResponse {
-            result: serde_json::Value,
-        }
-        let parsed = self.deserialize::<QueryResponse>(resp).await?;
-        parse_result::<T>(parsed.result)
-    }
-
-    async fn deserialize<T: DeserializeOwned>(
-        &self,
-        resp: reqwest::Response,
-    ) -> Result<T, RtDbError> {
-        let status = resp.status();
-        if status.is_success() {
-            return resp
-                .json::<T>()
-                .await
-                .map_err(|e| RtDbError::internal(format!("invalid response body: {e}")));
-        }
-        // Error path: try to parse {code,message}, else INTERNAL.
-        match resp.json::<ErrorEnvelope>().await {
-            Ok(env) => Err(RtDbError::from_envelope(env)),
-            Err(_) => Err(RtDbError::internal(format!(
-                "request failed with status {}",
-                status.as_u16()
-            ))),
         }
     }
 }

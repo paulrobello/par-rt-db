@@ -1,8 +1,8 @@
 //! One-shot HTTP client for par-rt-db. `Authorization: Bearer <token>` on every call.
 
-use crate::error::{ErrorEnvelope, RtDbError, retry_on_precondition};
+use crate::error::{RtDbError, retry_on_precondition};
 use crate::mutation::{Mutation, StepResult, Transaction};
-use crate::query::{Query, TableQuery, parse_result};
+use crate::query::{Query, TableQuery};
 use crate::wire::{
     AuthedUser, PROTOCOL_VERSION, ScheduleInfo, ScheduleWhen, WorkflowInfo, WorkflowSpec,
     WorkflowStatus,
@@ -198,7 +198,7 @@ impl RtDbHttpClient {
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("query request failed: {e}")))?;
-        self.json_result::<T>(resp).await
+        crate::http_common::json_result::<T>(resp).await
     }
 
     /// Point read: `{"table","get:id"}` → `Option<T>`.
@@ -266,7 +266,7 @@ impl RtDbHttpClient {
         struct BatchResponse {
             results: Vec<crate::wire::BatchQueryOutcome>,
         }
-        let parsed = self.deserialize::<BatchResponse>(resp).await?;
+        let parsed = crate::http_common::deserialize::<BatchResponse>(resp).await?;
         Ok(parsed.results)
     }
 
@@ -302,7 +302,7 @@ impl RtDbHttpClient {
         struct MutateResponse {
             results: Vec<serde_json::Value>,
         }
-        let parsed = self.deserialize::<MutateResponse>(resp).await?;
+        let parsed = crate::http_common::deserialize::<MutateResponse>(resp).await?;
         crate::mutation::parse_step_results(parsed.results)
     }
 
@@ -409,7 +409,7 @@ impl RtDbHttpClient {
         struct ScheduleResponse {
             id: String,
         }
-        let parsed = self.deserialize::<ScheduleResponse>(resp).await?;
+        let parsed = crate::http_common::deserialize::<ScheduleResponse>(resp).await?;
         Ok(parsed.id)
     }
 
@@ -464,7 +464,7 @@ impl RtDbHttpClient {
         struct ManageResponse {
             ok: bool,
         }
-        let parsed = self.deserialize::<ManageResponse>(resp).await?;
+        let parsed = crate::http_common::deserialize::<ManageResponse>(resp).await?;
         Ok(parsed.ok)
     }
 
@@ -488,7 +488,7 @@ impl RtDbHttpClient {
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("list schedules request failed: {e}")))?;
-        let parsed = self.deserialize::<ListResponse>(resp).await?;
+        let parsed = crate::http_common::deserialize::<ListResponse>(resp).await?;
         Ok(parsed.schedules)
     }
 
@@ -514,7 +514,7 @@ impl RtDbHttpClient {
         struct StartResponse {
             id: String,
         }
-        let parsed = self.deserialize::<StartResponse>(resp).await?;
+        let parsed = crate::http_common::deserialize::<StartResponse>(resp).await?;
         Ok(parsed.id)
     }
 
@@ -546,7 +546,7 @@ impl RtDbHttpClient {
         struct CancelResponse {
             cancelled: bool,
         }
-        let parsed = self.deserialize::<CancelResponse>(resp).await?;
+        let parsed = crate::http_common::deserialize::<CancelResponse>(resp).await?;
         Ok(parsed.cancelled)
     }
 
@@ -593,7 +593,7 @@ impl RtDbHttpClient {
         struct SignalResponse {
             delivered: bool,
         }
-        let parsed = self.deserialize::<SignalResponse>(resp).await?;
+        let parsed = crate::http_common::deserialize::<SignalResponse>(resp).await?;
         Ok(parsed.delivered)
     }
 
@@ -627,7 +627,7 @@ impl RtDbHttpClient {
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("list workflows request failed: {e}")))?;
-        let parsed = self.deserialize::<ListResponse>(resp).await?;
+        let parsed = crate::http_common::deserialize::<ListResponse>(resp).await?;
         Ok(parsed.workflows)
     }
 
@@ -653,7 +653,7 @@ impl RtDbHttpClient {
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("upload request failed: {e}")))?;
-        self.deserialize::<UploadResult>(resp).await
+        crate::http_common::deserialize::<UploadResult>(resp).await
     }
 
     /// Upload a streaming body without buffering it whole in memory. The server
@@ -688,7 +688,7 @@ impl RtDbHttpClient {
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("upload request failed: {e}")))?;
-        self.deserialize::<UploadResult>(resp).await
+        crate::http_common::deserialize::<UploadResult>(resp).await
     }
 
     /// Delete the file `id` (`DELETE /api/storage/{db}/{id}`) — also revokes
@@ -706,7 +706,7 @@ impl RtDbHttpClient {
         struct OkResp {
             ok: bool,
         }
-        let parsed = self.deserialize::<OkResp>(resp).await?;
+        let parsed = crate::http_common::deserialize::<OkResp>(resp).await?;
         if !parsed.ok {
             return Err(RtDbError::internal("delete file returned ok=false"));
         }
@@ -725,7 +725,7 @@ impl RtDbHttpClient {
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("file metadata request failed: {e}")))?;
-        self.deserialize::<FileMetadata>(resp).await
+        crate::http_common::deserialize::<FileMetadata>(resp).await
     }
 
     /// Mint an HMAC-signed, time-limited public URL for `id` via
@@ -751,7 +751,7 @@ impl RtDbHttpClient {
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("signed url request failed: {e}")))?;
-        self.deserialize::<SignedUrl>(resp).await
+        crate::http_common::deserialize::<SignedUrl>(resp).await
     }
 
     /// The public serve URL — no request is made.
@@ -808,7 +808,7 @@ impl RtDbHttpClient {
         struct MeResponse {
             user: AuthedUser,
         }
-        let parsed = self.deserialize::<MeResponse>(resp).await?;
+        let parsed = crate::http_common::deserialize::<MeResponse>(resp).await?;
         Ok(parsed.user)
     }
 
@@ -830,41 +830,8 @@ impl RtDbHttpClient {
         struct ValidateResponse {
             user: AuthedUser,
         }
-        let parsed = self.deserialize::<ValidateResponse>(resp).await?;
+        let parsed = crate::http_common::deserialize::<ValidateResponse>(resp).await?;
         Ok(parsed.user)
-    }
-
-    async fn json_result<T: DeserializeOwned>(
-        &self,
-        resp: reqwest::Response,
-    ) -> Result<T, RtDbError> {
-        #[derive(serde::Deserialize)]
-        struct QueryResponse {
-            result: serde_json::Value,
-        }
-        let parsed = self.deserialize::<QueryResponse>(resp).await?;
-        parse_result::<T>(parsed.result)
-    }
-
-    async fn deserialize<T: DeserializeOwned>(
-        &self,
-        resp: reqwest::Response,
-    ) -> Result<T, RtDbError> {
-        let status = resp.status();
-        if status.is_success() {
-            return resp
-                .json::<T>()
-                .await
-                .map_err(|e| RtDbError::internal(format!("invalid response body: {e}")));
-        }
-        // Error path: try to parse {code,message}, else INTERNAL.
-        match resp.json::<ErrorEnvelope>().await {
-            Ok(env) => Err(RtDbError::from_envelope(env)),
-            Err(_) => Err(RtDbError::internal(format!(
-                "request failed with status {}",
-                status.as_u16()
-            ))),
-        }
     }
 }
 
