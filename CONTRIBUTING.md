@@ -21,10 +21,11 @@ notes), see [`CLAUDE.md`](CLAUDE.md).
 
 ## Repository layout
 
-par-rt-db is a monorepo with **seven packages** built from one root `Makefile`:
+par-rt-db is a monorepo with **eight packages** built from one root `Makefile`:
 
 | Package | Path | Stack |
 | --- | --- | --- |
+| Core | `core/` | Rust (`par-rt-db-core`) — the wire vocabulary the server and Rust client share |
 | Server | `server/` | Rust (axum/tokio + Postgres 17) |
 | TypeScript client | `ts-client/` | TS (`@par-rt-db/client`, bun) |
 | Rust client | `rust-client/` | Rust (`par-rt-db-client`) |
@@ -75,18 +76,19 @@ gitignored and rebuilt on demand.
 
 ## The build gate
 
-`make checkall` is the **definition of done**. It must pass before commit. It
-runs, across all seven packages:
+`make checkall` is the **definition of done**. It must pass before every
+commit, and it spans all eight packages (`core`, `server`, `ts-client`,
+`rust-client`, `python-client`, `swift-client`, `dashboard`, `cli`).
 
-- `env-drift-check` — fails first if a `RTDB_*` var documented in `.env.example` or read by the server is not forwarded to the container by `docker-compose.yml`'s `environment:` block
-- `fmt-check` — formatting check (cargo fmt, bun fmt-check, ruff format --check)
-- `lint` — `cargo clippy --all-targets --all-features -- -D warnings`, `bun run lint`, `uv run ruff check .`
-- `typecheck` — `cargo check`, `bun run typecheck`, `uv run pyright`
-- `test` — `cargo test`, `bun run test`, `cargo test --all-features`, `uv run pytest -q` (auto-runs `dev-db-up` first)
+Its eight stages, what each one catches, and every other make target are
+documented once in the root README under
+[Verification gates](README.md#verification-gates). That table is the canonical
+description — read it there rather than trusting a summary here.
 
-The dashboard runs `vitest run` over `dashboard/src/**/*.test.tsx` (18 files as
-of 2026-08-09 — page tests for every operator page plus library/component
-tests). All six other packages also have substantive suites.
+Two stages exist because the rest of the gate cannot see what they check:
+`env-drift-check` catches a `RTDB_*` var the compose file never forwards, and
+`dockerfile-stub-check` catches a `[[test]]` with no Dockerfile stub, which
+would otherwise break only `make deploy`.
 
 Never `--no-verify` past the gate. If you do, fix the gate immediately and push
 the fix before anything else.
@@ -98,15 +100,17 @@ databases per test case (`t<uuid>`). Never assume exclusive access, and never
 drop a database or schema you didn't create.
 
 ```bash
-make test                                       # whole suite (dev-db-up + tests across all 6 packages)
+make test                                       # whole suite (dev-db-up + tests across all 8 packages)
 
 # Per-package:
+cd core && cargo test                           # core (par-rt-db-core) tests
 cd server && cargo test                         # server tests
 cd ts-client && bunx vitest run                 # ts-client tests
 cd rust-client && cargo test --all-features     # rust-client tests
 cd dashboard && bun run test                    # dashboard tests (vitest, 18 files)
 cd python-client && uv run pytest -q            # python-client tests
 cd cli && cargo test                            # cli tests (rtdb binary)
+make swift-client-test                          # swift-client tests (Darwin only)
 
 # Single test:
 cargo test --test main txn_test::upsert_multiple_matches  # one test
@@ -224,11 +228,16 @@ Common contributor symptoms:
   commit with a longer timeout (e.g. 600000 ms) rather than re-running it
   unchanged; the staged changes are intact and recoverable. Do not
   `--no-verify` past it — run `make checkall` and fix the underlying warning.
-- **Dev Postgres accumulates leaked test schemas (`db_t<uuid-v7>`).** Tests
-  create uniquely-named databases per test for fast isolation and don't drop
-  them afterward. Over time these bloat `pg_dump` and slow the dev DB. Run
-  `make dev-db-clean` periodically to drop them (the cleanup is scoped to the
-  `db_t*` pattern and never touches `rtdb`/`rtdb_auth`/real databases).
+- **Dev Postgres accumulates a tail of leaked test schemas.** Tests create a
+  uniquely-named database per test for fast isolation, and `TestDb` drops it on
+  `Drop` — cleanup is automatic, not manual. A bounded tail still leaks per
+  test binary (a process that aborts before its cleanup worker drains, or a
+  name that escaped its `TestDb` wrapper), so run `make dev-db-clean`
+  periodically. It sweeps both patterns: per-test schemas (`db_t<uuid-v7>`) and
+  the semantics-corpus runner's per-case schemas (`sc_<case>_<hex>`), plus the
+  matching `rtdb_auth` registry rows and stranded webhook deliveries. It is
+  scoped to those patterns and never touches `rtdb`, `rtdb_auth`, or real
+  databases.
 
 ## Invariants you must preserve
 
@@ -259,15 +268,23 @@ failing test.
   `is_admin` re-runs on every admin op. Don't add a cached auth check that
   bypasses this.
 - **Op-feed tap** — durable document mutations publish through the committer's
-  single enforcement point: every `handle_*` arm in `committer.rs` that commits
-  a document txn calls `publish_taps` — currently seven (`handle_mutate`,
-  `handle_scheduled`, `handle_migrate`, `handle_reaper`,
-  `handle_restore_schema`, `handle_merge_users`, `handle_workflow_advance`;
-  see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the canonical list and
-  each arm's `source` tag). Any new code path that commits a document txn must
-  publish through `publish_taps` the same way, or the op-feed (and
-  `/admin/stream`, the audit log, and the webhook outbox) will silently miss
-  those writes.
+  single enforcement point: every `handle_*` arm under `server/src/committer/arms/`
+  that commits a document txn calls `publish_taps` — currently eight
+  (`handle_mutate`, `handle_scheduled`, `handle_migrate`, `handle_reaper`,
+  `handle_push_schema`, `handle_restore_schema`, `handle_merge_users`,
+  `handle_workflow_advance`; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+  for the canonical table and each arm's `source` tag). Any new code path that
+  commits a document txn must publish through `publish_taps` the same way, or
+  the op-feed (and `/admin/stream`, the audit log, and the webhook outbox) will
+  silently miss those writes.
+- **A new `[[test]]` needs a Dockerfile stub** — the Dockerfile's dependency-caching
+  layer `touch`es a placeholder for every `[[test]]` declared by a non-server
+  workspace member. Add a test target to `rust-client/Cargo.toml` (or another
+  member) without adding its stub and `make deploy` fails at cargo's manifest
+  parse, while `make checkall` stays green — which is why `checkall` now runs
+  `dockerfile-stub-check` as its second stage. Run `make dockerfile-stub-check`
+  after touching any member's test targets; its output names the exact stub
+  line to add.
 - **Storage bypasses the committer** — `storage::put` writes directly to the
   `storage` side table because blobs don't touch document tables or
   subscriptions. `GET /storage/{id}` is the only unauthenticated route; keep

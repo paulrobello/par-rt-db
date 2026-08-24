@@ -26,8 +26,10 @@ public protocol WebSocketTransport: Sendable {
 /// `authErr` frames — frame-carried reasons are authoritative, this code is
 /// the socket-level signal.
 public struct TransportCloseError: Error, Sendable {
+    /// The peer's WebSocket close code, when the platform surfaced one.
     public let code: UInt16?
 
+    /// Create a close error carrying `code`, or nil when no close code was observed.
     public init(code: UInt16?) {
         self.code = code
     }
@@ -43,6 +45,7 @@ public struct URLSessionWebSocketTransport: WebSocketTransport {
     private let session: URLSession
     private let state = State()
 
+    /// Create a transport backed by `session` (defaults to `.shared`).
     public init(session: URLSession = .shared) {
         self.session = session
     }
@@ -169,6 +172,7 @@ public protocol WScheduler: Sendable {
 
 /// Wall-clock scheduler over `Date` and `Task.sleep`.
 public struct SystemScheduler: WScheduler {
+    /// Create a scheduler backed by the system wall clock.
     public init() {}
 
     public func now() -> UInt64 {

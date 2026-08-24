@@ -3,7 +3,7 @@
 Python client for [par-rt-db](..) — a port of the TypeScript SDK
 ([`../ts-client/`](../ts-client)) and Rust crate ([`../rust-client/`](../rust-client))
 for server-side and automation apps. Speaks the server's declarative
-query/transaction DSL; the wire layer is the **fourth** implementation of
+query/transaction DSL; the wire layer is one of four implementations of
 par-rt-db's JSON contract (alongside `server/src/protocol.rs`,
 `ts-client/src/protocol.ts`, and `rust-client/src/wire.rs`). No codegen: you
 build a `SchemaDef` that serializes to the exact server `SchemaDef`, and
@@ -11,6 +11,29 @@ query/mutate results deserialize generically into your own `pydantic` models or
 plain `dict`s.
 
 Package name: `par-rt-db` → in Python, `import par_rt_db`.
+
+## Table of Contents
+
+- [Status / features](#status--features)
+- [Install](#install)
+- [Quick start](#quick-start)
+  - [Atomic multi-step transaction](#atomic-multi-step-transaction)
+  - [Query + subscribe](#query--subscribe)
+  - [Reactive WebSocket (`[ws]` extra)](#reactive-websocket-ws-extra)
+  - [Async HTTP / admin / storage (`[aio]` extra)](#async-http--admin--storage-aio-extra)
+  - [Schemas and cursors](#schemas-and-cursors)
+  - [Computed fields (ENH-028)](#computed-fields-enh-028)
+  - [Schema migration (`[http]` extra)](#schema-migration-http-extra)
+  - [Durable workflows (FM-29)](#durable-workflows-fm-29)
+  - [Cascade delete + soft delete (FM-33)](#cascade-delete--soft-delete-fm-33)
+- [Errors](#errors)
+- [Full API](#full-api)
+  - [Wire and DSL types](#wire-and-dsl-types)
+  - [Reactive client: presence (`[ws]` extra)](#reactive-client-presence-ws-extra)
+  - [HTTP clients: storage, batch query, index helpers, schedules](#http-clients-storage-batch-query-index-helpers-schedules)
+  - [Admin control plane (`[http]` extra)](#admin-control-plane-http-extra)
+- [Wire contract](#wire-contract)
+- [Develop](#develop)
 
 ## Status / features
 
@@ -27,7 +50,7 @@ Package name: `par-rt-db` → in Python, `import par_rt_db`.
 | Reactive WebSocket client (`RtDbClient`, `Subscription`) | shipped | `par_rt_db.ws_client` (`[ws]` extra) |
 | Admin control plane (`RtDbAdminClient` — db/token/schema allowlist CRUD, webhooks, metrics, hot config, sessions, backups, snapshot export/import, schema preview, admin schedules CRUD, admin storage list/upload/delete, per-db anonymous-access toggle) | shipped | `par_rt_db.admin` (`[http]` extra; async twin `AsyncRtDbAdminClient` in the same module, `[aio]` extra) |
 | In-memory test harness (`InMemoryRtDbClient` — no network, no Postgres) | shipped | `par_rt_db.in_memory` |
-| Optimistic local-state updates (`OptimisticStore` for read-modify-write UI loops) | shipped | `par_rt_db.optimistic` |
+| Optimistic local-state updates (`RtDbClient(optimistic_updates=True)` overlays a subscription's cached result immediately, before the server round-trip) | shipped | `par_rt_db.optimistic` (projection logic), `par_rt_db.ws_client` (wiring) |
 
 The DSL layer is feature-complete: every server query terminal
 (`get`/`index`+`eq`/`gt`/`gte`/`lt`/`lte`/`order`/`take`/`unique`/`first`/`count`/
@@ -43,31 +66,46 @@ has a builder method that produces a wire-identical payload. Pydantic v2
 
 ## Install
 
+Not yet published to PyPI (see [`../docs/RELEASING.md`](../docs/RELEASING.md)) —
+install directly from the repository. With [uv](https://docs.astral.sh/uv/):
+
 ```bash
-pip install par-rt-db
+uv add "par-rt-db @ git+https://github.com/paulrobello/par-rt-db#subdirectory=python-client"
 ```
 
-Or with [uv](https://docs.astral.sh/uv/):
+Or against a local checkout:
 
 ```bash
-uv add par-rt-db
+uv add --editable ./python-client
+```
+
+`pip` works the same way:
+
+```bash
+pip install "par-rt-db @ git+https://github.com/paulrobello/par-rt-db#subdirectory=python-client"
+pip install -e ./python-client
 ```
 
 Requires Python ≥ 3.12 (see `pyproject.toml` for the supported `pydantic` and, per extra, `httpx`/`websockets` versions). The optional HTTP and WebSocket
-client extras pull in `httpx` and `websockets` respectively:
+client extras pull in `httpx` and `websockets` respectively — quote the
+package spec when an extra is appended, since zsh treats unquoted `[...]` as a
+glob:
 
 ```bash
-pip install par-rt-db[http]    # sync HTTP client + admin control plane + storage
-pip install par-rt-db[aio]     # async HTTP/admin/storage client (httpx.AsyncClient)
-pip install par-rt-db[ws]      # reactive WebSocket client (live queries, WS mutations)
+uv add "par-rt-db[http] @ git+https://github.com/paulrobello/par-rt-db#subdirectory=python-client"  # sync HTTP client + admin control plane + storage
+uv add "par-rt-db[ws] @ git+https://github.com/paulrobello/par-rt-db#subdirectory=python-client"    # reactive WebSocket client (live queries, WS mutations)
 ```
+
+`[aio]` is an alias for `[http]` — the async HTTP/admin/storage client
+(`httpx.AsyncClient`) ships in the same extra, no separate install needed.
 
 The DSL layer has no third-party dependency beyond pydantic.
 
-> **Docstring convention:** public APIs use Google-style docstrings
-> (`Args:` / `Returns:` / `Raises:`). The rollout across the package's
-> modules is incremental — new and edited docstrings follow the convention;
-> older prose docstrings convert on touch.
+> **Docstring convention:** new and edited public APIs use Google-style
+> docstrings (`Args:` / `Returns:` / `Raises:`). Most of the existing surface
+> still carries older prose-style docstrings — the convention is not yet
+> enforced by lint, so treat it as the target style rather than a guarantee;
+> a docstring converts to Google style the next time its function is touched.
 
 Editable install for development:
 
@@ -81,9 +119,9 @@ uv sync                    # installs the dev group by default (pytest, ruff, py
 `import par_rt_db` exposes the public DSL surface used below. The DSL produces
 JSON-serializable `pydantic` models you can `model_dump(by_alias=True)` onto the
 wire. For live use, install the sync HTTP/admin/storage surface
-(`pip install par-rt-db[http]`), the async twin (`pip install par-rt-db[aio]`),
-or the reactive WebSocket client (`pip install par-rt-db[ws]`) — see the
-respective sections below.
+(`"par-rt-db[http]"`), the async twin (`"par-rt-db[aio]"` — an alias of
+`[http]`), or the reactive WebSocket client (`"par-rt-db[ws]"`) — see the
+respective sections below and Install above for the full install command.
 
 ### Atomic multi-step transaction
 
@@ -208,7 +246,7 @@ schedule ops over one `/sync` connection with auto-reconnect, re-auth, and
 resubscribe. `get_token` is an async callable (it may refresh an OAuth token);
 return `None` to pause reconnects. Each `subscribe()` returns a `Subscription`
 that is both an async iterator (yields each new value) and exposes the latest
-value via `.current()`. Install with `pip install par-rt-db[ws]`.
+value via `.current()`. Install with the `[ws]` extra (see Install above).
 
 ### Async HTTP / admin / storage (`[aio]` extra)
 
@@ -227,15 +265,14 @@ async def main() -> None:
     # Same `(url, db, token)` shape as the sync client; `async with` closes it.
     async with RtDbAsyncHttpClient("https://rtdb.example.com", "mydb", "<machine-token>") as client:
         rows = await client.run(TableQuery("items").collect())
-        await client.mutate(
-            Mutation.builder().insert("items", {"_id": "i1", "name": "widget", "n": 1}).build()
-        )
+        # ``_id`` is server-managed (reserved); insert user fields only.
+        await client.mutate(Mutation.builder().insert("items", {"name": "widget", "n": 1}).build())
 
 
 asyncio.run(main())
 ```
 
-Install with `pip install par-rt-db[aio]` (same `httpx` pin as `[http]`; see `pyproject.toml`).
+Install with the `[aio]` extra — an alias of `[http]`, same `httpx` pin (see `pyproject.toml` and Install above).
 
 ### Schemas and cursors
 
@@ -286,7 +323,7 @@ schema = SchemaDef.model_validate(
 )
 # `model_dump(by_alias=True, exclude_none=True)` produces the wire shape to
 # `POST /admin/push-schema` (or use `admin.push_schema(db, schema)` from the
-# admin client — `pip install par-rt-db[http]`).
+# admin client — install the `[http]` extra, see Install above).
 
 cursor = encode_cursor(["kanban-board-1", 42, "i4"])  # opaque base64 string
 sort_tuple = decode_cursor(cursor)  # round-trips back to the list
@@ -294,7 +331,7 @@ sort_tuple = decode_cursor(cursor)  # round-trips back to the list
 
 `t.string()` / `t.number()` / `t.vector(n)` / `t.id(table)` / `t.optional(inner)`
 / `t.union([...])` / `t.object({...})` are the field constructors; see
-`par_rt_db/schema.py` for the full set of 15 variants.
+`src/par_rt_db/schema.py` for the full set of 15 variants.
 
 ### Computed fields (ENH-028)
 
@@ -352,7 +389,7 @@ Semantics (mirrored exactly by the in-memory harness):
 
 The full `ve.*` set: `field` / `literal` / `concat` / `add` / `sub` / `mul` /
 `div` / `coalesce` / `lower` / `upper` / `trim` / `cast` / `now` / `case` —
-see `par_rt_db/value_expr.py`. `renameField` migrations rewrite expression
+see `src/par_rt_db/value_expr.py`. `renameField` migrations rewrite expression
 references automatically; dropping a field an expression reads is rejected.
 
 ### Schema migration (`[http]` extra)
@@ -471,7 +508,7 @@ without `softDelete`). A soft delete never triggers a cascade; the TTL reaper
 always hard-deletes.
 
 ```python
-from par_rt_db import Mutation
+from par_rt_db import Mutation, RtDbHttpClient
 from par_rt_db.schema import Schema, t
 
 schema = (
@@ -497,10 +534,12 @@ schema = (
     .build()
 )
 
+client = RtDbHttpClient("https://rtdb.example.com", "mydb", "<machine-token>")
+
 # Deleting the user cascades: posts hard-delete, comments soft-delete (stamped).
-db.push_schema(schema)
-db.mutate(Mutation.builder().delete("users", user_id).build())
-db.mutate(Mutation.builder().undelete("comments", comment_id).build())  # restore
+client.push_schema("mydb", schema)
+client.mutate(Mutation.builder().delete("users", user_id).build())
+client.mutate(Mutation.builder().undelete("comments", comment_id).build())  # restore
 ```
 
 On the wire, `onDelete` rides the id variant (omitted when unset) and
@@ -521,9 +560,71 @@ body; `RtDbError.status_code` returns the mapped HTTP status.
 `retry_on_precondition` (in `par_rt_db.errors`) is a bounded async helper for
 read-modify-write loops (`expect_version` / `expect_absent` + retry).
 
+## Full API
+
+Every public symbol not already covered by an example above. Import path
+resolves through the package root (`from par_rt_db import <Name>`) unless a
+module is given.
+
+### Wire and DSL types
+
+| Symbol | Module | Description |
+| --- | --- | --- |
+| `FilterExpr` | `par_rt_db.wire` | Query/`filter()`/`authorize`/partial-index `where` predicate expression type. |
+| `AfterMs` / `RunAt` / `Cron` / `Interval` | `par_rt_db.wire` | `ScheduleWhen` variants for `schedule(when, txn)` — fire once after a delay, once at an instant, or repeatedly on a cron/interval schedule. |
+| `AwaitSignalSpec` | `par_rt_db.wire` | Wire spec for a workflow's `awaitSignal` step; build one with `await_signal()` (`par_rt_db.mutation`) rather than constructing it directly. |
+| `ValueExpr` | `par_rt_db.value_expr` | Computed-field expression type built with the `ve.*` constructors (see Computed fields above). |
+| `CaseWhen` | `par_rt_db.value_expr` | One branch of a `ve.case(whens, otherwise)` computed-field expression. |
+
+### Reactive client: presence (`[ws]` extra)
+
+| Symbol | Module | Description |
+| --- | --- | --- |
+| `RtDbClient.presence(room, state=None)` | `par_rt_db.ws_client` | Join a presence room with optional initial state; returns a `Presence` handle. |
+| `RtDbClient.update_presence(room, state, ttl_ms=None)` | `par_rt_db.ws_client` | Broadcast updated state for this connection in `room`. |
+| `RtDbClient.leave_presence(room)` | `par_rt_db.ws_client` | Leave a presence room. |
+| `Presence` | `par_rt_db.ws_client` | Handle returned by `presence()`; exposes the room's current member list and iterates snapshot updates. |
+
+### HTTP clients: storage, batch query, index helpers, schedules
+
+The sync (`RtDbHttpClient`) and async (`RtDbAsyncHttpClient`) clients expose
+the same surface; only the sync signatures are shown.
+
+| Symbol | Module | Description |
+| --- | --- | --- |
+| `RtDbHttpClient.upload(data, *, content_type=None)` | `par_rt_db.http_client` | `POST /api/storage/{db}` — uploads bytes, a file-like object, or an iterable of chunks; returns server-computed `UploadResult` (id, sha256, size, type). |
+| `RtDbHttpClient.batch_query(queries)` | `par_rt_db.http_client` | `POST /api/query-batch` — runs many queries in one round trip; returns one length-aligned `BatchQueryOutcome` per input. |
+| `RtDbHttpClient.find_one_by_index(table, index, value, *, model=dict)` | `par_rt_db.http_client` | Single-doc lookup on `index` via the `first` terminal. |
+| `RtDbHttpClient.upsert_by_index(table, index, value, insert, patch)` | `par_rt_db.http_client` | One-step upsert by index-field value: match → `patch`, no match → `insert`. |
+| `RtDbHttpClient.pause_schedule(id)` / `.resume_schedule(id)` | `par_rt_db.http_client` | Pause or resume a scheduled job by id; `False` when the id is unknown. |
+
+### Admin control plane (`[http]` extra)
+
+`AsyncRtDbAdminClient` is a one-to-one async mirror of `RtDbAdminClient` over
+`httpx.AsyncClient`.
+
+| Symbol | Module | Description |
+| --- | --- | --- |
+| `AsyncRtDbAdminClient` | `par_rt_db.admin` | Async twin of `RtDbAdminClient`. |
+| `RtDbAdminClient.list_sessions(*, user=None, limit=None)` | `par_rt_db.admin` | `GET /admin/sessions` — active interactive sessions across the instance, newest-first. |
+| `RtDbAdminClient.revoke_session(token_hash)` | `par_rt_db.admin` | `DELETE /admin/sessions/{tokenHash}` — revokes one session by its sha256 digest. |
+| `RtDbAdminClient.get_audit(db, *, table=None, op=None, principal=None, source=None, limit=None, offset=None)` | `par_rt_db.admin` | `GET /admin/audit` — durable audit-log rows, newest-first, with optional filters. |
+| `RtDbAdminClient.list_schema_history(db, *, limit=None, offset=None)` | `par_rt_db.admin` | `GET /admin/db/{db}/schema/history` — newest-first schema-push summary list. |
+| `RtDbAdminClient.get_schema_version(db, version)` | `par_rt_db.admin` | `GET /admin/db/{db}/schema/history/{version}` — one full schema snapshot. |
+| `RtDbAdminClient.restore_schema(db, version, *, confirm)` | `par_rt_db.admin` | Restores a database's schema to a prior pushed version. |
+| `RtDbAdminClient.admin_pause_schedule(db, id)` / `.admin_resume_schedule(db, id)` | `par_rt_db.admin` | Admin-scoped pause/resume of a scheduled job in `db`. |
+| `MintedToken` | `par_rt_db.admin` | Result of `mint_token()` — the token id and the one-time-visible secret. |
+| `TokenInfo` | `par_rt_db.admin` | Row returned by `list_tokens()` — token metadata without the secret. |
+| `SessionInfo` | `par_rt_db.admin` | Row returned by `list_sessions()`. |
+| `AuditEntry` | `par_rt_db.admin` | Row returned by `get_audit()`. |
+| `SchemaHistorySummary` | `par_rt_db.admin` | Row returned by `list_schema_history()` (schema blob omitted). |
+| `SchemaHistoryEntry` | `par_rt_db.admin` | Row returned by `get_schema_version()` (includes the full schema blob). |
+| `Webhook` | `par_rt_db.admin` | Row returned by `list_webhooks()` / config accepted by `create_webhook()`. |
+| `WebhookDelivery` | `par_rt_db.admin` | Row returned by `list_deliveries()`, a webhook's delivery history. |
+
 ## Wire contract
 
-`par_rt_db/wire.py` is the **fourth** implementation of par-rt-db's protocol
+`src/par_rt_db/wire.py` is one of four implementations of par-rt-db's protocol
 contract (alongside the server, the TS SDK, and the Rust crate). They must stay
 byte-identical — same discriminator tags (`type` / `op`), same camelCase field
 aliases, same omit-when-absent rules. Changing the wire format on any side is a

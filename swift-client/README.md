@@ -8,6 +8,28 @@ plus a thin SwiftUI package (`ParRtDbUI` — an `@Observable LiveQuery` wrapper)
 Design and scope:
 [docs/superpowers/specs/2026-08-18-swift-client-design.md](../docs/superpowers/specs/2026-08-18-swift-client-design.md).
 
+## Table of Contents
+
+- [Requirements](#requirements)
+- [Installation (Swift Package Manager)](#installation-swift-package-manager)
+- [Quick start](#quick-start)
+  - [One-shot HTTP: query + mutate](#one-shot-http-query-mutate)
+  - [Reactive: `RtDbClient` + `LiveQuery` in SwiftUI](#reactive-rtdbclient-livequery-in-swiftui)
+- [DSL examples](#dsl-examples)
+  - [Query DSL (`TableQuery`)](#query-dsl-tablequery)
+  - [Mutation DSL (`MutationBuilder`)](#mutation-dsl-mutationbuilder)
+  - [Durable workflows](#durable-workflows)
+  - [Schema DSL (`SchemaBuilder`)](#schema-dsl-schemabuilder)
+    - [Computed fields (`ValueExpr`)](#computed-fields-valueexpr)
+- [Storage](#storage)
+- [Admin client](#admin-client)
+- [Error handling](#error-handling)
+- [In-memory engine](#in-memory-engine)
+- [Full API](#full-api)
+- [Testing](#testing)
+- [Coverage: v1 surfaces vs deferred](#coverage-v1-surfaces-vs-deferred)
+- [License](#license)
+
 ## Requirements
 
 - Swift 6 (Swift concurrency in strict mode; `swift-tools-version:6.0`)
@@ -36,11 +58,11 @@ targets: [
 In an Xcode app project: File → Add Package Dependencies… → Add Local… → select
 `swift-client/`.
 
-```swift
-// Future remote form, once the package is published (SPM resolves packages at
-// a repo root, so this lands when swift-client gets its own release tag):
-// .package(url: "https://github.com/paulrobello/par-rt-db.git", branch: "main")
-```
+Nothing is published today: there is no root `Package.swift` in this repository
+and no release tag, so a URL-based SwiftPM dependency
+(`.package(url: "https://github.com/paulrobello/par-rt-db.git", ...)`) does not
+resolve. The local-path form above is the only supported installation method
+until a release process exists.
 
 ## Quick start
 
@@ -350,10 +372,10 @@ DSL's filters. Two examples:
 The expression may reference only declared NON-computed fields (push validation
 rejects undeclared references, computed-on-computed chains, and a
 statically-known result kind the field type does not accept — wrap arithmetic
-feeding an `int64` field in `.cast(value:, to: .toString)`, since int64 travels
-as a decimal string on the wire). An evaluation error (division by zero, a bad
-cast) fails the write with BAD_REQUEST naming the field. A `renameField`
-migration rewrites the expression's references with the field.
+feeding an `int64` field in `.cast(value: expr, to: .toString)`, since int64
+travels as a decimal string on the wire). An evaluation error (division by
+zero, a bad cast) fails the write with BAD_REQUEST naming the field. A
+`renameField` migration rewrites the expression's references with the field.
 
 ## Storage
 
@@ -435,25 +457,57 @@ let result = try await retryOnPrecondition {
 }
 ```
 
+## In-memory engine
+
+`InMemoryRtDbClient` (`Sources/ParRtDbClient/InMemoryEngine.swift`) mirrors the
+server's DSL, step-result, and system-field semantics without a network or a
+database — useful for unit tests and previews. It runs the same
+`wire-corpus/semantics/` and `wire-corpus/golden-vector.json` corpora as the
+other four client implementations.
+
+```swift
+let engine = InMemoryRtDbClient()
+try engine.pushSchema(schema)
+let results = try engine.mutate(txn)          // synchronous — no I/O
+let value = try engine.query(openTasks)        // raw JSONValue result
+```
+
+## Full API
+
+Surfaces not shown in the examples above:
+
+| Symbol | Source file |
+| --- | --- |
+| `RtDbHttpClient.batchQuery(_:)` — run multiple queries in one request | `Sources/ParRtDbClient/HttpClient.swift` |
+| `RtDbHttpClient.findOneByIndex(...)` — single-row index lookup | `Sources/ParRtDbClient/HttpClient.swift` |
+| `RtDbHttpClient.upsertByIndex(...)` — insert-or-update keyed by index | `Sources/ParRtDbClient/HttpClient.swift` |
+| `RtDbClient.status()` — current `ClientStatus` (connection state + user) | `Sources/ParRtDbClient/WsClient.swift` |
+| `WsState` — coarse connection state enum (`idle`/`connecting`/`connected`/`reconnecting`/`closed`) | `Sources/ParRtDbClient/WsClient.swift` |
+| `LiveQuery.start()` / `LiveQuery.stop()` — begin/end a live query's subscription | `Sources/ParRtDbUI/LiveQuery.swift` |
+| `encodeCursor(_:)` / `decodeCursor(_:)` — pagination cursor codec, byte-compatible with the other four clients | `Sources/ParRtDbClient/Cursor.swift` |
+| `RtDbAdminClient.dbStats(_:)` — table/row/storage counts for a database | `Sources/ParRtDbClient/AdminClient.swift` |
+| `RtDbAdminClient.listSubscriptions(db:)` — active subscriptions across the instance or one database | `Sources/ParRtDbClient/AdminClient.swift` |
+| `InMemoryRtDbClient` — in-process engine implementing the same query/mutate/schema surface (see [In-memory engine](#in-memory-engine)) | `Sources/ParRtDbClient/InMemoryEngine.swift` |
+
 ## Testing
 
-- `swift test` from `swift-client/` — 387 tests in 26 suites (Swift Testing
-  framework): wire-type round-trips, DSL builder shapes, URLProtocol-mocked
-  HTTP + admin tests, fake-transport WS tests, in-memory engine tests, and
-  `LiveQuery` main-actor tests.
+- `swift test` from `swift-client/` (Swift Testing framework): wire-type
+  round-trips, DSL builder shapes, URLProtocol-mocked HTTP + admin tests,
+  fake-transport WS tests, in-memory engine tests, and `LiveQuery` main-actor
+  tests.
 - The wire layer runs the shared [`wire-corpus/wire-corpus.json`](../wire-corpus/wire-corpus.json)
   parity corpus (ARC-008): every message/user/schedule/query/migrate section
   must round-trip value-identically, and every `rejects_*` section must be
   rejected.
-- The in-memory engine runs both behavioral corpora against
-  [`wire-corpus/semantics/`](../wire-corpus/semantics) (ENH-023 — all 53
-  cases: per-case schema/seed/op/expect with `normalize` projection,
-  `unordered` multiset compare, `$idRef` substitution, the `$prev` paginate
-  sentinel, and error-code assertions) and
+- The in-memory engine runs both behavioral corpora against every case in
+  [`wire-corpus/semantics/`](../wire-corpus/semantics) (ENH-023 — per-case
+  schema/seed/op/expect with `normalize` projection, `unordered` multiset
+  compare, `$idRef` substitution, the `$prev` paginate sentinel, and
+  error-code assertions) and every case in
   [`wire-corpus/golden-vector.json`](../wire-corpus/golden-vector.json)
-  (QA-001 — all 38 cases over the shared seeded dataset), the same fixtures
-  the server and the ts/rust/python engines execute; the server is the source
-  of truth for every expected value.
+  (QA-001 — over the shared seeded dataset), the same fixtures the server and
+  the ts/rust/python engines execute; the server is the source of truth for
+  every expected value.
 - Live-server integration tests ship in the suite (`LiveIntegrationTests`):
   `httpPushQueryMutateRoundTrip` (schema push, inserts, ordered scan, count
   terminal, blob upload/serve round trip, error envelope against a real
@@ -482,7 +536,7 @@ let result = try await retryOnPrecondition {
 | `ParRtDbUI` — `@Observable LiveQuery<T>` | ✅ |
 | Admin client — the full `/admin/*` control plane (db CRUD/clone/export/import, schema push/preview/get/history/restore, tokens, allowlist, admins, metrics, hot config, op feed, audit, sessions, merge-users, owner-bypass query/mutate, explain, slow queries, backups, webhooks + deliveries, admin workflow/schedule/file views) | ✅ |
 | Migrate DSL — `Migration` builder for every directive kind (incl. the typed `ValueExpr` evalExpr path), `Directive` wire family pinned by the corpus | ✅ |
-| In-memory engine — `InMemoryRtDbClient` mirrors the server's DSL/step-result/system-field semantics; fifth runner of `wire-corpus/semantics/` (53 cases) + `wire-corpus/golden-vector.json` (38 cases) | ✅ (2026-08-19) |
+| In-memory engine — `InMemoryRtDbClient` mirrors the server's DSL/step-result/system-field semantics; fifth runner of every case in `wire-corpus/semantics/` and `wire-corpus/golden-vector.json` | ✅ (2026-08-19) |
 | OAuth login-flow helpers | Not in v1 (spec decision — the `getToken` hook is the integration seam) |
 
 ## License

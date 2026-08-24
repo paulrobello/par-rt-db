@@ -242,6 +242,12 @@ export class RtDbClient {
     this.optimistic = options.optimisticUpdates ?? false;
   }
 
+  /**
+   * Opens the WebSocket connection and begins the auth handshake. Safe to
+   * call when already connecting or connected — it is a no-op in those
+   * states. Clears any prior `"unreachable"` auth signal so the next
+   * `authUnreachableAfterAttempts` closes are needed to re-signal it.
+   */
   connect(): void {
     this.stopped = false;
     if (this.connState === "connecting" || this.connState === "connected") {
@@ -257,6 +263,12 @@ export class RtDbClient {
     this.openSocket();
   }
 
+  /**
+   * Closes the connection and stops reconnecting. Rejects every in-flight
+   * mutation, scheduled-txn call, and workflow call, and reverts any
+   * unresolved optimistic subscription overlay back to its last
+   * server-confirmed value. Call `connect()` to reopen.
+   */
   close(): void {
     this.stopped = true;
     this.generation++;
@@ -279,6 +291,14 @@ export class RtDbClient {
     }
   }
 
+  /**
+   * Sets (or clears, with `null`) the bearer token used for the WS
+   * handshake and re-dials the connection under the new credential.
+   * Rejects any in-flight mutation, scheduled-txn call, or workflow call —
+   * they were authorized under the old credential and must be retried.
+   * Cookie-mode apps call this with `null` after sign-in/sign-out to
+   * trigger a re-dial without touching `localStorage`.
+   */
   setToken(token: string | null): void {
     this.token = token;
     this.hasToken = true;
@@ -296,28 +316,47 @@ export class RtDbClient {
     this.openSocket();
   }
 
+  /** Returns the current auth state (`"unauthenticated"` |
+   * `"authenticating"` | `"authenticated"` | `"unreachable"`). */
   getAuthState(): AuthState {
     return this.authState;
   }
 
+  /** Returns the authenticated principal, or `null` when not authenticated. */
   getUser(): AuthedUser | null {
     return this.user;
   }
 
+  /**
+   * Registers a callback fired on every auth state or user change. Returns
+   * an unsubscribe function.
+   */
   onAuthChange(cb: (state: AuthState, user: AuthedUser | null) => void): () => void {
     this.authListeners.add(cb);
     return () => this.authListeners.delete(cb);
   }
 
+  /** Returns the current WebSocket connection state. */
   getConnectionState(): ConnectionState {
     return this.connState;
   }
 
+  /**
+   * Registers a callback fired on every connection state change. Returns
+   * an unsubscribe function.
+   */
   onConnectionChange(cb: (state: ConnectionState) => void): () => void {
     this.connListeners.add(cb);
     return () => this.connListeners.delete(cb);
   }
 
+  /**
+   * Subscribes to a live query: `onUpdate` fires with the current result
+   * immediately (once known) and again on every server-pushed change.
+   * Deduplicates identical queries under one server subscription. Returns
+   * an unsubscribe function; the server subscription is torn down once its
+   * last listener unsubscribes.
+   */
   subscribe<R>(query: RtQuery<R>, onUpdate: (value: R) => void): () => void {
     const key = JSON.stringify(query.json);
     let sub = this.subsByKey.get(key);

@@ -61,6 +61,9 @@ authoritative source of truth; the spec is a historical design record. Point at
 | `2026-08-15-workflows-design.md` | Implemented | shipped (recorded 2026-08-16) | §2 #29 (Durable declarative workflows, FM-29) | — |
 | `2026-08-16-cascade-delete-soft-delete-design.md` | Implemented | shipped (recorded 2026-08-16) | §2 #33 (Cascade delete + soft delete, FM-33) | — |
 | `2026-08-16-field-defaults-design.md` | Implemented | shipped (recorded 2026-08-16) | §2 #32 (Field-level default values, FM-32) | — |
+| `2026-08-18-swift-client-design.md` | Implemented (wire + DSL + HTTP + reactive WS + SwiftUI `LiveQuery` + in-memory engine) | shipped 2026-08-19 | §1 (the four client SDKs) + §7 (client coverage) | — |
+| `2026-08-21-workflow-await-signal-design.md` | Implemented (`awaitSignal` step + HTTP/WS/admin signal surfaces) | shipped 2026-08-21 | §2 #29 (Durable declarative workflows, FM-29) | — |
+| `2026-08-22-multi-instance-stage4-design.md` | Implemented (Stages 1–4c: ownership lease, shadow committers, spooled write forwarding, takeover on timeout) | shipped 2026-08-23 | §4 (multi-instance operation) | — |
 
 ## Notes
 
@@ -85,6 +88,14 @@ authoritative source of truth; the spec is a historical design record. Point at
   client (query/mutate, admin, storage — `pip install par-rt-db[http]`), and
   the reactive WebSocket client (`pip install par-rt-db[ws]`) all ship; the
   four clients are at feature parity.
+- **Multi-instance.** ENH-022 shipped in stages: shared session/OAuth state and
+  the cross-replica op feed (Stage 2), presence gossip (Stage 3), the
+  advisory-lock ownership lease and shared rate counters (Stage 4), and write
+  forwarding to the lease owner with takeover on timeout (Stage 4c). The
+  remediation cycle recorded in `CHANGELOG.md` then added spooled forward
+  requests and replies, server-minted idempotency keys on forwarded mutates,
+  and cross-replica subscription invalidation. `README.md`'s "Multi-instance"
+  section describes the shipped behavior.
 - **The code is the source of truth.** When a spec and the implementation
   disagree, the implementation (and `FEATURE_MATRIX.md`) wins. Specs are linked
   from READMEs as historical design context, not as authoritative behavior

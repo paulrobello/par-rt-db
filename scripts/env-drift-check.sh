@@ -37,8 +37,11 @@ echo "env-drift-check: all $(echo "$documented" | wc -l | tr -d ' ') documented 
 # knows about `.env.example`. A `Config::from_env` key that is neither in
 # `.env.example` nor in docker-compose.yml would slip past it and silently keep
 # its code default in every docker deploy. This second pass closes that gap by
-# diffing every `std::env::var("RTDB_*")` call across server/src/ (not just
-# config.rs — RTDB_ADMIN_EMAILS is read at main.rs) against the forwarded set.
+# diffing every `RTDB_*` key read across server/src/ (not just config.rs —
+# RTDB_ADMIN_EMAILS is read at main.rs) against the forwarded set. Most of
+# `Config::from_env`'s ~50+ knobs go through the `env_parsed`/`env_bool`
+# helpers in config.rs rather than a bare `std::env::var(...)` call, so all
+# three call shapes are matched.
 #
 # A short exempt list documents the keys that are intentionally defaulted in the
 # docker deploy — adding to this list requires a comment explaining why the code
@@ -56,9 +59,12 @@ EOF
 # (integration tests point it at the dev Postgres). Not a production knob —
 # must never be forwarded to the docker deploy.
 
-# Pull every RTDB_* key the server reads (config.rs + main.rs + any module).
-read_in_code=$(grep -roE 'std::env::var\("RTDB_[A-Z_]+"\)' server/src/ \
-  | sed -E 's/.*"(.+)".*/\1/' | sort -u)
+# Pull every RTDB_* key the server reads (config.rs + main.rs + any module),
+# across all three read shapes: the bare std::env::var call and the
+# env_parsed/env_bool helpers in config.rs (both take the key as their first
+# argument).
+read_in_code=$(grep -roE '(std::env::var|env_parsed|env_bool)\("RTDB_[A-Z0-9_]+"' server/src/ \
+  | sed -E 's/.*"(.+)"/\1/' | sort -u)
 
 # Subtract the forwarded set and the exempt list. Anything left is a key the
 # code reads but the docker deploy never forwards AND that isn't on the

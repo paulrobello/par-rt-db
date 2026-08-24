@@ -27,16 +27,21 @@ export class Migration {
   private readonly directives: DirectiveJson[] = [];
   private dry = false;
 
+  /** Renames a declared field on `table`, preserving its data. */
   renameField(table: string, from: string, to: string): this {
     this.directives.push({ op: "renameField", table, from, to });
     return this;
   }
 
+  /** Renames a table, preserving its data and indexes. */
   renameTable(from: string, to: string): this {
     this.directives.push({ op: "renameTable", from, to });
     return this;
   }
 
+  /** Changes `field`'s declared type to `to`, coercing existing values with
+   * `cast`. `def` substitutes for values that fail to coerce; without it, a
+   * single bad value rolls the whole migration back atomically. */
   changeType(table: string, field: string, to: FieldTypeJson, cast: Cast, def?: unknown): this {
     this.directives.push({
       op: "changeType",
@@ -49,21 +54,28 @@ export class Migration {
     return this;
   }
 
+  /** Drops a declared field from `table`, discarding its data. */
   dropField(table: string, field: string): this {
     this.directives.push({ op: "dropField", table, field });
     return this;
   }
 
+  /** Drops a table and all of its data. */
   dropTable(name: string): this {
     this.directives.push({ op: "dropTable", name });
     return this;
   }
 
+  /** Drops a declared index by name, leaving the underlying field data
+   * untouched. */
   dropIndex(table: string, name: string): this {
     this.directives.push({ op: "dropIndex", table, name });
     return this;
   }
 
+  /** Backfills `value` into `field` on every existing row that is missing
+   * it. Does not change the schema's declared default for new rows — pair
+   * with `.defaults()` on the schema for that. */
   setDefault(table: string, field: string, value: unknown): this {
     this.directives.push({ op: "setDefault", table, field, value });
     return this;
@@ -107,6 +119,7 @@ export class Migration {
     return this;
   }
 
+  /** Emits the wire request body consumed by `POST /admin/db/{db}/migrate`. */
   build(): MigrateRequestJson {
     return { directives: [...this.directives], dryRun: this.dry };
   }

@@ -10,27 +10,31 @@
 //!
 //! | Feature | Default | Surface |
 //! | --- | --- | --- |
-//! | `http` | yes | `RtDbHttpClient` — typed query / mutate / `auth_me` |
-//! | `ws` | no | `RtDbClient` (`src/ws.rs`) — reactive WebSocket client (live query subscriptions + mutate) |
-//! | `admin` | no | `/admin/*` control-plane client — push-schema, create-db, mint-token, revoke-token, allowlist, export, import |
-//! | `in_memory` | no | `InMemoryRtDbClient` (`src/in_memory/mod.rs`) — in-memory harness for unit tests (no network, no Postgres) |
+//! | `http` | yes | [`RtDbHttpClient`] — typed query / mutate / `auth_me` |
+//! | `ws` | no | [`RtDbClient`] (`src/ws.rs`) — reactive WebSocket client (live query subscriptions, presence, optimistic updates, mutate) |
+//! | `admin` | no | [`RtDbAdminClient`] — `/admin/*` control-plane client: db create/list/push-schema, `explain_query`, webhooks, audit log, sessions, `merge_users`, backups, `clone_db`, and more |
+//! | `in_memory` | no | [`InMemoryRtDbClient`] (`src/in_memory/mod.rs`) — in-memory harness for unit tests (no network, no Postgres) |
 //!
 //! `core` (wire types, schema/query/mutation builders, error model) compiles with no
 //! features. `[lints.rust] warnings = "deny"` — same zero-warning posture as the server.
 //!
-//! The `http` surface also carries `.filter()` / `.search()` / `.vector_search()` query
-//! builders, the `mutate_with_retry` precondition-conflict helper, `upsert_by_index` /
-//! `find_one_by_index` shortcuts, scheduled/cron transactions, durable
-//! workflows, and file storage
-//! (`upload` / `delete_file` / `get_file_metadata` / `get_url`).
+//! The `http` surface also carries `.filter()` / `.search()` / `.vector_search()` /
+//! `.hybrid_search()` / `.fields()` / `.distinct()` / `.aggregate()` query builders,
+//! `batch_query` for fanning out many queries in one round trip, the
+//! `mutate_with_retry` precondition-conflict helper, `upsert_by_index` /
+//! `find_one_by_index` shortcuts, scheduled/cron transactions, durable workflows, and
+//! file storage (`upload` / `upload_stream` / `delete_file` / `get_file_metadata` /
+//! `get_url` / `get_signed_url` / `transform_url`). The `ws` surface additionally
+//! exposes presence and optimistic updates on live query [`Subscription`]s,
+//! configured via [`Config`] and reporting [`ConnectionState`].
 //!
 //! # Wire contract
 //!
-//! `src/wire.rs` is the **third** implementation of par-rt-db's protocol contract
-//! (alongside `server/src/protocol.rs` and `ts-client/src/protocol.ts`; the Python
-//! client's `wire.py` is the fourth). They must stay byte-identical — same serde tags
-//! and field names. Changing the wire format on any side is a breaking change unless
-//! mirrored across all clients.
+//! `src/wire.rs` is one of four implementations of par-rt-db's protocol contract
+//! (alongside `server/src/protocol.rs`, `ts-client/src/protocol.ts`, and the Python
+//! client's `wire.py`). They must stay byte-identical — same serde tags and field
+//! names. Changing the wire format on any side is a breaking change unless mirrored
+//! across all clients.
 //!
 //! See the crate [`README`](https://github.com/paulrobello/par-rt-db/blob/main/rust-client/README.md)
 //! for install snippets, quick-start examples (HTTP query/mutate, scheduling, file
@@ -81,7 +85,9 @@ pub use wire::{
 };
 
 #[cfg(feature = "http")]
-pub use http::{Fit, OutFormat, RtDbHttpClient, TransformOpts};
+pub use http::{
+    FileMetadata, Fit, OutFormat, RtDbHttpClient, SignedUrl, TransformOpts, UploadResult,
+};
 
 #[cfg(feature = "admin")]
 pub use admin::RtDbAdminClient;

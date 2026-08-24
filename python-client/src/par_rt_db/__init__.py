@@ -1,6 +1,6 @@
 """par-rt-db Python client.
 
-The fourth implementation of par-rt-db's JSON wire contract, alongside
+One of four implementations of par-rt-db's JSON wire contract, alongside
 ``server/src/protocol.rs``, ``ts-client/src/protocol.ts``, and
 ``rust-client/src/wire.rs``. This module packages the wire types and the
 declarative schema/query/mutation DSL; the one-shot HTTP client (data plane,

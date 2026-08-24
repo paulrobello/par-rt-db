@@ -22,6 +22,7 @@ working with zero providers configured.
 - [Microsoft (Entra ID / Azure AD v2.0)](#microsoft-entra-id--azure-ad-v20)
 - [Sign in with Apple](#sign-in-with-apple)
 - [Applying changes](#applying-changes)
+- [Session lifetime](#session-lifetime)
 - [Verifying](#verifying)
 - [Hardening](#hardening)
 - [Troubleshooting](#troubleshooting)
@@ -373,6 +374,28 @@ docker compose up -d    # no --build needed for an env-only change
 ```
 
 Locally / in dev, put the same vars in your `.env` and restart the dev server.
+
+**Disabling a provider (rollback)** is the same operation in reverse: blank
+that provider's client ID/secret (or comment out the lines) in `.env`, recreate
+the container, and its `/auth/{provider}/*` routes return `503` again —
+existing sessions for users who already signed in via that provider are
+unaffected (identity is stored per-user, not per-provider), only new logins
+through it are blocked.
+
+## Session lifetime
+
+Successful logins mint a session in `rtdb_auth.sessions`, whose lifetime is
+controlled by two boot-only env vars (`server/src/config.rs`):
+
+- **`RTDB_SESSION_TTL_DAYS`** (default `30`) — how long a standard OAuth or
+  admin-key session stays valid before the holder must sign in again.
+- **`RTDB_ANONYMOUS_SESSION_TTL_DAYS`** (default `1`) — the shorter TTL for
+  sessions minted by `POST /auth/anonymous`, so ephemeral guest rows expire
+  quickly instead of accumulating as permanent users/sessions.
+
+Sessions ride an HttpOnly cookie; **`RTDB_COOKIE_SECURE`** (default `true`)
+sets the `Secure` attribute on that cookie unconditionally. Only set it
+`false` for local HTTP development — never on a public deploy.
 
 ## Verifying
 

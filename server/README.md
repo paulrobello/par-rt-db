@@ -8,14 +8,18 @@ query updates on change. One instance hosts many named databases. There is no
 embedded JS runtime and no per-app server code — this one generic binary serves
 every app.
 
-This directory holds the `rtdb-server` binary. The three client SDKs live
+This directory holds the `rtdb-server` binary. Four client SDKs live
 alongside it: [`../ts-client/`](../ts-client) (browser/Node),
-[`../rust-client/`](../rust-client) (Rust), and
+[`../rust-client/`](../rust-client) (Rust),
 [`../python-client/`](../python-client) (Python — wire + DSL + sync HTTP/admin/storage
-+ reactive WS, all shipped). An operator dashboard SPA
++ reactive WS, all shipped), and [`../swift-client/`](../swift-client)
+(`ParRtDbClient`/`ParRtDbUI`, Darwin-only). An operator dashboard SPA
 ([`../dashboard/`](../dashboard)) is served same-origin by the server when
 `RTDB_STATIC_DIR` is set, and the [`../cli/`](../cli) package wraps
-`par-rt-db-client` as the `rtdb` operator/CI binary. See the
+`par-rt-db-client` as the `rtdb` operator/CI binary. A [`../core/`](../core)
+crate holds the wire vocabulary shared by the server and the Rust client, so a
+drift between them is a compile error rather than a wire-corpus failure. See
+the
 [root README](../README.md) for the project overview and
 [`../CLAUDE.md`](../CLAUDE.md) for contributor guidance. The protocol and
 semantics are defined by the root README, [`../FEATURE_MATRIX.md`](../FEATURE_MATRIX.md),
@@ -93,14 +97,17 @@ is a historical record of the original design.
 
 ## Layout
 
+Paths below are relative to `server/src/` (this directory's `src/`).
+
 | Area | Files |
 | --- | --- |
-| Correctness core (serialized writes + subscription fan-out) | `src/committer.rs`, `src/subs.rs` |
-| Scheduled / cron transactions | `src/scheduler.rs` (+ the `RunScheduled` arm in `src/committer.rs`) |
-| Durable declarative workflows (FM-29) | `src/workflows.rs` (+ the `RunWorkflowAdvance` arm in `src/committer.rs`; scheduler polls both tables) |
-| TTL reaper | `src/reaper.rs` (+ the `RunReaper` arm in `src/committer.rs`) |
-| Schema migration (destructive transforms) | `src/migrate.rs` (+ the `RunMigrate` arm in `src/committer.rs`) |
-| Schema change history + restore | `src/schema_history.rs`, `src/schema_diff.rs` (+ the `RunRestoreSchema` arm in `src/committer.rs`) |
+| Correctness core (serialized writes + subscription fan-out) | `src/committer/` (`mod.rs` — lease + dispatch; `lease.rs`, `forwarding.rs`, `supervisor.rs`, `taps.rs`; `arms/` — one file per committer request arm: `mutate.rs`, `subscribe.rs`, `scheduled.rs`, `workflow.rs`, `reaper.rs`, `migrate.rs`, `schema.rs`, `merge.rs`), `src/subs.rs` |
+| Cross-replica write forwarding (ENH-022 Stage 4c) | `src/forward.rs` (spools a non-owner write into the `rtdb_auth.forward_queue` table when the local replica doesn't hold the write lease; `src/db.rs` owns the table DDL) |
+| Scheduled / cron transactions | `src/scheduler.rs` (+ the `RunScheduled` arm in `src/committer/arms/scheduled.rs`) |
+| Durable declarative workflows (FM-29) | `src/workflows.rs` (+ the `RunWorkflowAdvance` arm in `src/committer/arms/workflow.rs`; scheduler polls both tables) |
+| TTL reaper | `src/reaper.rs` (+ the `RunReaper` arm in `src/committer/arms/reaper.rs`) |
+| Schema migration (destructive transforms) | `src/migrate.rs` (+ the `RunMigrate` arm in `src/committer/arms/migrate.rs`) |
+| Schema change history + restore | `src/schema_history.rs`, `src/schema_diff.rs` (+ the `RunRestoreSchema` arm in `src/committer/arms/schema.rs`) |
 | File storage (blobs) | `src/storage.rs` (+ the storage routes in `src/http_api.rs`) |
 | On-the-fly image transforms (ENH-014) | `src/image_transform.rs` (read-time, both serve routes; `moka` cache + decode semaphore + pixel cap; `RTDB_IMAGE_*` knobs) |
 | Per-database resource quotas (ENH-011) | `src/quota.rs` (three global caps on `HotConfig`; tables/subs/storage enforcement; `QUOTA_EXCEEDED` 507) |
@@ -109,7 +116,7 @@ is a historical record of the original design.
 | Webhook outbox (when `RTDB_WEBHOOKS_ENABLED=true`) | `src/webhook.rs` (per-`DocOp` outbox row drained by a boot worker; at-least-once) |
 | Backup lifecycle (when `RTDB_BACKUP_ENABLED=true`) | `src/backup.rs` (manual `pg_dump` trigger + dump list/download/delete; `pg_restore --no-owner --no-privileges` into a fresh `rtdb_restored_<stamp>` DB) |
 | Rate limiter (per-token + per-db fixed window) | `src/rate_limit.rs` (`RTDB_RATE_LIMIT_PER_TOKEN_RPM` / `RTDB_RATE_LIMIT_PER_DB_RPM`, 0 = off) |
-| OpenTelemetry / OTLP tracing (ENH-018, opt-in) | `src/tracing_setup.rs` (subscriber init + `OtelGuard` flush); span instrumentation in `committer.rs`/`subs.rs`/`query/`/`txn.rs`. The `otel` cargo feature (default off) gates the deps + subscriber; `RTDB_OTEL_ENABLED` (default false) gates it at runtime. `committer.mutate` carries `queue_wait_ms`. |
+| OpenTelemetry / OTLP tracing (ENH-018, opt-in) | `src/tracing_setup.rs` (subscriber init + `OtelGuard` flush); span instrumentation in `src/committer/`/`src/subs.rs`/`src/query/`/`src/txn.rs`. The `otel` cargo feature (default off) gates the deps + subscriber; `RTDB_OTEL_ENABLED` (default false) gates it at runtime. `committer.mutate` carries `queue_wait_ms`. |
 | Query introspection (ENH-019) | `POST /admin/db/{db}/explain` (re-compiles a Query JSON via `compile_query`, returns `{sql, params, terminal, warnings}` — no rows) and `GET /admin/slow-queries` (bounded ring of queries that exceeded `RTDB_SLOW_QUERY_MS`). Ring + `SlowQueryRecord` in `src/metrics.rs`; explain + slow-query recording in `src/http_api.rs`; list endpoint in `src/admin/observability.rs`. `RTDB_SLOW_QUERY_MS=0` (default) disables; `RTDB_SLOW_QUERY_LOG_PARAMS=false` (default) keeps document content out of the log. |
 | Mutation-log dedup (idempotency) | `src/mutation_log.rs` |
 | Op feed (in-memory ring + `/admin/stream`) | `src/op_feed.rs` |
@@ -129,8 +136,8 @@ is a historical record of the original design.
 | Signed, time-limited storage URLs (ENH-017) | `src/signed_url.rs` (HMAC over `admin_key`, `?exp=&sig=` verified on `GET /storage/{id}`) |
 | Database bootstrap + admin SQL | `src/db.rs` (create/drop database, `storage_index`, the `rtdb_auth` schema) |
 | Cross-replica fan-out (ENH-022) | `src/notify.rs` (`pg_notify` on the `rtdb_ops` channel; per-process LISTEN mirrors peer replicas into the local op-feed ring) |
-| Privacy policy | `src/privacy.rs` (serves `GET /privacy`) |
-| Static SPA serving | `src/static/` (last-resort router fallback reading `RTDB_STATIC_DIR`) |
+| Privacy policy | `src/privacy.rs` (serves `GET /privacy` from `src/static/privacy.html`, the only file `src/static/` holds) |
+| Static SPA serving | `src/lib.rs` (`ServeDir`/`ServeFile` mounted as the router's last-resort fallback, reading `RTDB_STATIC_DIR`; hashed assets get an immutable `Cache-Control`, `index.html` gets `no-cache`) |
 | Auth (six OAuth providers + sessions + machine tokens + anonymous) | `src/auth/` — `mod.rs`, `provider.rs` (trait + dispatcher), `github.rs`, `google.rs`, `gitlab.rs`, `microsoft.rs` (Entra ID/Azure AD v2), `apple.rs` (ES256 JWT `client_secret` + `form_post`), `oidc.rs` (generic), `session.rs`, `tokens.rs`, `cookie.rs`. Anonymous auth (`POST /auth/anonymous`, gated `RTDB_AUTH_ANONYMOUS_ENABLED` default off) mints an ephemeral `Principal::User` (`anonymous = true`, `email = None`) that bypasses the per-db allowlist via its boot gate and owns its own documents via per-row `ownerField`. On a later OAuth sign-in, the anon footprint is merged into the real account (`src/merge.rs` — doc restamps in the committer, storage owner swap, session re-point, guarded anon-row delete); `POST /admin/merge-users` is the operator escape hatch. |
 
 The read path compiles a db-side `filter()` predicate DSL to SQL, a full-text
@@ -173,8 +180,12 @@ the [root README](../README.md#endpoints)):
 - `POST /api/mutate` — one-shot transactions (both transports route through the
   committer, so subscriptions fire either way).
 
-Every `RTDB_*` knob name-dropped in this README is documented with its type,
+Most `RTDB_*` knobs name-dropped in this README have a row with their type,
 default, and meaning in the [root README's Configuration section](../README.md#configuration).
+A few groups (`RTDB_RATE_LIMIT_*`, `RTDB_IMAGE_*`, `RTDB_PRESENCE_*`) are
+documented in that README's prose near the feature they configure instead of
+in the table — search the root README for the exact variable name if it isn't
+in the Configuration table.
 
 ## Scheduling
 
@@ -190,8 +201,11 @@ path and finalizes the row, so the single-writer invariant is intact. The
 scheduler task only writes the side table (claim/reset) — it never executes
 transactions itself.
 
-`when` is one-shot (`afterMs`/`runAt`) or a 5-field cron expression (UTC,
-min-first, via the `croner` crate). Delivery is **at-least-once**: a crash
+`when` is one-shot (`afterMs`/`runAt`), a 5-field cron expression (UTC,
+min-first, via the `croner` crate), or a fixed `interval` (`everyMs`,
+first fire one interval from now; a missed window from downtime or a pause is
+skipped, never backfilled — each fire re-arms from its actual fire time, like
+cron). Delivery is **at-least-once**: a crash
 between commit and finalize is recovered by `reset_running` on startup, so apps
 should write idempotent scheduled txns. A past-due one-shot fires immediately
 (catch-up); cron **skips** missed windows with no backfill. WS surface:

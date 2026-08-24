@@ -23,26 +23,38 @@ export interface RtQuery<Result> {
 export class TableQuery<DocT, Indexes extends string> {
   constructor(private readonly json: QueryJson) {}
 
+  /** Selects a declared index and an optional equality prefix (`eq`) over
+   * its leading fields. Range bounds (`gt`/`gte`/`lt`/`lte`) apply to the
+   * index field immediately after the `eq` prefix. */
   withIndex(index: Indexes, eq: unknown[] = []): TableQuery<DocT, Indexes> {
     return new TableQuery({ ...this.json, index, eq });
   }
 
+  /** Restricts the index field after the `eq` prefix to values strictly
+   * greater than `value`. Requires `withIndex`. */
   gt(value: unknown): TableQuery<DocT, Indexes> {
     return new TableQuery({ ...this.json, gt: value });
   }
 
+  /** Restricts the index field after the `eq` prefix to values greater
+   * than or equal to `value`. Requires `withIndex`. */
   gte(value: unknown): TableQuery<DocT, Indexes> {
     return new TableQuery({ ...this.json, gte: value });
   }
 
+  /** Restricts the index field after the `eq` prefix to values strictly
+   * less than `value`. Requires `withIndex`. */
   lt(value: unknown): TableQuery<DocT, Indexes> {
     return new TableQuery({ ...this.json, lt: value });
   }
 
+  /** Restricts the index field after the `eq` prefix to values less than
+   * or equal to `value`. Requires `withIndex`. */
   lte(value: unknown): TableQuery<DocT, Indexes> {
     return new TableQuery({ ...this.json, lte: value });
   }
 
+  /** Sets result order (`"asc"` or `"desc"`) by the selected index. */
   order(order: Order): TableQuery<DocT, Indexes> {
     return new TableQuery({ ...this.json, order });
   }
@@ -133,18 +145,24 @@ export class TableQuery<DocT, Indexes extends string> {
     return new TableQuery({ ...this.json, hybridSearch });
   }
 
+  /** Terminal: returns up to `n` matching docs. */
   take(n: number): RtQuery<DocT[]> {
     return { json: { ...this.json, take: n } };
   }
 
+  /** Terminal: returns the single matching doc, or `null` if none match.
+   * The server rejects the query if more than one doc matches. */
   unique(): RtQuery<DocT | null> {
     return { json: { ...this.json, unique: true } };
   }
 
+  /** Terminal: returns the first matching doc in the selected order, or
+   * `null` if none match. */
   first(): RtQuery<DocT | null> {
     return { json: { ...this.json, first: true } };
   }
 
+  /** Terminal: returns the count of matching docs. */
   count(): RtQuery<number> {
     return { json: { ...this.json, count: true } };
   }
@@ -178,6 +196,10 @@ export class TableQuery<DocT, Indexes extends string> {
     return { json: { ...this.json, aggregate: spec } };
   }
 
+  /** Terminal: cursor-based pagination. `cursor` is the opaque cursor from
+   * a prior page (`undefined`/empty starts from the beginning); `numItems`
+   * caps the page size. Use `decodeCursor`/`encodeCursor` to inspect or
+   * construct cursors. */
   paginate(cursor: string | undefined, numItems: number): RtQuery<PaginatedResultJson> {
     // ARC-133: Paginate.cursor is `?:`-optional, so include it only when set
     // (exactOptionalPropertyTypes forbids literal `undefined`). `cursor || ""`
@@ -194,13 +216,18 @@ export class TableQuery<DocT, Indexes extends string> {
     };
   }
 
+  /** Terminal: returns every matching doc (no limit). */
   collect(): RtQuery<DocT[]> {
     return { json: { ...this.json } };
   }
 }
 
+/** Per-table query surface returned by {@link createApi}. */
 export interface TableApi<DocT, Indexes extends string> {
+  /** Starts a new query builder for this table. */
   query(): TableQuery<DocT, Indexes>;
+  /** Builds a query for the single doc with the given id, or `null` if
+   * absent. */
   get(id: Id<string> | string): RtQuery<DocT | null>;
 }
 

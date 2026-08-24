@@ -5,11 +5,51 @@ query/transaction protocol over WebSocket (reactive) and HTTP (one-shot). No cod
 your schema is a TypeScript object that is both pushed to the server and the source of
 inferred types.
 
+## Table of Contents
+
+- [Install](#install)
+- [Define a schema (once, shared by app + admin)](#define-a-schema-once-shared-by-app--admin)
+- [React](#react)
+  - [Authentication & token storage](#authentication--token-storage)
+- [Node / CLI](#node--cli)
+- [React Native / Expo](#react-native--expo)
+- [Scheduling](#scheduling)
+- [Durable workflows](#durable-workflows)
+- [Cascade delete & soft delete](#cascade-delete--soft-delete)
+- [Search](#search)
+- [Realtime presence](#realtime-presence)
+- [Schema migration](#schema-migration)
+- [File storage](#file-storage)
+- [In-memory test client](#in-memory-test-client)
+- [Full API](#full-api)
+- [Development](#development)
+
 ## Install
 
-```sh
-bun add @par-rt-db/client
+`@par-rt-db/client` is not yet published to npm — see
+[`docs/RELEASING.md`](../docs/RELEASING.md). Until it is, consume it as a
+file dependency built from source.
+
+Add it to your app's `package.json`:
+
+```json
+{
+  "dependencies": {
+    "@par-rt-db/client": "file:../ts-client"
+  }
+}
 ```
+
+Then build the package and install:
+
+```sh
+cd ts-client && bun install && bun run build
+cd .. && bun install
+```
+
+Inside this repo, packages that depend on the client (for example the
+dashboard) use a bun workspace dependency instead — `"@par-rt-db/client":
+"workspace:*"` — resolved to `ts-client/dist` by the root `bun install`.
 
 ## Define a schema (once, shared by app + admin)
 
@@ -34,18 +74,18 @@ mutate, and subscription re-run; machine tokens bypass):
 - `.collaboratorsField("memberIds")` — names an array-of-strings field; a
   principal reads/mutates a row if they own it **or** are listed in it.
 - `.authorize(expr)` — a general `FilterExpr` predicate over doc fields plus
-  `$user`/`$email` principal markers (e.g. `.authorize({ field: "userId", eq:
-  "$user" })`).
+  `$user`/`$email` principal markers (e.g. `.authorize({ op: "eq", field:
+  "userId", value: { $user: true } })`).
 - `.ttl("expiresAt")` — declares a document-TTL field; the server's per-db
   reaper deletes rows whose field value is past. The optional second argument
   (`defaultDurationMs`) stamps the field at insert time when a document omits
   it.
-- `.defaults({ status: "backlog" })` — declares field-level default values
-  (FM-32), stamped onto a **new** document that omits the key (insert / replace
+- `.defaults({ status: "backlog" })` — declares field-level default values,
+  stamped onto a **new** document that omits the key (insert / replace
   / upsert-insert only; `patch` never re-applies — clearing a field stays
   cleared).
-- `.updatedAtField("updatedAt")` — declares a server-stamped last-write field
-  (FM-36): names a declared `number` or `int64` field the server stamps with
+- `.updatedAtField("updatedAt")` — declares a server-stamped last-write field:
+  names a declared `number` or `int64` field the server stamps with
   the current epoch-ms on every version-bumping write (insert, patch, replace,
   upsert both branches, patchByQuery, cascade setNull), overwriting any
   client-supplied value — a JSON number on `number`, a decimal string on
@@ -53,7 +93,7 @@ mutate, and subscription re-run; machine tokens bypass):
   accepted and stamped; read types keep it required). Must differ from
   `ttl.field`; no index required.
 - `.autoIncrementField("num")` — declares a server-assigned per-table
-  monotonic counter (FM-37): names a declared `int64` field the server stamps
+  monotonic counter: names a declared `int64` field the server stamps
   with the next sequence value on insert (and upsert's insert branch) as a
   decimal string, overwriting any client-supplied value (a `defaults` entry
   on the field loses to the stamp). Optional in the insert input type —
@@ -63,7 +103,7 @@ mutate, and subscription re-run; machine tokens bypass):
   stored one. Must be `int64` exactly and differ from `ttl.field` and
   `updatedAtField`; legal in a unique index (the ticket-number guarantee).
   Gaps are possible on rolled-back transactions.
-- `.computed(name, expr)` — declares a server-computed field (ENH-028): the
+- `.computed(name, expr)` — declares a server-computed field: the
   server re-evaluates `expr` on every write (insert, patch, replace, upsert
   both branches, patchByQuery, cascade setNull) and stores the result,
   overwriting any client-supplied value. A null result REMOVES the key, so an
@@ -147,7 +187,7 @@ The server's recommended auth mode is **cookie mode**: after OAuth sign-in the
 server sets an HttpOnly `rtdb_session` cookie that the browser attaches
 automatically, and `useRtDbAuth()` / `RtDbProvider` send `credentials: "include"`
 on auth requests. JS can never read the cookie, and the cookie-mode sign-in
-begins with `mode=cookie` (SEC-207) so the completion poll's response body
+begins with `mode=cookie` so the completion poll's response body
 carries no token either — no script-readable copy of the credential exists at
 any point, so an XSS or malicious
 extension cannot lift the session token — this is the default and the safest
@@ -321,7 +361,7 @@ synchronously in unit tests.
 
 ## Durable workflows
 
-Durable declarative workflows (FM-29) — multi-step txn pipelines with per-step
+Durable declarative workflows — multi-step txn pipelines with per-step
 retry and sleeps, executed server-side and observable without holding a
 connection. Both the reactive `RtDbClient` and the one-shot `RtDbHttpClient`
 expose the trio, and a txn can start (or cancel) a run as a step, atomic with
@@ -392,7 +432,7 @@ await db.signalWorkflow(id, "approve", { approvedBy: "u1" }); // releases the ga
 
 ## Cascade delete & soft delete
 
-Referential actions (FM-33) are declared on the CHILD table's id field — no
+Referential actions are declared on the CHILD table's id field — no
 SQL FK; the server expands the cascade app-level inside the txn so every
 cascaded row is a first-class op (op-feed, audit, webhooks, subscriptions):
 
@@ -532,17 +572,61 @@ exercise the full DSL against it directly.
 `RtDbClient` also accepts an opt-in `optimisticUpdates` option that applies
 mutations to local state before the server confirms them.
 
+## Full API
+
+Surfaces not covered by the walkthroughs above. All symbols are exported from
+`@par-rt-db/client` (or `@par-rt-db/client/react` for the React entries)
+unless noted otherwise.
+
+| Symbol | Source file | What it does |
+| --- | --- | --- |
+| `TableQuery.vectorSearch(index, vector, opts)` | `src/query.ts` | Vector-similarity search over a declared vector index; `opts.filter` narrows results, `opts.limit` caps them. |
+| `TableQuery.hybridSearch(query, vector, limit, opts)` | `src/query.ts` | Fuses full-text and vector ranking via Reciprocal Rank Fusion; the table must declare both a search index and a vector index. |
+| `TableQuery.gt` / `.gte` / `.lt` / `.lte` | `src/query.ts` | Range bounds on the index field immediately after `withIndex`'s `eq` prefix. |
+| `RtDbClient.mutate(txn, { idempotencyKey })` | `src/client.ts` | Opt-in safe-retry key for a mutation — resend the same key to avoid double-applying a transaction whose result was never received. |
+| `TxnBuilder.undelete(table, id)` | `src/mutation.ts` | Restores a soft-deleted row on a table with `.softDelete()`. |
+| `TxnBuilder.expectVersion(table, id, version)` | `src/mutation.ts` | Precondition step: fails the transaction (`PRECONDITION_FAILED`) unless the row is currently at `version`. |
+| `TxnBuilder.expectAbsent(table, index, eq)` | `src/mutation.ts` | Precondition step: fails the transaction unless no row matches `eq` on `index`. |
+| `TxnBuilder.upsert(table, { index, eq, insert, patch })` | `src/mutation.ts` | Inserts `insert` if no row matches `eq` on `index`, otherwise patches the match with `patch`. |
+| `TxnBuilder.patchByQuery(table, filter, patch, limit?)` | `src/mutation.ts` | Patches every row matching `filter` (capped at `limit`, server max 1000). |
+| `TxnBuilder.deleteByQuery(table, filter, limit?)` | `src/mutation.ts` | Deletes every row matching `filter` (capped at `limit`, server max 1000). |
+| `Migration` and its builder methods (`renameField`, `renameTable`, `changeType`, `dropField`, `dropTable`, `dropIndex`, `setDefault`, `evalExpr`, `evalExprTyped`, `dryRun`, `build`) | `src/migration.ts` | Builds a destructive/type-changing schema migration applied via `RtDbAdminClient.migrate`. See [Schema migration](#schema-migration). |
+| `RtDbAdminClient.getSchemaHistory` / `.getSchemaVersion` / `.restoreSchema` | `src/admin.ts` | Lists, reads, and restores prior applied schema versions. |
+| `RtDbAdminClient.backupNow` / `.listBackups` / `.downloadBackup` / `.deleteBackup` / `.restoreBackup` | `src/admin.ts` | Triggers and manages instance backups; restore targets a fresh database, never the live one. |
+| `RtDbAdminClient.listWebhooks` / `.createWebhook` / `.editWebhook` / `.deleteWebhook` / `.listDeliveries` | `src/admin.ts` | Manages per-db webhook subscriptions and inspects delivery history. |
+| `RtDbAdminClient.getAudit` | `src/admin.ts` | Reads the per-db audit log of admin and write actions. |
+| `RtDbAdminClient.explainQuery(db, query)` | `src/admin.ts` | Returns the server's query plan for a given `RtQuery`/`QueryJson`, for performance diagnosis. |
+| `RtDbAdminClient.getSlowQueries` | `src/admin.ts` | Lists recently recorded slow queries for a db. |
+| `RtDbAdminClient.opsRecent` | `src/admin.ts` | Reads recent entries from the op feed. |
+| `RtDbAdminClient.listSubscriptions` | `src/admin.ts` | Lists active live-query subscriptions on the instance or a db. |
+| `RtDbAdminClient.dbStats` / `.metrics` / `.getConfig` / `.patchConfig` | `src/admin.ts` | Per-db stats, instance metrics, and hot-reloadable runtime config. |
+| `RtDbError` / `RtDbErrorCode` | `src/errors.ts` | The error class every client surface throws, carrying a stable code from the closed set documented on the class (`UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `SCHEMA_VIOLATION`, `PRECONDITION_FAILED`, `CONFLICT`, `BAD_REQUEST`, `INTERNAL`, `RATE_LIMITED`, `QUOTA_EXCEEDED`). |
+| `encodeCursor` / `decodeCursor` | `src/pagination.ts` | Encodes/decodes the opaque cursor used by `TableQuery.paginate` and `usePaginatedQuery`. |
+| `useRtDbAuth` | `src/react.tsx` (`react` entry) | React hook exposing `state`, `user`, `signIn`, `signInAnonymous`, and `signOut`. |
+| `Authenticated` / `Unauthenticated` / `AuthLoading` | `src/react.tsx` (`react` entry) | Conditional-render components gated on the current auth state. |
+| `useRtDbClient` | `src/react.tsx` (`react` entry) | Returns the `RtDbClient` instance passed to the enclosing `RtDbProvider`. |
+| `useConnectionState` | `src/react.tsx` (`react` entry) | React hook tracking the client's WebSocket connection state. |
+| `usePaginatedQuery` | `src/usePaginatedQuery.tsx` (`react` entry) | React hook for cursor-paginated queries with page-advance state. |
+
 ## Development
 
-The full gate runs from the **repo root** and covers all six packages; the
-integration suite is opt-in and lives under `ts-client/` (these are separate
-Makefiles — `make test-integration` is not a root target):
+The full gate runs from the **repo root** and covers all packages; see
+[Verification gates](../README.md#verification-gates) for what each stage
+checks and how the packages fit together.
 
 ```sh
-# from the repo root — fmt-check + lint + typecheck + test across all six packages
+# from the repo root — fmt-check + lint + typecheck + test across all packages
 make checkall
 make env-drift-check   # confirms RTDB_* keys stay in sync across .env.example, compose, and source
+```
 
-# from ts-client/ — opt-in live-server tests; needs RTDB_TEST_SERVER_URL + RTDB_TEST_ADMIN_KEY
+`ts-client` also has its own `Makefile` with the same standard targets
+(`fmt`, `fmt-check`, `lint`, `typecheck`, `test`, `build`, `checkall`) scoped
+to this package, for iterating without the full gate. Its live-server
+integration suite is opt-in and separate from `make test` — it needs a
+running server (`RTDB_TEST_SERVER_URL` + `RTDB_TEST_ADMIN_KEY`):
+
+```sh
+# from ts-client/
 make test-integration
 ```

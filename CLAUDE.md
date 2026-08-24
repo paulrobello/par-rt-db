@@ -10,10 +10,11 @@ Authoritative sources: [README.md](README.md) for the HTTP/WS surface, the DSL, 
 
 ## Workspace & commands
 
-Seven packages run from the root `Makefile` (swift-client's lines are Darwin-guarded — they echo a loud skip on Linux, and a macOS CI job runs `make swift-client-checkall`):
+Eight packages run from the root `Makefile` (swift-client's lines are Darwin-guarded — they echo a loud skip on Linux, and a macOS CI job runs `make swift-client-checkall`):
 
 | Package | Path | Tool |
 | --- | --- | --- |
+| Core — `par-rt-db-core`, the shared wire vocabulary | `core/` | cargo |
 | Server — the realtime DB binary | `server/` | cargo |
 | TypeScript client — `@par-rt-db/client` | `ts-client/` | bun |
 | Rust client — `par-rt-db-client` | `rust-client/` | cargo |
@@ -22,7 +23,7 @@ Seven packages run from the root `Makefile` (swift-client's lines are Darwin-gua
 | Operator dashboard SPA | `dashboard/` | bun (Vite + React) |
 | `rtdb` CLI — wraps the rust client | `cli/` | cargo |
 
-- `make checkall` — the full gate (fmt-check + clippy `-D warnings` + typecheck + tests). **Definition of done; must pass before commit.**
+- `make checkall` — the full gate: `env-drift-check`, `dockerfile-stub-check`, `cli-docs-check`, `fmt-check`, `lint`, `typecheck`, `test`, `rust-client-check-features`. **Definition of done; must pass before commit.** Each stage is described in [README.md](README.md#verification-gates).
 - `make dev-db-up` / `dev-db-down` — start/stop the dev Postgres on `127.0.0.1:55434`. **Required for any test run** — integration tests hit a real DB. `make dev-db-clean` periodically drops leaked test artifacts (per-test `db_t…` schemas and the corpus runner's `sc_…` databases; scoped to those patterns, never touches real DBs).
 - `make test` — dev-db-up then the whole suite. First-time setup: `make ts-client-install`, `make dashboard-install`, `make python-client-install`.
 - Single test: `cargo test --test main txn_test::upsert_multiple_matches` (from `server/`), `cd ts-client && bunx vitest run tests/<file>.test.ts`, or `cd python-client && uv run pytest -q tests/<file>.py`. Since ARC-010 the server's integration tests are ONE binary (`tests/main.rs`); each `tests/<name>.rs` is a module of it, so a filter is `<file_stem>::<test_name>` and a whole file is `--test main <file_stem>::`. A new test file needs a `mod` line in `tests/main.rs`.
@@ -49,6 +50,7 @@ Full detail and reasoning: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The one
 - **SQL construction**: validate and double-quote every identifier; bind every value via `$n`. Never interpolate an unvalidated value. Physical names are lowercased and length-capped to fit Postgres's 63-byte limit (see `ddl.rs`) — don't raise the caps.
 - **Errors**: every failure is the `RtDbError` envelope `{code, message}` (codes/statuses in `error.rs`). Client-facing 500s carry a **generic** message — never stringify a sqlx/serde error into the body (log it via `tracing`). Use `fetch_optional` for any lookup that can legitimately miss.
 - **Op-feed tap**: every code path that commits a document txn must go through a committer `handle_*` arm calling `publish_taps` (`committer/taps.rs`, called only from `committer/arms/*.rs`; enumerated in ARCHITECTURE.md), or the op-feed, audit log, and webhooks will silently miss those writes. TTL deletes are durable writes the same way.
+- **The ownership lease is the multi-writer boundary**: under `RTDB_MULTI_INSTANCE`, exactly one replica holds a database's `pg_try_advisory_lock` lease and runs its committer; every other replica is a SHADOW that forwards writes to the owner and never executes them locally (`committer/lease.rs`, `committer/forwarding.rs`, `forward.rs`). **Never bypass `Committers::submit`** — it is what routes a write to the owner or the forward path. Adding a code path that writes directly on a shadow replica reintroduces the second writer the lease exists to prevent.
 - **Clients mirror the core**: the server is the source of truth for the protocol, DSL, step-result shapes, and behavior. Any server change must be mirrored in **all four** clients (ts-client, rust-client, python-client, swift-client) — wire types, DSL builders, and their tests. If a client doesn't yet cover a changed surface, file the gap explicitly rather than letting it drift. The [wire-corpus](wire-corpus/README.md) semantics corpus enforces this — all five runners (server + four in-memory engines, swift's engine shipped 2026-08-19) execute every case, and every behavior-changing change ships with a case (its README's authoring rule).
 - **Backups never touch the live DB**: restore goes into a fresh `rtdb_restored_<stamp>` Postgres DB (`backup.rs`, `admin/backups.rs`); the single-writer invariant is preserved. Credentials travel via `PG*` env, never argv.
 - **Hot config is live**: runtime-mutable settings (`allowed_origins`, `session_ttl_days`, `max_file_size`, `idempotency_ttl_ms`, quota caps) live on `AppState` as `Arc<ArcSwap<HotConfig>>` (`config.rs`); every consumer reads `state.hot.load()`, and the CORS layer re-reads `allowed_origins` per request.

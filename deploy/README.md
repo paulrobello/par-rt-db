@@ -1,5 +1,9 @@
 # Deploying par-rt-db to a Docker host
 
+Runbook for operating par-rt-db in production: deploying and updating the
+server, configuring the Cloudflare tunnel and Postgres image, monitoring and
+tracing, backups and restore, and rolling back a bad deploy.
+
 The target is a standalone Docker host (plain `docker compose`, not Swarm). Public
 traffic reaches it through the host `cloudflared` tunnel, which routes
 `rtdb.example.com` -> `http://localhost:8300`. No ports 80/443 are opened on the
@@ -14,7 +18,7 @@ VPS and no reverse proxy is needed — TLS is terminated at Cloudflare's edge.
 - [Collation](#collation)
 - [Subscription-invalidation observability](#subscription-invalidation-observability)
 - [Monitoring](#monitoring)
-- [Tracing (OpenTelemetry / OTLP, ENH-018)](#tracing-opentelemetry--otel-enh-018)
+- [Tracing (OpenTelemetry / OTLP, ENH-018)](#tracing-opentelemetry--otlp-enh-018)
 - [Secrets (`/docker/par-rt-db/.env`, not committed)](#secrets-dockerpar-rt-dbenv-not-committed)
 - [Dashboard / SPA](#dashboard--spa)
 - [Admin bootstrap (after first deploy)](#admin-bootstrap-after-first-deploy)
@@ -33,10 +37,15 @@ VPS and no reverse proxy is needed — TLS is terminated at Cloudflare's edge.
 ## Deploy / update
 
 The preferred path is `make deploy` from the repo root: it runs `make checkall`
-first (the full gate), then rsyncs to docker-host and runs `docker compose up -d
---build` with `RTDB_BUILD_COMMIT` baked in (so `/healthz` reports the deployed
-commit). See the [`Makefile`](../Makefile) `deploy` target for the canonical
-commands.
+first (the full gate), then rsyncs to the deploy host and runs `docker compose
+up -d --build` with `RTDB_BUILD_COMMIT` baked in (so `/healthz` reports the
+deployed commit). See the [`Makefile`](../Makefile) `deploy` target for the
+canonical commands.
+
+The host and path are `DEPLOY_HOST` (default `root@docker-host.example.com`)
+and `DEPLOY_PATH` (`/docker/par-rt-db`) — both are `Makefile` variables;
+override `DEPLOY_HOST` on the command line for a different host
+(`make deploy DEPLOY_HOST=root@other-host`).
 
 ```sh
 make deploy
@@ -45,19 +54,20 @@ make deploy
 The manual rsync path below is the same thing without the gate or the commit
 label: it skips `checkall`, and unless you export `RTDB_BUILD_COMMIT` yourself,
 `/healthz` reports `git_commit: "unknown"`. Use it only when you need to bypass
-the gate intentionally.
+the gate intentionally. It mirrors the `Makefile`'s `deploy` target exactly:
+rsync excludes everything `.gitignore` excludes (`--filter=':- .gitignore'`),
+which already covers `target/`, `node_modules/`, and gitignored `.env*` files,
+plus an explicit `.git/` exclude.
 
-Source is synced to `/docker/par-rt-db` on docker-host and built there (the host is
-x86_64; do not `docker save` an arm64 image from a Mac).
+Source is synced to `/docker/par-rt-db` on the deploy host and built there (the
+host is x86_64; do not `docker save` an arm64 image from a Mac).
 
 ```sh
 # from the repo root on the workstation:
-# .env/.env.* MUST be excluded — they are gitignored (don't exist in the
-# local checkout) but hold the live secrets on docker-host, so `--delete` without
-# these excludes would wipe them out.
-rsync -az --delete \
-  --exclude target/ --exclude .git/ --exclude .superpowers/ --exclude node_modules/ \
-  --exclude .env --exclude '.env.*' \
+# .gitignore already excludes target/, node_modules/, and .env/.env.* (which
+# hold the live secrets on the deploy host) — --delete without that filter
+# would wipe them out.
+rsync -az --delete --filter=':- .gitignore' --exclude .git/ \
   ./ root@docker-host.example.com:/docker/par-rt-db/
 
 # on docker-host (the .env there holds the secrets, mode 600):
@@ -299,6 +309,19 @@ operator-critical subset.
   `RTDB_BUILD_COMMIT=$(git rev-parse --short HEAD)` (run on the workstation
   that has `.git`, before rsync). If unset, `/healthz` reports
   `git_commit: "unknown"`.
+- `RTDB_TRUSTED_PROXY` (default `false`; `docker-compose.yml` and
+  `.env.example` set it `true`) — **required** behind the Cloudflare tunnel.
+  When `true`, the server trusts the tunnel's forwarding headers
+  (`CF-Connecting-IP` / `X-Forwarded-For` for the per-IP rate-limit key,
+  `X-Forwarded-Proto` for cookie `Secure`/HSTS). Every request to
+  `docker-host:8300` arrives from the local `cloudflared` process, not the
+  original client, so with this `false` every request would key off the same
+  peer address — collapsing per-IP rate limits onto one bucket and breaking
+  `Secure`-cookie detection. Leave it `false` only for a deploy directly
+  reachable without a trusted proxy in front (SEC-201).
+- `RTDB_COOKIE_SECURE` (default `true`) — sets the `Secure` attribute on every
+  session/CSRF cookie unconditionally. Only set it `false` for local HTTP
+  development (e.g. `http://localhost`); never disable it on a public deploy.
 
 ## Dashboard / SPA
 
@@ -339,10 +362,12 @@ calls and are mirrored in the ts/rust/python admin clients.
 
 ### Scheduled backups
 
-Enable the built-in managed backup loop with `RTDB_BACKUP_ENABLED=true` plus
-`RTDB_BACKUP_CRON` (5-field UTC cron, default daily 03:00), `RTDB_BACKUP_DIR`,
-and `RTDB_BACKUP_RETENTION` (count, default 7) — the Deployment section of
-`CLAUDE.md` has the full semantics. The docker image installs `postgresql-client`
+Enable the built-in managed backup loop with `RTDB_BACKUP_ENABLED=true`
+(default `false`) plus `RTDB_BACKUP_CRON` (5-field UTC cron, default
+`0 3 * * *`), `RTDB_BACKUP_DIR` (default `./backups`), and
+`RTDB_BACKUP_RETENTION` (count, default `7`) — see `BackupEnv::from_env` in
+`server/src/config.rs` for the full semantics and `.env.example` for the
+commented reference values. The docker image installs `postgresql-client`
 so `pg_dump` is present, and `GET /admin/backups` lists the dumps. Data also
 persists in the `rtdb-pg` named volume.
 
@@ -409,6 +434,27 @@ Common operator symptoms on the live deploy:
   role needs the `CREATEDB` privilege. The docker-compose `POSTGRES_USER` is a
   superuser and already has it; on managed Postgres, run
   `ALTER ROLE "<role>" CREATEDB;`.
+- **The image build fails with `can't find '<name>' test at ...` during
+  `make deploy`.** The Dockerfile's dependency-caching layer builds
+  `rtdb-server` against stubbed sources, and Cargo validates every `[[test]]`
+  target declared in a workspace member's `Cargo.toml` (except the member
+  actually being built) at manifest-parse time — even one it never runs. A
+  new `[[test]]` entry in, for example, `rust-client/Cargo.toml` needs a
+  matching placeholder `touch <path>` in the Dockerfile's dependency layer, or
+  the build fails on the deploy host, long after `make checkall` looked clean.
+  `scripts/dockerfile-stub-check.sh` (wired into `make checkall` as the
+  `dockerfile-stub-check` target) catches this locally: it diffs every
+  declared `[[test]]` path against the `.rs` paths the Dockerfile's `touch`
+  stub list names and fails with the exact missing paths when one is absent.
+  Run it directly with:
+
+  ```sh
+  ./scripts/dockerfile-stub-check.sh
+  ```
+
+  Its failure output lists each missing `<member>/tests/<name>.rs` path —
+  add each one to the `touch` stub list in the Dockerfile's dependency layer
+  and re-run the check.
 - **Dashboard shows the old SPA after a frontend change.** The SPA is baked into
   the server image, not a live-mounted volume — a frontend change ships only via
   `docker compose up -d --build` (image rebuild + container recreate). A plain

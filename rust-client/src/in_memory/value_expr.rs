@@ -17,7 +17,7 @@ use crate::value_expr::{Cast, ValueExpr};
 /// semantics table. `now_ms` feeds [`ValueExpr::Now`]; `fields` is the table's
 /// declared field map, used only by `Case` branch predicates. Returns the JSON
 /// result or a `BAD_REQUEST` error (cast failures, division by zero,
-/// non-finite arithmetic) — the caller ([`stamp_computed`]) names the computed
+/// non-finite arithmetic) — the caller (`stamp_computed`) names the computed
 /// field.
 pub fn eval_value_expr(
     ve: &ValueExpr,
