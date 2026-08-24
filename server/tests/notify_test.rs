@@ -8,7 +8,7 @@
 //! op-feed ring. The self-dedupe contract (instance-id tag) keeps A from
 //! double-publishing its own writes into its own ring.
 
-use crate::common::{admin_get, admin_post, spawn_app, test_config, test_hot};
+use crate::common::{admin_get, admin_post, spawn_app, test_config, test_hot, wait_until};
 use rtdb_server::AppState;
 use serde_json::json;
 
@@ -177,16 +177,16 @@ async fn cross_replica_op_feed_fan_out_and_self_dedupe() -> anyhow::Result<()> {
     let doc_id = insert_widget(addr_a, &db_name, "gadget").await;
 
     // Poll replica B's op-feed ring until the write appears. NOTIFY delivery is
-    // asynchronous; bound the wait at ~5s with 100ms sleeps.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let mut b_ops: Vec<serde_json::Value> = Vec::new();
-    while std::time::Instant::now() < deadline {
-        b_ops = ops_recent(addr_b, &db_name, "widgets").await;
-        if b_ops.iter().any(|o| o["docId"] == doc_id) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    // asynchronous; bound the wait at ~5s.
+    let b_ops: std::cell::RefCell<Vec<serde_json::Value>> = std::cell::RefCell::new(Vec::new());
+    wait_until(std::time::Duration::from_secs(5), || async {
+        let ops = ops_recent(addr_b, &db_name, "widgets").await;
+        let found = ops.iter().any(|o| o["docId"] == doc_id);
+        *b_ops.borrow_mut() = ops;
+        found
+    })
+    .await;
+    let b_ops = b_ops.into_inner();
     let b_match_count = b_ops.iter().filter(|o| o["docId"] == doc_id).count();
     assert_eq!(
         b_match_count, 1,
@@ -342,15 +342,15 @@ async fn large_batch_write_coalesces_notifications() -> anyhow::Result<()> {
 
     // And the decoded side: replica B's op-feed ring must contain every op
     // (batching must not drop or truncate anything the listener decodes).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let mut b_ops: Vec<serde_json::Value> = Vec::new();
-    while std::time::Instant::now() < deadline {
-        b_ops = ops_recent(addr_b, &db_name, "widgets").await;
-        if b_ops.len() >= N {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    let b_ops: std::cell::RefCell<Vec<serde_json::Value>> = std::cell::RefCell::new(Vec::new());
+    wait_until(std::time::Duration::from_secs(5), || async {
+        let ops = ops_recent(addr_b, &db_name, "widgets").await;
+        let done = ops.len() >= N;
+        *b_ops.borrow_mut() = ops;
+        done
+    })
+    .await;
+    let b_ops = b_ops.into_inner();
     assert_eq!(
         b_ops.len(),
         N,

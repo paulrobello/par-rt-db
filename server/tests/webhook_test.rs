@@ -14,10 +14,11 @@
 use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::common::{
     admin_delete, admin_get, admin_post, admin_put, fresh_db, spawn_app, test_state_with_webhooks,
+    wait_until,
 };
 use axum::extract::State;
 use axum::response::IntoResponse;
@@ -345,23 +346,19 @@ async fn webhook_delivery_end_to_end_posts_payload() -> anyhow::Result<()> {
     // under full-suite parallel test load the shared delivery worker + Postgres
     // contend, and this test cares about CORRECTNESS (exactly one matching POST),
     // not speed.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
+    wait_until(Duration::from_secs(30), || async {
         rtdb_server::webhook::drain_once(&pool)
             .await
             .expect("drain_once");
-        let delivered: bool = sqlx::query_scalar(
+        sqlx::query_scalar(
             "SELECT status = 'delivered' FROM rtdb.webhook_deliveries WHERE webhook_id = $1",
         )
         .bind(webhook_id)
         .fetch_one(&pool)
         .await
-        .expect("fetch delivery status");
-        if delivered || Instant::now() > deadline {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+        .expect("fetch delivery status")
+    })
+    .await;
 
     // Receiver got at least one POST matching the payload. Other webhooks POST
     // to their own URLs, never this receiver, so every entry is ours — but
@@ -934,23 +931,19 @@ async fn webhook_delivery_carries_verifiable_signature() -> anyhow::Result<()> {
     // bounded-loop pattern: a single `drain_once` can defer our row under
     // parallel test load because the shared outbox is drained in bounded
     // batches ordered by `next_attempt`).
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
+    wait_until(Duration::from_secs(10), || async {
         rtdb_server::webhook::drain_once(&pool)
             .await
             .expect("drain_once");
-        let delivered: bool = sqlx::query_scalar(
+        sqlx::query_scalar(
             "SELECT status = 'delivered' FROM rtdb.webhook_deliveries WHERE webhook_id = $1",
         )
         .bind(webhook_id)
         .fetch_one(&pool)
         .await
-        .expect("fetch delivery status");
-        if delivered || Instant::now() > deadline {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+        .expect("fetch delivery status")
+    })
+    .await;
 
     // Find OUR captured POST by matching the payload's docId. Under parallel
     // test load a stale retrying webhook from another test whose URL happened

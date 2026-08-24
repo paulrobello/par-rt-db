@@ -7,7 +7,7 @@
 //! pre-feature migration path.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use sqlx::PgPool;
@@ -278,19 +278,13 @@ async fn poll_for_n(
         fields: None,
         aggregate: None,
     };
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Ok(QueryResult::Docs(docs)) =
-            execute_query(pool, db, schema, &query, &PrincipalCtx::bypass(), false).await
-            && !docs.is_empty()
-        {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    crate::common::wait_until(timeout, || async {
+        matches!(
+            execute_query(pool, db, schema, &query, &PrincipalCtx::bypass(), false).await,
+            Ok(QueryResult::Docs(docs)) if !docs.is_empty()
+        )
+    })
+    .await
 }
 
 /// Polls `scheduler::list` until `pred` returns `Some`, or `timeout`
@@ -302,18 +296,19 @@ async fn poll_list<T, F>(pool: &PgPool, db: &str, timeout: Duration, pred: F) ->
 where
     F: Fn(&[scheduler::ScheduleInfo]) -> Option<T>,
 {
-    let deadline = Instant::now() + timeout;
-    loop {
+    let found: std::cell::RefCell<Option<T>> = std::cell::RefCell::new(None);
+    crate::common::wait_until(timeout, || async {
         if let Ok(listed) = scheduler::list(pool, db).await
             && let Some(t) = pred(&listed)
         {
-            return Some(t);
+            *found.borrow_mut() = Some(t);
+            true
+        } else {
+            false
         }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    })
+    .await;
+    found.borrow_mut().take()
 }
 
 #[tokio::test]
@@ -846,15 +841,10 @@ async fn interval_fires_repeatedly_and_skips_paused_windows() {
     // retry until it lands. Once it returns true the row is quiescent: any
     // earlier claim would have made the UPDATE miss, and later claims only
     // take pending rows.
-    let pause_deadline = Instant::now() + Duration::from_secs(8);
-    let mut paused_landed = false;
-    while Instant::now() < pause_deadline {
-        if scheduler::set_paused(&pool, &db, &id, true).await.unwrap() {
-            paused_landed = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let paused_landed = crate::common::wait_until(Duration::from_secs(8), || async {
+        scheduler::set_paused(&pool, &db, &id, true).await.unwrap()
+    })
+    .await;
     assert!(paused_landed, "failed to pause the interval job");
     let f1 = scheduler::list(&pool, &db)
         .await

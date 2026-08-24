@@ -345,7 +345,7 @@ async fn adding_ttl_backfills_existing_rows() {
 // expired row is reaped.
 // ===========================================================================
 
-use crate::common::test_state_with_ttl_sweep;
+use crate::common::{test_state_with_ttl_sweep, wait_until};
 
 /// Point-read by id, returning `true` while the doc is still present. Used by
 /// the reaper poll loop (the existing `get_doc` helper panics on `Doc(None)`).
@@ -438,15 +438,13 @@ async fn reaper_deletes_expired_document() {
 
     // Poll until the reaper sweeps (interval=1s in this test state). Bound to
     // ~10s so a missing reap fails loudly rather than hanging.
-    let mut gone = false;
-    for _ in 0..100 {
-        if !doc_present(&pool, &db, &schema, "sessions", &expired_id).await {
-            gone = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    assert!(gone, "expired doc was not reaped within the poll window");
+    assert!(
+        wait_until(std::time::Duration::from_secs(10), || async {
+            !doc_present(&pool, &db, &schema, "sessions", &expired_id).await
+        })
+        .await,
+        "expired doc was not reaped within the poll window"
+    );
 
     // The not-yet-due doc is untouched.
     assert!(
@@ -473,7 +471,7 @@ use rtdb_server::ddl::pg_schema;
 async fn poll_until_reaped(pool: &sqlx::PgPool, db: &str, table: &str, expired_id: &str) {
     let schema_name = pg_schema(db);
     let table_ident = ddl::pg_table(table);
-    for _ in 0..100 {
+    let reaped = wait_until(std::time::Duration::from_secs(10), || async {
         let count: i64 = sqlx::query_scalar(&format!(
             "SELECT COUNT(*) FROM \"{schema_name}\".\"{table_ident}\" WHERE id = $1"
         ))
@@ -481,12 +479,13 @@ async fn poll_until_reaped(pool: &sqlx::PgPool, db: &str, table: &str, expired_i
         .fetch_one(pool)
         .await
         .unwrap_or_else(|e| panic!("count {table_ident} row in {schema_name}: {e}"));
-        if count == 0 {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    panic!("expired doc {expired_id} was not reaped within the poll window");
+        count == 0
+    })
+    .await;
+    assert!(
+        reaped,
+        "expired doc {expired_id} was not reaped within the poll window"
+    );
 }
 
 // A reaped row publishes to BOTH the durable audit log (op="delete",
@@ -547,20 +546,17 @@ async fn reaper_delete_publishes_to_audit_and_webhooks() -> anyhow::Result<()> {
     // BEFORE the tap-site writes (fan_out / op_feed / audit / webhook) finish —
     // they run in the same committer turn AFTER the DELETE, each on its own
     // await. So poll for the audit row to land before asserting its content.
-    let mut audit_landed = false;
-    for _ in 0..100 {
+    let audit_landed = wait_until(std::time::Duration::from_secs(10), || async {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM rtdb.audit_log WHERE db = $1 AND source = 'ttl'",
         )
         .bind(db.as_str())
         .fetch_one(&pool)
-        .await?;
-        if count > 0 {
-            audit_landed = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+        .await
+        .expect("count ttl audit rows");
+        count > 0
+    })
+    .await;
     assert!(audit_landed, "ttl audit row never landed after reap");
 
     // Audit: exactly one row for this db with source="ttl" — the reaped delete.
@@ -591,22 +587,28 @@ async fn reaper_delete_publishes_to_audit_and_webhooks() -> anyhow::Result<()> {
     // Webhook: one delivery for the registered webhook, payload carries
     // source="ttl" and kind="delete". The enqueue runs in the same committer
     // turn as the audit write, so poll for it to land too.
-    let mut payload = None;
-    for _ in 0..100 {
+    let payload: std::cell::RefCell<Option<serde_json::Value>> = std::cell::RefCell::new(None);
+    wait_until(std::time::Duration::from_secs(10), || async {
         if let Some((p,)) = sqlx::query_as::<_, (serde_json::Value,)>(
             "SELECT payload FROM rtdb.webhook_deliveries WHERE webhook_id = $1 \
              ORDER BY id DESC LIMIT 1",
         )
         .bind(webhook_id)
         .fetch_optional(&pool)
-        .await?
+        .await
+        .expect("query webhook delivery")
         {
-            payload = Some(p);
-            break;
+            *payload.borrow_mut() = Some(p);
+            true
+        } else {
+            false
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    let payload = payload.expect("webhook delivery never landed after reap");
+    })
+    .await;
+    let payload = payload
+        .borrow_mut()
+        .take()
+        .expect("webhook delivery never landed after reap");
     assert_eq!(
         payload["source"],
         serde_json::json!("ttl"),
@@ -696,7 +698,7 @@ async fn reaper_bypasses_per_row_owner_auth() {
     // Poll until reaped (bypass query, owner=None, sees the row until deleted).
     let schema_name = pg_schema(&db);
     let notes_table = ddl::pg_table("notes");
-    for _ in 0..100 {
+    wait_until(std::time::Duration::from_secs(10), || async {
         let count: i64 = sqlx::query_scalar(&format!(
             "SELECT COUNT(*) FROM \"{schema_name}\".\"{notes_table}\" WHERE id = $1"
         ))
@@ -704,11 +706,9 @@ async fn reaper_bypasses_per_row_owner_auth() {
         .fetch_one(&pool)
         .await
         .expect("count notes");
-        if count == 0 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+        count == 0
+    })
+    .await;
     // Confirm the owner-gated row is gone — the reaper deleted it despite
     // ownerField enforcement that would block any non-owner interactive caller.
     let count: i64 = sqlx::query_scalar(&format!(
