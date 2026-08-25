@@ -32,9 +32,7 @@ use sha2::{Digest, Sha256};
 use crate::error::{ErrorCode, RtDbError};
 use crate::mutation::{Step, StepResult, Transaction};
 use crate::query::{Order, Query};
-use crate::schema::{
-    FieldType, IndexDef, OnDeleteAction, SchemaDef, TableDef, is_widening_of, strip_on_delete,
-};
+use crate::schema::{FieldType, IndexDef, OnDeleteAction, SchemaDef, TableDef};
 use crate::wire::{
     AggregateOp, AuthedUser, FilterExpr, PresenceMember, ScheduleInfo, ScheduleKind,
     ScheduleStatus, ScheduleWhen,
@@ -448,7 +446,7 @@ impl InMemoryRtDbClient {
     /// Destructive changes — a removed/changed table, field, or index — return
     /// [`ErrorCode::BadRequest`] with the same messages as the live server's
     /// `ddl.rs::detect_destructive_changes`. The schema is validated first
-    /// ([`SchemaDef::validate`], mirroring the server's `schema.validate()`
+    /// (`SchemaDef::validate` via the `InMemorySchemaValidateExt` trait, mirroring the server's `schema.validate()`
     /// before `detect_destructive_changes`), so an invalid TTL or a
     /// non-indexable index field fails with [`ErrorCode::SchemaViolation`]
     /// exactly as the live server 422s.

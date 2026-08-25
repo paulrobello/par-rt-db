@@ -494,32 +494,11 @@ fn table_mut<'a>(schema: &'a mut SchemaDef, table: &str) -> Result<&'a mut Table
 
 /// Rewrite every `field` reference in `expr` that equals `from` to `to`, in
 /// place. Used by `RenameField` to carry an `authorize` predicate across a
-/// field rename (mirroring the ownerField/collaboratorsField rewrite). Recurses
-/// through `And`/`Or`/`Not`.
+/// field rename (mirroring the ownerField/collaboratorsField rewrite).
+/// `par_rt_db_core::engine::rename_filter_fields` (ARC-004) — shared with the
+/// Rust client's in-memory engine.
 fn rename_filter_fields(expr: &mut crate::query::FilterExpr, from: &str, to: &str) {
-    use crate::query::FilterExpr;
-    match expr {
-        FilterExpr::Eq { field, .. }
-        | FilterExpr::Neq { field, .. }
-        | FilterExpr::Gt { field, .. }
-        | FilterExpr::Gte { field, .. }
-        | FilterExpr::Lt { field, .. }
-        | FilterExpr::Lte { field, .. }
-        | FilterExpr::In { field, .. }
-        | FilterExpr::Contains { field, .. }
-        | FilterExpr::Exists { field }
-        | FilterExpr::OlderThan { field, .. } => {
-            if field == from {
-                *field = to.to_string();
-            }
-        }
-        FilterExpr::And { exprs } | FilterExpr::Or { exprs } => {
-            for e in exprs {
-                rename_filter_fields(e, from, to);
-            }
-        }
-        FilterExpr::Not { expr } => rename_filter_fields(expr, from, to),
-    }
+    par_rt_db_core::engine::rename_filter_fields(expr, from, to)
 }
 
 /// The `ValueExpr` half of the rename: rewrites every `Field` reference equal
@@ -528,38 +507,10 @@ fn rename_filter_fields(expr: &mut crate::query::FilterExpr, from: &str, to: &st
 /// `rename_filter_fields` (the same rewrite `authorize` gets), so a rename
 /// carries computed expressions across intact. `to` is fresh (the RenameField
 /// arm rejects an existing target), so no reference set can collide.
+/// `par_rt_db_core::engine::rename_value_expr_fields` (ARC-004) — shared with
+/// the Rust client's in-memory engine.
 fn rename_value_expr_fields(expr: &mut ValueExpr, from: &str, to: &str) {
-    match expr {
-        ValueExpr::Field { field } => {
-            if field == from {
-                *field = to.to_string();
-            }
-        }
-        ValueExpr::Literal { .. } | ValueExpr::Now => {}
-        ValueExpr::Concat { parts } | ValueExpr::Coalesce { parts } => {
-            for p in parts {
-                rename_value_expr_fields(p, from, to);
-            }
-        }
-        ValueExpr::Add { left, right }
-        | ValueExpr::Sub { left, right }
-        | ValueExpr::Mul { left, right }
-        | ValueExpr::Div { left, right } => {
-            rename_value_expr_fields(left, from, to);
-            rename_value_expr_fields(right, from, to);
-        }
-        ValueExpr::Lower { value } | ValueExpr::Upper { value } | ValueExpr::Trim { value } => {
-            rename_value_expr_fields(value, from, to);
-        }
-        ValueExpr::Cast { value, .. } => rename_value_expr_fields(value, from, to),
-        ValueExpr::Case { whens, otherwise } => {
-            for cw in whens {
-                rename_filter_fields(&mut cw.when, from, to);
-                rename_value_expr_fields(&mut cw.then, from, to);
-            }
-            rename_value_expr_fields(otherwise, from, to);
-        }
-    }
+    par_rt_db_core::engine::rename_value_expr_fields(expr, from, to)
 }
 
 /// True if any `field` reference in `expr` equals `field`. Used by `DropField`

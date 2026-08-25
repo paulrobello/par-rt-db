@@ -7,6 +7,7 @@
 #![deny(missing_docs)]
 #![deny(warnings)]
 
+pub mod engine;
 pub mod fields;
 pub mod schema;
 pub mod wire;

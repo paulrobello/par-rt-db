@@ -12,10 +12,7 @@ use sqlx::PgPool;
 use crate::db::{database_exists, load_schema, validate_db_name};
 use crate::error::RtDbError;
 use crate::query::compile_filter_literal;
-use crate::schema::{
-    FieldType, SchemaDef, SchemaDefExt, TableDef, indexed_column_type, is_widening_of,
-    strip_on_delete,
-};
+use crate::schema::{FieldType, SchemaDef, SchemaDefExt, TableDef, indexed_column_type};
 
 pub fn pg_table(user_table: &str) -> String {
     format!("t_{}", user_table.to_lowercase())
@@ -158,94 +155,12 @@ pub(crate) fn backfill_expr(pg_type: &str, field_name: &str) -> Result<String, R
 /// a removed field, a changed field type (except a safe literal-union widening,
 /// which is additive and allowed — see `schema::is_widening_of`), a removed
 /// index, or a changed index field list. Errors name the offending table,
-/// `table.field`, or index.
+/// `table.field`, or index. The comparison itself is
+/// `par_rt_db_core::engine::detect_destructive_changes` (ARC-004) — shared
+/// with the Rust client's in-memory engine; this wrapper only translates the
+/// core's plain `String` message into the server's `RtDbError` envelope.
 fn detect_destructive_changes(old: &SchemaDef, new: &SchemaDef) -> Result<(), RtDbError> {
-    for (table_name, old_table) in &old.tables {
-        let new_table = new
-            .tables
-            .get(table_name)
-            .ok_or_else(|| RtDbError::bad_request(format!("removed table '{table_name}'")))?;
-
-        for (field_name, old_field_type) in &old_table.fields {
-            match new_table.fields.get(field_name) {
-                None => {
-                    return Err(RtDbError::bad_request(format!(
-                        "removed field '{table_name}.{field_name}'"
-                    )));
-                }
-                // FM-33: compare with each side's `Id.on_delete` stripped —
-                // adding or changing an `onDelete` action alters runtime delete
-                // behavior only (no stored row shape), so it is additive, while
-                // changing the referenced table is still a type change.
-                Some(new_field_type)
-                    if strip_on_delete(new_field_type) != strip_on_delete(old_field_type)
-                        && !is_widening_of(old_field_type, new_field_type) =>
-                {
-                    return Err(RtDbError::bad_request(format!(
-                        "changed type of field '{table_name}.{field_name}'"
-                    )));
-                }
-                _ => {}
-            }
-        }
-
-        for old_index in &old_table.indexes {
-            match new_table
-                .indexes
-                .iter()
-                .find(|index| index.name == old_index.name)
-            {
-                None => {
-                    return Err(RtDbError::bad_request(format!(
-                        "removed index '{}'",
-                        old_index.name
-                    )));
-                }
-                Some(new_index) if new_index.fields != old_index.fields => {
-                    return Err(RtDbError::bad_request(format!(
-                        "changed fields of index '{}'",
-                        old_index.name
-                    )));
-                }
-                Some(new_index) if new_index.search != old_index.search => {
-                    return Err(RtDbError::bad_request(format!(
-                        "changed kind of index '{}' (btree <-> search)",
-                        old_index.name
-                    )));
-                }
-                Some(new_index) if new_index.vector != old_index.vector => {
-                    return Err(RtDbError::bad_request(format!(
-                        "changed vector spec of index '{}'",
-                        old_index.name
-                    )));
-                }
-                Some(new_index) if new_index.unique != old_index.unique => {
-                    return Err(RtDbError::bad_request(format!(
-                        "changed uniqueness of index '{}'",
-                        old_index.name
-                    )));
-                }
-                Some(new_index) if new_index.r#where != old_index.r#where => {
-                    return Err(RtDbError::bad_request(format!(
-                        "changed partial predicate of index '{}'",
-                        old_index.name
-                    )));
-                }
-                // A search index's `regconfig` is baked into a STORED generated
-                // column whose expression Postgres cannot alter in place, so a
-                // language change is a breaking index change (reject, like a
-                // vector-spec change) rather than a silent no-op.
-                Some(new_index) if new_index.language != old_index.language => {
-                    return Err(RtDbError::bad_request(format!(
-                        "changed language of search index '{}'",
-                        old_index.name
-                    )));
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(())
+    par_rt_db_core::engine::detect_destructive_changes(old, new).map_err(RtDbError::bad_request)
 }
 
 /// Verifies every search-index `language` declared in `schema` names a real

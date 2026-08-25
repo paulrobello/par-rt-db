@@ -435,19 +435,17 @@ mod tests {
     }
 
     #[test]
-    fn table_with_no_indexes_omits_key() {
+    fn table_with_no_indexes_serializes_empty_array() {
+        // ARC-004: `TableDef.indexes` is now `par_rt_db_core::schema`'s
+        // `Vec<IndexDef>` + `#[serde(default)]` (the server's wire-authority
+        // form), which always serializes the key — `"indexes":[]` when empty —
+        // rather than omitting it. Both an absent key and an empty array
+        // deserialize back to an empty `Vec`, so this is a benign wire change.
         let schema = Schema::builder()
             .table("solo", Table::new().field("x", FieldType::Number))
             .build();
         let v = serde_json::to_value(&schema).unwrap();
-        // Indexing a missing key and a present-null key both yield `Value::Null`,
-        // so verify absence on the underlying object rather than `is_null()`.
-        assert!(
-            !v["tables"]["solo"]
-                .as_object()
-                .expect("solo is an object")
-                .contains_key("indexes")
-        );
+        assert_eq!(v["tables"]["solo"]["indexes"], serde_json::json!([]));
     }
 
     #[test]
