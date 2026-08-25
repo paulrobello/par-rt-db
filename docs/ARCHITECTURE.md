@@ -987,20 +987,35 @@ via `make bench`) that drives real running servers over HTTP + WS. See
 [CONTRIBUTING.md's Benchmarks section](../CONTRIBUTING.md#benchmarks) for how
 to run either.
 
-The numbers below are quoted from `bench/baseline.json`. **They are a
-placeholder, not a real captured run** — hand-written when the harness was
-built, not produced by `make bench-baseline`. Replace this paragraph (and the
-committed baseline) once someone runs `make bench-baseline` on `main` and
-records the date and hardware it ran on:
+The numbers below are quoted from `bench/baseline.json`, the median of 3
+real runs captured 2026-08-25 against the live deployed instance
+(`RTDB_BUILD_COMMIT=3ab8b13`), run directly on `lenny2` against
+`127.0.0.1:8300` (no Cloudflare tunnel) with the `bench` database reset to
+empty before the series. Scenario (c) is not represented — the production
+deploy is a single instance, so multi-instance forward/takeover has no real
+number here; a two-instance `make bench-baseline` run on a dev machine would
+be needed to capture it. The three runs were not independent trials: the
+`bench` database was reused and grew across them (writes from run 1 were
+still present for run 2, and so on), so scenario (d)'s turn-hold-time and the
+subscription rerun counts trend upward run over run — the median partly
+absorbs that, but a future baseline recapture should reset the database
+before each run it wants to be comparable, not just once before the series:
 
-| Scenario | Metric | Placeholder value |
+| Scenario | Metric | Baseline value (median of 3) |
 | --- | --- | --- |
-| (a) sustained writes, 8 writers / 30s | commits/s | 400 |
-| (a) sustained writes | commit latency p50 / p99 | 8 ms / 25 ms |
-| (b) subscription fan-out, 8 subscribers | commit-to-update latency p50 / p99 | 12 ms / 40 ms |
-| (c) multi-instance forward round trip | latency p50 / p99 | 22 ms / 55 ms |
-| (c) ownership takeover after SIGKILL | takeover time | 1500 ms |
-| (d) bulk `deleteByQuery`, 5k rows, 100 subscribers | turn hold time | 350 ms |
+| (a) sustained writes, 8 writers / 30s | commits/s | 149.1 |
+| (a) sustained writes | commit latency p50 / p99 | 42.9 ms / 169.1 ms |
+| (b) subscription fan-out, 8 subscribers | write-to-update latency p50 / p99 | 14.1 ms / 84.2 ms |
+| (d) bulk `deleteByQuery`, 5k rows, 100 subscribers | turn hold time | 3418.6 ms |
+| (d) subscription rerun ratio | reruns / (reruns + skips) | 0.84 |
+
+The scenario (d) numbers are the most actionable finding so far: a 3.4s
+committer-turn hold on one bulk delete blocks every other write to that
+database for the same window (single-writer committer, see above), and an
+0.84 rerun ratio means most of the 100 subscriptions paid the full rerun
+path rather than an indexed/ordered skip — consistent with the audit's
+ARC-006 (`pg_notify`-per-op inside the committer turn) hotspot. Not yet
+investigated further; a follow-up optimization pass should start here.
 
 A regression beyond 15% on any metric (latency up, throughput down) is
 checked manually with `scripts/bench/compare.ts` — no CI job runs benchmarks
