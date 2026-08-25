@@ -176,3 +176,36 @@ The first pass filed 5 follow-up cards for things fix agents found but correctly
 ### Files Changed (this round)
 
 34 files, +2103/−239, across 8 commits on `fix/audit-followups` (branched from `main` @ `bf84f49`), merged fast-forward into `main` and pushed.
+
+---
+
+## Follow-up Round 2 (2026-08-25)
+
+All 4 follow-ups from round 1 fixed, in 2 more parallel worktree-isolated agents (protocol-header coverage; test-parallelism flakiness). Merged to `fix/audit-followups-2`, then to `main` and pushed. 21 files, +327/−48, 2 merge commits + 6 upstream commits.
+
+### Resolved
+
+- **ts-client/python-client/swift-client protocol-header gaps** — ts-client's `get`/`upload`/`deleteFile` paths and `admin.ts`'s `authHeaders()` now send `X-Rtdb-Protocol`; python's two standalone admin clients get it as an `httpx` client default (verified there's no caller-supplied-client path, unlike rust-client); swift `AdminClient`'s single `URLRequest` construction site now sets it alongside the bearer token.
+- **Server `/admin/*` protocol validation** — `require_admin_mw` now calls `check_protocol_version`, ahead of both the auth check and the login/logout/stream exemption list (mirroring `authed()`'s ordering), so a bad credential can't mask a version-skew rejection.
+- **`multi_instance_stage4_test` flakiness — real bug, not just test infra.** Root cause was NOT the hypothesized channel-namespacing (channels were already correctly payload-filtered). It was hardcoded replica-identity literals (`"stage4-own-b"`, `"replica-a"`) colliding across concurrent test *processes* sharing one Postgres — two processes' replicas got the same identity, so `forward.rs`'s `spool_claim_reply` could let the wrong process win a forwarded reply's atomic claim. The rightful origin timed out into a lease takeover, surfaced a spurious CONFLICT for an already-committed write, and `mutate_until_landed` retried with a fresh idempotency key — a real double-write under specific cross-process contention. Fixed with a `unique_instance_id()` test helper (also applied to `notify_test.rs` and `presence_xreplica_test.rs`, which carried the same latent collision). A second contributing cause — `forward_timeout_ms = 300`, below the owner's real execution time for this file's heavier writes — was widened to a named `FORWARD_TIMEOUT_MS = 2_000`. Also corrected a false doc-comment claim on `mutate_until_landed` ("retrying cannot double-write") that had made this failure mode look impossible on inspection.
+- **`workflows_test` signal-timeout flake** — a too-tight 100ms test window against a scheduler that sleeps until a row's exact gate (not a coarse tick), so a slow observation missed the window and let a second gate expire. Widened to a named 2s constant.
+
+### New follow-up filed (shared by both round-1 diagnoses, filed once)
+
+- **`audit_test::audit_disabled_writes_nothing_and_endpoint_returns_empty` is order-dependent** — fails on a fresh database (`relation rtdb.audit_log does not exist`); depends on a concurrently-run audit-*enabled* test having lazily created the table first. Will bite CI on any fresh volume.
+
+### Verification
+
+`make checkall` exit 0 on the exact merged commit — checked via `echo "REAL_EXIT=$?"` written to a log file (not through a `tee`/pipe, to avoid masking the real exit code, which happened once earlier in this remediation and was caught). 900+ server tests, zero failures, zero flakes — both `multi_instance_stage4_test` (10/10, verified across 8 runs under real cross-process contention, not just once) and `workflows_test`'s signal test passed. Also caught and fixed a genuine CORS regression the protocol-header fix would otherwise have introduced: `allow_headers` didn't include `x-rtdb-protocol`, so a cross-origin browser preflight would have been refused once ts-client started sending it on `get`/`upload`/`delete`.
+
+An agent stopped the shared dev Postgres mid-run to work around a port conflict in its own worktree; restored to the standard `par-rt-db-postgres-1` container before final verification.
+
+### Files Changed (this round)
+
+21 files, +327/−48, across 6 upstream commits + 2 merge commits on `fix/audit-followups-2` (branched from `main` @ `e95fea4`), merged fast-forward into `main` and pushed.
+
+---
+
+## Final State
+
+Every item from the original AUDIT.md and both follow-up rounds is resolved except **ARC-004** (partial core-crate extraction, blocked on a schema-type unification design — see above), which remains the sole open card. 5 new follow-ups were filed in this round for genuinely out-of-scope findings; none are urgent.
