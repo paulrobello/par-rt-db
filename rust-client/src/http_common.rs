@@ -42,3 +42,28 @@ pub(crate) async fn json_result<T: DeserializeOwned>(
     let parsed = deserialize::<QueryResponse>(resp).await?;
     parse_result::<T>(parsed.result)
 }
+
+/// ARC-013: header name carrying the requesting client's protocol version on
+/// the one-shot HTTP API — mirrors the WS `Auth` frame's `protocolVersion`.
+pub(crate) const PROTOCOL_HEADER: &str = "X-Rtdb-Protocol";
+
+/// The single seam every authorized request in this crate goes through:
+/// `Authorization: Bearer <token>` plus the ARC-013 `X-Rtdb-Protocol` header.
+///
+/// Attaching the version per request rather than as a `reqwest::Client`
+/// default keeps it on calls made through
+/// [`RtDbAdminClient::from_parts`](crate::admin::RtDbAdminClient::from_parts),
+/// which accepts a caller-supplied client. Every request site in `http.rs` and
+/// `admin/mod.rs` calls `.authed(..)`; a bare `bearer_auth` outside this file
+/// would silently drop the version header.
+pub(crate) trait AuthedRequest {
+    /// Attach the bearer token and the protocol-version header.
+    fn authed(self, token: &str) -> Self;
+}
+
+impl AuthedRequest for reqwest::RequestBuilder {
+    fn authed(self, token: &str) -> Self {
+        self.bearer_auth(token)
+            .header(PROTOCOL_HEADER, crate::wire::PROTOCOL_VERSION.to_string())
+    }
+}

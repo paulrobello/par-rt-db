@@ -10,6 +10,7 @@
 //! and python. The deprecated admin methods on `RtDbHttpClient` delegate here.
 
 use crate::error::{ErrorEnvelope, RtDbError};
+use crate::http_common::AuthedRequest;
 use crate::mutation::{StepResult, Transaction};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -17,7 +18,9 @@ use serde::de::DeserializeOwned;
 /// Admin control-plane client (`/admin/*`). Owns its own `reqwest::Client` (or
 /// one shared from [`RtDbHttpClient::admin_client`](crate::RtDbHttpClient::admin_client))
 /// plus the instance URL and admin-key bearer. Every call sends
-/// `Authorization: Bearer <admin key>`.
+/// `Authorization: Bearer <admin key>` and the ARC-013 `X-Rtdb-Protocol`
+/// version header, both attached by the crate-internal `AuthedRequest::authed`
+/// seam in `http_common`.
 ///
 /// Construct directly with [`RtDbAdminClient::new`], or from an existing
 /// [`RtDbHttpClient`](crate::RtDbHttpClient) via
@@ -286,7 +289,7 @@ impl RtDbAdminClient {
         let resp = self
             .client
             .get(format!("{}/admin/export-db", self.url))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .query(&[("db", db)])
             .send()
             .await
@@ -308,7 +311,7 @@ impl RtDbAdminClient {
         let resp = self
             .client
             .post(format!("{}/admin/import-db", self.url))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .query(&[("db", db)])
             .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
             .body(jsonl.to_string())
@@ -327,7 +330,7 @@ impl RtDbAdminClient {
         let resp = self
             .client
             .post(format!("{}/admin/clone-db", self.url))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .query(&[("from", from), ("to", to)])
             .send()
             .await
@@ -631,7 +634,7 @@ impl RtDbAdminClient {
         let resp = self
             .client
             .get(format!("{}/admin/backups/{name}", self.url))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("download_backup request failed: {e}")))?;
@@ -653,7 +656,7 @@ impl RtDbAdminClient {
         let resp = self
             .client
             .delete(format!("{}/admin/backups/{name}", self.url))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("delete_backup request failed: {e}")))?;
@@ -746,7 +749,7 @@ impl RtDbAdminClient {
         let resp = self
             .client
             .delete(format!("{}/admin/db/{db}/webhooks/{id}", self.url))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("delete_webhook request failed: {e}")))?;
@@ -860,7 +863,7 @@ impl RtDbAdminClient {
         let resp = self
             .client
             .delete(format!("{}/admin/sessions/{token_hash}", self.url))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("revoke_session request failed: {e}")))?;
@@ -876,7 +879,7 @@ impl RtDbAdminClient {
         let resp = self
             .client
             .delete(format!("{}/admin/sessions", self.url))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .query(&[("user", user_id)])
             .send()
             .await
@@ -899,7 +902,7 @@ impl RtDbAdminClient {
         let resp = self
             .client
             .delete(format!("{}/admin/sessions", self.url))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .query(&[("expired", "true")])
             .send()
             .await
@@ -1009,7 +1012,7 @@ impl RtDbAdminClient {
         let resp = self
             .client
             .post(format!("{}/admin/db/{db}/workflows/{id}/cancel", self.url))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("cancel_workflow request failed: {e}")))?;
@@ -1048,7 +1051,7 @@ impl RtDbAdminClient {
         let resp = self
             .client
             .delete(format!("{}/admin/db/{db}/workflows/{id}", self.url))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("delete_workflow request failed: {e}")))?;
@@ -1141,7 +1144,7 @@ impl RtDbAdminClient {
         let resp = self
             .client
             .post(format!("{}/admin/db/{db}/schedules/{id}/{op}", self.url))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("manage_schedule request failed: {e}")))?;
@@ -1187,7 +1190,7 @@ impl RtDbAdminClient {
         let mut req = self
             .client
             .post(format!("{}/admin/db/{db}/storage", self.url))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .body(bytes.to_vec());
         if let Some(ct) = content_type {
             req = req.header(reqwest::header::CONTENT_TYPE, ct);
@@ -1205,7 +1208,7 @@ impl RtDbAdminClient {
         let resp = self
             .client
             .delete(format!("{}/admin/db/{db}/storage/{id}", self.url))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("delete_file request failed: {e}")))?;
@@ -1260,7 +1263,7 @@ impl RtDbAdminClient {
     ) -> Result<reqwest::Response, RtDbError> {
         self.client
             .post(format!("{}{}", self.url, path))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .json(body)
             .send()
             .await
@@ -1276,7 +1279,7 @@ impl RtDbAdminClient {
     ) -> Result<reqwest::Response, RtDbError> {
         self.client
             .put(format!("{}{}", self.url, path))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .json(body)
             .send()
             .await
@@ -1290,7 +1293,7 @@ impl RtDbAdminClient {
     ) -> Result<reqwest::Response, RtDbError> {
         self.client
             .delete(format!("{}{}", self.url, path))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .json(body)
             .send()
             .await
@@ -1305,7 +1308,7 @@ impl RtDbAdminClient {
     ) -> Result<reqwest::Response, RtDbError> {
         self.client
             .patch(format!("{}{}", self.url, path))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .json(body)
             .send()
             .await
@@ -1320,7 +1323,7 @@ impl RtDbAdminClient {
         let resp = self
             .client
             .get(format!("{}{}", self.url, path))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .query(query)
             .send()
             .await
