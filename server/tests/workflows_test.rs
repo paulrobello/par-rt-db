@@ -1500,10 +1500,20 @@ async fn await_signal_timeout_retries_with_fresh_timeout_then_succeeds() -> anyh
     let addr = spawn_app(state.clone()).await;
     let token = mint_scoped_token(addr, &db, &["projects"]).await;
 
+    // The scheduler sleeps until a row's exact gate rather than on a coarse
+    // tick, so the window between the first attempt timing out and the second
+    // gate expiring is the timeout itself. Everything this test must fit into
+    // that window — one `await_status` poll to observe `attempts == 1`, then
+    // the signal POST round trip — took longer than 100ms under parallel-suite
+    // load, so the second gate expired too and the signal landed on attempt 3
+    // instead of 2. A 2s gate leaves room for that under contention; it costs
+    // wall time only on the single attempt that must genuinely time out.
+    const GATE_TIMEOUT_MS: u64 = 2_000;
+
     let id = workflows::insert(
         &pool,
         &db,
-        &await_gate_spec("fresh-timeout", "approve", Some(100), 3),
+        &await_gate_spec("fresh-timeout", "approve", Some(GATE_TIMEOUT_MS), 3),
     )
     .await?;
 
@@ -1517,8 +1527,12 @@ async fn await_signal_timeout_retries_with_fresh_timeout_then_succeeds() -> anyh
         .info
         .sleep_until
         .expect("waiting rows carry their gate");
+    // The retry waits the FULL timeoutMs again. `retry` on this spec is
+    // `initialRetryMs: 10 / maxRetryMs: 50`, so a distance anywhere near the
+    // gate rules out backoff — the wider gate sharpens that discrimination
+    // rather than loosening it.
     assert!(
-        gate - repark.info.updated_at >= 90,
+        gate - repark.info.updated_at >= GATE_TIMEOUT_MS as i64 - 100,
         "retry must wait the full timeoutMs again, not backoff (gate {gate}, updated_at {}, distance {})",
         repark.info.updated_at,
         gate - repark.info.updated_at
