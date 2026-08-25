@@ -305,129 +305,26 @@ pub struct PaginatedResult {
     pub next_cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]
-pub enum Step {
-    Insert {
-        table: String,
-        doc: serde_json::Map<String, serde_json::Value>,
-    },
-    Patch {
-        table: String,
-        id: String,
-        fields: serde_json::Map<String, serde_json::Value>,
-    },
-    Replace {
-        table: String,
-        id: String,
-        doc: serde_json::Map<String, serde_json::Value>,
-    },
-    Delete {
-        table: String,
-        id: String,
-    },
-    ExpectVersion {
-        table: String,
-        id: String,
-        version: i64,
-    },
-    ExpectAbsent {
-        table: String,
-        index: String,
-        eq: Vec<serde_json::Value>,
-    },
-    Upsert {
-        table: String,
-        index: String,
-        eq: Vec<serde_json::Value>,
-        insert: serde_json::Map<String, serde_json::Value>,
-        patch: serde_json::Map<String, serde_json::Value>,
-    },
-    /// Find every row in `table` matching `filter` (the same `FilterExpr` the
-    /// read path accepts) and apply `patch` to it, atomically, inside the
-    /// serialized committer turn. Visibility matches the read path exactly: an
-    /// interactive caller patches only rows they own/collaborate on and that
-    /// satisfy the table's `authorize` predicate; a bypass principal (machine
-    /// token/admin/scheduled) touches all matching rows. At most `limit` rows
-    /// (default `MAX_BY_QUERY_ROWS`); a larger match set patches `limit` and
-    /// reports `truncated: true`. Each patched row records a `DocOp`/`WriteSet`
-    /// entry, so subscriptions, the op-feed, audit log, and webhooks all fire
-    /// per row — the same contract as a per-id `Patch`.
-    PatchByQuery {
-        table: String,
-        filter: FilterExpr,
-        patch: serde_json::Map<String, serde_json::Value>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        limit: Option<u32>,
-    },
-    /// Find every row in `table` matching `filter` and delete it (same
-    /// visibility/`limit`/`truncated` semantics as `PatchByQuery`). Enables
-    /// server-side cascades and bulk cleanup (e.g. a scheduled job deleting
-    /// expired rows by predicate) without a client-side read-all-then-delete.
-    DeleteByQuery {
-        table: String,
-        filter: FilterExpr,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        limit: Option<u32>,
-    },
-    /// Schedule `txn` to run later (FM-28). The `scheduled_txns` row is
-    /// inserted on the OPEN sqlx transaction, so the enqueue commits (or
-    /// rolls back) atomically with this txn's document writes. Step result is
-    /// `{"scheduleId": "<id>"}`; the job fires through the unchanged
-    /// scheduler → `RunScheduled` committer path as the system (bypass)
-    /// principal. Nested steps are table-scope-checked recursively at enqueue
-    /// (`authorize_txn_tables`) and fully re-validated by `execute_txn` at
-    /// fire time.
-    Schedule {
-        when: crate::protocol::ScheduleWhen,
-        txn: Box<Transaction>,
-    },
-    /// Cancel a previously scheduled job by id, on the open sqlx transaction.
-    /// Step result `{"cancelled": <bool>}` — `false` (not an error) when the
-    /// id is missing, already fired, or already cancelled. A fire currently
-    /// in flight completes; the job never fires again (the cron finalize
-    /// update touches 0 rows).
-    CancelSchedule {
-        id: String,
-    },
-    /// Start a durable workflow run (FM-29). The `workflows` row is inserted on
-    /// the OPEN sqlx transaction — "write doc + start drip" is atomic; a
-    /// rolled-back txn leaves no orphan run. Step result `{"workflowId": "<id>"}`.
-    /// The spec is validated and table-scope-checked recursively at submit time;
-    /// steps fire later as the system (bypass) principal in the committer's
-    /// `RunWorkflowAdvance` turn.
-    StartWorkflow {
-        spec: Box<crate::protocol::WorkflowSpec>,
-    },
-    /// Cancel a workflow run by id, on the open sqlx transaction. Step result
-    /// `{"cancelled": <bool>}` — `false` when missing or already terminal. A run
-    /// whose advance is in flight stops at its next step boundary.
-    CancelWorkflow {
-        id: String,
-    },
-    /// Restore a soft-deleted row (FM-33): `UPDATE … SET deleted_at = NULL,
-    /// version = version + 1`. `NotFound` when the row is absent; idempotent
-    /// `Ok` when it is present and already live. Only legal on a table that
-    /// declares `softDelete`. Patch-shaped `DocOp` — the doc re-appears, so
-    /// content-bearing subscriptions re-run.
-    Undelete {
-        table: String,
-        id: String,
-    },
-}
+/// `Step`/`Transaction` are now `par_rt_db_core::mutation` types (ARC-004
+/// follow-up), re-exported here at their historical path so every existing
+/// `crate::dsl::{Step, Transaction}` call site keeps resolving.
+pub use par_rt_db_core::mutation::{Step, Transaction};
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Transaction {
-    pub steps: Vec<Step>,
-}
-
-impl Step {
+/// `Step::table()` is an extension trait rather than an inherent `impl`
+/// because `Step` is now a foreign type (owned by `par_rt_db_core`) — the
+/// orphan rule forbids `impl Step { .. }` here. Bring this trait into scope
+/// alongside `Step` to keep the `step.table()` call syntax.
+pub trait StepTableExt {
     /// The document table this step targets, or `None` for the schedule and
     /// workflow control-flow steps (they touch no documents; the per-step
     /// table-scope gate in `execute_txn` skips them, and `Step::Schedule` /
     /// `Step::StartWorkflow` check their NESTED steps recursively via
     /// `authorize_txn_tables` / `authorize_spec_tables` instead).
-    pub fn table(&self) -> Option<&str> {
+    fn table(&self) -> Option<&str>;
+}
+
+impl StepTableExt for Step {
+    fn table(&self) -> Option<&str> {
         match self {
             Step::Insert { table, .. }
             | Step::Patch { table, .. }

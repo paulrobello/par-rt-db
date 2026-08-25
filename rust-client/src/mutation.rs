@@ -5,145 +5,11 @@ use serde_json::{Map, Value};
 
 use crate::wire::{FilterExpr, ScheduleWhen, WorkflowSpec, WorkflowStepSpec};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-/// An ordered list of steps executed atomically by the server's committer.
-pub struct Transaction {
-    /// The steps, applied in order; any failure rolls the whole txn back.
-    pub steps: Vec<Step>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]
-/// One write/control step (tagged `{"op": "..."}`, camelCase).
-pub enum Step {
-    /// Insert a new document; result is its id.
-    Insert {
-        /// Target table.
-        table: String,
-        /// The document body.
-        doc: Map<String, Value>,
-    },
-    /// Merge `fields` into an existing document; result is `null`.
-    Patch {
-        /// Target table.
-        table: String,
-        /// Document id.
-        id: String,
-        /// Keys to merge in.
-        fields: Map<String, Value>,
-    },
-    /// Overwrite the whole document; result is `null`.
-    Replace {
-        /// Target table.
-        table: String,
-        /// Document id.
-        id: String,
-        /// The full replacement body.
-        doc: Map<String, Value>,
-    },
-    /// Delete a document; result is `null`.
-    Delete {
-        /// Target table.
-        table: String,
-        /// Document id.
-        id: String,
-    },
-    /// Precondition: the row must be at exactly `version`.
-    ExpectVersion {
-        /// Target table.
-        table: String,
-        /// Document id.
-        id: String,
-        /// The required current version.
-        version: i64,
-    },
-    /// Precondition: no row may match the index eq-prefix.
-    ExpectAbsent {
-        /// Target table.
-        table: String,
-        /// Index to probe.
-        index: String,
-        /// The eq-prefix values.
-        eq: Vec<Value>,
-    },
-    /// Insert-or-patch keyed by an index eq-prefix match.
-    Upsert {
-        /// Target table.
-        table: String,
-        /// Index whose eq-prefix locates the row.
-        index: String,
-        /// The eq-prefix values.
-        eq: Vec<Value>,
-        /// Body applied when inserting.
-        insert: Map<String, Value>,
-        /// Keys merged when the row exists.
-        patch: Map<String, Value>,
-    },
-    /// Patch every row in `table` matching `filter`. At most `limit` rows
-    /// (default server cap 1000); a larger match set patches `limit` and reports
-    /// `truncated: true`. Mirrors `server/src/txn.rs::Step::PatchByQuery`
-    /// byte-for-byte.
-    PatchByQuery {
-        /// Target table.
-        table: String,
-        /// Which rows match.
-        filter: FilterExpr,
-        /// Keys to merge into every match.
-        patch: Map<String, Value>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        /// Row cap (server default/max 1000); `None` = server default.
-        limit: Option<u32>,
-    },
-    /// Delete every row in `table` matching `filter` (same `limit`/`truncated`
-    /// semantics as `PatchByQuery`). Mirrors
-    /// `server/src/txn.rs::Step::DeleteByQuery` byte-for-byte.
-    DeleteByQuery {
-        /// Target table.
-        table: String,
-        /// Which rows match.
-        filter: FilterExpr,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        /// Row cap (server default/max 1000); `None` = server default.
-        limit: Option<u32>,
-    },
-    /// Schedule `txn` to run later. Mirrors
-    /// `server/src/txn.rs::Step::Schedule` byte-for-byte (FM-28).
-    Schedule {
-        /// One-shot delay/absolute time, a cron expression, or a fixed
-        /// interval.
-        when: ScheduleWhen,
-        /// The nested transaction to fire when due.
-        txn: Box<Transaction>,
-    },
-    /// Cancel a previously scheduled job. Mirrors
-    /// `server/src/txn.rs::Step::CancelSchedule` byte-for-byte (FM-28).
-    CancelSchedule {
-        /// The schedule id to cancel.
-        id: String,
-    },
-    /// Start a durable workflow run. Mirrors
-    /// `server/src/txn.rs::Step::StartWorkflow` byte-for-byte (FM-29).
-    StartWorkflow {
-        /// The run's spec, snapshotted per run server-side.
-        spec: Box<WorkflowSpec>,
-    },
-    /// Cancel a workflow run. Mirrors
-    /// `server/src/txn.rs::Step::CancelWorkflow` byte-for-byte (FM-29).
-    CancelWorkflow {
-        /// The workflow run id.
-        id: String,
-    },
-    /// Restore a soft-deleted row (only legal on a table that declares
-    /// `softDelete`). `NotFound` when the row is absent; idempotent `Ok` when
-    /// it is present and already live. Mirrors
-    /// `server/src/txn.rs::Step::Undelete` byte-for-byte (FM-33).
-    Undelete {
-        /// Target table (must declare `softDelete`).
-        table: String,
-        /// Document id.
-        id: String,
-    },
-}
+/// `Transaction`/`Step` are now `par_rt_db_core::mutation` types (ARC-004
+/// follow-up), re-exported here at their historical path so every existing
+/// `crate::mutation::{Transaction, Step}` call site keeps resolving. See
+/// `server/src/dsl.rs` for the server's mirror of this same re-export.
+pub use par_rt_db_core::mutation::{Step, Transaction};
 
 /// One entry of `mutateOk.results`, positionally aligned with `steps`.
 ///
@@ -407,13 +273,21 @@ impl Default for Mutation {
     }
 }
 
-impl WorkflowStepSpec {
+/// `WorkflowStepSpec::await_signal` is an extension trait rather than an
+/// inherent `impl` because `WorkflowStepSpec` is now a foreign type (owned by
+/// `par_rt_db_core`) — the orphan rule forbids `impl WorkflowStepSpec { .. }`
+/// here. Bring this trait into scope alongside `WorkflowStepSpec` to keep the
+/// `WorkflowStepSpec::await_signal(..)` call syntax.
+pub trait WorkflowStepSpecExt {
     /// Build an `awaitSignal` step: park the run until a signal named `name`
-    /// is delivered (`WorkflowStepSpec::await_signal`, spec §Wire — exactly
-    /// one of `txn`/`awaitSignal` per step; the server's `validate_spec`
-    /// enforces it). `timeout_ms` bounds each wait attempt; `None` waits
-    /// indefinitely (cancel is the escape).
-    pub fn await_signal(name: impl Into<String>, timeout_ms: Option<u64>) -> Self {
+    /// is delivered (spec §Wire — exactly one of `txn`/`awaitSignal` per
+    /// step; the server's `validate_spec` enforces it). `timeout_ms` bounds
+    /// each wait attempt; `None` waits indefinitely (cancel is the escape).
+    fn await_signal(name: impl Into<String>, timeout_ms: Option<u64>) -> Self;
+}
+
+impl WorkflowStepSpecExt for WorkflowStepSpec {
+    fn await_signal(name: impl Into<String>, timeout_ms: Option<u64>) -> Self {
         Self {
             txn: None,
             await_signal: Some(crate::wire::AwaitSignalSpec {

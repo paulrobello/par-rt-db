@@ -9,5 +9,6 @@
 
 pub mod engine;
 pub mod fields;
+pub mod mutation;
 pub mod schema;
 pub mod wire;

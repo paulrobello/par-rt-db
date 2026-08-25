@@ -213,7 +213,7 @@ directly; `Mutation::start_workflow(spec)` starts a run as a txn step,
 atomic with the txn's writes.
 
 ```rust
-use par_rt_db_client::{StepRetry, WorkflowInfo, WorkflowSpec, WorkflowStepSpec};
+use par_rt_db_client::{StepRetry, WorkflowInfo, WorkflowSpec, WorkflowStepSpec, WorkflowStepSpecExt};
 
 let spec = WorkflowSpec {
     name: "onboard".into(),

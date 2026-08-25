@@ -269,65 +269,13 @@ pub struct PresenceMember {
     pub state: serde_json::Value,
 }
 
-/// How a caller wants a transaction scheduled. Mirrored byte-for-byte in
-/// `ts-client/src/protocol.ts` and `rust-client/src/wire.rs`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
-pub enum ScheduleWhen {
-    /// Fire `ms` milliseconds from now.
-    AfterMs { ms: i64 },
-    /// Fire at this UTC epoch-ms instant (in the past = fire immediately).
-    RunAt { ms: i64 },
-    /// Fire on this 5-field cron schedule (UTC, min-first).
-    Cron { expr: String },
-    /// Fire every `every_ms` milliseconds, starting one interval from now.
-    /// Missed windows (downtime, pause) are skipped, never backfilled —
-    /// each fire re-arms from its actual fire time, like cron recompute.
-    Interval {
-        #[serde(rename = "everyMs")]
-        every_ms: i64,
-    },
-}
-
-/// Whether a scheduled job fires once (`ScheduleWhen::AfterMs`/`RunAt`) or
-/// repeats (`Cron` on an expression, `Interval` every N ms). Closed domain —
-/// was a free `String` (ARC-004/QA-008). Serializes as `"oneshot"` / `"cron"`
-/// / `"interval"`, byte-identical to the prior stringly-typed bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScheduleKind {
-    Oneshot,
-    Cron,
-    Interval,
-}
-
-impl ScheduleKind {
-    pub fn as_wire_str(&self) -> &'static str {
-        match self {
-            ScheduleKind::Oneshot => "oneshot",
-            ScheduleKind::Cron => "cron",
-            ScheduleKind::Interval => "interval",
-        }
-    }
-}
-
-impl From<ScheduleKind> for &'static str {
-    fn from(k: ScheduleKind) -> &'static str {
-        k.as_wire_str()
-    }
-}
-
-impl std::str::FromStr for ScheduleKind {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "oneshot" => Ok(ScheduleKind::Oneshot),
-            "cron" => Ok(ScheduleKind::Cron),
-            "interval" => Ok(ScheduleKind::Interval),
-            other => Err(format!("unknown ScheduleKind: {other}")),
-        }
-    }
-}
+/// `ScheduleWhen`/`ScheduleKind` are now `par_rt_db_core::mutation` types
+/// (ARC-004 follow-up — both were verified byte-identical against
+/// `rust-client/src/wire.rs`, contradicting this card's original premise that
+/// `ScheduleKind` was server-only), re-exported here at their historical path
+/// so every existing `crate::protocol::{ScheduleWhen, ScheduleKind}` call site
+/// keeps resolving. Mirrored byte-for-byte in `ts-client/src/protocol.ts`.
+pub use par_rt_db_core::mutation::{ScheduleKind, ScheduleWhen};
 
 /// Lifecycle state of a scheduled job. Closed domain — was a free `String`
 /// (ARC-004/QA-008). Serializes as `"pending"` / `"running"` / `"paused"` /
@@ -393,114 +341,15 @@ pub struct ScheduleInfo {
     pub fired_count: i64,
 }
 
-/// Per-step retry policy (FM-29). `maxAttempts` counts TOTAL attempts — the
-/// first try included. Defaults when a step omits `retry`: 3 attempts, 1s
-/// initial backoff doubling to a 60s cap.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct StepRetry {
-    pub max_attempts: u32,
-    #[serde(default = "default_initial_retry_ms")]
-    pub initial_retry_ms: u64,
-    #[serde(default = "default_max_retry_ms")]
-    pub max_retry_ms: u64,
-}
-
-fn default_initial_retry_ms() -> u64 {
-    1_000
-}
-
-fn default_max_retry_ms() -> u64 {
-    60_000
-}
-
-impl Default for StepRetry {
-    fn default() -> Self {
-        Self {
-            max_attempts: 3,
-            initial_retry_ms: 1_000,
-            max_retry_ms: 60_000,
-        }
-    }
-}
-
-/// An `awaitSignal` step's wait declaration (spec §Wire): park the run
-/// until a signal named `name` is delivered; `timeoutMs` bounds each wait
-/// attempt (omitted = wait indefinitely, cancel is the escape).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AwaitSignalSpec {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_ms: Option<u64>,
-}
-
-/// One workflow step: either an ordinary `Transaction` or an
-/// [`AwaitSignalSpec`] wait (exactly one — `validate_spec` enforces it),
-/// plus policy. The txn may itself carry `Schedule`/`CancelSchedule` steps
-/// (FM-28 rules apply).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkflowStepSpec {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub txn: Option<Transaction>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub await_signal: Option<AwaitSignalSpec>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retry: Option<StepRetry>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sleep_before_ms: Option<u64>,
-}
-
-/// A submitted workflow definition. Stored verbatim per run — a run
-/// snapshots its spec, so template edits never drift a live run.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkflowSpec {
-    pub name: String,
-    pub steps: Vec<WorkflowStepSpec>,
-}
-
-/// Run lifecycle. Closed domain (ARC-004/QA-008 pattern — was never a free
-/// string). Snake-case wire: pending|running|waiting|success|failed|cancelled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowStatus {
-    Pending,
-    Running,
-    Waiting,
-    Success,
-    Failed,
-    Cancelled,
-}
-
-impl WorkflowStatus {
-    pub fn as_wire_str(&self) -> &'static str {
-        match self {
-            WorkflowStatus::Pending => "pending",
-            WorkflowStatus::Running => "running",
-            WorkflowStatus::Waiting => "waiting",
-            WorkflowStatus::Success => "success",
-            WorkflowStatus::Failed => "failed",
-            WorkflowStatus::Cancelled => "cancelled",
-        }
-    }
-}
-
-impl std::str::FromStr for WorkflowStatus {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "pending" => Ok(WorkflowStatus::Pending),
-            "running" => Ok(WorkflowStatus::Running),
-            "waiting" => Ok(WorkflowStatus::Waiting),
-            "success" => Ok(WorkflowStatus::Success),
-            "failed" => Ok(WorkflowStatus::Failed),
-            "cancelled" => Ok(WorkflowStatus::Cancelled),
-            other => Err(format!("unknown WorkflowStatus: {other}")),
-        }
-    }
-}
+/// `StepRetry`/`AwaitSignalSpec`/`WorkflowStepSpec`/`WorkflowSpec`/
+/// `WorkflowStatus` are now `par_rt_db_core::mutation` types (ARC-004
+/// follow-up — `WorkflowStatus` was verified byte-identical against
+/// `rust-client/src/wire.rs`, contradicting this card's original premise that
+/// it was server-only), re-exported here at their historical path so every
+/// existing `crate::protocol::{..}` call site keeps resolving.
+pub use par_rt_db_core::mutation::{
+    AwaitSignalSpec, StepRetry, WorkflowSpec, WorkflowStatus, WorkflowStepSpec,
+};
 
 /// Terminal record for one step: completed successfully, or exhausted its
 /// retries (`status: failed`). Individual retried attempts are NOT recorded —

@@ -243,7 +243,17 @@ fn project_get(query: &Query, last: &Value, txn: &Transaction) -> OptimisticProj
     finalize(working, last)
 }
 
-impl Step {
+/// `Step` is now a `par_rt_db_core::mutation` type (ARC-004 follow-up) — the
+/// orphan rule forbids `impl Step { .. }` here, so this crate-private helper
+/// moves to an extension trait. NOT the same helper as the server's
+/// `dsl::StepTableExt` (see its doc comment): this one masks `ExpectAbsent`
+/// too, which is correct for optimistic projection but wrong for the
+/// server's table-scope authorization gate.
+trait OptimisticStepTable {
+    fn table(&self) -> Option<&str>;
+}
+
+impl OptimisticStepTable for Step {
     /// The table this step targets. Every variant except `ExpectAbsent` and the
     /// schedule/workflow steps carries one; `ExpectAbsent` is a precondition
     /// with no data effect, so its table is masked here (returning `None` makes

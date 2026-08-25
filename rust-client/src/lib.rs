@@ -71,7 +71,7 @@ pub mod in_memory;
 pub mod ws;
 
 pub use error::{ErrorCode, ErrorEnvelope, RtDbError, retry_on_precondition};
-pub use mutation::{Mutation, StepResult, Transaction};
+pub use mutation::{Mutation, StepResult, Transaction, WorkflowStepSpecExt};
 pub use query::{
     HybridSearchOpts, Order, Paginate, Paginated, Query, SearchOpts, TableQuery, VectorSearchOpts,
 };

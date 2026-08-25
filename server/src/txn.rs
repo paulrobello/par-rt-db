@@ -26,7 +26,7 @@ use tracing::Instrument;
 use crate::auth::{PrincipalCtx, authorize_table};
 use crate::db::{new_id, now_ms, validate_db_name};
 use crate::ddl::{pg_col, pg_schema, pg_sequence, pg_table};
-use crate::dsl::{FilterExpr, filter_matches};
+use crate::dsl::{FilterExpr, StepTableExt, filter_matches};
 use crate::error::RtDbError;
 use crate::scheduler;
 use crate::schema::{
