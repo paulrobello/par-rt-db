@@ -25,6 +25,23 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/par_rt_db"]
 
+[tool.hatch.build.targets.wheel.force-include]
+# ENH-028 phase 2: the shared query-combination rule table lives in the repo's
+# wire-corpus (single source of truth for all five runners); force-included
+# here so `importlib.resources` can load it from an installed wheel without a
+# duplicated copy drifting from the canonical file.
+"../wire-corpus/query-combinations.json" = "par_rt_db/_data/query-combinations.json"
+
+[tool.hatch.build.targets.sdist.force-include]
+# Mirrors the wheel force-include above, but into the src tree itself so the
+# file travels inside the sdist tarball (no `../wire-corpus` to reach once
+# unpacked). Note: this repo has no PyPI publish pipeline and `make checkall`
+# never builds a wheel or sdist for python-client (verified 2026-08-25) — a
+# hypothetical wheel-built-from-this-sdist step would still need its own
+# `../wire-corpus` reach and isn't covered; `uv build --wheel` from a checkout
+# (the case that matters) works, verified directly.
+"../wire-corpus/query-combinations.json" = "src/par_rt_db/_data/query-combinations.json"
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
