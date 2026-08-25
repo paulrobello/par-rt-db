@@ -219,6 +219,20 @@ pub async fn test_state_with_require_signed_urls() -> Arc<AppState> {
     AppState::new(pool, config, test_hot())
 }
 
+/// Like `test_state` but with the image-transform kill switch off
+/// (`RTDB_IMAGE_TRANSFORMS_ENABLED=false`). Used by
+/// `tests/storage_signed_url_test.rs` to prove a signature minted for a render
+/// does not widen into a full-resolution serve once transforms are disabled.
+pub async fn test_state_with_transforms_disabled() -> Arc<AppState> {
+    let mut config = test_config();
+    config.storage.image.enabled = false;
+    let pool = sqlx::PgPool::connect(&config.database_url)
+        .await
+        .expect("connect to test postgres");
+    db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
+    AppState::new(pool, config, test_hot())
+}
+
 /// Like `test_state` but with `webhooks_enabled = true` and the
 /// `rtdb.webhooks` / `rtdb.webhook_deliveries` tables ensured. Used by
 /// `tests/webhook_test.rs` to exercise the registry end-to-end without touching

@@ -1,0 +1,39 @@
+{
+  "name": "error-filter-depth-over-cap",
+  "$comment": "SEC-007 boundary (restrictive side): one level past MAX_FILTER_DEPTH (32) \u2014 33 levels \u2014 is rejected with BAD_REQUEST before any compilation work. The cap bounds `and`/`or`/`not` nesting so a hostile filter cannot drive unbounded recursion or an unbounded query plan. Cap constant: server/src/schema/filter.rs::MAX_FILTER_DEPTH.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_name",
+            "fields": [
+              "name"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "seed": [
+    {
+      "name": "a"
+    }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "filter": {"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "and", "exprs": [{"op": "eq", "field": "name", "value": "a"}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}
+    }
+  },
+  "expect": {
+    "error": {
+      "code": "BAD_REQUEST"
+    }
+  }
+}

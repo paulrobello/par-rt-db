@@ -908,6 +908,15 @@ private func executeSearchTerminal(
     if search.query.trimmingCharacters(in: .whitespaces).isEmpty {
         throw RtDbError(code: .badRequest, message: "search query text must not be empty")
     }
+    // SEC-007: bound the text handed to the search engine before any
+    // compilation work happens. Mirrors server `MAX_SEARCH_QUERY_BYTES`,
+    // capping the UTF-8 byte length (not the character count).
+    if search.query.utf8.count > InMemoryLimits.maxSearchQueryBytes {
+        throw RtDbError(
+            code: .badRequest,
+            message: "search query text must be at most \(InMemoryLimits.maxSearchQueryBytes) bytes"
+        )
+    }
     guard let searchDef = (tableDef.indexes ?? []).first(where: {
         $0.name == search.index && $0.search
     }) else {

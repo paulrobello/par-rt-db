@@ -30,6 +30,15 @@ from ..wire import (
     _FilterOr,
 )
 
+# SEC-007: hard ceiling on `and`/`or`/`not` nesting in a filter expression.
+# Mirrors server `schema/filter.rs::MAX_FILTER_DEPTH`. Depth starts at 1 for
+# the top-level expr and increments for each child of And/Or/Not.
+MAX_FILTER_DEPTH = 32
+
+# SEC-007: hard ceiling on `in` list length. Mirrors server
+# `schema/filter.rs::MAX_IN_VALUES`.
+MAX_IN_VALUES = 1000
+
 
 def _validate_filter(
     expr: FilterExpr, table_def: TableDef, *, allow_relative_time: bool = False
@@ -37,11 +46,21 @@ def _validate_filter(
     """Structural + value-kind validation of a ``FilterExpr`` against a table's
     declared fields (the prologue the server runs in ``compile_filter``).
     Raises ``BAD_REQUEST`` for an empty ``and``/``or``/``in``, an unknown field,
-    a non-string/number/boolean leaf value, mixed-type ``in`` values, or a value
-    whose JSON kind does not match the field's declared type (SEC-126).
-    ``allow_relative_time`` admits the ``olderThan`` leaf — only the by-query
-    step filters pass ``True`` (server ``compile_scan_where``); every read-path
-    caller keeps the default, which rejects it there."""
+    a non-string/number/boolean leaf value, mixed-type ``in`` values, a value
+    whose JSON kind does not match the field's declared type (SEC-126), filter
+    nesting beyond ``MAX_FILTER_DEPTH``, or an ``in`` list longer than
+    ``MAX_IN_VALUES`` (SEC-007). ``allow_relative_time`` admits the
+    ``olderThan`` leaf — only the by-query step filters pass ``True`` (server
+    ``compile_scan_where``); every read-path caller keeps the default, which
+    rejects it there."""
+    _validate_filter_at(expr, table_def, allow_relative_time=allow_relative_time, depth=1)
+
+
+def _validate_filter_at(
+    expr: FilterExpr, table_def: TableDef, *, allow_relative_time: bool, depth: int
+) -> None:
+    if depth > MAX_FILTER_DEPTH:
+        raise RtDbError(ErrorCode.BAD_REQUEST, f"filter nesting exceeds {MAX_FILTER_DEPTH} levels")
     match expr:
         case _FilterAnd(exprs=exprs) | _FilterOr(exprs=exprs):
             if not exprs:
@@ -49,10 +68,14 @@ def _validate_filter(
                     ErrorCode.BAD_REQUEST, f"{expr.op} filter requires at least one expr"
                 )
             for e in exprs:
-                _validate_filter(e, table_def, allow_relative_time=allow_relative_time)
+                _validate_filter_at(
+                    e, table_def, allow_relative_time=allow_relative_time, depth=depth + 1
+                )
         case _FilterIn(field=fld, values=values):
             if not values:
                 raise RtDbError(ErrorCode.BAD_REQUEST, "in filter requires at least one value")
+            if len(values) > MAX_IN_VALUES:
+                raise RtDbError(ErrorCode.BAD_REQUEST, f"in: at most {MAX_IN_VALUES} values")
             for v in values:
                 _check_leaf_value(fld, v, table_def)
             first_kind = _in_value_kind(values[0])
@@ -94,7 +117,9 @@ def _validate_filter(
                     f"field '{fld}' must be a number or int64 field for olderThan",
                 )
         case _FilterNot(expr=inner):
-            _validate_filter(inner, table_def, allow_relative_time=allow_relative_time)
+            _validate_filter_at(
+                inner, table_def, allow_relative_time=allow_relative_time, depth=depth + 1
+            )
         case _FilterContains(field=fld, value=val):
             _check_leaf_value(fld, val, table_def)
         case _FilterExists(field=fld):

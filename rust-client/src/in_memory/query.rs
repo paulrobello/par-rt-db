@@ -430,6 +430,14 @@ impl InMemoryRtDbClient {
                 "search query text must not be empty",
             ));
         }
+        // SEC-007: bound the raw search text before any compilation work
+        // happens. Mirrors `server/src/query/search.rs::MAX_SEARCH_QUERY_BYTES`.
+        if search.query.len() > MAX_SEARCH_QUERY_BYTES {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("search query text must be at most {MAX_SEARCH_QUERY_BYTES} bytes"),
+            ));
+        }
         let search_not_found = || {
             RtDbError::new(
                 ErrorCode::BadRequest,

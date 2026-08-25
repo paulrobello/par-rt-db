@@ -40,6 +40,10 @@ import {
 
 const MAX_TAKE = 4096;
 
+/** SEC-007: hard ceiling on the raw `search.query` text, in UTF-8 bytes.
+ * Mirrors server `search::MAX_SEARCH_QUERY_BYTES`. */
+const MAX_SEARCH_QUERY_BYTES = 4096;
+
 /** Lowercase a value to FTS-indexable text. Mirrors the text the server feeds
  *  into a search index's generated tsvector for a declared field. */
 function ftsStringify(v: unknown): string {
@@ -865,6 +869,12 @@ function executeSearchTerminal(
   const search = q.search!;
   if (search.query.trim().length === 0) {
     throw new RtDbError("BAD_REQUEST", "search query text must not be empty");
+  }
+  if (new TextEncoder().encode(search.query).length > MAX_SEARCH_QUERY_BYTES) {
+    throw new RtDbError(
+      "BAD_REQUEST",
+      `search query text must be at most ${MAX_SEARCH_QUERY_BYTES} bytes`,
+    );
   }
   const searchDef = tableDef.indexes?.find((i) => i.name === search.index && i.search);
   if (!searchDef) {

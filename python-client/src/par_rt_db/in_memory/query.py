@@ -50,6 +50,10 @@ if TYPE_CHECKING:
 else:
     _Core = object
 
+# SEC-007: hard ceiling on search query text, in UTF-8 bytes. Mirrors server
+# `query/search.rs::MAX_SEARCH_QUERY_BYTES`.
+MAX_SEARCH_QUERY_BYTES = 4096
+
 
 def _check_query_combinations(q: Query) -> None:
     """Conflicting-terminal guards, in the server's validation order: each
@@ -804,6 +808,13 @@ class _QueryEngine(_Core):
         # then filter shape.
         if not q.search.query.strip():
             raise RtDbError(ErrorCode.BAD_REQUEST, "search query text must not be empty")
+        # SEC-007: mirrors server `query/search.rs::MAX_SEARCH_QUERY_BYTES`;
+        # the cap is on UTF-8 byte length, not code-point count.
+        if len(q.search.query.encode("utf-8")) > MAX_SEARCH_QUERY_BYTES:
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"search query text must be at most {MAX_SEARCH_QUERY_BYTES} bytes",
+            )
         search_def = next(
             (i for i in table_def.indexes if i.name == q.search.index and i.search), None
         )

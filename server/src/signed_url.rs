@@ -10,7 +10,14 @@
 //! once at boot from the server's required `admin_key` and held on `AppState`,
 //! so the feature needs no extra configuration. Rotating `admin_key` changes the
 //! derived key and invalidates every outstanding signed URL (a desirable
-//! "revoke all signed access" side effect). See
+//! "revoke all signed access" side effect).
+//!
+//! `transform` is derived from `parse()`, which knows nothing about the
+//! `RTDB_IMAGE_TRANSFORMS_ENABLED` kill switch, so the serve route
+//! (`http_api::serve_public`) rejects a signed request that asks for a render
+//! while transforms are disabled — otherwise the serve path would skip the
+//! transform and return the full-resolution original against a signature
+//! minted for a thumbnail. See
 //! docs/superpowers/specs/2026-08-08-signed-storage-urls-design.md.
 
 /// Domain-separation label mixed into key derivation so a signed URL (which

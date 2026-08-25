@@ -52,6 +52,10 @@ public enum InMemoryLimits {
     /// `workflows::MAX_SIGNAL_PAYLOAD_BYTES`), enforced on delivery so every
     /// surface gets the same bound.
     static let maxSignalPayloadBytes = 64 * 1024
+    /// SEC-007: hard ceiling on `search.query`'s UTF-8 byte length (server
+    /// `search::MAX_SEARCH_QUERY_BYTES`), enforced right after the
+    /// not-empty check.
+    public static let maxSearchQueryBytes = 4096
 }
 
 /// SEC-104: total documents a txn could touch in the worst case (store.ts
