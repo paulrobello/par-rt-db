@@ -48,7 +48,7 @@ fn user(email: &str) -> AuthedUser {
 /// ENH-022 Stage 3: a `join` on replica A is visible to a subscriber on
 /// replica B via Postgres LISTEN/NOTIFY gossip. Replica B's union broadcast
 /// contains BOTH its own local member AND the peer member from A, with A's
-/// member namespaced as `"replica-a:<conn>"` so the two replicas' per-process
+/// member namespaced as `"<a's instance id>:<conn>"` so the two replicas' per-process
 /// ConnIds cannot collide. This is the load-bearing wire-visible difference in
 /// multi-instance mode and the whole point of the gossip layer.
 #[tokio::test]
@@ -128,7 +128,7 @@ async fn cross_replica_presence_union_includes_namespaced_peer_member() -> anyho
     );
     let members = found.borrow_mut().take().expect("checked above");
     // Assert the union shape: local member "1" (B's own, plain conn id) AND
-    // the namespaced peer member "replica-a:1".
+    // the namespaced peer member `peer_conn_id` (A's instance id + ":1").
     let local = members.iter().find(|m| m.connection_id == "1");
     let peer = members.iter().find(|m| m.connection_id == peer_conn_id);
     assert!(
