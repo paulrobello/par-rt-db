@@ -472,131 +472,43 @@ private func executeQueryUnprojected(
     return try executeCollectTerminal(query, sorted)
 }
 
-// swiftlint:disable cyclomatic_complexity function_body_length
-/// Conflicting-terminal guards, in the server's validation order (query.ts
-/// `checkQueryCombinations`).
+/// Conflicting-clause guards, table-driven from `wire-corpus/query-combinations.json`
+/// (mirrored as `QueryCombinationRules` — ENH-028 phase 2). Runs before the
+/// `vectorSearch`/`hybridSearch`/`search`/scan dispatch; `get` is handled earlier by
+/// `executeGetTerminal` and is never present when this runs, so it never fires the
+/// `get`-side rules here (they exist in the table for the other four runners' sake).
 private func checkQueryCombinations(_ query: Query) throws {
-    if query.unique, query.take != nil || query.order != nil || query.distinct || query.aggregate != nil {
-        throw RtDbError(
-            code: .badRequest,
-            message: "unique cannot be combined with take, order, distinct, or aggregate"
-        )
+    let flags: [(String, Bool)] = [
+        ("get", query.get != nil),
+        ("index", query.index != nil),
+        ("eq", !query.eq.isEmpty),
+        ("gt", query.gt != nil),
+        ("gte", query.gte != nil),
+        ("lt", query.lt != nil),
+        ("lte", query.lte != nil),
+        ("order", query.order != nil),
+        ("take", query.take != nil),
+        ("unique", query.unique),
+        ("first", query.first),
+        ("count", query.count),
+        ("distinct", query.distinct),
+        ("aggregate", query.aggregate != nil),
+        ("paginate", query.paginate != nil),
+        ("filter", query.filter != nil),
+        ("search", query.search != nil),
+        ("vectorSearch", query.vectorSearch != nil),
+        ("hybridSearch", query.hybridSearch != nil)
+    ]
+    let present = Set(flags.filter(\.1).map(\.0))
+
+    if let rule = firstViolatedQueryCombinationRule(present) {
+        throw RtDbError(code: ErrorCode(rawValue: rule.code) ?? .badRequest, message: rule.message)
     }
-    if query.first, query.unique {
-        throw RtDbError(code: .badRequest, message: "first cannot be combined with unique")
-    }
-    if query.first, query.take != nil {
-        throw RtDbError(code: .badRequest, message: "first cannot be combined with take")
-    }
-    if query.first, query.distinct {
-        throw RtDbError(code: .badRequest, message: "first cannot be combined with distinct")
-    }
-    if query.first, query.aggregate != nil {
-        throw RtDbError(code: .badRequest, message: "first cannot be combined with aggregate")
-    }
-    if query.count, query.unique {
-        throw RtDbError(code: .badRequest, message: "count cannot be combined with unique")
-    }
-    if query.count, query.take != nil {
-        throw RtDbError(code: .badRequest, message: "count cannot be combined with take")
-    }
-    if query.count, query.first {
-        throw RtDbError(code: .badRequest, message: "count cannot be combined with first")
-    }
-    if query.count, query.order != nil {
-        throw RtDbError(code: .badRequest, message: "count cannot be combined with order")
-    }
-    if query.count, query.distinct {
-        throw RtDbError(code: .badRequest, message: "count cannot be combined with distinct")
-    }
-    if query.count, query.aggregate != nil {
-        throw RtDbError(code: .badRequest, message: "count cannot be combined with aggregate")
-    }
-    if query.distinct {
-        if query.take != nil {
-            throw RtDbError(code: .badRequest, message: "distinct cannot be combined with take")
-        }
-        if query.order != nil {
-            throw RtDbError(code: .badRequest, message: "distinct cannot be combined with order")
-        }
-        if query.paginate != nil {
-            throw RtDbError(code: .badRequest, message: "distinct cannot be combined with paginate")
-        }
-        if query.search != nil {
-            throw RtDbError(code: .badRequest, message: "distinct cannot be combined with search")
-        }
-        if query.vectorSearch != nil {
-            throw RtDbError(
-                code: .badRequest, message: "distinct cannot be combined with vector search"
-            )
-        }
-        if query.hybridSearch != nil {
-            throw RtDbError(
-                code: .badRequest, message: "distinct cannot be combined with hybrid search"
-            )
-        }
-        if query.aggregate != nil {
-            throw RtDbError(code: .badRequest, message: "distinct cannot be combined with aggregate")
-        }
-    }
-    if query.aggregate != nil {
-        if query.take != nil {
-            throw RtDbError(code: .badRequest, message: "aggregate cannot be combined with take")
-        }
-        if query.order != nil {
-            throw RtDbError(code: .badRequest, message: "aggregate cannot be combined with order")
-        }
-        if query.paginate != nil {
-            throw RtDbError(code: .badRequest, message: "aggregate cannot be combined with paginate")
-        }
-        if query.search != nil {
-            throw RtDbError(code: .badRequest, message: "aggregate cannot be combined with search")
-        }
-        if query.vectorSearch != nil {
-            throw RtDbError(
-                code: .badRequest, message: "aggregate cannot be combined with vector search"
-            )
-        }
-        if query.hybridSearch != nil {
-            throw RtDbError(
-                code: .badRequest, message: "aggregate cannot be combined with hybrid search"
-            )
-        }
-    }
-    if query.paginate != nil {
-        if query.count {
-            throw RtDbError(code: .badRequest, message: "paginate cannot be combined with count")
-        }
-        if query.distinct {
-            throw RtDbError(code: .badRequest, message: "paginate cannot be combined with distinct")
-        }
-        if query.aggregate != nil {
-            throw RtDbError(
-                code: .badRequest, message: "paginate cannot be combined with aggregate"
-            )
-        }
-        if query.unique {
-            throw RtDbError(code: .badRequest, message: "paginate cannot be combined with unique")
-        }
-        if query.first {
-            throw RtDbError(code: .badRequest, message: "paginate cannot be combined with first")
-        }
-        if query.take != nil {
-            throw RtDbError(code: .badRequest, message: "paginate cannot be combined with take")
-        }
-    }
-    if query.gt != nil, query.gte != nil {
-        throw RtDbError(code: .badRequest, message: "gt and gte cannot both be set")
-    }
-    if query.lt != nil, query.lte != nil {
-        throw RtDbError(code: .badRequest, message: "lt and lte cannot both be set")
-    }
+    // Not a combination rule (no counterpart clause) — stays a standalone bound check.
     if let take = query.take, take > maxQueryTake {
         throw RtDbError(code: .badRequest, message: "take exceeds maximum of \(maxQueryTake)")
     }
 }
-
-// swiftlint:enable cyclomatic_complexity function_body_length
 
 // swiftlint:disable cyclomatic_complexity
 /// Index resolution, eq-prefix binding, range-bound coercion, and one-time
