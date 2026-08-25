@@ -1,6 +1,7 @@
 /** Scenario b: M subscribers on one live query + one writer. Measures the
- * time from a commit's ack to each subscriber's `queryUpdate` receipt
- * (fan-out latency), p50/p99. */
+ * time from issuing each write to each subscriber's `queryUpdate` receipt
+ * (fan-out latency), p50/p99. Timed from send rather than from the HTTP
+ * mutate's ack — see the in-loop comment for why. */
 
 import { mutation, RtDbClient, RtDbHttpClient } from "@par-rt-db/client";
 import type { RtQuery } from "@par-rt-db/client";
@@ -73,9 +74,17 @@ export async function runScenarioB(
   for (let i = 0; i < iterations; i++) {
     const payload = makePayload(i);
     const txn = mutation().insert("items", payload).build();
-    await httpClient.mutate(txn);
-    const commitAckAt = performance.now();
 
+    // Register every subscriber's waiter BEFORE sending the mutation. The
+    // server pushes a subscriber's queryUpdate over its own already-open
+    // WebSocket as soon as it commits — a single hop — while this HTTP
+    // mutate still has a full request/response round trip left to complete.
+    // Waiting for `httpClient.mutate` to resolve before registering waiters
+    // lost that race almost every time (confirmed against a real deployed
+    // server: 151/160 iterations timed out), because the push routinely
+    // lands before the HTTP response does, finds no waiter for its key, and
+    // is dropped with nothing left to trigger the match once one is set.
+    let sentAt = 0;
     const perSubscriber = subClients.map(
       (_, idx) =>
         new Promise<number | null>((resolve) => {
@@ -86,10 +95,12 @@ export async function runScenarioB(
           }, PER_WRITE_TIMEOUT_MS);
           waiters.set(key, () => {
             clearTimeout(timer);
-            resolve(performance.now() - commitAckAt);
+            resolve(performance.now() - sentAt);
           });
         }),
     );
+    sentAt = performance.now();
+    await httpClient.mutate(txn);
     const results = await Promise.all(perSubscriber);
     for (const r of results) {
       if (r === null) timeouts++;
