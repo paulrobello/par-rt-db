@@ -581,6 +581,20 @@ GitLab, Microsoft, Apple, and generic OIDC, each optional via the
 and Mutate** — not just at connect — so revocation, allowlist changes, and
 session expiry take effect on open connections.
 
+**One identity resolver, six providers.** Every completed login goes through
+`auth::resolve_user`, which keys on the provider's own stable subject column
+(`github_id`, `apple_sub`, `microsoft_sub`, `google_sub`, `gitlab_id`,
+`oidc_sub`) — never on the email, which providers let users change. Resolution
+is three ordered steps: reuse the row carrying this subject (refreshing
+`login`/`email`, so a provider-side email change follows the account instead of
+forking a second one); else link an existing row with the same verified email
+whose subject column is still NULL (this is what links one person across two
+providers, and what adopts a row created before a provider had a subject
+column); else insert. The email-link step is skipped for Microsoft unless the
+tenant asserts `xms_edov` — SEC-102's nOAuth defense. The subject columns are
+nullable and never backfilled: a pre-existing user's first login after a column
+is added takes the link step, and every later login matches at step one.
+
 ### Per-row authorization
 
 On top of the db-level gate:

@@ -36,6 +36,11 @@ impl OidcProvider {
 
 /// Normalized identity extracted from the IdP's userinfo response.
 struct OidcIdentity {
+    /// The IdP's `sub` claim — the stable identifier written to
+    /// `users.oidc_sub`. `sub` is unique per issuer, and a deployment
+    /// configures exactly one OIDC issuer, so the bare claim is the key (no
+    /// issuer prefix, unlike Microsoft's multi-tenant `{tid}.{sub}`).
+    sub: String,
     email: String,
     name: Option<String>,
 }
@@ -93,18 +98,18 @@ impl OAuthProvider for OidcProvider {
         let identity = parse_userinfo(userinfo)?;
         let email = identity.email.to_lowercase();
 
-        // Identity is email-keyed (UNIQUE; the key the allowlist uses), so an
-        // OIDC login reuses an existing row if the same person previously signed
-        // in with another provider matching on email. The IdP's `sub` is not
-        // persisted, mirroring the google provider — no schema change, identity
-        // aligned with the email-based authorization model. QA-004: resolved
-        // through the shared `auth::resolve_user` email-keyed path.
+        // Identity keys on the IdP's stable `sub` (`users.oidc_sub`), not on
+        // email, so an IdP-side email change follows the account instead of
+        // forking a second one. Cross-provider linking still works — step (2)
+        // of `auth::resolve_user` adopts an existing row that carries the same
+        // verified email and no `oidc_sub` yet, which is also what links a row
+        // created before this column existed.
         let login = identity.name.clone().unwrap_or_else(|| email.clone());
         let user_id = auth::resolve_user(
             &state.pool,
             ProviderIdentity {
-                provider_id_column: auth::PROVIDER_COL_EMAIL,
-                provider_id: &email,
+                provider_id_column: auth::PROVIDER_COL_OIDC_SUB,
+                provider_id: &identity.sub,
                 login: &login,
                 email: &email,
                 allow_email_link: true,
@@ -142,6 +147,17 @@ fn is_email_verified(value: &serde_json::Value) -> bool {
 /// mail but omits the claim should patch their IdP's userinfo to emit it
 /// rather than relax this gate.
 fn parse_userinfo(value: serde_json::Value) -> Result<OidcIdentity, RtDbError> {
+    // OIDC Core requires `sub` in every userinfo response, and it is the
+    // durable identity key here, so a response without it is rejected rather
+    // than silently falling back to email-keyed identity. An IdP that omits
+    // `sub` from userinfo (non-compliant) must be fixed on the IdP side.
+    let sub = value
+        .get("sub")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| RtDbError::forbidden("userinfo missing sub"))?
+        .to_string();
+
     let email = value
         .get("email")
         .and_then(|v| v.as_str())
@@ -158,7 +174,7 @@ fn parse_userinfo(value: serde_json::Value) -> Result<OidcIdentity, RtDbError> {
 
     let name = value.get("name").and_then(|v| v.as_str()).map(String::from);
 
-    Ok(OidcIdentity { email, name })
+    Ok(OidcIdentity { sub, email, name })
 }
 
 #[cfg(test)]
@@ -178,14 +194,26 @@ mod tests {
         .unwrap();
         assert_eq!(id.email, "Alice@Example.com");
         assert_eq!(id.name.as_deref(), Some("Alice"));
+        assert_eq!(id.sub, "123", "sub is the durable identity key");
     }
 
     #[test]
     fn parse_userinfo_accepts_verified_string_email() {
-        let id =
-            parse_userinfo(json!({"email": "bob@example.com", "email_verified": "true"})).unwrap();
+        let id = parse_userinfo(
+            json!({"sub": "456", "email": "bob@example.com", "email_verified": "true"}),
+        )
+        .unwrap();
         assert_eq!(id.email, "bob@example.com");
         assert!(id.name.is_none());
+    }
+
+    /// `sub` is what keeps identity stable across an IdP-side email change,
+    /// so userinfo without it is rejected rather than silently degrading to
+    /// email-keyed identity. OIDC Core requires the claim.
+    #[test]
+    fn parse_userinfo_rejects_missing_sub() {
+        let err = parse_userinfo(json!({"email": "e@x.com", "email_verified": true}));
+        assert!(err.is_err());
     }
 
     #[test]
@@ -198,7 +226,7 @@ mod tests {
 
     #[test]
     fn parse_userinfo_rejects_unverified_email() {
-        let err = parse_userinfo(json!({"email": "c@x.com", "email_verified": false}));
+        let err = parse_userinfo(json!({"sub": "2", "email": "c@x.com", "email_verified": false}));
         assert!(err.is_err());
     }
 
@@ -342,13 +370,18 @@ mod tests {
         pool
     }
 
-    /// A generic OIDC IdP has no persisted per-provider id, so its durable
-    /// key IS the email: a returning login with the same email (but a
-    /// changed display `name`) reuses the row instead of forking a new one.
+    /// The IdP's `sub` (`users.oidc_sub`) is the durable key, not the email: a
+    /// returning login with the same `sub` but an IdP-side email change reuses
+    /// the row instead of forking a new account.
     #[tokio::test]
-    async fn returning_user_with_the_same_email_reuses_the_row() {
+    async fn returning_user_with_the_same_sub_reuses_the_row_across_an_email_change() {
         let pool = users_pool().await;
+        let sub = uuid::Uuid::now_v7().simple().to_string();
         let email = format!(
+            "{}@oidc-resolve-test.example",
+            uuid::Uuid::now_v7().simple()
+        );
+        let new_email = format!(
             "{}@oidc-resolve-test.example",
             uuid::Uuid::now_v7().simple()
         );
@@ -356,8 +389,8 @@ mod tests {
         let first_id = auth::resolve_user(
             &pool,
             ProviderIdentity {
-                provider_id_column: auth::PROVIDER_COL_EMAIL,
-                provider_id: &email,
+                provider_id_column: auth::PROVIDER_COL_OIDC_SUB,
+                provider_id: &sub,
                 login: "Carol",
                 email: &email,
                 allow_email_link: true,
@@ -370,10 +403,10 @@ mod tests {
         let second_id = auth::resolve_user(
             &pool,
             ProviderIdentity {
-                provider_id_column: auth::PROVIDER_COL_EMAIL,
-                provider_id: &email,
+                provider_id_column: auth::PROVIDER_COL_OIDC_SUB,
+                provider_id: &sub,
                 login: "Carol Renamed",
-                email: &email,
+                email: &new_email,
                 allow_email_link: true,
                 conflict_style: ConflictStyle::Conflict,
             },
@@ -381,15 +414,23 @@ mod tests {
         .await
         .expect("returning-user resolve");
 
-        assert_eq!(second_id, first_id, "same email reuses the row");
-        let (login,): (String,) = sqlx::query_as("SELECT login FROM rtdb_auth.users WHERE id = $1")
-            .bind(&first_id)
-            .fetch_one(&pool)
-            .await
-            .expect("user row exists");
+        assert_eq!(
+            second_id, first_id,
+            "the same oidc_sub reuses the row across an email change"
+        );
+        let (login, row_email): (String, String) =
+            sqlx::query_as("SELECT login, email FROM rtdb_auth.users WHERE id = $1")
+                .bind(&first_id)
+                .fetch_one(&pool)
+                .await
+                .expect("user row exists");
         assert_eq!(
             login, "Carol Renamed",
             "login follows the provider-side change"
+        );
+        assert_eq!(
+            row_email, new_email,
+            "email follows the provider-side change"
         );
     }
 }

@@ -394,8 +394,10 @@ Login-CSRF is defended by the `rtdb-oauth-csrf` double-submit cookie set at
 `/begin` and constant-time-verified at `/callback`
 (`RTDB_OAUTH_LOGIN_CSRF=true` by default; cross-origin SDK consumers must send
 `credentials: "include"` on the `/begin` and `/auth/state` fetches — the poll
-also requires the `rtdb-oauth-state` cookie, SEC-121). Identity is email-keyed with
-cross-provider linking (Apple additionally keys on its stable `sub`).
+also requires the `rtdb-oauth-state` cookie, SEC-121). Identity is keyed on each
+provider's stable subject (`github_id`, `apple_sub`, `microsoft_sub`,
+`google_sub`, `gitlab_id`, `oidc_sub`), with the verified email linking an
+account across providers on a first login.
 
 Bearer tokens are either a per-database **machine token** (minted via `/admin/mint-token`)
 or a **session token** (minted by completing an OAuth flow). Both resolve through the same

@@ -431,12 +431,15 @@ pub fn authed_user(p: &Principal) -> AuthedUser {
 // --- QA-004: one `resolve_user` for every OAuth provider -------------------
 //
 // Every provider used to hand-roll its own "find or create the user" block.
-// Three (GitHub, Apple, Microsoft) persist a stable per-provider identifier
-// (`github_id`/`apple_sub`/`microsoft_sub`) and resolve by that column first,
-// falling back to linking an existing email-keyed row; three (Google, GitLab,
-// OIDC) persist no such column and resolve purely by the UNIQUE `email`
-// column. `resolve_user` below serves both shapes through one call so the
+// `resolve_user` below is the one implementation they all share, so the
 // resolution rules can't silently drift between providers again.
+//
+// All six now persist a stable per-provider subject and resolve by that
+// column first, falling back to linking an existing email-keyed row only when
+// the subject is not yet on file. Google, GitLab and OIDC previously had no
+// such column and resolved purely by the UNIQUE `email` column, which forked a
+// second account whenever the provider-side email changed; they key on
+// `google_sub`/`gitlab_id`/`oidc_sub` now (see `db.rs` for the columns).
 
 /// The fixed set of columns `resolve_user` may splice into SQL as
 /// `provider_id_column`. Every provider passes one of these `&'static str`
@@ -446,20 +449,17 @@ pub fn authed_user(p: &Principal) -> AuthedUser {
 pub const PROVIDER_COL_GITHUB_ID: &str = "github_id";
 pub const PROVIDER_COL_APPLE_SUB: &str = "apple_sub";
 pub const PROVIDER_COL_MICROSOFT_SUB: &str = "microsoft_sub";
-/// Sentinel for the three providers with no persisted per-provider id
-/// (Google, GitLab, OIDC): `resolve_user` recognizes this value and takes the
-/// single email-keyed upsert path instead of the three-step resolution.
-pub const PROVIDER_COL_EMAIL: &str = "email";
+pub const PROVIDER_COL_GOOGLE_SUB: &str = "google_sub";
+pub const PROVIDER_COL_GITLAB_ID: &str = "gitlab_id";
+pub const PROVIDER_COL_OIDC_SUB: &str = "oidc_sub";
 
 /// How `resolve_user` reports a unique-violation race on the final
 /// insert/update. The three providers disagreed before consolidation
 /// (GitHub and Microsoft returned `PRECONDITION_FAILED`, Apple returned
 /// `CONFLICT`); both are preserved verbatim here per provider — GitHub's is
 /// asserted by `oauth_test.rs`, Microsoft's by its own DB-level tests — so no
-/// existing wire contract shifts. Google/GitLab/OIDC (previously unmapped;
-/// their `ON CONFLICT (email) DO UPDATE` couldn't 23505 on email) get
-/// `Conflict` as the more descriptive default for the one dormant path this
-/// still leaves (a same-transaction race on another constraint).
+/// existing wire contract shifts. Google/GitLab/OIDC use `Conflict` as the
+/// more descriptive default.
 #[derive(Debug, Clone, Copy)]
 pub enum ConflictStyle {
     Precondition,
@@ -467,8 +467,7 @@ pub enum ConflictStyle {
 }
 
 /// The identity a provider extracted from its token exchange / claims,
-/// normalized for `resolve_user`. `provider_id_column`/`provider_id` are
-/// meaningless (and ignored) when `provider_id_column == PROVIDER_COL_EMAIL`.
+/// normalized for `resolve_user`.
 pub struct ProviderIdentity<'a> {
     pub provider_id_column: &'static str,
     pub provider_id: &'a str,
@@ -490,10 +489,9 @@ pub struct ProviderIdentity<'a> {
 /// Resolves (finds or creates) the `rtdb_auth.users` row for a completed
 /// OAuth login and returns its id.
 ///
-/// Two resolution shapes, chosen by `id.provider_id_column`:
+/// One resolution shape for every provider, keyed on the stable per-provider
+/// subject column named by `id.provider_id_column`:
 ///
-/// **Id-keyed** (GitHub/Apple/Microsoft — `provider_id_column` is
-/// `github_id`/`apple_sub`/`microsoft_sub`):
 /// 1. An existing user with this `provider_id_column` value (a returning
 ///    user of this provider) is reused, with `login`/`email` refreshed — so a
 ///    provider-side email change follows the account instead of forking it.
@@ -501,27 +499,20 @@ pub struct ProviderIdentity<'a> {
 ///    already belongs to an account not yet linked to this provider
 ///    (`provider_id_column IS NULL`), that account is linked by setting its
 ///    `provider_id_column`. Both providers verified the email, so this is the
-///    same person.
+///    same person. This is also what adopts a pre-existing Google/GitLab/OIDC
+///    row from before those three had a subject column — their first login
+///    after the upgrade links; every later login matches at step (1).
 /// 3. Otherwise a new row is inserted.
-///
-/// **Email-keyed** (Google/GitLab/OIDC — `provider_id_column ==
-/// PROVIDER_COL_EMAIL`, no persisted per-provider id): a single upsert keyed
-/// on the UNIQUE `email` column, identical to each provider's pre-
-/// consolidation `ON CONFLICT (email) DO UPDATE`.
 ///
 /// A UNIQUE violation on the final write — the email already linked to a
 /// *different* account, or a concurrent login racing past the checks — is
 /// mapped to a deliberate conflict per `id.conflict_style` rather than leaked
 /// as a 500.
 pub async fn resolve_user(pool: &PgPool, id: ProviderIdentity<'_>) -> Result<String, RtDbError> {
-    if id.provider_id_column == PROVIDER_COL_EMAIL {
-        return resolve_by_email_only(pool, &id).await;
-    }
-
     // Only `github_id` is a non-text column (bigint); the value still arrives
     // as `&str` (the plan's struct shape), so it is cast explicitly rather
-    // than bound as a mismatched type. `apple_sub`/`microsoft_sub` are text
-    // and need no cast.
+    // than bound as a mismatched type. Every other subject column is text and
+    // needs no cast.
     let cast = if id.provider_id_column == PROVIDER_COL_GITHUB_ID {
         "::bigint"
     } else {
@@ -591,31 +582,6 @@ pub async fn resolve_user(pool: &PgPool, id: ProviderIdentity<'_>) -> Result<Str
         .map_err(|e| map_conflict(e, id.conflict_style))?;
     tx.commit().await?;
     Ok(row_id)
-}
-
-/// The email-keyed resolution path for providers with no persisted
-/// per-provider id (Google/GitLab/OIDC): identical to each provider's
-/// pre-consolidation single-statement upsert.
-async fn resolve_by_email_only(
-    pool: &PgPool,
-    id: &ProviderIdentity<'_>,
-) -> Result<String, RtDbError> {
-    let row_id = new_id();
-    let now = now_ms();
-    let (user_id,): (String,) = sqlx::query_as(
-        "INSERT INTO rtdb_auth.users (id, login, email, created_at) \
-         VALUES ($1, $2, $3, $4) \
-         ON CONFLICT (email) DO UPDATE SET login = EXCLUDED.login \
-         RETURNING id",
-    )
-    .bind(&row_id)
-    .bind(id.login)
-    .bind(id.email)
-    .bind(now)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| map_conflict(e, id.conflict_style))?;
-    Ok(user_id)
 }
 
 /// Maps a Postgres unique-violation (`23505`) from a `resolve_user` write to
@@ -901,12 +867,22 @@ mod resolve_user_tests {
         assert_eq!(row_github_id, Some(github_id));
     }
 
-    // --- email-keyed path (Google / GitLab / OIDC: no persisted id) --------
+    // --- Google / GitLab / OIDC subject columns ---------------------------
+    //
+    // These three used to resolve on the UNIQUE `email` column alone, so a
+    // provider-side email change forked a second account. They now carry a
+    // stable subject (`google_sub`/`gitlab_id`/`oidc_sub`) and take the same
+    // three-step path as GitHub/Apple/Microsoft.
 
-    fn email_identity<'a>(login: &'a str, email: &'a str) -> ProviderIdentity<'a> {
+    fn subject_identity<'a>(
+        column: &'static str,
+        subject: &'a str,
+        login: &'a str,
+        email: &'a str,
+    ) -> ProviderIdentity<'a> {
         ProviderIdentity {
-            provider_id_column: PROVIDER_COL_EMAIL,
-            provider_id: email,
+            provider_id_column: column,
+            provider_id: subject,
             login,
             email,
             allow_email_link: true,
@@ -914,44 +890,110 @@ mod resolve_user_tests {
         }
     }
 
+    async fn subject_of(pool: &PgPool, id: &str, column: &str) -> Option<String> {
+        let (value,): (Option<String>,) = sqlx::query_as(&format!(
+            "SELECT {column} FROM rtdb_auth.users WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("user row exists");
+        value
+    }
+
     #[tokio::test]
-    async fn email_keyed_insert_creates_a_brand_new_user() {
+    async fn subject_keyed_insert_creates_a_brand_new_user() {
         let pool = users_pool().await;
         let login = uniq("login");
         let email = format!("{}@resolve-user-test.example", uniq("g"));
+        let sub = uniq("google-sub");
 
-        let id = resolve_user(&pool, email_identity(&login, &email))
-            .await
-            .expect("insert brand-new user");
+        let id = resolve_user(
+            &pool,
+            subject_identity(PROVIDER_COL_GOOGLE_SUB, &sub, &login, &email),
+        )
+        .await
+        .expect("insert brand-new user");
 
         let (row_login, row_email, ..) = user_row(&pool, &id).await;
         assert_eq!(row_login, login);
         assert_eq!(row_email, email);
+        assert_eq!(subject_of(&pool, &id, "google_sub").await, Some(sub));
     }
 
-    /// Google/GitLab/OIDC persist no per-provider id, so their durable key
-    /// IS the email: a second login with the same email always reuses the
-    /// row (this is the pre-consolidation `ON CONFLICT (email) DO UPDATE`
-    /// behavior, preserved verbatim) and refreshes the display login.
+    /// The bug this column exists to fix: a second login carrying the SAME
+    /// provider subject but a DIFFERENT email must reuse the row and follow
+    /// the email change, not insert a second account. Runs for all three
+    /// newly-keyed providers.
     #[tokio::test]
-    async fn email_keyed_returning_user_with_the_same_email_reuses_the_row() {
+    async fn subject_keyed_email_change_reuses_the_row() {
         let pool = users_pool().await;
-        let email = format!("{}@resolve-user-test.example", uniq("h"));
-        let first_id = resolve_user(&pool, email_identity(&uniq("login-a"), &email))
+        for (column, tag) in [
+            (PROVIDER_COL_GOOGLE_SUB, "google_sub"),
+            (PROVIDER_COL_GITLAB_ID, "gitlab_id"),
+            (PROVIDER_COL_OIDC_SUB, "oidc_sub"),
+        ] {
+            let sub = uniq(tag);
+            let old_email = format!("{}@resolve-user-test.example", uniq("before"));
+            let new_email = format!("{}@resolve-user-test.example", uniq("after"));
+
+            let first_id = resolve_user(
+                &pool,
+                subject_identity(column, &sub, &uniq("login-a"), &old_email),
+            )
             .await
             .expect("initial insert");
 
-        let new_login = uniq("login-b");
-        let second_id = resolve_user(&pool, email_identity(&new_login, &email))
+            let new_login = uniq("login-b");
+            let second_id = resolve_user(
+                &pool,
+                subject_identity(column, &sub, &new_login, &new_email),
+            )
             .await
-            .expect("returning-user resolve");
+            .expect("returning-user resolve after an email change");
 
-        assert_eq!(second_id, first_id, "same email reuses the row");
-        let (row_login, row_email, ..) = user_row(&pool, &first_id).await;
+            assert_eq!(
+                second_id, first_id,
+                "{tag}: the same subject reuses the row across an email change"
+            );
+            let (row_login, row_email, ..) = user_row(&pool, &first_id).await;
+            assert_eq!(row_email, new_email, "{tag}: email follows the change");
+            assert_eq!(row_login, new_login, "{tag}: login follows the change");
+        }
+    }
+
+    /// The upgrade path: a row that predates the subject columns has a NULL
+    /// subject, so the owner's first post-upgrade login links it (step 2)
+    /// instead of forking, and the subject is written for every later login.
+    #[tokio::test]
+    async fn subject_keyed_first_login_adopts_a_pre_existing_email_row() {
+        let pool = users_pool().await;
+        let email = format!("{}@resolve-user-test.example", uniq("legacy"));
+        let existing = insert_email_user(&pool, &uniq("legacy-login"), &email).await;
+        let sub = uniq("oidc-sub");
+
+        let resolved = resolve_user(
+            &pool,
+            subject_identity(PROVIDER_COL_OIDC_SUB, &sub, &uniq("login"), &email),
+        )
+        .await
+        .expect("first login after the column was added");
+
+        assert_eq!(resolved, existing, "the pre-existing row is adopted");
         assert_eq!(
-            row_login, new_login,
-            "login follows the provider-side change"
+            subject_of(&pool, &existing, "oidc_sub").await,
+            Some(sub.clone()),
+            "the subject is written on the adopting login"
         );
-        assert_eq!(row_email, email);
+
+        // A later login with a changed email now matches at step (1).
+        let changed_email = format!("{}@resolve-user-test.example", uniq("moved"));
+        let again = resolve_user(
+            &pool,
+            subject_identity(PROVIDER_COL_OIDC_SUB, &sub, &uniq("login"), &changed_email),
+        )
+        .await
+        .expect("second login after the email changed");
+        assert_eq!(again, existing);
     }
 }

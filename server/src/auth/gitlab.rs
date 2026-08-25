@@ -29,6 +29,10 @@ impl GitlabProvider {
 
 /// Normalized identity extracted from GitLab's `/api/v4/user` response.
 struct GitlabIdentity {
+    /// GitLab's numeric user `id`, rendered as text for `users.gitlab_id`.
+    /// Stable across a GitLab-side email or username change, which neither
+    /// `email` nor `username` is.
+    id: String,
     email: String,
     login: String,
 }
@@ -83,18 +87,17 @@ impl OAuthProvider for GitlabProvider {
         let identity = parse_user(user)?;
         let email = identity.email.to_lowercase();
 
-        // Identity is email-keyed, mirroring the Google provider: `email` is
-        // UNIQUE and is the key the allowlist uses, so a GitLab login reuses an
-        // existing row if the same person previously signed in with GitHub or
-        // Google (matching on email). There is no `gitlab_id` column — GitLab's
-        // numeric id is not persisted, which avoids a schema change and keeps
-        // identity aligned with the email-based authorization model. QA-004:
-        // resolved through the shared `auth::resolve_user` email-keyed path.
+        // Identity keys on GitLab's numeric user id (`users.gitlab_id`), not
+        // on email, so a GitLab-side email change follows the account instead
+        // of forking a second one. Cross-provider linking still works — step
+        // (2) of `auth::resolve_user` adopts an existing row that carries the
+        // same verified email and no `gitlab_id` yet, which is also what links
+        // a row created before this column existed.
         let user_id = auth::resolve_user(
             &state.pool,
             ProviderIdentity {
-                provider_id_column: auth::PROVIDER_COL_EMAIL,
-                provider_id: &email,
+                provider_id_column: auth::PROVIDER_COL_GITLAB_ID,
+                provider_id: &identity.id,
                 login: &identity.login,
                 email: &email,
                 allow_email_link: true,
@@ -119,6 +122,15 @@ impl OAuthProvider for GitlabProvider {
 /// Google's `email_verified` stance. The display `login` prefers the full name,
 /// then the `@username` handle, then the email.
 fn parse_user(value: serde_json::Value) -> Result<GitlabIdentity, RtDbError> {
+    // `/api/v4/user` always carries the numeric `id`; it is the durable
+    // identity key, so a response without it is rejected rather than silently
+    // falling back to email-keyed identity.
+    let id = value
+        .get("id")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| RtDbError::forbidden("user response missing id"))?
+        .to_string();
+
     let email = value
         .get("email")
         .and_then(|v| v.as_str())
@@ -138,6 +150,7 @@ fn parse_user(value: serde_json::Value) -> Result<GitlabIdentity, RtDbError> {
     let login = name.or(username).unwrap_or(email).to_string();
 
     Ok(GitlabIdentity {
+        id,
         email: email.to_string(),
         login,
     })
@@ -161,11 +174,13 @@ mod tests {
         .unwrap();
         assert_eq!(id.email, "Alice@Example.com");
         assert_eq!(id.login, "Alice");
+        assert_eq!(id.id, "42", "the numeric id is the durable identity key");
     }
 
     #[test]
     fn parse_user_falls_back_to_username_then_email_for_login() {
         let no_name = parse_user(json!({
+            "id": 43,
             "username": "bob",
             "email": "bob@example.com",
             "confirmed_at": "2024-01-02T03:04:05Z"
@@ -174,11 +189,25 @@ mod tests {
         assert_eq!(no_name.login, "bob");
 
         let neither = parse_user(json!({
+            "id": 44,
             "email": "carol@example.com",
             "confirmed_at": "2024-01-02T03:04:05Z"
         }))
         .unwrap();
         assert_eq!(neither.login, "carol@example.com");
+    }
+
+    /// The numeric id is what keeps identity stable across a GitLab-side
+    /// email change, so a response without it is rejected rather than
+    /// silently degrading to email-keyed identity.
+    #[test]
+    fn parse_user_rejects_missing_id() {
+        let err = parse_user(json!({
+            "username": "dave",
+            "email": "dave@example.com",
+            "confirmed_at": "2024-01-02T03:04:05Z"
+        }));
+        assert!(err.is_err());
     }
 
     #[test]
@@ -317,13 +346,20 @@ mod tests {
         pool
     }
 
-    /// GitLab has no persisted per-provider id, so its durable key IS the
-    /// email: a returning login with the same email (but a changed display
-    /// `login`) reuses the row instead of forking a new one.
+    /// GitLab's durable key is its numeric user id (`users.gitlab_id`), not
+    /// the email: a returning login with the same id but a GitLab-side email
+    /// change reuses the row instead of forking a new account.
     #[tokio::test]
-    async fn returning_user_with_the_same_email_reuses_the_row() {
+    async fn returning_user_with_the_same_id_reuses_the_row_across_an_email_change() {
         let pool = users_pool().await;
+        // Numeric like a real GitLab user id, unique so a concurrent run of
+        // this test can't collide on the partial unique index.
+        let gitlab_id = uuid::Uuid::now_v7().as_u128().to_string();
         let email = format!(
+            "{}@gitlab-resolve-test.example",
+            uuid::Uuid::now_v7().simple()
+        );
+        let new_email = format!(
             "{}@gitlab-resolve-test.example",
             uuid::Uuid::now_v7().simple()
         );
@@ -331,8 +367,8 @@ mod tests {
         let first_id = auth::resolve_user(
             &pool,
             ProviderIdentity {
-                provider_id_column: auth::PROVIDER_COL_EMAIL,
-                provider_id: &email,
+                provider_id_column: auth::PROVIDER_COL_GITLAB_ID,
+                provider_id: &gitlab_id,
                 login: "Bob",
                 email: &email,
                 allow_email_link: true,
@@ -345,10 +381,10 @@ mod tests {
         let second_id = auth::resolve_user(
             &pool,
             ProviderIdentity {
-                provider_id_column: auth::PROVIDER_COL_EMAIL,
-                provider_id: &email,
+                provider_id_column: auth::PROVIDER_COL_GITLAB_ID,
+                provider_id: &gitlab_id,
                 login: "Bob Renamed",
-                email: &email,
+                email: &new_email,
                 allow_email_link: true,
                 conflict_style: ConflictStyle::Conflict,
             },
@@ -356,15 +392,23 @@ mod tests {
         .await
         .expect("returning-user resolve");
 
-        assert_eq!(second_id, first_id, "same email reuses the row");
-        let (login,): (String,) = sqlx::query_as("SELECT login FROM rtdb_auth.users WHERE id = $1")
-            .bind(&first_id)
-            .fetch_one(&pool)
-            .await
-            .expect("user row exists");
+        assert_eq!(
+            second_id, first_id,
+            "the same gitlab_id reuses the row across an email change"
+        );
+        let (login, row_email): (String, String) =
+            sqlx::query_as("SELECT login, email FROM rtdb_auth.users WHERE id = $1")
+                .bind(&first_id)
+                .fetch_one(&pool)
+                .await
+                .expect("user row exists");
         assert_eq!(
             login, "Bob Renamed",
             "login follows the provider-side change"
+        );
+        assert_eq!(
+            row_email, new_email,
+            "email follows the provider-side change"
         );
     }
 }
