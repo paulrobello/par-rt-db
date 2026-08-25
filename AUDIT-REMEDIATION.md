@@ -2,10 +2,11 @@
 
 > **Project**: par-rt-db
 > **Audit Date**: 2026-08-23
-> **Remediation Date**: 2026-08-24
+> **Remediation Date**: 2026-08-24 to 2026-08-25
 > **Severity Filter Applied**: all
 > **Plan Source**: AUDIT.md `## Remediation Plan` + AUDIT-REMEDIATION-PLAN.md playbook
 > **Implementation Model**: Opus 5 (all fix agents)
+> **Addendum (2026-08-25)**: a second pass fixed the 5 follow-up items filed during the first pass — see [Follow-up Round](#follow-up-round-2026-08-25) below.
 
 ---
 
@@ -143,7 +144,35 @@ Six items fix agents found and correctly left out of their assigned scope, filed
 
 ## Next Steps
 
-1. Review the 5 follow-up cards and the ARC-004 partial-extraction card on the kanban board and prioritize.
-2. Design the schema-type unification needed to finish ARC-004's helper-function extraction.
-3. Re-run `/audit` after this merges to get an updated baseline reflecting current state.
-4. Consider the Google/GitLab/OIDC provider-id migration (follow-up #5) before the next OAuth-touching change, since it's a real, if narrow, correctness gap.
+1. Review the ARC-004 partial-extraction card on the kanban board (the only item left open from this whole remediation) and prioritize the schema-type unification it needs.
+2. Re-run `/audit` to get an updated baseline reflecting current state.
+3. Prioritize the 4 new follow-ups filed in the second round (below) — the intra-binary test-parallelism items are worth fixing before they cause more false-alarm CI noise.
+
+---
+
+## Follow-up Round (2026-08-25)
+
+The first pass filed 5 follow-up cards for things fix agents found but correctly left out of scope. All 5 are now fixed, in 3 more parallel agents (one per domain: security, rust-client, OAuth/schema), same worktree-isolated pattern, merged to `fix/audit-followups` and fast-forwarded into `main`. 8 more commits, 34 files, +2103/−239.
+
+### Resolved
+
+- **SEC-007 engine parity** — `MAX_FILTER_DEPTH`/`MAX_IN_VALUES`/`MAX_SEARCH_QUERY_BYTES` now enforced identically in all four in-memory client engines (ts/rust/python/swift), with 4 new wire-corpus semantics cases pinning both cap boundaries across all five runners.
+- **Signed-URL kill-switch seam** — a transform-requesting signed URL is now rejected (403) rather than silently served full-resolution when `RTDB_IMAGE_TRANSFORMS_ENABLED=false`.
+- **`image_transform.rs` JoinError leak** — routed through the same `internal_transform_error` choke point SEC-002 already established; client sees a fixed generic message, detail is logged server-side only.
+- **rust-client protocol-header gap** — all 36 HTTP call sites (17 data-plane + 19 admin) now go through one shared `AuthedRequest::authed` seam that attaches both the bearer token and `X-Rtdb-Protocol`; `bearer_auth` appears exactly once crate-wide (inside the seam) as the coverage invariant.
+- **Google/GitLab/OIDC identity bug (the real QA-004 bug)** — three new nullable columns (`google_sub`, `gitlab_id`, `oidc_sub`) added additively to the users table; all six OAuth providers now key identity resolution on a stable provider subject, falling back to email-link only for a user's first login with that provider. An email change at any of the six providers no longer forks a new account. Filed under **Breaking** in the changelog: a non-compliant OIDC IdP that omits `sub` from userinfo now gets a 403 instead of silently succeeding.
+
+### New follow-ups discovered during this round (filed, not fixed — genuinely out of scope for the cards that found them)
+
+1. **ts-client/python-client/swift-client protocol-header gaps** — the rust-client fix's own investigation found the original card's premise wrong: the other three SDKs do NOT already cover their full HTTP surface for `X-Rtdb-Protocol`. ts-client's upload/delete/get paths and admin client, python's two standalone admin clients, and Swift's `AdminClient` all send `Authorization` only.
+2. **Server doesn't validate `X-Rtdb-Protocol` on `/admin/*`** — `check_protocol_version` has 16 callers, all through `/api/*`'s `authed()`. Admin-surface protocol skew is currently unenforced even though clients now send the header there.
+3. **`multi_instance_stage4_test` unsafe for intra-binary parallel execution** — all 10 tests pass with `--test-threads=1` even on an uncontended database, but fail intermittently (a different subset each run) under default parallel test execution. They share `rtdb_write_fwd`/`rtdb_write_replies` LISTEN/NOTIFY channels and a 300ms forward timeout. This is what caused `make checkall`'s `test` stage to fail on the first attempt in this round — confirmed as pre-existing flakiness, not a regression, by isolating the test file.
+4. **`workflows_test::await_signal_timeout_retries_with_fresh_timeout_then_succeeds` flaky under load** — passes in isolation, fails under full-suite parallel load with a retry-count assertion mismatch (timing-sensitive).
+
+### Verification
+
+`make checkall`'s static stages (fmt, clippy, typecheck, lint, env-drift-check, dockerfile-stub-check, cli-docs-check) and all four client test suites passed clean on the first run. The `test` stage initially failed with 4 `multi_instance_stage4_test` failures — investigated rather than assumed: two stale test processes from already-merged-and-removed agent worktrees were still running against the shared Postgres, killing them didn't fully explain it, and isolating the test file with `--test-threads=1` confirmed all 10 pass — a pre-existing flake (follow-up #3 above), not a regression. The remaining suite (`--skip multi_instance_stage4_test`) surfaced one more flake (`workflows_test`, follow-up #4), also confirmed to pass in isolation. Neither touches any file this round's three fixes modified (auth/*, db.rs, image_transform.rs, signed_url.rs, http_api.rs, client in-memory engines, rust-client/*).
+
+### Files Changed (this round)
+
+34 files, +2103/−239, across 8 commits on `fix/audit-followups` (branched from `main` @ `bf84f49`), merged fast-forward into `main` and pushed.
