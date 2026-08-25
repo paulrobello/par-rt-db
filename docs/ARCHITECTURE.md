@@ -1002,5 +1002,9 @@ records the date and hardware it ran on:
 | (c) ownership takeover after SIGKILL | takeover time | 1500 ms |
 | (d) bulk `deleteByQuery`, 5k rows, 100 subscribers | turn hold time | 350 ms |
 
-A regression beyond 15% on any metric (latency up, throughput down) is caught
-by CI's `bench` job on push to `main` — see `scripts/bench/compare.ts`.
+A regression beyond 15% on any metric (latency up, throughput down) is
+checked manually with `scripts/bench/compare.ts` — no CI job runs benchmarks
+(GitHub-hosted runners are noisy shared hardware, not comparable run to run).
+Runs happen only from the operator's dev machine or `lenny2` (the deploy
+host, run there against `127.0.0.1:8300` to skip the tunnel) — see
+[CONTRIBUTING.md's Benchmarks section](../CONTRIBUTING.md#benchmarks).

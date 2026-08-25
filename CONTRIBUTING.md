@@ -151,13 +151,33 @@ ENH-033 adds a two-layer benchmark harness, deliberately excluded from
   invoked by CI or `checkall`, since it intentionally moves the regression
   baseline.
 
-CI's `bench` job runs on `workflow_dispatch` and on `push` to `main` (not on
-every PR), uploads the JSON result and criterion HTML reports as artifacts,
-and compares the new run against `bench/baseline.json` with
-`scripts/bench/compare.ts` — a 15% regression on any metric (latency up,
-throughput down) fails the job. If `bench/baseline.json` is stale or still
-the placeholder shipped with ENH-033, run `make bench-baseline` on `main` to
-capture a real one.
+**No CI job runs benchmarks.** GitHub-hosted runners are noisy, shared
+hardware — commit throughput and latency numbers measured there aren't
+comparable run to run, so they'd produce false regressions and hide real
+ones. Benchmarks are run manually, only from two known, reproducible
+machines: the operator's local dev Mac, and `lenny2` (the deploy host,
+`root@lenny2.par-com.net`) — running there against the deployed instance's
+`127.0.0.1:8300` avoids the Cloudflare tunnel's network latency and measures
+the server alone.
+
+To run against the live deployed server from `lenny2` instead of a local dev
+server: sync the current `scripts/bench/` and `ts-client/dist/` to
+`/docker/par-rt-db` (`make deploy` already keeps that tree current; a
+between-deploys sync can use `rsync -avz scripts/bench/
+lenny2.par-com.net:/docker/par-rt-db/scripts/bench/` plus the same for
+`ts-client/dist/`), then run `bun run scripts/bench/load.ts` there with
+`RTDB_ADMIN_KEY` read from the deployed `.env` and `--url
+http://127.0.0.1:8300`. This talks to the same Postgres the live traffic
+uses, so always pass `--db` something other than the app's real database
+name — `ensureBenchDb` creates and reuses an isolated database and never
+touches existing ones, but only if you don't point it at one by name.
+
+After either kind of run, compare the result against `bench/baseline.json`
+with `bun run scripts/bench/compare.ts bench/baseline.json
+bench/results/<sha>.json` — exits 1 on any metric regressing more than 15%
+(latency up, throughput down). If `bench/baseline.json` is stale or still the
+placeholder shipped with ENH-033, run `make bench-baseline` (from the dev
+Mac, against a local server) to capture a real one.
 
 ## Style and formatting
 
