@@ -1,5 +1,5 @@
 {
   "name": "par-rt-db-workspace",
   "private": true,
-  "workspaces": ["ts-client", "dashboard"]
+  "workspaces": ["ts-client", "dashboard", "scripts/bench"]
 }

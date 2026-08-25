@@ -144,6 +144,116 @@ jobs:
       - name: rust-client feature-combination gate (ARC-110)
         run: make rust-client-check-features
 
+  # --- Performance benchmarks (ENH-033) -----------------------------------
+  # Not on `pull_request`: `make bench` builds a release binary, starts two
+  # real server processes, and runs load scenarios — too slow for the PR
+  # gate. Runs on `workflow_dispatch` (on demand) and `push` to `main` (catch
+  # regressions once they land). Reuses the same toolchain/Bun setup steps as
+  # `checkall` above, pinned to the identical action refs (SEC-138).
+  bench:
+    name: make bench-micro && make bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+
+    env:
+      RTDB_TEST_DATABASE_URL: postgres://rtdb:rtdb@127.0.0.1:55434/rtdb
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Free runner disk space
+        run: |
+          set -x
+          df -h /
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /usr/local/share/powershell \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/local/share/edge_driver \
+            /usr/local/share/gecko_driver \
+            /usr/local/share/chrome_driver
+          sudo apt-get clean
+          sudo docker system prune -af --volumes || true
+          df -h /
+
+      - name: Set up Rust (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2.7.5
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2.2.0
+
+      - name: Install ts-client deps
+        run: make ts-client-install
+
+      - name: Run criterion micro-benchmarks
+        run: make bench-micro
+
+      # Best-of-two is the plan's suggested noise mitigation, but the load
+      # script (scripts/bench/load.ts) writes one fixed path
+      # (bench/results/<sha>.json) per run and `compare.ts` takes one result
+      # file — picking the "better" of two runs would need either a
+      # restructure of load.ts's output path or a metric-by-metric merge in
+      # this step, both out of scope for this phase. Running once now and
+      # relying on the 15% threshold; TODO(ENH-033 follow-up): implement
+      # run-twice-take-best once load.ts accepts an explicit --out per run.
+      - name: Run black-box load benchmark
+        run: make bench
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: bench-results-${{ github.sha }}
+          path: |
+            bench/results/*.json
+            target/criterion/
+          if-no-files-found: warn
+          retention-days: 90
+
+      # `bench/baseline.json` starts as a hand-written placeholder (not a real
+      # captured run) until someone runs `make bench-baseline` deliberately —
+      # comparing against it now would always "regress" nonsensically. Run
+      # the comparison and always surface it in the step summary, but only
+      # fail the job once the baseline has a real sha (i.e. is not the
+      # placeholder). `make bench-baseline` is how you fix a stale baseline
+      # (documented in CONTRIBUTING.md's Benchmarks section).
+      - name: Compare against baseline and write summary
+        run: |
+          set +e
+          sha=$(git rev-parse --short HEAD)
+          result="bench/results/$sha.json"
+          baseline_sha=$(jq -r '.sha' bench/baseline.json 2>/dev/null || echo "unknown")
+          {
+            echo "## Benchmark results ($sha)"
+            echo
+            echo "Baseline: \`$baseline_sha\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ ! -f "$result" ]; then
+            echo "no result file at $result" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          bun run scripts/bench/compare.ts bench/baseline.json "$result" >> "$GITHUB_STEP_SUMMARY" 2>&1
+          compare_status=$?
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ "$baseline_sha" = "PLACEHOLDER-not-a-real-run" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "_baseline is still the placeholder — run \`make bench-baseline\` to capture a real one; not failing this job on it._" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          exit "$compare_status"
+
   # --- Swift client (macOS runner) --------------------------------------
   # `swift build`/`swift test` need the Swift 6 toolchain, which ships with the
   # Xcode on macos-latest; swiftformat/swiftlint come from Homebrew (the runner

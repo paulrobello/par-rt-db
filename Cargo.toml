@@ -49,3 +49,5 @@ bytes = "1"
 wiremock = "0.6"
 # dev-dep in server, prod dep in cli.
 anyhow = "1"
+# ENH-033: criterion micro-benchmarks, shared by server + rust-client.
+criterion = { version = "0.5", features = ["html_reports"] }

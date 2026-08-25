@@ -34,6 +34,7 @@ relative to `server/src/`.
 - [Backups and restore](#backups-and-restore)
 - [Hot config and dynamic CORS](#hot-config-and-dynamic-cors)
 - [Static SPA hosting](#static-spa-hosting)
+- [Performance characteristics](#performance-characteristics)
 
 ## The single-writer committer
 
@@ -976,3 +977,30 @@ in `Dockerfile` runs the bun/vite build and copies `dist/` to
 `/app/dashboard-dist`, which `RTDB_STATIC_DIR` points at) — so a frontend
 change ships via the standard `docker compose up -d --build` (image rebuild +
 server container recreate); it is not a live-mounted volume.
+
+## Performance characteristics
+
+ENH-033 added a two-layer benchmark harness: criterion micro-benchmarks over
+the pure hot paths (`server/benches/`, `rust-client/benches/`, run via
+`make bench-micro`) and a black-box load script (`scripts/bench/load.ts`, run
+via `make bench`) that drives real running servers over HTTP + WS. See
+[CONTRIBUTING.md's Benchmarks section](../CONTRIBUTING.md#benchmarks) for how
+to run either.
+
+The numbers below are quoted from `bench/baseline.json`. **They are a
+placeholder, not a real captured run** — hand-written when the harness was
+built, not produced by `make bench-baseline`. Replace this paragraph (and the
+committed baseline) once someone runs `make bench-baseline` on `main` and
+records the date and hardware it ran on:
+
+| Scenario | Metric | Placeholder value |
+| --- | --- | --- |
+| (a) sustained writes, 8 writers / 30s | commits/s | 400 |
+| (a) sustained writes | commit latency p50 / p99 | 8 ms / 25 ms |
+| (b) subscription fan-out, 8 subscribers | commit-to-update latency p50 / p99 | 12 ms / 40 ms |
+| (c) multi-instance forward round trip | latency p50 / p99 | 22 ms / 55 ms |
+| (c) ownership takeover after SIGKILL | takeover time | 1500 ms |
+| (d) bulk `deleteByQuery`, 5k rows, 100 subscribers | turn hold time | 350 ms |
+
+A regression beyond 15% on any metric (latency up, throughput down) is caught
+by CI's `bench` job on push to `main` — see `scripts/bench/compare.ts`.

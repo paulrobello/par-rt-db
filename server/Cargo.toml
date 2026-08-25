@@ -128,6 +128,25 @@ rsa = "0.9"
 # reqwest already compiled for the server.
 proptest = "1"
 par-rt-db-client = { path = "../rust-client", features = ["in_memory"] }
+# ENH-033: criterion micro-benchmarks over the pure hot paths (query compile,
+# computed-field eval, doc validation, migration planning) — no Postgres.
+criterion.workspace = true
+
+[[bench]]
+name = "compile_query"
+harness = false
+
+[[bench]]
+name = "value_expr"
+harness = false
+
+[[bench]]
+name = "validate_doc"
+harness = false
+
+[[bench]]
+name = "migrate_validate"
+harness = false
 
 # Match cli/ and rust-client/: a direct `cargo clippy`/`cargo build` (editor,
 # rust-analyzer, pre-commit) denies warnings without needing the Makefile's

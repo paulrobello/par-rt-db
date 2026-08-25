@@ -62,3 +62,6 @@ firmware/**/sdkconfig*
 !firmware/**/sdkconfig.defaults.*
 
 server/target/
+
+# ENH-033: benchmark run output (only bench/baseline.json is committed)
+bench/results/

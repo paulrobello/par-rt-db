@@ -1,0 +1,42 @@
+{
+  "sha": "PLACEHOLDER-not-a-real-run",
+  "ranAtMs": 0,
+  "scenarios": ["a", "b", "c", "d"],
+  "a": {
+    "writers": 8,
+    "durationSec": 30,
+    "commits": 12000,
+    "commitsPerSec": 400,
+    "commitLatency": { "count": 12000, "p50Ms": 8, "p99Ms": 25, "meanMs": 9.5 },
+    "errors": 0
+  },
+  "b": {
+    "subscribers": 8,
+    "iterations": 20,
+    "fanoutLatency": { "count": 160, "p50Ms": 12, "p99Ms": 40, "meanMs": 14 },
+    "timeouts": 0
+  },
+  "c": {
+    "probeSamples": 20,
+    "portALatency": { "count": 20, "p50Ms": 6, "p99Ms": 18, "meanMs": 7 },
+    "portBLatency": { "count": 20, "p50Ms": 22, "p99Ms": 55, "meanMs": 25 },
+    "likelyOwnerUrl": "http://127.0.0.1:8300",
+    "likelyShadowUrl": "http://127.0.0.1:8301",
+    "forwardRoundTripLatency": { "count": 20, "p50Ms": 22, "p99Ms": 55, "meanMs": 25 },
+    "takeoverTimeMs": 1500,
+    "takeoverMeasured": true
+  },
+  "d": {
+    "rowsInserted": 5000,
+    "rowsRequested": 5000,
+    "subscribers": 100,
+    "turnHoldTimeMs": { "count": 1, "p50Ms": 350, "p99Ms": 350, "meanMs": 350 }
+  },
+  "adminMetrics": {
+    "subsRerunsTotal": 500,
+    "subsSkipsPointTotal": 1000,
+    "subsSkipsIndexedTotal": 200,
+    "subsSkipsOrderedTotal": 50,
+    "rerunRatio": 0.286
+  }
+}

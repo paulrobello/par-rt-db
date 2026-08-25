@@ -1,0 +1,19 @@
+{
+  "name": "@par-rt-db/bench",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "load": "bun run load.ts",
+    "compare": "bun run compare.ts"
+  },
+  "dependencies": {
+    "@par-rt-db/client": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.0",
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
+  }
+}

@@ -11,6 +11,7 @@ notes), see [`CLAUDE.md`](CLAUDE.md).
 - [Development setup](#development-setup)
 - [The build gate](#the-build-gate)
 - [Running tests](#running-tests)
+- [Benchmarks](#benchmarks)
 - [Style and formatting](#style-and-formatting)
 - [Commit messages](#commit-messages)
 - [Versioning](#versioning)
@@ -127,6 +128,36 @@ Live-server tests are opt-in and `#[ignore]` by default:
 `ts-client/tests/integration/**` and `rust-client/tests/http_integration.rs`
 need `RTDB_TEST_SERVER_URL` + `RTDB_TEST_ADMIN_KEY` and run with `--ignored`.
 The rust-client one needs no dev Postgres.
+
+## Benchmarks
+
+ENH-033 adds a two-layer benchmark harness, deliberately excluded from
+`checkall` (too slow for the PR gate) but required to keep compiling under
+`--all-targets`:
+
+- `make bench-micro` — criterion micro-benchmarks over the pure hot paths:
+  `server/benches/{compile_query,value_expr,validate_doc,migrate_validate}.rs`
+  (no Postgres) and `rust-client/benches/in_memory.rs` (the in-memory engine).
+  Produces HTML reports at `target/criterion/*/report/index.html`.
+- `make bench` — black-box load scenarios against real, running servers. It
+  starts the dev Postgres, builds and launches one or two `rtdb-server`
+  release processes, drives them with `scripts/bench/load.ts` over HTTP + WS
+  (commit throughput/latency, subscription fan-out latency, multi-instance
+  forward round-trip latency, bulk-mutation turn hold time), and
+  unconditionally stops the server(s) it started, even on failure. Writes
+  `bench/results/<git-sha>.json`.
+- `make bench-baseline` — runs `make bench` and overwrites the committed
+  `bench/baseline.json` with the fresh result. **Human-run only** — never
+  invoked by CI or `checkall`, since it intentionally moves the regression
+  baseline.
+
+CI's `bench` job runs on `workflow_dispatch` and on `push` to `main` (not on
+every PR), uploads the JSON result and criterion HTML reports as artifacts,
+and compares the new run against `bench/baseline.json` with
+`scripts/bench/compare.ts` — a 15% regression on any metric (latency up,
+throughput down) fails the job. If `bench/baseline.json` is stale or still
+the placeholder shipped with ENH-033, run `make bench-baseline` on `main` to
+capture a real one.
 
 ## Style and formatting
 

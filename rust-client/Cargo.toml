@@ -37,6 +37,8 @@ sha2 = { workspace = true, optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 wiremock.workspace = true
+# ENH-033: criterion micro-benchmark over the in_memory engine.
+criterion.workspace = true
 
 # ARC-110: declare each test binary's feature dependencies so `cargo check
 # --all-targets` (what `cargo test` builds) compiles under every feature
@@ -71,3 +73,10 @@ required-features = ["ws", "http"]
 [[test]]
 name = "http_integration"
 required-features = ["admin", "http"]
+
+# ENH-033: criterion micro-benchmark over the in-memory engine's `mutate`
+# (execute_step) and query execution — no network, no server.
+[[bench]]
+name = "in_memory"
+harness = false
+required-features = ["in_memory"]

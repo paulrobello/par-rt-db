@@ -24,7 +24,8 @@ SWIFT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(1),$(SW
 	python-client-typecheck python-client-checkall rust-client-check-features rtdb-cli deploy \
 	env-drift-check dockerfile-stub-check cli-docs cli-docs-check \
 	swift-client-build swift-client-test swift-client-lint swift-client-fmt \
-	swift-client-fmt-check swift-client-typecheck swift-client-checkall
+	swift-client-fmt-check swift-client-typecheck swift-client-checkall \
+	bench-micro bench bench-baseline
 
 # The dashboard's typecheck/build resolve `@par-rt-db/client` from ts-client's
 # gitignored `dist/` (workspace link + exports.types). Build it first so the
@@ -215,6 +216,70 @@ dockerfile-stub-check:
 	./scripts/dockerfile-stub-check.sh
 
 checkall: env-drift-check dockerfile-stub-check cli-docs-check fmt-check lint typecheck test rust-client-check-features
+
+# ENH-033: criterion micro-benchmarks over the pure hot paths (server) and the
+# in-memory engine (rust-client). No Postgres, no server process. Deliberately
+# NOT part of `checkall` — too slow for the PR gate; `--all-targets` in
+# `typecheck`/`lint` already keeps these compiling. HTML reports land under
+# target/criterion/*/report/index.html.
+bench-micro:
+	cargo bench --manifest-path server/Cargo.toml
+	cargo bench --manifest-path rust-client/Cargo.toml --features in_memory
+
+# ENH-033: black-box load benchmark. Starts real rtdb-server process(es)
+# against the dev Postgres, drives them with scripts/bench/load.ts, then
+# unconditionally tears the server(s) down — the `trap ... EXIT` fires on
+# success, failure, or the `timeout` below killing the load script, so a
+# crashed run never leaves an rtdb-server process behind (verify with
+# `pgrep -f rtdb-server`).
+#
+# Two instances (RTDB_MULTI_INSTANCE=true, same RTDB_DATABASE_URL) so
+# scenario (c) can measure forward round-trip latency. Which of the two wins
+# the ownership advisory lock is a race (committer/lease.rs) — this target
+# does not track it, so it deliberately omits `--owner-pid` and scenario (c)
+# reports forward-latency only, not takeover time (see load.ts --help and
+# CONTRIBUTING.md's Benchmarks section).
+bench: dev-db-up ts-client-build
+	@set -e; \
+	export RTDB_DATABASE_URL='postgres://rtdb:rtdb@127.0.0.1:55434/rtdb'; \
+	export RTDB_ADMIN_KEY="$$(openssl rand -hex 32)"; \
+	export RTDB_PUBLIC_URL='http://localhost:8300'; \
+	SERVER1_PID=""; SERVER2_PID=""; \
+	cleanup() { \
+		[ -n "$$SERVER1_PID" ] && kill "$$SERVER1_PID" 2>/dev/null; \
+		[ -n "$$SERVER2_PID" ] && kill "$$SERVER2_PID" 2>/dev/null; \
+		wait "$$SERVER1_PID" "$$SERVER2_PID" 2>/dev/null; \
+		true; \
+	}; \
+	trap cleanup EXIT; \
+	echo "=== bench: building rtdb-server (release) ==="; \
+	cargo build --release --manifest-path server/Cargo.toml --bin rtdb-server; \
+	echo "=== bench: starting server on :8300 (owner or shadow) ==="; \
+	RTDB_PORT=8300 RTDB_MULTI_INSTANCE=true ./target/release/rtdb-server & \
+	SERVER1_PID=$$!; \
+	echo "=== bench: starting server on :8301 (owner or shadow) ==="; \
+	RTDB_PORT=8301 RTDB_MULTI_INSTANCE=true ./target/release/rtdb-server & \
+	SERVER2_PID=$$!; \
+	for port in 8300 8301; do \
+		echo "=== bench: waiting for :$$port/healthz ==="; \
+		ok=0; \
+		for i in $$(seq 1 30); do \
+			if curl -fsS "http://127.0.0.1:$$port/healthz" >/dev/null 2>&1; then ok=1; break; fi; \
+			sleep 1; \
+		done; \
+		[ "$$ok" = 1 ] || { echo "server on :$$port never became healthy" >&2; exit 1; }; \
+	done; \
+	echo "=== bench: running load scenarios (5 min deadline) ==="; \
+	timeout 300 bun run scripts/bench/load.ts --admin-key "$$RTDB_ADMIN_KEY"
+
+# ENH-033: human-run only — deliberately overwrites the committed
+# bench/baseline.json. Never invoked by CI or checkall.
+bench-baseline: bench
+	@sha=$$(git rev-parse --short HEAD); \
+	result="bench/results/$$sha.json"; \
+	[ -f "$$result" ] || { echo "bench-baseline: expected $$result, not found" >&2; exit 1; }; \
+	cp "$$result" bench/baseline.json; \
+	echo "bench-baseline: wrote bench/baseline.json from $$result"
 
 pre-commit:
 	pre-commit run --all-files

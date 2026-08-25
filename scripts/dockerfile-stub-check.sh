@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# Fails when a `[[test]]` target declared in a workspace member's Cargo.toml
-# has no matching stub in the Dockerfile's dependency layer.
+# Fails when a `[[test]]` or `[[bench]]` target declared in a workspace
+# member's Cargo.toml has no matching stub in the Dockerfile's dependency
+# layer.
 #
-# Cargo validates a `[[test]]` path at MANIFEST-PARSE time for every workspace
-# member EXCEPT the one being built. The Dockerfile's dependency layer compiles
-# with stubbed sources, so a `[[test]]` in another member whose file is absent
-# makes `cargo build --bin rtdb-server` fail with "can't find `<name>` test at
-# ..." — during `make deploy`, long after `make checkall` went green. This has
-# fired for real: a new rust-client `[[test]]` broke the image build and
-# nothing in the local gate noticed.
+# Cargo validates a `[[test]]`/`[[bench]]` path at MANIFEST-PARSE time for
+# every workspace member EXCEPT the one being built. The Dockerfile's
+# dependency layer compiles with stubbed sources, so a `[[test]]`/`[[bench]]`
+# in another member whose file is absent makes `cargo build --bin rtdb-server`
+# fail with "can't find `<name>` test/bench at ..." — during `make deploy`,
+# long after `make checkall` went green. This has fired for real: a new
+# rust-client `[[test]]` broke the image build and nothing in the local gate
+# noticed; ENH-033 added `[[bench]]` targets to the same blind spot (this
+# script previously scanned `[[test]]` only), so both kinds are covered here.
 #
 # The built member is exempt, and that is not an assumption: measured
 # 2026-08-23, hiding `server/tests` and running the Dockerfile's exact
@@ -34,19 +37,21 @@ if [[ -z "$built_member" ]]; then
     exit 1
 fi
 
-# Every `[[test]]` in the workspace, as "<member>/tests/<name>.rs". Cargo's
-# default path for `[[test]] name = "x"` is `tests/x.rs`; an explicit `path`
-# overrides it.
+# Every `[[test]]`/`[[bench]]` in the workspace, as "<member>/tests/<name>.rs"
+# or "<member>/benches/<name>.rs". Cargo's default path for `[[test]] name =
+# "x"` is `tests/x.rs` (and `benches/x.rs` for `[[bench]]`); an explicit
+# `path` overrides it.
 declared=""
 for manifest in */Cargo.toml; do
     member=$(dirname "$manifest")
     [[ "$member" == "$built_member" ]] && continue
-    in_test=0
+    in_target=0
+    default_dir=""
     name=""
     path=""
     flush() {
         if [[ -n "$name" || -n "$path" ]]; then
-            [[ -n "$path" ]] || path="tests/$name.rs"
+            [[ -n "$path" ]] || path="$default_dir/$name.rs"
             declared="${declared}${member}/${path}"$'\n'
         fi
         name=""
@@ -54,16 +59,17 @@ for manifest in */Cargo.toml; do
     }
     while IFS= read -r line; do
         case "$line" in
-            '[[test]]'*) flush; in_test=1; continue ;;
-            '['*)        [[ $in_test -eq 1 ]] && flush; in_test=0; continue ;;
+            '[[test]]'*)  flush; in_target=1; default_dir="tests"; continue ;;
+            '[[bench]]'*) flush; in_target=1; default_dir="benches"; continue ;;
+            '['*)         [[ $in_target -eq 1 ]] && flush; in_target=0; continue ;;
         esac
-        [[ $in_test -eq 1 ]] || continue
+        [[ $in_target -eq 1 ]] || continue
         case "$line" in
             *name*=*) name=$(sed -E 's/.*"([^"]*)".*/\1/' <<<"$line") ;;
             *path*=*) path=$(sed -E 's/.*"([^"]*)".*/\1/' <<<"$line") ;;
         esac
     done < "$manifest"
-    [[ $in_test -eq 1 ]] && flush
+    [[ $in_target -eq 1 ]] && flush
 done
 declared=$(grep -v '^$' <<<"$declared" | sort -u)
 
@@ -79,11 +85,11 @@ while IFS= read -r path; do
 done <<<"$declared"
 
 if [[ -n "$missing" ]]; then
-    echo "dockerfile-stub-check: [[test]] targets with no Dockerfile stub:" >&2
+    echo "dockerfile-stub-check: [[test]]/[[bench]] targets with no Dockerfile stub:" >&2
     printf '%s' "$missing" >&2
     echo "Add each to the dependency layer's stub list in Dockerfile, or the" >&2
     echo "image build fails at manifest parse during 'make deploy'." >&2
     exit 1
 fi
 
-echo "dockerfile-stub-check: ok ($(grep -c . <<<"$declared") declared [[test]] targets, all stubbed)"
+echo "dockerfile-stub-check: ok ($(grep -c . <<<"$declared") declared [[test]]/[[bench]] targets, all stubbed)"

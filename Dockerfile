@@ -34,22 +34,25 @@ COPY wire-corpus/query-combinations.json wire-corpus/query-combinations.json
 # Dependency layer: compile the whole dependency tree once, cached unless
 # Cargo.toml or Cargo.lock change. Throwaway main/lib so each member package
 # parses, then build the server deps without the real source (next layer).
-# The rust-client [[test]] entries (ARC-110) name specific test files, which
-# cargo validates at manifest-parse time even when building a different member's
-# --bin — so the stub layer must create empty placeholders for them.
+# The rust-client [[test]]/[[bench]] entries (ARC-110, ENH-033) name specific
+# test/bench files, which cargo validates at manifest-parse time even when
+# building a different member's --bin — so the stub layer must create empty
+# placeholders for them.
 #
 # ARC-011: this list is no longer maintained by memory. `make checkall` runs
 # scripts/dockerfile-stub-check.sh, which diffs the workspace's declared
-# [[test]] targets against the paths named here and fails on a missing stub.
-# (The server's own [[test]] needs no stub: cargo skips test-target validation
-# for the member it is building — measured, see the script's header.)
-RUN mkdir -p server/src rust-client/src rust-client/tests cli/src cli/tests \
+# [[test]]/[[bench]] targets against the paths named here and fails on a
+# missing stub. (The server's own [[test]]/[[bench]] entries need no stub:
+# cargo skips target validation for the member it is building — measured, see
+# the script's header.)
+RUN mkdir -p server/src rust-client/src rust-client/tests rust-client/benches cli/src cli/tests \
     && echo 'fn main() {}' > server/src/main.rs \
     && echo '' > rust-client/src/lib.rs \
     && echo 'fn main() {}' > cli/src/main.rs \
     && touch rust-client/tests/golden_vector.rs rust-client/tests/query_combinations.rs \
               rust-client/tests/semantics_corpus.rs rust-client/tests/hot_config_test.rs \
               rust-client/tests/ws_integration.rs rust-client/tests/http_integration.rs \
+              rust-client/benches/in_memory.rs \
     && touch cli/tests/live.rs \
     && cargo build --release --locked --manifest-path server/Cargo.toml --bin rtdb-server \
     && rm -rf server/src
