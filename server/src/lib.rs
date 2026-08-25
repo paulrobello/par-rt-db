@@ -65,7 +65,7 @@ use std::time::{Duration, SystemTime};
 
 use arc_swap::ArcSwap;
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::{Router, routing::get};
@@ -601,7 +601,15 @@ fn cors_layer(hot: Arc<ArcSwap<HotConfig>>) -> CorsLayer {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        // ARC-013: `X-Rtdb-Protocol` rides every SDK HTTP call, so a
+        // cross-origin browser caller's preflight lists it in
+        // `Access-Control-Request-Headers` — omitting it here fails the
+        // preflight and blocks the request before it reaches a handler.
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            HeaderName::from_static(http_api::PROTOCOL_HEADER),
+        ])
         .allow_credentials(true)
 }
 

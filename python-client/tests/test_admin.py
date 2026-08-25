@@ -48,7 +48,7 @@ from par_rt_db.admin_models import MergeConflict, MergeDbResult
 from par_rt_db.errors import ErrorCode, RtDbError
 from par_rt_db.http_client import FileMetadata, SubscriptionInfo
 from par_rt_db.schema import Schema
-from par_rt_db.wire import ScheduleInfo, WorkflowInfo, WorkflowInfoFull
+from par_rt_db.wire import PROTOCOL_VERSION, ScheduleInfo, WorkflowInfo, WorkflowInfoFull
 
 ADMIN_BEARER = "Bearer admin-key"
 URL = "https://rtdb.example"
@@ -184,6 +184,8 @@ def test_mint_token_posts_capabilities_and_parses_response() -> None:
     assert captured["request"].method == "POST"
     assert captured["request"].url.path == "/admin/mint-token"
     assert captured["request"].headers["authorization"] == ADMIN_BEARER
+    # ARC-013: protocol-version header sent on every admin call
+    assert captured["request"].headers["x-rtdb-protocol"] == str(PROTOCOL_VERSION)
     # body: camelCase keys, all three capabilities present when set
     assert captured["body"] == {
         "db": "dbx",
@@ -508,6 +510,7 @@ async def test_async_mint_token_posts_capabilities_and_parses_response() -> None
     def handler(request: httpx.Request) -> httpx.Response:
         captured["body"] = json.loads(request.content)
         captured["auth"] = request.headers["authorization"]
+        captured["protocol"] = request.headers["x-rtdb-protocol"]
         return httpx.Response(200, json={"tokenId": "aid", "token": "atok"})
 
     async with _async_client(handler) as c:
@@ -518,6 +521,8 @@ async def test_async_mint_token_posts_capabilities_and_parses_response() -> None
     assert minted.token_id == "aid"
     assert minted.token == "atok"
     assert captured["auth"] == ADMIN_BEARER
+    # ARC-013: protocol-version header sent on every admin call
+    assert captured["protocol"] == str(PROTOCOL_VERSION)
     assert captured["body"] == {
         "db": "dbx",
         "name": "scraper",

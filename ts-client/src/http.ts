@@ -253,7 +253,12 @@ export class RtDbHttpClient {
         "upload body must be Uint8Array, Blob, ReadableStream, ArrayBuffer, or string",
       );
     }
-    const headers: Record<string, string> = { Authorization: `Bearer ${this.token}` };
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.token}`,
+      // ARC-013: lets the server diagnose/reject a version mismatch instead
+      // of a generic 400 from `deny_unknown_fields`.
+      "X-Rtdb-Protocol": String(PROTOCOL_VERSION),
+    };
     if (contentType) {
       headers["content-type"] = contentType;
     }
@@ -269,7 +274,15 @@ export class RtDbHttpClient {
   async deleteFile(id: string): Promise<void> {
     await this.fetchImpl(
       `${this.url}/api/storage/${encodeURIComponent(this.db)}/${encodeURIComponent(id)}`,
-      { method: "DELETE", headers: { Authorization: `Bearer ${this.token}` } },
+      {
+        method: "DELETE",
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          // ARC-013: lets the server diagnose/reject a version mismatch instead
+          // of a generic 400 from `deny_unknown_fields`.
+          "X-Rtdb-Protocol": String(PROTOCOL_VERSION),
+        },
+      },
     ).then((r) => this.requireOk(r));
   }
 
@@ -320,6 +333,9 @@ export class RtDbHttpClient {
       method: "GET",
       headers: {
         Authorization: `Bearer ${bearer}`,
+        // ARC-013: lets the server diagnose/reject a version mismatch instead
+        // of a generic 400 from `deny_unknown_fields`.
+        "X-Rtdb-Protocol": String(PROTOCOL_VERSION),
       },
     });
     return this.parse(response, path);

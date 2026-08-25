@@ -111,6 +111,7 @@ from .mutation import StepResult, Transaction
 from .query import Query, TableQuery, _terminal_of, parse_result
 from .schema import SchemaDef
 from .wire import (
+    PROTOCOL_VERSION,
     ScheduleInfo,
     ScheduleWhen,
     WorkflowInfo,
@@ -984,7 +985,12 @@ class RtDbAdminClient:
         self._admin_key = admin_key
         self._client: httpx.Client = _httpx.Client(
             base_url=self._base,
-            headers={"Authorization": f"Bearer {admin_key}"},
+            headers={
+                "Authorization": f"Bearer {admin_key}",
+                # ARC-013: lets the server diagnose/reject a version mismatch
+                # instead of a generic 400 from `deny_unknown_fields`.
+                "X-Rtdb-Protocol": str(PROTOCOL_VERSION),
+            },
             transport=transport,
         )
         self._executor = _SyncAdminExecutor(self._client)
@@ -1734,7 +1740,12 @@ class AsyncRtDbAdminClient:
         self._admin_key = admin_key
         self._client: httpx.AsyncClient = httpx.AsyncClient(
             base_url=self._base,
-            headers={"Authorization": f"Bearer {admin_key}"},
+            headers={
+                "Authorization": f"Bearer {admin_key}",
+                # ARC-013: lets the server diagnose/reject a version mismatch
+                # instead of a generic 400 from `deny_unknown_fields`.
+                "X-Rtdb-Protocol": str(PROTOCOL_VERSION),
+            },
             transport=transport,
         )
         self._executor = _AsyncAdminExecutor(self._client)

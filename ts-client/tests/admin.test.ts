@@ -17,11 +17,12 @@ import { RtDbAdminClient } from "../src/admin.js";
 import type { WebSocketLike } from "../src/client.js";
 import { RtDbError } from "../src/errors.js";
 import { Migration } from "../src/migration.js";
-import type {
-  SchemaHistoryEntry,
-  SchemaHistoryEntrySummary,
-  TransactionJson,
-  WorkflowSpec,
+import {
+  PROTOCOL_VERSION,
+  type SchemaHistoryEntry,
+  type SchemaHistoryEntrySummary,
+  type TransactionJson,
+  type WorkflowSpec,
 } from "../src/protocol.js";
 import { defineSchema, defineTable, t } from "../src/schema.js";
 
@@ -1343,6 +1344,8 @@ describe("RtDbAdminClient cookie mode (ARC-106)", () => {
       expect(init.credentials).toBe("include");
       expect(init.headers.Authorization).toBeUndefined();
       expect(init.headers["X-Rtdb-Csrf"]).toBe("nonce123");
+      // ARC-013: protocol header rides in cookie mode too.
+      expect(init.headers["X-Rtdb-Protocol"]).toBe(String(PROTOCOL_VERSION));
     } finally {
       // best-effort cleanup; jsdom retains other cookies too
       // biome-ignore lint/suspicious/noDocumentCookie: jsdom has no Cookie Store API
@@ -1359,6 +1362,8 @@ describe("RtDbAdminClient cookie mode (ARC-106)", () => {
     const [, init] = fetchMock.mock.calls[0];
     expect(init.credentials).toBeUndefined();
     expect(init.headers.Authorization).toBe("Bearer k");
+    // ARC-013: protocol header rides on every admin call, bearer mode included.
+    expect(init.headers["X-Rtdb-Protocol"]).toBe(String(PROTOCOL_VERSION));
   });
 
   it("cookie-mode errors carry the HTTP status on the thrown RtDbError", async () => {

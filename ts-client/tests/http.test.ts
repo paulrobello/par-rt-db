@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { RtDbError } from "../src/errors.js";
 import { RtDbHttpClient } from "../src/http.js";
 import { mutation } from "../src/mutation.js";
-import type { WorkflowSpec } from "../src/protocol.js";
+import { PROTOCOL_VERSION, type WorkflowSpec } from "../src/protocol.js";
 import type { RtQuery } from "../src/query.js";
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -385,6 +385,8 @@ describe("RtDbHttpClient", () => {
     expect(init.method).toBe("GET");
     // authMe uses the client's own token, not an argument like validateSessionToken.
     expect(init.headers.Authorization).toBe("Bearer client-own-token");
+    // ARC-013: protocol header now rides on GET calls too.
+    expect(init.headers["X-Rtdb-Protocol"]).toBe(String(PROTOCOL_VERSION));
   });
 
   it("authMe surfaces a 401 as an RtDbError envelope", async () => {

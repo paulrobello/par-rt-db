@@ -577,12 +577,14 @@ distinct so a client knows not to blind-retry with the same credentials. A
 connection whose outbound backlog exceeds 1024 unsent frames, or that stalls a
 single send for 30 s, is also dropped.
 
-`auth` and the one-shot HTTP API (`X-Rtdb-Protocol` request header) both accept an
+`auth` and the HTTP API (`X-Rtdb-Protocol` request header, honored on both the
+per-db `/api/*` routes and the `/admin/*` control plane) both accept an
 optional `protocolVersion` (ARC-013) so a client can declare the wire version it
 speaks. Omitting it is backward-compatible (treated as version `1`, the current
 `PROTOCOL_VERSION`); a client requesting a version *newer* than the server's is
 rejected with `UNSUPPORTED_PROTOCOL` (400) instead of a generic `deny_unknown_fields`
-400, so a version skew is diagnosable. When the `auth` frame carries
+400, so a version skew is diagnosable. All four SDKs send the header on every
+HTTP call — data plane and admin alike. When the `auth` frame carries
 `protocolVersion`, `authOk` echoes the server's `PROTOCOL_VERSION` back (also
 omitted otherwise, so an older client's `authOk` bytes never change):
 

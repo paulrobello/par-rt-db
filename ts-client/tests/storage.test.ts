@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { RtDbHttpClient } from "../src/http.js";
 import { InMemoryRtDbClient } from "../src/in_memory/index.js";
+import { PROTOCOL_VERSION } from "../src/protocol.js";
 
 describe("in-memory storage", () => {
   it("uploads, serves-via-url-shape, deletes, and reports metadata", async () => {
@@ -82,6 +83,26 @@ describe("in-memory storage", () => {
     expect(init.headers).toMatchObject({
       Authorization: "Bearer tok",
       "content-type": "image/png",
+      // ARC-013: protocol header rides on every HTTP call, upload included.
+      "X-Rtdb-Protocol": String(PROTOCOL_VERSION),
+    });
+  });
+
+  it("deleteFile DELETEs with bearer + protocol headers (ARC-013)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    const http = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+    await http.deleteFile("f1");
+    const [calledUrl, init] = fetchMock.mock.calls[0];
+    expect(calledUrl).toBe("http://h:8300/api/storage/kanban/f1");
+    expect(init.method).toBe("DELETE");
+    expect(init.headers).toEqual({
+      Authorization: "Bearer tok",
+      "X-Rtdb-Protocol": String(PROTOCOL_VERSION),
     });
   });
 
