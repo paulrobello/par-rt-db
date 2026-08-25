@@ -56,6 +56,33 @@ pub fn background_guard(state: &AppState) -> BackgroundGuard {
     BackgroundGuard(state.background.clone())
 }
 
+/// A replica id for a multi-instance test, unique to THIS process.
+///
+/// The Stage 2/3/4 NOTIFY channels (`rtdb_ops`, `rtdb_write_sets`,
+/// `rtdb_presence`, `rtdb_write_fwd`, `rtdb_write_replies`) are fleet-global:
+/// every replica sharing a Postgres receives every payload and filters it by
+/// instance id alone. Tests share one Postgres across concurrent `cargo test`
+/// processes and across worktrees, so a hardcoded literal makes a second
+/// process's replica answer to the first's identity — and both filters then
+/// misfire. The op-feed/presence listeners self-dedupe by id, so a peer's
+/// notification is discarded as "our own"; worse, `forward::spool_claim_reply`
+/// claims a reply with `WHERE … target = $2` on the id, so the wrong process
+/// can win the atomic `DELETE … RETURNING` for a forwarded write's reply. The
+/// rightful origin never resolves its oneshot, times out into a lease takeover
+/// it should not have attempted, and surfaces CONFLICT for a write the owner
+/// already committed (the ambiguity documented in
+/// `docs/superpowers/specs/2026-08-22-multi-instance-stage4-design.md`).
+///
+/// The suffix is minted once per process, not per call: a replica's identity
+/// must stay stable for its whole life, since the ownership lease and the
+/// forwarder's pending-request map are keyed by it. `label` is preserved as a
+/// prefix so failures still name the replica the test meant.
+pub fn unique_instance_id(label: &str) -> String {
+    static SUFFIX: OnceLock<String> = OnceLock::new();
+    let suffix = SUFFIX.get_or_init(|| uuid::Uuid::now_v7().simple().to_string());
+    format!("{label}-{suffix}")
+}
+
 pub fn test_config() -> Config {
     Config {
         port: 0,

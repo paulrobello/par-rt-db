@@ -5,7 +5,7 @@
 //! full `AppState`s with distinct instance ids sharing one Postgres — the
 //! same shape `notify_test.rs` uses for Stage 2/3.
 
-use crate::common::{test_config, test_hot};
+use crate::common::{test_config, test_hot, unique_instance_id};
 use rtdb_server::AppState;
 use rtdb_server::auth::{Principal, PrincipalCtx};
 use rtdb_server::error::ErrorCode;
@@ -24,7 +24,7 @@ async fn replica(
 ) -> std::sync::Arc<AppState> {
     let mut cfg = test_config();
     cfg.multi_instance.enabled = true;
-    cfg.multi_instance.instance_id = Some(instance_id.to_string());
+    cfg.multi_instance.instance_id = Some(unique_instance_id(instance_id));
     cfg.limits.per_token_rpm = per_token_rpm;
     cfg.limits.per_db_rpm = per_db_rpm;
     // ARC-007: this helper's one rate-limiting test
@@ -59,8 +59,19 @@ fn insert_item(title: &str) -> Transaction {
 /// CONFLICT transiently — the peer's forward listener may still be
 /// connecting, or a just-dropped owner's lease may not be released yet — and
 /// the production contract is that the client retries into convergence.
-/// Every failed attempt executed nothing (the shadow CONFLICT backstop), so
-/// retrying cannot double-write.
+///
+/// This retry is safe only against a CONFLICT raised BEFORE the owner ran the
+/// write: the shadow's ownership backstop when no owner ever received it.
+/// It is NOT safe against the forward path's documented timeout ambiguity —
+/// per `docs/superpowers/specs/2026-08-22-multi-instance-stage4-design.md`
+/// ("the caller may see CONFLICT for a write that committed"), a reply lost or
+/// delayed past `forward_timeout_ms` drives the origin into a takeover that
+/// CONFLICTs while the owner has already committed. Retrying an unkeyed txn
+/// there mints a fresh server-side idempotency key and writes a second row, so
+/// the exactly-once assertions in this file depend on that ambiguity not
+/// firing: every replica must carry a process-unique instance id (see
+/// `common::unique_instance_id`) so no peer process can claim this origin's
+/// forward reply.
 async fn mutate_until_landed(
     state: &std::sync::Arc<AppState>,
     db: &str,
@@ -662,14 +673,14 @@ async fn forward_concurrency_cap_rate_limits_excess_requests() -> anyhow::Result
     let pool = shared_pool().await;
     let mut cfg_a = test_config();
     cfg_a.multi_instance.enabled = true;
-    cfg_a.multi_instance.instance_id = Some("arc008-cap-a".to_string());
+    cfg_a.multi_instance.instance_id = Some(unique_instance_id("arc008-cap-a"));
     cfg_a.multi_instance.forward_timeout_ms = 2000;
     cfg_a.multi_instance.forward_concurrency = 1;
     let a = AppState::new(pool.clone(), cfg_a, test_hot());
 
     let mut cfg_b = test_config();
     cfg_b.multi_instance.enabled = true;
-    cfg_b.multi_instance.instance_id = Some("arc008-cap-b".to_string());
+    cfg_b.multi_instance.instance_id = Some(unique_instance_id("arc008-cap-b"));
     cfg_b.multi_instance.forward_timeout_ms = 2000;
     let b = AppState::new(pool.clone(), cfg_b, test_hot());
 
