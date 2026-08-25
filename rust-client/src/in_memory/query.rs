@@ -63,12 +63,24 @@ impl InMemoryRtDbClient {
         let eq = &q.eq;
         let has_range = q.gt.is_some() || q.gte.is_some() || q.lt.is_some() || q.lte.is_some();
 
+        // ENH-028 phase 2: one table-driven check up front, replacing this
+        // file's previous per-terminal hand-written peer-rejection guards
+        // (the old `check_query_combinations` ladder, plus the inline guards
+        // that used to open `execute_get_terminal`/
+        // `execute_vector_search_terminal`/`execute_hybrid_search_terminal`/
+        // `execute_search_terminal`). See `check_query_combinations` below.
+        check_query_combinations(q)?;
+        if q.take.is_some_and(|t| t as usize > MAX_TAKE) {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("take exceeds maximum of {MAX_TAKE}"),
+            ));
+        }
+
         // `get` terminal — exclusive of every other clause.
         if let Some(id) = &q.get {
             return self.execute_get_terminal(q, id, eq, has_range);
         }
-
-        check_query_combinations(q)?;
 
         // `vectorSearch` terminal — cascade mirror of server `execute_query`.
         // In-memory replica approximation: there is no pgvector distance model
@@ -249,32 +261,11 @@ impl InMemoryRtDbClient {
         &self,
         q: &Query,
         id: &str,
-        eq: &[Value],
-        has_range: bool,
+        _eq: &[Value],
+        _has_range: bool,
     ) -> Result<Value, RtDbError> {
-        if q.index.is_some()
-            || !eq.is_empty()
-            || has_range
-            || q.order.is_some()
-            || q.take.is_some()
-            || q.unique
-            || q.first
-            || q.count
-            || q.distinct
-            || q.aggregate.is_some()
-            || q.paginate.is_some()
-            || q.filter.is_some()
-            || q.search.is_some()
-            || q.vector_search.is_some()
-            || q.hybrid_search.is_some()
-        {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "get cannot be combined with index, eq, range bounds, order, take, \
-                 unique, first, count, distinct, aggregate, paginate, filter, search, \
-                 vector search, or hybrid search",
-            ));
-        }
+        // Peer-rejection now runs once, up front, in `execute_query`'s call
+        // to `check_query_combinations` — see the ENH-028 phase 2 note there.
         // The DSL `get` terminal reuses the point-read primitive so the
         // system-field merge path is shared with the Task 2 helper.
         Ok(self.get(&q.table, id).unwrap_or(Value::Null))
@@ -293,29 +284,11 @@ impl InMemoryRtDbClient {
         q: &Query,
         vector: &crate::wire::VectorSearchQuery,
         table_def: &TableDef,
-        eq: &[Value],
-        has_range: bool,
+        _eq: &[Value],
+        _has_range: bool,
     ) -> Result<Value, RtDbError> {
-        if q.index.is_some()
-            || !eq.is_empty()
-            || has_range
-            || q.order.is_some()
-            || q.unique
-            || q.first
-            || q.count
-            || q.distinct
-            || q.aggregate.is_some()
-            || q.paginate.is_some()
-            || q.filter.is_some()
-            || q.search.is_some()
-            || q.hybrid_search.is_some()
-            || q.take.is_some()
-        {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "vectorSearch cannot be combined with any other terminal",
-            ));
-        }
+        // Peer-rejection now runs once, up front, in `execute_query`'s call
+        // to `check_query_combinations` — see the ENH-028 phase 2 note there.
         if let Some(filter) = &vector.filter {
             validate_filter(filter, table_def)?;
         }
@@ -338,29 +311,11 @@ impl InMemoryRtDbClient {
         &self,
         q: &Query,
         hybrid: &crate::wire::HybridSearchQuery,
-        eq: &[Value],
-        has_range: bool,
+        _eq: &[Value],
+        _has_range: bool,
     ) -> Result<Value, RtDbError> {
-        if q.index.is_some()
-            || !eq.is_empty()
-            || has_range
-            || q.order.is_some()
-            || q.unique
-            || q.first
-            || q.count
-            || q.distinct
-            || q.aggregate.is_some()
-            || q.paginate.is_some()
-            || q.filter.is_some()
-            || q.search.is_some()
-            || q.vector_search.is_some()
-            || q.take.is_some()
-        {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "hybridSearch cannot be combined with any other terminal",
-            ));
-        }
+        // Peer-rejection now runs once, up front, in `execute_query`'s call
+        // to `check_query_combinations` — see the ENH-028 phase 2 note there.
         let mut rows: Vec<Value> = self.collect_all(&q.table);
         rows.truncate(hybrid.limit as usize);
         Ok(Value::Array(rows))
@@ -397,31 +352,12 @@ impl InMemoryRtDbClient {
         q: &Query,
         search: &crate::wire::SearchQuery,
         table_def: &TableDef,
-        eq: &[Value],
-        has_range: bool,
+        _eq: &[Value],
+        _has_range: bool,
     ) -> Result<Value, RtDbError> {
-        if q.index.is_some()
-            || !eq.is_empty()
-            || has_range
-            || q.order.is_some()
-            || q.unique
-            || q.first
-            || q.count
-            || q.distinct
-            || q.aggregate.is_some()
-            || q.paginate.is_some()
-            || q.filter.is_some()
-            || q.vector_search.is_some()
-            || q.hybrid_search.is_some()
-        {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "search cannot be combined with index, eq, range bounds, order, \
-                 unique, first, count, distinct, aggregate, paginate, filter, \
-                 vector search, or hybrid search",
-            ));
-        }
-        // Shared prologue (guard → empty query → search index → filter), run
+        // Peer-rejection now runs once, up front, in `execute_query`'s call
+        // to `check_query_combinations` — see the ENH-028 phase 2 note there.
+        // Shared prologue (empty query → search index → filter), run
         // before the mode branch so both modes reject identically — mirrors
         // server `compile_search` and the ts/python harnesses.
         if search.query.trim().is_empty() {
@@ -926,215 +862,84 @@ pub(super) fn diff_canonical(result: &Value, q: &Query) -> String {
     canonical(&stripped)
 }
 
-/// Conflicting-terminal guards, in the server's validation order: each
-/// terminal rejects the peers it cannot compose with, then the range-bound
-/// and take-cap checks apply to every remaining shape. Mirrors the ts/python
-/// engines' `checkQueryCombinations` / `_check_query_combinations`.
-fn check_query_combinations(q: &Query) -> Result<(), RtDbError> {
-    // Conflicting-terminal guards (ports :919-939).
-    if q.unique && (q.take.is_some() || q.order.is_some() || q.distinct || q.aggregate.is_some()) {
-        return Err(RtDbError::new(
-            ErrorCode::BadRequest,
-            "unique cannot be combined with take, order, distinct, or aggregate",
-        ));
+/// Build the wire-corpus clause-presence set for `q` — mirrors the server's
+/// `query_clauses` in `server/src/query/mod.rs`. Fed once, up front, to
+/// `par_rt_db_core::query_combinations::check_query_combinations`.
+fn query_clauses(q: &Query) -> std::collections::HashSet<&'static str> {
+    let mut set = std::collections::HashSet::new();
+    if q.get.is_some() {
+        set.insert("get");
     }
-    if q.first && q.unique {
-        return Err(RtDbError::new(
-            ErrorCode::BadRequest,
-            "first cannot be combined with unique",
-        ));
+    if q.index.is_some() {
+        set.insert("index");
     }
-    if q.first && q.take.is_some() {
-        return Err(RtDbError::new(
-            ErrorCode::BadRequest,
-            "first cannot be combined with take",
-        ));
+    if !q.eq.is_empty() {
+        set.insert("eq");
     }
-    if q.first && q.distinct {
-        return Err(RtDbError::new(
-            ErrorCode::BadRequest,
-            "first cannot be combined with distinct",
-        ));
+    if q.gt.is_some() {
+        set.insert("gt");
     }
-    if q.first && q.aggregate.is_some() {
-        return Err(RtDbError::new(
-            ErrorCode::BadRequest,
-            "first cannot be combined with aggregate",
-        ));
+    if q.gte.is_some() {
+        set.insert("gte");
     }
-    if q.count && q.unique {
-        return Err(RtDbError::new(
-            ErrorCode::BadRequest,
-            "count cannot be combined with unique",
-        ));
+    if q.lt.is_some() {
+        set.insert("lt");
     }
-    if q.count && q.take.is_some() {
-        return Err(RtDbError::new(
-            ErrorCode::BadRequest,
-            "count cannot be combined with take",
-        ));
+    if q.lte.is_some() {
+        set.insert("lte");
     }
-    if q.count && q.first {
-        return Err(RtDbError::new(
-            ErrorCode::BadRequest,
-            "count cannot be combined with first",
-        ));
+    if q.order.is_some() {
+        set.insert("order");
     }
-    if q.count && q.order.is_some() {
-        return Err(RtDbError::new(
-            ErrorCode::BadRequest,
-            "count cannot be combined with order",
-        ));
+    if q.take.is_some() {
+        set.insert("take");
     }
-    if q.count && q.distinct {
-        return Err(RtDbError::new(
-            ErrorCode::BadRequest,
-            "count cannot be combined with distinct",
-        ));
+    if q.unique {
+        set.insert("unique");
     }
-    if q.count && q.aggregate.is_some() {
-        return Err(RtDbError::new(
-            ErrorCode::BadRequest,
-            "count cannot be combined with aggregate",
-        ));
+    if q.first {
+        set.insert("first");
     }
-    // Paginate combination guards (ports `:940-955`): paginate is one-shot
-    // paging, so it cannot also narrow to count/unique/first/take. (`get`
-    // is rejected above; `order`, index, eq, and range bounds are allowed.)
-    if q.paginate.is_some() {
-        if q.count {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "paginate cannot be combined with count",
-            ));
-        }
-        if q.unique {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "paginate cannot be combined with unique",
-            ));
-        }
-        if q.first {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "paginate cannot be combined with first",
-            ));
-        }
-        if q.take.is_some() {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "paginate cannot be combined with take",
-            ));
-        }
+    if q.count {
+        set.insert("count");
     }
-    if q.gt.is_some() && q.gte.is_some() {
-        return Err(RtDbError::new(
-            ErrorCode::BadRequest,
-            "gt and gte cannot both be set",
-        ));
-    }
-    if q.lt.is_some() && q.lte.is_some() {
-        return Err(RtDbError::new(
-            ErrorCode::BadRequest,
-            "lt and lte cannot both be set",
-        ));
-    }
-    if q.take.is_some_and(|t| t as usize > MAX_TAKE) {
-        return Err(RtDbError::new(
-            ErrorCode::BadRequest,
-            format!("take exceeds maximum of {MAX_TAKE}"),
-        ));
-    }
-
-    // `distinct`/`aggregate` are standalone terminals (like `count`): they
-    // compose only with index/eq/range/filter. `get`/`unique`/`first`/`count`
-    // rejected their own combinations above (validated first, matching the
-    // server's check order in query.rs), so these blocks only reject the
-    // remaining peers each terminal owns — mirroring the server's
-    // DISTINCT/AGGREGATE_INCOMPATIBLES tables.
     if q.distinct {
-        if q.take.is_some() {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "distinct cannot be combined with take",
-            ));
-        }
-        if q.order.is_some() {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "distinct cannot be combined with order",
-            ));
-        }
-        if q.aggregate.is_some() {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "distinct cannot be combined with aggregate",
-            ));
-        }
-        if q.paginate.is_some() {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "distinct cannot be combined with paginate",
-            ));
-        }
-        if q.search.is_some() {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "distinct cannot be combined with search",
-            ));
-        }
-        if q.vector_search.is_some() {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "distinct cannot be combined with vector search",
-            ));
-        }
-        if q.hybrid_search.is_some() {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "distinct cannot be combined with hybrid search",
-            ));
-        }
+        set.insert("distinct");
     }
     if q.aggregate.is_some() {
-        if q.take.is_some() {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "aggregate cannot be combined with take",
-            ));
-        }
-        if q.order.is_some() {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "aggregate cannot be combined with order",
-            ));
-        }
-        if q.paginate.is_some() {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "aggregate cannot be combined with paginate",
-            ));
-        }
-        if q.search.is_some() {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "aggregate cannot be combined with search",
-            ));
-        }
-        if q.vector_search.is_some() {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "aggregate cannot be combined with vector search",
-            ));
-        }
-        if q.hybrid_search.is_some() {
-            return Err(RtDbError::new(
-                ErrorCode::BadRequest,
-                "aggregate cannot be combined with hybrid search",
-            ));
-        }
+        set.insert("aggregate");
     }
-    Ok(())
+    if q.paginate.is_some() {
+        set.insert("paginate");
+    }
+    if q.filter.is_some() {
+        set.insert("filter");
+    }
+    if q.search.is_some() {
+        set.insert("search");
+    }
+    if q.vector_search.is_some() {
+        set.insert("vectorSearch");
+    }
+    if q.hybrid_search.is_some() {
+        set.insert("hybridSearch");
+    }
+    set
+}
+
+/// ENH-028 phase 2: the single combination check for the in-memory engine,
+/// replacing the hand-written per-terminal ladder with one call into the
+/// table-driven evaluator shared with the server
+/// (`par_rt_db_core::query_combinations`, itself driven by
+/// `wire-corpus/query-combinations.json`, the cross-runner semantics
+/// corpus). Declaration order in the JSON only decides which message a
+/// multi-violation query gets — accept/reject is unaffected — so calling
+/// this once up front (rather than per-terminal) does not change behavior;
+/// see the module doc on `par_rt_db_core::query_combinations`.
+fn check_query_combinations(q: &Query) -> Result<(), RtDbError> {
+    let present = query_clauses(q);
+    par_rt_db_core::query_combinations::check_query_combinations(&present)
+        .map_err(|violation| RtDbError::new(ErrorCode::BadRequest, violation.message))
 }
 
 /// Everything the row scan needs besides the query itself: the resolved

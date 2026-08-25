@@ -60,367 +60,86 @@ pub use terminals::{CompiledQuery, compile_query};
 /// deliberately (memory cost scales with it).
 const MAX_TAKE: u32 = 4096;
 
-/// A `Query` field that can participate in a combination-rejection rule. Each
-/// variant wraps the "is this field set?" predicate for one field, so peer lists
-/// read as data instead of being inlined as boolean chains.
-#[derive(Copy, Clone)]
-pub(crate) enum Peer {
-    Get,
-    Index,
-    Eq,
-    Gt,
-    Gte,
-    Lt,
-    Lte,
-    Order,
-    Take,
-    Unique,
-    First,
-    Count,
-    Distinct,
-    Aggregate,
-    Paginate,
-    Filter,
-    Search,
-    VectorSearch,
-    HybridSearch,
-}
-
-impl Peer {
-    pub(crate) fn is_set(self, q: &Query) -> bool {
-        match self {
-            Self::Get => q.get.is_some(),
-            Self::Index => q.index.is_some(),
-            Self::Eq => !q.eq.is_empty(),
-            Self::Gt => q.gt.is_some(),
-            Self::Gte => q.gte.is_some(),
-            Self::Lt => q.lt.is_some(),
-            Self::Lte => q.lte.is_some(),
-            Self::Order => q.order.is_some(),
-            Self::Take => q.take.is_some(),
-            Self::Unique => q.unique,
-            Self::First => q.first,
-            Self::Count => q.count,
-            Self::Distinct => q.distinct,
-            Self::Aggregate => q.aggregate.is_some(),
-            Self::Paginate => q.paginate.is_some(),
-            Self::Filter => q.filter.is_some(),
-            Self::Search => q.search.is_some(),
-            Self::VectorSearch => q.vector_search.is_some(),
-            Self::HybridSearch => q.hybrid_search.is_some(),
-        }
+/// Build the wire-corpus clause-presence set for `q` — one canonical clause
+/// name (matching `wire-corpus/query-combinations.json`'s `clauses` array)
+/// per `Query` field that is actually set. Fed to
+/// `par_rt_db_core::query_combinations::check_query_combinations`.
+fn query_clauses(q: &Query) -> std::collections::HashSet<&'static str> {
+    let mut set = std::collections::HashSet::new();
+    if q.get.is_some() {
+        set.insert("get");
     }
-}
-
-/// A peer that conflicts with a terminal, plus the message to emit when it's
-/// set. Per-peer entries let a terminal emit different messages for different
-/// peers (matching the pre-refactor cascade's per-peer messages for
-/// `first`/`count`/`paginate`).
-pub(crate) struct Incompatible {
-    peer: Peer,
-    message: &'static str,
-}
-
-/// Aggregate-message helper: if ANY of `peers` is set on `q`, return
-/// `BadRequest(message)`. Used by terminals whose pre-refactor check emitted a
-/// single message regardless of which peer was set (`get`, `unique`,
-/// `vector_search`, `search`).
-pub(crate) fn reject_if_any_set(q: &Query, peers: &[Peer], message: &str) -> Result<(), RtDbError> {
-    if peers.iter().any(|p| p.is_set(q)) {
-        return Err(RtDbError::bad_request(message));
+    if q.index.is_some() {
+        set.insert("index");
     }
-    Ok(())
-}
-
-/// Per-peer helper: for each entry in `entries` (in declaration order), if its
-/// peer is set on `q`, return `BadRequest(entry.message)`. Used by terminals
-/// whose pre-refactor check emitted peer-specific messages (`first`, `count`,
-/// `paginate`). Declaration order preserves the original cascade's
-/// first-match-wins ordering, so the same combination produces the same message.
-pub(crate) fn reject_per_peer_set(q: &Query, entries: &[Incompatible]) -> Result<(), RtDbError> {
-    for entry in entries {
-        if entry.peer.is_set(q) {
-            return Err(RtDbError::bad_request(entry.message));
-        }
+    if !q.eq.is_empty() {
+        set.insert("eq");
     }
-    Ok(())
+    if q.gt.is_some() {
+        set.insert("gt");
+    }
+    if q.gte.is_some() {
+        set.insert("gte");
+    }
+    if q.lt.is_some() {
+        set.insert("lt");
+    }
+    if q.lte.is_some() {
+        set.insert("lte");
+    }
+    if q.order.is_some() {
+        set.insert("order");
+    }
+    if q.take.is_some() {
+        set.insert("take");
+    }
+    if q.unique {
+        set.insert("unique");
+    }
+    if q.first {
+        set.insert("first");
+    }
+    if q.count {
+        set.insert("count");
+    }
+    if q.distinct {
+        set.insert("distinct");
+    }
+    if q.aggregate.is_some() {
+        set.insert("aggregate");
+    }
+    if q.paginate.is_some() {
+        set.insert("paginate");
+    }
+    if q.filter.is_some() {
+        set.insert("filter");
+    }
+    if q.search.is_some() {
+        set.insert("search");
+    }
+    if q.vector_search.is_some() {
+        set.insert("vectorSearch");
+    }
+    if q.hybrid_search.is_some() {
+        set.insert("hybridSearch");
+    }
+    set
 }
 
-// Per-terminal incompatible-peer tables. Order within each table mirrors the
-// pre-refactor cascade's check order.
-
-pub(crate) const GET_PEERS: &[Peer] = &[
-    Peer::Index,
-    Peer::Eq,
-    Peer::Gt,
-    Peer::Gte,
-    Peer::Lt,
-    Peer::Lte,
-    Peer::Order,
-    Peer::Take,
-    Peer::Unique,
-    Peer::First,
-    Peer::Count,
-    Peer::Distinct,
-    Peer::Aggregate,
-    Peer::Paginate,
-    Peer::Filter,
-    Peer::Search,
-    Peer::VectorSearch,
-    Peer::HybridSearch,
-];
-
-pub(crate) const GET_MESSAGE: &str = "get cannot be combined with index, eq, range bounds, order, take, unique, first, count, distinct, aggregate, paginate, filter, search, or vector search";
-
-pub(crate) const UNIQUE_PEERS: &[Peer] =
-    &[Peer::Take, Peer::Order, Peer::Distinct, Peer::Aggregate];
-
-pub(crate) const UNIQUE_MESSAGE: &str =
-    "unique cannot be combined with take, order, distinct, or aggregate";
-
-pub(crate) const FIRST_INCOMPATIBLES: &[Incompatible] = &[
-    Incompatible {
-        peer: Peer::Unique,
-        message: "first cannot be combined with unique",
-    },
-    Incompatible {
-        peer: Peer::Take,
-        message: "first cannot be combined with take",
-    },
-    Incompatible {
-        peer: Peer::Distinct,
-        message: "first cannot be combined with distinct",
-    },
-    Incompatible {
-        peer: Peer::Aggregate,
-        message: "first cannot be combined with aggregate",
-    },
-];
-
-pub(crate) const COUNT_INCOMPATIBLES: &[Incompatible] = &[
-    Incompatible {
-        peer: Peer::Unique,
-        message: "count cannot be combined with unique",
-    },
-    Incompatible {
-        peer: Peer::Take,
-        message: "count cannot be combined with take",
-    },
-    Incompatible {
-        peer: Peer::First,
-        message: "count cannot be combined with first",
-    },
-    Incompatible {
-        peer: Peer::Order,
-        message: "count cannot be combined with order",
-    },
-    Incompatible {
-        peer: Peer::Distinct,
-        message: "count cannot be combined with distinct",
-    },
-    Incompatible {
-        peer: Peer::Aggregate,
-        message: "count cannot be combined with aggregate",
-    },
-];
-
-pub(crate) const DISTINCT_INCOMPATIBLES: &[Incompatible] = &[
-    Incompatible {
-        peer: Peer::Get,
-        message: "distinct cannot be combined with get",
-    },
-    Incompatible {
-        peer: Peer::Take,
-        message: "distinct cannot be combined with take",
-    },
-    Incompatible {
-        peer: Peer::Unique,
-        message: "distinct cannot be combined with unique",
-    },
-    Incompatible {
-        peer: Peer::First,
-        message: "distinct cannot be combined with first",
-    },
-    Incompatible {
-        peer: Peer::Count,
-        message: "distinct cannot be combined with count",
-    },
-    Incompatible {
-        peer: Peer::Aggregate,
-        message: "distinct cannot be combined with aggregate",
-    },
-    Incompatible {
-        peer: Peer::Order,
-        message: "distinct cannot be combined with order",
-    },
-    Incompatible {
-        peer: Peer::Paginate,
-        message: "distinct cannot be combined with paginate",
-    },
-    Incompatible {
-        peer: Peer::Search,
-        message: "distinct cannot be combined with search",
-    },
-    Incompatible {
-        peer: Peer::VectorSearch,
-        message: "distinct cannot be combined with vector search",
-    },
-    Incompatible {
-        peer: Peer::HybridSearch,
-        message: "distinct cannot be combined with hybrid search",
-    },
-];
-
-/// `aggregate` is a standalone terminal like `distinct`/`count`: it rejects
-/// every other terminal except `index`/`eq`/range bounds/`filter` (which
-/// narrow the matching set the aggregate runs over). `take` is also rejected
-/// — groups are capped internally by `MAX_TAKE` instead, so the matrix stays
-/// simple (the alternative was a `take`-caps-groups carve-out that crossed
-/// two terminals).
-pub(crate) const AGGREGATE_INCOMPATIBLES: &[Incompatible] = &[
-    Incompatible {
-        peer: Peer::Get,
-        message: "aggregate cannot be combined with get",
-    },
-    Incompatible {
-        peer: Peer::Take,
-        message: "aggregate cannot be combined with take",
-    },
-    Incompatible {
-        peer: Peer::Unique,
-        message: "aggregate cannot be combined with unique",
-    },
-    Incompatible {
-        peer: Peer::First,
-        message: "aggregate cannot be combined with first",
-    },
-    Incompatible {
-        peer: Peer::Count,
-        message: "aggregate cannot be combined with count",
-    },
-    Incompatible {
-        peer: Peer::Distinct,
-        message: "aggregate cannot be combined with distinct",
-    },
-    Incompatible {
-        peer: Peer::Order,
-        message: "aggregate cannot be combined with order",
-    },
-    Incompatible {
-        peer: Peer::Paginate,
-        message: "aggregate cannot be combined with paginate",
-    },
-    Incompatible {
-        peer: Peer::Search,
-        message: "aggregate cannot be combined with search",
-    },
-    Incompatible {
-        peer: Peer::VectorSearch,
-        message: "aggregate cannot be combined with vector search",
-    },
-    Incompatible {
-        peer: Peer::HybridSearch,
-        message: "aggregate cannot be combined with hybrid search",
-    },
-];
-
-pub(crate) const PAGINATE_INCOMPATIBLES: &[Incompatible] = &[
-    Incompatible {
-        peer: Peer::Get,
-        message: "paginate cannot be combined with get",
-    },
-    Incompatible {
-        peer: Peer::Count,
-        message: "paginate cannot be combined with count",
-    },
-    Incompatible {
-        peer: Peer::Distinct,
-        message: "paginate cannot be combined with distinct",
-    },
-    Incompatible {
-        peer: Peer::Aggregate,
-        message: "paginate cannot be combined with aggregate",
-    },
-    Incompatible {
-        peer: Peer::Unique,
-        message: "paginate cannot be combined with unique",
-    },
-    Incompatible {
-        peer: Peer::First,
-        message: "paginate cannot be combined with first",
-    },
-    Incompatible {
-        peer: Peer::Take,
-        message: "paginate cannot be combined with take",
-    },
-];
-
-pub(crate) const VECTOR_SEARCH_PEERS: &[Peer] = &[
-    Peer::Index,
-    Peer::Eq,
-    Peer::Gt,
-    Peer::Gte,
-    Peer::Lt,
-    Peer::Lte,
-    Peer::Order,
-    Peer::Unique,
-    Peer::First,
-    Peer::Count,
-    Peer::Distinct,
-    Peer::Aggregate,
-    Peer::Paginate,
-    Peer::Filter,
-    Peer::Search,
-    Peer::Take,
-    Peer::HybridSearch,
-];
-
-pub(crate) const VECTOR_SEARCH_MESSAGE: &str =
-    "vectorSearch cannot be combined with any other terminal";
-
-pub(crate) const SEARCH_PEERS: &[Peer] = &[
-    Peer::Index,
-    Peer::Eq,
-    Peer::Gt,
-    Peer::Gte,
-    Peer::Lt,
-    Peer::Lte,
-    Peer::Order,
-    Peer::Unique,
-    Peer::First,
-    Peer::Count,
-    Peer::Distinct,
-    Peer::Aggregate,
-    Peer::Paginate,
-    Peer::Filter,
-    Peer::VectorSearch,
-    Peer::HybridSearch,
-];
-
-pub(crate) const SEARCH_MESSAGE: &str = "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, paginate, filter, or vector search";
-
-pub(crate) const HYBRID_SEARCH_PEERS: &[Peer] = &[
-    Peer::Index,
-    Peer::Eq,
-    Peer::Gt,
-    Peer::Gte,
-    Peer::Lt,
-    Peer::Lte,
-    Peer::Order,
-    Peer::Take,
-    Peer::Unique,
-    Peer::First,
-    Peer::Count,
-    Peer::Distinct,
-    Peer::Aggregate,
-    Peer::Paginate,
-    Peer::Filter,
-    Peer::Search,
-    Peer::VectorSearch,
-];
-
-pub(crate) const HYBRID_SEARCH_MESSAGE: &str =
-    "hybridSearch cannot be combined with any other terminal";
+/// ENH-028 phase 2: the single compile-time combination check, replacing the
+/// pre-refactor per-terminal `GET_PEERS`/`UNIQUE_PEERS`/`*_INCOMPATIBLES`/
+/// `*_PEERS` cascade with one call into the table-driven evaluator shared
+/// with the Rust client (`par_rt_db_core::query_combinations`, itself driven
+/// by `wire-corpus/query-combinations.json`, the cross-runner semantics
+/// corpus). Declaration order in the JSON only decides which message a
+/// multi-violation query gets — accept/reject is unaffected — so calling this
+/// once up front (rather than cascading per terminal) does not change
+/// behavior; see the module doc on `par_rt_db_core::query_combinations`.
+pub(crate) fn check_query_combinations(q: &Query) -> Result<(), RtDbError> {
+    let present = query_clauses(q);
+    par_rt_db_core::query_combinations::check_query_combinations(&present)
+        .map_err(|violation| RtDbError::bad_request(violation.message))
+}
 
 /// Compile-time warnings about a query's filter shape. Currently a single
 /// check: a `filter` predicate on a field the table declares but no index

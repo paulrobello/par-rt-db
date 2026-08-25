@@ -26,6 +26,11 @@ COPY cli/Cargo.toml cli/Cargo.toml
 # server's `par_rt_db_core::…` paths unresolvable. It is tiny and changes
 # rarely, so copying it here costs no meaningful cache invalidation.
 COPY core/src core/src
+# ENH-028 phase 2: core/src/query_combinations.rs embeds this file at compile
+# time via include_str!, so it must be present alongside core/src in this
+# dependency layer or `cargo build` fails with "No such file or directory"
+# even though core/src itself is there.
+COPY wire-corpus/query-combinations.json wire-corpus/query-combinations.json
 # Dependency layer: compile the whole dependency tree once, cached unless
 # Cargo.toml or Cargo.lock change. Throwaway main/lib so each member package
 # parses, then build the server deps without the real source (next layer).

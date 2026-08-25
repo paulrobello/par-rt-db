@@ -15,13 +15,7 @@ use super::row_auth::{
 use super::search::{
     CompileSearchCtx, SearchCtx, compile_hybrid_search, compile_search, compile_vector_search,
 };
-use super::{
-    AGGREGATE_INCOMPATIBLES, COUNT_INCOMPATIBLES, DISTINCT_INCOMPATIBLES, FIRST_INCOMPATIBLES,
-    GET_MESSAGE, GET_PEERS, HYBRID_SEARCH_MESSAGE, HYBRID_SEARCH_PEERS, MAX_TAKE,
-    PAGINATE_INCOMPATIBLES, SEARCH_MESSAGE, SEARCH_PEERS, UNIQUE_MESSAGE, UNIQUE_PEERS,
-    VECTOR_SEARCH_MESSAGE, VECTOR_SEARCH_PEERS, reject_if_any_set, reject_per_peer_set,
-    validate_projection,
-};
+use super::{MAX_TAKE, check_query_combinations, validate_projection};
 use crate::auth::{PrincipalCtx, authorize_table};
 use crate::db::validate_db_name;
 use crate::ddl::{pg_col, pg_schema, pg_table};
@@ -118,35 +112,12 @@ pub fn compile_query(
     };
     let _ = owner;
 
-    if let Some(id) = &q.get {
-        reject_if_any_set(q, GET_PEERS, GET_MESSAGE)?;
-        return Ok((compile_point_read(&sctx, id)?, warnings));
-    }
-
-    if q.unique {
-        reject_if_any_set(q, UNIQUE_PEERS, UNIQUE_MESSAGE)?;
-    }
-    if q.first {
-        reject_per_peer_set(q, FIRST_INCOMPATIBLES)?;
-    }
-    if q.count {
-        reject_per_peer_set(q, COUNT_INCOMPATIBLES)?;
-    }
-    if q.distinct {
-        reject_per_peer_set(q, DISTINCT_INCOMPATIBLES)?;
-    }
-    if q.aggregate.is_some() {
-        reject_per_peer_set(q, AGGREGATE_INCOMPATIBLES)?;
-    }
-    if q.paginate.is_some() {
-        reject_per_peer_set(q, PAGINATE_INCOMPATIBLES)?;
-    }
-    if q.gt.is_some() && q.gte.is_some() {
-        return Err(RtDbError::bad_request("gt and gte cannot both be set"));
-    }
-    if q.lt.is_some() && q.lte.is_some() {
-        return Err(RtDbError::bad_request("lt and lte cannot both be set"));
-    }
+    // ENH-028 phase 2: one table-driven check replaces the old per-terminal
+    // peer-rejection cascade (see `check_query_combinations` in `mod.rs`).
+    // `gt`+`gte` and `lt`+`lte` mutual exclusion are rules in the same table
+    // (`gt-excludes-gte`/`lt-excludes-lte`), so those no longer need a
+    // separate inline check.
+    check_query_combinations(q)?;
     if let Some(take) = q.take
         && take > MAX_TAKE
     {
@@ -155,16 +126,17 @@ pub fn compile_query(
         )));
     }
 
+    if let Some(id) = &q.get {
+        return Ok((compile_point_read(&sctx, id)?, warnings));
+    }
+
     if let Some(vs) = &q.vector_search {
-        reject_if_any_set(q, VECTOR_SEARCH_PEERS, VECTOR_SEARCH_MESSAGE)?;
         return Ok((compile_vector_search(&sctx, vs)?, warnings));
     }
     if let Some(hs) = &q.hybrid_search {
-        reject_if_any_set(q, HYBRID_SEARCH_PEERS, HYBRID_SEARCH_MESSAGE)?;
         return Ok((compile_hybrid_search(&sctx, hs)?, warnings));
     }
     if let Some(search) = &q.search {
-        reject_if_any_set(q, SEARCH_PEERS, SEARCH_MESSAGE)?;
         return Ok((compile_search(&sctx, search, q.take)?, warnings));
     }
 
