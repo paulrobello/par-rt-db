@@ -36,13 +36,22 @@ use crate::storage;
 use crate::txn::Transaction;
 use crate::workflows;
 
+/// ARC-013: the request header carrying the client's wire protocol version.
+/// Lowercase is load-bearing — `HeaderName::from_static` (used by the CORS
+/// layer in `lib`) panics on any uppercase byte.
+pub(crate) const PROTOCOL_HEADER: &str = "x-rtdb-protocol";
+
 /// ARC-013: parse the optional `X-Rtdb-Protocol` request header and reject a
 /// version newer than this build's `PROTOCOL_VERSION`. Absent or non-numeric
 /// (never sent by a real client) is treated as version 1 — mirrors the WS
 /// `Auth` frame's `protocolVersion` handling in `ws::authenticate`.
-fn check_protocol_version(headers: &HeaderMap) -> Result<(), RtDbError> {
+///
+/// Called from `authed` for the per-db `/api/*` routes and from
+/// `admin::require_admin_mw` for the `/admin/*` control plane, so a version
+/// skew is diagnosable on both surfaces rather than only the data plane.
+pub(crate) fn check_protocol_version(headers: &HeaderMap) -> Result<(), RtDbError> {
     let Some(requested) = headers
-        .get("x-rtdb-protocol")
+        .get(PROTOCOL_HEADER)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u32>().ok())
     else {

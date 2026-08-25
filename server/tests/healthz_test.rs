@@ -173,6 +173,35 @@ async fn cors_preflight_echoes_allowed_origin() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ARC-013: `X-Rtdb-Protocol` rides every SDK HTTP call, so it must survive the
+// CORS preflight — a cross-origin browser caller lists it in
+// `Access-Control-Request-Headers`, and an `allow_headers` set that omits it
+// fails the preflight and blocks the request before any handler runs.
+#[tokio::test]
+async fn cors_preflight_allows_the_protocol_version_header() -> anyhow::Result<()> {
+    let addr = spawn_for_cors().await?;
+
+    let resp = reqwest::Client::new()
+        .request(reqwest::Method::OPTIONS, format!("http://{addr}/api/query"))
+        .header("Origin", "http://localhost:5173")
+        .header("Access-Control-Request-Method", "POST")
+        .header("Access-Control-Request-Headers", "x-rtdb-protocol")
+        .send()
+        .await?;
+
+    let allowed = resp
+        .headers()
+        .get("access-control-allow-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        allowed.contains("x-rtdb-protocol"),
+        "preflight must allow the protocol-version header, got: {allowed:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn cors_preflight_omits_header_for_disallowed_origin() -> anyhow::Result<()> {
     let addr = spawn_for_cors().await?;

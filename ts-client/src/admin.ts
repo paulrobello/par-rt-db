@@ -1,6 +1,7 @@
 import type { WebSocketLike } from "./client.js";
 import { RtDbError } from "./errors.js";
 import type { FileMetadata } from "./http.js";
+import { PROTOCOL_VERSION } from "./protocol.js";
 import type {
   MigrateRequestJson,
   MigrateResultJson,
@@ -497,11 +498,17 @@ export class RtDbAdminClient {
 
   /** Auth + CSRF headers for the current mode. Bearer mode sets
    *  `Authorization: Bearer <key>`; cookie mode omits it and instead echoes the
-   *  readable `rtdb-admin-csrf` nonce. Merged into every outgoing request. */
+   *  readable `rtdb-admin-csrf` nonce. Both modes carry the ARC-013
+   *  `X-Rtdb-Protocol` version header. Merged into every outgoing request. */
   private authHeaders(): Record<string, string> {
-    if (this.adminKey) return { Authorization: `Bearer ${this.adminKey}` };
+    // ARC-013: lets the server diagnose/reject a version mismatch instead of a
+    // generic 400 from `deny_unknown_fields`, in both bearer and cookie mode.
+    const protocolHeader = { "X-Rtdb-Protocol": String(PROTOCOL_VERSION) };
+    if (this.adminKey) {
+      return { Authorization: `Bearer ${this.adminKey}`, ...protocolHeader };
+    }
     const csrf = readAdminCsrfCookie();
-    return csrf ? { "X-Rtdb-Csrf": csrf } : {};
+    return csrf ? { "X-Rtdb-Csrf": csrf, ...protocolHeader } : { ...protocolHeader };
   }
 
   /** `credentials` value for `fetch` init: cookie mode sends `"include"` so the

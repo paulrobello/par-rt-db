@@ -2222,3 +2222,58 @@ async fn sec109_admin_login_rate_limited_after_threshold() -> anyhow::Result<()>
 
     Ok(())
 }
+
+// ARC-013 follow-up: `X-Rtdb-Protocol` newer than this build's
+// `PROTOCOL_VERSION` is rejected with 400 `UNSUPPORTED_PROTOCOL` on `/admin/*`
+// too, not just the `/api/*` data plane. All four SDKs now send the header on
+// every admin call, so admin-surface skew must be enforced rather than silently
+// ignored. `require_admin_mw` runs the check ahead of both the exemption list
+// and auth (mirroring `http_api::authed`), so a bogus credential does not mask
+// the skew. Uses the bearer admin-key path so the outer cookie-mode CSRF guard
+// — which layers OUTSIDE require_admin_mw — stays out of the way.
+#[tokio::test]
+async fn unsupported_protocol_header_is_rejected_on_admin_routes() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+    let client = reqwest::Client::new();
+
+    for credential in ["test-admin-key", "wrong-admin-key"] {
+        let resp = client
+            .get(format!("http://{addr}/admin/config"))
+            .header("Authorization", format!("Bearer {credential}"))
+            .header("X-Rtdb-Protocol", "999")
+            .send()
+            .await?;
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "protocol skew must 400 for credential {credential}"
+        );
+        let body: serde_json::Value = resp.json().await?;
+        assert_eq!(body["code"], "UNSUPPORTED_PROTOCOL");
+    }
+
+    Ok(())
+}
+
+// ARC-013 follow-up: a version at or below the server's is transparent on the
+// admin surface — the route serves normally — and an absent header stays
+// backward-compatible (pre-ARC-013 clients keep working).
+#[tokio::test]
+async fn supported_protocol_header_does_not_block_admin_routes() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/admin/config"))
+        .header("Authorization", "Bearer test-admin-key")
+        .header("X-Rtdb-Protocol", "1")
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let resp = admin_get(addr, "/admin/config").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    Ok(())
+}

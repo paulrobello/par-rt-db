@@ -158,11 +158,20 @@ pub(crate) async fn require_admin(
 /// `require_admin`). The resolved `AdminPrincipal` is stashed in request
 /// extensions for handlers that need the Key-vs-User distinction (e.g.
 /// `admin_migrate`'s `evalExpr` gate, SEC-107).
+///
+/// ARC-013 follow-up: the protocol-version check runs first, ahead of both the
+/// exemption list and auth, mirroring `http_api::authed` on `/api/*`. All four
+/// SDKs send `X-Rtdb-Protocol` on admin calls, so a client declaring a version
+/// this build cannot speak gets the same typed `UNSUPPORTED_PROTOCOL` (400)
+/// here that it already gets on the data plane.
 pub(super) async fn require_admin_mw(
     State(state): State<Arc<AppState>>,
     mut req: Request,
     next: Next,
 ) -> Response {
+    if let Err(e) = crate::http_api::check_protocol_version(req.headers()) {
+        return e.into_response();
+    }
     if matches!(
         req.uri().path(),
         "/admin/login" | "/admin/logout" | "/admin/stream"

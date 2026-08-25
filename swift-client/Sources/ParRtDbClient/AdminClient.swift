@@ -9,7 +9,8 @@ import Foundation
 /// one-to-one from the rust client; only the method names are camelCased.
 ///
 /// An actor like `RtDbHttpClient`, but keying the whole admin plane: every
-/// call sends `Authorization: Bearer <admin key>`. Construct directly with
+/// call sends `Authorization: Bearer <admin key>` and (ARC-013)
+/// `X-Rtdb-Protocol: <WireProtocol.version>`. Construct directly with
 /// `init(url:adminKey:)`; for the data plane (queries, mutations,
 /// subscriptions on one database) use `RtDbHttpClient`/`RtDbClient`.
 public actor RtDbAdminClient {
@@ -953,6 +954,9 @@ extension RtDbAdminClient {
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue("Bearer \(adminKey)", forHTTPHeaderField: "Authorization")
+        // ARC-013: lets the server diagnose/reject a version mismatch instead
+        // of a generic 400 from `deny_unknown_fields`.
+        request.setValue(String(WireProtocol.version), forHTTPHeaderField: "X-Rtdb-Protocol")
         if let contentType {
             request.setValue(contentType, forHTTPHeaderField: "Content-Type")
         }

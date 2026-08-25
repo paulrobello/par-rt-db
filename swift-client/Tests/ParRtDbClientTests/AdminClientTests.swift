@@ -97,12 +97,16 @@ private func makeAdminClient() -> RtDbAdminClient {
     )
 }
 
-/// Asserts the admin bearer on every request — folded into each handler via
-/// `adminAuth(request)`.
+/// Asserts the admin bearer and the ARC-013 protocol-version header on every
+/// request — folded into each handler via `adminAuth(request)`.
 private func adminAuth(_ request: URLRequest) throws {
     try demand(
         request.value(forHTTPHeaderField: "Authorization") == "Bearer root-key",
         "missing admin-key bearer"
+    )
+    try demand(
+        request.value(forHTTPHeaderField: "X-Rtdb-Protocol") == String(WireProtocol.version),
+        "missing X-Rtdb-Protocol header"
     )
 }
 
@@ -124,6 +128,20 @@ struct AdminClientTests {
             try demand(request.url?.path == "/admin/create-db", "expected /admin/create-db")
             let body = try jsonObjectBody(request)
             try demand(body["name"] as? String == "app2", "name mismatch: \(body)")
+            return (200, Data(#"{"ok":true}"#.utf8))
+        }
+        try await makeAdminClient().createDb("app2")
+    }
+
+    /// ARC-013: every admin call sends `X-Rtdb-Protocol`, not just the data
+    /// plane (`HttpClientTests`). Asserted directly here rather than only via
+    /// `adminAuth`, so a regression in `execute`'s header set fails loudly.
+    @Test func createDbSendsProtocolVersionHeader() async throws {
+        StubProtocol.handler = { request in
+            try demand(
+                request.value(forHTTPHeaderField: "X-Rtdb-Protocol") == String(WireProtocol.version),
+                "expected X-Rtdb-Protocol: \(WireProtocol.version)"
+            )
             return (200, Data(#"{"ok":true}"#.utf8))
         }
         try await makeAdminClient().createDb("app2")
