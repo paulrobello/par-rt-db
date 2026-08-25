@@ -231,11 +231,22 @@ async fn audit_disabled_writes_nothing_and_endpoint_returns_empty() -> anyhow::R
     )
     .await;
 
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rtdb.audit_log WHERE db = $1")
-        .bind(name.as_str())
+    // The table only exists once some enabled-audit test has ensured it; on a
+    // fresh database with no concurrent enabled-audit test yet run, it may not
+    // exist at all. Absence itself proves no rows were written.
+    let table_exists: bool = sqlx::query_scalar("SELECT to_regclass('rtdb.audit_log') IS NOT NULL")
         .fetch_one(&pool)
         .await
-        .expect("audit_log query (table exists from concurrent enabled tests; filtered by db)");
+        .expect("check rtdb.audit_log existence");
+    let count: i64 = if table_exists {
+        sqlx::query_scalar("SELECT COUNT(*) FROM rtdb.audit_log WHERE db = $1")
+            .bind(name.as_str())
+            .fetch_one(&pool)
+            .await
+            .expect("audit_log query")
+    } else {
+        0
+    };
     assert_eq!(count, 0, "disabled audit writes no rows for this db");
 
     let entries = audit_for_db(addr, &name).await;
