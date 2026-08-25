@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::RtDbError;
 use crate::http_api::ApiJson;
-use crate::schema::SchemaDef;
+use crate::schema::{SchemaDef, SchemaDefExt};
 use crate::{AppState, db, schema_history};
 
 use super::AdminPrincipal;

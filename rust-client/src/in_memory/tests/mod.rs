@@ -9,7 +9,7 @@
 use super::*;
 use crate::mutation::Mutation;
 use crate::query::{Paginate, Paginated, SearchOpts, TableQuery, VectorSearchOpts};
-use crate::schema::{Schema, Table};
+use crate::schema::{Schema, SchemaBuilderExt, Table};
 use crate::wire::{AggregateOp, AggregateSpec, FilterExpr, SearchMode};
 use serde_json::json;
 use std::sync::{Arc, Mutex};

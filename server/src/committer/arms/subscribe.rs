@@ -3,6 +3,7 @@
 //! with a write.
 
 use crate::committer::*;
+use crate::schema::SchemaDefExt;
 
 pub(in crate::committer) async fn handle_subscribe(
     ctx: &CommitterCtx,

@@ -446,8 +446,8 @@ impl InMemoryRtDbClient {
         };
         let index_def = table_def
             .indexes
-            .as_ref()
-            .and_then(|indexes| indexes.iter().find(|i| i.name == search.index && i.search))
+            .iter()
+            .find(|i| i.name == search.index && i.search)
             .ok_or_else(search_not_found)?;
         let index_fields: Vec<String> = index_def.fields.clone();
         // `snippet` needs a tsquery tree to highlight; trgm mode matches raw
@@ -2030,10 +2030,8 @@ pub(super) fn require_index<'a>(
     table_def: &'a TableDef,
     name: &str,
 ) -> Result<&'a IndexDef, RtDbError> {
-    let indexes = table_def.indexes.as_ref().ok_or_else(|| {
-        RtDbError::new(ErrorCode::BadRequest, format!("index '{name}' not found"))
-    })?;
-    indexes
+    table_def
+        .indexes
         .iter()
         .find(|i| i.name == name)
         .ok_or_else(|| RtDbError::new(ErrorCode::BadRequest, format!("index '{name}' not found")))

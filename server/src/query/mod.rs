@@ -25,7 +25,7 @@ use tracing::Instrument;
 
 use crate::auth::PrincipalCtx;
 use crate::error::RtDbError;
-use crate::schema::{SchemaDef, TableDef};
+use crate::schema::{SchemaDef, SchemaDefExt, TableDef};
 use search::{SearchCtx, execute_hybrid_search, execute_search, execute_vector_search};
 use terminals::{
     PaginateExecCtx, compile_query_window, execute_aggregate_terminal, execute_collect_terminal,

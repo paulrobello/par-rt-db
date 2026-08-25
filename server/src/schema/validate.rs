@@ -98,8 +98,30 @@ fn validate_field_type(ty: &FieldType) -> Result<(), RtDbError> {
     }
 }
 
-impl TableDef {
-    pub(super) fn validate_structure(&self, table_name: &str) -> Result<(), RtDbError> {
+/// `TableDef`/`SchemaDef` are now `par_rt_db_core::schema` types (ARC-004), so
+/// these validation methods -- server-specific, not shared with the Rust
+/// client's in-memory engine -- move from inherent `impl`s (the orphan rule
+/// forbids an inherent `impl` on a foreign type) to extension traits kept
+/// local to this module. Call sites bring the trait into scope alongside the
+/// type and keep the same `x.validate_structure(...)` method syntax.
+pub trait TableDefExt {
+    fn validate_structure(&self, table_name: &str) -> Result<(), RtDbError>;
+    fn validate_field_names(&self, table_name: &str) -> Result<(), RtDbError>;
+    fn validate_owner_field(&self) -> Result<(), RtDbError>;
+    fn validate_collaborators_field(&self) -> Result<(), RtDbError>;
+    fn validate_indexes(&self, table_name: &str) -> Result<(), RtDbError>;
+    fn validate_ttl(&self) -> Result<(), RtDbError>;
+    fn validate_updated_at(&self) -> Result<(), RtDbError>;
+    fn validate_auto_increment(&self) -> Result<(), RtDbError>;
+    fn validate_defaults(&self, table_name: &str) -> Result<(), RtDbError>;
+    fn validate_computed(&self, table_name: &str) -> Result<(), RtDbError>;
+    fn validate_on_delete(&self, table_name: &str) -> Result<(), RtDbError>;
+    fn field_has_nested_on_delete(&self, ty: &FieldType) -> bool;
+    fn index(&self, name: &str) -> Result<&IndexDef, RtDbError>;
+}
+
+impl TableDefExt for TableDef {
+    fn validate_structure(&self, table_name: &str) -> Result<(), RtDbError> {
         // QA-002: extracted the six independent cascade stages into named
         // helpers so this reads as a routing table. Order matters — early
         // failures short-circuit later checks exactly as before.
@@ -474,7 +496,7 @@ impl TableDef {
     ///    on insert/upsert-insert `verify_authorize_doc` runs before computed
     ///    stamping, so such a predicate would evaluate forgeable client
     ///    input instead of the server-derived value.
-    pub(super) fn validate_computed(&self, table_name: &str) -> Result<(), RtDbError> {
+    fn validate_computed(&self, table_name: &str) -> Result<(), RtDbError> {
         for (field, expr) in &self.computed {
             if !self.fields.contains_key(field) {
                 return Err(RtDbError::bad_request(format!(
@@ -644,7 +666,7 @@ impl TableDef {
         }
     }
 
-    pub fn index(&self, name: &str) -> Result<&IndexDef, RtDbError> {
+    fn index(&self, name: &str) -> Result<&IndexDef, RtDbError> {
         self.indexes
             .iter()
             .find(|index| index.name == name)
@@ -652,12 +674,21 @@ impl TableDef {
     }
 }
 
-impl SchemaDef {
+/// See [`TableDefExt`]: `SchemaDef` is also a `par_rt_db_core::schema` type, so
+/// its validation/lookup methods move to an extension trait for the same
+/// orphan-rule reason.
+pub trait SchemaDefExt {
+    fn validate(&self) -> Result<(), RtDbError>;
+    fn check_table_quota(&self, cap: usize) -> Result<(), RtDbError>;
+    fn table(&self, name: &str) -> Result<&TableDef, RtDbError>;
+}
+
+impl SchemaDefExt for SchemaDef {
     /// Structural validation: identifier regexes (Global Constraints), case-insensitive
     /// table uniqueness, index names unique per table and matching the field-name regex,
     /// index fields exist and are indexable, Literal values scalar, Union non-empty,
     /// reserved field names rejected: any starting with "_" .
-    pub fn validate(&self) -> Result<(), RtDbError> {
+    fn validate(&self) -> Result<(), RtDbError> {
         let mut lower_names = HashSet::new();
         for (table_name, table_def) in &self.tables {
             if !is_valid_identifier(table_name, MAX_TABLE_NAME_LEN) {
@@ -704,7 +735,7 @@ impl SchemaDef {
 
     /// Reject a schema whose table count exceeds `cap`. `cap == 0` is unlimited.
     /// Counted as `tables.len()` (user-declared tables only).
-    pub fn check_table_quota(&self, cap: usize) -> Result<(), RtDbError> {
+    fn check_table_quota(&self, cap: usize) -> Result<(), RtDbError> {
         if cap > 0 && self.tables.len() > cap {
             return Err(RtDbError::quota_exceeded(format!(
                 "db has {} table(s), limit is {cap}",
@@ -714,7 +745,7 @@ impl SchemaDef {
         Ok(())
     }
 
-    pub fn table(&self, name: &str) -> Result<&TableDef, RtDbError> {
+    fn table(&self, name: &str) -> Result<&TableDef, RtDbError> {
         self.tables
             .get(name)
             .ok_or_else(|| RtDbError::not_found(format!("table '{name}' not found")))

@@ -1,6 +1,7 @@
 //! The `RunMigrate` arm: schema-migration execution.
 
 use crate::committer::*;
+use crate::schema::SchemaDefExt;
 
 /// Applies a declarative migration through the committer, mirroring
 /// `handle_mutate`'s post-commit tap-site block so the same four downstream

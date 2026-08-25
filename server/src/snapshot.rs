@@ -10,7 +10,7 @@ use sqlx::PgPool;
 use crate::db::validate_db_name;
 use crate::ddl::{pg_schema, pg_table, push_schema, reposition_sequence};
 use crate::error::RtDbError;
-use crate::schema::SchemaDef;
+use crate::schema::{SchemaDef, SchemaDefExt};
 use crate::txn::insert_snapshot_row;
 
 /// One line of a database snapshot's JSONL wire format: a leading `schema` line

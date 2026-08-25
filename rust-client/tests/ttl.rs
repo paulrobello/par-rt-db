@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 
 use par_rt_db_client::in_memory::InMemoryRtDbClientOptions;
 use par_rt_db_client::schema::Table;
-use par_rt_db_client::{FieldType, InMemoryRtDbClient, Mutation, SchemaDef, StepResult};
+use par_rt_db_client::{
+    FieldType, InMemoryRtDbClient, Mutation, SchemaBuilderExt, SchemaDef, StepResult,
+};
 use serde_json::json;
 
 /// Fixed-clock harness so the stamped `expiresAt` (`now + default_duration_ms`)

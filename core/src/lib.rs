@@ -8,4 +8,5 @@
 #![deny(warnings)]
 
 pub mod fields;
+pub mod schema;
 pub mod wire;

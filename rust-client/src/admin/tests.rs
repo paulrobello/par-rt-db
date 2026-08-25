@@ -2,7 +2,7 @@ use super::RtDbAdminClient;
 use crate::error::ErrorCode;
 use crate::mutation::Mutation;
 use crate::query::TableQuery;
-use crate::schema::{FieldType, SchemaDef, Table};
+use crate::schema::{FieldType, SchemaBuilderExt, SchemaDef, Table};
 use serde_json::{Value, json};
 use wiremock::matchers::{
     body_bytes, body_partial_json, body_string_contains, header, method, path, query_param,

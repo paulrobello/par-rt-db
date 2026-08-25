@@ -25,7 +25,7 @@ use crate::error::RtDbError;
 use crate::metrics::{Metrics, SkipClass};
 use crate::protocol::ServerMessage;
 use crate::query::{Order, Query, QueryResult, diff_canonical, execute_query};
-use crate::schema::{FieldType, IndexDef, SchemaDef, TableDef};
+use crate::schema::{FieldType, IndexDef, SchemaDef, TableDef, TableDefExt};
 use crate::txn::{DocValues, EqBind, WriteSet, eq_bind_for, eq_binds};
 
 pub type ConnId = u64;

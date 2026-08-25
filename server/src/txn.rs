@@ -30,8 +30,8 @@ use crate::dsl::{FilterExpr, filter_matches};
 use crate::error::RtDbError;
 use crate::scheduler;
 use crate::schema::{
-    FieldType, OnDeleteAction, SchemaDef, TableDef, indexed_column_type, validate_doc,
-    validate_value,
+    FieldType, OnDeleteAction, SchemaDef, SchemaDefExt, TableDef, TableDefExt, indexed_column_type,
+    validate_doc, validate_value,
 };
 use crate::value_expr::eval_value_expr;
 

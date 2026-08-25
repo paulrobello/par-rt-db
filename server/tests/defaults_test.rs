@@ -8,7 +8,7 @@
 use crate::common::{test_state, wrap_test_db};
 use rtdb_server::ddl::push_schema;
 use rtdb_server::migrate::{Directive, plan_migration};
-use rtdb_server::schema::SchemaDef;
+use rtdb_server::schema::{SchemaDef, SchemaDefExt};
 use rtdb_server::txn::{Step, Transaction, execute_txn};
 use sqlx::PgPool;
 

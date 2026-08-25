@@ -19,7 +19,7 @@
 use par_rt_db_client::error::{ErrorCode, RtDbError};
 use par_rt_db_client::in_memory::{InMemoryRtDbClient, InMemoryRtDbClientOptions};
 use par_rt_db_client::query::Query;
-use par_rt_db_client::schema::{DistanceMetric, FieldType, Schema, Table};
+use par_rt_db_client::schema::{DistanceMetric, FieldType, Schema, SchemaBuilderExt, Table};
 use serde_json::{Map, Value, json};
 
 const ID: &str = "0123456789abcdef0123456789abcdef";

@@ -76,7 +76,8 @@ pub use query::{
     HybridSearchOpts, Order, Paginate, Paginated, Query, SearchOpts, TableQuery, VectorSearchOpts,
 };
 pub use schema::{
-    DistanceMetric, FieldType, IndexDef, OnDeleteAction, SchemaDef, TableDef, VectorIndexSpec,
+    DistanceMetric, FieldType, IndexDef, OnDeleteAction, SchemaBuilderExt, SchemaDef, TableDef,
+    VectorIndexSpec,
 };
 pub use value_expr::{CaseWhen, Cast, ValueExpr};
 pub use wire::{

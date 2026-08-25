@@ -4,7 +4,7 @@ use rtdb_server::db;
 use rtdb_server::ddl;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::query::{Query, QueryResult, execute_query};
-use rtdb_server::schema::SchemaDef;
+use rtdb_server::schema::{SchemaDef, SchemaDefExt};
 use rtdb_server::txn::{Step, Transaction, execute_txn};
 
 fn doc(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {

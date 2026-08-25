@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex};
 use par_rt_db_client::in_memory::InMemoryRtDbClientOptions;
 use par_rt_db_client::schema::Table;
 use par_rt_db_client::{
-    ErrorCode, FieldType, FilterExpr, InMemoryRtDbClient, Mutation, SchemaDef, StepResult,
-    TableQuery,
+    ErrorCode, FieldType, FilterExpr, InMemoryRtDbClient, Mutation, SchemaBuilderExt, SchemaDef,
+    StepResult, TableQuery,
 };
 use serde_json::json;
 

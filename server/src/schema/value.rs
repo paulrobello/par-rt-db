@@ -1,8 +1,9 @@
 //! Value-level validation and typing: `validate_value`/`validate_doc` (checked
-//! against `FieldType` at write time), `indexed_column_type` (the typed-column
-//! mapping shared with `ddl`), and `is_widening_of` (the safe-widening rule for
-//! additive schema pushes). Structural schema validation lives in
-//! `schema::validate`.
+//! against `FieldType` at write time) and `indexed_column_type` (the
+//! typed-column mapping shared with `ddl`). `is_widening_of` (the safe-widening
+//! rule for additive schema pushes) lives in `par_rt_db_core::schema` (ARC-004)
+//! and is re-exported from `schema::types`. Structural schema validation lives
+//! in `schema::validate`.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
@@ -78,52 +79,6 @@ pub fn indexed_column_type(ty: &FieldType) -> Result<(&'static str, bool), RtDbE
             "field type '{}' is not indexable",
             type_tag(other)
         ))),
-    }
-}
-
-/// Returns `true` when changing a field's declared type from `old` to `new` is a
-/// safe widening — every value valid under `old` remains valid under `new`, so no
-/// existing row is orphaned and no data migration is required. The only widening
-/// currently recognized is over finite literal sets: a lone `Literal` or a `Union`
-/// whose variants are all `Literal`s, where the new literal set is a superset of
-/// the old one (e.g. adding a variant to an enum-like union). Every other type
-/// change — narrowing a union (drops a variant some rows may hold), `union <->
-/// scalar`, any scalar-type change, `Optional`, `Object`, and mixed-kind unions —
-/// is NOT a widening and stays rejected by `detect_destructive_changes`.
-pub fn is_widening_of(old: &FieldType, new: &FieldType) -> bool {
-    match (literal_set(old), literal_set(new)) {
-        (Some(old_vals), Some(new_vals)) => old_vals.iter().all(|old_v| new_vals.contains(old_v)),
-        _ => false,
-    }
-}
-
-/// Finite set of accepted values for a literal-only type: `Some` for a lone
-/// `Literal` or a `Union` whose variants are all `Literal`s; `None` for any other
-/// type (unions mixing in non-literal variants, scalars, `Optional`, `Object`).
-/// Variant order and duplicates are irrelevant — the result is used only for
-/// membership tests. `serde_json::Value` is `PartialEq` but not `Ord`/`Hash`, so
-/// this returns a `Vec<&Value>` for linear `.contains()` membership rather than a set.
-fn literal_set(ty: &FieldType) -> Option<Vec<&serde_json::Value>> {
-    match ty {
-        FieldType::Literal { value } => Some(vec![value]),
-        FieldType::Union { variants } => {
-            let vals: Vec<&serde_json::Value> = variants
-                .iter()
-                .filter_map(|v| match v {
-                    FieldType::Literal { value } => Some(value),
-                    _ => None,
-                })
-                .collect();
-            // Finite only when every variant is a Literal. An empty union is
-            // refused so is_widening_of never returns a vacuous true for it
-            // (empty unions are also rejected at validation time).
-            if vals.len() == variants.len() && !variants.is_empty() {
-                Some(vals)
-            } else {
-                None
-            }
-        }
-        _ => None,
     }
 }
 

@@ -38,7 +38,7 @@ use rtdb_server::ddl;
 use rtdb_server::error::{ErrorCode, RtDbError};
 use rtdb_server::migrate::{MigrateRequest, apply_migration, plan_migration};
 use rtdb_server::query::{Query, QueryResult, execute_query};
-use rtdb_server::schema::SchemaDef;
+use rtdb_server::schema::{SchemaDef, SchemaDefExt};
 use rtdb_server::txn::{Step, Transaction, TxnOutcome, execute_txn};
 use serde_json::{Map, Value};
 

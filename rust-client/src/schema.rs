@@ -1,446 +1,21 @@
 //! Schema DSL: builds the exact `SchemaDef` JSON consumed by `POST /admin/push-schema`.
+//!
+//! The wire types (`OnDeleteAction`, `FieldType`, `IndexDef`, `DistanceMetric`,
+//! `VectorIndexSpec`, `TtlDef`, `TableDef`, `SchemaDef`) live in
+//! `par_rt_db_core::schema` (ARC-004) -- the server and Rust client share one
+//! definition instead of two hand-kept mirrors -- and are re-exported here so
+//! every existing `crate::schema::X` path keeps resolving unchanged. Only the
+//! ergonomic `TableBuilder`/`SchemaBuilder` DSL sugar below is rust-client-only.
 
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+pub use par_rt_db_core::schema::{
+    DistanceMetric, FieldType, IndexDef, OnDeleteAction, SchemaDef, TableDef, TtlDef,
+    VectorIndexSpec, is_widening_of, strip_on_delete,
+};
 
 use crate::value_expr::ValueExpr;
 use crate::wire::FilterExpr;
-
-/// Referential action applied to child rows when the referenced parent row is
-/// hard-deleted (FM-33). Carried on the CHILD table's `id` field as an
-/// additive `onDelete` wire key (`cascade` | `restrict` | `setNull`); the
-/// cascade executes app-level inside the server's `execute_txn` (not a SQL
-/// FK) so every cascaded row is a first-class op. Mirrors
-/// `server/src/schema.rs::OnDeleteAction` byte-for-byte.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum OnDeleteAction {
-    /// Delete the child rows too.
-    Cascade,
-    /// Block the parent delete while live children reference it (Conflict).
-    Restrict,
-    /// Clear the child's referencing field (the key is removed).
-    SetNull,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
-/// A field's declared type — the wire shape shared with the server (tagged
-/// `{"type": "..."}`, camelCase).
-pub enum FieldType {
-    /// JSON string.
-    String,
-    /// JSON number (f64).
-    Number,
-    /// JSON boolean.
-    Boolean,
-    /// JSON null.
-    Null,
-    /// Reference to a document in `table` (an id string on the wire).
-    Id {
-        /// The referenced table's name.
-        table: String,
-        /// `onDelete` referential action (FM-33). Legal only on a TOP-LEVEL
-        /// field of the table (`Id` directly, or one `Optional` wrapping an
-        /// `Id`; server push validation enforces this). Omitted on the wire
-        /// when `None`, so existing schemas deserialize unchanged. Mirrors
-        /// `server/src/schema.rs::FieldType` byte-for-byte.
-        #[serde(default, rename = "onDelete", skip_serializing_if = "Option::is_none")]
-        on_delete: Option<OnDeleteAction>,
-    },
-    /// Exactly one accepted literal value (enum-like).
-    Literal {
-        /// The accepted value.
-        value: serde_json::Value,
-    },
-    /// `T | null`.
-    Optional {
-        /// The wrapped type.
-        inner: Box<FieldType>,
-    },
-    /// Any one of the variants.
-    Union {
-        /// The accepted member types.
-        variants: Vec<FieldType>,
-    },
-    /// Array of `element`.
-    Array {
-        /// The per-item type.
-        element: Box<FieldType>,
-    },
-    /// Fixed-shape nested object.
-    Object {
-        /// The nested field names and types.
-        fields: BTreeMap<String, FieldType>,
-    },
-    /// 64-bit integer (wire-encoded as a string to keep JSON precision).
-    Int64,
-    /// Binary payload (base64 on the wire).
-    Bytes,
-    /// Any JSON value.
-    Any,
-    /// Dynamic-key map with a uniform value type.
-    Record {
-        /// The per-value type.
-        value: Box<FieldType>,
-    },
-    /// Embedding vector of fixed `dimensions` (pgvector).
-    Vector {
-        /// The fixed dimension count.
-        dimensions: u32,
-    },
-}
-
-impl FieldType {
-    /// Shorthand for an id reference without an `onDelete` action.
-    pub fn id(table: &str) -> Self {
-        FieldType::Id {
-            table: table.into(),
-            on_delete: None,
-        }
-    }
-    /// Declare the `onDelete` referential action on an id field (FM-33):
-    /// `.on_delete(OnDeleteAction::Cascade)` after `FieldType::id(table)`.
-    /// Mirrors the TS client's chainable `.onDelete(action)`. Only the `Id`
-    /// variant carries the action — on any other variant this is a no-op
-    /// (server push validation rejects a mis-placed `onDelete` anyway, and
-    /// only a top-level `Id` or `Optional<Id>` is legal).
-    pub fn on_delete(mut self, action: OnDeleteAction) -> Self {
-        if let FieldType::Id { on_delete, .. } = &mut self {
-            *on_delete = Some(action);
-        }
-        self
-    }
-    /// Wrap `inner` as `Optional`.
-    pub fn optional(inner: FieldType) -> Self {
-        FieldType::Optional {
-            inner: Box::new(inner),
-        }
-    }
-    /// A lone accepted literal value.
-    pub fn literal(value: impl Into<serde_json::Value>) -> Self {
-        FieldType::Literal {
-            value: value.into(),
-        }
-    }
-    /// A union over the given variants.
-    pub fn union(variants: impl IntoIterator<Item = FieldType>) -> Self {
-        FieldType::Union {
-            variants: variants.into_iter().collect(),
-        }
-    }
-    /// An array of `element`.
-    pub fn array(element: FieldType) -> Self {
-        FieldType::Array {
-            element: Box::new(element),
-        }
-    }
-    /// An embedding vector type of `dimensions`.
-    pub fn vector(dimensions: u32) -> Self {
-        FieldType::Vector { dimensions }
-    }
-}
-
-/// Returns `true` when changing a field's declared type from `old` to `new` is a
-/// safe widening — every value valid under `old` remains valid under `new`, so no
-/// existing row is orphaned and no data migration is required. The only widening
-/// currently recognized is over finite literal sets: a lone `Literal` or a `Union`
-/// whose variants are all `Literal`s, where the new literal set is a superset of
-/// the old one (e.g. adding a variant to an enum-like union). Every other type
-/// change — narrowing a union (drops a variant some rows may hold), `union <->
-/// scalar`, any scalar-type change, `Optional`, `Object`, and mixed-kind unions —
-/// is NOT a widening and stays rejected by `detect_destructive_changes`.
-pub fn is_widening_of(old: &FieldType, new: &FieldType) -> bool {
-    match (literal_set(old), literal_set(new)) {
-        (Some(old_vals), Some(new_vals)) => old_vals.iter().all(|old_v| new_vals.contains(old_v)),
-        _ => false,
-    }
-}
-
-/// Finite set of accepted values for a literal-only type: `Some` for a lone
-/// `Literal` or a `Union` whose variants are all `Literal`s; `None` for any other
-/// type (unions mixing in non-literal variants, scalars, `Optional`, `Object`).
-/// Variant order and duplicates are irrelevant — the result is used only for
-/// membership tests. `serde_json::Value` is `PartialEq` but not `Ord`/`Hash`, so
-/// this returns a `Vec<&Value>` for linear `.contains()` membership rather than a set.
-fn literal_set(ty: &FieldType) -> Option<Vec<&serde_json::Value>> {
-    match ty {
-        FieldType::Literal { value } => Some(vec![value]),
-        FieldType::Union { variants } => {
-            let vals: Vec<&serde_json::Value> = variants
-                .iter()
-                .filter_map(|v| match v {
-                    FieldType::Literal { value } => Some(value),
-                    _ => None,
-                })
-                .collect();
-            // Finite only when every variant is a Literal. An empty union is
-            // refused so is_widening_of never returns a vacuous true for it
-            // (empty unions are also rejected at validation time).
-            if vals.len() == variants.len() && !variants.is_empty() {
-                Some(vals)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Recursively strips every `Id`'s `on_delete` action from `ty`, keeping the
-/// referenced `table` (FM-33). Used by the in-memory harness's
-/// `detect_destructive_changes` (mirroring `server/src/ddl.rs`): adding or
-/// changing an `onDelete` action alters runtime delete behavior only (no
-/// stored row shape), so it is additive, while changing the referenced table
-/// is still a type change. Public for the same reason as
-/// [`is_widening_of`]: its only in-crate consumer is the `in_memory` feature,
-/// and `pub` keeps the feature-less lib build free of dead-code warnings.
-pub fn strip_on_delete(ty: &FieldType) -> FieldType {
-    match ty {
-        FieldType::Id { table, .. } => FieldType::Id {
-            table: table.clone(),
-            on_delete: None,
-        },
-        FieldType::Optional { inner } => FieldType::Optional {
-            inner: Box::new(strip_on_delete(inner)),
-        },
-        FieldType::Union { variants } => FieldType::Union {
-            variants: variants.iter().map(strip_on_delete).collect(),
-        },
-        FieldType::Array { element } => FieldType::Array {
-            element: Box::new(strip_on_delete(element)),
-        },
-        FieldType::Object { fields } => FieldType::Object {
-            fields: fields
-                .iter()
-                .map(|(k, v)| (k.clone(), strip_on_delete(v)))
-                .collect(),
-        },
-        FieldType::Record { value } => FieldType::Record {
-            value: Box::new(strip_on_delete(value)),
-        },
-        other => other.clone(),
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-/// One declared index on a table (btree, search, or vector).
-pub struct IndexDef {
-    /// Index name (used in queries' `with_index`).
-    pub name: String,
-    /// The indexed field names, in key order.
-    pub fields: Vec<String>,
-    /// `true` marks a full-text search index (mirrors server `schema.rs`: the
-    /// server tsvectorizes its text `fields` into a GIN-indexed generated column
-    /// ranked via the `search` query terminal). Omitted on the wire for ordinary
-    /// btree indexes, so existing schemas deserialize unchanged.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub search: bool,
-    /// When present, marks this as a vector index: `fields[0]` must name a
-    /// `Vector { dimensions }` field whose dimensions match `vector.dimensions`,
-    /// and `filter_fields` (if any) names scalar columns used to pre-filter
-    /// nearest-neighbor queries. Omitted on the wire for btree/search indexes,
-    /// so existing schemas deserialize unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vector: Option<VectorIndexSpec>,
-    /// `true` marks a unique btree index (mirrors server `schema.rs`: the
-    /// server emits `CREATE UNIQUE INDEX`, constraining tuples over `fields`).
-    /// Omitted on the wire when false, so existing schemas deserialize
-    /// unchanged. May not combine with `search` or `vector`.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub unique: bool,
-    /// Optional partial-index predicate (mirrors server `schema.rs::IndexDef`):
-    /// when present the index constrains only rows matching this filter.
-    /// Serialized as the wire key `where` (the field is the raw-identifier
-    /// `r#where` so the JSON key matches the server/TS/Python clients exactly),
-    /// and omitted on the wire when `None`.
-    #[serde(default, rename = "where", skip_serializing_if = "Option::is_none")]
-    pub r#where: Option<FilterExpr>,
-    /// Full-text search language for a search index — a Postgres `regconfig`
-    /// name (e.g. `"english"`, `"simple"`, `"spanish"`) that the server uses to
-    /// tsvectorize the index's text `fields`. Only meaningful when `search: true`;
-    /// the server default (field absent) behaves as `english`. Mirrors
-    /// `server/src/schema.rs::IndexDef` byte-for-byte: omitted on the wire when
-    /// `None`, so existing schemas serialize unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub language: Option<String>,
-}
-
-/// Distance metric for a vector index. Mirrors
-/// `server/src/schema.rs::DistanceMetric` byte-for-byte: serializes as
-/// lowercase `"cosine" | "l2" | "ip"`. The default (`Cosine`) is omitted on
-/// the wire by `VectorIndexSpec`'s `skip_serializing_if`, so existing schemas
-/// serialize identically — backward compatible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DistanceMetric {
-    #[default]
-    /// Cosine distance (default).
-    Cosine,
-    /// Euclidean L2 distance.
-    L2,
-    /// Inner product.
-    Ip,
-}
-
-impl DistanceMetric {
-    /// Returns `true` for the default metric, so `VectorIndexSpec` can omit it
-    /// on the wire (backward compatible with pre-metric schemas).
-    fn is_cosine(&self) -> bool {
-        matches!(self, Self::Cosine)
-    }
-}
-
-/// Declaration of a vector (approximate nearest-neighbor) index. Wire shape is
-/// camelCase (`filterFields`, and `metric` as lowercase `"cosine"|"l2"|"ip"`)
-/// to match the rest of the protocol. Mirrors `server/src/schema.rs::VectorIndexSpec`
-/// byte-for-byte — including the optional `metric` field (default `Cosine`,
-/// omitted on the wire).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VectorIndexSpec {
-    /// Vector dimension count.
-    pub dimensions: u32,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    /// Scalar fields usable as eq-filters in `vectorSearch`.
-    pub filter_fields: Vec<String>,
-    /// Distance metric used by this index (default `Cosine`). Omitted on the
-    /// wire when `Cosine`, so existing schemas serialize identically.
-    #[serde(default, skip_serializing_if = "DistanceMetric::is_cosine")]
-    pub metric: DistanceMetric,
-}
-
-fn is_false(b: &bool) -> bool {
-    !*b
-}
-
-/// Declarative document TTL (auto-expiry). `field` names a declared numeric
-/// field whose value is each document's absolute epoch-ms expiry; the in-memory
-/// harness's `InMemoryRtDbClient::tick` (feature `in_memory`) reaps rows whose
-/// value is in the past (mirroring the live server's per-db reaper).
-/// `default_duration_ms` stamps the field at insert time when the caller omits
-/// it. Mirrors `server/src/schema.rs::TtlDef` byte-for-byte (camelCase wire).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TtlDef {
-    /// The declared numeric field holding each doc's epoch-ms expiry.
-    pub field: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Stamped at insert time when the document omits `field`.
-    pub default_duration_ms: Option<i64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-/// One table: fields, indexes, and opt-in per-row rules / TTL / defaults.
-pub struct TableDef {
-    /// Field name → declared type.
-    pub fields: BTreeMap<String, FieldType>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    /// Declared indexes, if any.
-    pub indexes: Option<Vec<IndexDef>>,
-    /// Opt-in per-row authorization: names a declared, string-compatible field
-    /// whose value is the owning user's id. When set, an authenticated user
-    /// reads/mutates only their own rows on this table; machine tokens and
-    /// scheduled jobs bypass. Server-enforced; clients only declare it.
-    /// Mirrors `server/src/schema.rs::TableDef` byte-for-byte — the explicit
-    /// `rename` is required because this struct has no container `rename_all`.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        rename = "ownerField"
-    )]
-    pub owner_field: Option<String>,
-    /// Opt-in extension of `owner_field`: names a declared array-of-strings (or
-    /// array-of-id) field whose values are additional user ids that may
-    /// read/mutate the row (owner OR collaborator). May be declared alone.
-    /// Mirrors `server/src/schema.rs::TableDef` byte-for-byte.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        rename = "collaboratorsField"
-    )]
-    pub collaborators_field: Option<String>,
-    /// Declarative document TTL. When `Some`, the in-memory harness's `tick`
-    /// reaps rows whose `ttl.field` value is in the past. Additive — schemas
-    /// without it deserialize unchanged. Mirrors `server/src/schema.rs::TableDef`
-    /// byte-for-byte (wire key `ttl`).
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "ttl")]
-    pub ttl: Option<TtlDef>,
-    /// Server-stamped update timestamp (FM-36): names a declared
-    /// `number`/`int64` field the server stamps with the current epoch-ms on
-    /// every version-bumping write — insert, patch, replace, upsert (both
-    /// branches), patchByQuery, and cascade setNull — overwriting any
-    /// client-supplied value (the `ownerField` authority model). Server-only
-    /// enforcement; the client only declares it. Additive — schemas without
-    /// it deserialize unchanged. Mirrors `server/src/schema.rs::TableDef`
-    /// byte-for-byte (wire key `updatedAtField`).
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        rename = "updatedAtField"
-    )]
-    pub updated_at_field: Option<String>,
-    /// Server-assigned per-table monotonic counter (FM-37): names a declared
-    /// `int64` field the server stamps from a per-table sequence on insert
-    /// (and upsert's insert branch), overwriting any client-supplied value
-    /// (the `ownerField` authority model). Immutable after insert — a patch
-    /// or replace that changes the stored value is rejected. Additive —
-    /// schemas without it deserialize unchanged. Mirrors
-    /// `server/src/schema.rs::TableDef` byte-for-byte (wire key
-    /// `autoIncrementField`).
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        rename = "autoIncrementField"
-    )]
-    pub auto_increment_field: Option<String>,
-    /// Opt-in per-row authorization predicate (Model C). A general `FilterExpr`
-    /// over this table's declared doc fields and the principal's markers
-    /// (`{"$user":true}` / `{"$email":true}`). Enforced on the same
-    /// read/write/subscription seams as `owner_field`; additive to it. Marker
-    /// values are valid only here — client `.filter()` queries reject them.
-    /// Server-enforced; the client only declares it. Mirrors
-    /// `server/src/schema.rs::TableDef` byte-for-byte (wire key `authorize`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authorize: Option<FilterExpr>,
-    /// Field-level default values (FM-32). Applied to a NEW document
-    /// (insert / replace / upsert-insert) when it omits the key; `patch`
-    /// never re-applies, so clearing an optional field stays cleared.
-    /// Values are literals the server validates at push time against the
-    /// field's type. Stamped server values (ttl default, ownerField,
-    /// authorize `$user`) win over a default on the same field. Additive —
-    /// schemas without it deserialize unchanged. Mirrors
-    /// `server/src/schema.rs::TableDef` byte-for-byte.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub defaults: BTreeMap<String, serde_json::Value>,
-    /// Computed fields (ENH-028): field name → expression. The server
-    /// re-evaluates each expression on every write and stores the result in
-    /// the doc (overwriting any client-supplied value — the `ownerField`
-    /// authority model); a null result removes the key. Push-time validation
-    /// is `validate_computed`: keys must be declared non-stamped fields,
-    /// referenced fields declared and non-computed, `Case.whens` reject
-    /// principal markers, and a statically-known result kind must be
-    /// acceptable to the field's type. Additive — schemas without it
-    /// deserialize unchanged. Mirrors `server/src/schema.rs::TableDef`
-    /// byte-for-byte (wire key `computed`).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub computed: BTreeMap<String, ValueExpr>,
-    /// Soft delete (FM-33): `Delete`/`DeleteByQuery` rows on this table are
-    /// STAMPED (`deleted_at`) instead of removed — invisible to every read and
-    /// write lookup, restorable via the `undelete` mutation step, physically
-    /// removed only by the TTL reaper. Omitted on the wire when false, so
-    /// existing schemas deserialize unchanged. Mirrors
-    /// `server/src/schema.rs::TableDef` byte-for-byte.
-    #[serde(default, rename = "softDelete", skip_serializing_if = "is_false")]
-    pub soft_delete: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-/// A whole schema: named tables. Pushed via `POST /admin/push-schema`.
-pub struct SchemaDef {
-    /// Table name → definition.
-    pub tables: BTreeMap<String, TableDef>,
-}
 
 /// Finished schema (alias for the wire type).
 pub type Schema = SchemaDef;
@@ -688,14 +263,9 @@ impl TableBuilder {
         self
     }
     fn finish(self) -> TableDef {
-        let indexes = if self.indexes.is_empty() {
-            None
-        } else {
-            Some(self.indexes)
-        };
         TableDef {
             fields: self.fields,
-            indexes,
+            indexes: self.indexes,
             owner_field: self.owner_field,
             collaborators_field: self.collaborators_field,
             ttl: self.ttl,
@@ -754,9 +324,17 @@ impl OnceTable for TableBuilder {
     }
 }
 
-impl SchemaDef {
+/// `SchemaDef` is now a `par_rt_db_core::schema` type (ARC-004), so
+/// `SchemaDef::builder()` (an inherent `impl` is forbidden on a foreign type
+/// by the orphan rule) moves to this extension trait. Bring it into scope
+/// alongside `SchemaDef`/`Schema` to keep the `Schema::builder()` call syntax.
+pub trait SchemaBuilderExt {
     /// Start a [`SchemaBuilder`] for this definition type.
-    pub fn builder() -> SchemaBuilder {
+    fn builder() -> SchemaBuilder;
+}
+
+impl SchemaBuilderExt for SchemaDef {
+    fn builder() -> SchemaBuilder {
         SchemaBuilder::new()
     }
 }
@@ -899,14 +477,14 @@ mod tests {
         let notes = back.tables.get("notes").expect("notes present");
         let search = notes
             .indexes
-            .as_ref()
-            .and_then(|idxs| idxs.iter().find(|i| i.name == "search_content"))
+            .iter()
+            .find(|i| i.name == "search_content")
             .expect("search index present");
         assert!(search.search);
         let by_title = notes
             .indexes
-            .as_ref()
-            .and_then(|idxs| idxs.iter().find(|i| i.name == "by_title"))
+            .iter()
+            .find(|i| i.name == "by_title")
             .expect("btree index present");
         assert!(!by_title.search);
     }
@@ -951,14 +529,14 @@ mod tests {
         let notes = back.tables.get("notes").expect("notes present");
         let default_back = notes
             .indexes
-            .as_ref()
-            .and_then(|i| i.iter().find(|x| x.name == "search_default"))
+            .iter()
+            .find(|x| x.name == "search_default")
             .expect("default search index present");
         assert!(default_back.language.is_none());
         let spanish_back = notes
             .indexes
-            .as_ref()
-            .and_then(|i| i.iter().find(|x| x.name == "search_spanish"))
+            .iter()
+            .find(|x| x.name == "search_spanish")
             .expect("spanish search index present");
         assert_eq!(spanish_back.language.as_deref(), Some("spanish"));
 
@@ -976,8 +554,7 @@ mod tests {
         let legacy_idx = from_legacy
             .tables
             .get("notes")
-            .and_then(|t| t.indexes.as_ref())
-            .and_then(|i| i.first())
+            .and_then(|t| t.indexes.first())
             .expect("legacy index present");
         assert!(legacy_idx.language.is_none());
     }
@@ -1015,16 +592,16 @@ mod tests {
         let notes = back.tables.get("notes").expect("notes present");
         let by_embedding = notes
             .indexes
-            .as_ref()
-            .and_then(|idxs| idxs.iter().find(|i| i.name == "by_embedding"))
+            .iter()
+            .find(|i| i.name == "by_embedding")
             .expect("vector index present");
         let vspec = by_embedding.vector.as_ref().expect("vector spec present");
         assert_eq!(vspec.dimensions, 4);
         assert_eq!(vspec.filter_fields, vec!["userId"]);
         let by_title = notes
             .indexes
-            .as_ref()
-            .and_then(|idxs| idxs.iter().find(|i| i.name == "by_title"))
+            .iter()
+            .find(|i| i.name == "by_title")
             .expect("btree index present");
         assert!(by_title.vector.is_none());
     }
@@ -1588,15 +1165,15 @@ mod tests {
         // The unique flag lands on `by_email` only; `by_org` is a plain btree.
         let by_email = td
             .indexes
-            .as_ref()
-            .and_then(|i| i.iter().find(|x| x.name == "by_email"))
+            .iter()
+            .find(|x| x.name == "by_email")
             .expect("by_email present");
         assert!(by_email.unique);
         assert!(by_email.r#where.is_none());
         let by_org = td
             .indexes
-            .as_ref()
-            .and_then(|i| i.iter().find(|x| x.name == "by_org"))
+            .iter()
+            .find(|x| x.name == "by_org")
             .expect("by_org present");
         assert!(!by_org.unique);
 
@@ -1635,14 +1212,14 @@ mod tests {
         let back: TableDef = serde_json::from_value(v).unwrap();
         let by_email_back = back
             .indexes
-            .as_ref()
-            .and_then(|i| i.iter().find(|x| x.name == "by_email"))
+            .iter()
+            .find(|x| x.name == "by_email")
             .expect("by_email present");
         assert!(by_email_back.unique);
         let by_org_back = back
             .indexes
-            .as_ref()
-            .and_then(|i| i.iter().find(|x| x.name == "by_org"))
+            .iter()
+            .find(|x| x.name == "by_org")
             .expect("by_org present");
         assert!(!by_org_back.unique);
     }
@@ -1672,11 +1249,7 @@ mod tests {
         );
         // Round-trips: the predicate comes back as `where: Some(...)`.
         let back: TableDef = serde_json::from_value(v.clone()).unwrap();
-        let idx_back = back
-            .indexes
-            .as_ref()
-            .and_then(|i| i.first())
-            .expect("index present");
+        let idx_back = back.indexes.first().expect("index present");
         assert!(idx_back.unique);
         let pred = idx_back.r#where.as_ref().expect("predicate present");
         assert!(matches!(pred, FilterExpr::Neq { field, .. } if field == "archived"));
@@ -1698,7 +1271,7 @@ mod tests {
                 value: json!("x"),
             })
             .finish();
-        assert!(td.indexes.is_none());
+        assert!(td.indexes.is_empty());
     }
 
     // ---- is_widening_of (mirrors server/src/schema.rs tests) --------------

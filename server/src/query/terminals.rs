@@ -31,7 +31,7 @@ use crate::dsl::{
 };
 use crate::error::RtDbError;
 use crate::pagination::{decode_cursor, encode_cursor};
-use crate::schema::{FieldType, IndexDef, SchemaDef, TableDef};
+use crate::schema::{FieldType, IndexDef, SchemaDef, SchemaDefExt, TableDef, TableDefExt};
 
 /// Result docs = stored doc merged with {"_id", "_creationTime", "_version"}.
 /// get: point SELECT, null if missing. unique: error PreconditionFailed "unique query matched

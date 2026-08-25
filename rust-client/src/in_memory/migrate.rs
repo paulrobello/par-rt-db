@@ -73,12 +73,10 @@ impl InMemoryRtDbClient {
             )
         })?;
         t.fields.insert(to.to_string(), ft);
-        if let Some(indexes) = t.indexes.as_mut() {
-            for ix in indexes.iter_mut() {
-                for f in ix.fields.iter_mut() {
-                    if f == from {
-                        *f = to.to_string();
-                    }
+        for ix in t.indexes.iter_mut() {
+            for f in ix.fields.iter_mut() {
+                if f == from {
+                    *f = to.to_string();
                 }
             }
         }
@@ -290,10 +288,8 @@ impl InMemoryRtDbClient {
                 format!("dropped field '{table}.{field}' does not exist"),
             ));
         }
-        if let Some(indexes) = t.indexes.as_mut() {
-            for ix in indexes.iter_mut() {
-                ix.fields.retain(|f| f != field);
-            }
+        for ix in t.indexes.iter_mut() {
+            ix.fields.retain(|f| f != field);
         }
         if t.owner_field.as_deref() == Some(field) {
             t.owner_field = None;
@@ -401,19 +397,13 @@ impl InMemoryRtDbClient {
     ) -> Result<(crate::wire::admin::DirectiveReport, Option<String>), RtDbError> {
         use crate::wire::admin::DirectiveReport;
         let t = migrate_table_mut(planned, table)?;
-        let indexes = t.indexes.as_mut().ok_or_else(|| {
-            RtDbError::new(
-                ErrorCode::BadRequest,
-                format!("dropped index '{table}.{name}' does not exist"),
-            )
-        })?;
-        if !indexes.iter().any(|ix| ix.name == name) {
+        if !t.indexes.iter().any(|ix| ix.name == name) {
             return Err(RtDbError::new(
                 ErrorCode::BadRequest,
                 format!("dropped index '{table}.{name}' does not exist"),
             ));
         }
-        indexes.retain(|ix| ix.name != name);
+        t.indexes.retain(|ix| ix.name != name);
         Ok((
             DirectiveReport {
                 op: "dropIndex".into(),
@@ -671,12 +661,8 @@ pub(super) fn detect_destructive_changes(
                 _ => {}
             }
         }
-        for old_index in old_table.indexes.iter().flatten() {
-            let new_index = new_table
-                .indexes
-                .iter()
-                .flatten()
-                .find(|i| i.name == old_index.name);
+        for old_index in old_table.indexes.iter() {
+            let new_index = new_table.indexes.iter().find(|i| i.name == old_index.name);
             let new_index = match new_index {
                 None => {
                     return Err(RtDbError::new(
@@ -1032,10 +1018,18 @@ fn infer_static_kind(ve: &crate::value_expr::ValueExpr) -> Option<StaticKind> {
 /// `autoIncrementField` must name a declared int64 field distinct from both.
 /// This is deliberately a subset — identifier formats, owner/collaborator
 /// fields, defaults, and `onDelete` shapes stay server-side.
-impl SchemaDef {
-    /// Validates TTL and index-field rules (see the impl docs) — called by
+/// `SchemaDef` is now a `par_rt_db_core::schema` type (ARC-004), so this
+/// in-memory-engine-only subset of push validation (an inherent `impl` is
+/// forbidden on a foreign type by the orphan rule) moves to an extension
+/// trait. Bring it into scope alongside `SchemaDef` to keep `.validate()`.
+pub trait InMemorySchemaValidateExt {
+    /// Validates TTL and index-field rules (see the trait docs) — called by
     /// [`InMemoryRtDbClient::push_schema`] before the destructive-change check.
-    pub fn validate(&self) -> Result<(), RtDbError> {
+    fn validate(&self) -> Result<(), RtDbError>;
+}
+
+impl InMemorySchemaValidateExt for SchemaDef {
+    fn validate(&self) -> Result<(), RtDbError> {
         for (table_name, table) in &self.tables {
             // `olderThan` context gate for `authorize` (server
             // `validate_structure`'s `validate_filter_expr_fields(authorize,
@@ -1051,7 +1045,7 @@ impl SchemaDef {
                     "olderThan filter is only allowed in patchByQuery/deleteByQuery filters",
                 ));
             }
-            for index in table.indexes.iter().flatten() {
+            for index in table.indexes.iter() {
                 // A partial-index `where` predicate is baked into DDL as a
                 // literal — an execution-time-relative cutoff has no static
                 // meaning there (the server rejects it in
@@ -1114,7 +1108,7 @@ impl SchemaDef {
                         format!("ttl.field '{}' must be a number or bigint field", ttl.field),
                     ));
                 }
-                let has_ttl_index = table.indexes.iter().flatten().any(|idx| {
+                let has_ttl_index = table.indexes.iter().any(|idx| {
                     !idx.search
                         && idx.vector.is_none()
                         && !idx.unique

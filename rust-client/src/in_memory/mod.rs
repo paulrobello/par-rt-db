@@ -1432,10 +1432,7 @@ impl InMemoryRtDbClient {
         candidate_doc: &Value,
         exclude_id: Option<&str>,
     ) -> Result<(), RtDbError> {
-        let Some(indexes) = table_def.indexes.as_ref() else {
-            return Ok(());
-        };
-        for index in indexes.iter().filter(|i| i.unique) {
+        for index in table_def.indexes.iter().filter(|i| i.unique) {
             // A partial unique index constrains only rows matching its predicate.
             if let Some(pred) = &index.r#where
                 && !eval_filter_expr(pred, candidate_doc, &table_def.fields)
@@ -2223,7 +2220,7 @@ mod validate;
 mod value_expr;
 
 // Cross-module helpers (private to this module's descendants).
-use migrate::detect_destructive_changes;
+use migrate::{InMemorySchemaValidateExt, detect_destructive_changes};
 use query::{collect_index_key, diff_canonical, require_index};
 use validate::{apply_defaults, matches_filter, stamp_ttl_default, stamp_updated_at};
 use value_expr::stamp_computed;

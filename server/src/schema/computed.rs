@@ -10,6 +10,7 @@ use crate::value_expr::ValueExpr;
 
 use super::filter::validate_filter_expr_fields;
 use super::types::{SchemaDef, TableDef};
+use super::validate::TableDefExt;
 
 /// Walks a computed expression's `Case` nodes validating each `when` filter
 /// with the marker-rejecting mode of `validate_filter_expr_fields` — the same

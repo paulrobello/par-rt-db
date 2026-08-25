@@ -17,7 +17,7 @@ use rtdb_server::db;
 use rtdb_server::ddl;
 use rtdb_server::error::RtDbError;
 use rtdb_server::query::{FilterExpr, Query, QueryResult, execute_query};
-use rtdb_server::schema::SchemaDef;
+use rtdb_server::schema::{SchemaDef, SchemaDefExt};
 use rtdb_server::txn::{OpKind, Step, Transaction, TxnOutcome, execute_txn};
 
 // ===========================================================================

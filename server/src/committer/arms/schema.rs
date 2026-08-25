@@ -1,6 +1,7 @@
 //! The schema arms: `RunPushSchema` and `RunRestoreSchema`.
 
 use crate::committer::*;
+use crate::schema::SchemaDefExt;
 
 /// Restores the database's schema shape to a captured `schema_history`
 /// snapshot, mirroring `handle_migrate`'s structure (load current → begin tx →

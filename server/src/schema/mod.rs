@@ -27,4 +27,5 @@ pub use computed::*;
 pub use filter::*;
 pub use types::*;
 pub(crate) use validate::*;
+pub use validate::{SchemaDefExt, TableDefExt};
 pub use value::*;

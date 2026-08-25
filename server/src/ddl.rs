@@ -13,7 +13,8 @@ use crate::db::{database_exists, load_schema, validate_db_name};
 use crate::error::RtDbError;
 use crate::query::compile_filter_literal;
 use crate::schema::{
-    FieldType, SchemaDef, TableDef, indexed_column_type, is_widening_of, strip_on_delete,
+    FieldType, SchemaDef, SchemaDefExt, TableDef, indexed_column_type, is_widening_of,
+    strip_on_delete,
 };
 
 pub fn pg_table(user_table: &str) -> String {

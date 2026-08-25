@@ -601,7 +601,6 @@ fn check_leaf_kind(field: &str, value: &Value, table: &TableDef) -> Result<(), R
     let indexed = table
         .indexes
         .iter()
-        .flatten()
         .any(|idx| idx.fields.iter().any(|f| f == field));
     if indexed {
         return coerce_index_value(table, field, value).map(|_| ());
