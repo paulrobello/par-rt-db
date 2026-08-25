@@ -1,16 +1,14 @@
-//! One-shot HTTP client for par-rt-db. `Authorization: Bearer <token>` on every call.
+//! One-shot HTTP client for par-rt-db. `Authorization: Bearer <token>` and the
+//! ARC-013 `X-Rtdb-Protocol` version header on every call, both attached by the
+//! crate-internal `AuthedRequest::authed` seam in `http_common`.
 
 use crate::error::{RtDbError, retry_on_precondition};
+use crate::http_common::AuthedRequest;
 use crate::mutation::{Mutation, StepResult, Transaction};
 use crate::query::{Query, TableQuery};
 use crate::wire::{
-    AuthedUser, PROTOCOL_VERSION, ScheduleInfo, ScheduleWhen, WorkflowInfo, WorkflowSpec,
-    WorkflowStatus,
+    AuthedUser, ScheduleInfo, ScheduleWhen, WorkflowInfo, WorkflowSpec, WorkflowStatus,
 };
-
-/// ARC-013: header name carrying the requesting client's protocol version on
-/// the one-shot HTTP API — mirrors the WS `Auth` frame's `protocolVersion`.
-const PROTOCOL_HEADER: &str = "X-Rtdb-Protocol";
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::future::Future;
@@ -192,8 +190,7 @@ impl RtDbHttpClient {
         let resp = self
             .client
             .post(format!("{}/api/query", self.url))
-            .bearer_auth(&self.token)
-            .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+            .authed(&self.token)
             .json(&body)
             .send()
             .await
@@ -256,8 +253,7 @@ impl RtDbHttpClient {
         let resp = self
             .client
             .post(format!("{}/api/query-batch", self.url))
-            .bearer_auth(&self.token)
-            .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+            .authed(&self.token)
             .json(&body)
             .send()
             .await
@@ -292,8 +288,7 @@ impl RtDbHttpClient {
         let resp = self
             .client
             .post(format!("{}/api/mutate", self.url))
-            .bearer_auth(&self.token)
-            .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+            .authed(&self.token)
             .json(&body)
             .send()
             .await
@@ -400,7 +395,7 @@ impl RtDbHttpClient {
         let resp = self
             .client
             .post(format!("{}/api/schedule", self.url))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .json(&body)
             .send()
             .await
@@ -455,7 +450,7 @@ impl RtDbHttpClient {
                 self.url,
                 encode_uri_component(id)
             ))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .json(&body)
             .send()
             .await
@@ -483,7 +478,7 @@ impl RtDbHttpClient {
         let resp = self
             .client
             .post(format!("{}/api/schedules", self.url))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .json(&body)
             .send()
             .await
@@ -505,7 +500,7 @@ impl RtDbHttpClient {
         let resp = self
             .client
             .post(format!("{}/api/workflows", self.url))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .json(&body)
             .send()
             .await
@@ -537,7 +532,7 @@ impl RtDbHttpClient {
                 self.url,
                 encode_uri_component(id)
             ))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .json(&body)
             .send()
             .await
@@ -584,7 +579,7 @@ impl RtDbHttpClient {
                 self.url,
                 encode_uri_component(id)
             ))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .json(&body)
             .send()
             .await
@@ -622,7 +617,7 @@ impl RtDbHttpClient {
         let resp = self
             .client
             .post(format!("{}/api/workflows/list", self.url))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .json(&body)
             .send()
             .await
@@ -644,7 +639,7 @@ impl RtDbHttpClient {
         let mut req = self
             .client
             .post(format!("{}/api/storage/{}", self.url, self.db))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .body(bytes.to_vec());
         if let Some(ct) = content_type {
             req = req.header(reqwest::header::CONTENT_TYPE, ct);
@@ -679,7 +674,7 @@ impl RtDbHttpClient {
         let mut req = self
             .client
             .post(format!("{}/api/storage/{}", self.url, self.db))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .body(body);
         if let Some(ct) = content_type {
             req = req.header(reqwest::header::CONTENT_TYPE, ct);
@@ -698,7 +693,7 @@ impl RtDbHttpClient {
         let resp = self
             .client
             .delete(format!("{}/api/storage/{}/{id}", self.url, self.db))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("delete file request failed: {e}")))?;
@@ -721,7 +716,7 @@ impl RtDbHttpClient {
                 "{}/api/storage/{}/{id}/metadata",
                 self.url, self.db
             ))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("file metadata request failed: {e}")))?;
@@ -743,7 +738,7 @@ impl RtDbHttpClient {
                 "{}/api/storage/{}/{id}/signed-url",
                 self.url, self.db
             ))
-            .bearer_auth(&self.token);
+            .authed(&self.token);
         if let Some(ttl) = ttl_seconds {
             req = req.query(&[("ttlSeconds", ttl)]);
         }
@@ -800,7 +795,7 @@ impl RtDbHttpClient {
         let resp = self
             .client
             .get(format!("{}/auth/me", self.url))
-            .bearer_auth(&self.token)
+            .authed(&self.token)
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("auth_me request failed: {e}")))?;
@@ -822,7 +817,7 @@ impl RtDbHttpClient {
         let resp = self
             .client
             .get(format!("{}/auth/validate", self.url))
-            .bearer_auth(token)
+            .authed(token)
             .send()
             .await
             .map_err(|e| RtDbError::internal(format!("validate request failed: {e}")))?;
@@ -2113,6 +2108,86 @@ mod tests {
         // `mod tests` is a child of the `http` module, so it can read the private
         // `url` field of `RtDbHttpClient`.
         assert_eq!(client.get_url("f1"), format!("{}/storage/f1", client.url));
+    }
+
+    // ARC-013 follow-up: the protocol-version header is attached by the shared
+    // `AuthedRequest::authed` seam, so it rides every route this client serves —
+    // not just query/mutate/batch, which were the only three carrying it when
+    // the header was hand-written per call site. One request per family
+    // (schedule, workflow, storage, auth) and one assertion over every request
+    // the server actually received.
+    #[tokio::test]
+    async fn protocol_header_rides_every_route_not_just_query_mutate_batch() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/schedule"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "job-1"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/workflows"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "wf-1"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/storage/t%3Cuuid%3E"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "f1", "sha256": "abc", "size": 3
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/storage/t%3Cuuid%3E/f1/metadata"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "f1", "sha256": "abc", "size": 3, "creationTime": 5
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/auth/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "user": {"kind": "machine", "subject": "s"}
+            })))
+            .mount(&server)
+            .await;
+
+        let txn = Mutation::new().build();
+        client
+            .schedule(&txn, crate::wire::ScheduleWhen::AfterMs { ms: 1 })
+            .await
+            .unwrap();
+        client
+            .start_workflow(&crate::wire::WorkflowSpec {
+                name: "w".into(),
+                steps: vec![crate::wire::WorkflowStepSpec {
+                    txn: Some(Mutation::new().build()),
+                    await_signal: None,
+                    retry: None,
+                    sleep_before_ms: None,
+                }],
+            })
+            .await
+            .unwrap();
+        client.upload(b"abc", None).await.unwrap();
+        client.get_file_metadata("f1").await.unwrap();
+        client.auth_me().await.unwrap();
+
+        let expected = crate::wire::PROTOCOL_VERSION.to_string();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 5);
+        for req in requests {
+            let sent = req
+                .headers
+                .get("x-rtdb-protocol")
+                .and_then(|v| v.to_str().ok());
+            assert_eq!(
+                sent,
+                Some(expected.as_str()),
+                "{} {} sent no protocol header",
+                req.method,
+                req.url.path()
+            );
+        }
     }
 
     #[tokio::test]

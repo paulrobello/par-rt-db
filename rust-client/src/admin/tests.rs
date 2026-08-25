@@ -2544,3 +2544,48 @@ async fn set_anonymous_access_surfaces_unknown_db_envelope() {
     assert_eq!(err.code, ErrorCode::NotFound);
     assert_eq!(err.message, "database not registered");
 }
+
+// ARC-013 follow-up: admin calls go through the same `AuthedRequest::authed`
+// seam as the data plane, so every `/admin/*` request carries the client's
+// protocol version — previously only query/mutate/batch did. Covers a POST
+// (JSON body), a GET (query string), and a PATCH.
+#[tokio::test]
+async fn every_admin_request_carries_the_protocol_header() {
+    let (server, client) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/admin/create-db"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/admin/export-db"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}\n"))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/admin/db/kanban/anonymous-access"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&server)
+        .await;
+
+    client.create_db("kanban").await.unwrap();
+    client.export_db("kanban").await.unwrap();
+    client.set_anonymous_access("kanban", true).await.unwrap();
+
+    let expected = crate::wire::PROTOCOL_VERSION.to_string();
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    for req in requests {
+        let sent = req
+            .headers
+            .get("x-rtdb-protocol")
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(
+            sent,
+            Some(expected.as_str()),
+            "{} {} sent no protocol header",
+            req.method,
+            req.url.path()
+        );
+    }
+}
