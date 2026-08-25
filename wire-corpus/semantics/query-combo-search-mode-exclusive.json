@@ -1,0 +1,94 @@
+{
+  "name": "query-combo-search-mode-exclusive",
+  "$comment": "Rule 'search-mode-exclusive' from wire-corpus/query-combinations.json: at most one of ['hybridSearch', 'search', 'vectorSearch'] may be set on a query. Representative violation: hybridSearch+search. Pins BAD_REQUEST across all five runners.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "order": {
+            "type": "number"
+          },
+          "embedding": {
+            "type": "vector",
+            "dimensions": 3
+          },
+          "body": {
+            "type": "string"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_name",
+            "fields": [
+              "name"
+            ]
+          },
+          {
+            "name": "by_status",
+            "fields": [
+              "status"
+            ]
+          },
+          {
+            "name": "vector_embedding",
+            "fields": [
+              "embedding"
+            ],
+            "vector": {
+              "dimensions": 3
+            }
+          },
+          {
+            "name": "search_body",
+            "fields": [
+              "body"
+            ],
+            "search": true
+          }
+        ]
+      }
+    }
+  },
+  "seed": [
+    {
+      "name": "a",
+      "status": "todo",
+      "order": 1,
+      "embedding": [
+        1,
+        0,
+        0
+      ],
+      "body": "task alpha"
+    }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "hybridSearch": {
+        "query": "x",
+        "vector": [
+          1,
+          0,
+          0
+        ],
+        "limit": 1
+      },
+      "search": {
+        "index": "search_body",
+        "query": "x"
+      }
+    }
+  },
+  "expect": {
+    "error": {
+      "code": "BAD_REQUEST"
+    }
+  }
+}

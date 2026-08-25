@@ -1,0 +1,91 @@
+{
+  "name": "query-combo-gte-excludes-hybridSearch",
+  "$comment": "Rule 'gte-excludes-hybridSearch' from wire-corpus/query-combinations.json: gte and hybridSearch may not both be set on a query. Pins BAD_REQUEST across all five runners.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "order": {
+            "type": "number"
+          },
+          "embedding": {
+            "type": "vector",
+            "dimensions": 3
+          },
+          "body": {
+            "type": "string"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_name",
+            "fields": [
+              "name"
+            ]
+          },
+          {
+            "name": "by_status",
+            "fields": [
+              "status"
+            ]
+          },
+          {
+            "name": "vector_embedding",
+            "fields": [
+              "embedding"
+            ],
+            "vector": {
+              "dimensions": 3
+            }
+          },
+          {
+            "name": "search_body",
+            "fields": [
+              "body"
+            ],
+            "search": true
+          }
+        ]
+      }
+    }
+  },
+  "seed": [
+    {
+      "name": "a",
+      "status": "todo",
+      "order": 1,
+      "embedding": [
+        1,
+        0,
+        0
+      ],
+      "body": "task alpha"
+    }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "gte": 1,
+      "hybridSearch": {
+        "query": "x",
+        "vector": [
+          1,
+          0,
+          0
+        ],
+        "limit": 1
+      }
+    }
+  },
+  "expect": {
+    "error": {
+      "code": "BAD_REQUEST"
+    }
+  }
+}

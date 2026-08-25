@@ -15,6 +15,8 @@
 //! execute routing in `terminals.rs`, the ranked search family + their shared
 //! ctx in `search.rs`, and the per-row auth predicate rendering in `row_auth.rs`.
 
+#[cfg(test)]
+mod combinations_coverage;
 mod filter;
 mod row_auth;
 mod search;

@@ -26,6 +26,19 @@ implementations honest against each other. Three artifacts live here:
   this corpus is what checks the five lists actually agree, so a code added to
   the server can't silently go unknown to a client. See
   [Error-code parity](#error-code-parity) below.
+- [`query-combinations.json`](query-combinations.json) — the **query
+  clause-combination rule table** (ENH-028): the declarative source of truth
+  for which read-`Query` clauses may not coexist (`get`/`vectorSearch`/
+  `hybridSearch`/`search` each excluding most other clauses, the
+  `unique`/`first`/`count`/`distinct`/`aggregate`/`paginate`/`take` terminal
+  clique, `gt`+`gte`, `lt`+`lte`, …). Phase 1 (this table plus one
+  `semantics/query-combo-<rule-id>.json` case per rule) only *documents and
+  pins* the rules every runner's hand-written checker already enforces
+  (`compile_query` on the server; `check_query_combinations`/
+  `checkQueryCombinations`/`_check_query_combinations` plus each engine's
+  terminal executors on the four clients) — a later phase replaces those five
+  checkers with one evaluator that reads this table. See
+  [Query combination rules](#query-combination-rules) below.
 
 **Runner scope:** the server and all four client in-memory engines
 (`ts-client`, `rust-client`, `python-client`, `swift-client`) execute
@@ -46,6 +59,7 @@ layers. A divergence between any client engine and these fixtures is a bug in th
 - [Substitution placeholders](#substitution-placeholders)
 - [Adding a case](#adding-a-case)
 - [Error-code parity](#error-code-parity)
+- [Query combination rules](#query-combination-rules)
 
 ## The authoring rule
 
@@ -235,3 +249,67 @@ corpus's authoring rule above.
   additionally asserts its per-code HTTP status against `httpStatus`
   (`RtDbError.status_code`); TS and Rust don't model an HTTP status per code,
   so they check the code set only.
+
+## Query combination rules
+
+`query-combinations.json` is the declarative source of truth for which
+clauses of the read `Query` DSL may not be set together — the rule set that
+`server/src/query/mod.rs`/`terminals.rs`'s `compile_query`, the four clients'
+`check_query_combinations`/`checkQueryCombinations`/
+`_check_query_combinations` (plus, in every client, the `get`/`vectorSearch`/
+`hybridSearch`/`search` terminal-executor guards those functions don't own),
+and swift's mirror all hand-enforce today. It is not itself executed by any
+runner yet (that lands in a later phase, replacing the five hand-written
+checkers with one evaluator reading this table); today it exists purely to
+**document and pin** the union of those rules with a corpus case per rule, so
+a rule silently added to one checker and missed in another shows up as a
+`query-combo-*` case failing on the runner that lacks it.
+
+### Table format
+
+```json
+{
+  "$comment": "...",
+  "clauses": ["get", "index", "eq", "gt", "gte", "lt", "lte", "order", "take",
+              "unique", "first", "count", "distinct", "aggregate", "paginate",
+              "filter", "search", "vectorSearch", "hybridSearch"],
+  "rules": [
+    { "id": "get-excludes-index", "forbid": ["get", "index"],
+      "code": "BAD_REQUEST", "message": "get cannot be combined with index, ..." },
+    { "id": "terminal-exclusive",
+      "atMostOne": ["aggregate", "count", "distinct", "first", "get", "paginate", "take", "unique"],
+      "code": "BAD_REQUEST", "message": "only one terminal may be set" }
+  ]
+}
+```
+
+- `clauses` — every read-`Query` clause name a rule can reference (wire
+  camelCase, e.g. `vectorSearch`).
+- `rules[].forbid` — a 2-element set that may not **both** be present on a
+  query; the pairwise primitive every rule ultimately reduces to.
+- `rules[].atMostOne` — a set of which **at most one** member may be present.
+  Only used where every pairwise combination within the set is independently
+  confirmed forbidden (a full clique) — using it for a non-clique group would
+  wrongly reject a legal combination of two of its members (e.g. `index` and
+  `eq`, which combine legally outside a terminal context). The table currently
+  has two: `terminal-exclusive` (the 8-member result-shaping terminal clique:
+  `get`, `unique`, `first`, `count`, `distinct`, `aggregate`, `paginate`,
+  `take`) and `search-mode-exclusive` (`search`, `vectorSearch`,
+  `hybridSearch`).
+- `rules[].code`/`.message` — the server's canonical `RtDbError` code and
+  message text (the server is the wire/behavior authority throughout this
+  codebase). **Only `code` is part of the enforced contract** — per
+  determinism ruling 4 above, corpus cases assert error `code`, never message
+  text, so `message` is documentation, not something a runner is checked
+  against.
+
+**The authoring rule:** a new clause, or a new combination restriction on an
+existing clause, lands in `query-combinations.json` (a new `rules[]` entry, or
+a clause added to an existing `forbid`/`atMostOne` set) plus one
+`semantics/query-combo-<rule-id>.json` case in the same change — the same
+"behavior ships with a pinning case" rule as [above](#the-authoring-rule),
+specialized to this table. A rule id must equal the `<rule-id>` suffix of its
+case's filename; `server/src/query/combinations_coverage.rs`'s tests fail the
+build if a rule has no matching case, or a `query-combo-*` case has no
+matching rule (guarding both directions — a rule added without a case, and a
+stale case left behind after a rule is renamed or removed).

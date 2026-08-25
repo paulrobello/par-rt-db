@@ -1,0 +1,86 @@
+{
+  "name": "query-combo-first-excludes-search",
+  "$comment": "Rule 'first-excludes-search' from wire-corpus/query-combinations.json: first and search may not both be set on a query. Pins BAD_REQUEST across all five runners.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "order": {
+            "type": "number"
+          },
+          "embedding": {
+            "type": "vector",
+            "dimensions": 3
+          },
+          "body": {
+            "type": "string"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_name",
+            "fields": [
+              "name"
+            ]
+          },
+          {
+            "name": "by_status",
+            "fields": [
+              "status"
+            ]
+          },
+          {
+            "name": "vector_embedding",
+            "fields": [
+              "embedding"
+            ],
+            "vector": {
+              "dimensions": 3
+            }
+          },
+          {
+            "name": "search_body",
+            "fields": [
+              "body"
+            ],
+            "search": true
+          }
+        ]
+      }
+    }
+  },
+  "seed": [
+    {
+      "name": "a",
+      "status": "todo",
+      "order": 1,
+      "embedding": [
+        1,
+        0,
+        0
+      ],
+      "body": "task alpha"
+    }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "first": true,
+      "search": {
+        "index": "search_body",
+        "query": "x"
+      }
+    }
+  },
+  "expect": {
+    "error": {
+      "code": "BAD_REQUEST"
+    }
+  }
+}
