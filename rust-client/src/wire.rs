@@ -374,82 +374,12 @@ pub struct PresenceMember {
 /// `ts-client/src/protocol.ts`.
 pub use par_rt_db_core::mutation::{ScheduleKind, ScheduleWhen};
 
-/// Lifecycle state of a scheduled job. Mirrors
-/// `server/src/protocol.rs::ScheduleStatus` (ARC-004/QA-008): serializes as
-/// `"pending"` / `"running"` / `"paused"` / `"error"`, byte-identical to the
-/// prior `String` form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScheduleStatus {
-    /// Waiting for its due time.
-    Pending,
-    /// Currently executing (crash-recovered at startup).
-    Running,
-    /// Held by pause; resume re-arms it.
-    Paused,
-    /// Failed; `last_error` carries why.
-    Error,
-}
-
-impl ScheduleStatus {
-    /// The wire string (`"pending"` etc.).
-    pub fn as_wire_str(&self) -> &'static str {
-        match self {
-            ScheduleStatus::Pending => "pending",
-            ScheduleStatus::Running => "running",
-            ScheduleStatus::Paused => "paused",
-            ScheduleStatus::Error => "error",
-        }
-    }
-}
-
-impl From<ScheduleStatus> for &'static str {
-    fn from(s: ScheduleStatus) -> &'static str {
-        s.as_wire_str()
-    }
-}
-
-impl std::str::FromStr for ScheduleStatus {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "pending" => Ok(ScheduleStatus::Pending),
-            "running" => Ok(ScheduleStatus::Running),
-            "paused" => Ok(ScheduleStatus::Paused),
-            "error" => Ok(ScheduleStatus::Error),
-            other => Err(format!("unknown ScheduleStatus: {other}")),
-        }
-    }
-}
-
-/// A scheduled job's public view (returned by `listSchedules`). `cron`,
-/// `everyMs`, and `last_error` are omitted on the wire when absent. Mirrors
-/// `server/src/protocol.rs::ScheduleInfo`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScheduleInfo {
-    /// Opaque job id.
-    pub id: String,
-    /// One-shot, cron, or interval.
-    pub kind: ScheduleKind,
-    /// Next due time, epoch ms.
-    pub due_at: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// The cron expression, for cron jobs.
-    pub cron: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Interval jobs only: the fixed recurrence in ms (`kind: "interval"`).
-    pub every_ms: Option<i64>,
-    /// Lifecycle state.
-    pub status: ScheduleStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// The last firing error, if any.
-    pub last_error: Option<String>,
-    /// Creation time, epoch ms.
-    pub created_at: i64,
-    /// Times fired.
-    pub fired_count: i64,
-}
+/// `ScheduleStatus`/`ScheduleInfo` are now `par_rt_db_core::mutation` types
+/// (ARC-004 follow-up), re-exported here at their historical path so every
+/// existing `crate::wire::{ScheduleStatus, ScheduleInfo}` call site keeps
+/// resolving. Mirrors `server/src/protocol.rs::{ScheduleStatus, ScheduleInfo}`
+/// byte-for-byte.
+pub use par_rt_db_core::mutation::{ScheduleInfo, ScheduleStatus};
 
 /// Per-step retry policy (FM-29). `maxAttempts` counts TOTAL attempts — the
 /// first try included. `StepRetry`/`AwaitSignalSpec`/`WorkflowStepSpec`/

@@ -277,69 +277,13 @@ pub struct PresenceMember {
 /// keeps resolving. Mirrored byte-for-byte in `ts-client/src/protocol.ts`.
 pub use par_rt_db_core::mutation::{ScheduleKind, ScheduleWhen};
 
-/// Lifecycle state of a scheduled job. Closed domain — was a free `String`
-/// (ARC-004/QA-008). Serializes as `"pending"` / `"running"` / `"paused"` /
-/// `"error"`, byte-identical to the prior stringly-typed bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScheduleStatus {
-    Pending,
-    Running,
-    Paused,
-    Error,
-}
-
-impl ScheduleStatus {
-    pub fn as_wire_str(&self) -> &'static str {
-        match self {
-            ScheduleStatus::Pending => "pending",
-            ScheduleStatus::Running => "running",
-            ScheduleStatus::Paused => "paused",
-            ScheduleStatus::Error => "error",
-        }
-    }
-}
-
-impl From<ScheduleStatus> for &'static str {
-    fn from(s: ScheduleStatus) -> &'static str {
-        s.as_wire_str()
-    }
-}
-
-impl std::str::FromStr for ScheduleStatus {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "pending" => Ok(ScheduleStatus::Pending),
-            "running" => Ok(ScheduleStatus::Running),
-            "paused" => Ok(ScheduleStatus::Paused),
-            "error" => Ok(ScheduleStatus::Error),
-            other => Err(format!("unknown ScheduleStatus: {other}")),
-        }
-    }
-}
-
-/// A scheduled job's public view (returned by `listSchedules`). `cron` and
-/// `last_error` are omitted on the wire when absent. The canonical home is
-/// `protocol::ScheduleInfo`; `scheduler` re-exports it for its `list` return
-/// type and existing call sites.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScheduleInfo {
-    pub id: String,
-    pub kind: ScheduleKind,
-    pub due_at: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cron: Option<String>,
-    /// Interval jobs only: the fixed recurrence in ms (`kind: "interval"`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub every_ms: Option<i64>,
-    pub status: ScheduleStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<String>,
-    pub created_at: i64,
-    pub fired_count: i64,
-}
+/// `ScheduleStatus`/`ScheduleInfo` are now `par_rt_db_core::mutation` types
+/// (ARC-004 follow-up — both were verified byte-identical against
+/// `rust-client/src/wire.rs`), re-exported here at their historical path so
+/// every existing `crate::protocol::{ScheduleStatus, ScheduleInfo}` call site
+/// keeps resolving. `scheduler` re-exports `ScheduleInfo` for its `list`
+/// return type. Mirrored byte-for-byte in `ts-client/src/protocol.ts`.
+pub use par_rt_db_core::mutation::{ScheduleInfo, ScheduleStatus};
 
 /// `StepRetry`/`AwaitSignalSpec`/`WorkflowStepSpec`/`WorkflowSpec`/
 /// `WorkflowStatus` are now `par_rt_db_core::mutation` types (ARC-004

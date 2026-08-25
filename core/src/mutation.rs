@@ -1,7 +1,8 @@
 //! Mutation/transaction DSL wire types shared by the server and Rust client
 //! (ARC-004 follow-up): `Transaction`, `Step`, `ScheduleWhen`, `ScheduleKind`,
-//! `StepRetry`, `AwaitSignalSpec`, `WorkflowStepSpec`, `WorkflowSpec`, and
-//! `WorkflowStatus`. These were two hand-kept copies — one in
+//! `ScheduleStatus`, `ScheduleInfo`, `StepRetry`, `AwaitSignalSpec`,
+//! `WorkflowStepSpec`, `WorkflowSpec`, and `WorkflowStatus`. These were two
+//! hand-kept copies — one in
 //! `server/src/dsl.rs`/`server/src/protocol.rs`, one in
 //! `rust-client/src/mutation.rs`/`rust-client/src/wire.rs` — verified
 //! structurally identical (same variants, same fields, same serde tags)
@@ -388,4 +389,79 @@ impl std::str::FromStr for WorkflowStatus {
             other => Err(format!("unknown WorkflowStatus: {other}")),
         }
     }
+}
+
+/// Lifecycle state of a scheduled job. Closed domain — was a free `String`
+/// (ARC-004/QA-008). Serializes as `"pending"` / `"running"` / `"paused"` /
+/// `"error"`, byte-identical to the prior stringly-typed bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleStatus {
+    /// Waiting for its due time.
+    Pending,
+    /// Currently executing (crash-recovered at startup).
+    Running,
+    /// Held by pause; resume re-arms it.
+    Paused,
+    /// Failed; `last_error` carries why.
+    Error,
+}
+
+impl ScheduleStatus {
+    /// The wire string (`"pending"` etc.).
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            ScheduleStatus::Pending => "pending",
+            ScheduleStatus::Running => "running",
+            ScheduleStatus::Paused => "paused",
+            ScheduleStatus::Error => "error",
+        }
+    }
+}
+
+impl From<ScheduleStatus> for &'static str {
+    fn from(s: ScheduleStatus) -> &'static str {
+        s.as_wire_str()
+    }
+}
+
+impl std::str::FromStr for ScheduleStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(ScheduleStatus::Pending),
+            "running" => Ok(ScheduleStatus::Running),
+            "paused" => Ok(ScheduleStatus::Paused),
+            "error" => Ok(ScheduleStatus::Error),
+            other => Err(format!("unknown ScheduleStatus: {other}")),
+        }
+    }
+}
+
+/// A scheduled job's public view (returned by `listSchedules`). `cron`,
+/// `everyMs`, and `last_error` are omitted on the wire when absent.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleInfo {
+    /// Opaque job id.
+    pub id: String,
+    /// One-shot, cron, or interval.
+    pub kind: ScheduleKind,
+    /// Next due time, epoch ms.
+    pub due_at: i64,
+    /// The cron expression, for cron jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    /// Interval jobs only: the fixed recurrence in ms (`kind: "interval"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub every_ms: Option<i64>,
+    /// Lifecycle state.
+    pub status: ScheduleStatus,
+    /// The last firing error, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Creation time, epoch ms.
+    pub created_at: i64,
+    /// Times fired.
+    pub fired_count: i64,
 }
