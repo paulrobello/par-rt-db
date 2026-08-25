@@ -61,49 +61,22 @@ pub const MAX_AFFECTED_ROWS_PER_TXN: usize = 10_000;
 /// `deleteByQuery` step. Over → `conflict`, txn aborts atomically.
 pub const MAX_CASCADE_ROWS: usize = 10_000;
 
-/// SEC-104: total documents a txn could touch in the worst case. Per-id steps
-/// count 1 each; `Schedule`/`CancelSchedule`/`StartWorkflow`/`CancelWorkflow`
-/// count 0 (control-flow steps touch no documents); each `patchByQuery`/
-/// `deleteByQuery` step counts up to its `limit` (default and cap
-/// `MAX_BY_QUERY_ROWS`). Mirrors server `txn::worst_case_affected`. Used by
-/// `execute_transaction`'s [`MAX_AFFECTED_ROWS_PER_TXN`] budget check.
+/// SEC-104: total documents a txn could touch in the worst case, capped per
+/// by-query step at [`MAX_BY_QUERY_ROWS`]. Mirrors server
+/// `txn::worst_case_affected`. Used by `execute_transaction`'s
+/// [`MAX_AFFECTED_ROWS_PER_TXN`] budget check. Thin wrapper over
+/// [`par_rt_db_core::engine::worst_case_affected`] (ARC-004 follow-up) — see
+/// its doc comment for the full estimate semantics.
 pub fn worst_case_affected(txn: &Transaction) -> usize {
-    txn.steps
-        .iter()
-        .map(|step| match step {
-            Step::PatchByQuery { limit, .. } | Step::DeleteByQuery { limit, .. } => {
-                (*limit).unwrap_or(MAX_BY_QUERY_ROWS).min(MAX_BY_QUERY_ROWS) as usize
-            }
-            Step::Schedule { .. }
-            | Step::CancelSchedule { .. }
-            | Step::StartWorkflow { .. }
-            | Step::CancelWorkflow { .. } => 0,
-            _ => 1,
-        })
-        .sum()
+    par_rt_db_core::engine::worst_case_affected(txn, MAX_BY_QUERY_ROWS)
 }
 
-/// FM-28/FM-29: recursive step count — a `schedule` step counts as itself
-/// plus every step in its nested txn, and a `startWorkflow` step counts as
-/// itself plus the sum of its spec's step txns. Mirrors the server's recursive
-/// gate against [`MAX_STEPS`] (a nested tree can't smuggle past the flat cap).
+/// Recursive step count against [`MAX_STEPS`] (a nested tree can't smuggle
+/// past the flat cap). Thin wrapper over
+/// [`par_rt_db_core::engine::count_steps`] (ARC-004 follow-up) — see its doc
+/// comment for the full recursion semantics.
 fn count_steps(txn: &Transaction) -> usize {
-    let mut total = txn.steps.len();
-    for step in &txn.steps {
-        match step {
-            Step::Schedule { txn: nested, .. } => total += count_steps(nested),
-            Step::StartWorkflow { spec } => {
-                // An `awaitSignal` step carries no txn, so it nests nothing.
-                total += spec
-                    .steps
-                    .iter()
-                    .map(|s| s.txn.as_ref().map_or(0, count_steps))
-                    .sum::<usize>();
-            }
-            _ => {}
-        }
-    }
-    total
+    par_rt_db_core::engine::count_steps(txn)
 }
 
 /// The `onDelete` action `ty` declares when it references `parent_table`, or

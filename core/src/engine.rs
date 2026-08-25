@@ -1,9 +1,12 @@
 //! Pure engine helpers shared by the server's Postgres-backed engine and the
-//! Rust client's in-memory engine (ARC-004 part B). Each function here is a
-//! byte-for-byte port of what used to be two hand-kept copies — one in
-//! `server/src/ddl.rs`/`server/src/migrate.rs`, one in
-//! `rust-client/src/in_memory/migrate.rs` — verified identical before being
-//! moved here.
+//! Rust client's in-memory engine (ARC-004 part B, plus the mutation-DSL
+//! follow-up). Each function here is a byte-for-byte port of what used to be
+//! two hand-kept copies — one in `server/src/ddl.rs`/`server/src/migrate.rs`/
+//! `server/src/txn.rs`, one in `rust-client/src/in_memory/migrate.rs`/
+//! `rust-client/src/in_memory/mod.rs` — verified identical before being moved
+//! here. [`worst_case_affected`] takes `max_by_query_rows` as a parameter
+//! rather than a baked-in constant because each crate keeps its own copy of
+//! that cap (`MAX_BY_QUERY_ROWS`) alongside its other budget constants.
 //!
 //! Several other functions that LOOK like duplicates deliberately stay put in
 //! each crate because they carry real behavioral divergence (not just a
@@ -22,6 +25,7 @@
 //! message into its own error type at the call site with a one-line
 //! `.map_err(...)`.
 
+use crate::mutation::{Step, Transaction};
 use crate::schema::{SchemaDef, is_widening_of, strip_on_delete};
 use crate::wire::{FilterExpr, ValueExpr};
 
@@ -172,4 +176,65 @@ pub fn rename_value_expr_fields(expr: &mut ValueExpr, from: &str, to: &str) {
             rename_value_expr_fields(otherwise, from, to);
         }
     }
+}
+
+/// FM-28/FM-29: recursive step count — a `Schedule` step counts as itself
+/// plus every step in its nested txn, and a `StartWorkflow` step counts as
+/// itself plus the sum of its spec's step txns (an `awaitSignal` step carries
+/// no txn, so it nests nothing). Bounds one request body's serialized size
+/// against each crate's `MAX_STEPS` cap and blocks the nesting bomb (N steps
+/// each scheduling N steps) — by-query caps are NOT applied to nested txns
+/// here: the nested txn executes in a future committer turn and is
+/// re-validated fully at fire time. ARC-004 follow-up: a byte-for-byte port
+/// of what used to be two hand-kept copies, `server/src/txn.rs` and
+/// `rust-client/src/in_memory/mod.rs` (the two prior implementations differed
+/// in code shape — a `map().sum()` vs an accumulator loop — but were verified
+/// behaviorally identical before being unified into this one shape).
+pub fn count_steps(txn: &Transaction) -> usize {
+    txn.steps
+        .iter()
+        .map(|step| match step {
+            Step::Schedule { txn, .. } => 1 + count_steps(txn),
+            Step::StartWorkflow { spec } => {
+                1 + spec
+                    .steps
+                    .iter()
+                    .map(|s| s.txn.as_ref().map_or(0, count_steps))
+                    .sum::<usize>()
+            }
+            _ => 1,
+        })
+        .sum()
+}
+
+/// SEC-104: total documents `txn` could touch in the worst case. Per-id
+/// steps (`Insert`/`Patch`/`Replace`/`Delete`/`ExpectVersion`/
+/// `ExpectAbsent`/`Upsert`/`Undelete`) touch at most one each;
+/// `Schedule`/`CancelSchedule`/`StartWorkflow`/`CancelWorkflow` count 0
+/// (control-flow steps touch no documents); each `PatchByQuery`/
+/// `DeleteByQuery` step touches up to its `limit`, capped at
+/// `max_by_query_rows` (the server's `MAX_BY_QUERY_ROWS` / the Rust client's
+/// mirror of the same cap — threaded in rather than baked in here since each
+/// crate keeps its own copy of the constant). The estimate is an
+/// over-approximation — the actual count is lower when fewer rows match —
+/// and must never under-approximate (that would weaken both crates' budget
+/// checks: the server's `MAX_AFFECTED_ROWS_PER_TXN` guard in `execute_txn`
+/// and the admin `max_affected_docs` guardrail, and the in-memory engine's
+/// mirror of the same check). ARC-004 follow-up: a byte-for-byte port of
+/// what used to be two hand-kept copies, `server/src/txn.rs` and
+/// `rust-client/src/in_memory/mod.rs`.
+pub fn worst_case_affected(txn: &Transaction, max_by_query_rows: u32) -> usize {
+    txn.steps
+        .iter()
+        .map(|step| match step {
+            Step::PatchByQuery { limit, .. } | Step::DeleteByQuery { limit, .. } => {
+                (*limit).unwrap_or(max_by_query_rows).min(max_by_query_rows) as usize
+            }
+            Step::Schedule { .. }
+            | Step::CancelSchedule { .. }
+            | Step::StartWorkflow { .. }
+            | Step::CancelWorkflow { .. } => 0,
+            _ => 1,
+        })
+        .sum()
 }

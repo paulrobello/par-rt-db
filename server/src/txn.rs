@@ -50,28 +50,11 @@ pub(crate) use crate::dsl::{eq_bind_for, eq_binds};
 /// Raise further only if a measured workload genuinely needs >1024 atomic steps.
 pub const MAX_STEPS: usize = 1024;
 
-/// Recursive step count: every step counts 1, a `Schedule` step adds its
-/// nested txn's count on top, and a `StartWorkflow` step sums its spec's
-/// step txns. The total tree must stay within `MAX_STEPS` —
-/// this bounds one request body's serialized size and blocks the nesting
-/// bomb (N steps each scheduling N steps). By-query caps are NOT applied to
-/// nested txns here: the nested txn executes in a future committer turn and
-/// `execute_txn` re-validates it fully at fire time.
+/// Recursive step count; the total tree must stay within `MAX_STEPS`. Thin
+/// wrapper over [`par_rt_db_core::engine::count_steps`] (ARC-004 follow-up) —
+/// see its doc comment for the full recursion semantics.
 pub(crate) fn count_steps(txn: &Transaction) -> usize {
-    txn.steps
-        .iter()
-        .map(|step| match step {
-            Step::Schedule { txn, .. } => 1 + count_steps(txn),
-            Step::StartWorkflow { spec } => {
-                1 + spec
-                    .steps
-                    .iter()
-                    .map(|s| s.txn.as_ref().map_or(0, count_steps))
-                    .sum::<usize>()
-            }
-            _ => 1,
-        })
-        .sum()
+    par_rt_db_core::engine::count_steps(txn)
 }
 
 /// Hard cap on the number of rows a single `PatchByQuery`/`DeleteByQuery` step
@@ -1347,30 +1330,14 @@ fn row_auth_enforced_uid<'a>(table_def: &'a TableDef, owner: Option<&'a str>) ->
 /// Runs under READ COMMITTED with no row locking; correctness depends on all
 /// writes for a database being serialized through the per-db committer.
 /// Never call `execute_txn` from a non-committer production path.
-/// Worst-case number of documents `txn` could affect. Per-id steps
-/// (`Insert`/`Patch`/`Replace`/`Delete`/`ExpectVersion`/`ExpectAbsent`/`Upsert`)
-/// touch at most one each; `Schedule`/`CancelSchedule`/`StartWorkflow`/
-/// `CancelWorkflow` count 0 (control-flow steps touch no documents); each
-/// `PatchByQuery`/`DeleteByQuery` step touches
-/// up to its `limit` (default and ceiling [`MAX_BY_QUERY_ROWS`]). The estimate
-/// is an over-approximation — the actual count is lower when fewer rows match —
-/// and is used by [`execute_txn`]'s [`MAX_AFFECTED_ROWS_PER_TXN`] budget check
-/// and the admin `max_affected_docs` guardrail (admin/docs.rs, ws.rs). It must
-/// never under-approximate (that would weaken both caps). SEC-104.
+/// Worst-case number of documents `txn` could affect, capped per by-query
+/// step at [`MAX_BY_QUERY_ROWS`]. Used by [`execute_txn`]'s
+/// [`MAX_AFFECTED_ROWS_PER_TXN`] budget check and the admin `max_affected_docs`
+/// guardrail (admin/docs.rs, ws.rs). SEC-104. Thin wrapper over
+/// [`par_rt_db_core::engine::worst_case_affected`] (ARC-004 follow-up) — see
+/// its doc comment for the full estimate semantics.
 pub fn worst_case_affected(txn: &Transaction) -> usize {
-    txn.steps
-        .iter()
-        .map(|step| match step {
-            Step::PatchByQuery { limit, .. } | Step::DeleteByQuery { limit, .. } => {
-                (*limit).unwrap_or(MAX_BY_QUERY_ROWS).min(MAX_BY_QUERY_ROWS) as usize
-            }
-            Step::Schedule { .. }
-            | Step::CancelSchedule { .. }
-            | Step::StartWorkflow { .. }
-            | Step::CancelWorkflow { .. } => 0,
-            _ => 1,
-        })
-        .sum()
+    par_rt_db_core::engine::worst_case_affected(txn, MAX_BY_QUERY_ROWS)
 }
 
 pub async fn execute_txn(
