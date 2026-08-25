@@ -140,10 +140,10 @@ async fn distinct_requires_an_index_field_beyond_eq_prefix() {
 
 #[tokio::test]
 async fn distinct_rejects_conflicting_terminals() {
-    // Ownership mirrors the server's check order (query.rs :676-706): get,
-    // unique, first, count are validated before distinct, so distinct+
-    // {get,unique,first,count} surfaces *that* terminal's message; distinct
-    // owns only take/order/aggregate.
+    // ENH-028: the table-driven evaluator's `terminal-exclusive` rule covers
+    // every pair among {aggregate,count,distinct,first,get,paginate,take,
+    // unique} with one generic message; only a pairing with `order` (not a
+    // member of that set) keeps its own specific message.
     let c = new_client();
     let base = || Query {
         table: "items".into(),
@@ -151,6 +151,7 @@ async fn distinct_rejects_conflicting_terminals() {
         eq: vec![json!("todo")],
         ..Default::default()
     };
+    const TERMINAL_EXCLUSIVE: &str = "only one terminal may be set";
     let cases: &[(Query, &str)] = &[
         (
             Query {
@@ -158,7 +159,7 @@ async fn distinct_rejects_conflicting_terminals() {
                 take: Some(1),
                 ..base()
             },
-            "distinct cannot be combined with take",
+            TERMINAL_EXCLUSIVE,
         ),
         (
             Query {
@@ -177,7 +178,7 @@ async fn distinct_rejects_conflicting_terminals() {
                 }),
                 ..base()
             },
-            "distinct cannot be combined with aggregate",
+            TERMINAL_EXCLUSIVE,
         ),
         (
             Query {
@@ -185,7 +186,7 @@ async fn distinct_rejects_conflicting_terminals() {
                 unique: true,
                 ..base()
             },
-            "unique cannot be combined with take, order, distinct, or aggregate",
+            TERMINAL_EXCLUSIVE,
         ),
         (
             Query {
@@ -193,7 +194,7 @@ async fn distinct_rejects_conflicting_terminals() {
                 first: true,
                 ..base()
             },
-            "first cannot be combined with distinct",
+            TERMINAL_EXCLUSIVE,
         ),
         (
             Query {
@@ -201,7 +202,7 @@ async fn distinct_rejects_conflicting_terminals() {
                 count: true,
                 ..base()
             },
-            "count cannot be combined with distinct",
+            TERMINAL_EXCLUSIVE,
         ),
         (
             Query {
@@ -209,6 +210,9 @@ async fn distinct_rejects_conflicting_terminals() {
                 get: Some("x".into()),
                 ..base()
             },
+            // base() also sets `eq`, so `eq-excludes-get` (a forbid rule,
+            // checked before any atMostOne rule) fires ahead of the generic
+            // terminal-exclusive clique.
             "get cannot be combined with",
         ),
     ];
@@ -458,6 +462,11 @@ async fn aggregate_rejects_conflicting_terminals() {
         op: AggregateOp::Sum,
         group_by: false,
     };
+    // ENH-028: the table-driven evaluator's `terminal-exclusive` rule covers
+    // every pair among {aggregate,count,distinct,first,get,paginate,take,
+    // unique} with one generic message; only a pairing with `order` (not a
+    // member of that set) keeps its own specific message.
+    const TERMINAL_EXCLUSIVE: &str = "only one terminal may be set";
     let cases: &[(Query, &str)] = &[
         (
             Query {
@@ -465,7 +474,7 @@ async fn aggregate_rejects_conflicting_terminals() {
                 take: Some(1),
                 ..base()
             },
-            "aggregate cannot be combined with take",
+            TERMINAL_EXCLUSIVE,
         ),
         (
             Query {
@@ -481,7 +490,7 @@ async fn aggregate_rejects_conflicting_terminals() {
                 unique: true,
                 ..base()
             },
-            "unique cannot be combined with take, order, distinct, or aggregate",
+            TERMINAL_EXCLUSIVE,
         ),
         (
             Query {
@@ -489,7 +498,7 @@ async fn aggregate_rejects_conflicting_terminals() {
                 first: true,
                 ..base()
             },
-            "first cannot be combined with aggregate",
+            TERMINAL_EXCLUSIVE,
         ),
         (
             Query {
@@ -497,7 +506,7 @@ async fn aggregate_rejects_conflicting_terminals() {
                 count: true,
                 ..base()
             },
-            "count cannot be combined with aggregate",
+            TERMINAL_EXCLUSIVE,
         ),
         (
             Query {
@@ -505,7 +514,7 @@ async fn aggregate_rejects_conflicting_terminals() {
                 distinct: true,
                 ..base()
             },
-            "distinct cannot be combined with aggregate",
+            TERMINAL_EXCLUSIVE,
         ),
         (
             Query {
@@ -513,6 +522,9 @@ async fn aggregate_rejects_conflicting_terminals() {
                 get: Some("x".into()),
                 ..base()
             },
+            // base() also sets `eq`, so `eq-excludes-get` (a forbid rule,
+            // checked before any atMostOne rule) fires ahead of the generic
+            // terminal-exclusive clique.
             "get cannot be combined with",
         ),
     ];

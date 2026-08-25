@@ -679,7 +679,11 @@ async fn query_accepts_take_at_max_take() {
 }
 
 /// One assertion per conflicting-terminal guard at TS :919-939. Each case
-/// is BAD_REQUEST; the needle distinguishes which guard fired.
+/// is BAD_REQUEST; the needle distinguishes which guard fired. ENH-028: the
+/// table-driven evaluator's `terminal-exclusive` rule covers every pair
+/// among {aggregate,count,distinct,first,get,paginate,take,unique} with one
+/// generic message; only a pairing with `order` (not a member of that set)
+/// keeps its own specific message.
 #[tokio::test]
 async fn query_rejects_conflicting_terminals() {
     let c = new_client();
@@ -696,11 +700,12 @@ async fn query_rejects_conflicting_terminals() {
             ..Default::default()
         };
 
+    const TERMINAL_EXCLUSIVE: &str = "only one terminal may be set";
     let cases: &[(Query, &str)] = &[
         // unique + take
         (
             base_index_query(true, false, false, false, Some(1)),
-            "unique cannot be combined with take",
+            TERMINAL_EXCLUSIVE,
         ),
         // unique + order
         (
@@ -710,27 +715,27 @@ async fn query_rejects_conflicting_terminals() {
         // first + unique
         (
             base_index_query(true, true, false, false, None),
-            "first cannot be combined with unique",
+            TERMINAL_EXCLUSIVE,
         ),
         // first + take
         (
             base_index_query(false, true, false, false, Some(1)),
-            "first cannot be combined with take",
+            TERMINAL_EXCLUSIVE,
         ),
         // count + unique
         (
             base_index_query(true, false, true, false, None),
-            "count cannot be combined with unique",
+            TERMINAL_EXCLUSIVE,
         ),
         // count + take
         (
             base_index_query(false, false, true, false, Some(1)),
-            "count cannot be combined with take",
+            TERMINAL_EXCLUSIVE,
         ),
         // count + first
         (
             base_index_query(false, true, true, false, None),
-            "count cannot be combined with first",
+            TERMINAL_EXCLUSIVE,
         ),
         // count + order
         (

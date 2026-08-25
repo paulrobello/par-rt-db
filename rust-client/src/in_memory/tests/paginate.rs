@@ -275,13 +275,14 @@ async fn paginate_rejects_cursor_whose_created_at_is_not_a_number() {
 #[tokio::test]
 async fn paginate_rejects_combination_with_take_count_unique_or_first() {
     // Ports TS "rejects paginate combined with take or count" and extends
-    // to unique/first — the validation cascade Task 3 collapsed is now
-    // restored (TS :940-955).
+    // to unique/first. ENH-028: paginate/take/count/unique/first are all
+    // members of the table-driven evaluator's `terminal-exclusive` rule, so
+    // every pairing here now surfaces that rule's one generic message.
     let mut c = new_client();
     seed_items(&mut c, 3, &["todo"]).await;
     for (needle, q) in [
         (
-            "take",
+            "only one terminal may be set",
             Query {
                 table: "items".into(),
                 paginate: Some(Paginate {
@@ -293,7 +294,7 @@ async fn paginate_rejects_combination_with_take_count_unique_or_first() {
             },
         ),
         (
-            "count",
+            "only one terminal may be set",
             Query {
                 table: "items".into(),
                 paginate: Some(Paginate {
@@ -305,7 +306,7 @@ async fn paginate_rejects_combination_with_take_count_unique_or_first() {
             },
         ),
         (
-            "unique",
+            "only one terminal may be set",
             Query {
                 table: "items".into(),
                 paginate: Some(Paginate {
@@ -317,7 +318,7 @@ async fn paginate_rejects_combination_with_take_count_unique_or_first() {
             },
         ),
         (
-            "first",
+            "only one terminal may be set",
             Query {
                 table: "items".into(),
                 paginate: Some(Paginate {
