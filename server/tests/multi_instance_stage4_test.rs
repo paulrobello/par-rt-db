@@ -5,17 +5,35 @@
 //! full `AppState`s with distinct instance ids sharing one Postgres — the
 //! same shape `notify_test.rs` uses for Stage 2/3.
 
-use crate::common::{test_config, test_hot};
+use crate::common::{test_config, test_hot, unique_instance_id};
 use rtdb_server::AppState;
 use rtdb_server::auth::{Principal, PrincipalCtx};
 use rtdb_server::error::ErrorCode;
 use rtdb_server::txn::{Step, Transaction};
 use sqlx::PgPool;
 
+/// Forward timeout for this file's replicas. Short enough that the two
+/// failover tests reach `timeout → takeover` without waiting the 5s
+/// production default, long enough that a forward the owner WILL answer is
+/// not cut off first.
+///
+/// It was 300ms, which was under the owner's real execution time for the
+/// heavier forwarded writes in this file once the machine was busy. That
+/// misfires in a self-sustaining way: the origin gives up and retries, but
+/// the timed-out request still reaches the owner and still executes there, so
+/// every retry adds work to the owner that made the deadline unreachable in
+/// the first place. `forwarded_push_schema_reply_larger_than_notify_cap`
+/// (an 81-table DDL push) hit exactly that under concurrent-suite load and
+/// CONFLICTed for its whole retry deadline.
+const FORWARD_TIMEOUT_MS: u64 = 2_000;
+
+/// Deadline for this file's CONFLICT retry loops. Generous relative to
+/// [`FORWARD_TIMEOUT_MS`] so a loop that does pay one full timeout still has
+/// many attempts left to converge.
+const RETRY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A multi-instance `AppState` with distinct instance id and optional rate
-/// limits, sharing `pool` — one stand-in per replica process. The forward
-/// timeout is short (300ms) so the timeout→takeover failover path is
-/// exercisable within a test without waiting the 5s production default.
+/// limits, sharing `pool` — one stand-in per replica process.
 async fn replica(
     pool: &PgPool,
     instance_id: &str,
@@ -24,7 +42,7 @@ async fn replica(
 ) -> std::sync::Arc<AppState> {
     let mut cfg = test_config();
     cfg.multi_instance.enabled = true;
-    cfg.multi_instance.instance_id = Some(instance_id.to_string());
+    cfg.multi_instance.instance_id = Some(unique_instance_id(instance_id));
     cfg.limits.per_token_rpm = per_token_rpm;
     cfg.limits.per_db_rpm = per_db_rpm;
     // ARC-007: this helper's one rate-limiting test
@@ -34,7 +52,7 @@ async fn replica(
     // callers all pass 0/0 (rate limiting disabled), so this is a no-op for
     // them.
     cfg.limits.exact = true;
-    cfg.multi_instance.forward_timeout_ms = 300;
+    cfg.multi_instance.forward_timeout_ms = FORWARD_TIMEOUT_MS;
     AppState::new(pool.clone(), cfg, test_hot())
 }
 
@@ -59,15 +77,26 @@ fn insert_item(title: &str) -> Transaction {
 /// CONFLICT transiently — the peer's forward listener may still be
 /// connecting, or a just-dropped owner's lease may not be released yet — and
 /// the production contract is that the client retries into convergence.
-/// Every failed attempt executed nothing (the shadow CONFLICT backstop), so
-/// retrying cannot double-write.
+///
+/// This retry is safe only against a CONFLICT raised BEFORE the owner ran the
+/// write: the shadow's ownership backstop when no owner ever received it.
+/// It is NOT safe against the forward path's documented timeout ambiguity —
+/// per `docs/superpowers/specs/2026-08-22-multi-instance-stage4-design.md`
+/// ("the caller may see CONFLICT for a write that committed"), a reply lost or
+/// delayed past `forward_timeout_ms` drives the origin into a takeover that
+/// CONFLICTs while the owner has already committed. Retrying an unkeyed txn
+/// there mints a fresh server-side idempotency key and writes a second row, so
+/// the exactly-once assertions in this file depend on that ambiguity not
+/// firing: every replica must carry a process-unique instance id (see
+/// `common::unique_instance_id`) so no peer process can claim this origin's
+/// forward reply.
 async fn mutate_until_landed(
     state: &std::sync::Arc<AppState>,
     db: &str,
     txn: Transaction,
     principal: PrincipalCtx,
 ) -> anyhow::Result<rtdb_server::txn::TxnOutcome> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + RETRY_DEADLINE;
     loop {
         let result = state
             .realtime
@@ -237,7 +266,8 @@ async fn forward_timeout_conflicts_then_takes_over_when_lease_frees() -> anyhow:
         .await?;
     assert!(locked, "ghost session must take the advisory lock");
 
-    // Forward finds no owner (nobody owns the db), times out (300ms), the
+    // Forward finds no owner (nobody owns the db), times out after
+    // FORWARD_TIMEOUT_MS, the
     // takeover hits the ghost's lock, and the write surfaces CONFLICT.
     let err = b
         .realtime
@@ -407,7 +437,7 @@ async fn forwarded_push_schema_reply_larger_than_notify_cap() -> anyhow::Result<
 
     // Retry on CONFLICT the same way `mutate_until_landed` does — the peer's
     // forward listener may still be connecting.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + RETRY_DEADLINE;
     let pushed = loop {
         match b
             .realtime
@@ -662,14 +692,14 @@ async fn forward_concurrency_cap_rate_limits_excess_requests() -> anyhow::Result
     let pool = shared_pool().await;
     let mut cfg_a = test_config();
     cfg_a.multi_instance.enabled = true;
-    cfg_a.multi_instance.instance_id = Some("arc008-cap-a".to_string());
+    cfg_a.multi_instance.instance_id = Some(unique_instance_id("arc008-cap-a"));
     cfg_a.multi_instance.forward_timeout_ms = 2000;
     cfg_a.multi_instance.forward_concurrency = 1;
     let a = AppState::new(pool.clone(), cfg_a, test_hot());
 
     let mut cfg_b = test_config();
     cfg_b.multi_instance.enabled = true;
-    cfg_b.multi_instance.instance_id = Some("arc008-cap-b".to_string());
+    cfg_b.multi_instance.instance_id = Some(unique_instance_id("arc008-cap-b"));
     cfg_b.multi_instance.forward_timeout_ms = 2000;
     let b = AppState::new(pool.clone(), cfg_b, test_hot());
 

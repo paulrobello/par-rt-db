@@ -13,7 +13,7 @@
 //! a short beat timeout, proving the "killing A evicts A's members within the
 //! beat timeout" contract without waiting out a real 15s timeout.
 
-use crate::common::{spawn_app, test_config, test_hot, wait_until};
+use crate::common::{spawn_app, test_config, test_hot, unique_instance_id, wait_until};
 use rtdb_server::AppState;
 use rtdb_server::presence::{PresenceConfig, PresenceManager};
 use rtdb_server::protocol::{AuthedUser, PresenceMember, ServerMessage, UserKind};
@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 async fn multi_instance_state(pool: sqlx::PgPool, instance_id: &str) -> std::sync::Arc<AppState> {
     let mut cfg = test_config();
     cfg.multi_instance.enabled = true;
-    cfg.multi_instance.instance_id = Some(instance_id.to_string());
+    cfg.multi_instance.instance_id = Some(unique_instance_id(instance_id));
     cfg.presence_enabled = true;
     // Use a non-zero broadcast interval so the flush task is spawned normally
     // (matches real multi-instance deploy). Tests drive `flush_once` directly
@@ -48,7 +48,7 @@ fn user(email: &str) -> AuthedUser {
 /// ENH-022 Stage 3: a `join` on replica A is visible to a subscriber on
 /// replica B via Postgres LISTEN/NOTIFY gossip. Replica B's union broadcast
 /// contains BOTH its own local member AND the peer member from A, with A's
-/// member namespaced as `"replica-a:<conn>"` so the two replicas' per-process
+/// member namespaced as `"<a's instance id>:<conn>"` so the two replicas' per-process
 /// ConnIds cannot collide. This is the load-bearing wire-visible difference in
 /// multi-instance mode and the whole point of the gossip layer.
 #[tokio::test]
@@ -63,6 +63,11 @@ async fn cross_replica_presence_union_includes_namespaced_peer_member() -> anyho
 
     let state_a = multi_instance_state(pool.clone(), "replica-a").await;
     let state_b = multi_instance_state(pool.clone(), "replica-b").await;
+    // A's members arrive on B namespaced by A's instance id. That id is now
+    // process-unique, so build the expected conn id from the same helper
+    // rather than the bare label (`unique_instance_id` is stable per process,
+    // so this is the very string `state_a` was constructed with).
+    let peer_conn_id = format!("{}:1", unique_instance_id("replica-a"));
     let _addr_a = spawn_app(state_a.clone()).await;
     let _addr_b = spawn_app(state_b.clone()).await;
 
@@ -107,7 +112,7 @@ async fn cross_replica_presence_union_includes_namespaced_peer_member() -> anyho
     let got_peer = wait_until(std::time::Duration::from_secs(5), || async {
         state_b.realtime.presence.flush_once().await;
         if let Ok(ServerMessage::PresenceSnapshot { members, .. }) = rx_b.borrow_mut().try_recv()
-            && members.iter().any(|m| m.connection_id == "replica-a:1")
+            && members.iter().any(|m| m.connection_id == peer_conn_id)
         {
             *found.borrow_mut() = Some(members);
             true
@@ -123,9 +128,9 @@ async fn cross_replica_presence_union_includes_namespaced_peer_member() -> anyho
     );
     let members = found.borrow_mut().take().expect("checked above");
     // Assert the union shape: local member "1" (B's own, plain conn id) AND
-    // the namespaced peer member "replica-a:1".
+    // the namespaced peer member `peer_conn_id` (A's instance id + ":1").
     let local = members.iter().find(|m| m.connection_id == "1");
-    let peer = members.iter().find(|m| m.connection_id == "replica-a:1");
+    let peer = members.iter().find(|m| m.connection_id == peer_conn_id);
     assert!(
         local.is_some(),
         "union must contain B's own local member with plain conn id"

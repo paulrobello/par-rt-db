@@ -8,7 +8,9 @@
 //! op-feed ring. The self-dedupe contract (instance-id tag) keeps A from
 //! double-publishing its own writes into its own ring.
 
-use crate::common::{admin_get, admin_post, spawn_app, test_config, test_hot, wait_until};
+use crate::common::{
+    admin_get, admin_post, spawn_app, test_config, test_hot, unique_instance_id, wait_until,
+};
 use rtdb_server::AppState;
 use serde_json::json;
 
@@ -16,7 +18,7 @@ use serde_json::json;
 async fn multi_instance_state(pool: sqlx::PgPool, instance_id: &str) -> std::sync::Arc<AppState> {
     let mut cfg = test_config();
     cfg.multi_instance.enabled = true;
-    cfg.multi_instance.instance_id = Some(instance_id.to_string());
+    cfg.multi_instance.instance_id = Some(unique_instance_id(instance_id));
     AppState::new(pool, cfg, test_hot())
 }
 
@@ -30,7 +32,7 @@ async fn multi_instance_state_with_cap(
 ) -> std::sync::Arc<AppState> {
     let mut cfg = test_config();
     cfg.multi_instance.enabled = true;
-    cfg.multi_instance.instance_id = Some(instance_id.to_string());
+    cfg.multi_instance.instance_id = Some(unique_instance_id(instance_id));
     cfg.max_affected_docs = max_affected_docs;
     AppState::new(pool, cfg, test_hot())
 }
