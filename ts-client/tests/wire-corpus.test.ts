@@ -22,6 +22,7 @@ import { describe, expect, it } from "vitest";
 
 import { ALL_ERROR_CODES } from "../src/errors.js";
 import { MAX_STEPS } from "../src/in_memory/index.js";
+import { QUERY_COMBO_CLAUSES, QUERY_COMBO_RULES } from "../src/in_memory/query-combinations.js";
 import type {
   AuthedUser,
   AuthedUserKind,
@@ -492,5 +493,43 @@ describe("wire-corpus: error codes match the server (ARC-017)", () => {
       .sort();
     const clientCodes = [...ALL_ERROR_CODES].sort();
     expect(clientCodes).toStrictEqual(corpusCodes);
+  });
+});
+
+/**
+ * ENH-028 phase 2: `query-combinations.ts` is a hand-mirrored copy of
+ * `wire-corpus/query-combinations.json` (see that file's header comment for
+ * why it isn't a direct JSON import — the package build's `rootDir` can't
+ * reach outside `ts-client/`). This test is the drift guard: it asserts the
+ * embedded TS table matches the JSON source exactly, byte-for-byte in
+ * content and order (the generic evaluator in `in_memory/query.ts` applies
+ * rules in declared order and returns the first match).
+ */
+describe("wire-corpus: query-combinations table matches query.ts's mirror (ENH-028)", () => {
+  interface QueryCombinationsCorpus {
+    clauses: string[];
+    rules: Array<{
+      id: string;
+      forbid?: string[];
+      atMostOne?: string[];
+      code: string;
+      message: string;
+    }>;
+  }
+
+  const QUERY_COMBINATIONS_PATH = resolve(__dirname, "../../wire-corpus/query-combinations.json");
+
+  function loadQueryCombinationsCorpus(): QueryCombinationsCorpus {
+    return JSON.parse(readFileSync(QUERY_COMBINATIONS_PATH, "utf8")) as QueryCombinationsCorpus;
+  }
+
+  it("clauses match, in order", () => {
+    const corpus = loadQueryCombinationsCorpus();
+    expect(QUERY_COMBO_CLAUSES).toStrictEqual(corpus.clauses);
+  });
+
+  it("rules match, in order", () => {
+    const corpus = loadQueryCombinationsCorpus();
+    expect(QUERY_COMBO_RULES).toStrictEqual(corpus.rules);
   });
 });

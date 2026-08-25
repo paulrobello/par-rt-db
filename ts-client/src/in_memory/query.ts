@@ -27,6 +27,7 @@ import type {
   QueryJson,
   TableJson,
 } from "../protocol.js";
+import { type QueryComboClause, QUERY_COMBO_RULES } from "./query-combinations.js";
 import type { StoredRow } from "./store.js";
 import {
   coerceIndexValue,
@@ -420,129 +421,60 @@ function executeUnprojected(
   return executeCollectTerminal(q, filtered);
 }
 
-/** Conflicting-terminal guards, in the server's validation order: each
- *  terminal rejects the peers it cannot compose with, then the range-bound and
- *  take-cap checks apply to every remaining shape. */
+/** Clauses of `q` present per `wire-corpus/query-combinations.json`'s
+ *  canonical clause names (`get`/`index`/`eq`/range bounds/... — see
+ *  `./query-combinations.js`). `eq`/`filter` are presence-of-array/object
+ *  checks; the boolean terminals (`unique`/`first`/`count`/`distinct`) key
+ *  off truthiness like the rest of this engine; everything else is
+ *  presence (`!== undefined`). */
+function presentQueryCombos(q: QueryJson): Set<QueryComboClause> {
+  const present = new Set<QueryComboClause>();
+  if (q.get !== undefined) present.add("get");
+  if (q.index !== undefined) present.add("index");
+  if ((q.eq?.length ?? 0) > 0) present.add("eq");
+  if (q.gt !== undefined) present.add("gt");
+  if (q.gte !== undefined) present.add("gte");
+  if (q.lt !== undefined) present.add("lt");
+  if (q.lte !== undefined) present.add("lte");
+  if (q.order !== undefined) present.add("order");
+  if (q.take !== undefined) present.add("take");
+  if (q.unique) present.add("unique");
+  if (q.first) present.add("first");
+  if (q.count) present.add("count");
+  if (q.distinct) present.add("distinct");
+  if (q.aggregate !== undefined) present.add("aggregate");
+  if (q.paginate !== undefined) present.add("paginate");
+  if (q.filter !== undefined) present.add("filter");
+  if (q.search !== undefined) present.add("search");
+  if (q.vectorSearch !== undefined) present.add("vectorSearch");
+  if (q.hybridSearch !== undefined) present.add("hybridSearch");
+  return present;
+}
+
+/** Generic table-driven evaluator (ENH-028 phase 2): applies
+ *  `QUERY_COMBO_RULES` in declaration order and throws on the first rule a
+ *  query violates — `forbid` rejects a query with every listed clause
+ *  present, `atMostOne` rejects a query with more than one listed clause
+ *  present. Replaces the previous hand-written per-clause `if` ladder;
+ *  behavior (error codes) is unchanged, verified by the `query-combo-*`
+ *  wire-corpus cases. */
 function checkQueryCombinations(q: QueryJson): void {
-  if (
-    q.unique &&
-    (q.take !== undefined || q.order !== undefined || q.distinct || q.aggregate !== undefined)
-  ) {
-    throw new RtDbError(
-      "BAD_REQUEST",
-      "unique cannot be combined with take, order, distinct, or aggregate",
-    );
-  }
-  if (q.first && q.unique) {
-    throw new RtDbError("BAD_REQUEST", "first cannot be combined with unique");
-  }
-  if (q.first && q.take !== undefined) {
-    throw new RtDbError("BAD_REQUEST", "first cannot be combined with take");
-  }
-  if (q.first && q.distinct) {
-    throw new RtDbError("BAD_REQUEST", "first cannot be combined with distinct");
-  }
-  if (q.first && q.aggregate !== undefined) {
-    throw new RtDbError("BAD_REQUEST", "first cannot be combined with aggregate");
-  }
-  if (q.count && q.unique) {
-    throw new RtDbError("BAD_REQUEST", "count cannot be combined with unique");
-  }
-  if (q.count && q.take !== undefined) {
-    throw new RtDbError("BAD_REQUEST", "count cannot be combined with take");
-  }
-  if (q.count && q.first) {
-    throw new RtDbError("BAD_REQUEST", "count cannot be combined with first");
-  }
-  if (q.count && q.order !== undefined) {
-    throw new RtDbError("BAD_REQUEST", "count cannot be combined with order");
-  }
-  if (q.count && q.distinct) {
-    throw new RtDbError("BAD_REQUEST", "count cannot be combined with distinct");
-  }
-  if (q.count && q.aggregate !== undefined) {
-    throw new RtDbError("BAD_REQUEST", "count cannot be combined with aggregate");
-  }
-  // `distinct` is a standalone terminal like `count`: it rejects every other
-  // terminal except `index`/`eq`/range bounds/`filter` (which compose by
-  // narrowing the matching set). The `get`/`unique`/`first`/`count` peers
-  // above already throw on `+distinct`; this branch covers the rest.
-  if (q.distinct) {
-    if (q.take !== undefined) {
-      throw new RtDbError("BAD_REQUEST", "distinct cannot be combined with take");
-    }
-    if (q.order !== undefined) {
-      throw new RtDbError("BAD_REQUEST", "distinct cannot be combined with order");
-    }
-    if (q.paginate !== undefined) {
-      throw new RtDbError("BAD_REQUEST", "distinct cannot be combined with paginate");
-    }
-    if (q.search !== undefined) {
-      throw new RtDbError("BAD_REQUEST", "distinct cannot be combined with search");
-    }
-    if (q.vectorSearch !== undefined) {
-      throw new RtDbError("BAD_REQUEST", "distinct cannot be combined with vector search");
-    }
-    if (q.hybridSearch !== undefined) {
-      throw new RtDbError("BAD_REQUEST", "distinct cannot be combined with hybrid search");
-    }
-    if (q.aggregate !== undefined) {
-      throw new RtDbError("BAD_REQUEST", "distinct cannot be combined with aggregate");
+  const present = presentQueryCombos(q);
+  for (const rule of QUERY_COMBO_RULES) {
+    if (rule.forbid) {
+      if (rule.forbid.every((clause) => present.has(clause))) {
+        throw new RtDbError(rule.code, rule.message);
+      }
+    } else if (rule.atMostOne) {
+      const count = rule.atMostOne.reduce((n, clause) => n + (present.has(clause) ? 1 : 0), 0);
+      if (count > 1) {
+        throw new RtDbError(rule.code, rule.message);
+      }
     }
   }
-  // `aggregate` is a standalone terminal like `distinct`: it rejects every
-  // other terminal except `index`/`eq`/range bounds/`filter`. The
-  // `get`/`unique`/`first`/`count`/`distinct` peers above already throw on
-  // `+aggregate`; this branch covers the rest.
-  if (q.aggregate !== undefined) {
-    if (q.take !== undefined) {
-      throw new RtDbError("BAD_REQUEST", "aggregate cannot be combined with take");
-    }
-    if (q.order !== undefined) {
-      throw new RtDbError("BAD_REQUEST", "aggregate cannot be combined with order");
-    }
-    if (q.paginate !== undefined) {
-      throw new RtDbError("BAD_REQUEST", "aggregate cannot be combined with paginate");
-    }
-    if (q.search !== undefined) {
-      throw new RtDbError("BAD_REQUEST", "aggregate cannot be combined with search");
-    }
-    if (q.vectorSearch !== undefined) {
-      throw new RtDbError("BAD_REQUEST", "aggregate cannot be combined with vector search");
-    }
-    if (q.hybridSearch !== undefined) {
-      throw new RtDbError("BAD_REQUEST", "aggregate cannot be combined with hybrid search");
-    }
-  }
-  if (q.paginate !== undefined) {
-    // Combination guards mirror server `validate_query`: paginate is one-shot
-    // paging, so it can't also narrow to count/unique/first/take. (`get` is
-    // rejected above; `order`, index, eq, and range bounds are allowed.)
-    if (q.count) {
-      throw new RtDbError("BAD_REQUEST", "paginate cannot be combined with count");
-    }
-    if (q.distinct) {
-      throw new RtDbError("BAD_REQUEST", "paginate cannot be combined with distinct");
-    }
-    if (q.aggregate !== undefined) {
-      throw new RtDbError("BAD_REQUEST", "paginate cannot be combined with aggregate");
-    }
-    if (q.unique) {
-      throw new RtDbError("BAD_REQUEST", "paginate cannot be combined with unique");
-    }
-    if (q.first) {
-      throw new RtDbError("BAD_REQUEST", "paginate cannot be combined with first");
-    }
-    if (q.take !== undefined) {
-      throw new RtDbError("BAD_REQUEST", "paginate cannot be combined with take");
-    }
-  }
-  if (q.gt !== undefined && q.gte !== undefined) {
-    throw new RtDbError("BAD_REQUEST", "gt and gte cannot both be set");
-  }
-  if (q.lt !== undefined && q.lte !== undefined) {
-    throw new RtDbError("BAD_REQUEST", "lt and lte cannot both be set");
-  }
+  // Value-cap check, not a clause-combination rule, so it lives outside the
+  // `query-combinations.json` table (which only encodes presence/absence
+  // shapes, not thresholds on a present value).
   if (q.take !== undefined && q.take > MAX_TAKE) {
     throw new RtDbError("BAD_REQUEST", `take exceeds maximum of ${MAX_TAKE}`);
   }
