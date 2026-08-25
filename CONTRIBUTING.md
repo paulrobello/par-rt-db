@@ -172,6 +172,28 @@ uses, so always pass `--db` something other than the app's real database
 name — `ensureBenchDb` creates and reuses an isolated database and never
 touches existing ones, but only if you don't point it at one by name.
 
+**Reset the bench database before every run you want comparable to another,
+not just once before a series.** `ensureBenchDb` is deliberately additive —
+it reuses an existing `--db` rather than recreating it — so scenario (a)'s
+and (d)'s writes accumulate across repeated runs against the same database.
+A 2026-08-25 baseline capture (3 runs, database reset only once up front)
+measured this directly: scenario (d)'s turn-hold-time drifted 3.4s → 3.2s →
+5.5s and the subscription rerun count climbed 995 → 1255 → 1515 across the
+three runs, purely from table growth, not from anything changing in the
+server. Before each individual run, delete and let the script recreate the
+database:
+
+```bash
+curl -s -X POST http://127.0.0.1:8300/admin/delete-db \
+  -H "Authorization: Bearer $RTDB_ADMIN_KEY" -H 'Content-Type: application/json' \
+  -d '{"name":"bench","confirm":"bench"}'
+```
+
+Skipping this reset is fine for a single one-off run, but never treat
+multiple runs sharing one un-reset database as independent trials — average
+or take the median across them only after confirming each started from the
+same state, or the trend you're measuring is table growth, not code.
+
 After either kind of run, compare the result against `bench/baseline.json`
 with `bun run scripts/bench/compare.ts bench/baseline.json
 bench/results/<sha>.json` — exits 1 on any metric regressing more than 15%
