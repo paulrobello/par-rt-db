@@ -13,7 +13,9 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from functools import cmp_to_key
+from functools import cache, cmp_to_key
+from importlib import resources
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..cursor import decode_cursor, encode_cursor
@@ -55,99 +57,99 @@ else:
 MAX_SEARCH_QUERY_BYTES = 4096
 
 
-def _check_query_combinations(q: Query) -> None:
-    """Conflicting-terminal guards, in the server's validation order: each
-    terminal rejects the peers it cannot compose with, then the range-bound and
-    take-cap checks apply to every remaining shape."""
-    unique = bool(q.unique)
-    first = bool(q.first)
-    count = bool(q.count)
+#: Package-relative location the wheel's ``force-include`` (see
+#: ``pyproject.toml``) copies ``wire-corpus/query-combinations.json`` to, so an
+#: installed package can load it via :mod:`importlib.resources` without a
+#: duplicated copy drifting from the canonical file.
+_RULE_TABLE_RESOURCE = "_data/query-combinations.json"
 
-    # Conflicting-terminal guards.
-    if unique and (
-        q.take is not None or q.order is not None or q.distinct or q.aggregate is not None
-    ):
-        raise RtDbError(
-            ErrorCode.BAD_REQUEST,
-            "unique cannot be combined with take, order, distinct, or aggregate",
-        )
-    if first and unique:
-        raise RtDbError(ErrorCode.BAD_REQUEST, "first cannot be combined with unique")
-    if first and q.take is not None:
-        raise RtDbError(ErrorCode.BAD_REQUEST, "first cannot be combined with take")
-    if first and q.distinct:
-        raise RtDbError(ErrorCode.BAD_REQUEST, "first cannot be combined with distinct")
-    if first and q.aggregate is not None:
-        raise RtDbError(ErrorCode.BAD_REQUEST, "first cannot be combined with aggregate")
-    if count and unique:
-        raise RtDbError(ErrorCode.BAD_REQUEST, "count cannot be combined with unique")
-    if count and q.take is not None:
-        raise RtDbError(ErrorCode.BAD_REQUEST, "count cannot be combined with take")
-    if count and first:
-        raise RtDbError(ErrorCode.BAD_REQUEST, "count cannot be combined with first")
-    if count and q.order is not None:
-        raise RtDbError(ErrorCode.BAD_REQUEST, "count cannot be combined with order")
-    if count and q.distinct:
-        raise RtDbError(ErrorCode.BAD_REQUEST, "count cannot be combined with distinct")
-    if count and q.aggregate is not None:
-        raise RtDbError(ErrorCode.BAD_REQUEST, "count cannot be combined with aggregate")
-    if q.paginate is not None:
-        if count:
-            raise RtDbError(ErrorCode.BAD_REQUEST, "paginate cannot be combined with count")
-        if unique:
-            raise RtDbError(ErrorCode.BAD_REQUEST, "paginate cannot be combined with unique")
-        if first:
-            raise RtDbError(ErrorCode.BAD_REQUEST, "paginate cannot be combined with first")
-        if q.take is not None:
-            raise RtDbError(ErrorCode.BAD_REQUEST, "paginate cannot be combined with take")
-        if q.distinct:
-            raise RtDbError(ErrorCode.BAD_REQUEST, "paginate cannot be combined with distinct")
-        if q.aggregate is not None:
-            raise RtDbError(ErrorCode.BAD_REQUEST, "paginate cannot be combined with aggregate")
-    if q.gt is not None and q.gte is not None:
-        raise RtDbError(ErrorCode.BAD_REQUEST, "gt and gte cannot both be set")
-    if q.lt is not None and q.lte is not None:
-        raise RtDbError(ErrorCode.BAD_REQUEST, "lt and lte cannot both be set")
+
+@cache
+def _load_combination_rules() -> list[dict[str, Any]]:
+    """Load ``wire-corpus/query-combinations.json``'s ``rules`` array (ENH-028):
+    the clause-combination table shared by the server and all four client
+    in-memory engines. Preserves array order — :func:`_evaluate_combinations`
+    returns the first matching rule, and rule order is significant where two
+    rules could both fire (e.g. a query hitting both the ``terminal-exclusive``
+    clique and a more specific pairwise rule).
+
+    Tries the package data copy first (installed wheel; see
+    ``_RULE_TABLE_RESOURCE``), falling back to the monorepo-relative path
+    (editable/dev install, where the wheel's ``force-include`` never ran)."""
+    try:
+        text = resources.files("par_rt_db").joinpath(_RULE_TABLE_RESOURCE).read_text()
+    except FileNotFoundError:
+        repo_root = Path(__file__).resolve().parents[4]
+        text = (repo_root / "wire-corpus" / "query-combinations.json").read_text()
+    table: dict[str, Any] = json.loads(text)
+    rules: list[dict[str, Any]] = table["rules"]
+    return rules
+
+
+def _query_clauses(q: Query) -> set[str]:
+    """The set of clause names (matching ``wire-corpus/query-combinations.json``'s
+    ``clauses``) present on ``q``, for :func:`_evaluate_combinations`. ``get`` is
+    always absent here — :meth:`_QueryEngine.run_query` dispatches ``get``
+    queries through :meth:`_QueryEngine._execute_get_terminal` before
+    :func:`_check_query_combinations` ever runs — but is still derived
+    generically rather than hardcoded out, so the mapping stays a faithful
+    mirror of the table's clause list."""
+    clauses = {
+        "index": q.index is not None,
+        "eq": bool(q.eq),
+        "gt": q.gt is not None,
+        "gte": q.gte is not None,
+        "lt": q.lt is not None,
+        "lte": q.lte is not None,
+        "order": q.order is not None,
+        "take": q.take is not None,
+        "unique": bool(q.unique),
+        "first": bool(q.first),
+        "count": bool(q.count),
+        "distinct": bool(q.distinct),
+        "aggregate": q.aggregate is not None,
+        "paginate": q.paginate is not None,
+        "filter": q.filter is not None,
+        "search": q.search is not None,
+        "vectorSearch": q.vector_search is not None,
+        "hybridSearch": q.hybrid_search is not None,
+        "get": q.get is not None,
+    }
+    return {name for name, present in clauses.items() if present}
+
+
+def _evaluate_combinations(present: set[str]) -> dict[str, Any] | None:
+    """Apply ``wire-corpus/query-combinations.json``'s rules, in table order,
+    against a query's present-clause set: a ``forbid`` rule fails when every
+    one of its clauses is present; an ``atMostOne`` rule fails when more than
+    one of its clauses is present. Returns the first failing rule (its
+    ``code``/``message`` are what the caller raises), or ``None`` when every
+    rule passes."""
+    for rule in _load_combination_rules():
+        forbid = rule.get("forbid")
+        if forbid is not None:
+            if all(name in present for name in forbid):
+                return rule
+            continue
+        at_most_one = rule.get("atMostOne")
+        if at_most_one is not None and sum(1 for name in at_most_one if name in present) > 1:
+            return rule
+    return None
+
+
+def _check_query_combinations(q: Query) -> None:
+    """Conflicting-terminal guards: the table-driven evaluator
+    (:func:`_evaluate_combinations` over ``wire-corpus/query-combinations.json``,
+    ENH-028 — includes the ``gt``/``gte`` and ``lt``/``lte`` mutual-exclusion
+    rules) rejects any clause combination the table forbids, then the
+    take-cap check — not a combination rule, so not part of the shared table —
+    applies to every remaining shape."""
+    rule = _evaluate_combinations(_query_clauses(q))
+    if rule is not None:
+        raise RtDbError(ErrorCode(rule["code"]), rule["message"])
+
     if q.take is not None and q.take > MAX_TAKE:
         raise RtDbError(ErrorCode.BAD_REQUEST, f"take exceeds maximum of {MAX_TAKE}")
-
-    # `distinct`/`aggregate` are standalone terminals (like `count`): they
-    # compose only with index/eq/range/filter. `get`/`unique`/`first`/`count`
-    # rejected their own combinations above (validated first, matching the
-    # server's check order), so these blocks reject the remaining peers each
-    # terminal owns — mirroring the server's DISTINCT/AGGREGATE_INCOMPATIBLES.
-    if q.distinct:
-        if q.take is not None:
-            raise RtDbError(ErrorCode.BAD_REQUEST, "distinct cannot be combined with take")
-        if q.order is not None:
-            raise RtDbError(ErrorCode.BAD_REQUEST, "distinct cannot be combined with order")
-        if q.aggregate is not None:
-            raise RtDbError(ErrorCode.BAD_REQUEST, "distinct cannot be combined with aggregate")
-        if q.paginate is not None:
-            raise RtDbError(ErrorCode.BAD_REQUEST, "distinct cannot be combined with paginate")
-        if q.search is not None:
-            raise RtDbError(ErrorCode.BAD_REQUEST, "distinct cannot be combined with search")
-        if q.vector_search is not None:
-            raise RtDbError(ErrorCode.BAD_REQUEST, "distinct cannot be combined with vector search")
-        if q.hybrid_search is not None:
-            raise RtDbError(ErrorCode.BAD_REQUEST, "distinct cannot be combined with hybrid search")
-    if q.aggregate is not None:
-        if q.take is not None:
-            raise RtDbError(ErrorCode.BAD_REQUEST, "aggregate cannot be combined with take")
-        if q.order is not None:
-            raise RtDbError(ErrorCode.BAD_REQUEST, "aggregate cannot be combined with order")
-        if q.paginate is not None:
-            raise RtDbError(ErrorCode.BAD_REQUEST, "aggregate cannot be combined with paginate")
-        if q.search is not None:
-            raise RtDbError(ErrorCode.BAD_REQUEST, "aggregate cannot be combined with search")
-        if q.vector_search is not None:
-            raise RtDbError(
-                ErrorCode.BAD_REQUEST, "aggregate cannot be combined with vector search"
-            )
-        if q.hybrid_search is not None:
-            raise RtDbError(
-                ErrorCode.BAD_REQUEST, "aggregate cannot be combined with hybrid search"
-            )
 
 
 #: The always-included system fields a ``fields`` projection may name

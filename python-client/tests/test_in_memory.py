@@ -1447,9 +1447,13 @@ def test_distinct_requires_an_index_field_beyond_eq_prefix() -> None:
 
 
 def test_distinct_rejects_conflicting_terminals() -> None:
-    # Ownership mirrors the server's check order: get/unique/first/count are
-    # validated before distinct, so distinct+{get,unique,first,count} surfaces
-    # that terminal's message; distinct owns take/order/aggregate.
+    # Messages come from the shared table-driven evaluator (ENH-028,
+    # wire-corpus/query-combinations.json): distinct+{aggregate,unique,first,
+    # count} all hit the "terminal-exclusive" atMostOne clique (generic
+    # message, rule order wins over any more specific pairwise rule);
+    # distinct+order keeps its own pairwise rule's specific message;
+    # distinct+get never reaches the evaluator — `get` dispatches through its
+    # own terminal executor before `_check_query_combinations` runs.
     c = _new_client()
 
     def base(**kw: Any) -> Query:
@@ -1457,15 +1461,12 @@ def test_distinct_rejects_conflicting_terminals() -> None:
 
     sum_spec = AggregateSpec(op="sum")
     cases: list[tuple[Query, str]] = [
-        (base(distinct=True, take=1), "distinct cannot be combined with take"),
+        (base(distinct=True, take=1), "only one terminal may be set"),
         (base(distinct=True, order="asc"), "distinct cannot be combined with order"),
-        (base(distinct=True, aggregate=sum_spec), "distinct cannot be combined with aggregate"),
-        (
-            base(distinct=True, unique=True),
-            "unique cannot be combined with take, order, distinct, or aggregate",
-        ),
-        (base(distinct=True, first=True), "first cannot be combined with distinct"),
-        (base(distinct=True, count=True), "count cannot be combined with distinct"),
+        (base(distinct=True, aggregate=sum_spec), "only one terminal may be set"),
+        (base(distinct=True, unique=True), "only one terminal may be set"),
+        (base(distinct=True, first=True), "only one terminal may be set"),
+        (base(distinct=True, count=True), "only one terminal may be set"),
         (base(distinct=True, get="x"), "get cannot be combined with"),
     ]
     for q, needle in cases:
@@ -1622,6 +1623,9 @@ def test_aggregate_requires_an_index_field_beyond_eq_prefix() -> None:
 
 
 def test_aggregate_rejects_conflicting_terminals() -> None:
+    # Messages come from the shared table-driven evaluator (ENH-028,
+    # wire-corpus/query-combinations.json) — see test_distinct_rejects_
+    # conflicting_terminals's comment for the same clique/pairwise/get split.
     c = _new_client()
 
     def base(**kw: Any) -> Query:
@@ -1629,15 +1633,12 @@ def test_aggregate_rejects_conflicting_terminals() -> None:
 
     sum_spec = AggregateSpec(op="sum")
     cases: list[tuple[Query, str]] = [
-        (base(aggregate=sum_spec, take=1), "aggregate cannot be combined with take"),
+        (base(aggregate=sum_spec, take=1), "only one terminal may be set"),
         (base(aggregate=sum_spec, order="asc"), "aggregate cannot be combined with order"),
-        (
-            base(aggregate=sum_spec, unique=True),
-            "unique cannot be combined with take, order, distinct, or aggregate",
-        ),
-        (base(aggregate=sum_spec, first=True), "first cannot be combined with aggregate"),
-        (base(aggregate=sum_spec, count=True), "count cannot be combined with aggregate"),
-        (base(aggregate=sum_spec, distinct=True), "distinct cannot be combined with aggregate"),
+        (base(aggregate=sum_spec, unique=True), "only one terminal may be set"),
+        (base(aggregate=sum_spec, first=True), "only one terminal may be set"),
+        (base(aggregate=sum_spec, count=True), "only one terminal may be set"),
+        (base(aggregate=sum_spec, distinct=True), "only one terminal may be set"),
         (base(aggregate=sum_spec, get="x"), "get cannot be combined with"),
     ]
     for q, needle in cases:
