@@ -37,7 +37,7 @@ ts-client-build:
 # Remove generated build output while preserving installed dependencies.
 clean:
 	cargo clean
-	rm -rf ts-client/dist dashboard/dist dashboard/.next dashboard/node_modules/.cache swift-client/.build
+	rm -rf ts-client/dist dashboard/dist dashboard/node_modules/.cache swift-client/.build
 build: ts-client-build
 	cd core && cargo build
 	cd server && cargo build
