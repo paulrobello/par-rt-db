@@ -17,7 +17,7 @@ SWIFT_OS := $(shell uname -s)
 SWIFT_SKIP := @echo "Skipping swift-client (non-Darwin host)"
 SWIFT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(1),$(SWIFT_SKIP))
 
-.PHONY: build test lint fmt fmt-check typecheck checkall dev-db-up dev-db-down dev-db-clean \
+.PHONY: clean build test lint fmt fmt-check typecheck checkall dev-db-up dev-db-down dev-db-clean \
 	pre-commit pre-commit-update ts-client-build ts-client-install dashboard-install \
 	dashboard-test \
 	python-client-install python-client-test python-client-lint python-client-fmt \
@@ -27,12 +27,17 @@ SWIFT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(1),$(SW
 	swift-client-fmt-check swift-client-typecheck swift-client-checkall \
 	bench-micro bench bench-baseline
 
+
 # The dashboard's typecheck/build resolve `@par-rt-db/client` from ts-client's
 # gitignored `dist/` (workspace link + exports.types). Build it first so the
 # gate never fails on a fresh or stale checkout.
 ts-client-build:
 	cd ts-client && bun run build
 
+# Remove generated build output while preserving installed dependencies.
+clean:
+	cargo clean
+	rm -rf ts-client/dist dashboard/dist dashboard/.next dashboard/node_modules/.cache swift-client/.build
 build: ts-client-build
 	cd core && cargo build
 	cd server && cargo build
