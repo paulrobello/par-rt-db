@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use futures::StreamExt;
 use serde::Serialize;
 use sqlx::PgPool;
 use tokio::sync::Mutex;
@@ -29,6 +30,14 @@ use crate::schema::{FieldType, IndexDef, SchemaDef, TableDef, TableDefExt};
 use crate::txn::{DocValues, EqBind, WriteSet, eq_bind_for, eq_binds};
 
 pub type ConnId = u64;
+
+/// Bound on concurrent subscription re-runs within one `fan_out` call
+/// (ENH-034 / ARC-006). Each re-run is a Postgres round-trip against the
+/// shared pool, so this caps how many connections one bulk write's fan-out
+/// can hold at once — sized well under `RTDB_POOL_MAX_CONNECTIONS`' default
+/// (75), which already budgets for "one committer task + N sub re-runs per
+/// db" (`config/mod.rs`).
+const FAN_OUT_CONCURRENCY: usize = 16;
 
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1124,7 +1133,12 @@ impl SubscriptionManager {
         };
         let mut db_subs = shard.lock().await;
 
-        for ((_, query_id), entry) in db_subs.iter_mut() {
+        // ENH-034: decide pass. Classify every matching subscription exactly as
+        // before (`decide` is unchanged), but only collect what a concurrent
+        // re-run needs — the mutable `entry` borrow doesn't need to span the
+        // `.await`s below, so it doesn't have to.
+        let mut pending = Vec::new();
+        for (key, entry) in db_subs.iter() {
             if !write_set.tables.contains(&entry.query.table) {
                 continue;
             }
@@ -1152,8 +1166,29 @@ impl SubscriptionManager {
                     Some(class)
                 }
             };
+            pending.push((
+                key.clone(),
+                entry.query.clone(),
+                entry.principal_ctx.clone(),
+                verifying,
+            ));
+        }
 
-            let result = {
+        // ENH-034 / ARC-006: execute pass. Each re-run is an independent,
+        // read-only Postgres round-trip, so run them concurrently instead of
+        // one at a time — this is what was holding the single serialized
+        // committer turn open for the full sum of every subscriber's re-run
+        // latency (measured: ~3.4s median with 100 subscribers on a bulk
+        // delete). Bounded via `FAN_OUT_CONCURRENCY` so a bulk write with many
+        // subscribers doesn't open one connection per subscription against the
+        // shared pool — `RTDB_POOL_MAX_CONNECTIONS`' default sizing already
+        // accounts for "one committer task + N sub re-runs per db"
+        // (`config/mod.rs`). `db_subs` stays locked and untouched across this
+        // pass (no other task can observe or mutate it), so the apply pass
+        // below always finds each entry.
+        let results: Vec<_> = futures::stream::iter(pending)
+            .map(|(key, query, principal_ctx, verifying)| {
+                let query_id = key.1.as_str();
                 // ENH-018: one span per subscription re-run so an expensive
                 // subscription's query is identifiable by table/terminal in a
                 // trace. `read_set_class` names which skip class this would
@@ -1164,24 +1199,39 @@ impl SubscriptionManager {
                     "subs.rerun",
                     db,
                     query_id,
-                    table = %entry.query.table,
-                    terminal = entry.query.terminal_name(),
+                    table = %query.table,
+                    terminal = query.terminal_name(),
                     read_set_class = ?verifying,
                 );
-                match execute_query(pool, db, schema, &entry.query, &entry.principal_ctx, false)
-                    .instrument(rerun_span)
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            db,
-                            query_id,
-                            "subscription re-run failed; skipping"
-                        );
-                        continue;
-                    }
+                async move {
+                    let result = execute_query(pool, db, schema, &query, &principal_ctx, false)
+                        .instrument(rerun_span)
+                        .await;
+                    (key, verifying, result)
+                }
+            })
+            .buffer_unordered(FAN_OUT_CONCURRENCY)
+            .collect()
+            .await;
+
+        // Apply pass: identical bookkeeping to the former sequential loop,
+        // just driven from the collected results instead of an in-place
+        // iteration.
+        for (key, verifying, result) in results {
+            let query_id = key.1.as_str();
+            let Some(entry) = db_subs.get_mut(&key) else {
+                continue;
+            };
+            let result = match result {
+                Ok(result) => result,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        db,
+                        query_id,
+                        "subscription re-run failed; skipping"
+                    );
+                    continue;
                 }
             };
 
@@ -1241,7 +1291,7 @@ impl SubscriptionManager {
 
             entry.last = canon;
             let _ = entry.tx.send(ServerMessage::QueryUpdate {
-                query_id: query_id.clone(),
+                query_id: query_id.to_string(),
                 result: value,
             });
         }

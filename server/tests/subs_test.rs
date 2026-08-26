@@ -374,6 +374,65 @@ async fn two_subscriptions_both_receive_updates_from_one_mutate() -> anyhow::Res
     Ok(())
 }
 
+// ENH-034: many concurrent subscriptions on the same table all receive the
+// pushed update from one mutate, exercising fan_out's bounded-concurrency
+// rerun path (subscriber count exceeds the internal concurrency cap).
+#[tokio::test]
+async fn many_subscriptions_all_receive_updates_from_one_mutate() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+
+    const SUB_COUNT: usize = 40;
+    let mut receivers = Vec::with_capacity(SUB_COUNT);
+    for i in 0..SUB_COUNT {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let conn = next_conn_id();
+        state
+            .realtime
+            .committers
+            .subscribe(
+                &db,
+                conn,
+                format!("q{i}"),
+                collect_work_items(),
+                tx,
+                PrincipalCtx::bypass(),
+            )
+            .await?;
+        rx.try_recv().expect("initial query update");
+        receivers.push((format!("q{i}"), rx));
+    }
+
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 1.0),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+
+    for (query_id, mut rx) in receivers {
+        let msg = rx
+            .try_recv()
+            .unwrap_or_else(|_| panic!("update for {query_id}"));
+        match msg {
+            ServerMessage::QueryUpdate {
+                query_id: got_id,
+                result,
+            } => {
+                assert_eq!(got_id, query_id);
+                assert_eq!(docs_len(&result), 1);
+            }
+            other => panic!("expected QueryUpdate for {query_id}, got {other:?}"),
+        }
+    }
+
+    Ok(())
+}
+
 // (f) remove_conn then mutate -> no message.
 #[tokio::test]
 async fn remove_conn_stops_further_updates() -> anyhow::Result<()> {

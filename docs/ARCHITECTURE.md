@@ -1009,13 +1009,21 @@ before each run it wants to be comparable, not just once before the series:
 | (d) bulk `deleteByQuery`, 5k rows, 100 subscribers | turn hold time | 3418.6 ms |
 | (d) subscription rerun ratio | reruns / (reruns + skips) | 0.84 |
 
-The scenario (d) numbers are the most actionable finding so far: a 3.4s
+The scenario (d) numbers were the most actionable finding here: a 3.4s
 committer-turn hold on one bulk delete blocks every other write to that
 database for the same window (single-writer committer, see above), and an
 0.84 rerun ratio means most of the 100 subscriptions paid the full rerun
-path rather than an indexed/ordered skip — consistent with the audit's
-ARC-006 (`pg_notify`-per-op inside the committer turn) hotspot. Not yet
-investigated further; a follow-up optimization pass should start here.
+path rather than an indexed/ordered skip. This was filed as ARC-006's
+`pg_notify`-per-op hotspot, but that specific op-feed NOTIFY fan-out
+(`notify::publish_ops`, `committer/taps.rs`) was already spawned off the
+turn — the actual cost was `subs::fan_out_inner` awaiting each affected
+subscription's re-run query **sequentially**, one Postgres round-trip at a
+time (ENH-034). Fixed by restructuring `fan_out_inner` into decide/execute/
+apply passes, running the independent re-runs concurrently via
+`buffer_unordered` bounded at `FAN_OUT_CONCURRENCY` (16, well under
+`RTDB_POOL_MAX_CONNECTIONS`'s default of 75). A same-machine A/B bench
+(scenario a+d, 3 trials each) measured turn-hold p50 dropping from ~2050ms
+to ~1500ms (~27%) with no regression to scenario a's commit throughput.
 
 A regression beyond 15% on any metric (latency up, throughput down) is
 checked manually with `scripts/bench/compare.ts` — no CI job runs benchmarks
