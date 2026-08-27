@@ -45,7 +45,7 @@ COPY wire-corpus/query-combinations.json wire-corpus/query-combinations.json
 # missing stub. (The server's own [[test]]/[[bench]] entries need no stub:
 # cargo skips target validation for the member it is building — measured, see
 # the script's header.)
-RUN mkdir -p server/src rust-client/src rust-client/tests rust-client/benches cli/src cli/tests \
+RUN mkdir -p server/src server/benches rust-client/src rust-client/tests rust-client/benches cli/src cli/tests \
     && echo 'fn main() {}' > server/src/main.rs \
     && echo '' > rust-client/src/lib.rs \
     && echo 'fn main() {}' > cli/src/main.rs \
@@ -53,6 +53,8 @@ RUN mkdir -p server/src rust-client/src rust-client/tests rust-client/benches cl
               rust-client/tests/semantics_corpus.rs rust-client/tests/hot_config_test.rs \
               rust-client/tests/ws_integration.rs rust-client/tests/http_integration.rs \
               rust-client/benches/in_memory.rs \
+              server/benches/compile_query.rs server/benches/value_expr.rs \
+              server/benches/validate_doc.rs server/benches/migrate_validate.rs \
     && touch cli/tests/live.rs \
     && cargo build --release --locked --manifest-path server/Cargo.toml --bin rtdb-server \
     && rm -rf server/src
