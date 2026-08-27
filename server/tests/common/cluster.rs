@@ -278,10 +278,10 @@ impl Cluster {
 
     async fn wait_owner_settled(&self) {
         let ok = crate::common::wait_until(Duration::from_secs(10), || async {
-            self.is_owner_of(ReplicaId::A).await || self.is_owner_of(ReplicaId::B).await
+            self.is_owner_of(ReplicaId::A).await
         })
         .await;
-        assert!(ok, "cluster: lease owner did not settle within 10s");
+        assert!(ok, "cluster: replica A did not hold the lease within 10s");
     }
 
     async fn is_owner_of(&self, id: ReplicaId) -> bool {
@@ -475,8 +475,10 @@ pub async fn replica(
 }
 
 pub async fn shared_pool() -> PgPool {
-    let state = crate::common::test_state().await;
-    state.pool.clone()
+    let config = crate::common::test_config();
+    crate::common::test_shared_pool(&config.database_url, 11)
+        .await
+        .expect("connect to shared cluster test postgres")
 }
 
 pub fn insert_item(title: &str) -> Transaction {

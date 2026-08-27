@@ -136,7 +136,7 @@ rsa = "0.9"
 # tree via this crate's own dependency); its default `http` feature reuses the
 # reqwest already compiled for the server.
 proptest = "1"
-par-rt-db-client = { path = "../rust-client", features = ["in_memory"] }
+par-rt-db-client = { path = "../rust-client", features = ["in_memory", "admin"] }
 # ENH-033: criterion micro-benchmarks over the pure hot paths (query compile,
 # computed-field eval, doc validation, migration planning) — no Postgres.
 criterion.workspace = true

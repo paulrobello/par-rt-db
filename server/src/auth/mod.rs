@@ -670,7 +670,10 @@ mod resolve_user_tests {
     async fn users_pool() -> PgPool {
         let url = std::env::var("RTDB_TEST_DATABASE_URL")
             .unwrap_or_else(|_| "postgres://rtdb:rtdb@127.0.0.1:55434/rtdb".into());
-        let pool = sqlx::PgPool::connect(&url)
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .idle_timeout(std::time::Duration::from_secs(1))
+            .connect(&url)
             .await
             .expect("connect to dev postgres");
         crate::db::bootstrap(&pool)

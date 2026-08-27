@@ -215,6 +215,47 @@ Placeholders never appear in `expect` — expectations use `normalize` instead.
 5. `jq . <file>` must parse. Each runner enumerates the corpus directory at
    test time, so adding a file is picked up automatically — no count to bump.
 
+## Promoting property-test counterexamples
+
+When `txn_dsl_server_vs_in_memory_parity` or
+`migrate_dsl_server_vs_in_memory_parity` fails, the harness writes the shrunk
+transaction or migration case to the repository-root
+`target/proptest-counterexamples/<name>.json` (the server test binary resolves
+`CARGO_MANIFEST_DIR/../target`, so this is the repository `target/`, not
+`server/target/`). The file is a complete, runnable semantics-corpus case:
+`expect` is captured from the server at export time (transaction step results
+or error, and migration's applied flag, derived schema, directive reports, and
+the post-migration query result for apply/other phases). Dry-run preview
+envelopes omit `then` because their database is rolled back. Transaction envelopes label the first seeded
+document with `$id: "seed"` and render its `seed-id` operands as
+`{"$idRef": "seed"}`; minted `id` and `scheduleId` results are covered by
+`normalize`. Only preamble-minted `cancelSchedule` steps are omitted because
+the corpus `$idRef` contract names seeded documents only; literal
+`missing-schedule-id` error probes are retained. The query-parity,
+cap-overflow, and destructive-schema properties persist failures as
+`proptest-regressions/` seeds and do not export envelopes.
+
+Replay one generated file through the real corpus loader (from the repository
+root):
+
+```bash
+RTDB_COUNTEREXAMPLE=target/proptest-counterexamples/<name>.json \
+  cargo test --manifest-path server/Cargo.toml --all-features --test main \
+  semantics_corpus_counterexample -- --ignored
+```
+
+To inspect one generated file before promotion, use `jq` directly:
+
+```bash
+jq . target/proptest-counterexamples/<name>.json
+```
+
+Before committing a regression, copy the file into `wire-corpus/semantics/`,
+review the server-captured `expect`, choose `unordered` and `normalize` as
+required by the determinism rulings, and give it a stable kebab-case name
+(`name` must equal the filename stem). The committed case is then loaded by
+every corpus runner.
+
 ## Error-code parity
 
 `error-codes.json` is a flat `{code, httpStatus}` table, one row per

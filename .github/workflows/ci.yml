@@ -11,9 +11,14 @@ on:
   push:
   pull_request:
 
-# Cancel superseded runs on the same ref; keep one in-flight job per branch/PR.
+  schedule:
+    - cron: '17 4 * * 1'
+# Cancel superseded runs on the same ref AND event: branch pushes and PR
+# updates still supersede their own in-flight runs, but the weekly scheduled
+# run (schedule event on the default branch) can no longer be cancelled by —
+# nor cancel — a concurrent push run on that same ref.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 # Least-privilege: CI only reads the repo. Add write tokens only if a step needs them.
@@ -162,6 +167,28 @@ jobs:
       # rust-client/Cargo.toml make the per-test gating declarative.
       - name: rust-client feature-combination gate (ARC-110)
         run: make rust-client-check-features
+
+  proptest-weekly:
+    name: property tests (1000 cases)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RTDB_TEST_DATABASE_URL: postgres://rtdb:rtdb@127.0.0.1:55434/rtdb
+      PROPTEST_CASES: '1000'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: stable
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2.9.2
+      - name: Start dev database
+        run: make dev-db-up
+      - name: Run property tests
+        run: cargo test --manifest-path server/Cargo.toml --all-features --test main proptest_parity
 
   # --- Swift client (macOS runner) --------------------------------------
   # `swift build`/`swift test` need the Swift 6 toolchain, which ships with the

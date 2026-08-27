@@ -2166,7 +2166,7 @@ async fn sec108_login_and_logout_are_not_gated() -> anyhow::Result<()> {
 async fn sec109_admin_login_rate_limited_after_threshold() -> anyhow::Result<()> {
     let mut config = crate::common::test_config();
     config.limits.admin_per_ip_rpm = 3;
-    let pool = sqlx::PgPool::connect(&config.database_url)
+    let pool = crate::common::test_pool(&config.database_url)
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");

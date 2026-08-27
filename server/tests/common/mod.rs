@@ -12,6 +12,39 @@ use rtdb_server::{
     db, ddl,
 };
 
+use sqlx::postgres::PgPoolOptions;
+
+const TEST_POOL_MAX_CONNECTIONS: u32 = 1;
+const TEST_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Build a fresh, deliberately bounded pool for a single test `AppState`.
+///
+/// Each call creates an independent pool: test runtimes must never share a
+/// pool because its background tasks are runtime-bound. A one-connection
+/// ceiling and short idle timeout limit detached test-state pools in the
+/// consolidated integration binary without changing the Postgres server
+/// limit.
+pub async fn test_pool(database_url: &str) -> sqlx::Result<sqlx::PgPool> {
+    PgPoolOptions::new()
+        .max_connections(TEST_POOL_MAX_CONNECTIONS)
+        .idle_timeout(TEST_POOL_IDLE_TIMEOUT)
+        .connect(database_url)
+        .await
+}
+
+/// Build a fresh pool for multiple `multi_instance` states sharing it.
+///
+/// Callers provide the smallest bound required by their listener topology.
+pub async fn test_shared_pool(
+    database_url: &str,
+    max_connections: u32,
+) -> sqlx::Result<sqlx::PgPool> {
+    PgPoolOptions::new()
+        .max_connections(max_connections)
+        .idle_timeout(TEST_POOL_IDLE_TIMEOUT)
+        .connect(database_url)
+        .await
+}
 #[allow(dead_code)]
 pub mod cluster;
 #[allow(unused_imports)]
@@ -181,7 +214,7 @@ pub fn test_hot() -> HotConfig {
 }
 
 pub async fn test_state() -> Arc<AppState> {
-    let pool = sqlx::PgPool::connect(&test_config().database_url)
+    let pool = test_pool(&test_config().database_url)
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
@@ -198,7 +231,7 @@ pub async fn test_state_with_rate_limits(per_token_rpm: u32, per_db_rpm: u32) ->
     let mut config = test_config();
     config.limits.per_token_rpm = per_token_rpm;
     config.limits.per_db_rpm = per_db_rpm;
-    let pool = sqlx::PgPool::connect(&config.database_url)
+    let pool = test_pool(&config.database_url)
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
@@ -212,7 +245,7 @@ pub async fn test_state_with_rate_limits(per_token_rpm: u32, per_db_rpm: u32) ->
 pub async fn test_state_with_audit() -> Arc<AppState> {
     let mut config = test_config();
     config.audit_log_enabled = true;
-    let pool = sqlx::PgPool::connect(&config.database_url)
+    let pool = test_pool(&config.database_url)
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
@@ -231,7 +264,7 @@ pub async fn test_state_with_slow_queries(ms: u64, log_params: bool) -> Arc<AppS
     let mut config = test_config();
     config.slow_query_ms = ms;
     config.slow_query_log_params = log_params;
-    let pool = sqlx::PgPool::connect(&config.database_url)
+    let pool = test_pool(&config.database_url)
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
@@ -244,7 +277,7 @@ pub async fn test_state_with_slow_queries(ms: u64, log_params: bool) -> Arc<AppS
 pub async fn test_state_with_require_signed_urls() -> Arc<AppState> {
     let mut config = test_config();
     config.storage.require_signed_urls = true;
-    let pool = sqlx::PgPool::connect(&config.database_url)
+    let pool = test_pool(&config.database_url)
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
@@ -258,7 +291,7 @@ pub async fn test_state_with_require_signed_urls() -> Arc<AppState> {
 pub async fn test_state_with_transforms_disabled() -> Arc<AppState> {
     let mut config = test_config();
     config.storage.image.enabled = false;
-    let pool = sqlx::PgPool::connect(&config.database_url)
+    let pool = test_pool(&config.database_url)
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
@@ -276,7 +309,7 @@ pub async fn test_state_with_webhooks() -> Arc<AppState> {
     // registration validator lets the e2e test point at a local 127.0.0.1
     // axum receiver over http. Production keeps the default (false).
     config.webhook_allow_http = true;
-    let pool = sqlx::PgPool::connect(&config.database_url)
+    let pool = test_pool(&config.database_url)
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
@@ -294,7 +327,7 @@ pub async fn test_state_with_webhooks() -> Arc<AppState> {
 pub async fn test_state_with_skip_verification(every: u64) -> Arc<AppState> {
     let mut config = test_config();
     config.subs_verify_skip_every = every;
-    let pool = sqlx::PgPool::connect(&config.database_url)
+    let pool = test_pool(&config.database_url)
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
@@ -309,7 +342,7 @@ pub async fn test_state_with_skip_verification(every: u64) -> Arc<AppState> {
 pub async fn test_state_with_ttl_sweep(secs: u64) -> Arc<AppState> {
     let mut config = test_config();
     config.ttl_sweep_interval_secs = secs;
-    let pool = sqlx::PgPool::connect(&config.database_url)
+    let pool = test_pool(&config.database_url)
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
@@ -323,7 +356,7 @@ pub async fn test_state_with_ttl_sweep(secs: u64) -> Arc<AppState> {
 pub async fn test_state_with_idle_reclaim(secs: u64) -> Arc<AppState> {
     let mut config = test_config();
     config.db_idle_reclaim_secs = secs;
-    let pool = sqlx::PgPool::connect(&config.database_url)
+    let pool = test_pool(&config.database_url)
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
@@ -339,7 +372,7 @@ pub async fn test_state_with_idle_reclaim(secs: u64) -> Arc<AppState> {
 pub async fn test_state_with_backup_dir(dir: String) -> Arc<AppState> {
     let mut config = test_config();
     config.backup.dir = dir;
-    let pool = sqlx::PgPool::connect(&config.database_url)
+    let pool = test_pool(&config.database_url)
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
@@ -359,7 +392,7 @@ pub async fn test_state_with_ttl_audit_webhooks(secs: u64) -> Arc<AppState> {
     // Match `test_state_with_webhooks`: SSRF dev-escape hatch on so the test
     // can register an http webhook pointing at example.com (SEC-001).
     config.webhook_allow_http = true;
-    let pool = sqlx::PgPool::connect(&config.database_url)
+    let pool = test_pool(&config.database_url)
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
@@ -382,7 +415,7 @@ pub async fn test_state_with_presence() -> Arc<AppState> {
     let mut config = test_config();
     config.presence_enabled = true;
     config.presence_broadcast_interval_ms = 0;
-    let pool = sqlx::PgPool::connect(&config.database_url)
+    let pool = test_pool(&config.database_url)
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");

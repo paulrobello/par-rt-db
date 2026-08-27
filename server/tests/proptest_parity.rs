@@ -1,4 +1,5 @@
-//! ENH-027: property-based parity testing for the query DSL.
+//! ENH-032 extends and supersedes the original ENH-027 query-only property
+//! testing plan with transaction and migration parity properties.
 //!
 //! Randomly generated schemas/documents/queries are executed against BOTH the
 //! real server (Postgres) and the rust-client in-memory engine, asserting
@@ -58,7 +59,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 
-use crate::common::{test_state, wrap_test_db};
+use crate::common::{admin_post, spawn_app, test_state, wrap_test_db};
 use par_rt_db_client::in_memory::InMemoryRtDbClientOptions;
 use par_rt_db_client::schema::SchemaDef as ClientSchemaDef;
 use par_rt_db_client::{
@@ -1008,4 +1009,1190 @@ fn query_dsl_server_vs_in_memory_parity() {
             .map_err(TestCaseError::fail)
     });
     result.expect("query DSL parity property failed (counterexample above)");
+}
+// ============ ENH-032: Transaction generator + oracle ============
+//
+// Step variants enumerate every supported non-workflow mutation, including
+// scheduling and soft-delete restoration. Workflow steps remain narrowed
+// because the in-memory harness intentionally reports Internal for them.
+
+#[derive(Clone, Debug)]
+struct TxnCase {
+    tables: Vec<TableCase>,
+    steps: Vec<Value>,
+}
+
+fn id_pick() -> impl Strategy<Value = &'static str> {
+    prop_oneof![8 => Just("seed-id"), 2 => Just("missing-id")]
+}
+fn schedule_id_pick() -> impl Strategy<Value = &'static str> {
+    prop_oneof![8 => Just("schedule-id"), 2 => Just("missing-schedule-id")]
+}
+fn version_pick() -> impl Strategy<Value = i64> {
+    prop_oneof![8 => Just(1i64), 2 => Just(999i64)]
+}
+fn typed_patch_fields(table: &TableCase) -> BoxedStrategy<Map<String, Value>> {
+    let (name, kind) = table.fields[0].clone();
+    let values = match kind {
+        Kind::Scalar(s) | Kind::Opt(s) => scalar_doc_value(s),
+        Kind::ArrayStr => collection::vec(string_value(), 0..=3)
+            .prop_map(|v| Value::Array(v.into_iter().map(Value::String).collect()))
+            .boxed(),
+    };
+    values
+        .prop_map(move |v| {
+            let mut fields = Map::new();
+            fields.insert(name.clone(), v);
+            fields
+        })
+        .boxed()
+}
+fn seed_index_eq(table: &TableCase) -> Option<(String, Vec<Value>)> {
+    let (name, positions) = table.indexes.first().cloned()?;
+    let doc = table.docs.iter().find(|doc| {
+        positions.iter().all(|p| {
+            table
+                .fields
+                .get(*p)
+                .and_then(|(n, _)| doc.get(n))
+                .is_some_and(|v| !v.is_null())
+        })
+    })?;
+    let eq = positions
+        .into_iter()
+        .map(|p| {
+            table
+                .fields
+                .get(p)
+                .and_then(|(n, _)| doc.get(n).cloned())
+                .ok_or(())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    Some((name, eq))
+}
+fn index_eq_strategy(table: Arc<TableCase>) -> BoxedStrategy<(String, Vec<Value>)> {
+    let kinds = table
+        .indexes
+        .first()
+        .map(|(_, ps)| {
+            ps.iter()
+                .filter_map(|p| table.fields.get(*p).map(|(_, k)| *k))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let generated_name = table
+        .indexes
+        .first()
+        .map(|(n, _)| n.clone())
+        .unwrap_or_else(|| "by_f_a".into());
+    let generated = value_vec(&kinds).prop_map(move |v| (generated_name.clone(), v));
+    match seed_index_eq(&table) {
+        Some(present) => prop_oneof![8 => Just(present), 2 => generated].boxed(),
+        None => generated.boxed(),
+    }
+}
+fn gen_step(table: Arc<TableCase>) -> BoxedStrategy<Value> {
+    let t = table.name.clone();
+    let doc = table.docs.first().cloned().unwrap_or_default();
+    let fields = Arc::new(table_field_refs(&table));
+    let pbq = {
+        let t = t.clone();
+        (filter_tree(fields.clone(),2), typed_patch_fields(&table)).prop_map(move |(f,p)| serde_json::json!({"op":"patchByQuery","table":t,"filter":f,"patch":p,"limit":1})).boxed()
+    };
+    let dbq = {
+        let t = t.clone();
+        filter_tree(fields, 2)
+            .prop_map(
+                move |f| serde_json::json!({"op":"deleteByQuery","table":t,"filter":f,"limit":1}),
+            )
+            .boxed()
+    };
+    let idx = index_eq_strategy(table.clone());
+    prop_oneof![
+        2 => Just(serde_json::json!({"op":"insert","table":t,"doc":doc})),
+        2 => { let t=t.clone(); (id_pick(),typed_patch_fields(&table)).prop_map(move |(id,p)| serde_json::json!({"op":"patch","table":t,"id":id,"fields":p})).boxed() },
+        2 => { let t=t.clone(); let d=doc.clone(); id_pick().prop_map(move |id| serde_json::json!({"op":"replace","table":t,"id":id,"doc":d})).boxed() },
+        2 => { let t=t.clone(); id_pick().prop_map(move |id| serde_json::json!({"op":"delete","table":t,"id":id})).boxed() },
+        2 => { let t=t.clone(); (id_pick(),version_pick()).prop_map(move |(id,v)| serde_json::json!({"op":"expectVersion","table":t,"id":id,"version":v})).boxed() },
+        2 => { let t=t.clone(); idx.clone().prop_map(move |(i,e)| serde_json::json!({"op":"expectAbsent","table":t,"index":i,"eq":e})).boxed() },
+        2 => { let t=t.clone(); let d=doc.clone(); (idx,typed_patch_fields(&table)).prop_map(move |((i,e),p)| serde_json::json!({"op":"upsert","table":t,"index":i,"eq":e,"insert":d,"patch":p})).boxed() },
+        2 => pbq,
+        2 => dbq,
+        2 => { let t=t.clone(); id_pick().prop_map(move |id| serde_json::json!({"op":"undelete","table":t,"id":id})).boxed() },
+        2 => { let t=t.clone(); let d=doc.clone(); Just(serde_json::json!({"op":"schedule","when":{"type":"afterMs","ms":60000},"txn":{"steps":[{"op":"insert","table":t,"doc":d}]}})).boxed() },
+        2 => schedule_id_pick().prop_map(|id| serde_json::json!({"op":"cancelSchedule","id":id})).boxed(),
+    ].boxed()
+}
+fn txn_case_strategy() -> BoxedStrategy<TxnCase> {
+    table_strategy()
+        .prop_flat_map(|mut t| {
+            t.name = "t0".into();
+            let t = Arc::new(t);
+            collection::vec(gen_step(t.clone()), 1..=8).prop_map(move |steps| TxnCase {
+                tables: vec![(*t).clone()],
+                steps,
+            })
+        })
+        .boxed()
+}
+fn overflow_txn_strategy() -> BoxedStrategy<TxnCase> {
+    table_strategy().prop_flat_map(|mut t| { t.name="t0".into(); let fields=Arc::new(table_field_refs(&t)); filter_tree(fields,2).prop_map(move |f| TxnCase{tables:vec![t.clone()],steps:(0..17).map(|_| serde_json::json!({"op":"patchByQuery","table":"t0","filter":f,"patch":{},"limit":1})).collect()}) }).boxed()
+}
+
+fn txn_schema_json(case: &TxnCase) -> Value {
+    let mut schema = Case {
+        tables: case.tables.clone(),
+        queries: Vec::new(),
+    }
+    .schema_json();
+    let table = &mut schema["tables"]["t0"];
+    table["softDelete"] = Value::Bool(true);
+    if let Some(source) = case.tables[0].fields.iter().find_map(|(name, kind)| {
+        kind.scalar_inner()
+            .filter(|s| *s == Scalar::Str)
+            .map(|_| name.clone())
+    }) {
+        table["fields"]["computed_label"] = serde_json::json!({"type":"string"});
+        table["computed"] = serde_json::json!({"computed_label":{"op":"concat","parts":[
+            {"op":"field","field":source},{"op":"literal","value":""}
+        ]}});
+    }
+    schema
+}
+
+fn txn_seed_json(case: &TxnCase) -> Value {
+    Case {
+        tables: case.tables.clone(),
+        queries: Vec::new(),
+    }
+    .seed_txn_json()
+}
+fn normalize_txn_result(mut value: Value) -> Value {
+    project_recursive(&mut value, &NORMALIZE);
+    if let Value::Array(rows) = &mut value {
+        for row in rows {
+            if let Value::Object(obj) = row {
+                for key in ["id", "scheduleId", "workflowId"] {
+                    if obj.contains_key(key) {
+                        obj.insert(key.to_string(), Value::String("<id>".into()));
+                    }
+                }
+            }
+        }
+    }
+    value
+}
+fn materialize_seed_id(mut value: Value, seed_id: &str, schedule_id: &str) -> Value {
+    match &mut value {
+        Value::String(s) if s == "seed-id" => *s = seed_id.to_string(),
+        Value::String(s) if s == "schedule-id" => *s = schedule_id.to_string(),
+        Value::Array(items) => {
+            for item in items {
+                *item = materialize_seed_id(item.take(), seed_id, schedule_id);
+            }
+        }
+        Value::Object(obj) => {
+            for item in obj.values_mut() {
+                *item = materialize_seed_id(item.take(), seed_id, schedule_id);
+            }
+        }
+        _ => {}
+    }
+    value
+}
+
+async fn run_txn_case(state: &rtdb_server::AppState, case: &TxnCase) -> Result<(), String> {
+    let db_name = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(&state.pool, &db_name)
+        .await
+        .map_err(|e| format!("create db: {e:?}"))?;
+    let _guard = wrap_test_db(db_name.clone());
+    let schema_json = txn_schema_json(case);
+    let schema: ServerSchemaDef =
+        serde_json::from_value(schema_json.clone()).map_err(|e| e.to_string())?;
+    ddl::push_schema(&state.pool, &db_name, schema.clone())
+        .await
+        .map_err(|e| format!("schema: {e:?}"))?;
+    let seed: ServerTransaction =
+        serde_json::from_value(txn_seed_json(case)).map_err(|e| e.to_string())?;
+    let server_seed = state
+        .realtime
+        .committers
+        .mutate(&db_name, None, seed, PrincipalCtx::bypass())
+        .await
+        .map_err(|e| format!("seed: {e:?}"))?;
+    let server_id = server_seed
+        .results
+        .first()
+        .and_then(|v| v.get("id"))
+        .and_then(Value::as_str)
+        .ok_or("seed did not return id")?;
+    let mut client = InMemoryRtDbClient::new(
+        InMemoryRtDbClientOptions::default()
+            .now(|| CLOCK.fetch_add(1, AtomicOrdering::SeqCst))
+            .random(|| 0.0),
+    );
+    let client_schema: ClientSchemaDef =
+        serde_json::from_value(schema_json.clone()).map_err(|e| e.to_string())?;
+    client
+        .push_schema(&client_schema)
+        .map_err(|e| format!("client schema: {e:?}"))?;
+    let client_seed: ClientTransaction =
+        serde_json::from_value(txn_seed_json(case)).map_err(|e| e.to_string())?;
+    let client_seed_result = client
+        .mutate(&client_seed, None)
+        .await
+        .map_err(|e| format!("client seed: {e:?}"))?;
+    let engine_id = serde_json::to_value(&client_seed_result)
+        .ok()
+        .and_then(|v| {
+            v.as_array().and_then(|a| {
+                a.first()
+                    .and_then(|v| v.get("id").and_then(Value::as_str).map(str::to_owned))
+            })
+        })
+        .ok_or("engine seed did not return id")?;
+    let schedule_json = serde_json::json!({"steps":[{"op":"schedule","when":{"type":"afterMs","ms":60000},"txn":{"steps":[]}}]});
+    let schedule_server: ServerTransaction =
+        serde_json::from_value(schedule_json.clone()).map_err(|e| e.to_string())?;
+    let schedule_server = state
+        .realtime
+        .committers
+        .mutate(&db_name, None, schedule_server, PrincipalCtx::bypass())
+        .await
+        .map_err(|e| format!("schedule preamble: {e:?}"))?;
+    let schedule_id = schedule_server
+        .results
+        .first()
+        .and_then(|v| v.get("scheduleId"))
+        .and_then(Value::as_str)
+        .ok_or("schedule preamble missing id")?;
+    let schedule_client: ClientTransaction =
+        serde_json::from_value(schedule_json).map_err(|e| e.to_string())?;
+    let schedule_result = client
+        .mutate(&schedule_client, None)
+        .await
+        .map_err(|e| format!("engine schedule preamble: {e:?}"))?;
+    let engine_schedule_id = serde_json::to_value(schedule_result)
+        .ok()
+        .and_then(|v| {
+            v.as_array().and_then(|a| {
+                a.first().and_then(|v| {
+                    v.get("scheduleId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+            })
+        })
+        .ok_or("engine schedule preamble missing id")?;
+    let server_txn_json = materialize_seed_id(
+        serde_json::json!({"steps": case.steps}),
+        server_id,
+        schedule_id,
+    );
+    let engine_txn_json = materialize_seed_id(
+        serde_json::json!({"steps": case.steps}),
+        &engine_id,
+        &engine_schedule_id,
+    );
+    let server_txn: ServerTransaction =
+        serde_json::from_value(server_txn_json).map_err(|e| e.to_string())?;
+    let server = state
+        .realtime
+        .committers
+        .mutate(&db_name, None, server_txn, PrincipalCtx::bypass())
+        .await;
+    let client_txn: ClientTransaction =
+        serde_json::from_value(engine_txn_json).map_err(|e| e.to_string())?;
+    let engine = client.mutate(&client_txn, None).await;
+    match (server, engine) {
+        (Ok(s), Ok(e)) => {
+            let sv = normalize_txn_result(Value::Array(s.results));
+            let ev = normalize_txn_result(serde_json::to_value(e).map_err(|e| e.to_string())?);
+            if sv != ev {
+                return Err(format!("txn result mismatch: server={sv} engine={ev}"));
+            }
+        }
+        (Err(s), Err(e)) if format!("{:?}", s.code) == format!("{:?}", e.code) => {}
+        (s, e) => return Err(format!("txn error mismatch: server={s:?} engine={e:?}")),
+    }
+    for table in &case.tables {
+        let q: ServerQuery = serde_json::from_value(serde_json::json!({"table": table.name}))
+            .map_err(|e| e.to_string())?;
+        let rows = execute_query(
+            &state.pool,
+            &db_name,
+            &schema,
+            &q,
+            &PrincipalCtx::bypass(),
+            false,
+        )
+        .await
+        .map_err(|e| format!("collect: {e:?}"))?;
+        let mut sv = serde_json::to_value(rows).map_err(|e| e.to_string())?;
+        let mut ev = Value::Array(client.collect_all(&table.name));
+        project_recursive(&mut sv, &NORMALIZE);
+        project_recursive(&mut ev, &NORMALIZE);
+        let empty = Vec::new();
+        if !multiset_equal(
+            sv.as_array().unwrap_or(&empty),
+            ev.as_array().unwrap_or(&empty),
+        ) {
+            return Err(format!("post-state mismatch: server={sv} engine={ev}"));
+        }
+    }
+    Ok(())
+}
+
+async fn run_overflow_case(state: &rtdb_server::AppState, case: &TxnCase) -> Result<(), String> {
+    let db_name = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(&state.pool, &db_name)
+        .await
+        .map_err(|e| format!("create db: {e:?}"))?;
+    let _guard = wrap_test_db(db_name.clone());
+    let schema_json = txn_schema_json(case);
+    let schema: ServerSchemaDef =
+        serde_json::from_value(schema_json.clone()).map_err(|e| e.to_string())?;
+    ddl::push_schema(&state.pool, &db_name, schema)
+        .await
+        .map_err(|e| format!("schema: {e:?}"))?;
+    let txn_json = serde_json::json!({"steps": case.steps});
+    let server_txn: ServerTransaction =
+        serde_json::from_value(txn_json.clone()).map_err(|e| e.to_string())?;
+    let server = state
+        .realtime
+        .committers
+        .mutate(&db_name, None, server_txn, PrincipalCtx::bypass())
+        .await;
+    let mut client = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+    let client_schema: ClientSchemaDef =
+        serde_json::from_value(schema_json).map_err(|e| e.to_string())?;
+    client
+        .push_schema(&client_schema)
+        .map_err(|e| format!("client schema: {e:?}"))?;
+    let client_txn: ClientTransaction =
+        serde_json::from_value(txn_json).map_err(|e| e.to_string())?;
+    let engine = client.mutate(&client_txn, None).await;
+    match (server, engine) {
+        (Err(s), Err(e))
+            if serde_json::to_value(s.code).ok() == serde_json::to_value(e.code).ok()
+                && serde_json::to_value(s.code).ok()
+                    == Some(Value::String("BAD_REQUEST".into())) =>
+        {
+            Ok(())
+        }
+        (s, e) => Err(format!("overflow mismatch: server={s:?} engine={e:?}")),
+    }
+}
+
+#[test]
+fn txn_dsl_server_vs_in_memory_parity() {
+    let rt = tokio::runtime::Runtime::new().expect("build tokio runtime");
+    let state = rt.block_on(async { test_state().await });
+
+    let mut runner = TestRunner::new(Config {
+        failure_persistence: Some(Box::new(FileFailurePersistence::Direct(
+            "proptest-regressions/proptest_parity_txn.txt",
+        ))),
+        ..Config::with_cases(case_count())
+    });
+    let strategy = txn_case_strategy();
+    let result = runner.run(&strategy, |case| {
+        match rt.block_on(run_txn_case(&state, &case)) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let path = rt.block_on(export_txn_counterexample(
+                    &state.pool,
+                    &counterexample_dir(),
+                    "txn-dsl-server-vs-in-memory-parity",
+                    &case,
+                ));
+                eprintln!("counterexample envelope: {}", path.display());
+                Err(TestCaseError::fail(error))
+            }
+        }
+    });
+    result.expect("txn DSL parity property failed (counterexample above)");
+}
+
+#[test]
+fn txn_cap_overflow_is_bad_request_on_both() {
+    let rt = tokio::runtime::Runtime::new().expect("build tokio runtime");
+    let state = rt.block_on(async { test_state().await });
+
+    let mut runner = TestRunner::new(Config {
+        failure_persistence: Some(Box::new(FileFailurePersistence::Direct(
+            "proptest-regressions/proptest_parity_txn_overflow.txt",
+        ))),
+        ..Config::with_cases(case_count())
+    });
+    let strategy = overflow_txn_strategy();
+    let result = runner.run(&strategy, |case| {
+        rt.block_on(run_overflow_case(&state, &case))
+            .map_err(TestCaseError::fail)
+    });
+    result.expect("txn cap-overflow property failed (counterexample above)");
+}
+// ============ ENH-032: Migration generator + oracle ============
+
+#[derive(Clone, Debug)]
+struct MigrateCase {
+    directives: Vec<Value>,
+    count_query: bool,
+    query_kind: u8,
+}
+
+fn migrate_case_strategy() -> BoxedStrategy<MigrateCase> {
+    // Unique 1–4 ops in canonical order so every subset is valid by construction.
+    // Collect vs count is an independent bit — not derived from which ops fired.
+    (
+        collection::vec(any::<u8>(), 1..=4),
+        any::<bool>(),
+        any::<u8>(),
+    )
+        .prop_map(|(choices, count_query, query_kind)| {
+            let mut seen = std::collections::BTreeSet::new();
+            for c in choices {
+                seen.insert(c % 9);
+            }
+            let mut directives = Vec::new();
+            for c in seen {
+                directives.push(match c {
+                    0 => serde_json::json!({"op":"renameField","table":"docs","from":"nick","to":"alias"}),
+                    1 => serde_json::json!({"op":"renameField","table":"docs","from":"owner","to":"account"}),
+                    2 => serde_json::json!({"op":"renameField","table":"docs","from":"editors","to":"collaborators"}),
+                    3 => serde_json::json!({"op":"renameField","table":"docs","from":"ticket","to":"number"}),
+                    4 => serde_json::json!({"op":"renameField","table":"docs","from":"expires","to":"expiresAt"}),
+                    5 => serde_json::json!({"op":"renameField","table":"docs","from":"score","to":"rating"}),
+                    6 => serde_json::json!({"op":"changeType","table":"docs","field":"spare","to":{"type":"string"},"cast":"toString"}),
+                    7 => serde_json::json!({"op":"dropIndex","table":"docs","name":"by_nick"}),
+                    _ => serde_json::json!({"op":"dropField","table":"docs","field":"spare"}),
+                });
+            }
+            MigrateCase {
+                directives,
+                count_query,
+                query_kind: query_kind % 3,
+            }
+        })
+        .boxed()
+}
+
+fn migration_schema_json() -> Value {
+    serde_json::json!({"tables":{"docs":{"fields":{
+        "owner":{"type":"string"},"editors":{"type":"array","element":{"type":"string"}},
+        "ticket":{"type":"int64"},"expires":{"type":"number"},
+        "nick":{"type":"string"},"score":{"type":"number"},"spare":{"type":"number"},"label":{"type":"string"}
+    },"indexes":[{"name":"by_nick","fields":["nick"]},{"name":"by_ticket","fields":["ticket"]},{"name":"by_expires","fields":["expires"]}],
+    "ownerField":"owner","collaboratorsField":"editors","autoIncrementField":"ticket",
+    "ttl":{"field":"expires"},"authorize":{"op":"eq","field":"owner","value":{"$user":true}},
+    "defaults":{"score":0},"computed":{"label":{"op":"concat","parts":[{"op":"literal","value":"n:"},{"op":"field","field":"nick"}]}},"softDelete":true}}})
+}
+
+fn additive_migration_schema_json() -> Value {
+    let mut schema = migration_schema_json();
+    schema["tables"]["docs"]["fields"]["added"] = serde_json::json!({"type":"string"});
+    schema["tables"]["docs"]["defaults"]["added"] = serde_json::json!("new");
+    schema["tables"]["docs"]["indexes"]
+        .as_array_mut()
+        .expect("migration indexes")
+        .push(serde_json::json!({"name":"by_added","fields":["added"]}));
+    schema
+}
+
+fn migrate_case_query_json(case: &MigrateCase) -> Value {
+    let owner_field = if case.directives.iter().any(|d| d["from"] == "owner") {
+        "account"
+    } else {
+        "owner"
+    };
+    let mut query = match case.query_kind {
+        0 => {
+            serde_json::json!({"table":"docs","filter":{"op":"eq","field":owner_field,"value":"u"}})
+        }
+        1 => serde_json::json!({"table":"docs","index":"by_added","eq":["new"]}),
+        _ => serde_json::json!({"table":"docs"}),
+    };
+    if case.count_query {
+        query["count"] = Value::Bool(true);
+    }
+    query
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MigratePhase {
+    Preview,
+    Apply,
+    Other,
+}
+
+impl MigratePhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Preview => "dry-run preview",
+            Self::Apply => "apply",
+            Self::Other => "setup/verification",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MigrateCaseFailure {
+    phase: MigratePhase,
+    message: String,
+}
+
+impl MigrateCaseFailure {
+    fn preview(message: impl Into<String>) -> Self {
+        Self {
+            phase: MigratePhase::Preview,
+            message: message.into(),
+        }
+    }
+
+    fn apply(message: impl Into<String>) -> Self {
+        Self {
+            phase: MigratePhase::Apply,
+            message: message.into(),
+        }
+    }
+
+    fn other(message: impl Into<String>) -> Self {
+        Self {
+            phase: MigratePhase::Other,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<String> for MigrateCaseFailure {
+    fn from(message: String) -> Self {
+        Self::other(message)
+    }
+}
+
+impl From<&str> for MigrateCaseFailure {
+    fn from(message: &str) -> Self {
+        Self::other(message)
+    }
+}
+
+async fn run_migration_case(
+    state: &Arc<rtdb_server::AppState>,
+    addr: std::net::SocketAddr,
+    case: &MigrateCase,
+) -> Result<(), MigrateCaseFailure> {
+    let db_name = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(&state.pool, &db_name)
+        .await
+        .map_err(|e| format!("create: {e:?}"))?;
+    let _guard = wrap_test_db(db_name.clone());
+    let schema_json = migration_schema_json();
+    let base_schema: ServerSchemaDef =
+        serde_json::from_value(schema_json.clone()).map_err(|e| e.to_string())?;
+    ddl::push_schema(&state.pool, &db_name, base_schema.clone())
+        .await
+        .map_err(|e| format!("schema: {e:?}"))?;
+    let additive_json = additive_migration_schema_json();
+    let additive: ServerSchemaDef =
+        serde_json::from_value(additive_json.clone()).map_err(|e| e.to_string())?;
+    ddl::push_schema(&state.pool, &db_name, additive.clone())
+        .await
+        .map_err(|e| format!("additive push: {e:?}"))?;
+    let schema = additive;
+    let seed = ServerTransaction { steps: vec![rtdb_server::txn::Step::Insert { table: "docs".into(), doc: serde_json::from_value(serde_json::json!({"owner":"u","editors":["v"],"nick":"Ada","score":4.0,"spare":1.0,"expires":4102444800000.0})).unwrap() }]};
+    state
+        .realtime
+        .committers
+        .mutate(&db_name, None, seed, PrincipalCtx::bypass())
+        .await
+        .map_err(|e| format!("seed: {e:?}"))?;
+    let directives: Vec<rtdb_server::migrate::Directive> = case
+        .directives
+        .iter()
+        .cloned()
+        .map(|v| serde_json::from_value(v).map_err(|e| e.to_string()))
+        .collect::<Result<_, _>>()?;
+    let request_json = serde_json::json!({
+        "directives": case.directives.clone(),
+        "dryRun": true,
+    });
+    let preview_response =
+        admin_post(addr, &format!("/admin/db/{db_name}/migrate"), request_json).await;
+    if !preview_response.status().is_success() {
+        return Err(MigrateCaseFailure::preview(format!(
+            "dry-run HTTP status: {}",
+            preview_response.status()
+        )));
+    }
+    let preview: rtdb_server::migrate::MigrateResult = preview_response
+        .json()
+        .await
+        .map_err(|e| format!("dry-run JSON: {e}"))?;
+    if preview.applied {
+        return Err(MigrateCaseFailure::preview("dry-run unexpectedly applied"));
+    }
+    let apply_response = admin_post(
+        addr,
+        &format!("/admin/db/{db_name}/migrate"),
+        serde_json::json!({"directives": case.directives.clone(), "dryRun": false}),
+    )
+    .await;
+    if !apply_response.status().is_success() {
+        return Err(MigrateCaseFailure::apply(format!(
+            "apply HTTP status: {}",
+            apply_response.status()
+        )));
+    }
+    let applied: rtdb_server::migrate::MigrateResult = apply_response
+        .json()
+        .await
+        .map_err(|e| format!("apply JSON: {e}"))?;
+    let mut client = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+    if !applied.applied {
+        return Err(MigrateCaseFailure::apply(
+            "server apply unexpectedly returned applied=false",
+        ));
+    }
+    let base_client_schema: ClientSchemaDef =
+        serde_json::from_value(schema_json.clone()).map_err(|e| e.to_string())?;
+    client
+        .push_schema(&base_client_schema)
+        .map_err(|e| format!("client base schema: {e:?}"))?;
+    let client_schema: ClientSchemaDef =
+        serde_json::from_value(additive_json).map_err(|e| e.to_string())?;
+    client
+        .push_schema(&client_schema)
+        .map_err(|e| format!("client additive schema: {e:?}"))?;
+    let server_additive_json = serde_json::to_value(&schema).map_err(|e| e.to_string())?;
+    let engine_additive_json =
+        serde_json::to_value(client.to_schema_json().ok_or("client schema missing")?)
+            .map_err(|e| e.to_string())?;
+    if server_additive_json != engine_additive_json {
+        return Err(MigrateCaseFailure::other(format!(
+            "post-additive schema mismatch: {server_additive_json} != {engine_additive_json}"
+        )));
+    }
+    let seed: ClientTransaction = serde_json::from_value(serde_json::json!({"steps":[{"op":"insert","table":"docs","doc":{"owner":"u","editors":["v"],"nick":"Ada","score":4.0,"spare":1.0,"expires":4102444800000.0}}]})).unwrap();
+    client
+        .mutate(&seed, None)
+        .await
+        .map_err(|e| format!("client seed: {e:?}"))?;
+    let client_directives: Vec<par_rt_db_client::Directive> =
+        serde_json::from_value(serde_json::to_value(&directives).unwrap())
+            .map_err(|e| e.to_string())?;
+    let dry = client
+        .migrate_schema(&client_directives, true)
+        .map_err(|e| format!("client dry-run: {e:?}"))?;
+    let live = client
+        .migrate_schema(&client_directives, false)
+        .map_err(|e| format!("client apply: {e:?}"))?;
+    if dry.applied || !live.applied {
+        return Err(MigrateCaseFailure::other(
+            "engine dry-run/apply flags mismatch",
+        ));
+    }
+    let server_json = serde_json::to_value(&applied.schema).map_err(|e| e.to_string())?;
+    let engine_json = serde_json::to_value(&live.schema).map_err(|e| e.to_string())?;
+    if server_json != engine_json {
+        return Err(MigrateCaseFailure::other(format!(
+            "schema mismatch: {server_json} != {engine_json}"
+        )));
+    }
+    for directive in &case.directives {
+        if directive["op"] == "renameField" {
+            let from = directive["from"].as_str().unwrap();
+            if !server_json.is_object() || server_json.to_string().contains(&format!("\"{from}\""))
+            {
+                return Err(MigrateCaseFailure::other(format!(
+                    "QA-002: renamed field '{from}' remains in schema JSON"
+                )));
+            }
+        }
+    }
+    let query_json = migrate_case_query_json(case);
+    let q: ServerQuery = serde_json::from_value(query_json.clone()).unwrap();
+    let rows = execute_query(
+        &state.pool,
+        &db_name,
+        &applied.schema,
+        &q,
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .map_err(|e| format!("query: {e:?}"))?;
+    let mut s = serde_json::to_value(rows).unwrap();
+    let cq: ClientQuery = serde_json::from_value(query_json).unwrap();
+    let mut e = client
+        .run_query(&cq)
+        .map_err(|e| format!("engine query: {e:?}"))?;
+    project_recursive(&mut s, &NORMALIZE);
+    project_recursive(&mut e, &NORMALIZE);
+    if case.count_query {
+        if s != e {
+            return Err(MigrateCaseFailure::other(format!(
+                "post-apply generated count mismatch: {s} != {e}"
+            )));
+        }
+        return Ok(());
+    }
+    if !multiset_equal(
+        s.as_array().unwrap_or(&vec![]),
+        e.as_array().unwrap_or(&vec![]),
+    ) {
+        return Err(MigrateCaseFailure::other(format!(
+            "post-apply query mismatch: {s} != {e}"
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn migrate_dsl_server_vs_in_memory_parity() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let state = rt.block_on(async { test_state().await });
+    let addr = rt.block_on(spawn_app(state.clone()));
+    let mut runner = TestRunner::new(Config {
+        failure_persistence: Some(Box::new(FileFailurePersistence::Direct(
+            "proptest-regressions/proptest_parity_migrate.txt",
+        ))),
+        ..Config::with_cases(case_count())
+    });
+    runner
+        .run(&migrate_case_strategy(), |case| {
+            match rt.block_on(run_migration_case(&state, addr, &case)) {
+                Ok(()) => Ok(()),
+                Err(failure) => {
+                    let path = rt.block_on(export_migrate_counterexample(
+                        &state.pool,
+                        &counterexample_dir(),
+                        "migrate-dsl-server-vs-in-memory-parity",
+                        &case,
+                        &failure,
+                    ));
+                    eprintln!("counterexample envelope: {}", path.display());
+                    Err(TestCaseError::fail(failure.message))
+                }
+            }
+        })
+        .expect("migration parity");
+}
+fn destructive_schema_strategy() -> BoxedStrategy<Value> {
+    prop_oneof![
+        Just({
+            let mut v = migration_schema_json();
+            v["tables"]["docs"]["fields"]
+                .as_object_mut()
+                .unwrap()
+                .remove("score");
+            v["tables"]["docs"]["defaults"]
+                .as_object_mut()
+                .unwrap()
+                .remove("score");
+            v
+        }),
+        Just({
+            let mut v = migration_schema_json();
+            v["tables"]["docs"]["fields"]["score"] = serde_json::json!({"type":"string"});
+            v["tables"]["docs"]["defaults"]
+                .as_object_mut()
+                .unwrap()
+                .remove("score");
+            v
+        }),
+        Just({
+            let mut v = migration_schema_json();
+            v["tables"]["docs"]["indexes"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|ix| ix["name"] != "by_nick");
+            v
+        }),
+    ]
+    .boxed()
+}
+
+#[test]
+fn migrate_destructive_change_detector_rejects_on_both() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let state = rt.block_on(async { test_state().await });
+    let mut runner = TestRunner::new(Config {
+        failure_persistence: Some(Box::new(FileFailurePersistence::Direct(
+            "proptest-regressions/proptest_parity_migrate_destructive.txt",
+        ))),
+        ..Config::with_cases(case_count())
+    });
+    runner
+        .run(&destructive_schema_strategy(), |new_json| {
+            let state = &state;
+            rt.block_on(async {
+                let db_name = format!("t{}", uuid::Uuid::now_v7().simple());
+                db::create_database(&state.pool, &db_name)
+                    .await
+                    .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+                let _guard = wrap_test_db(db_name.clone());
+                let old: ServerSchemaDef = serde_json::from_value(migration_schema_json())
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                ddl::push_schema(&state.pool, &db_name, old.clone())
+                    .await
+                    .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+                let new: ServerSchemaDef = serde_json::from_value(new_json.clone())
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                if ddl::push_schema(&state.pool, &db_name, new.clone())
+                    .await
+                    .is_ok()
+                {
+                    return Err(TestCaseError::fail("server accepted destructive schema"));
+                }
+                let mut client = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+                let old_client: ClientSchemaDef =
+                    serde_json::from_value(serde_json::to_value(old).unwrap()).unwrap();
+                client
+                    .push_schema(&old_client)
+                    .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+                let new_client: ClientSchemaDef =
+                    serde_json::from_value(serde_json::to_value(new).unwrap()).unwrap();
+                if client.push_schema(&new_client).is_ok() {
+                    return Err(TestCaseError::fail("engine accepted destructive schema"));
+                }
+                Ok(())
+            })
+        })
+        .expect("destructive detector parity");
+}
+
+fn is_preamble_schedule_cancel(step: &Value) -> bool {
+    step["op"].as_str() == Some("cancelSchedule") && step["id"].as_str() == Some("schedule-id")
+}
+// ============ ENH-032: semantics-corpus counterexample export ============
+
+fn rewrite_counterexample_refs(mut value: Value) -> Value {
+    match &mut value {
+        Value::String(s) if s == "seed-id" => return serde_json::json!({"$idRef":"seed"}),
+        Value::Array(items) => {
+            for item in items {
+                *item = rewrite_counterexample_refs(item.take());
+            }
+        }
+        Value::Object(obj) => {
+            for item in obj.values_mut() {
+                *item = rewrite_counterexample_refs(item.take());
+            }
+        }
+        _ => {}
+    }
+    value
+}
+
+fn txn_case_to_semantics_envelope(case: &TxnCase, name: &str) -> Value {
+    let mut seed = Vec::new();
+    for (table_index, table) in case.tables.iter().enumerate() {
+        for (doc_index, doc) in table.docs.iter().enumerate() {
+            let mut entry = serde_json::json!({"table": table.name, "doc": doc});
+            if table_index == 0 && doc_index == 0 {
+                entry["$id"] = Value::String("seed".into());
+            }
+            seed.push(entry);
+        }
+    }
+    let omitted = case
+        .steps
+        .iter()
+        .filter(|step| is_preamble_schedule_cancel(step))
+        .count();
+    let steps = case
+        .steps
+        .iter()
+        .filter(|step| !is_preamble_schedule_cancel(step))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut comment = "Generated shrunk transaction counterexample; expect and post-state query are captured from the server at export time. seed-id operands use $idRef against the first seeded document; missing ids remain literal probes.".to_string();
+    if omitted != 0 {
+        comment.push_str(&format!(
+            " Omitted {omitted} preamble cancelSchedule step(s) with id schedule-id: the property harness mints their schedule in a preamble, while corpus $idRef labels come only from seeded documents; literal missing-schedule-id cancelSchedule probes are retained."
+        ));
+    }
+    serde_json::json!({
+        "name": name,
+        "$comment": comment,
+        "schema": txn_schema_json(case),
+        "seed": seed,
+        "op": {"txn": {"steps": rewrite_counterexample_refs(Value::Array(steps))}},
+        "expect": Value::Null,
+        "normalize": ["_id","_creationTime","_version","id","scheduleId"],
+        "then": {"query": {"table": case.tables[0].name}, "unordered": true, "expect": Value::Null}
+    })
+}
+
+fn migrate_case_to_semantics_envelope(
+    case: &MigrateCase,
+    name: &str,
+    failure: &MigrateCaseFailure,
+) -> Value {
+    let dry_run = failure.phase == MigratePhase::Preview;
+    let message: String = failure.message.chars().take(240).collect();
+    let mut comment = format!(
+        "Generated shrunk migration counterexample; property failed in {} phase: {}. expect contains server-derived results for this dryRun={} operation.",
+        failure.phase.label(),
+        message,
+        dry_run
+    );
+    if dry_run {
+        comment.push_str(
+            " then omitted: dry-run rolls back, so post-migration queries are not expressible against the rolled-back database.",
+        );
+    }
+    let mut envelope = serde_json::json!({
+        "name": name,
+        "$comment": comment,
+        "schema": additive_migration_schema_json(),
+        "seed": [{"table":"docs","doc":{"owner":"u","editors":["v"],"nick":"Ada","score":4.0,"spare":1.0,"expires":4102444800000.0}}],
+        "op": {"migrate":{"directives":case.directives,"dryRun":dry_run}},
+        "expect": Value::Null,
+        "normalize": ["_id","_creationTime","_version","id"],
+    });
+    if !dry_run {
+        envelope["then"] = serde_json::json!({
+            "query": migrate_case_query_json(case),
+            "unordered": !case.count_query,
+            "expect": Value::Null
+        });
+    }
+    envelope
+}
+
+fn write_counterexample_to(
+    dir: &std::path::Path,
+    name: &str,
+    envelope: &Value,
+) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir).expect("create counterexample directory");
+    let path = dir.join(format!("{name}.json"));
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(envelope).expect("serialize counterexample"),
+    )
+    .expect("write counterexample");
+    path
+}
+
+fn counterexample_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/proptest-counterexamples")
+}
+
+async fn export_txn_counterexample(
+    pool: &sqlx::PgPool,
+    dir: &std::path::Path,
+    name: &str,
+    case: &TxnCase,
+) -> std::path::PathBuf {
+    let mut envelope = txn_case_to_semantics_envelope(case, name);
+    let captured = crate::semantics_corpus_test::capture_case_expect(pool, name, &envelope).await;
+    envelope["expect"] = captured.op;
+    if let Some(expect) = captured.then {
+        envelope["then"]["expect"] = expect;
+    } else {
+        envelope.as_object_mut().unwrap().remove("then");
+    }
+    write_counterexample_to(dir, name, &envelope)
+}
+
+async fn export_migrate_counterexample(
+    pool: &sqlx::PgPool,
+    dir: &std::path::Path,
+    name: &str,
+    case: &MigrateCase,
+    failure: &MigrateCaseFailure,
+) -> std::path::PathBuf {
+    let mut envelope = migrate_case_to_semantics_envelope(case, name, failure);
+    let captured = crate::semantics_corpus_test::capture_case_expect(pool, name, &envelope).await;
+    envelope["expect"] = captured.op;
+    if let Some(expect) = captured.then {
+        envelope["then"]["expect"] = expect;
+    } else {
+        envelope.as_object_mut().unwrap().remove("then");
+    }
+    write_counterexample_to(dir, name, &envelope)
+}
+
+#[test]
+fn txn_counterexample_envelope_replays_through_corpus_runner() {
+    let case = TxnCase {
+        tables: vec![TableCase {
+            name: "t0".into(),
+            fields: vec![("f_a".into(), Kind::Scalar(Scalar::Str))],
+            indexes: vec![("by_f_a".into(), vec![0])],
+            docs: vec![
+                serde_json::json!({"f_a":"seed-key"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                serde_json::json!({"f_a":"other"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ],
+        }],
+        steps: vec![
+            serde_json::json!({"op":"patch","table":"t0","id":"seed-id","fields":{"f_a":"patched"}}),
+            serde_json::json!({"op":"expectVersion","table":"t0","id":"seed-id","version":2}),
+            serde_json::json!({"op":"upsert","table":"t0","index":"by_f_a","eq":["other"],"insert":{"f_a":"other"},"patch":{"f_a":"upserted"}}),
+            serde_json::json!({"op":"patchByQuery","table":"t0","filter":{"op":"eq","field":"f_a","value":"patched"},"patch":{"f_a":"z"},"limit":1}),
+        ],
+    };
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let state = rt.block_on(async { test_state().await });
+    let path = rt.block_on(export_txn_counterexample(
+        &state.pool,
+        &counterexample_dir(),
+        "txn-counterexample-replay-check",
+        &case,
+    ));
+    let raw = std::fs::read_to_string(&path).expect("read exported envelope");
+    let envelope: Value = serde_json::from_str(&raw).expect("parse exported envelope");
+    assert_eq!(envelope["name"], "txn-counterexample-replay-check");
+    assert_eq!(envelope["seed"][0]["$id"], "seed");
+    assert_eq!(
+        envelope["op"]["txn"]["steps"][0]["id"],
+        serde_json::json!({"$idRef":"seed"})
+    );
+    assert!(envelope["expect"].is_array());
+    assert!(envelope["then"]["expect"].is_array());
+    rt.block_on(crate::semantics_corpus_test::run_case(
+        &state.pool,
+        "txn-counterexample-replay-check",
+        &envelope,
+    ));
+}
+
+#[test]
+fn txn_counterexample_retains_missing_schedule_cancel() {
+    let case = TxnCase {
+        tables: vec![TableCase {
+            name: "t0".into(),
+            fields: vec![("f_a".into(), Kind::Scalar(Scalar::Str))],
+            indexes: vec![],
+            docs: vec![
+                serde_json::json!({"f_a":"seed"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ],
+        }],
+        steps: vec![
+            serde_json::json!({"op":"cancelSchedule","id":"missing-schedule-id"}),
+            serde_json::json!({"op":"cancelSchedule","id":"schedule-id"}),
+        ],
+    };
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let state = rt.block_on(async { test_state().await });
+    let path = rt.block_on(export_txn_counterexample(
+        &state.pool,
+        &counterexample_dir(),
+        "txn-counterexample-schedule-labels",
+        &case,
+    ));
+    let raw = std::fs::read_to_string(&path).expect("read exported envelope");
+    let envelope: Value = serde_json::from_str(&raw).expect("parse exported envelope");
+    let steps = envelope["op"]["txn"]["steps"]
+        .as_array()
+        .expect("txn steps");
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0]["id"], "missing-schedule-id");
+    assert!(envelope["expect"].is_array());
+    assert!(envelope["then"]["expect"].is_array());
+    rt.block_on(crate::semantics_corpus_test::run_case(
+        &state.pool,
+        "txn-counterexample-schedule-labels",
+        &envelope,
+    ));
+}
+
+#[test]
+fn migrate_counterexample_envelope_replays_through_corpus_runner() {
+    let case = MigrateCase {
+        directives: vec![
+            serde_json::json!({"op":"renameField","table":"docs","from":"nick","to":"alias"}),
+            serde_json::json!({"op":"changeType","table":"docs","field":"spare","to":{"type":"string"},"cast":"toString"}),
+        ],
+        count_query: false,
+        query_kind: 0,
+    };
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let state = rt.block_on(async { test_state().await });
+    let failure = MigrateCaseFailure::apply("roundtrip apply phase");
+    let path = rt.block_on(export_migrate_counterexample(
+        &state.pool,
+        &counterexample_dir(),
+        "migrate-counterexample-replay-check",
+        &case,
+        &failure,
+    ));
+    let raw = std::fs::read_to_string(&path).expect("read exported envelope");
+    let envelope: Value = serde_json::from_str(&raw).expect("parse exported envelope");
+    assert_eq!(envelope["name"], "migrate-counterexample-replay-check");
+    assert_eq!(envelope["expect"]["applied"], true);
+    let derived = envelope["expect"]["schema"].to_string();
+    assert!(derived.contains("\"alias\"") && !derived.contains("\"nick\""));
+    assert_eq!(
+        envelope["expect"]["directives"].as_array().unwrap().len(),
+        2
+    );
+    assert!(envelope["then"]["expect"].is_array());
+    rt.block_on(crate::semantics_corpus_test::run_case(
+        &state.pool,
+        "migrate-counterexample-replay-check",
+        &envelope,
+    ));
+    let preview_failure = MigrateCaseFailure::preview("roundtrip preview phase");
+    let preview_path = rt.block_on(export_migrate_counterexample(
+        &state.pool,
+        &counterexample_dir(),
+        "migrate-counterexample-preview-check",
+        &case,
+        &preview_failure,
+    ));
+    let preview_raw = std::fs::read_to_string(&preview_path).expect("read preview envelope");
+    let preview_envelope: Value =
+        serde_json::from_str(&preview_raw).expect("parse preview envelope");
+    assert_eq!(preview_envelope["op"]["migrate"]["dryRun"], true);
+    assert_eq!(preview_envelope["expect"]["applied"], false);
+    rt.block_on(crate::semantics_corpus_test::run_case(
+        &state.pool,
+        "migrate-counterexample-preview-check",
+        &preview_envelope,
+    ));
+}
+
+#[test]
+fn migrate_counterexample_preview_rollback_replays() {
+    let case = MigrateCase {
+        directives: vec![
+            serde_json::json!({"op":"renameField","table":"docs","from":"owner","to":"account"}),
+        ],
+        count_query: false,
+        query_kind: 1,
+    };
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let state = rt.block_on(async { test_state().await });
+    let failure = MigrateCaseFailure::preview("preview rollback roundtrip");
+    let path = rt.block_on(export_migrate_counterexample(
+        &state.pool,
+        &counterexample_dir(),
+        "migrate-counterexample-preview-rollback",
+        &case,
+        &failure,
+    ));
+    let raw = std::fs::read_to_string(&path).expect("read exported envelope");
+    let envelope: Value = serde_json::from_str(&raw).expect("parse exported envelope");
+    assert_eq!(envelope["op"]["migrate"]["dryRun"], true);
+    assert_eq!(envelope["expect"]["applied"], false);
+    assert!(envelope.get("then").is_none());
+    rt.block_on(crate::semantics_corpus_test::run_case(
+        &state.pool,
+        "migrate-counterexample-preview-rollback",
+        &envelope,
+    ));
 }

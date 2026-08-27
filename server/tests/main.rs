@@ -36,6 +36,7 @@ mod notify_test;
 mod oauth_ms_apple_test;
 mod oauth_test;
 mod per_row_auth_test;
+mod pool_bound_test;
 mod presence_test;
 mod presence_xreplica_test;
 mod proptest_parity;

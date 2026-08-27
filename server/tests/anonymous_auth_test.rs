@@ -49,7 +49,7 @@ fn owner_schema() -> SchemaDef {
 async fn anon_enabled_state() -> Arc<AppState> {
     let mut config = test_config();
     config.auth_anonymous_enabled = true;
-    let pool = sqlx::PgPool::connect(&config.database_url)
+    let pool = crate::common::test_pool(&config.database_url)
         .await
         .expect("connect to test postgres");
     rtdb_server::db::bootstrap(&pool)
@@ -247,7 +247,7 @@ async fn sec103_anon_mint_is_ip_rate_limited() -> anyhow::Result<()> {
     let mut config = test_config();
     config.auth_anonymous_enabled = true;
     config.limits.anonymous_per_ip_rpm = 2;
-    let pool = sqlx::PgPool::connect(&config.database_url)
+    let pool = crate::common::test_pool(&config.database_url)
         .await
         .expect("connect to test postgres");
     rtdb_server::db::bootstrap(&pool).await.expect("bootstrap");

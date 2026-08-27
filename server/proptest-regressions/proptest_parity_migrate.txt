@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f14e3696ec5142405a9435b1922260a3c8ba3854726ce8d07dacdfa9461ece53 # shrinks to MigrateCase { directives: [Object {"from": String("nick"), "op": String("renameField"), "table": String("docs"), "to": String("alias")}] }

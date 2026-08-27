@@ -150,7 +150,7 @@ async fn insert_widgets_batch(addr: std::net::SocketAddr, db: &str, n: usize) {
 #[tokio::test]
 async fn cross_replica_op_feed_fan_out_and_self_dedupe() -> anyhow::Result<()> {
     let cfg = test_config();
-    let pool = sqlx::PgPool::connect(&cfg.database_url)
+    let pool = crate::common::test_shared_pool(&cfg.database_url, 8)
         .await
         .expect("connect to test postgres");
     rtdb_server::db::bootstrap(&pool)
@@ -218,7 +218,7 @@ async fn cross_replica_op_feed_fan_out_and_self_dedupe() -> anyhow::Result<()> {
 #[tokio::test]
 async fn multi_instance_disabled_does_not_fan_out() -> anyhow::Result<()> {
     let cfg = test_config();
-    let pool = sqlx::PgPool::connect(&cfg.database_url)
+    let pool = crate::common::test_shared_pool(&cfg.database_url, 2)
         .await
         .expect("connect to test postgres");
     rtdb_server::db::bootstrap(&pool)
@@ -268,7 +268,7 @@ async fn multi_instance_disabled_does_not_fan_out() -> anyhow::Result<()> {
 #[tokio::test]
 async fn large_batch_write_coalesces_notifications() -> anyhow::Result<()> {
     let cfg = test_config();
-    let pool = sqlx::PgPool::connect(&cfg.database_url)
+    let pool = crate::common::test_shared_pool(&cfg.database_url, 9)
         .await
         .expect("connect to test postgres");
     rtdb_server::db::bootstrap(&pool)

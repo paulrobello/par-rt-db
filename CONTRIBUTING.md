@@ -101,7 +101,18 @@ databases per test case (`t<uuid>`). Never assume exclusive access, and never
 drop a database or schema you didn't create.
 
 ```bash
-make test                                       # whole suite (dev-db-up + tests across all 8 packages)
+make test                                       # whole suite; properties use 64 cases by default
+
+# Property parity (server + in-memory engine):
+cargo test --manifest-path server/Cargo.toml --all-features --test main proptest_parity
+PROPTEST_CASES=1000 cargo test --manifest-path server/Cargo.toml --all-features --test main proptest_parity
+# Transaction/migration parity failures write runnable, server-captured
+# envelopes to the repository-root target/proptest-counterexamples/; query,
+# overflow, and destructive-schema failures persist as proptest seeds only.
+# Replay one exported envelope before promotion:
+RTDB_COUNTEREXAMPLE=target/proptest-counterexamples/<name>.json \
+  cargo test --manifest-path server/Cargo.toml --all-features --test main \
+  semantics_corpus_counterexample -- --ignored
 
 # Per-package:
 cd core && cargo test                           # core (par-rt-db-core) tests
@@ -122,8 +133,7 @@ cargo test upsert                                         # by name, lib + integ
 # A NEW test file needs a `mod <name>;` line in `tests/main.rs`.
 For multi-instance server tests, use `server/tests/common/cluster.rs` and
 `Cluster::two` instead of constructing replicas inline. The `test-support`
-feature provides gated `drop_replies` and `delay_listener` chaos hooks for
-failure-injection scenarios.
+feature provides gated `drop_replies` and `delay_listener` chaos hooks.
 
 cd ts-client && bunx vitest run tests/<file>.test.ts
 cd python-client && uv run pytest -q tests/<file>.py

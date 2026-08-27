@@ -1252,7 +1252,7 @@ async fn static_dir_serves_index_and_assets() -> anyhow::Result<()> {
 
     let mut cfg = crate::common::test_config();
     cfg.static_dir = Some(dir.to_string_lossy().to_string());
-    let pool = sqlx::PgPool::connect(&cfg.database_url).await?;
+    let pool = crate::common::test_pool(&cfg.database_url).await?;
     rtdb_server::db::bootstrap(&pool).await?;
     let state = rtdb_server::AppState::new(pool, cfg, crate::common::test_hot());
     let addr = crate::common::spawn_app(state).await;

@@ -314,7 +314,7 @@ async fn run_migrate(
 }
 
 /// Execute one corpus case end to end. Every failure names the case.
-async fn run_case(pool: &sqlx::PgPool, case_name: &str, case: &Value) {
+pub async fn run_case(pool: &sqlx::PgPool, case_name: &str, case: &Value) {
     // Fresh database per case: unique name derived from the case stem, RAII
     // guard held for the case's lifetime so cleanup cannot race the reads
     // (same pattern as golden_vector_test::seed_db).
@@ -518,6 +518,135 @@ async fn run_case(pool: &sqlx::PgPool, case_name: &str, case: &Value) {
     }
 }
 
+/// Server-derived expectations for one exported counterexample envelope
+/// (ENH-032): `op` is the `expect` block for the case's operation — per-step
+/// transaction results, the migrate result (applied flag, DERIVED schema,
+/// per-directive reports), or an `{"error": {"code": ...}}` envelope when the
+/// op fails on the server — and `then` the captured `expect` for the case's
+/// `then.query`, executed against the post-migrate derived schema. Both are
+/// already projected by the case's `normalize` list exactly as `assert_result`
+/// projects at replay time, so the values are writable verbatim.
+pub struct CapturedServerExpect {
+    pub op: Value,
+    pub then: Option<Value>,
+}
+
+/// Capture the server-derived `expect` blocks for an exported counterexample
+/// envelope — README "Adding a case" step 2 ("derive the expected value from
+/// the server"), automated. Mirrors `run_case`'s op path exactly (fresh
+/// database, `ddl::push_schema`, seed-via-`execute_txn` with `$id` label
+/// capture, `$idRef` substitution, `run_migrate` for `op.migrate`) but
+/// captures instead of asserting. Only the two shapes the ENH-032 exporter
+/// emits are accepted (`op.txn` / `op.migrate`). The export-roundtrip tests
+/// in `proptest_parity` run capture AND `run_case` on the same envelope, so
+/// any drift between the two paths fails the suite.
+pub async fn capture_case_expect(
+    pool: &sqlx::PgPool,
+    case_name: &str,
+    case: &Value,
+) -> CapturedServerExpect {
+    let db_name = db_name_for(case_name);
+    db::create_database(pool, &db_name)
+        .await
+        .unwrap_or_else(|e| panic!("{case_name}: create database: {e:?}"));
+    let _guard = wrap_test_db(db_name.clone());
+    let mut schema: SchemaDef = serde_json::from_value(case["schema"].clone())
+        .unwrap_or_else(|e| panic!("{case_name}: schema does not parse: {e}"));
+    ddl::push_schema(pool, &db_name, schema.clone())
+        .await
+        .unwrap_or_else(|e| panic!("{case_name}: push_schema: {e:?}"));
+
+    let single_table =
+        (schema.tables.len() == 1).then(|| schema.tables.keys().next().cloned().unwrap());
+    let mut ids: HashMap<String, String> = HashMap::new();
+    let seed = case["seed"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{case_name}: seed must be an array"));
+    for (i, entry) in seed.iter().enumerate() {
+        let (table, doc, label) = parse_seed_entry(entry, single_table.as_deref(), case_name);
+        let txn = Transaction {
+            steps: vec![Step::Insert {
+                table: table.clone(),
+                doc,
+            }],
+        };
+        let outcome: TxnOutcome =
+            execute_txn(pool, &db_name, &schema, &txn, &PrincipalCtx::bypass())
+                .await
+                .unwrap_or_else(|e| panic!("{case_name}: seed #{i} into '{table}': {e:?}"));
+        if let Some(label) = label {
+            let id = outcome.results[0]
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("{case_name}: seed #{i}: insert result missing id"))
+                .to_string();
+            ids.insert(label, id);
+        }
+    }
+    let case_keys = normalize_keys(case, &DEFAULT_NORMALIZE.map(|s| s.to_string()), case_name);
+
+    let error_envelope = |e: &RtDbError| serde_json::json!({"error": {"code": serde_json::to_value(e.code).expect("serialize error code")}});
+    let (op_result, derived): (Result<Value, RtDbError>, Option<SchemaDef>) =
+        if let Some(txn_json) = case.pointer("/op/txn") {
+            let txn: Transaction = serde_json::from_value(substitute(txn_json, &ids, case_name))
+                .unwrap_or_else(|e| panic!("{case_name}: op.txn does not parse: {e}"));
+            match execute_txn(pool, &db_name, &schema, &txn, &PrincipalCtx::bypass()).await {
+                Ok(outcome) => (Ok(Value::Array(outcome.results)), None),
+                Err(e) => (Err(e), None),
+            }
+        } else if let Some(migrate_json) = case.pointer("/op/migrate") {
+            let req: MigrateRequest =
+                serde_json::from_value(substitute(migrate_json, &ids, case_name))
+                    .unwrap_or_else(|e| panic!("{case_name}: op.migrate does not parse: {e}"));
+            match run_migrate(pool, &db_name, &schema, &req, case_name).await {
+                Ok((derived, result)) => (Ok(result), Some(derived)),
+                Err(e) => (Err(e), None),
+            }
+        } else {
+            panic!("{case_name}: capture expects an `op.txn` or `op.migrate` case");
+        };
+    // A failed op asserts its error code and has no `then` follow-up — the
+    // same rule `run_case` applies.
+    let op = match op_result {
+        Err(e) => {
+            return CapturedServerExpect {
+                op: error_envelope(&e),
+                then: None,
+            };
+        }
+        Ok(mut value) => {
+            project_recursive(&mut value, &case_keys);
+            value
+        }
+    };
+
+    let then = if let Some(then_block) = case.get("then") {
+        let q_json = substitute(
+            then_block
+                .get("query")
+                .unwrap_or_else(|| panic!("{case_name}: then requires query")),
+            &ids,
+            case_name,
+        );
+        let q: Query = serde_json::from_value(q_json)
+            .unwrap_or_else(|e| panic!("{case_name}: then.query does not parse: {e}"));
+        // A migrate op's follow-up reads through the DERIVED schema.
+        if let Some(derived) = &derived {
+            schema = derived.clone();
+        }
+        let r = execute_query(pool, &db_name, &schema, &q, &PrincipalCtx::bypass(), false)
+            .await
+            .unwrap_or_else(|e| panic!("{case_name}: then.query: {e:?}"));
+        let mut actual = serde_json::to_value(&r).expect("serialize then result");
+        let keys = normalize_keys(then_block, &case_keys, case_name);
+        project_recursive(&mut actual, &keys);
+        Some(actual)
+    } else {
+        None
+    };
+    CapturedServerExpect { op, then }
+}
+
 #[tokio::test]
 async fn semantics_corpus_runner() -> anyhow::Result<()> {
     // Enumerate the corpus at RUNTIME — the directory IS the count ("bumped
@@ -582,5 +711,40 @@ async fn semantics_corpus_runner() -> anyhow::Result<()> {
         executed,
         skipped
     );
+    Ok(())
+}
+
+/// ENH-032 promotion loop, loader half (wire-corpus/README.md "Promoting
+/// property-test counterexamples"): execute one exported counterexample
+/// envelope exactly like a promoted corpus case — read the generated file
+/// from disk, apply the loader's rules (parse, `name` == filename stem), and
+/// run it through `run_case`. Opt-in like the live-server tests: a clean
+/// checkout has no counterexample file to replay. From the repo root:
+///
+/// ```bash
+/// RTDB_COUNTEREXAMPLE=target/proptest-counterexamples/<name>.json \
+///   cargo test --manifest-path server/Cargo.toml --all-features --test main \
+///   semantics_corpus_counterexample -- --ignored
+/// ```
+#[tokio::test]
+#[ignore = "opt-in: set RTDB_COUNTEREXAMPLE to an exported envelope path"]
+async fn semantics_corpus_counterexample_replay() -> anyhow::Result<()> {
+    let path = std::env::var("RTDB_COUNTEREXAMPLE")
+        .expect("RTDB_COUNTEREXAMPLE must point at an exported counterexample envelope");
+    let stem = PathBuf::from(&path)
+        .file_stem()
+        .expect("envelope file stem")
+        .to_string_lossy()
+        .to_string();
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{stem}: read {path}: {e}"));
+    let case: Value = serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{stem}: parse: {e}"));
+    assert_eq!(
+        case["name"].as_str().unwrap_or_default(),
+        stem,
+        "{stem}: case `name` must equal the filename stem"
+    );
+    let state = test_state().await;
+    run_case(&state.pool, &stem, &case).await;
+    eprintln!("ok: replayed {stem}");
     Ok(())
 }

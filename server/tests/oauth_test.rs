@@ -20,7 +20,7 @@ async fn oauth_state_with_csrf(mock: &MockServer, csrf: bool) -> (Arc<AppState>,
     cfg.oauth.github.client_secret = Some("test-secret".into());
     cfg.oauth_login_csrf = csrf;
 
-    let pool = sqlx::PgPool::connect(&cfg.database_url)
+    let pool = crate::common::test_pool(&cfg.database_url)
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
@@ -863,7 +863,7 @@ async fn google_configured_state() -> (Arc<AppState>, SocketAddr) {
     let mut cfg = test_config();
     cfg.oauth.google.client_id = Some("g-client".into());
     cfg.oauth.google.client_secret = Some("g-secret".into());
-    let pool = sqlx::PgPool::connect(&cfg.database_url)
+    let pool = crate::common::test_pool(&cfg.database_url)
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
@@ -1206,10 +1206,10 @@ async fn cross_replica_login_completes_on_second_replica() -> anyhow::Result<()>
     cfg.oauth.github.client_secret = Some("test-secret".into());
     cfg.oauth_login_csrf = false;
 
-    // One shared pool = one Postgres, as in a real multi-instance deploy.
-    let pool = sqlx::PgPool::connect(&cfg.database_url)
+    // Six listener connections (three per replica) plus two writers.
+    let pool = crate::common::test_shared_pool(&cfg.database_url, 8)
         .await
-        .expect("connect to test postgres");
+        .expect("connect to shared OAuth test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
 
     // Replica A and replica B: distinct AppStates, same pool.

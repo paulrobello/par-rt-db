@@ -66,6 +66,16 @@ alter observable behavior on upgrade.
   migration.
 
 ### Added
+- **ENH-032 extends ENH-027 property testing to mutations and migrations.**
+  `server/tests/proptest_parity.rs` is the implementation authority: every
+  property runs 64 cases by default (the weekly CI job sets
+  `PROPTEST_CASES=1000`), and shrunk transaction/migration parity failures
+  export runnable semantics-corpus envelopes with server-captured expectations
+  under the repository-root `target/proptest-counterexamples/`; replay uses the
+  `semantics_corpus_counterexample` loader test. Query-parity,
+  cap-overflow, and destructive-schema properties retain failures as
+  `proptest-regressions/` seeds only. The existing ENH-027 query parity entry
+  is superseded by this broader coverage.
 
 - **Swift client (`ParRtDbClient` / `ParRtDbUI`) — the fourth SDK and the fifth
   implementation of the wire contract.** Wire types, the query/mutation/schema

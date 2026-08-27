@@ -95,7 +95,7 @@ fn test_hot() -> HotConfig {
 
 #[tokio::test]
 async fn healthz_returns_diagnostics() -> anyhow::Result<()> {
-    let pool = sqlx::PgPool::connect(&test_config().database_url).await?;
+    let pool = crate::common::test_pool(&test_config().database_url).await?;
     let state = AppState::new(pool, test_config(), test_hot());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -145,7 +145,7 @@ async fn healthz_returns_diagnostics() -> anyhow::Result<()> {
 }
 
 async fn spawn_for_cors() -> anyhow::Result<std::net::SocketAddr> {
-    let pool = sqlx::PgPool::connect(&test_config().database_url).await?;
+    let pool = crate::common::test_pool(&test_config().database_url).await?;
     let state = AppState::new(pool, test_config(), test_hot());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;

@@ -31,7 +31,7 @@ const ALLOWED_ORIGIN: &str = "http://localhost:5173";
 /// provider's helper can configure just its own fields. Mirrors
 /// `oauth_test.rs::google_configured_state`.
 async fn configured_state(cfg: Config) -> (Arc<AppState>, SocketAddr) {
-    let pool = sqlx::PgPool::connect(&cfg.database_url)
+    let pool = crate::common::test_pool(&cfg.database_url)
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");

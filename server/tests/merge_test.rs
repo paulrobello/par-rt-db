@@ -656,13 +656,13 @@ async fn merge_users_aborts_on_scan_failure_and_publishes_committed_restamps() -
         let trimmed = base_url.trim_end_matches('/');
         &trimmed[..trimmed.rfind('/').expect("database url has a path")]
     };
-    let base_pool = sqlx::PgPool::connect(&base_url).await?;
+    let base_pool = crate::common::test_pool(&base_url).await?;
     sqlx::query(&format!("CREATE DATABASE \"{pg_db}\""))
         .execute(&base_pool)
         .await?;
     let mut config = crate::common::test_config();
     config.database_url = format!("{server}/{pg_db}");
-    let pool = sqlx::PgPool::connect(&config.database_url).await?;
+    let pool = crate::common::test_pool(&config.database_url).await?;
     db::bootstrap(&pool).await?;
     let state = rtdb_server::AppState::new(pool, config, crate::common::test_hot());
 
@@ -1287,7 +1287,7 @@ async fn oauth_login_merges_anon_footprint_end_to_end() -> anyhow::Result<()> {
     cfg.oauth.github.client_secret = Some("test-secret".into());
     cfg.auth_anonymous_enabled = true;
 
-    let pool = sqlx::PgPool::connect(&cfg.database_url).await?;
+    let pool = crate::common::test_pool(&cfg.database_url).await?;
     db::bootstrap(&pool).await?;
     let state = AppState::new(pool, cfg, crate::common::test_hot());
     let addr = crate::common::spawn_app(state.clone()).await;
