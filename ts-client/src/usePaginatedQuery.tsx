@@ -3,17 +3,47 @@ import type { PaginatedResultJson, QueryJson } from "./protocol.js";
 import type { RtQuery } from "./query.js";
 import { useRtDbClient } from "./react.js";
 
+/**
+ * Options configuring the behavior of `usePaginatedQuery`.
+ */
 export interface UsePaginatedQueryOptions {
+  /**
+   * The maximum number of items to return in a single page.
+   */
   pageSize?: number;
+  /**
+   * Flag to temporarily disable the pagination query logic.
+   */
   enabled?: boolean;
 }
 
+/**
+ * The structured result object returned by `usePaginatedQuery`.
+ */
 export interface UsePaginatedQueryResult<T> {
+  /**
+   * Aligned stitched list of loaded query documents.
+   */
   data: T[];
+  /**
+   * Flag indicating whether a page subscription is currently loading.
+   */
   loading: boolean;
+  /**
+   * The last encountered subscription error.
+   */
   error: Error | null;
+  /**
+   * Flag indicating whether there are more pages that can be loaded.
+   */
   hasNextPage: boolean;
+  /**
+   * Triggers subscription and loading of the next page of results.
+   */
   loadMore: () => Promise<void>;
+  /**
+   * Refetches all pages from the beginning.
+   */
   refetch: () => Promise<void>;
 }
 

@@ -132,8 +132,17 @@ export function useMutation(): (txn: TransactionJson) => Promise<StepResult[]> {
  * the real dependency, so changing it leaves the old room and joins the new.
  */
 export function usePresence(room: string): {
+  /**
+   * The current list of members in the presence room.
+   */
   members: PresenceMember[];
+  /**
+   * Updates the current client's presence state in the room.
+   */
   updatePresence: (state: unknown, ttlMs?: number) => void;
+  /**
+   * Explicitly leaves the presence room.
+   */
   leavePresence: () => void;
 } {
   const { client } = useContextValue();
@@ -187,10 +196,25 @@ export type OAuthProvider = "github" | "google" | "gitlab" | "microsoft" | "appl
  * (HttpOnly session cookie; no script-readable credential) and token mode
  * (`getToken` + storage). */
 export function useRtDbAuth(): {
+  /**
+   * The current authentication state.
+   */
   state: AuthState;
+  /**
+   * The currently authenticated user, or null if unauthenticated.
+   */
   user: AuthedUser | null;
+  /**
+   * Triggers an OAuth sign-in flow (defaults to GitHub).
+   */
   signIn: (provider?: OAuthProvider) => Promise<void>;
+  /**
+   * Triggers an anonymous sign-in flow if enabled on the server.
+   */
   signInAnonymous: () => Promise<void>;
+  /**
+   * Triggers sign-out and clears all credentials.
+   */
   signOut: () => Promise<void>;
 } {
   const { client, authBaseUrl, state, user } = useContextValue();

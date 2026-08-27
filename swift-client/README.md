@@ -472,22 +472,14 @@ let results = try engine.mutate(txn)          // synchronous — no I/O
 let value = try engine.query(openTasks)        // raw JSONValue result
 ```
 
-## Full API
+## API reference
 
-Surfaces not shown in the examples above:
+The generated DocC reference covers the public `ParRtDbClient` API. From the
+repository root, run `make swift-client-doc`, then open the generated archive
+under [`docs-api`](docs-api). The examples above remain the recommended
+starting point for common client, HTTP, WebSocket, and in-memory flows.
+Published reference: https://paulrobello.github.io/par-rt-db/swift/
 
-| Symbol | Source file |
-| --- | --- |
-| `RtDbHttpClient.batchQuery(_:)` — run multiple queries in one request | `Sources/ParRtDbClient/HttpClient.swift` |
-| `RtDbHttpClient.findOneByIndex(...)` — single-row index lookup | `Sources/ParRtDbClient/HttpClient.swift` |
-| `RtDbHttpClient.upsertByIndex(...)` — insert-or-update keyed by index | `Sources/ParRtDbClient/HttpClient.swift` |
-| `RtDbClient.status()` — current `ClientStatus` (connection state + user) | `Sources/ParRtDbClient/WsClient.swift` |
-| `WsState` — coarse connection state enum (`idle`/`connecting`/`connected`/`reconnecting`/`closed`) | `Sources/ParRtDbClient/WsClient.swift` |
-| `LiveQuery.start()` / `LiveQuery.stop()` — begin/end a live query's subscription | `Sources/ParRtDbUI/LiveQuery.swift` |
-| `encodeCursor(_:)` / `decodeCursor(_:)` — pagination cursor codec, byte-compatible with the other four clients | `Sources/ParRtDbClient/Cursor.swift` |
-| `RtDbAdminClient.dbStats(_:)` — table/row/storage counts for a database | `Sources/ParRtDbClient/AdminClient.swift` |
-| `RtDbAdminClient.listSubscriptions(db:)` — active subscriptions across the instance or one database | `Sources/ParRtDbClient/AdminClient.swift` |
-| `InMemoryRtDbClient` — in-process engine implementing the same query/mutate/schema surface (see [In-memory engine](#in-memory-engine)) | `Sources/ParRtDbClient/InMemoryEngine.swift` |
 
 ## Testing
 

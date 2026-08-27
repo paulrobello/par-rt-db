@@ -1,5 +1,8 @@
 import type { RtDbErrorEnvelope } from "./errors.js";
 
+/**
+ * Direction order for index ranges and query sorting.
+ */
 export type Order = "asc" | "desc";
 
 /** Mirrors server `query::Query` (serde `deny_unknown_fields`). */
@@ -33,8 +36,17 @@ export interface QueryJson {
   fields?: string[];
 }
 
+/**
+ * Parameters for cursor-based query pagination on the wire.
+ */
 export interface Paginate {
+  /**
+   * The cursor offset from the last page.
+   */
   cursor?: string;
+  /**
+   * The max number of items to return in this page.
+   */
   numItems: number;
 }
 
@@ -313,7 +325,13 @@ export type StepJson =
   | { op: "startWorkflow"; spec: WorkflowSpec }
   | { op: "cancelWorkflow"; id: string };
 
+/**
+ * Structured wire envelope for multi-step transaction mutations.
+ */
 export interface TransactionJson {
+  /**
+   * List of mutation steps.
+   */
   steps: StepJson[];
 }
 
@@ -463,9 +481,21 @@ export interface SchemaHistoryEntry extends SchemaHistoryEntrySummary {
  */
 export type AuthedUserKind = "user" | "machine";
 
+/**
+ * Structured representation of the authenticated user's session profile.
+ */
 export interface AuthedUser {
+  /**
+   * The authentication provider kind.
+   */
   kind: AuthedUserKind;
+  /**
+   * The user's email address.
+   */
   email?: string | null;
+  /**
+   * The user's display name.
+   */
   name?: string | null;
   /** GitHub login. Absent on the wire for machine tokens / non-GitHub users. */
   githubLogin?: string | null;
@@ -565,8 +595,17 @@ export interface VectorIndexSpec {
   metric?: DistanceMetric;
 }
 
+/**
+ * Structured index definition layout on the wire.
+ */
 export interface IndexJson {
+  /**
+   * Unique name identifying this index.
+   */
   name: string;
+  /**
+   * Table fields compiled into the index keys, in order.
+   */
   fields: string[];
   /** `true` marks a full-text search index; omitted on the wire for ordinary btree indexes. */
   search?: boolean;
@@ -598,8 +637,17 @@ export interface TtlDef {
   defaultDurationMs?: number;
 }
 
+/**
+ * Structured database table definition schema on the wire.
+ */
 export interface TableJson {
+  /**
+   * Schema definition of the table fields.
+   */
   fields: Record<string, FieldTypeJson>;
+  /**
+   * Optional indexes defined on the table.
+   */
   indexes?: IndexJson[];
   /** Opt-in per-row authorization: names a declared string-compatible field
    * whose value is the owning user's id. Server-enforced; clients only declare
@@ -667,6 +715,12 @@ export interface TableJson {
   softDelete?: boolean;
 }
 
+/**
+ * Structured representation of the full database schema layout on the wire.
+ */
 export interface SchemaJson {
+  /**
+   * Mapping of table name to table schema.
+   */
   tables: Record<string, TableJson>;
 }

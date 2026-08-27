@@ -1,0 +1,9 @@
+{
+  "name": "@par-rt-db/client-docs-toolchain",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "typedoc": "0.28.20",
+    "typescript": "5.9.3"
+  }
+}

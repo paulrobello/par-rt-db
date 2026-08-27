@@ -231,6 +231,9 @@ export interface TableApi<DocT, Indexes extends string> {
   get(id: Id<string> | string): RtQuery<DocT | null>;
 }
 
+/**
+ * Typed API client surface mapped from database schema definition S.
+ */
 export type ClientApi<S extends SchemaDefinition<any>> = {
   [T in TableNames<S>]: TableApi<Doc<S, T>, IndexNamesOf<S, T>>;
 };

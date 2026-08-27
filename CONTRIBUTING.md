@@ -390,7 +390,8 @@ A stale doc that contradicts the code is a bug.
 
 Before requesting review:
 
-- [ ] `make checkall` passes locally on a clean checkout.
+- [ ] `make checkall` passes locally on a clean checkout, including `make docs-api`.
+- [ ] `make docs-api` produces warning-free Rust, TypeScript, Python, and Swift references.
 - [ ] Tests are added or updated for any new behavior (every package the change touches).
 - [ ] If the change alters the wire protocol or DSL, all five clients (`server`, `ts-client`, `rust-client`, `python-client`, `swift-client`) are updated and tested in the same PR, and `FEATURE_MATRIX.md` reflects the new state.
 - [ ] No `unwrap()`/`expect()` outside `#[cfg(test)]`; no new clippy warnings.

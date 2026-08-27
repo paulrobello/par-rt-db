@@ -29,7 +29,7 @@ that produced it.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_serializer
 from pydantic_core.core_schema import SerializerFunctionWrapHandler
@@ -44,6 +44,8 @@ from .wire import (
     VectorSearchQuery,
     to_camel,
 )
+
+T = TypeVar("T")
 
 
 class _Paginate(BaseModel):

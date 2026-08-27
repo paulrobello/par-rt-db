@@ -25,7 +25,8 @@
     "test:integration": "vitest run tests/integration",
     "lint": "biome lint src tests",
     "fmt": "biome format --write src tests",
-    "fmt-check": "biome format src tests"
+    "fmt-check": "biome format src tests",
+    "doc": "cd docs-toolchain && bun run typedoc --options ../typedoc.json"
   },
   "peerDependencies": {
     "react": ">=18"

@@ -23,6 +23,7 @@ SWIFT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(1),$(SW
 	python-client-install python-client-test python-client-lint python-client-fmt \
 	python-client-typecheck python-client-checkall rust-client-check-features rtdb-cli deploy \
 	env-drift-check dockerfile-stub-check cli-docs cli-docs-check \
+	rust-client-doc ts-client-doc python-client-doc swift-client-doc docs-api \
 	swift-client-build swift-client-test swift-client-lint swift-client-fmt \
 	swift-client-fmt-check swift-client-typecheck swift-client-checkall \
 	bench-micro bench bench-baseline
@@ -113,7 +114,7 @@ test: dev-db-up
 
 ts-client-install:
 	cd ts-client && bun install
-
+	cd ts-client/docs-toolchain && bun install --frozen-lockfile
 dashboard-install:
 	bun install
 	cd dashboard && bun install
@@ -186,6 +187,21 @@ rust-client-check-features:
 	@echo "=== rust-client: cargo doc --all-features (deny warnings) ==="
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --manifest-path rust-client/Cargo.toml
 
+
+rust-client-doc:
+	RUSTDOCFLAGS="-D warnings -D rustdoc::broken_intra_doc_links" cargo doc --no-deps --all-features --manifest-path rust-client/Cargo.toml
+
+ts-client-doc:
+	cd ts-client && bun run doc
+
+python-client-doc:
+	cd python-client && uv run --all-extras pdoc par_rt_db -o docs-api --docformat google
+
+swift-client-doc:
+	$(call SWIFT_IF_DARWIN,mkdir -p docs-api && swift package --allow-writing-to-directory docs-api generate-documentation --target ParRtDbClient --output-path docs-api/ParRtDbClient.doccarchive --transform-for-static-hosting --hosting-base-path par-rt-db/swift --warnings-as-errors)
+
+docs-api: rust-client-doc ts-client-doc python-client-doc swift-client-doc
+
 rtdb-cli:
 	cd cli && cargo build --release
 
@@ -220,7 +236,7 @@ env-drift-check:
 dockerfile-stub-check:
 	./scripts/dockerfile-stub-check.sh
 
-checkall: env-drift-check dockerfile-stub-check cli-docs-check fmt-check lint typecheck test rust-client-check-features
+checkall: env-drift-check dockerfile-stub-check cli-docs-check docs-api fmt-check lint typecheck test rust-client-check-features
 
 # ENH-033: criterion micro-benchmarks over the pure hot paths (server) and the
 # in-memory engine (rust-client). No Postgres, no server process. Deliberately

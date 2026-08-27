@@ -20,7 +20,13 @@ import type {
 import type { RtQuery } from "./query.js";
 import type { AnySchema } from "./schema.js";
 
+/**
+ * Options for configuring the `RtDbAdminClient`.
+ */
 export interface RtDbAdminClientOptions {
+  /**
+   * The base URL of the Realtime Database server admin API.
+   */
   url: string;
   /** Instance admin key. When set, every request carries
    *  `Authorization: Bearer <adminKey>` (the CLI/automation path). When omitted,
@@ -31,6 +37,9 @@ export interface RtDbAdminClientOptions {
    *  verbs). Cookie mode is how the operator dashboard — a same-origin SPA with
    *  no JS-readable admin key — consumes this client. */
   adminKey?: string;
+  /**
+   * Optional custom fetch implementation to override the global fetch.
+   */
   fetch?: typeof fetch;
   /** Injectable WebSocket constructor (browser/Node/bun). Defaults to the global
    *  `WebSocket`. The second arg carries the WS subprotocol(s) — `/admin/stream`
@@ -40,18 +49,49 @@ export interface RtDbAdminClientOptions {
   webSocketFactory?: (url: string, protocols?: string | string[]) => WebSocketLike;
 }
 
+/**
+ * Represents an administrative user member.
+ */
 export interface AdminMember {
+  /**
+   * The member's email address.
+   */
   email: string;
+  /**
+   * The member's optional GitHub user ID.
+   */
   githubId?: number;
 }
 
+/**
+ * Represents statistics for a single database table.
+ */
 export interface TableStat {
+  /**
+   * The name of the table.
+   */
   name: string;
+  /**
+   * The total number of rows in the table.
+   */
   rowCount: number;
+  /**
+   * The size of the table in bytes.
+   */
   sizeBytes: number;
 }
+
+/**
+ * Combined statistics for a database.
+ */
 export interface DbStats {
+  /**
+   * An array of stats per table.
+   */
   tables: TableStat[];
+  /**
+   * The total size of all tables in bytes.
+   */
   totalSizeBytes: number;
   /** ENH-011 per-db quota/usage fields (0 = unlimited). Server always emits all six. */
   tablesQuota: number;
@@ -61,10 +101,25 @@ export interface DbStats {
   subsQuota: number;
   subsUsed: number;
 }
+/**
+ * Metadata representing information about an administrative token.
+ */
 export interface TokenInfo {
+  /**
+   * Unique identifier of the token.
+   */
   id: string;
+  /**
+   * User-supplied descriptive name for the token.
+   */
   name: string;
+  /**
+   * Epoch timestamp when the token was created.
+   */
   createdAt: number;
+  /**
+   * Flag indicating whether the token has been revoked.
+   */
   revoked: boolean;
   /** Server always sends these three; `null` means "no limit" (full access). */
   expiresAt: number | null;
@@ -113,11 +168,27 @@ export interface MintTokenOptions {
   readOnly?: boolean;
   tables?: string[];
 }
+/**
+ * Percentile latency measurements for server operations.
+ */
 export interface LatencyStats {
+  /**
+   * The 50th percentile (median) latency in milliseconds.
+   */
   p50: number;
+  /**
+   * The 95th percentile latency in milliseconds.
+   */
   p95: number;
+  /**
+   * The 99th percentile latency in milliseconds.
+   */
   p99: number;
 }
+
+/**
+ * A snapshot of server-wide telemetry metrics.
+ */
 export interface MetricsSnapshot {
   queriesTotal: number;
   mutationsTotal: number;
@@ -154,6 +225,9 @@ export interface MetricsSnapshot {
    *  includes it on `/admin/metrics`. Absent on older server builds. */
   perDbSubs?: DbSubCounters[];
 }
+/**
+ * Represents the runtime configuration variables that can be hot-patched on the server.
+ */
 export interface HotConfig {
   allowedOrigins: string[];
   sessionTtlDays: number;
@@ -164,6 +238,9 @@ export interface HotConfig {
   maxStorageBytesPerDb: number;
   maxSubsPerDb: number;
 }
+/**
+ * The full configuration profile response returned by the server.
+ */
 export interface ConfigResponse {
   port: number;
   publicUrl: string;
@@ -180,6 +257,9 @@ export interface ConfigResponse {
   gitCommit: string;
   admins: AdminMember[];
 }
+/**
+ * Patch object for updating server runtime configuration variables.
+ */
 export interface HotConfigPatch {
   allowedOrigins?: string[];
   sessionTtlDays?: number;
@@ -190,7 +270,14 @@ export interface HotConfigPatch {
   maxStorageBytesPerDb?: number;
   maxSubsPerDb?: number;
 }
+/**
+ * Union of valid operation event kinds recorded by the mutation/change log.
+ */
 export type OpEventKind = "insert" | "patch" | "replace" | "delete" | "upsert";
+
+/**
+ * An entry in the mutation event log representing a database change event.
+ */
 export interface OpEvent {
   db: string;
   table: string;

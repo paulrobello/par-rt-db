@@ -61,9 +61,21 @@ export const ALL_ERROR_CODES: readonly RtDbErrorCode[] = [
 
 const CODES: ReadonlySet<string> = new Set<RtDbErrorCode>(ALL_ERROR_CODES);
 
+/**
+ * The JSON wire envelope structure for errors returned by the server.
+ */
 export interface RtDbErrorEnvelope {
+  /**
+   * The structured error code.
+   */
   code: RtDbErrorCode;
+  /**
+   * Human-readable explanation of the error.
+   */
   message: string;
+  /**
+   * Optional number of seconds the client should wait before retrying.
+   */
   retryAfter?: number;
 }
 
@@ -90,6 +102,9 @@ export class RtDbError extends Error {
     this.status = status;
   }
 
+  /**
+   * Checks whether an unknown object matches the structure of `RtDbErrorEnvelope`.
+   */
   static isEnvelope(value: unknown): value is RtDbErrorEnvelope {
     return (
       typeof value === "object" &&
@@ -102,6 +117,9 @@ export class RtDbError extends Error {
     );
   }
 
+  /**
+   * Creates an `RtDbError` from a wire `RtDbErrorEnvelope`.
+   */
   static fromEnvelope(envelope: RtDbErrorEnvelope, status?: number): RtDbError {
     return new RtDbError(envelope.code, envelope.message, envelope.retryAfter, status);
   }

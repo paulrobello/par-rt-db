@@ -50,6 +50,9 @@ export interface Validator<T, Optional extends boolean = false> {
   readonly __optional?: Optional;
 }
 
+/**
+ * Infers the TypeScript type validated by a Validator.
+ */
 export type Infer<V> = V extends Validator<infer T, boolean> ? T : never;
 
 function makeValidator<T, Optional extends boolean = false>(
@@ -75,6 +78,9 @@ function fieldsToJson(
  * reads are text extraction (numbers become `"42"`-style strings, mirroring
  * the server's `doc->>'field'`), arithmetic coerces its operands back to
  * numbers, and `concat` skips null parts. */
+/**
+ * Expression builder namespace for defining computed fields.
+ */
 export const ve = {
   /** A declared field on the same table, read as text (`doc->>'field'`). */
   field: (name: string): ValueExprJson => ({ op: "field", field: name }),
@@ -82,8 +88,11 @@ export const ve = {
   literal: (value: unknown): ValueExprJson => ({ op: "literal", value }),
   /** String concatenation; null parts are skipped (all-null → `""`). */
   concat: (...parts: ValueExprJson[]): ValueExprJson => ({ op: "concat", parts }),
+  /** Adds two computed expressions. */
   add: (left: ValueExprJson, right: ValueExprJson): ValueExprJson => ({ op: "add", left, right }),
+  /** Subtracts two computed expressions. */
   sub: (left: ValueExprJson, right: ValueExprJson): ValueExprJson => ({ op: "sub", left, right }),
+  /** Multiplies two computed expressions. */
   mul: (left: ValueExprJson, right: ValueExprJson): ValueExprJson => ({ op: "mul", left, right }),
   /** Division; a zero divisor fails the write at evaluation time — guard the
    * divisor with `ve.case`/`ve.coalesce` when it may be zero. */
@@ -111,10 +120,17 @@ export const ve = {
   }),
 };
 
+/**
+ * Validator namespace for declaring table field types.
+ */
 export const t = {
+  /** Creates a string validator. */
   string: (): Validator<string> => makeValidator({ type: "string" }),
+  /** Creates a number validator. */
   number: (): Validator<number> => makeValidator({ type: "number" }),
+  /** Creates a boolean validator. */
   boolean: (): Validator<boolean> => makeValidator({ type: "boolean" }),
+  /** Creates a null validator. */
   null: (): Validator<null> => makeValidator({ type: "null" }),
   /** An id referencing `table`. `opts.onDelete` (FM-33) declares the action the
    * server takes on child rows when the referenced parent row is hard-deleted:
@@ -130,29 +146,42 @@ export const t = {
       table,
       ...(opts?.onDelete ? { onDelete: opts.onDelete } : {}),
     }),
+  /** Creates a validator for a specific literal value. */
   literal: <L extends string | number | boolean>(value: L): Validator<L> =>
     makeValidator({ type: "literal", value }),
+  /** Wraps another validator to make its field optional. */
   optional: <T>(inner: Validator<T, boolean>): Validator<T | undefined, true> =>
     makeValidator({ type: "optional", inner: inner.json }),
+  /** Creates a union validator matching any of the variants. */
   union: <Vs extends [Validator<unknown, boolean>, ...Validator<unknown, boolean>[]]>(
     ...variants: Vs
   ): Validator<Infer<Vs[number]>> =>
     makeValidator({ type: "union", variants: variants.map((v) => v.json) }),
+  /** Creates an array validator. */
   array: <T>(element: Validator<T, boolean>): Validator<T[]> =>
     makeValidator({ type: "array", element: element.json }),
+  /** Creates a nested object validator. */
   object: <S extends Record<string, Validator<unknown, boolean>>>(
     fields: S,
   ): Validator<{ [K in keyof S]: Infer<S[K]> }> =>
     makeValidator({ type: "object", fields: fieldsToJson(fields) }),
+  /** Creates a record validator mapping keys to values of the inner validator. */
   record: <T>(value: Validator<T, boolean>): Validator<Record<string, T>> =>
     makeValidator({ type: "record", value: value.json }),
+  /** Creates a validator matching any value. */
   any: (): Validator<unknown> => makeValidator({ type: "any" }),
+  /** Creates a string-formatted bytes validator. */
   bytes: (): Validator<string> => makeValidator({ type: "bytes" }),
+  /** Creates a 64-bit integer validator. */
   int64: (): Validator<Int64> => makeValidator({ type: "int64" }),
+  /** Creates a float vector validator with set dimensions. */
   vector: (dimensions: number): Validator<number[]> =>
     makeValidator({ type: "vector", dimensions }),
 };
 
+/**
+ * Definition representation of a database table schema.
+ */
 export class TableDefinition<
   Fields extends Record<string, Validator<unknown, boolean>>,
   Indexes extends string = never,
@@ -178,6 +207,9 @@ export class TableDefinition<
     readonly computedMap?: Record<string, ValueExprJson>,
   ) {}
 
+  /**
+   * Defines a btree range index on the table.
+   */
   index<Name extends string>(
     name: Name,
     fields: [keyof Fields & string, ...(keyof Fields & string)[]],
@@ -531,6 +563,9 @@ export class TableDefinition<
     );
   }
 
+  /**
+   * Converts the table definition to its JSON representation for the wire.
+   */
   toJSON(): TableJson {
     const json: TableJson = { fields: fieldsToJson(this.fields) };
     if (this.indexes.length > 0) {
@@ -579,9 +614,15 @@ export function defineTable<Fields extends Record<string, Validator<unknown, boo
   return new TableDefinition(fields);
 }
 
+/**
+ * Definition representation of the complete database schema layout.
+ */
 export class SchemaDefinition<Tables extends Record<string, TableDefinition<any, string, any>>> {
   constructor(readonly tables: Tables) {}
 
+  /**
+   * Converts the database schema definition to its JSON representation for the DDL wire.
+   */
   toJSON(): SchemaJson {
     const tables: Record<string, TableJson> = {};
     for (const [name, table] of Object.entries(this.tables)) {
@@ -603,9 +644,21 @@ export function defineSchema<Tables extends Record<string, TableDefinition<any, 
 
 // ---- Type-level document derivation ----
 
+/**
+ * Standard system fields automatically stamped by the database server.
+ */
 export interface SystemFields<TableName extends string> {
+  /**
+   * Unique row identifier.
+   */
   _id: Id<TableName>;
+  /**
+   * Server epoch timestamp (ms) when the row was first inserted.
+   */
   _creationTime: number;
+  /**
+   * Optimistic concurrency version counter bumped on every mutate step.
+   */
   _version: number;
 }
 
@@ -628,11 +681,17 @@ export type DocFields<Fields extends Record<string, Validator<unknown, boolean>>
  */
 export type AnySchema = SchemaDefinition<Record<string, TableDefinition<any, string, any>>>;
 
+/**
+ * Helper type-level extractor matching all table names defined in schema S.
+ */
 export type TableNames<S extends AnySchema> = keyof S["tables"] & string;
 
 type FieldsOf<S extends AnySchema, T extends TableNames<S>> =
   S["tables"][T] extends TableDefinition<infer F, string, any> ? F : never;
 
+/**
+ * Helper type-level extractor matching all index names defined on table T under schema S.
+ */
 export type IndexNamesOf<S extends AnySchema, T extends TableNames<S>> =
   S["tables"][T] extends TableDefinition<any, infer I, any> ? I : never;
 

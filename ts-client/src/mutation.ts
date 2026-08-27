@@ -148,11 +148,17 @@ export function parseStepResults(results: unknown[]): StepResult[] {
 export class TxnBuilder<S extends SchemaDefinition<any> = SchemaDefinition<any>> {
   private readonly steps: StepJson[] = [];
 
+  /**
+   * Adds an insert step to the transaction.
+   */
   insert<T extends TableNames<S>>(table: T, doc: WithoutSystemFields<S, T>): this {
     this.steps.push({ op: "insert", table, doc });
     return this;
   }
 
+  /**
+   * Adds a patch step to the transaction.
+   */
   patch<T extends TableNames<S>>(
     table: T,
     id: string,
@@ -162,11 +168,17 @@ export class TxnBuilder<S extends SchemaDefinition<any> = SchemaDefinition<any>>
     return this;
   }
 
+  /**
+   * Adds a replace step to the transaction.
+   */
   replace<T extends TableNames<S>>(table: T, id: string, doc: WithoutSystemFields<S, T>): this {
     this.steps.push({ op: "replace", table, id, doc });
     return this;
   }
 
+  /**
+   * Adds a delete step to the transaction.
+   */
   delete<T extends TableNames<S>>(table: T, id: string): this {
     this.steps.push({ op: "delete", table, id });
     return this;
@@ -179,16 +191,25 @@ export class TxnBuilder<S extends SchemaDefinition<any> = SchemaDefinition<any>>
     return this;
   }
 
+  /**
+   * Adds a version expectation check to the transaction.
+   */
   expectVersion<T extends TableNames<S>>(table: T, id: string, version: number): this {
     this.steps.push({ op: "expectVersion", table, id, version });
     return this;
   }
 
+  /**
+   * Adds a check to expect a document is absent for a given key.
+   */
   expectAbsent<T extends TableNames<S>>(table: T, index: IndexNamesOf<S, T>, eq: unknown[]): this {
     this.steps.push({ op: "expectAbsent", table, index, eq });
     return this;
   }
 
+  /**
+   * Adds an upsert step to the transaction.
+   */
   upsert<T extends TableNames<S>>(
     table: T,
     args: {
@@ -202,6 +223,9 @@ export class TxnBuilder<S extends SchemaDefinition<any> = SchemaDefinition<any>>
     return this;
   }
 
+  /**
+   * Adds a patchByQuery step to patch multiple rows matching a filter.
+   */
   patchByQuery<T extends TableNames<S>>(
     table: T,
     filter: FilterExpr,
@@ -218,6 +242,9 @@ export class TxnBuilder<S extends SchemaDefinition<any> = SchemaDefinition<any>>
     return this;
   }
 
+  /**
+   * Adds a deleteByQuery step to delete multiple rows matching a filter.
+   */
   deleteByQuery<T extends TableNames<S>>(table: T, filter: FilterExpr, limit?: number): this {
     this.steps.push({ op: "deleteByQuery", table, filter, ...(limit !== undefined && { limit }) });
     return this;
@@ -249,6 +276,9 @@ export class TxnBuilder<S extends SchemaDefinition<any> = SchemaDefinition<any>>
     return this;
   }
 
+  /**
+   * Builds and returns the structured transaction representation.
+   */
   build(): TransactionJson {
     return { steps: [...this.steps] };
   }
@@ -267,8 +297,17 @@ export function awaitSignal(name: string, timeoutMs?: number): WorkflowStepSpec 
   };
 }
 
+/**
+ * Creates a new TxnBuilder instance.
+ */
 export function mutation(): TxnBuilder<SchemaDefinition<any>>;
+/**
+ * Creates a new TxnBuilder instance typed for schema S.
+ */
 export function mutation<S extends SchemaDefinition<any>>(schema: S): TxnBuilder<S>;
+/**
+ * Creates a new TxnBuilder instance.
+ */
 export function mutation<S extends SchemaDefinition<any>>(_schema?: S): TxnBuilder<S> {
   return new TxnBuilder<S>();
 }

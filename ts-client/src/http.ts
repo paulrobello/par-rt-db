@@ -14,10 +14,25 @@ import type {
 import { PROTOCOL_VERSION } from "./protocol.js";
 import type { RtQuery } from "./query.js";
 
+/**
+ * Options for configuring the `RtDbHttpClient`.
+ */
 export interface RtDbHttpClientOptions {
+  /**
+   * Base URL of the Realtime Database instance.
+   */
   url: string;
+  /**
+   * The target database name.
+   */
   db: string;
+  /**
+   * The authorization Bearer token.
+   */
   token: string;
+  /**
+   * Optional custom fetch implementation to override the global fetch.
+   */
   fetch?: typeof fetch;
 }
 
@@ -90,6 +105,9 @@ export class RtDbHttpClient {
     this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
   }
 
+  /**
+   * Executes a database query.
+   */
   async query<R>(query: RtQuery<R>): Promise<R> {
     const body = await this.post("/api/query", { db: this.db, query: query.json });
     return (body as { result: R }).result;
@@ -168,6 +186,9 @@ export class RtDbHttpClient {
     return (body as { ok: boolean }).ok;
   }
 
+  /**
+   * Lists all workflows/tasks scheduled on the server.
+   */
   async listSchedules(): Promise<ScheduleInfo[]> {
     const body = await this.post("/api/schedules", { db: this.db });
     return (body as { schedules: ScheduleInfo[] }).schedules;
@@ -271,6 +292,9 @@ export class RtDbHttpClient {
     return (await this.parse(response, path)) as UploadResult;
   }
 
+  /**
+   * Deletes a stored file by its unique identifier.
+   */
   async deleteFile(id: string): Promise<void> {
     await this.fetchImpl(
       `${this.url}/api/storage/${encodeURIComponent(this.db)}/${encodeURIComponent(id)}`,
@@ -286,6 +310,9 @@ export class RtDbHttpClient {
     ).then((r) => this.requireOk(r));
   }
 
+  /**
+   * Retrieves metadata for a stored file.
+   */
   async getFileMetadata(id: string): Promise<FileMetadata> {
     const body = await this.get(
       `/api/storage/${encodeURIComponent(this.db)}/${encodeURIComponent(id)}/metadata`,

@@ -506,6 +506,9 @@ export class PresenceRooms {
   }
 }
 
+/**
+ * Options for configuring the `InMemoryRtDbClient`.
+ */
 export interface InMemoryRtDbClientOptions {
   /** Injectable clock (epoch ms) for deterministic `_creationTime` and id minting. */
   now?: () => number;
@@ -1400,6 +1403,9 @@ export class InMemoryRtDbClient {
     return true;
   }
 
+  /**
+   * Lists all workflows/tasks scheduled in this in-memory instance.
+   */
   async listSchedules(): Promise<ScheduleInfo[]> {
     return [...this.schedules.values()].map((job) => this.toScheduleInfo(job));
   }
@@ -1572,12 +1578,18 @@ export class InMemoryRtDbClient {
     };
   }
 
+  /**
+   * Deletes a stored file by its unique identifier from the in-memory store.
+   */
   async deleteFile(id: string): Promise<void> {
     if (!this.files.delete(id)) {
       throw new RtDbError("NOT_FOUND", "unknown file");
     }
   }
 
+  /**
+   * Retrieves metadata for a stored file in the in-memory store.
+   */
   async getFileMetadata(id: string): Promise<FileMetadata> {
     const f = this.files.get(id);
     if (!f) {

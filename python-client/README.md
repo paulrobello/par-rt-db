@@ -560,67 +560,14 @@ body; `RtDbError.status_code` returns the mapped HTTP status.
 `retry_on_precondition` (in `par_rt_db.errors`) is a bounded async helper for
 read-modify-write loops (`expect_version` / `expect_absent` + retry).
 
-## Full API
+## API reference
 
-Every public symbol not already covered by an example above. Import path
-resolves through the package root (`from par_rt_db import <Name>`) unless a
-module is given.
-
-### Wire and DSL types
-
-| Symbol | Module | Description |
-| --- | --- | --- |
-| `FilterExpr` | `par_rt_db.wire` | Query/`filter()`/`authorize`/partial-index `where` predicate expression type. |
-| `AfterMs` / `RunAt` / `Cron` / `Interval` | `par_rt_db.wire` | `ScheduleWhen` variants for `schedule(when, txn)` — fire once after a delay, once at an instant, or repeatedly on a cron/interval schedule. |
-| `AwaitSignalSpec` | `par_rt_db.wire` | Wire spec for a workflow's `awaitSignal` step; build one with `await_signal()` (`par_rt_db.mutation`) rather than constructing it directly. |
-| `ValueExpr` | `par_rt_db.value_expr` | Computed-field expression type built with the `ve.*` constructors (see Computed fields above). |
-| `CaseWhen` | `par_rt_db.value_expr` | One branch of a `ve.case(whens, otherwise)` computed-field expression. |
-
-### Reactive client: presence (`[ws]` extra)
-
-| Symbol | Module | Description |
-| --- | --- | --- |
-| `RtDbClient.presence(room, state=None)` | `par_rt_db.ws_client` | Join a presence room with optional initial state; returns a `Presence` handle. |
-| `RtDbClient.update_presence(room, state, ttl_ms=None)` | `par_rt_db.ws_client` | Broadcast updated state for this connection in `room`. |
-| `RtDbClient.leave_presence(room)` | `par_rt_db.ws_client` | Leave a presence room. |
-| `Presence` | `par_rt_db.ws_client` | Handle returned by `presence()`; exposes the room's current member list and iterates snapshot updates. |
-
-### HTTP clients: storage, batch query, index helpers, schedules
-
-The sync (`RtDbHttpClient`) and async (`RtDbAsyncHttpClient`) clients expose
-the same surface; only the sync signatures are shown.
-
-| Symbol | Module | Description |
-| --- | --- | --- |
-| `RtDbHttpClient.upload(data, *, content_type=None)` | `par_rt_db.http_client` | `POST /api/storage/{db}` — uploads bytes, a file-like object, or an iterable of chunks; returns server-computed `UploadResult` (id, sha256, size, type). |
-| `RtDbHttpClient.batch_query(queries)` | `par_rt_db.http_client` | `POST /api/query-batch` — runs many queries in one round trip; returns one length-aligned `BatchQueryOutcome` per input. |
-| `RtDbHttpClient.find_one_by_index(table, index, value, *, model=dict)` | `par_rt_db.http_client` | Single-doc lookup on `index` via the `first` terminal. |
-| `RtDbHttpClient.upsert_by_index(table, index, value, insert, patch)` | `par_rt_db.http_client` | One-step upsert by index-field value: match → `patch`, no match → `insert`. |
-| `RtDbHttpClient.pause_schedule(id)` / `.resume_schedule(id)` | `par_rt_db.http_client` | Pause or resume a scheduled job by id; `False` when the id is unknown. |
-
-### Admin control plane (`[http]` extra)
-
-`AsyncRtDbAdminClient` is a one-to-one async mirror of `RtDbAdminClient` over
-`httpx.AsyncClient`.
-
-| Symbol | Module | Description |
-| --- | --- | --- |
-| `AsyncRtDbAdminClient` | `par_rt_db.admin` | Async twin of `RtDbAdminClient`. |
-| `RtDbAdminClient.list_sessions(*, user=None, limit=None)` | `par_rt_db.admin` | `GET /admin/sessions` — active interactive sessions across the instance, newest-first. |
-| `RtDbAdminClient.revoke_session(token_hash)` | `par_rt_db.admin` | `DELETE /admin/sessions/{tokenHash}` — revokes one session by its sha256 digest. |
-| `RtDbAdminClient.get_audit(db, *, table=None, op=None, principal=None, source=None, limit=None, offset=None)` | `par_rt_db.admin` | `GET /admin/audit` — durable audit-log rows, newest-first, with optional filters. |
-| `RtDbAdminClient.list_schema_history(db, *, limit=None, offset=None)` | `par_rt_db.admin` | `GET /admin/db/{db}/schema/history` — newest-first schema-push summary list. |
-| `RtDbAdminClient.get_schema_version(db, version)` | `par_rt_db.admin` | `GET /admin/db/{db}/schema/history/{version}` — one full schema snapshot. |
-| `RtDbAdminClient.restore_schema(db, version, *, confirm)` | `par_rt_db.admin` | Restores a database's schema to a prior pushed version. |
-| `RtDbAdminClient.admin_pause_schedule(db, id)` / `.admin_resume_schedule(db, id)` | `par_rt_db.admin` | Admin-scoped pause/resume of a scheduled job in `db`. |
-| `MintedToken` | `par_rt_db.admin` | Result of `mint_token()` — the token id and the one-time-visible secret. |
-| `TokenInfo` | `par_rt_db.admin` | Row returned by `list_tokens()` — token metadata without the secret. |
-| `SessionInfo` | `par_rt_db.admin` | Row returned by `list_sessions()`. |
-| `AuditEntry` | `par_rt_db.admin` | Row returned by `get_audit()`. |
-| `SchemaHistorySummary` | `par_rt_db.admin` | Row returned by `list_schema_history()` (schema blob omitted). |
-| `SchemaHistoryEntry` | `par_rt_db.admin` | Row returned by `get_schema_version()` (includes the full schema blob). |
-| `Webhook` | `par_rt_db.admin` | Row returned by `list_webhooks()` / config accepted by `create_webhook()`. |
-| `WebhookDelivery` | `par_rt_db.admin` | Row returned by `list_deliveries()`, a webhook's delivery history. |
+The generated reference covers the public Python package, including the wire,
+DSL, reactive, HTTP, and admin surfaces. From the repository root, run
+`make python-client-doc`, then open
+[`docs-api/par_rt_db.html`](docs-api/par_rt_db.html). The examples above remain
+the recommended starting point for normal usage.
+Published reference: https://paulrobello.github.io/par-rt-db/python/par_rt_db.html
 
 ## Wire contract
 

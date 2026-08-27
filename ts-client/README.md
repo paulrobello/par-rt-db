@@ -572,41 +572,14 @@ exercise the full DSL against it directly.
 `RtDbClient` also accepts an opt-in `optimisticUpdates` option that applies
 mutations to local state before the server confirms them.
 
-## Full API
+## API reference
 
-Surfaces not covered by the walkthroughs above. All symbols are exported from
-`@par-rt-db/client` (or `@par-rt-db/client/react` for the React entries)
-unless noted otherwise.
-
-| Symbol | Source file | What it does |
-| --- | --- | --- |
-| `TableQuery.vectorSearch(index, vector, opts)` | `src/query.ts` | Vector-similarity search over a declared vector index; `opts.filter` narrows results, `opts.limit` caps them. |
-| `TableQuery.hybridSearch(query, vector, limit, opts)` | `src/query.ts` | Fuses full-text and vector ranking via Reciprocal Rank Fusion; the table must declare both a search index and a vector index. |
-| `TableQuery.gt` / `.gte` / `.lt` / `.lte` | `src/query.ts` | Range bounds on the index field immediately after `withIndex`'s `eq` prefix. |
-| `RtDbClient.mutate(txn, { idempotencyKey })` | `src/client.ts` | Opt-in safe-retry key for a mutation — resend the same key to avoid double-applying a transaction whose result was never received. |
-| `TxnBuilder.undelete(table, id)` | `src/mutation.ts` | Restores a soft-deleted row on a table with `.softDelete()`. |
-| `TxnBuilder.expectVersion(table, id, version)` | `src/mutation.ts` | Precondition step: fails the transaction (`PRECONDITION_FAILED`) unless the row is currently at `version`. |
-| `TxnBuilder.expectAbsent(table, index, eq)` | `src/mutation.ts` | Precondition step: fails the transaction unless no row matches `eq` on `index`. |
-| `TxnBuilder.upsert(table, { index, eq, insert, patch })` | `src/mutation.ts` | Inserts `insert` if no row matches `eq` on `index`, otherwise patches the match with `patch`. |
-| `TxnBuilder.patchByQuery(table, filter, patch, limit?)` | `src/mutation.ts` | Patches every row matching `filter` (capped at `limit`, server max 1000). |
-| `TxnBuilder.deleteByQuery(table, filter, limit?)` | `src/mutation.ts` | Deletes every row matching `filter` (capped at `limit`, server max 1000). |
-| `Migration` and its builder methods (`renameField`, `renameTable`, `changeType`, `dropField`, `dropTable`, `dropIndex`, `setDefault`, `evalExpr`, `evalExprTyped`, `dryRun`, `build`) | `src/migration.ts` | Builds a destructive/type-changing schema migration applied via `RtDbAdminClient.migrate`. See [Schema migration](#schema-migration). |
-| `RtDbAdminClient.getSchemaHistory` / `.getSchemaVersion` / `.restoreSchema` | `src/admin.ts` | Lists, reads, and restores prior applied schema versions. |
-| `RtDbAdminClient.backupNow` / `.listBackups` / `.downloadBackup` / `.deleteBackup` / `.restoreBackup` | `src/admin.ts` | Triggers and manages instance backups; restore targets a fresh database, never the live one. |
-| `RtDbAdminClient.listWebhooks` / `.createWebhook` / `.editWebhook` / `.deleteWebhook` / `.listDeliveries` | `src/admin.ts` | Manages per-db webhook subscriptions and inspects delivery history. |
-| `RtDbAdminClient.getAudit` | `src/admin.ts` | Reads the per-db audit log of admin and write actions. |
-| `RtDbAdminClient.explainQuery(db, query)` | `src/admin.ts` | Returns the server's query plan for a given `RtQuery`/`QueryJson`, for performance diagnosis. |
-| `RtDbAdminClient.getSlowQueries` | `src/admin.ts` | Lists recently recorded slow queries for a db. |
-| `RtDbAdminClient.opsRecent` | `src/admin.ts` | Reads recent entries from the op feed. |
-| `RtDbAdminClient.listSubscriptions` | `src/admin.ts` | Lists active live-query subscriptions on the instance or a db. |
-| `RtDbAdminClient.dbStats` / `.metrics` / `.getConfig` / `.patchConfig` | `src/admin.ts` | Per-db stats, instance metrics, and hot-reloadable runtime config. |
-| `RtDbError` / `RtDbErrorCode` | `src/errors.ts` | The error class every client surface throws, carrying a stable code from the closed set documented on the class (`UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `SCHEMA_VIOLATION`, `PRECONDITION_FAILED`, `CONFLICT`, `BAD_REQUEST`, `INTERNAL`, `RATE_LIMITED`, `QUOTA_EXCEEDED`). |
-| `encodeCursor` / `decodeCursor` | `src/pagination.ts` | Encodes/decodes the opaque cursor used by `TableQuery.paginate` and `usePaginatedQuery`. |
-| `useRtDbAuth` | `src/react.tsx` (`react` entry) | React hook exposing `state`, `user`, `signIn`, `signInAnonymous`, and `signOut`. |
-| `Authenticated` / `Unauthenticated` / `AuthLoading` | `src/react.tsx` (`react` entry) | Conditional-render components gated on the current auth state. |
-| `useRtDbClient` | `src/react.tsx` (`react` entry) | Returns the `RtDbClient` instance passed to the enclosing `RtDbProvider`. |
-| `useConnectionState` | `src/react.tsx` (`react` entry) | React hook tracking the client's WebSocket connection state. |
-| `usePaginatedQuery` | `src/usePaginatedQuery.tsx` (`react` entry) | React hook for cursor-paginated queries with page-advance state. |
+The generated API reference covers every exported TypeScript and React symbol:
+run `make ts-client-doc` from the repository root, then open
+`docs-api/index.html`. The walkthroughs above remain the
+recommended starting point for common client, query, migration, admin, and
+React-hook flows.
+Published reference: https://paulrobello.github.io/par-rt-db/ts/
 
 ## Development
 

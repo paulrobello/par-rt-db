@@ -17,6 +17,9 @@ import type { QueryJson, TransactionJson } from "./protocol.js";
 /** A result document: user fields plus the merged system fields `_id`/`_creationTime`/`_version`. */
 type ResultDoc = Record<string, unknown> & { _id: string };
 
+/**
+ * The result of computing an optimistic update overlay.
+ */
 export interface OptimisticProjection {
   /**
    * `true` with a computed `value` to surface immediately. `false` for either a

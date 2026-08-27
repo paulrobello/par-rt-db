@@ -65,7 +65,6 @@ function evalExpr(expr: ValueExprJson, doc: Record<string, unknown>): unknown {
 /** One `case` branch. `then` is the server's serde wire key for a CaseWhen —
  * a value expression, never a thenable. */
 function whenThen(when: CaseWhenJson["when"], then: ValueExprJson): CaseWhenJson {
-  // biome-ignore lint/suspicious/noThenProperty: `then` is CaseWhenJson's wire key (server serde rename), never a thenable
   return { when, then };
 }
 

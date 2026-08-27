@@ -410,27 +410,14 @@ breaking change unless mirrored on all four. See
 [`../CLAUDE.md`](../CLAUDE.md) and the design spec
 [`../docs/superpowers/specs/2026-07-22-rust-client-design.md`](../docs/superpowers/specs/2026-07-22-rust-client-design.md).
 
-## Full API
+## API reference
 
-The sections above cover the common paths. The rest of the public surface,
-by source file:
+The generated rustdoc reference covers every public Rust client symbol and
+feature. From the repository root, run `make rust-client-doc`, then open
+[`../target/doc/par_rt_db_client/index.html`](../target/doc/par_rt_db_client/index.html).
+The sections above remain the recommended starting point for common usage.
 
-| Symbol | Feature | Source | Notes |
-| --- | --- | --- | --- |
-| `RtDbHttpClient` | `http` | `src/http.rs` | One-shot query/mutate/admin-bridge client |
-| `RtDbClient` | `ws` | `src/ws.rs` | Reactive WebSocket client — live query subscriptions, presence, mutate |
-| `Config` | `ws` | `src/ws.rs` | `RtDbClient` connection/reconnect configuration |
-| `ConnectionState` | `ws` | `src/ws.rs` | Reported connection lifecycle state (`connecting`/`open`/`closed`/…) |
-| `Subscription` | `ws` | `src/ws.rs` | A live query subscription handle — snapshot + on-change updates |
-| `project_optimistic_update` | `ws` | `src/optimistic.rs` | Applies a pending mutation's optimistic projection to a cached query result |
-| `InMemoryRtDbClient` | `in_memory` | `src/in_memory/mod.rs` | No-network, no-Postgres test harness mirroring the live clients |
-| `RtDbAdminClient::explain_query` | `admin` | `src/admin/mod.rs` | Query-plan explain — mirrors server `admin::observability::explain_query` |
-| `RtDbAdminClient::list_webhooks` / `create_webhook` / `delete_webhook` | `admin` | `src/admin/mod.rs` | Webhook subscription CRUD |
-| `RtDbAdminClient::get_audit` | `admin` | `src/admin/mod.rs` | Audit log read-back |
-| `RtDbAdminClient::list_sessions` / `revoke_session` / `revoke_user_sessions` / `revoke_expired_sessions` | `admin` | `src/admin/mod.rs` | OAuth session administration |
-| `RtDbAdminClient::merge_users` | `admin` | `src/admin/mod.rs` | Merges one user's data into another |
-| `RtDbAdminClient::backup_now` / `list_backups` / `download_backup` / `delete_backup` / `restore_backup` | `admin` | `src/admin/mod.rs` | Postgres-backed backup/restore — restore always targets a fresh database |
-| `RtDbAdminClient::clone_db` | `admin` | `src/admin/mod.rs` | Clones one database's schema and documents into a new database |
+Published reference: https://paulrobello.github.io/par-rt-db/rust/par_rt_db_client/
 
 ## Develop
 

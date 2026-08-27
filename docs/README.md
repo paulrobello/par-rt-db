@@ -12,6 +12,18 @@ contribution.
 - [`RELEASING.md`](RELEASING.md) — the repeatable release procedure: lockstep version bump, CHANGELOG heading, gate, annotated tag, push (owner-confirmed).
 - [`clients.md`](clients.md) — the four client SDKs (TypeScript/Rust/Python/Swift) at a glance: surface comparison, the five-way wire parity contract, and links to each package's detailed README.
 
+## Generated API references
+
+The four SDK reference sites are generated from source and checked by
+`make docs-api`. The local outputs are `target/doc/par_rt_db_client`,
+`ts-client/docs-api`, `python-client/docs-api`, and `swift-client/docs-api`.
+Tagged releases publish the same sites together on GitHub Pages.
+
+- [TypeScript API reference](https://paulrobello.github.io/par-rt-db/ts/)
+- [Rust API reference](https://paulrobello.github.io/par-rt-db/rust/par_rt_db_client/)
+- [Python API reference](https://paulrobello.github.io/par-rt-db/python/par_rt_db.html)
+- [Swift API reference](https://paulrobello.github.io/par-rt-db/swift/)
+
 ## Top-level docs (repo root)
 
 - [`../README.md`](../README.md) — project overview, quickstart, configuration, and wire protocol.

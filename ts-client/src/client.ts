@@ -19,16 +19,39 @@ import type {
 import { PROTOCOL_VERSION } from "./protocol.js";
 import type { RtQuery } from "./query.js";
 
-/** Minimal surface of a WebSocket the client depends on (browser/Node/bun compatible). */
+/**
+ * Minimal surface of a WebSocket the client depends on (browser/Node/bun compatible).
+ */
 export interface WebSocketLike {
+  /**
+   * Sends data over the WebSocket connection.
+   */
   send(data: string): void;
+  /**
+   * Closes the WebSocket connection.
+   */
   close(code?: number, reason?: string): void;
+  /**
+   * Callback invoked when the WebSocket connection is successfully opened.
+   */
   onopen: (() => void) | null;
+  /**
+   * Callback invoked when a message is received from the WebSocket.
+   */
   onmessage: ((ev: { data: unknown }) => void) | null;
+  /**
+   * Callback invoked when the WebSocket connection is closed.
+   */
   onclose: ((ev: { code: number; reason: string }) => void) | null;
+  /**
+   * Callback invoked when an error occurs on the WebSocket.
+   */
   onerror: (() => void) | null;
 }
 
+/**
+ * State representation of the WebSocket connection lifecycle.
+ */
 export type ConnectionState = "idle" | "connecting" | "connected" | "reconnecting" | "closed";
 /**
  * `"unreachable"`: the auth endpoint could not be reached — the socket kept
@@ -41,10 +64,25 @@ export type ConnectionState = "idle" | "connecting" | "connected" | "reconnectin
  */
 export type AuthState = "unauthenticated" | "authenticating" | "authenticated" | "unreachable";
 
+/**
+ * Options for configuring the `RtDbClient`.
+ */
 export interface RtDbClientOptions {
+  /**
+   * Base URL of the Realtime Database instance.
+   */
   url: string;
+  /**
+   * The target database name.
+   */
   db: string;
+  /**
+   * Callback to fetch the authorization token dynamically for token mode.
+   */
   getToken?: () => string | null | Promise<string | null>;
+  /**
+   * Factory function to instantiate custom WebSocket instances.
+   */
   webSocketFactory?: (url: string) => WebSocketLike;
   backoff?: { baseMs: number; maxMs: number };
   heartbeatMs?: number;
@@ -58,10 +96,22 @@ export interface RtDbClientOptions {
    * 0 disables the signal (pre-fix behavior).
    */
   authUnreachableAfterAttempts?: number;
+  /**
+   * Injectable clock function (returning epoch milliseconds) for deterministic client timing.
+   */
   now?: () => number;
+  /**
+   * Injectable random number generator returning a float in [0, 1) for ID minting.
+   */
   random?: () => number;
-  setTimeoutImpl?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
-  clearTimeoutImpl?: (handle: ReturnType<typeof setTimeout>) => void;
+  /**
+   * Injectable setTimeout implementation override.
+   */
+  setTimeoutImpl?: (fn: () => void, ms: number) => any;
+  /**
+   * Injectable clearTimeout implementation override.
+   */
+  clearTimeoutImpl?: (handle: any) => void;
   /**
    * When true, a locally-submitted mutation's projected effect is overlaid on
    * each active subscription's last result (via `onUpdate`) before the
@@ -160,8 +210,8 @@ export class RtDbClient {
   private readonly factory: (url: string) => WebSocketLike;
   private readonly now: () => number;
   private readonly random: () => number;
-  private readonly setTimeoutImpl: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
-  private readonly clearTimeoutImpl: (handle: ReturnType<typeof setTimeout>) => void;
+  private readonly setTimeoutImpl: (fn: () => void, ms: number) => any;
+  private readonly clearTimeoutImpl: (handle: any) => void;
   private readonly backoff: { baseMs: number; maxMs: number };
   private readonly heartbeatMs: number;
   private readonly authUnreachableAfter: number;

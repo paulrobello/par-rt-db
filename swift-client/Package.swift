@@ -8,6 +8,9 @@ let package = Package(
         .library(name: "ParRtDbClient", targets: ["ParRtDbClient"]),
         .library(name: "ParRtDbUI", targets: ["ParRtDbUI"]),
     ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.4.3"),
+    ],
     targets: [
         .target(name: "ParRtDbClient"),
         .target(name: "ParRtDbUI", dependencies: ["ParRtDbClient"]),

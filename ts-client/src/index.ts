@@ -32,19 +32,29 @@
 export const VERSION = "0.1.0";
 
 export type {
+  AdminMember,
   AdminStreamFrame,
   AuditEntry,
   BackupFile,
   BackupsListResponse,
+  ConfigResponse,
   CreateWebhookOptions,
+  DbStats,
   DbSubCounters,
   EditWebhookOptions,
   ExplainResult,
   GetAuditOptions,
   ListDeliveriesOptions,
+  HotConfig,
+  HotConfigPatch,
+  LatencyStats,
   MergeConflict,
   MergeDbResult,
   MergeReport,
+  MetricsSnapshot,
+  MintTokenOptions,
+  OpEvent,
+  OpEventKind,
   RestoreResult,
   RtDbAdminClientOptions,
   SchemaPreviewColumnAdd,
@@ -58,6 +68,8 @@ export type {
   SubscriptionInfo,
   SubscriptionsPrincipal,
   SubscriptionsResponse,
+  TableStat,
+  TokenInfo,
   Webhook,
   WebhookDelivery,
 } from "./admin.js";
@@ -71,32 +83,52 @@ export type {
   RtDbHttpClientOptions,
   SignedUrl,
   TransformOpts,
+  UploadInput,
   UploadResult,
 } from "./http.js";
 export { appendImageParams, RtDbHttpClient } from "./http.js";
 export type { InMemoryRtDbClientOptions } from "./in_memory/index.js";
 export { InMemoryAdminClient, InMemoryRtDbClient, PresenceRooms } from "./in_memory/index.js";
 export { Migration } from "./migration.js";
-export type { StepInsertResult, StepResult, StepUpsertResult } from "./mutation.js";
+export type {
+  StepCancelScheduleResult,
+  StepDeleteByQueryResult,
+  StepInsertResult,
+  StepPatchByQueryResult,
+  StepResult,
+  StepScheduleResult,
+  StepStartWorkflowResult,
+  StepUpsertResult,
+} from "./mutation.js";
 export { awaitSignal, mutation, parseStepResults, TxnBuilder } from "./mutation.js";
 export type { OptimisticProjection } from "./optimistic.js";
 export { projectOptimisticUpdate } from "./optimistic.js";
 export { decodeCursor, encodeCursor } from "./pagination.js";
 export type {
+  AggregateGroup,
+  AggregateOp,
+  AggregateSpec,
   AuthedUser,
+  AuthedUserKind,
   AwaitSignalSpec,
+  BatchQueryOutcomeJson,
   CaseWhenJson,
   Cast,
   CastFailureJson,
   ClientMessage,
   DirectiveJson,
   DirectiveReportJson,
+  DistanceMetric,
   FieldTypeJson,
   FilterExpr,
+  HybridSearchQuery,
   IndexJson,
   MigrateRequestJson,
   MigrateResultJson,
+  OnDeleteAction,
   Order,
+  Paginate,
+  PaginatedResultJson,
   PresenceMember,
   QueryJson,
   SampleChangeJson,
@@ -105,6 +137,7 @@ export type {
   SchemaHistoryEntry,
   SchemaHistoryEntrySummary,
   SchemaJson,
+  SearchMode,
   SearchQuery,
   ServerMessage,
   StepJson,
@@ -132,6 +165,7 @@ export type {
   Id,
   IndexNamesOf,
   Infer,
+  Int64,
   SystemFields,
   TableNames,
   Validator,

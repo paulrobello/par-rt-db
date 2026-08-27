@@ -29,6 +29,7 @@ continues to work for the wire/DSL surface.
 
 from __future__ import annotations
 
+import sys
 from typing import TYPE_CHECKING, Any
 
 from .cursor import decode_cursor, encode_cursor
@@ -53,6 +54,23 @@ from .wire import (
 )
 
 if TYPE_CHECKING:
+    from .admin import (
+        AsyncRtDbAdminClient,
+        AuditEntry,
+        MintedToken,
+        RtDbAdminClient,
+        SchemaHistoryEntry,
+        SchemaHistorySummary,
+        SessionInfo,
+        TokenInfo,
+        Webhook,
+        WebhookDelivery,
+    )
+    from .aio_http_client import RtDbAsyncHttpClient
+    from .http_client import RtDbHttpClient
+    from .ws_client import Presence, RtDbClient, Subscription
+
+if "pdoc" in sys.modules:
     from .admin import (
         AsyncRtDbAdminClient,
         AuditEntry,

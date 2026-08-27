@@ -16,7 +16,13 @@ aio = ["par-rt-db[http]"]    # alias for [http] (ARC-124): async surface no long
 [dependency-groups]
 # `dev` is a default group — `uv run` / `uv sync` installs it automatically, so
 # `make checkall` works from a clean checkout without a prior `make install`.
-dev = ["pytest>=9.1.1", "pytest-asyncio>=1.4.0", "ruff>=0.16.3", "pyright>=1.1.411"]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.3",
+    "pyright>=1.1.411",
+    "pdoc>=16.0.0",
+]
 
 [build-system]
 requires = ["hatchling"]

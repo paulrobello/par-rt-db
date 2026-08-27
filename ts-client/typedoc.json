@@ -1,0 +1,27 @@
+{
+  "entryPoints": ["src/index.ts", "src/react.tsx"],
+  "out": "docs-api",
+  "treatWarningsAsErrors": true,
+  "validation": {
+    "notDocumented": true,
+    "notExported": true
+  },
+  "requiredToBeDocumented": [
+    "Function",
+    "Class",
+    "Interface",
+    "Method",
+    "TypeAlias",
+    "Enum",
+    "Variable"
+  ],
+  "intentionallyNotExported": [
+    "FieldsOf",
+    "InsertRequiredKeys",
+    "OptionalFieldKeys",
+    "RequiredFieldKeys",
+    "StampedFieldsOf",
+    "Subscription"
+  ],
+  "intentionallyNotDocumented": []
+}
