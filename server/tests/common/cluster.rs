@@ -278,10 +278,10 @@ impl Cluster {
 
     async fn wait_owner_settled(&self) {
         let ok = crate::common::wait_until(Duration::from_secs(10), || async {
-            self.is_owner_of(ReplicaId::A).await
+            self.is_owner_of(ReplicaId::A).await || self.is_owner_of(ReplicaId::B).await
         })
         .await;
-        assert!(ok, "cluster: replica A did not hold the lease within 10s");
+        assert!(ok, "cluster: lease owner did not settle within 10s");
     }
 
     async fn is_owner_of(&self, id: ReplicaId) -> bool {

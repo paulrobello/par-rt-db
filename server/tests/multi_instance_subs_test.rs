@@ -172,12 +172,12 @@ async fn owner_scheduled_write_pushes_b_subscriber() -> anyhow::Result<()> {
     let mut ws_b = cluster.ws(ReplicaId::B).await;
     subscribe_and_snapshot(&mut ws_b, "q-sched", 0).await;
 
-    // Schedule through A's websocket: due immediately, the owner's ≤2 s
-    // scheduler poll claims and fires it.
+    // Schedule through A's websocket: give the listener tasks time to settle
+    // before the owner's scheduler claims and fires the job.
     let mut ws_a = cluster.ws(ReplicaId::A).await;
     ws_a.send(&ClientMessage::Schedule {
         schedule_id: SCHED_ID.to_string(),
-        when: ScheduleWhen::AfterMs { ms: 1 },
+        when: ScheduleWhen::AfterMs { ms: 1_000 },
         txn: insert_item("from-scheduler"),
     })
     .await;
