@@ -419,13 +419,17 @@ through it are blocked.
 ## Session lifetime
 
 Successful logins mint a session in `rtdb_auth.sessions`, whose lifetime is
-controlled by two boot-only env vars (`server/src/config.rs`):
+controlled by two env vars (`server/src/config/`):
 
 - **`RTDB_SESSION_TTL_DAYS`** (default `30`) — how long a standard OAuth or
   admin-key session stays valid before the holder must sign in again.
+  Hot-reloadable: the value lives in the hot config (`server/src/config/hot.rs`),
+  is applied live via `PATCH /admin/config` (`sessionTtlDays`), and is read at
+  each login.
 - **`RTDB_ANONYMOUS_SESSION_TTL_DAYS`** (default `1`) — the shorter TTL for
   sessions minted by `POST /auth/anonymous`, so ephemeral guest rows expire
-  quickly instead of accumulating as permanent users/sessions.
+  quickly instead of accumulating as permanent users/sessions. Boot-only
+  (`server/src/config/mod.rs`), not hot-reloadable.
 
 Sessions ride an HttpOnly cookie; **`RTDB_COOKIE_SECURE`** (default `true`)
 sets the `Secure` attribute on that cookie unconditionally. Only set it

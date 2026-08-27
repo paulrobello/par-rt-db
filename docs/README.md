@@ -42,7 +42,7 @@ The [`superpowers/`](superpowers/) directory holds the design history of the pro
 - [`superpowers/SPEC_STATUS.md`](superpowers/SPEC_STATUS.md) — at-a-glance status of every spec (implemented, in-progress, or shelved).
 - [`superpowers/specs/`](superpowers/specs/) — design specs. `2026-07-21-par-rt-db-design.md` is the original design, kept as a historical record (the root README, `FEATURE_MATRIX.md`, and `wire-corpus/` define current protocol and semantics); later specs cover clients (rust, python, dashboard), per-row authorization, fine-grained subscription invalidation, file storage, scheduling, schema migration, presence, quotas, schema history, image transforms, signed URLs, durable workflows, full-text search, cascade delete, field defaults, and more.
 - [`superpowers/plans/`](superpowers/plans/) — implementation plans: per-spec execution breakdowns including the seven-phase realtime-dashboard series (`2026-07-24-realtime-dashboard-phase{1-auth,2-metadata,3a-metrics,3b-opfeed,4-config,5-admin-docs,6-static}.md`).
-- [`fable/`](fable/) — enhancement plan docs (ENH-023–027) from the fable-audit cycle: the behavioral-semantics corpus, subscription rerun observability, the generated CLI reference, the v0.1.0 release process, and query-DSL property testing.
+- [`fable/`](fable/) — enhancement plan docs from the fable-audit cycle; currently `ENH-029-multi-instance-test-harness.md` covers a reusable two-replica test harness with failure injection. Completed plans are removed once shipped, with outcomes recorded in [`../CHANGELOG.md`](../CHANGELOG.md).
 
 When the code and a spec disagree, the code wins; fix the spec.
 

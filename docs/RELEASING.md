@@ -7,19 +7,20 @@ The repeatable cut procedure. Everything versions in **lockstep** — `server`,
 `swift-client` has no manifest version to bump — SPM carries no version field,
 so the release tag identifies which commit a build was cut from, though there
 is no root `Package.swift` for a Swift consumer to resolve a remote git
-dependency against; see the note under step 1. Nothing here publishes to a registry;
-a release is a git tag plus the CHANGELOG
-heading. Publishing the SDKs to crates.io / npm / PyPI is a separate,
-user-approved decision.
+dependency against; see the note under step 1. Nothing here publishes to a package
+registry; a release is a git tag plus the CHANGELOG heading. Publishing the SDKs
+to crates.io / npm / PyPI is a separate, user-approved decision.
 
 ## Procedure
 
 1. **Bump versions (lockstep)** to the next `0.x.y` in:
-   - `server/Cargo.toml`, `rust-client/Cargo.toml`, `cli/Cargo.toml`
+   - `server/Cargo.toml`, `core/Cargo.toml`, `rust-client/Cargo.toml`, `cli/Cargo.toml`
    - `ts-client/package.json`, `dashboard/package.json`
    - `python-client/pyproject.toml`
    Regenerate the lockfiles (`cargo build` for `Cargo.lock`; `bun install` from
-   the root for the bun lockfile) and commit them. `swift-client` is absent
+   the root for the bun lockfile, which records the workspace package versions;
+   `uv lock` in `python-client/` for `uv.lock`, which records the package's own
+   version) and commit them. `swift-client` is absent
    from this list on purpose: SPM manifests carry no version field, and
    `Package.swift` lives in `swift-client/`, not the repo root, so a Swift
    consumer cannot resolve this as a remote git package pinned to a tag —
@@ -39,7 +40,9 @@ user-approved decision.
    git tag -a v0.x.y -m "par-rt-db v0.x.y"
    ```
 6. **Push the commit and the tag.** Pushing a tag is an outward-facing action —
-   it requires the owner's explicit confirmation per the standing policy.
+   it requires the owner's explicit confirmation per the standing policy (a
+   `v*` tag also triggers CI's `pages` job, which publishes the API references
+   to GitHub Pages).
    ```bash
    git push origin main && git push origin v0.x.y
    ```
@@ -47,13 +50,16 @@ user-approved decision.
    section as notes (`gh release create v0.x.y --title "v0.x.y" --notes-file …`).
 8. **Deploy** per [`deploy/README.md`](../deploy/README.md) if this release ships
    to the operator's instance. The deployed binary's version label comes from
-   `CARGO_PKG_VERSION` automatically (`/healthz` reports it); no deploy-script
-   version to update.
+   `CARGO_PKG_VERSION` automatically (`/healthz` reports `version` and the
+   deployed commit sha only on an admin-authenticated request; unauthenticated
+   responses omit both); no deploy-script version to update.
 
 ## Rules
 
 - **Never delete or move a pushed tag.** If a cut turns out bad, fix forward
   with `0.x.(y+1)`. Before push, `git tag -d v0.x.y` and revert is fine.
-- CI (`ci.yml`) gates every push including tags; it publishes nothing, so a tag
-  alone triggers no registry action.
+- CI (`ci.yml`) gates every push including tags. It publishes nothing to a
+  package registry, but a `v*` tag push also runs the `pages` job, which
+  deploys the generated API references to GitHub Pages once the `checkall` and
+  macOS `swift` jobs pass.
 - The pre-release check is the same gate as everything else: `make checkall`.

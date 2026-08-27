@@ -155,7 +155,7 @@ committer (blobs don't touch document tables). See
 * [Docker](https://www.docker.com/) — for the dev Postgres and for the production `docker compose` deploy path (see [`deploy/README.md`](deploy/README.md))
 * A Rust `stable` toolchain to build the server binary from source ([`rust-toolchain.toml`](rust-toolchain.toml) is the single source of truth)
 * `jq` for the Quickstart walkthrough
-* Per client SDK: bun/node for TypeScript, cargo for Rust, Python 3.12+ (uv) for Python
+* Per client SDK: bun/node for TypeScript, cargo for Rust, Python 3.12+ (uv) for Python, Xcode with the Swift 6 toolchain for Swift (Darwin only)
 
 ## Prerequisites for dev
 * See [CONTRIBUTING's development setup](CONTRIBUTING.md#development-setup) for the full tool list and first-time setup
@@ -235,7 +235,7 @@ since browsers cannot set headers on a WS handshake.
 
 | Method & path | Auth | Description |
 | --- | --- | --- |
-| `GET /healthz` | none | Liveness: `{status:"ok"\|"degraded", version, git_commit, build_timestamp, started_at, uptime_seconds, postgres}`. 503 when Postgres is unreachable. |
+| `GET /healthz` | none | Liveness: `{status:"ok"\|"degraded", started_at, uptime_seconds, postgres}`. 503 when Postgres is unreachable. The build fingerprint fields (`version`, `git_commit`, `build_timestamp`) are admin-only — included just when the request carries a valid admin bearer (SEC-129). |
 | `GET /privacy` | none | par-rt-db's own privacy policy as static HTML (compile-time-embedded from `server/src/static/privacy.html`), so an OAuth consent screen's required privacy URL can point at the deployment itself. Public and stateless; works in API-only mode. |
 | `GET /metrics` | none | Prometheus text-exposition scrape endpoint. Content-negotiated on `Accept`: a browser (`text/html`) is served the SPA's `index.html` when `RTDB_STATIC_DIR` is set; everything else (Prometheus sends `application/openmetrics-text`, curl, API-only deploys) gets Prometheus text. Aggregate-only (no per-db, no principal data), same posture as `/healthz`. The admin JSON snapshot stays at `GET /admin/metrics`. |
 | `GET /sync` | first WS frame | WebSocket upgrade. Speaks the realtime protocol (auth, subscribe, mutate, schedule, ping). |
@@ -412,7 +412,7 @@ The server reads its configuration from environment variables (prefix `RTDB_`).
 container deploy — copy it to `.env` and edit. It covers the knobs the compose
 file forwards, so a few that the process reads directly (`RTDB_DATABASE_URL`,
 `RTDB_PORT`) are set elsewhere in `docker-compose.yml` and do not appear there;
-`server/src/config.rs` is the complete list. The subset below is what most
+`server/src/config/` is the complete list. The subset below is what most
 operators tune on first boot:
 
 | Variable | Required | Default | Description |
@@ -443,7 +443,7 @@ behind a proxy or runs as more than one replica.
 | `RTDB_FORWARD_TIMEOUT_MS` | `5000` | How long a non-owner waits for the lease owner's reply before attempting takeover. Clamped to a 100 ms floor. |
 | `RTDB_POOL_MAX_CONNECTIONS` | `75` | Postgres pool ceiling. One committer task plus N subscription re-runs per database, so a many-database instance needs headroom. |
 | `RTDB_ADMIN_EMAILS` | empty | Comma-separated emails seeded into `rtdb_auth.admins` at startup, so an OAuth login can reach the dashboard before any admin exists. |
-| `RTDB_BACKUP_ENABLED` | `false` | Enables scheduled `pg_dump` backups. Paired with `RTDB_BACKUP_CRON` (default daily at 03:00 UTC), `RTDB_BACKUP_DIR`, and `RTDB_BACKUP_RETENTION` (default `7` dumps kept). Defaults and semantics live in `server/src/config.rs`. |
+| `RTDB_BACKUP_ENABLED` | `false` | Enables scheduled `pg_dump` backups. Paired with `RTDB_BACKUP_CRON` (default daily at 03:00 UTC), `RTDB_BACKUP_DIR`, and `RTDB_BACKUP_RETENTION` (default `7` dumps kept). Defaults and semantics live in `server/src/config/`. |
 
 
 The hot-reloadable settings (live on `AppState` as `Arc<ArcSwap<HotConfig>>`,
@@ -1024,7 +1024,7 @@ Those SDK method names are not the wire tags. On the wire the client sends:
 
 The server answers with `presenceSnapshot` (`room`, `members`) or
 `presenceErr`. There is no `presenceOk` frame. When presence is disabled, the
-server replies with a `PRESENCE_DISABLED` `presenceErr`.
+server replies with a `FORBIDDEN` `presenceErr` ("presence not enabled").
 
 ## Make targets
 
@@ -1041,7 +1041,7 @@ here rather than restating it.
 
 | Target | Packages | Purpose |
 | --- | --- | --- |
-| `make ts-client-install` | ts-client | `bun install` in `ts-client/`. |
+| `make ts-client-install` | ts-client | `bun install` in `ts-client/` and `ts-client/docs-toolchain/`. |
 | `make dashboard-install` | dashboard | `bun install` at repo root + `dashboard/`. |
 | `make python-client-install` | python-client | `uv sync --all-extras` in `python-client/`, so pyright can resolve the optional `http`/`ws` deps. |
 
@@ -1053,12 +1053,12 @@ build.
 
 | Target | What runs in each package |
 | --- | --- |
-| `make build` | server `cargo build` · rust-client `cargo build --all-features` · dashboard `bun run build`. Runs `ts-client-build` first, because the dashboard resolves `@par-rt-db/client` from the gitignored `ts-client/dist`. |
-| `make fmt` | server/rust-client/cli `cargo fmt --all` · ts-client/dashboard `bun run fmt` · python-client `uv run ruff format .` · swift-client `swiftformat .` |
+| `make build` | core/server/rust-client/cli `cargo build` (rust-client and cli with `--all-features`) · dashboard `bun run build` · swift-client `swift build` (Darwin). Runs `ts-client-build` first, because the dashboard resolves `@par-rt-db/client` from the gitignored `ts-client/dist`. |
+| `make fmt` | workspace `cargo fmt --all` (core/server/rust-client/cli) · ts-client/dashboard `bun run fmt` · python-client `uv run ruff format .` · swift-client `swiftformat .` |
 | `make fmt-check` | the same commands in check mode (`--check`, `swiftformat --lint`). |
-| `make lint` | core/server/rust-client/cli `cargo clippy --all-targets --all-features -- -D warnings` · ts-client/dashboard `bun run lint` · python-client `uv run ruff check .` · swift-client `swiftlint --strict` |
-| `make typecheck` | core/server/rust-client/cli `cargo check` · ts-client/dashboard `bun run typecheck` · python-client `uv run pyright` · swift-client `swift build`. Runs `ts-client-build` first. |
-| `make test` | core `cargo test` · server `cargo test` · ts-client `bun run test` · rust-client and cli `cargo test --all-features` · dashboard `bun run test` · python-client `uv run pytest -q` · swift-client `swift test`. Runs `dev-db-up` first. |
+| `make lint` | workspace `cargo clippy --all-targets --all-features -- -D warnings` (core/server/rust-client/cli) · ts-client/dashboard `bun run lint` · python-client `uv run ruff check .` · swift-client `swiftlint --strict` |
+| `make typecheck` | workspace `cargo check --all-targets --all-features` (core/server/rust-client/cli) · ts-client/dashboard `bun run typecheck` · python-client `uv run pyright` · swift-client `swift build`. Runs `ts-client-build` first. |
+| `make test` | workspace `cargo test --workspace --all-features` (core/server/rust-client/cli — the flag is required, or cargo silently skips rust-client's feature-gated test targets) · ts-client/dashboard `bun run test` · python-client `uv run pytest -q` · swift-client `swift test`. Runs `dev-db-up` first. |
 
 ### Verification gates
 
@@ -1071,11 +1071,12 @@ run.
 | 1. `env-drift-check` | Every `RTDB_*` var read by the server or documented in `.env.example` is forwarded to the container by `docker-compose.yml`'s `environment:` block. The block is an explicit allowlist, so a `.env`-only key silently does nothing. | `make env-drift-check` |
 | 2. `dockerfile-stub-check` | Every `[[test]]` declared by a non-server workspace member has a matching placeholder in the Dockerfile's dependency-caching layer. Without it `make deploy` fails at cargo's manifest parse — a break the rest of `checkall` cannot see. | `make dockerfile-stub-check` |
 | 3. `cli-docs-check` | `cli/README.md` matches what `gen-cli-docs` regenerates, so the CLI reference cannot drift from the CLI. | `make cli-docs-check` |
-| 4. `fmt-check` | Formatting across all eight packages. | `make fmt-check` |
-| 5. `lint` | Clippy under `-D warnings`, biome, ruff, swiftlint `--strict`. | `make lint` |
-| 6. `typecheck` | `cargo check`, `tsc`, pyright, `swift build`. | `make typecheck` |
-| 7. `test` | The full suite across all eight packages, against the dev Postgres. | `make test` |
-| 8. `rust-client-check-features` | The rust-client library **and** its test targets compile under every meaningful feature combination, not just `--all-features`. | `make rust-client-check-features` |
+| 4. `docs-api` | API docs regenerate cleanly for every SDK (`rust-client-doc`, `ts-client-doc`, `python-client-doc`, `swift-client-doc`), with warnings denied, so doc comments cannot rot. | `make docs-api` |
+| 5. `fmt-check` | Formatting across all eight packages. | `make fmt-check` |
+| 6. `lint` | Clippy under `-D warnings`, biome, ruff, swiftlint `--strict`. | `make lint` |
+| 7. `typecheck` | `cargo check`, `tsc`, pyright, `swift build`. | `make typecheck` |
+| 8. `test` | The full suite across all eight packages, against the dev Postgres. | `make test` |
+| 9. `rust-client-check-features` | The rust-client library **and** its test targets compile under every meaningful feature combination, not just `--all-features`. | `make rust-client-check-features` |
 
 Never `--no-verify` past the gate. If you do, fix the gate before anything
 else.
@@ -1092,6 +1093,7 @@ else.
 | `make dashboard-test` | Runs the dashboard's Vitest + React Testing Library suite standalone. |
 | `make pre-commit` / `pre-commit-update` | `pre-commit run --all-files` (gitleaks, private-key detection, per-package fmt/lint) and `pre-commit autoupdate`. |
 | `make deploy` | `checkall` → rsync to the Docker host → `docker compose up -d --build` → healthz probe. |
+| `make docs-api` / `bench-micro` / `bench` / `bench-baseline` | Regenerate the four SDK API references; run the criterion micro-benchmarks and the black-box load benchmark (ENH-033 — deliberately outside `checkall`; see [CONTRIBUTING's Benchmarks section](CONTRIBUTING.md#benchmarks)). |
 
 ### Per-package targets
 
@@ -1247,7 +1249,7 @@ plus an operator SPA and a CLI built on top of them:
 * [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) is the authoritative Convex-parity contract
 
 ### Where we're going
-* The first tagged release (`v0.1.0`, ENH-026): lockstep client versions and the release process
+* The next lockstep release cutting `[Unreleased]` — all packages version together per [`docs/RELEASING.md`](docs/RELEASING.md); publishing the SDKs to crates.io / npm / PyPI stays a separate, owner-approved decision
 
 ## What's new
 

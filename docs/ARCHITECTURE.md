@@ -272,7 +272,7 @@ runs only in `handle_reaper` inside the committer turn.
 
 ## Data pipeline
 
-`schema.rs` → `ddl.rs` → `txn.rs`/`query/`. A pushed schema compiles to
+`schema/` → `ddl.rs` → `txn.rs`/`query/`. A pushed schema compiles to
 Postgres DDL — one typed column per indexed field, documents stored as `doc`
 jsonb with system fields merged in at read time, schema changes additive-only.
 
@@ -428,10 +428,12 @@ transport wrote.
 
 HTTP requests are optionally rate-limited per machine-token and per-db
 (`RTDB_RATE_LIMIT_PER_TOKEN_RPM` / `RTDB_RATE_LIMIT_PER_DB_RPM`, 0 =
-off/default; over-limit → 429 `RATE_LIMITED` + `Retry-After`; in-memory
-fixed-window `RateLimiter` on `AppState`, checked after `authorize`;
-rate-limit keys are namespaced by route as well as principal, so a burst
-against one endpoint cannot exhaust another endpoint's budget; the same
+off/default; over-limit → 429 `RATE_LIMITED` + `Retry-After`; a fixed-window
+`RateLimiter` on `AppState`, checked after `authorize` — in-memory when
+single-instance, Postgres-backed under `RTDB_MULTI_INSTANCE`; the per-IP keys
+on the unauthenticated routes (public storage serve, admin login, anonymous
+mint) are namespaced by route as well as address, so a burst against one
+endpoint cannot exhaust another endpoint's budget; the same
 limiter also covers inbound WS `Mutate`/`Subscribe` frames (after the per-op
 `authorize` re-run): a denial replies with a `RATE_LIMITED` `MutateErr`/
 `SubscribeErr` carrying `retryAfter` and the connection stays open; the
@@ -613,7 +615,7 @@ is added takes the link step, and every later login matches at step one.
 
 On top of the db-level gate:
 
-- **`ownerField`** (`schema.rs`, enforced in `query/`/`txn.rs`/`subs.rs`): an
+- **`ownerField`** (`schema/`, enforced in `query/`/`txn.rs`/`subs.rs`): an
   authenticated user reads/mutates only rows they own, or rows that list them
   in a declared `collaboratorsField` (an optional array-of-strings field) —
   owner OR collaborator (inserts are server-stamped; `patch`/`replace`/
@@ -798,8 +800,8 @@ connection that stops refreshing ages out without disconnecting.
 Every dimension is bounded by boot-only `PresenceConfig` fields
 (`RTDB_PRESENCE_*`): state bytes per member, members per room, rooms per
 connection, bytes per room, broadcast interval, updates per second, and maximum
-TTL. Presence is off by default; when disabled the frames answer
-`PRESENCE_DISABLED`.
+TTL. Presence is on by default (`RTDB_PRESENCE_ENABLED`); when disabled the
+frames answer `FORBIDDEN` ("presence not enabled").
 
 Under `RTDB_MULTI_INSTANCE` each replica republishes its **full** local
 membership for a room on `rtdb_presence` at a configured cadence. A full
@@ -814,8 +816,13 @@ reconciliation, and rooms are capped small enough for it to stay cheap.
 `Query.swift`/`Mutation.swift` alongside it) are five
 implementations of the same protocol and must stay byte-identical (serde tags
 and field names). The casing is deliberately non-uniform and load-bearing —
-match the protocol files exactly (see the spec). The SDKs are no-codegen: a
-schema object is both pushed to the server and the source of inferred types.
+match the protocol files exactly (see the spec). Since ARC-004 the Rust-side
+txn vocabulary (`Step`/`Transaction`) is defined once in the shared `core`
+crate and re-exported by both `server/src/dsl.rs` and
+`rust-client/src/mutation.rs`, so that subset cannot drift between the two
+Rust surfaces; the WS envelopes remain per-implementation mirrors. The SDKs
+are no-codegen: a schema object is both pushed to the server and the source
+of inferred types.
 The Rust client ports the TS SDK (design at
 [`superpowers/specs/2026-07-22-rust-client-design.md`](superpowers/specs/2026-07-22-rust-client-design.md));
 its `http`, reactive `ws`, and `admin` features all ship, plus
@@ -857,13 +864,13 @@ point — the `publish_taps` helper (`committer/taps.rs`) — called from
 
 | Arm | `source` | Emits DocOps | Notes |
 | --- | --- | --- | --- |
-| `handle_mutate` | per-request | yes | The ordinary write path, WS and HTTP alike |
+| `handle_mutate` | `"mutate"` | yes | The ordinary write path, WS and HTTP alike |
 | `handle_scheduled` | `"scheduled"` | yes | Scheduler-claimed jobs |
 | `handle_workflow_advance` | `"workflow"` | yes | Durable workflow step commits |
 | `handle_migrate` | `"migrate"` | yes | Schema migrate DDL + DML |
 | `handle_reaper` | `"ttl"` | yes | TTL deletes are durable writes, `owner = None` |
 | `handle_merge_users` | `"merge"` | yes | The anon→real merge's committed doc restamps |
-| `handle_push_schema` | `"push"` | no | Schema push runs through the committer; it publishes for audit/webhooks but emits no DocOps |
+| `handle_push_schema` | `"push"` | no | `docop_taps = false`: fan-out + cross-replica invalidation only — DDL/backfills emit no DocOps, so no op-feed/audit/webhook taps |
 | `handle_restore_schema` | `"restore"` | no | Same shape as push, for schema-history restore |
 
 Any future code path that commits a document txn must call `publish_taps` too,
@@ -955,7 +962,7 @@ the DB role (new — the server previously only ran `CREATE SCHEMA`/
 
 ## Hot config and dynamic CORS
 
-`config.rs`, `lib.rs`. Seven settings — `allowed_origins`, `session_ttl_days`,
+`config/` (hot config in `config/hot.rs`), `lib.rs`. Seven settings — `allowed_origins`, `session_ttl_days`,
 `max_file_size`, `idempotency_ttl_ms`, plus the three ENH-011 quota caps
 (`maxTablesPerDb`/`maxStorageBytesPerDb`/`maxSubsPerDb`) — are
 runtime-mutable, held on `AppState` as `Arc<ArcSwap<HotConfig>>` and

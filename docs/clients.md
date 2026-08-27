@@ -16,21 +16,21 @@ where its detailed documentation lives.
 | Python | `par-rt-db` | [`python-client/`](../python-client) | [`python-client/README.md`](../python-client/README.md) |
 | Swift | `ParRtDbClient` / `ParRtDbUI` | [`swift-client/`](../swift-client) | [`swift-client/README.md`](../swift-client/README.md) |
 
-No package has been published to a registry yet (tracked as ENH-026); consume
-each SDK from this repo — see its README for workspace setup. `swift-client`
-has no root `Package.swift`, so a Swift consumer adds it as a local package
-dependency pointed at a checkout of this repo (see its README), not as a
-remote git dependency.
+No package has been published to a registry yet; consume
+each SDK from this repo — see its README for workspace setup. This repo's
+root has no `Package.swift` (the Swift manifest lives at
+`swift-client/Package.swift`) and no release tag, so a Swift consumer adds
+the package by local path (see its README), not as a remote git dependency.
 
 ## Surface comparison
 
 | Capability | TypeScript | Rust | Python | Swift |
 | --- | --- | --- | --- | --- |
 | Schema builder (no codegen) | ✅ | ✅ | ✅ | ✅ |
-| Reactive WebSocket client | ✅ | ✅ (`ws` feature) | ✅ | ✅ |
+| Reactive WebSocket client | ✅ | ✅ (`ws` feature) | ✅ (`par-rt-db[ws]` extra) | ✅ |
 | One-shot HTTP client | ✅ | ✅ (`http` feature) | ✅ (`par-rt-db[http]` extra) | ✅ |
-| Admin API client | ✅ | ✅ (`admin` feature) | ✅ | ✅ |
-| File storage upload/download | ✅ | ✅ | ✅ | ✅ |
+| Admin API client | ✅ | ✅ (`admin` feature) | ✅ (via `[http]` extra) | ✅ |
+| File storage (upload, delete, serve/signed URLs) | ✅ | ✅ | ✅ | ✅ |
 | Query DSL builders (`.filter()` / `.search()` / `.vector_search()`) | ✅ | ✅ | ✅ | ✅ |
 | In-memory test harness | ✅ | ✅ (`in_memory` feature) | ✅ (`par_rt_db.in_memory`) | ✅ |
 | Optimistic updates | ✅ | ✅ | ✅ | ✅ |
