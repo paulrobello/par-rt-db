@@ -11,6 +11,11 @@ use rtdb_server::{
     config::{Config, OAuthConfig},
     db, ddl,
 };
+
+#[allow(dead_code)]
+pub mod cluster;
+#[allow(unused_imports)]
+pub use cluster::{Cluster, Replica, ReplicaId};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 /// ARC-009: RAII guard that stops an `AppState`'s background tasks (the

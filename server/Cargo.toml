@@ -28,6 +28,15 @@ otel = [
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
 ]
+# ENH-029 multi-instance test harness: the chaos hooks in `src/forward.rs`
+# (`drop_replies` / `delay_listener`) and their reachability path
+# (`Committers::forwarder`) are cfg-gated on `any(test, feature =
+# "test-support")`. `cfg(test)` covers the lib's own unit tests only — an
+# integration test binary is a separate crate, so `tests/common/cluster.rs`
+# needs the feature enabled on the lib when the test binary is built:
+# `cargo test --features test-support`. No new dependencies — the flag only
+# compiles in code that is already reachable from the dev-dependency graph.
+test-support = []
 
 [dependencies]
 par-rt-db-core.workspace = true

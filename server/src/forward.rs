@@ -300,6 +300,15 @@ pub struct Forwarder {
     instance_id: String,
     timeout: std::time::Duration,
     pending: Mutex<HashMap<String, oneshot::Sender<ForwardReply>>>,
+    /// ENH-029 chaos hook (test-support only): when true, this replica
+    /// silently drops forward replies (both incoming replies never resolve
+    /// the pending oneshot, and replies it would publish as owner are skipped).
+    #[cfg(any(test, feature = "test-support"))]
+    drop_replies: std::sync::atomic::AtomicBool,
+    /// ENH-029 chaos hook (test-support only): when Some(d), this replica's
+    /// forward listener sleeps d before handling each notification.
+    #[cfg(any(test, feature = "test-support"))]
+    delay_listener: std::sync::Mutex<Option<std::time::Duration>>,
 }
 
 impl Forwarder {
@@ -309,6 +318,10 @@ impl Forwarder {
             instance_id,
             timeout,
             pending: Mutex::new(HashMap::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            drop_replies: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-support"))]
+            delay_listener: std::sync::Mutex::new(None),
         })
     }
 
@@ -378,6 +391,14 @@ impl Forwarder {
     /// late reply racing the origin's timeout — the submitter already moved
     /// on to takeover, so drop it (logged) rather than erroring.
     pub async fn handle_reply(&self, reply: ForwardReply) {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.drop_replies_enabled() {
+            tracing::debug!(
+                request_id = %reply.request_id,
+                "chaos: drop_replies enabled; dropping claimed forward reply"
+            );
+            return;
+        }
         let mut pending = self.pending.lock().await;
         if let Some(tx) = pending.remove(&reply.request_id) {
             let _ = tx.send(reply);
@@ -387,6 +408,33 @@ impl Forwarder {
                 "forward reply arrived after the origin timed out; dropped"
             );
         }
+    }
+}
+
+/// ENH-029: Gated chaos methods.
+#[cfg(any(test, feature = "test-support"))]
+impl Forwarder {
+    pub fn set_drop_replies(&self, on: bool) {
+        self.drop_replies
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn drop_replies_enabled(&self) -> bool {
+        self.drop_replies.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn set_delay_listener(&self, delay: Option<std::time::Duration>) {
+        *self
+            .delay_listener
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = delay;
+    }
+
+    pub fn delay_listener_duration(&self) -> Option<std::time::Duration> {
+        *self
+            .delay_listener
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -651,6 +699,14 @@ pub async fn run_forward_listener(
                     break;
                 }
             };
+            // ENH-029 chaos hook (test-support only): a live-but-slow replica.
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(delay) = forwarder.delay_listener_duration() {
+                tracing::debug!(
+                    "chaos: delay_listener sleeping {delay:?} before handling a forward notification"
+                );
+                tokio::time::sleep(delay).await;
+            }
             match notif.channel() {
                 WRITE_REPLY_CHANNEL => {
                     // ARC-002: the NOTIFY carries only the spool row id; the
@@ -685,6 +741,8 @@ pub async fn run_forward_listener(
                     }
                     let committers = committers.clone();
                     let notify_pool = pool.clone();
+                    #[cfg(any(test, feature = "test-support"))]
+                    let chaos = forwarder.clone();
                     // ARC-008: acquire a permit BEFORE spawning, so the cap
                     // bounds actual in-flight executions rather than merely
                     // throttling inside an already-spawned task.
@@ -710,7 +768,19 @@ pub async fn run_forward_listener(
                                                 err,
                                             ),
                                         };
-                                        publish_reply(&notify_pool, reply).await;
+                                        #[cfg(any(test, feature = "test-support"))]
+                                        let suppress_reply = chaos.drop_replies_enabled();
+                                        #[cfg(not(any(test, feature = "test-support")))]
+                                        let suppress_reply = false;
+
+                                        if suppress_reply {
+                                            tracing::debug!(
+                                                request_id = %reply.request_id,
+                                                "chaos: drop_replies enabled; owner dropping forward reply"
+                                            );
+                                        } else {
+                                            publish_reply(&notify_pool, reply).await;
+                                        }
                                         // The request row's work is done on
                                         // the only replica that will ever
                                         // execute it.

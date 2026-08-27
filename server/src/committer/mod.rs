@@ -368,6 +368,13 @@ impl Committers {
         }
     }
 
+    /// ENH-029: Gated accessor for the forwarder, so the integration-test
+    /// `Cluster` harness can reach its chaos knobs.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn forwarder(&self) -> Option<Arc<crate::forward::Forwarder>> {
+        self.forwarder.clone()
+    }
+
     /// Bundles this `Committers`'s shared state with a per-task `db` into a
     /// `CommitterCtx` ready to hand to `run_committer` by value. Constructs
     /// the ctx once at spawn time in `channel_for` so `run_committer` accepts
@@ -455,7 +462,7 @@ impl Committers {
     /// draining entry with `lease: Some`). The forward listener uses this to
     /// decide whether a broadcast write belongs here — every replica receives
     /// the NOTIFY, and only the owner executes + replies.
-    pub(crate) async fn is_owner(&self, db: &str) -> bool {
+    pub async fn is_owner(&self, db: &str) -> bool {
         let guard = self.channels.lock().await;
         guard
             .get(db)

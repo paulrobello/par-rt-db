@@ -30,6 +30,7 @@ mod image_transform_test;
 mod merge_test;
 mod migration_test;
 mod multi_instance_stage4_test;
+mod multi_instance_subs_test;
 mod mutation_dedup_test;
 mod notify_test;
 mod oauth_ms_apple_test;

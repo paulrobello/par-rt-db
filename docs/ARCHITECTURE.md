@@ -574,6 +574,19 @@ session, so every payload carries its origin `instance_id` and every listener
 skips its own echo. Without it a local write would land in the op-feed ring
 twice and double `/admin/stream`'s event count.
 
+### Testing the cluster
+
+Multi-instance behavior is exercised through the shared harness in
+`server/tests/common/cluster.rs`: `Cluster::two(schema)` builds a
+two-replica cluster with one Postgres database, distinct `instance_id`s, and
+per-replica WS/HTTP clients. Use `Cluster::kill(ReplicaId)` and
+`wait_takeover` to drive the owner-loss/takeover lifecycle. Fault injection
+(`drop_replies`, `delay_listener`) is gated behind the `test-support` cargo
+feature, so the chaos hooks compile only when that test-support feature is
+enabled. New multi-instance tests should build on `Cluster::two` (see
+[CONTRIBUTING.md](../CONTRIBUTING.md#running-tests)) rather than
+hand-building replica pairs.
+
 ## Auth
 
 `auth/`: per-database machine tokens and OAuth sessions (GitHub, Google,

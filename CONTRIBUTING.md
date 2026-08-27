@@ -120,6 +120,11 @@ cargo test upsert                                         # by name, lib + integ
 # The server's integration tests are ONE binary (`server/tests/main.rs`), so
 # every `tests/<name>.rs` is a module of it and filters are `<name>::<test>`.
 # A NEW test file needs a `mod <name>;` line in `tests/main.rs`.
+For multi-instance server tests, use `server/tests/common/cluster.rs` and
+`Cluster::two` instead of constructing replicas inline. The `test-support`
+feature provides gated `drop_replies` and `delay_listener` chaos hooks for
+failure-injection scenarios.
+
 cd ts-client && bunx vitest run tests/<file>.test.ts
 cd python-client && uv run pytest -q tests/<file>.py
 ```

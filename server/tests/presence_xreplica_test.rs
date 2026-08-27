@@ -1,38 +1,52 @@
 //! Integration tests for cross-instance presence gossip via Postgres
 //! LISTEN/NOTIFY (ENH-022 Stage 3).
 //!
-//! These tests build two `AppState`s (replica A + replica B) sharing one
-//! Postgres pool, both with `multi_instance = true` and distinct instance ids,
-//! plus a presence-enabled config. A `join` on replica A publishes the room's
-//! local snapshot via `pg_notify('rtdb_presence', …)`; replica B's dedicated
-//! presence LISTEN task mirrors it into its peer shadow map and marks the room
-//! dirty so the next flush broadcasts the union — local members first, then
-//! namespaced peer members (`"{origin_instance_id}:{conn_id}"`).
+//! The gossip test builds its two replicas (A + B) with the ENH-029
+//! `common::cluster` harness — `Cluster::two_with` with presence enabled on
+//! both — so both share one Postgres, run `multi_instance = true` with
+//! distinct instance ids, and bind real listeners. A `join` on replica A
+//! publishes the room's local snapshot via `pg_notify('rtdb_presence', …)`;
+//! replica B's dedicated presence LISTEN task mirrors it into its peer shadow
+//! map and marks the room dirty so the next flush broadcasts the union —
+//! local members first, then namespaced peer members
+//! (`"{origin_instance_id}:{conn_id}"`).
 //!
 //! The peer-eviction test drives `PresenceManager::expire_peers` directly with
 //! a short beat timeout, proving the "killing A evicts A's members within the
-//! beat timeout" contract without waiting out a real 15s timeout.
+//! beat timeout" contract without waiting out a real 15s timeout; it builds a
+//! bare `PresenceManager` (no Postgres) and so does not use the harness.
 
-use crate::common::{spawn_app, test_config, test_hot, unique_instance_id, wait_until};
-use rtdb_server::AppState;
+use crate::common::cluster::{Cluster, ReplicaId, ReplicaOpts};
+use crate::common::wait_until;
 use rtdb_server::presence::{PresenceConfig, PresenceManager};
 use rtdb_server::protocol::{AuthedUser, PresenceMember, ServerMessage, UserKind};
 use serde_json::json;
 use tokio::sync::mpsc;
 
-/// Build a multi-instance, presence-enabled `AppState` with the given instance
-/// id, sharing `pool`. Presence is enabled so the manager's gossip hooks fire
-/// and the dedicated `rtdb_presence` LISTEN task is spawned.
-async fn multi_instance_state(pool: sqlx::PgPool, instance_id: &str) -> std::sync::Arc<AppState> {
-    let mut cfg = test_config();
-    cfg.multi_instance.enabled = true;
-    cfg.multi_instance.instance_id = Some(unique_instance_id(instance_id));
-    cfg.presence_enabled = true;
-    // Use a non-zero broadcast interval so the flush task is spawned normally
-    // (matches real multi-instance deploy). Tests drive `flush_once` directly
-    // for determinism; the background task coexists without interfering.
-    cfg.presence_broadcast_interval_ms = 50;
-    AppState::new(pool, cfg, test_hot())
+/// Harness options for one presence-gossip replica: presence enabled with a
+/// non-zero broadcast interval so the flush task is spawned normally (matches
+/// a real multi-instance deploy). Tests drive `flush_once` directly for
+/// determinism; the background task coexists without interfering.
+fn presence_opts(label: &str) -> ReplicaOpts {
+    ReplicaOpts {
+        label: label.to_string(),
+        presence_enabled: true,
+        presence_broadcast_interval_ms: 50,
+        ..Default::default()
+    }
+}
+
+/// The schema `Cluster::two_with` pushes before the test runs. Presence rooms
+/// key by db NAME only — the schema itself is incidental, so a minimal
+/// one-table schema suffices.
+fn presence_schema() -> rtdb_server::schema::SchemaDef {
+    serde_json::from_value(serde_json::json!({
+        "tables": { "items": {
+            "fields": { "title": { "type": "string" } },
+            "indexes": [{ "name": "by_title", "fields": ["title"] }]
+        }}
+    }))
+    .expect("valid schema")
 }
 
 fn user(email: &str) -> AuthedUser {
@@ -53,23 +67,20 @@ fn user(email: &str) -> AuthedUser {
 /// multi-instance mode and the whole point of the gossip layer.
 #[tokio::test]
 async fn cross_replica_presence_union_includes_namespaced_peer_member() -> anyhow::Result<()> {
-    let cfg = test_config();
-    let pool = sqlx::PgPool::connect(&cfg.database_url)
-        .await
-        .expect("connect to test postgres");
-    rtdb_server::db::bootstrap(&pool)
-        .await
-        .expect("bootstrap rtdb_auth");
-
-    let state_a = multi_instance_state(pool.clone(), "replica-a").await;
-    let state_b = multi_instance_state(pool.clone(), "replica-b").await;
-    // A's members arrive on B namespaced by A's instance id. That id is now
-    // process-unique, so build the expected conn id from the same helper
-    // rather than the bare label (`unique_instance_id` is stable per process,
-    // so this is the very string `state_a` was constructed with).
-    let peer_conn_id = format!("{}:1", unique_instance_id("replica-a"));
-    let _addr_a = spawn_app(state_a.clone()).await;
-    let _addr_b = spawn_app(state_b.clone()).await;
+    let cluster = Cluster::two_with(
+        presence_schema(),
+        presence_opts("replica-a"),
+        presence_opts("replica-b"),
+    )
+    .await;
+    let state_a = cluster.replica(ReplicaId::A).state.clone();
+    let state_b = cluster.replica(ReplicaId::B).state.clone();
+    // A's members arrive on B namespaced by A's instance id. That id is
+    // process-unique and the harness minted it, so read it back from the
+    // replica rather than rebuilding it (`unique_instance_id` is stable per
+    // process, so this is the very string replica A was constructed with).
+    let peer_conn_id = format!("{}:1", cluster.replica(ReplicaId::A).instance_id);
+    let db = cluster.db.as_str().to_string();
 
     // 1. A LOCAL subscriber on replica B conn 1 in "room-x". This is the
     //    client whose receipt of the union broadcast we assert against. The
@@ -79,7 +90,7 @@ async fn cross_replica_presence_union_includes_namespaced_peer_member() -> anyho
     state_b
         .realtime
         .presence
-        .join("db-x", 1, "room-x", None, user("local@b.example"), tx_b)
+        .join(&db, 1, "room-x", None, user("local@b.example"), tx_b)
         .await
         .expect("B local join");
     // Drain the initial local-only snapshot from B's join so the next recv
@@ -89,13 +100,13 @@ async fn cross_replica_presence_union_includes_namespaced_peer_member() -> anyho
     // 2. Join on replica A conn 1 in the SAME room. A's join calls
     //    gossip_publish -> pg_notify('rtdb_presence', …). B's presence LISTEN
     //    task picks it up and calls ingest_peer_snapshot, which refreshes the
-    //    shadow map and marks (db-x, room-x) dirty on B.
+    //    shadow map and marks (db, room-x) dirty on B.
     let (tx_a, _rx_a) = mpsc::unbounded_channel::<ServerMessage>();
     state_a
         .realtime
         .presence
         .join(
-            "db-x",
+            &db,
             1,
             "room-x",
             Some(json!({"role": "caller"})),

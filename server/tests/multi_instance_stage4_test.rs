@@ -2,136 +2,38 @@
 //! and the committer ownership lease (docs/superpowers/specs/
 //! 2026-08-22-multi-instance-stage4-design.md, option A1 + B1), plus Stage 4c
 //! forwarding of non-owner writes to the lease owner. "Two processes" are two
-//! full `AppState`s with distinct instance ids sharing one Postgres — the
-//! same shape `notify_test.rs` uses for Stage 2/3.
+//! full `AppState`s with distinct instance ids sharing one Postgres — built
+//! with the ENH-029 `common::cluster` harness (`Cluster::two`/`two_with`/`two_bare`),
+//! the shared shape for all multi-instance tests.
 
-use crate::common::{test_config, test_hot, unique_instance_id};
-use rtdb_server::AppState;
+use crate::common::cluster::{Cluster, ReplicaId, ReplicaOpts, insert_item, mutate_until_landed};
 use rtdb_server::auth::{Principal, PrincipalCtx};
 use rtdb_server::error::ErrorCode;
 use rtdb_server::txn::{Step, Transaction};
-use sqlx::PgPool;
 
-/// Forward timeout for this file's replicas. Short enough that the two
-/// failover tests reach `timeout → takeover` without waiting the 5s
-/// production default, long enough that a forward the owner WILL answer is
-/// not cut off first.
-///
-/// It was 300ms, which was under the owner's real execution time for the
-/// heavier forwarded writes in this file once the machine was busy. That
-/// misfires in a self-sustaining way: the origin gives up and retries, but
-/// the timed-out request still reaches the owner and still executes there, so
-/// every retry adds work to the owner that made the deadline unreachable in
-/// the first place. `forwarded_push_schema_reply_larger_than_notify_cap`
-/// (an 81-table DDL push) hit exactly that under concurrent-suite load and
-/// CONFLICTed for its whole retry deadline.
-const FORWARD_TIMEOUT_MS: u64 = 2_000;
-
-/// Deadline for this file's CONFLICT retry loops. Generous relative to
-/// [`FORWARD_TIMEOUT_MS`] so a loop that does pay one full timeout still has
-/// many attempts left to converge.
+/// Deadline for this file's CONFLICT retry loops. Generous relative to the
+/// harness's 2_000ms forward timeout so a loop that does pay one full timeout
+/// still has many attempts left to converge.
 const RETRY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// A multi-instance `AppState` with distinct instance id and optional rate
-/// limits, sharing `pool` — one stand-in per replica process.
-async fn replica(
-    pool: &PgPool,
-    instance_id: &str,
-    per_token_rpm: u32,
-    per_db_rpm: u32,
-) -> std::sync::Arc<AppState> {
-    let mut cfg = test_config();
-    cfg.multi_instance.enabled = true;
-    cfg.multi_instance.instance_id = Some(unique_instance_id(instance_id));
-    cfg.limits.per_token_rpm = per_token_rpm;
-    cfg.limits.per_db_rpm = per_db_rpm;
-    // ARC-007: this helper's one rate-limiting test
-    // (`rate_budget_is_shared_across_replicas`) asserts the budget is shared
-    // *synchronously* across replicas with no flush delay — that's the exact
-    // path's guarantee, not the (now-default) approximate path's. The other
-    // callers all pass 0/0 (rate limiting disabled), so this is a no-op for
-    // them.
-    cfg.limits.exact = true;
-    cfg.multi_instance.forward_timeout_ms = FORWARD_TIMEOUT_MS;
-    AppState::new(pool.clone(), cfg, test_hot())
-}
-
-async fn shared_pool() -> PgPool {
-    let state = crate::common::test_state().await;
-    state.pool.clone()
-}
-
-fn insert_item(title: &str) -> Transaction {
-    Transaction {
-        steps: vec![Step::Insert {
-            table: "items".to_string(),
-            doc: serde_json::json!({ "title": title })
-                .as_object()
-                .unwrap()
-                .clone(),
-        }],
-    }
-}
-
-/// `mutate` with a bounded retry on CONFLICT. A forwarded write can surface
-/// CONFLICT transiently — the peer's forward listener may still be
-/// connecting, or a just-dropped owner's lease may not be released yet — and
-/// the production contract is that the client retries into convergence.
-///
-/// This retry is safe only against a CONFLICT raised BEFORE the owner ran the
-/// write: the shadow's ownership backstop when no owner ever received it.
-/// It is NOT safe against the forward path's documented timeout ambiguity —
-/// per `docs/superpowers/specs/2026-08-22-multi-instance-stage4-design.md`
-/// ("the caller may see CONFLICT for a write that committed"), a reply lost or
-/// delayed past `forward_timeout_ms` drives the origin into a takeover that
-/// CONFLICTs while the owner has already committed. Retrying an unkeyed txn
-/// there mints a fresh server-side idempotency key and writes a second row, so
-/// the exactly-once assertions in this file depend on that ambiguity not
-/// firing: every replica must carry a process-unique instance id (see
-/// `common::unique_instance_id`) so no peer process can claim this origin's
-/// forward reply.
-async fn mutate_until_landed(
-    state: &std::sync::Arc<AppState>,
-    db: &str,
-    txn: Transaction,
-    principal: PrincipalCtx,
-) -> anyhow::Result<rtdb_server::txn::TxnOutcome> {
-    let deadline = std::time::Instant::now() + RETRY_DEADLINE;
-    loop {
-        let result = state
-            .realtime
-            .committers
-            .mutate(db, None, txn.clone(), principal.clone())
-            .await;
-        match result {
-            Ok(outcome) => return Ok(outcome),
-            Err(err) if err.code == ErrorCode::Conflict => {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "write kept conflicting past the deadline: {err}"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            Err(err) => return Err(err.into()),
-        }
-    }
-}
 
 /// (T2) A per-db rate budget configured on two replicas is ONE budget: the
 /// counters live in `rtdb_auth.rate_counters`, so the Nth+1 request is denied
 /// regardless of which replica handled the first N.
 #[tokio::test]
 async fn rate_budget_is_shared_across_replicas() -> anyhow::Result<()> {
-    let pool = shared_pool().await;
-    let a = replica(&pool, "stage4-rate-a", 0, 4).await;
-    let b = replica(&pool, "stage4-rate-b", 0, 4).await;
-
-    let db = format!("t{}", uuid::Uuid::now_v7().simple());
-    rtdb_server::db::create_database(&pool, &db).await?;
-    let db = crate::common::wrap_test_db(db);
+    let opts = |label: &str| ReplicaOpts {
+        label: label.into(),
+        per_db_rpm: 4,
+        exact_limits: true,
+        ..Default::default()
+    };
+    let cluster = Cluster::two_bare(opts("stage4-rate-a"), opts("stage4-rate-b")).await;
+    let a = cluster.replica(ReplicaId::A).state.clone();
+    let b = cluster.replica(ReplicaId::B).state.clone();
+    let db = cluster.db.as_str().to_string();
 
     let principal = Principal::Machine {
-        db: db.as_str().to_string(),
+        db: db.clone(),
         token_id: "stage4-rate-token".to_string(),
         read_only: false,
         tables: None,
@@ -187,19 +89,11 @@ fn items_schema(with_owner_field: bool) -> rtdb_server::schema::SchemaDef {
 /// lands. Writes land exactly once throughout.
 #[tokio::test]
 async fn ownership_lease_forwarding_and_failover_on_death() -> anyhow::Result<()> {
-    let pool = shared_pool().await;
-    let a = replica(&pool, "stage4-own-a", 0, 0).await;
-    let b = replica(&pool, "stage4-own-b", 0, 0).await;
-
-    let name = format!("t{}", uuid::Uuid::now_v7().simple());
-    rtdb_server::db::create_database(&pool, &name).await?;
-    let db = crate::common::wrap_test_db(name);
-
-    // A's push takes the lease (A becomes the owner).
-    a.realtime
-        .committers
-        .push_schema(&db, items_schema(false))
-        .await?;
+    let mut cluster = Cluster::two(items_schema(false)).await;
+    let a = cluster.replica(ReplicaId::A).state.clone();
+    let b = cluster.replica(ReplicaId::B).state.clone();
+    let pool = b.pool.clone();
+    let db = cluster.db.as_str().to_string();
 
     // Stage 4c: B's write is FORWARDED to A and commits — no CONFLICT. The
     // retry wrapper only absorbs the listener-connecting startup window.
@@ -211,13 +105,13 @@ async fn ownership_lease_forwarding_and_failover_on_death() -> anyhow::Result<()
         .mutate(&db, None, insert_item("from-a"), PrincipalCtx::bypass())
         .await?;
 
-    // Owner death: dropping A's channel entry drops the lease pool — its
-    // connection closes, and Postgres releases the advisory lock exactly as
-    // it does when the process dies.
-    a.realtime.committers.drop_db(&db).await;
+    // Owner death: kill(A) drops A's committer entry (releasing the lease),
+    // stops its axum server and background listeners, and drops every AppState
+    // clone — what process death looks like to Postgres.
+    cluster.kill(ReplicaId::A).await;
 
-    // Failover: B's next write forwards (no owner answers — A's entry is
-    // gone), times out, takes the lease itself, and lands.
+    // Failover: B's next write forwards (no owner answers — A is gone),
+    // times out, takes the lease itself, and lands.
     mutate_until_landed(
         &b,
         &db,
@@ -241,20 +135,14 @@ async fn ownership_lease_forwarding_and_failover_on_death() -> anyhow::Result<()
 /// held on a held-live pooled connection: lease held, no listener behind it.
 #[tokio::test]
 async fn forward_timeout_conflicts_then_takes_over_when_lease_frees() -> anyhow::Result<()> {
-    let pool = shared_pool().await;
-    let b = replica(&pool, "stage4c-ghost-b", 0, 0).await;
+    let mut cluster = Cluster::two(items_schema(false)).await;
+    let b = cluster.replica(ReplicaId::B).state.clone();
+    let pool = b.pool.clone();
+    let db = cluster.db.as_str().to_string();
 
-    let name = format!("t{}", uuid::Uuid::now_v7().simple());
-    rtdb_server::db::create_database(&pool, &name).await?;
-    let db = crate::common::wrap_test_db(name);
-    b.realtime
-        .committers
-        .push_schema(&db, items_schema(false))
-        .await?;
-    // ^ B pushed to a cold db — B is now the OWNER. Simulate an unreachable
-    // owner instead by retiring B's entry (releasing its lease) and holding
-    // the advisory lock on a raw connection no listener answers for.
-    b.realtime.committers.drop_db(&db).await;
+    // A took the lease via `Cluster::two`; kill it the way process death looks
+    // to Postgres — the whole state drops, so the advisory lock releases.
+    cluster.kill(ReplicaId::A).await;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     let hex = rtdb_server::db::sha256_hex(&db);
@@ -267,8 +155,8 @@ async fn forward_timeout_conflicts_then_takes_over_when_lease_frees() -> anyhow:
     assert!(locked, "ghost session must take the advisory lock");
 
     // Forward finds no owner (nobody owns the db), times out after
-    // FORWARD_TIMEOUT_MS, the
-    // takeover hits the ghost's lock, and the write surfaces CONFLICT.
+    // forward_timeout_ms, the takeover hits the ghost's lock, and the write
+    // surfaces CONFLICT.
     let err = b
         .realtime
         .committers
@@ -315,17 +203,10 @@ async fn forward_timeout_conflicts_then_takes_over_when_lease_frees() -> anyhow:
 /// the stored row's `owner` must be `user-fwd`.
 #[tokio::test]
 async fn forwarded_write_preserves_principal_on_owner() -> anyhow::Result<()> {
-    let pool = shared_pool().await;
-    let a = replica(&pool, "stage4c-prin-a", 0, 0).await;
-    let b = replica(&pool, "stage4c-prin-b", 0, 0).await;
-
-    let name = format!("t{}", uuid::Uuid::now_v7().simple());
-    rtdb_server::db::create_database(&pool, &name).await?;
-    let db = crate::common::wrap_test_db(name);
-    a.realtime
-        .committers
-        .push_schema(&db, items_schema(true))
-        .await?;
+    let cluster = Cluster::two(items_schema(true)).await;
+    let b = cluster.replica(ReplicaId::B).state.clone();
+    let pool = b.pool.clone();
+    let db = cluster.db.as_str().to_string();
 
     let principal = PrincipalCtx {
         user_id: Some("user-fwd".to_string()),
@@ -353,17 +234,10 @@ async fn forwarded_write_preserves_principal_on_owner() -> anyhow::Result<()> {
 /// fell into the takeover path instead of reaching the owner.
 #[tokio::test]
 async fn forwarded_mutate_larger_than_notify_cap_round_trips() -> anyhow::Result<()> {
-    let pool = shared_pool().await;
-    let a = replica(&pool, "arc002-big-a", 0, 0).await;
-    let b = replica(&pool, "arc002-big-b", 0, 0).await;
-
-    let name = format!("t{}", uuid::Uuid::now_v7().simple());
-    rtdb_server::db::create_database(&pool, &name).await?;
-    let db = crate::common::wrap_test_db(name);
-    a.realtime
-        .committers
-        .push_schema(&db, items_schema(false))
-        .await?;
+    let cluster = Cluster::two(items_schema(false)).await;
+    let b = cluster.replica(ReplicaId::B).state.clone();
+    let pool = b.pool.clone();
+    let db = cluster.db.as_str().to_string();
 
     // 20 KB of title — two and a half times the NOTIFY cap on its own.
     let big_title = "x".repeat(20 * 1024);
@@ -389,18 +263,9 @@ async fn forwarded_mutate_larger_than_notify_cap_round_trips() -> anyhow::Result
 /// past 8000 bytes. Both legs go through the spool.
 #[tokio::test]
 async fn forwarded_push_schema_reply_larger_than_notify_cap() -> anyhow::Result<()> {
-    let pool = shared_pool().await;
-    let a = replica(&pool, "arc002-schema-a", 0, 0).await;
-    let b = replica(&pool, "arc002-schema-b", 0, 0).await;
-
-    let name = format!("t{}", uuid::Uuid::now_v7().simple());
-    rtdb_server::db::create_database(&pool, &name).await?;
-    let db = crate::common::wrap_test_db(name);
-    // A takes the lease with the baseline schema; B's push is forwarded.
-    a.realtime
-        .committers
-        .push_schema(&db, items_schema(false))
-        .await?;
+    let cluster = Cluster::two(items_schema(false)).await;
+    let b = cluster.replica(ReplicaId::B).state.clone();
+    let db = cluster.db.as_str().to_string();
 
     // Additive-only: keep `items` and add 80 more tables.
     let mut tables = serde_json::Map::new();
@@ -494,18 +359,10 @@ async fn await_query_update(
 /// until B happened to write.
 #[tokio::test]
 async fn owner_side_write_invalidates_peer_subscriptions() -> anyhow::Result<()> {
-    let pool = shared_pool().await;
-    let a = replica(&pool, "arc001-owner-a", 0, 0).await;
-    let b = replica(&pool, "arc001-peer-b", 0, 0).await;
-
-    let name = format!("t{}", uuid::Uuid::now_v7().simple());
-    rtdb_server::db::create_database(&pool, &name).await?;
-    let db = crate::common::wrap_test_db(name);
-    // A's push takes the lease — A is the owner for the rest of the test.
-    a.realtime
-        .committers
-        .push_schema(&db, items_schema(false))
-        .await?;
+    let cluster = Cluster::two(items_schema(false)).await;
+    let a = cluster.replica(ReplicaId::A).state.clone();
+    let b = cluster.replica(ReplicaId::B).state.clone();
+    let db = cluster.db.as_str().to_string();
 
     // The subscription lives on B, which owns nothing.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -554,17 +411,10 @@ async fn owner_side_write_invalidates_peer_subscriptions() -> anyhow::Result<()>
 /// (`kind='writeset'`) and the NOTIFY carries only the row id.
 #[tokio::test]
 async fn oversized_write_set_invalidates_peer_subscriptions() -> anyhow::Result<()> {
-    let pool = shared_pool().await;
-    let a = replica(&pool, "arc001-bulk-a", 0, 0).await;
-    let b = replica(&pool, "arc001-bulk-b", 0, 0).await;
-
-    let name = format!("t{}", uuid::Uuid::now_v7().simple());
-    rtdb_server::db::create_database(&pool, &name).await?;
-    let db = crate::common::wrap_test_db(name);
-    a.realtime
-        .committers
-        .push_schema(&db, items_schema(false))
-        .await?;
+    let cluster = Cluster::two(items_schema(false)).await;
+    let a = cluster.replica(ReplicaId::A).state.clone();
+    let b = cluster.replica(ReplicaId::B).state.clone();
+    let db = cluster.db.as_str().to_string();
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let query: rtdb_server::query::Query =
@@ -620,17 +470,11 @@ async fn oversized_write_set_invalidates_peer_subscriptions() -> anyhow::Result<
 /// left the origin resubmitting a write that had already committed.
 #[tokio::test]
 async fn forwarded_mutate_is_deduped_by_a_server_minted_key() -> anyhow::Result<()> {
-    let pool = shared_pool().await;
-    let a = replica(&pool, "arc003-key-a", 0, 0).await;
-    let b = replica(&pool, "arc003-key-b", 0, 0).await;
-
-    let name = format!("t{}", uuid::Uuid::now_v7().simple());
-    rtdb_server::db::create_database(&pool, &name).await?;
-    let db = crate::common::wrap_test_db(name);
-    a.realtime
-        .committers
-        .push_schema(&db, items_schema(false))
-        .await?;
+    let cluster = Cluster::two(items_schema(false)).await;
+    let a = cluster.replica(ReplicaId::A).state.clone();
+    let b = cluster.replica(ReplicaId::B).state.clone();
+    let pool = b.pool.clone();
+    let db = cluster.db.as_str().to_string();
 
     // A local (owner-side) unkeyed mutate is NOT keyed — it has no forward to
     // be ambiguous about, so it must not pay for a dedup row.
@@ -689,28 +533,19 @@ async fn forwarded_mutate_is_deduped_by_a_server_minted_key() -> anyhow::Result<
 /// until the forward timeout drives the origin into a lease takeover.
 #[tokio::test]
 async fn forward_concurrency_cap_rate_limits_excess_requests() -> anyhow::Result<()> {
-    let pool = shared_pool().await;
-    let mut cfg_a = test_config();
-    cfg_a.multi_instance.enabled = true;
-    cfg_a.multi_instance.instance_id = Some(unique_instance_id("arc008-cap-a"));
-    cfg_a.multi_instance.forward_timeout_ms = 2000;
-    cfg_a.multi_instance.forward_concurrency = 1;
-    let a = AppState::new(pool.clone(), cfg_a, test_hot());
-
-    let mut cfg_b = test_config();
-    cfg_b.multi_instance.enabled = true;
-    cfg_b.multi_instance.instance_id = Some(unique_instance_id("arc008-cap-b"));
-    cfg_b.multi_instance.forward_timeout_ms = 2000;
-    let b = AppState::new(pool.clone(), cfg_b, test_hot());
-
-    let name = format!("t{}", uuid::Uuid::now_v7().simple());
-    rtdb_server::db::create_database(&pool, &name).await?;
-    let db = crate::common::wrap_test_db(name);
-    // A's push takes the lease — A is the owner for the rest of the test.
-    a.realtime
-        .committers
-        .push_schema(&db, items_schema(false))
-        .await?;
+    let a_opts = ReplicaOpts {
+        label: "arc008-cap-a".into(),
+        forward_concurrency: 1,
+        ..Default::default()
+    };
+    let b_opts = ReplicaOpts {
+        label: "arc008-cap-b".into(),
+        ..Default::default()
+    };
+    let cluster = Cluster::two_with(items_schema(false), a_opts, b_opts).await;
+    let b = cluster.replica(ReplicaId::B).state.clone();
+    let pool = b.pool.clone();
+    let db = cluster.db.as_str().to_string();
 
     // Let both replicas' forward listeners finish LISTENing before the burst
     // so the saturation this test targets isn't masked by the unrelated
@@ -724,11 +559,11 @@ async fn forward_concurrency_cap_rate_limits_excess_requests() -> anyhow::Result
     let mut handles = Vec::with_capacity(n);
     for i in 0..n {
         let b = b.clone();
-        // NOT `db.clone()`: `TestDb::Drop` schedules a real `DROP SCHEMA` for
-        // every clone, so 8 of them would race the writes with real cleanup.
+        // NOT `cluster.db.clone()`: `TestDb::Drop` schedules a real `DROP SCHEMA`
+        // for every clone, so 8 of them would race the writes with real cleanup.
         // A plain owned `String` carries the name with no cleanup attached —
-        // the original `db` still owns the one teardown, at end of test.
-        let db_name = db.as_str().to_string();
+        // the original `cluster.db` still owns the one teardown, at end of test.
+        let db_name = db.clone();
         handles.push(tokio::spawn(async move {
             b.realtime
                 .committers
