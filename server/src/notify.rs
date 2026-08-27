@@ -387,6 +387,9 @@ pub async fn run_write_set_listener(
             if payload.instance_id == own_instance_id {
                 continue;
             }
+            if !subs.has_db(&payload.db).await {
+                continue;
+            }
             let schema = match schemas.get(&pool, &payload.db).await {
                 Ok(schema) => schema,
                 Err(e) => {

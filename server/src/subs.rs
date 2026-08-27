@@ -922,6 +922,13 @@ impl SubscriptionManager {
         guard.get(db).cloned()
     }
 
+    /// Whether this manager has a shard for `db`. Shards are retained after
+    /// teardown, so a concurrent registration cannot race a notification into
+    /// the fast path as an apparent non-subscriber.
+    pub(crate) async fn has_db(&self, db: &str) -> bool {
+        self.shard_get(db).await.is_some()
+    }
+
     pub async fn remove(&self, db: &str, conn: ConnId, query_id: &str) {
         let Some(shard) = self.shard_get(db).await else {
             return;
