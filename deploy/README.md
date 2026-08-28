@@ -37,10 +37,10 @@ VPS and no reverse proxy is needed — TLS is terminated at Cloudflare's edge.
 ## Deploy / update
 
 The preferred path is `make deploy` from the repo root: it runs `make checkall`
-first (the full gate), then rsyncs to the deploy host and runs `docker compose
-up -d --build` with `RTDB_BUILD_COMMIT` baked in (so `/healthz` reports the
-deployed commit). See the [`Makefile`](../Makefile) `deploy` target for the
-canonical commands.
+first (the full gate), then rsyncs to the deploy host and runs
+`BUILDX_BUILDER=par-rt-db-builder docker compose up -d --build` with
+`RTDB_BUILD_COMMIT` baked in (so `/healthz` reports the deployed commit). See
+the [`Makefile`](../Makefile) `deploy` target for the canonical commands.
 
 The deploy target bootstraps the named `par-rt-db-builder` BuildKit
 `docker-container` builder if it does not already exist. The builder reads
@@ -57,7 +57,10 @@ limit would not provide this protection because it applies only after an image
 has been built.
 
 For a live verification, run the deploy in the background and sample the host
-load plus every lenny2 tunnel hostname until that deploy exits:
+load plus every lenny2 tunnel hostname until that deploy exits. The monitor is
+bounded: 540 samples at 5s covers 45 minutes, a trap tears the background
+deploy down on interrupt, and the closing wait only runs once the deploy has
+exited, so a hung deploy cannot block it forever:
 
 ```sh
 hosts="l2-streamer.parflare.com kanban.pardev.net projects.pardev.net \
@@ -65,7 +68,13 @@ rtdb.pardev.net linekeep.pardev.net hack.pardev.net"
 make deploy DEPLOY_HOST=root@lenny2.par-com.net \
   >/tmp/par-rt-db-deploy.log 2>&1 &
 deploy_pid=$!
-for sample in $(seq 1 360); do
+cleanup() {
+  kill "$deploy_pid" 2>/dev/null || true
+  wait "$deploy_pid" 2>/dev/null || true
+}
+trap cleanup INT TERM
+# 540 samples x 5s = 45 minutes of coverage; break early once the deploy exits.
+for sample in $(seq 1 540); do
   kill -0 "$deploy_pid" 2>/dev/null || break
   date -Is
   ssh root@lenny2.par-com.net 'uptime'
@@ -75,7 +84,18 @@ for sample in $(seq 1 360); do
   done
   sleep 5
 done
+# Bounded finish: terminate a deploy that exceeds the 45-minute window, then
+# reap it so this monitor cannot block forever.
+if kill -0 "$deploy_pid" 2>/dev/null; then
+  echo "monitor window elapsed; terminating deploy $deploy_pid"
+  kill "$deploy_pid" 2>/dev/null || true
+  wait "$deploy_pid" 2>/dev/null || true
+  exit 124
+fi
 wait "$deploy_pid"
+deploy_rc=$?
+echo "deploy exited with status $deploy_rc"
+exit "$deploy_rc"
 ```
 
 Inspect `/tmp/par-rt-db-deploy.log` and the terminal output. The acceptance

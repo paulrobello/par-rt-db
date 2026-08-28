@@ -995,8 +995,9 @@ routes. Same-origin ⇒ the dashboard needs no `allowed_origins` entry. In the
 docker deploy the SPA is **baked into the image** (the `dashboard` build stage
 in `Dockerfile` runs the bun/vite build and copies `dist/` to
 `/app/dashboard-dist`, which `RTDB_STATIC_DIR` points at) — so a frontend
-change ships via the standard `docker compose up -d --build` (image rebuild +
-server container recreate); it is not a live-mounted volume.
+change ships via the standard `BUILDX_BUILDER=par-rt-db-builder docker
+compose up -d --build` (image rebuild + server container recreate); it is not
+a live-mounted volume.
 
 ## Performance characteristics
 

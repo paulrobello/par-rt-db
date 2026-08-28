@@ -1092,7 +1092,7 @@ else.
 | `make rtdb-cli` | Builds the `rtdb` CLI release binary (`cli/`, wraps `par-rt-db-client`). |
 | `make dashboard-test` | Runs the dashboard's Vitest + React Testing Library suite standalone. |
 | `make pre-commit` / `pre-commit-update` | `pre-commit run --all-files` (gitleaks, private-key detection, per-package fmt/lint) and `pre-commit autoupdate`. |
-| `make deploy` | `checkall` → rsync to the Docker host → `docker compose up -d --build` → healthz probe. |
+| `make deploy` | `checkall` → rsync to the Docker host → `BUILDX_BUILDER=par-rt-db-builder docker compose up -d --build` → healthz probe. |
 | `make docs-api` / `bench-micro` / `bench` / `bench-baseline` | Regenerate the four SDK API references; run the criterion micro-benchmarks and the black-box load benchmark (ENH-033 — deliberately outside `checkall`; see [CONTRIBUTING's Benchmarks section](CONTRIBUTING.md#benchmarks)). |
 
 ### Per-package targets

@@ -24,7 +24,7 @@ A self-hosted realtime document DB the operator fully controls — Convex's deve
 
 ## Operating Context
 
-- Reference deployment shape: `docker compose` behind a Cloudflare tunnel (host-agnostic; see `deploy/README.md`); the dashboard is a same-origin SPA served by the server itself from `RTDB_STATIC_DIR`. In the docker deploy the SPA is **baked into the image** (the `dashboard` build stage in `Dockerfile` copies `dist/` to `/app/dashboard-dist`), so a frontend change ships via `docker compose up -d --build` (image rebuild + server container recreate), not a live-mounted volume.
+- Reference deployment shape: `docker compose` behind a Cloudflare tunnel (host-agnostic; see `deploy/README.md`); the dashboard is a same-origin SPA served by the server itself from `RTDB_STATIC_DIR`. In the docker deploy the SPA is **baked into the image** (the `dashboard` build stage in `Dockerfile` copies `dist/` to `/app/dashboard-dist`), so a frontend change ships via `BUILDX_BUILDER=par-rt-db-builder docker compose up -d --build` (image rebuild + server container recreate), not a live-mounted volume.
 - The operator authenticates either with the admin key (machine) or as an OAuth'd admin (GitHub, Google, GitLab, Microsoft, Apple, or a configured OIDC provider — allowlisted as admin).
 - Every database is isolated and named; the operator juggles several (e.g. the projects board, app datastores). Documents are JSON; indexed fields become typed Postgres columns, the rest lives in a `doc` jsonb column merged in at read time.
 - Realtime is central: subscriptions re-run on every write, and the op feed surfaces durable mutations as they happen. The dashboard must feel live, not request/response.
