@@ -42,6 +42,51 @@ up -d --build` with `RTDB_BUILD_COMMIT` baked in (so `/healthz` reports the
 deployed commit). See the [`Makefile`](../Makefile) `deploy` target for the
 canonical commands.
 
+The deploy target bootstraps the named `par-rt-db-builder` BuildKit
+`docker-container` builder if it does not already exist. The builder reads
+[`buildkitd.toml`](./buildkitd.toml), which limits solver parallelism to two
+steps, and is constrained to four CPUs with `cpu-quota=400000` and
+`cpu-period=100000`. `default-load=true` makes the resulting image available
+to the Docker Engine used by Compose. The existing builder is reused so
+deploys retain its cache and do not recreate a running builder.
+
+These limits protect the host-local `cloudflared` connector while Rust and
+dashboard build steps run. They limit both BuildKit solver concurrency and the
+builder container's CPU share. A Docker Compose service `deploy.resources`
+limit would not provide this protection because it applies only after an image
+has been built.
+
+For a live verification, run the deploy in the background and sample the host
+load plus every lenny2 tunnel hostname until that deploy exits:
+
+```sh
+hosts="l2-streamer.parflare.com kanban.pardev.net projects.pardev.net \
+rtdb.pardev.net linekeep.pardev.net hack.pardev.net"
+make deploy DEPLOY_HOST=root@lenny2.par-com.net \
+  >/tmp/par-rt-db-deploy.log 2>&1 &
+deploy_pid=$!
+while kill -0 "$deploy_pid" 2>/dev/null; do
+  date -Is
+  ssh root@lenny2.par-com.net 'uptime'
+  for host in $hosts; do
+    curl --fail --silent --show-error --output /dev/null \
+      --write-out "$host %{http_code}\n" "https://$host/"
+  done
+  sleep 5
+done
+wait "$deploy_pid"
+```
+
+Inspect `/tmp/par-rt-db-deploy.log` and the terminal output. The acceptance
+threshold is load below 16 on every sample and HTTP 200 from
+`kanban.pardev.net`, `projects.pardev.net`, `rtdb.pardev.net`, and
+`hack.pardev.net` throughout the build window. The additional lenny2 tunnel
+hostnames must remain healthy too. Do not mark the mitigation verified from a
+local `docker compose config` check alone.
+
+The manual path below must use the same builder bootstrap before
+`docker compose up`:
+
 The host and path are `DEPLOY_HOST` (default `root@docker-host.example.com`)
 and `DEPLOY_PATH` (`/docker/par-rt-db`) — both are `Makefile` variables;
 override `DEPLOY_HOST` on the command line for a different host
@@ -69,10 +114,17 @@ host is x86_64; do not `docker save` an arm64 image from a Mac).
 # would wipe them out.
 rsync -az --delete --filter=':- .gitignore' --exclude .git/ \
   ./ root@docker-host.example.com:/docker/par-rt-db/
-
 # on docker-host (the .env there holds the secrets, mode 600):
 cd /docker/par-rt-db
-docker compose up -d --build
+BUILDER=par-rt-db-builder
+if ! docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
+  docker buildx create --name "$BUILDER" --driver docker-container \
+    --driver-opt default-load=true \
+    --driver-opt cpu-quota=400000 --driver-opt cpu-period=100000 \
+    --buildkitd-config /docker/par-rt-db/deploy/buildkitd.toml
+fi
+docker buildx use "$BUILDER"
+BUILDX_BUILDER="$BUILDER" docker compose up -d --build
 docker compose ps
 curl -fsS http://127.0.0.1:8300/healthz | jq .
 # -> {"status":"ok","started_at":..,"uptime_seconds":..,"postgres":true}
