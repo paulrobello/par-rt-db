@@ -65,7 +65,8 @@ rtdb.pardev.net linekeep.pardev.net hack.pardev.net"
 make deploy DEPLOY_HOST=root@lenny2.par-com.net \
   >/tmp/par-rt-db-deploy.log 2>&1 &
 deploy_pid=$!
-while kill -0 "$deploy_pid" 2>/dev/null; do
+for sample in $(seq 1 360); do
+  kill -0 "$deploy_pid" 2>/dev/null || break
   date -Is
   ssh root@lenny2.par-com.net 'uptime'
   for host in $hosts; do
@@ -357,10 +358,10 @@ operator-critical subset.
 - `RTDB_ALLOWED_ORIGINS` — the SPA origin(s); adjust when the client's final
   origin is known, then `docker compose up -d` to apply.
 - `RTDB_BUILD_COMMIT` (optional) — git short sha baked into `/healthz`. Set it
-  to the deployed commit before `docker compose up -d --build`, e.g.
-  `RTDB_BUILD_COMMIT=$(git rev-parse --short HEAD)` (run on the workstation
-  that has `.git`, before rsync). If unset, `/healthz` reports
-  `git_commit: "unknown"`.
+  to the deployed commit before `BUILDX_BUILDER=par-rt-db-builder docker
+  compose up -d --build`, e.g. `RTDB_BUILD_COMMIT=$(git rev-parse --short HEAD)`
+  (run on the workstation that has `.git`, before rsync). If unset, `/healthz`
+  reports `git_commit: "unknown"`.
 - `RTDB_TRUSTED_PROXY` (default `false`; `docker-compose.yml` and
   `.env.example` set it `true`) — **required** behind the Cloudflare tunnel.
   When `true`, the server trusts the tunnel's forwarding headers
@@ -384,9 +385,10 @@ the bun/vite build and copies `dist/` to `/app/dashboard-dist`, and
 (as the router's last-resort SPA fallback, so it never shadows `/healthz`,
 `/api/*`, `/admin/*`, `/sync`, or `/auth/*`). Consequences:
 
-- A **frontend-only change ships via the standard `docker compose up -d --build`**
-  (image rebuild + server container recreate) — it is NOT a hot volume you can
-  swap without a rebuild.
+- A **frontend-only change ships via the standard
+  `BUILDX_BUILDER=par-rt-db-builder docker compose up -d --build`** (image
+  rebuild + server container recreate) — it is NOT a hot volume you can swap
+  without a rebuild.
 - Same-origin serving means the dashboard needs **no `RTDB_ALLOWED_ORIGINS`
   entry** of its own.
 - Unset/empty `RTDB_STATIC_DIR` (or a missing dir) ⇒ API-only, no SPA served.
@@ -509,10 +511,10 @@ Common operator symptoms on the live deploy:
   and re-run the check.
 - **Dashboard shows the old SPA after a frontend change.** The SPA is baked into
   the server image, not a live-mounted volume — a frontend change ships only via
-  `docker compose up -d --build` (image rebuild + container recreate). A plain
-  `docker compose up -d` without `--build` keeps the old image and the old SPA.
-  A hard reload (`Cmd/Ctrl`+`Shift`+`R`) clears a stale browser cache, but the
-  image-rebuild step is the real fix.
+  `BUILDX_BUILDER=par-rt-db-builder docker compose up -d --build` (image rebuild
+  + container recreate). A plain `docker compose up -d` without `--build` keeps
+  the old image and the old SPA. A hard reload (`Cmd/Ctrl`+`Shift`+`R`) clears a
+  stale browser cache, but the image-rebuild step is the real fix.
 
 ## Rollback
 
@@ -528,9 +530,10 @@ older commit.
    make deploy
    ```
 
-   `make deploy` re-runs the gate, rsyncs that commit's source over
-   `/docker/par-rt-db` (the `.env` excludes keep the live secrets intact), and
-   rebuilds the image on the host (`docker compose up -d --build`).
+  `make deploy` re-runs the gate, rsyncs that commit's source over
+  `/docker/par-rt-db` (the `.env` excludes keep the live secrets intact), and
+  rebuilds the image on the host with the capped
+  `par-rt-db-builder` BuildKit builder.
 
 2. Verify: `curl -fsS https://rtdb.example.com/healthz -H "Authorization: Bearer $RTDB_ADMIN_KEY" | jq .`
    reports the expected `git_commit` (the redeployed sha; the fingerprint is
