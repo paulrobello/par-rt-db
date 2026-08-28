@@ -314,5 +314,5 @@ deploy: checkall
 	ssh $(DEPLOY_HOST) 'cd $(DEPLOY_PATH) && RTDB_BUILD_COMMIT=$(DEPLOY_COMMIT) docker compose up -d --build && docker compose ps'
 	ssh $(DEPLOY_HOST) 'curl -fsS http://127.0.0.1:8300/healthz'
 	@echo
-	curl -fsS https://rtdb.example.com/healthz
+	curl -fsS https://rtdb.pardev.net/healthz
 	@echo
