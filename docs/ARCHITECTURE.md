@@ -929,17 +929,16 @@ at the handshake) bypasses the per-db `authorize` and subscribes/mutates with
 `auth::authorize`/`owner_of` are untouched.
 
 The admin-only `RTDB_MAX_AFFECTED_DOCS` (boot `Config`, default 100)
-step-count cap rejects an over-cap mutation before the committer — an
-over-cap write never becomes durable. The step-count cap bounds the per-id
-steps (`Insert`/`Patch`/`Replace`/`Delete`/`Undelete`/`Upsert`, each ≤1 doc,
-so `steps.len() ≤ cap` ⟹ affected ≤ cap); the predicate-driven
-`PatchByQuery`/`DeleteByQuery` steps are ONE step each but touch many rows, so
-they bypass the step-count cap and are bounded instead by a per-step row cap
-(`MAX_BY_QUERY_ROWS`, const default 1000) enforced inside `execute_txn` — a
-step whose match set exceeds its `limit` touches exactly `limit` and reports
-`truncated: true`. The admin query route also accepts `includeDeleted: true`
-(an internal `execute_query` param, NOT a wire `Query` field) so an operator
-can see soft-deleted rows.
+guardrail rejects an over-cap mutation before the committer — an
+over-cap write never becomes durable. The bound is worst-case affected
+documents (`worst_case_affected`), not raw step count: per-id steps
+(`Insert`/`Patch`/`Replace`/`Delete`/`Undelete`/`Upsert`) count 1 doc each,
+control-flow steps (`Schedule`/`CancelSchedule`/`StartWorkflow`/`CancelWorkflow`)
+count 0, and each predicate-driven `PatchByQuery`/`DeleteByQuery` step counts up to
+its `limit` (default and ceiling `MAX_BY_QUERY_ROWS = 1000`). An over-budget
+transaction rejects with `BadRequest` before reaching the committer turn. The admin query
+route also accepts `includeDeleted: true` (an internal `execute_query` param, NOT a wire
+`Query` field) so an operator can see soft-deleted rows.
 
 ## Backups and restore
 
