@@ -77,12 +77,12 @@ jobs:
       # image and by rustup locally. The dtolnay action still needs an explicit
       # `toolchain:` input (it does not auto-read the file), so it is pinned to
       # `stable` here matching the file. SEC-138: the action ref is pinned to an
-      # immutable master-history SHA — `6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772`
+      # immutable master-history SHA — `d1031067263f94b142dd6c0ce24c5eb9d02d52a0`
       # (master-history SHAs are the only ones dtolnay guarantees are not
       # garbage-collected). Bump deliberately: re-verify the new SHA resolves
       # and is on master.
       - name: Set up Rust (from rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -180,7 +180,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7.0.1
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
         with:
           toolchain: stable
       - name: Rust build cache
@@ -269,4 +269,4 @@ jobs:
           path: site
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v5.0.0
+        uses: actions/deploy-pages@v5.0.1
