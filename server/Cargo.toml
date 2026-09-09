@@ -98,21 +98,23 @@ tokio-stream = "0.1"
 # OpenTelemetry / OTLP tracing export (ENH-018). Optional + feature-gated behind
 # `otel` (default off). The exact versions are pinned because the
 # opentelemetry / tracing-opentelemetry pairing breaks across minor versions
-# more often than most crates — 0.31.x + tracing-opentelemetry 0.32.x is the
+# more often than most crates — 0.32.x + tracing-opentelemetry 0.33.x is the
 # verified-resolving matrix (checked with `cargo tree -d`, no duplicate tree).
-# The 0.31 API renames `TracerProvider` → `SdkTracerProvider`, drops the runtime
-# arg from `with_batch_exporter`, and replaces `Resource::new` with a builder —
-# the pre-0.27 sketch in the plan doc no longer compiles.
-opentelemetry = { version = "0.31", default-features = false, optional = true }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = [
+# sdk 0.32.1 is the floor for the Dependabot-moderate advisory (unbounded
+# memory allocation in W3C Baggage propagation); 0.31.x is vulnerable too.
+# Historical: the 0.31 API renamed `TracerProvider` → `SdkTracerProvider`,
+# dropped the runtime arg from `with_batch_exporter`, and replaced
+# `Resource::new` with a builder.
+opentelemetry = { version = "0.32", default-features = false, optional = true }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = [
     "trace",
     "rt-tokio",
 ], optional = true }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = [
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "trace",
     "grpc-tonic",
 ], optional = true }
-tracing-opentelemetry = { version = "0.32", optional = true }
+tracing-opentelemetry = { version = "0.33", optional = true }
 
 [dev-dependencies]
 anyhow.workspace = true

@@ -108,7 +108,7 @@ fn install_otel(config: &Config, env_filter: tracing_subscriber::EnvFilter) -> O
         .build();
 
     // Set the global provider BEFORE building the layer's tracer. In
-    // tracing-opentelemetry 0.32 / opentelemetry 0.31, `global::tracer("…")`
+    // tracing-opentelemetry 0.33 / opentelemetry 0.32, `global::tracer("…")`
     // returns a proxy that resolves to whatever provider is global *at call
     // time*; capturing it before `set_tracer_provider` leaves the layer pinned
     // to the no-op default and no spans ever export (caught during the ENH-018
@@ -140,7 +140,7 @@ fn install_otel(config: &Config, env_filter: tracing_subscriber::EnvFilter) -> O
 /// RAII guard: on drop, flushes the OTLP exporter and shuts the provider down
 /// so the last in-flight span batch reaches the collector before the process
 /// exits. Created only when otel is installed. Holds a clone of the provider so
-/// `Drop` can call `shutdown()` directly (0.31's global module does not expose
+/// `Drop` can call `shutdown()` directly (the global module does not expose
 /// a shutdown entrypoint).
 pub struct OtelGuard {
     #[cfg(feature = "otel")]
