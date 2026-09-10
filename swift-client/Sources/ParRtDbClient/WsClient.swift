@@ -477,7 +477,7 @@ public actor RtDbClient {
     /// The request a schedule call will send once authenticated (rust
     /// `ScheduleMsg`).
     private enum ScheduleRequest: Sendable {
-        case schedule(when: ScheduleWhen, txn: Transaction)
+        case schedule(when: ScheduleWhen, txn: Transaction, external: Bool?)
         case cancel(id: String)
         case pause(id: String)
         case resume(id: String)
@@ -1256,9 +1256,18 @@ public actor RtDbClient {
     // MARK: Task 14 — scheduler ops
 
     /// Schedule `txn` to fire at `when`; resolves with the new schedule's id
-    /// on `scheduleOk`, rejects with `RtDbError` on `scheduleErr`.
-    public func schedule(_ txn: Transaction, when: ScheduleWhen) async throws -> String {
-        guard case let .id(id) = try await submitSchedule(.schedule(when: when, txn: txn)) else {
+    /// on `scheduleOk`, rejects with `RtDbError` on `scheduleErr`. `external`
+    /// marks an external-claim job: the internal scheduler never executes it —
+    /// an application worker claims it over HTTP and finalizes it with the
+    /// returned fencing token.
+    public func schedule(
+        _ txn: Transaction, when: ScheduleWhen, external: Bool? = nil
+    ) async throws -> String {
+        guard
+            case let .id(id) = try await submitSchedule(
+                .schedule(when: when, txn: txn, external: external)
+            )
+        else {
             throw RtDbError(code: .internal, message: "unexpected schedule reply")
         }
         return id
@@ -1828,8 +1837,8 @@ public actor RtDbClient {
 
     private static func scheduleFrame(scheduleId: String, request: ScheduleRequest) -> ClientMessage {
         switch request {
-        case let .schedule(when, txn):
-            .schedule(scheduleId: scheduleId, when: when, txn: txn)
+        case let .schedule(when, txn, external):
+            .schedule(scheduleId: scheduleId, when: when, txn: txn, external: external)
         case let .cancel(id):
             .cancelSchedule(scheduleId: scheduleId, id: id)
         case let .pause(id):

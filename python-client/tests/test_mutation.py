@@ -286,6 +286,17 @@ def test_schedule_and_cancel_schedule_wire_shapes():
     assert json.loads(Mutation.model_validate(wire).model_dump_json(by_alias=True)) == wire
 
 
+def test_schedule_external_step_wire_shape():
+    # 2026-09-09 external-claim feature: `schedule_external` emits the schedule
+    # step with `external: true`; an ordinary `schedule` step stays unchanged.
+    inner = Mutation.builder().insert("workItems", {"title": "later"}).build()
+    m = Mutation.builder().schedule_external(AfterMs(ms=60_000), inner).build()
+    wire = json.loads(m.model_dump_json(by_alias=True))
+    assert wire["steps"][0]["external"] is True
+    # Round-trips through model_validate (corpus parity path).
+    assert json.loads(Mutation.model_validate(wire).model_dump_json(by_alias=True)) == wire
+
+
 def test_step_result_schedule_and_cancel_schedule():
     sr = TypeAdapter(StepResult)
     assert sr.validate_python({"scheduleId": "s1"}).model_dump(by_alias=True, mode="json") == {

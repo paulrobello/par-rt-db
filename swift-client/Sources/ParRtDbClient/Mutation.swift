@@ -68,8 +68,10 @@ public enum Step: Equatable, Codable, Sendable {
     )
     /// Delete every row matching `filter` (same `limit` semantics).
     case deleteByQuery(table: String, filter: FilterExpr, limit: UInt32?)
-    /// Schedule `txn` to run later.
-    case schedule(when: ScheduleWhen, txn: Transaction)
+    /// Schedule `txn` to run later. `external` marks an external-claim job:
+    /// never executed by the internal scheduler, served to application workers
+    /// via `POST /api/schedule/claim` instead.
+    case schedule(when: ScheduleWhen, txn: Transaction, external: Bool?)
     /// Cancel a previously scheduled job.
     case cancelSchedule(id: String)
     /// Start a durable workflow run.
@@ -81,7 +83,7 @@ public enum Step: Equatable, Codable, Sendable {
 
     enum CodingKeys: String, CodingKey, CaseIterable {
         case op, table, doc, id, fields, version, index, eq, insert, patch
-        case filter, limit, when, txn, spec
+        case filter, limit, when, txn, spec, external
     }
 
     // swiftlint:disable:next cyclomatic_complexity function_body_length
@@ -183,11 +185,12 @@ public enum Step: Equatable, Codable, Sendable {
         case "schedule":
             try rejectUnknownVariantFields(
                 "Step", variant: payload.tag, keys: payload.keys,
-                allowed: ["op", "when", "txn"]
+                allowed: ["op", "when", "txn", "external"]
             )
             self = try .schedule(
                 when: container.decode(ScheduleWhen.self, forKey: .when),
-                txn: container.decode(Transaction.self, forKey: .txn)
+                txn: container.decode(Transaction.self, forKey: .txn),
+                external: container.decodeIfPresent(Bool.self, forKey: .external)
             )
         case "cancelSchedule":
             try rejectUnknownVariantFields(
@@ -276,10 +279,11 @@ public enum Step: Equatable, Codable, Sendable {
             try container.encode(table, forKey: .table)
             try container.encode(filter, forKey: .filter)
             try container.encodeIfPresent(limit, forKey: .limit)
-        case let .schedule(when, txn):
+        case let .schedule(when, txn, external):
             try container.encode("schedule", forKey: .op)
             try container.encode(when, forKey: .when)
             try container.encode(txn, forKey: .txn)
+            try container.encodeIfPresent(external, forKey: .external)
         case let .cancelSchedule(id):
             try container.encode("cancelSchedule", forKey: .op)
             try container.encode(id, forKey: .id)

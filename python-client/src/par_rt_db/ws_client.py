@@ -645,11 +645,19 @@ class RtDbClient:
             entry.sent = True
         # else: queued; ``_flush_on_auth`` sends it on the next authOk.
 
-    async def schedule(self, txn: Transaction, when: ScheduleWhen) -> str:
+    async def schedule(
+        self,
+        txn: Transaction,
+        when: ScheduleWhen,
+        *,
+        external: bool = False,
+    ) -> str:
         """Schedule ``txn`` to run at ``when`` (a one-shot deadline, a cron
         expression, or a fixed ``everyMs`` interval). Returns the new schedule's
-        id."""
-        return await self._sched_op("schedule", txn=txn, when=when)
+        id. ``external=True`` creates an external-claim job — never executed by
+        the server's internal scheduler; a worker claims it via the HTTP
+        ``POST /api/schedule/claim`` surface with a fencing token."""
+        return await self._sched_op("schedule", txn=txn, when=when, external=external)
 
     async def cancel_schedule(self, id: str) -> bool:
         """Cancel the scheduled job with ``id``. ``True`` when a pending job
@@ -718,7 +726,12 @@ class RtDbClient:
 
     @overload
     async def _sched_op(
-        self, kind: Literal["schedule"], *, txn: Transaction, when: ScheduleWhen
+        self,
+        kind: Literal["schedule"],
+        *,
+        txn: Transaction,
+        when: ScheduleWhen,
+        external: bool = ...,
     ) -> str: ...
     @overload
     async def _sched_op(self, kind: Literal["cancel", "pause", "resume"], *, id: str) -> bool: ...
@@ -1174,6 +1187,7 @@ def _build_sched_frame(kind: str, sid: str, fields: dict[str, Any]) -> str:
             schedule_id=sid,
             when=fields["when"],
             txn=fields["txn"].model_dump(by_alias=True, mode="json"),
+            external=fields.get("external") or None,
         ).model_dump_json(by_alias=True)
     if kind == "cancel":
         return _ClientCancelSchedule(schedule_id=sid, id=fields["id"]).model_dump_json(

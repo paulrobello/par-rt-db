@@ -149,7 +149,7 @@ interface QueuedMutate extends PendingMutate {
 /** The ClientMessage a schedule call will send once authenticated, carried while
  * queued so `flushOnAuth` can dispatch it verbatim. */
 type ScheduleMsg =
-  | { kind: "schedule"; when: ScheduleWhen; txn: TransactionJson }
+  | { kind: "schedule"; when: ScheduleWhen; txn: TransactionJson; external?: true }
   | { kind: "cancel"; id: string }
   | { kind: "pause"; id: string }
   | { kind: "resume"; id: string }
@@ -505,9 +505,18 @@ export class RtDbClient {
   /** Schedules `txn` for `when`. Resolves with the new schedule `{id}` on
    * `scheduleOk`; rejects with `RtDbError` on `scheduleErr` (e.g. a bad cron
    * expression — the server validates cron). While unauthenticated, the request
-   * queues and fires on the next `authOk`, mirroring `mutate`. */
-  schedule(txn: TransactionJson, when: ScheduleWhen): Promise<{ id: string }> {
-    return this.queueSchedule<{ id: string }>({ kind: "schedule", when, txn });
+   * queues and fires on the next `authOk`, mirroring `mutate`. Pass `external`
+   * to create an external job instead: one never executed by the server — an
+   * application worker claims it via `POST /api/schedule/claim` (a
+   * `claimSchedules` HTTP-client call) and finalizes with the returned
+   * `leaseGeneration` fencing token. */
+  schedule(txn: TransactionJson, when: ScheduleWhen, external?: boolean): Promise<{ id: string }> {
+    return this.queueSchedule<{ id: string }>({
+      kind: "schedule",
+      when,
+      txn,
+      ...(external === true && { external: true as const }),
+    });
   }
 
   /** Cancels a scheduled job. Resolves `true` on `scheduleAck.ok:true`; a bare
@@ -749,6 +758,7 @@ export class RtDbClient {
           scheduleId: entry.scheduleId,
           when: entry.msg.when,
           txn: entry.msg.txn,
+          ...(entry.msg.external === true && { external: true as const }),
         });
         break;
       case "cancel":

@@ -150,11 +150,25 @@ class _DeleteByQuery(_Step):
 class _Schedule(_Step):
     """FM-28: schedule a nested txn. The nested steps do NOT run at enqueue —
     the server's scheduler fires them at ``when``; the in-memory harness's
-    ``tick()`` mirrors that."""
+    ``tick()`` mirrors that.
+
+    2026-09-09 external-claim feature: ``external`` flags the job as never
+    internally executed — an application worker claims it via
+    ``POST /api/schedule/claim`` and finalizes it with the returned
+    ``leaseGeneration`` fencing token. Omitted on the wire when ``None``
+    (mirrors the server's ``skip_serializing_if = "Option::is_none"``)."""
 
     op: Literal["schedule"] = "schedule"
     when: ScheduleWhen
     txn: Transaction
+    external: bool | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_none_external(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("external") is None:
+            out.pop("external", None)
+        return out
 
 
 class _CancelSchedule(_Step):
@@ -443,6 +457,17 @@ class _MutationBuilder:
         fires them at the due time; the step result carries the job's
         ``scheduleId``."""
         self._steps.append(_Schedule(op="schedule", when=when, txn=txn))
+        return self
+
+    def schedule_external(self, when: ScheduleWhen, txn: Transaction) -> _MutationBuilder:
+        """External schedule step: like :meth:`schedule`, but the job is never
+        executed by the server's internal scheduler — an application worker
+        claims it via ``POST /api/schedule/claim`` and finalizes it with the
+        returned ``leaseGeneration`` fencing token. ``tick()`` (harness) and
+        ``claim_due`` (server) both skip external jobs."""
+        self._steps.append(
+            _Schedule(op="schedule", when=when, txn=txn, external=True),
+        )
         return self
 
     def cancel_schedule(self, id: str) -> _MutationBuilder:

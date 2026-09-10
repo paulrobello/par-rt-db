@@ -2329,6 +2329,78 @@ def test_schedule_interval_rejects_over_cap_every_ms() -> None:
     assert c.list_schedules() == []
 
 
+# --- external jobs (2026-09-09 external-claim feature) -----------------------
+
+
+def test_tick_skips_external_job() -> None:
+    # External jobs are never internally executed — the worker that claims
+    # them over HTTP owns their execution (server claim_due/next_due exclude
+    # external rows).
+    c, clock = _new_clock_client()
+    sid = c.schedule(
+        _insert_todo_txn(),
+        _when.validate_python({"type": "afterMs", "ms": 1000}),
+        external=True,
+    )
+    clock[0] += 2000  # past the due time
+    c.tick()
+    assert c.run_query(TableQuery("items").build()) == []
+    info = c.list_schedules()
+    assert len(info) == 1
+    assert info[0].external is True
+    assert info[0].status == "pending"
+    assert is_hex_id(sid)
+
+
+def test_external_step_enqueues_external_job_and_tick_skips_it() -> None:
+    # The scheduleExternal txn step stores an external job — tick skips it the
+    # same way the standalone external path is skipped.
+    c, clock = _new_clock_client()
+    c.mutate(
+        Mutation.builder()
+        .schedule_external(
+            _when.validate_python({"type": "afterMs", "ms": 1000}), _insert_todo_txn()
+        )
+        .build()
+    )
+    clock[0] += 2000
+    c.tick()
+    assert c.run_query(TableQuery("items").build()) == []
+    info = c.list_schedules()
+    assert len(info) == 1
+    assert info[0].external is True
+
+
+def test_list_schedules_reports_external_flag() -> None:
+    c, _clock = _new_clock_client()
+    c.schedule(_insert_todo_txn(), _when.validate_python({"type": "afterMs", "ms": 1000}))
+    c.schedule(
+        _insert_todo_txn(),
+        _when.validate_python({"type": "afterMs", "ms": 1000}),
+        external=True,
+    )
+    infos = c.list_schedules()
+    assert [i.external for i in infos] == [False, True]
+    assert all(i.status == "pending" for i in infos)
+
+
+def test_external_interval_job_never_fires_on_any_tick() -> None:
+    # Even a recurring external job never fires internally — the flag wins over
+    # the kind (server: claim_due/next_due exclude external rows outright).
+    c, clock = _new_clock_client()
+    c.schedule(
+        _insert_todo_txn(),
+        _when.validate_python({"type": "interval", "everyMs": 1_000}),
+        external=True,
+    )
+    clock[0] += 10_000
+    c.tick()
+    clock[0] += 10_000
+    c.tick()
+    assert c.run_query(TableQuery("items").build()) == []
+    assert len(c.list_schedules()) == 1
+
+
 def test_schedule_step_rejects_invalid_interval_every_ms() -> None:
     # The txn `schedule` step routes through the same validated schedule() path.
     c, _clock = _new_clock_client()

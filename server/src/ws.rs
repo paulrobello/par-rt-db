@@ -419,7 +419,8 @@ async fn handle_text_frame(
             schedule_id,
             when,
             txn,
-        } => handle_schedule(fctx, schedule_id, when, txn).await,
+            external,
+        } => handle_schedule(fctx, schedule_id, when, txn, external).await,
         ClientMessage::CancelSchedule { schedule_id, id } => {
             run_simple_schedule(
                 fctx.state,
@@ -668,6 +669,7 @@ async fn handle_schedule(
     schedule_id: String,
     when: ScheduleWhen,
     txn: crate::txn::Transaction,
+    external: Option<bool>,
 ) -> bool {
     let state = fctx.state;
     let principal = fctx.principal;
@@ -703,6 +705,7 @@ async fn handle_schedule(
                                 &txn,
                                 cron.as_deref(),
                                 every_ms,
+                                external.is_some_and(|e| e),
                             )
                             .await
                             {

@@ -7,7 +7,8 @@ use crate::http_common::AuthedRequest;
 use crate::mutation::{Mutation, StepResult, Transaction};
 use crate::query::{Query, TableQuery};
 use crate::wire::{
-    AuthedUser, ScheduleInfo, ScheduleWhen, WorkflowInfo, WorkflowSpec, WorkflowStatus,
+    AuthedUser, ClaimedSchedule, ScheduleInfo, ScheduleWhen, WorkflowInfo, WorkflowSpec,
+    WorkflowStatus,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -485,6 +486,136 @@ impl RtDbHttpClient {
             .map_err(|e| RtDbError::internal(format!("list schedules request failed: {e}")))?;
         let parsed = crate::http_common::deserialize::<ListResponse>(resp).await?;
         Ok(parsed.schedules)
+    }
+
+    /// Atomically claim due external jobs for an application worker
+    /// (`POST /api/schedule/claim`). Each claim assigns the per-job monotonic
+    /// `lease_generation` fencing token and stamps the lease deadline; the
+    /// finalize methods ([`complete_schedule`](Self::complete_schedule) /
+    /// [`retry_schedule`](Self::retry_schedule) /
+    /// [`fail_schedule`](Self::fail_schedule)) reject with `CONFLICT` once a
+    /// newer generation exists. External jobs are never executed by the
+    /// server's internal scheduler. Mirrors `ts-client`'s `claimSchedules`.
+    pub async fn claim_schedules(
+        &self,
+        limit: Option<i64>,
+        lease_ms: Option<i64>,
+    ) -> Result<Vec<ClaimedSchedule>, RtDbError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            db: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            limit: Option<i64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            lease_ms: Option<i64>,
+        }
+        let body = Body {
+            db: &self.db,
+            limit,
+            lease_ms,
+        };
+        let resp = self
+            .client
+            .post(format!("{}/api/schedule/claim", self.url))
+            .authed(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("claim schedules request failed: {e}")))?;
+        #[derive(serde::Deserialize)]
+        struct ClaimResponse {
+            jobs: Vec<ClaimedSchedule>,
+        }
+        let parsed = crate::http_common::deserialize::<ClaimResponse>(resp).await?;
+        Ok(parsed.jobs)
+    }
+
+    /// Finalize one external claim: shared body for
+    /// [`complete_schedule`](Self::complete_schedule) /
+    /// [`retry_schedule`](Self::retry_schedule) /
+    /// [`fail_schedule`](Self::fail_schedule). `op` is always a hardcoded
+    /// literal, never caller-supplied, so interpolating it into the path is
+    /// safe. A stale or non-current `lease` arrives as a non-2xx `CONFLICT`
+    /// error envelope and rejects.
+    async fn finalize_schedule(
+        &self,
+        id: &str,
+        op: &str,
+        lease: i64,
+        delay_ms: Option<i64>,
+        error: Option<&str>,
+    ) -> Result<(), RtDbError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            db: &'a str,
+            lease: i64,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            delay_ms: Option<i64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            error: Option<&'a str>,
+        }
+        let body = Body {
+            db: &self.db,
+            lease,
+            delay_ms,
+            error,
+        };
+        let resp = self
+            .client
+            .post(format!(
+                "{}/api/schedule/{}/{op}",
+                self.url,
+                encode_uri_component(id)
+            ))
+            .authed(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("schedule {op} request failed: {e}")))?;
+        #[derive(serde::Deserialize)]
+        struct FinalizeResponse {
+            ok: bool,
+        }
+        let parsed = crate::http_common::deserialize::<FinalizeResponse>(resp).await?;
+        // The server only ever answers `{ok:true}` here — a stale token or a
+        // non-running row arrives as a non-2xx `CONFLICT` error envelope.
+        debug_assert!(parsed.ok);
+        Ok(())
+    }
+
+    /// Complete an externally-claimed job with its claim's fencing token
+    /// (`POST /api/schedule/{id}/complete`). One-shot jobs are deleted (the
+    /// same terminal as internal one-shot success); cron/interval jobs advance
+    /// to their next due instant. A stale lease rejects with `CONFLICT`.
+    pub async fn complete_schedule(&self, id: &str, lease: i64) -> Result<(), RtDbError> {
+        self.finalize_schedule(id, "complete", lease, None, None)
+            .await
+    }
+
+    /// Re-arm an externally-claimed job that failed mid-execution
+    /// (`POST /api/schedule/{id}/retry`). Re-arms at `now + delay_ms`
+    /// (server default 60_000) and records `error` on the job as `last_error`
+    /// while keeping the generation history. A stale lease rejects with
+    /// `CONFLICT`.
+    pub async fn retry_schedule(
+        &self,
+        id: &str,
+        lease: i64,
+        delay_ms: Option<i64>,
+        error: Option<&str>,
+    ) -> Result<(), RtDbError> {
+        self.finalize_schedule(id, "retry", lease, delay_ms, error)
+            .await
+    }
+
+    /// Mark an externally-claimed job as terminally failed with its claim's
+    /// fencing token (`POST /api/schedule/{id}/fail`); `error` is recorded as
+    /// `last_error`. A stale lease rejects with `CONFLICT`.
+    pub async fn fail_schedule(&self, id: &str, lease: i64, error: &str) -> Result<(), RtDbError> {
+        self.finalize_schedule(id, "fail", lease, None, Some(error))
+            .await
     }
 
     /// Start a durable workflow run (`POST /api/workflows`, FM-29). Returns
@@ -1514,6 +1645,130 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, "job-1");
         assert_eq!(list[0].cron.as_deref(), Some("*/5 * * * *"));
+    }
+
+    #[tokio::test]
+    async fn claim_schedules_posts_claim_and_parses_jobs() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/schedule/claim"))
+            .and(header("authorization", "Bearer machine-token"))
+            .and(body_partial_json(json!({
+                "db": "t<uuid>",
+                "limit": 4,
+                "leaseMs": 60_000
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jobs": [{
+                    "id": "job-1",
+                    "kind": "cron",
+                    "dueAt": 9000,
+                    "txn": {"steps": [{"op": "insert", "table": "items", "doc": {"n": 1}}]},
+                    "cron": "*/5 * * * *",
+                    "leaseGeneration": 3,
+                    "leaseDeadlineMs": 1_234_567_890
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let jobs = client.claim_schedules(Some(4), Some(60_000)).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        let job = &jobs[0];
+        assert_eq!(job.id, "job-1");
+        assert_eq!(job.kind, crate::wire::ScheduleKind::Cron);
+        assert_eq!(job.due_at, 9000);
+        assert_eq!(job.cron.as_deref(), Some("*/5 * * * *"));
+        assert_eq!(job.every_ms, None);
+        assert_eq!(job.lease_generation, 3);
+        assert_eq!(job.lease_deadline_ms, 1_234_567_890);
+        // The txn decodes to a real Transaction, not raw JSON.
+        assert_eq!(job.txn.steps.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn claim_schedules_omits_unset_tunables_from_body() {
+        let (server, client) = setup().await;
+        // Exact-body match asserts the `None` limit/leaseMs keys are omitted
+        // entirely — never serialized as `null` (matches the TS client, whose
+        // `JSON.stringify` drops undefined).
+        Mock::given(method("POST"))
+            .and(path("/api/schedule/claim"))
+            .and(body_bytes(
+                serde_json::to_vec(&json!({"db": "t<uuid>"})).unwrap(),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"jobs": []})))
+            .mount(&server)
+            .await;
+        let jobs = client.claim_schedules(None, None).await.unwrap();
+        assert!(jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn schedule_finalize_ops_post_paths_and_lease_body() {
+        let (server, client) = setup().await;
+        for op in ["complete", "retry", "fail"] {
+            Mock::given(method("POST"))
+                .and(path(format!("/api/schedule/job-1/{op}")))
+                .and(body_partial_json(json!({"db": "t<uuid>", "lease": 7})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+                .mount(&server)
+                .await;
+        }
+        client.complete_schedule("job-1", 7).await.unwrap();
+        client.retry_schedule("job-1", 7, None, None).await.unwrap();
+        client.fail_schedule("job-1", 7, "boom").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_finalize_retry_carries_delay_and_error() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/schedule/job-1/retry"))
+            .and(body_partial_json(json!({
+                "db": "t<uuid>", "lease": 7, "delayMs": 5000, "error": "boom"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        client
+            .retry_schedule("job-1", 7, Some(5000), Some("boom"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_finalize_omits_unset_retry_tunables() {
+        let (server, client) = setup().await;
+        // Exact-body match: `None` delayMs/error keys are omitted entirely.
+        Mock::given(method("POST"))
+            .and(path("/api/schedule/job-1/retry"))
+            .and(body_bytes(
+                serde_json::to_vec(&json!({
+                    "db": "t<uuid>", "lease": 7
+                }))
+                .unwrap(),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        client.retry_schedule("job-1", 7, None, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_finalize_stale_lease_rejects_conflict() {
+        let (server, client) = setup().await;
+        // A fencing token that is no longer current arrives as a non-2xx
+        // CONFLICT error envelope (see server `finalize_external`).
+        Mock::given(method("POST"))
+            .and(path("/api/schedule/job-1/complete"))
+            .and(body_partial_json(json!({"db": "t<uuid>", "lease": 4})))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "code": "CONFLICT", "message": "stale lease"
+            })))
+            .mount(&server)
+            .await;
+        let err = client.complete_schedule("job-1", 4).await.unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Conflict);
     }
 
     #[tokio::test]

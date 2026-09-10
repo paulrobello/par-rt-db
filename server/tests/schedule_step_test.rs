@@ -221,6 +221,7 @@ async fn schedule_step_commits_atomically_with_writes() -> anyhow::Result<()> {
             steps: vec![
                 insert_project_step(),
                 Step::Schedule {
+                    external: None,
                     when: future_run_at(),
                     txn: Box::new(Transaction {
                         steps: vec![Step::Insert {
@@ -268,6 +269,7 @@ async fn schedule_step_rolls_back_with_failed_txn() -> anyhow::Result<()> {
         &Transaction {
             steps: vec![
                 Step::Schedule {
+                    external: None,
                     when: future_run_at(),
                     txn: Box::new(Transaction { steps: vec![] }),
                 },
@@ -318,6 +320,7 @@ async fn bad_when_rolls_back_writes() -> anyhow::Result<()> {
                 steps: vec![
                     insert_project_step(),
                     Step::Schedule {
+                        external: None,
                         when,
                         txn: Box::new(Transaction { steps: vec![] }),
                     },
@@ -360,6 +363,7 @@ async fn cancel_schedule_step_result_and_idempotence() -> anyhow::Result<()> {
             steps: vec![Step::Schedule {
                 when: future_run_at(),
                 txn: Box::new(Transaction { steps: vec![] }),
+                external: None,
             }],
         },
         &PrincipalCtx::bypass(),
@@ -490,6 +494,7 @@ async fn scoped_token_cannot_enqueue_forbidden_table() -> anyhow::Result<()> {
             steps: vec![
                 insert_project_step(),
                 Step::Schedule {
+                    external: None,
                     when: future_run_at(),
                     txn: Box::new(Transaction {
                         steps: vec![Step::Insert {
@@ -524,6 +529,7 @@ async fn scoped_token_cannot_enqueue_forbidden_table() -> anyhow::Result<()> {
             steps: vec![
                 insert_project_step(),
                 Step::Schedule {
+                    external: None,
                     when: future_run_at(),
                     txn: Box::new(Transaction {
                         steps: vec![insert_project_step()],
@@ -562,6 +568,7 @@ async fn recursive_step_budget() -> anyhow::Result<()> {
             .chain(std::iter::once(Step::Schedule {
                 when: future_run_at(),
                 txn: Box::new(nested_512()),
+                external: None,
             }))
             .collect(),
     };
@@ -583,6 +590,7 @@ async fn recursive_step_budget() -> anyhow::Result<()> {
             .chain(std::iter::once(Step::Schedule {
                 when: future_run_at(),
                 txn: Box::new(nested_512()),
+                external: None,
             }))
             .collect(),
     };
@@ -617,6 +625,7 @@ async fn chained_schedule_fires_and_enqueues_follow_up() -> anyhow::Result<()> {
                 doc: valid_work_item_doc("chained-a"),
             },
             Step::Schedule {
+                external: None,
                 when: ScheduleWhen::AfterMs { ms: 0 },
                 txn: Box::new(Transaction {
                     steps: vec![Step::Insert {
@@ -635,6 +644,7 @@ async fn chained_schedule_fires_and_enqueues_follow_up() -> anyhow::Result<()> {
                 steps: vec![Step::Schedule {
                     when: ScheduleWhen::RunAt { ms: 1 }, // past ⇒ immediate
                     txn: Box::new(nested),
+                    external: None,
                 }],
             },
             PrincipalCtx::bypass(),

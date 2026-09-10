@@ -141,6 +141,15 @@ pub enum Step {
         when: ScheduleWhen,
         /// The nested transaction to fire when due.
         txn: Box<Transaction>,
+        /// When set, the job is never executed by the server's internal
+        /// scheduler — it is served to application workers via the external
+        /// claim surface (`POST /api/schedule/claim`), which returns it with a
+        /// monotonic per-job `leaseGeneration` fencing token; the worker's
+        /// complete/retry/fail transitions are rejected once the token is
+        /// stale (re-claimed after lease expiry). Omitted/`false` keeps the
+        /// default internal execution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external: Option<bool>,
     },
     /// Cancel a previously scheduled job by id, on the open sqlx transaction.
     /// Step result `{"cancelled": <bool>}` — `false` (not an error) when the
@@ -464,4 +473,11 @@ pub struct ScheduleInfo {
     pub created_at: i64,
     /// Times fired.
     pub fired_count: i64,
+    /// True when the job is never executed by the internal scheduler and is
+    /// served to application workers via the external claim surface instead.
+    /// Omitted on the wire when false, so ordinary jobs' list rows are
+    /// byte-identical to pre-feature servers; `default` keeps old payloads
+    /// (and old fixtures) decoding with the key absent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub external: bool,
 }

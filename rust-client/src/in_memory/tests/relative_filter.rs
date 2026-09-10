@@ -350,7 +350,7 @@ async fn scheduled_sweep_fires_with_the_engine_clock() {
     let txn = Mutation::new()
         .delete_by_query("tasks", older_than("updatedAt", SWEEP_MS), None)
         .build();
-    c.schedule(txn, ScheduleWhen::AfterMs { ms: 0 })
+    c.schedule(txn, ScheduleWhen::AfterMs { ms: 0 }, false)
         .expect("schedule sweep");
     c.tick(None);
 

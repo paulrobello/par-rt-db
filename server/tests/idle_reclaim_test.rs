@@ -189,6 +189,7 @@ async fn pending_scheduled_job_protects_db() -> anyhow::Result<()> {
         &insert_work_item(),
         None,
         None,
+        false,
     )
     .await?;
 

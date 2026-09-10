@@ -197,13 +197,72 @@ public actor RtDbHttpClient {
     // MARK: Scheduler
 
     /// Schedule `txn` to fire at `when` (`POST /api/schedule`
-    /// `{db, when, txn}`); returns the new schedule's id. The server validates
-    /// cron expressions and resolves the due time.
-    public func schedule(_ txn: Transaction, when: ScheduleWhen) async throws -> String {
+    /// `{db, when, txn, external?}`); returns the new schedule's id. The
+    /// server validates cron expressions and resolves the due time. `external:
+    /// true` marks an external-claim job: the internal scheduler never
+    /// executes it — an application worker claims it via `claimSchedules` and
+    /// finalizes it with the returned fencing token.
+    public func schedule(
+        _ txn: Transaction, when: ScheduleWhen, external: Bool? = nil
+    ) async throws -> String {
         let response: IdResponse = try await postJson(
-            "schedule", "/api/schedule", ScheduleRequest(db: db, when: when, txn: txn)
+            "schedule", "/api/schedule",
+            ScheduleRequest(db: db, when: when, txn: txn, external: external)
         )
         return response.id
+    }
+
+    /// Atomically claim due external jobs for an application worker
+    /// (`POST /api/schedule/claim` `{db, limit?, leaseMs?}`); returns the
+    /// claimed jobs, each stamped with its `leaseGeneration` fencing token.
+    /// The token must be passed back to `completeSchedule`/`retrySchedule`/
+    /// `failSchedule` — a stale token (a newer claim exists) is rejected with
+    /// CONFLICT. `limit` defaults to 8, capped at 64; `leaseMs` defaults to
+    /// 300_000, bounded to [1_000, 86_400_000].
+    public func claimSchedules(
+        limit: Int64? = nil, leaseMs: Int64? = nil
+    ) async throws -> [ClaimedSchedule] {
+        let response: ClaimSchedulesResponse = try await postJson(
+            "claim schedules", "/api/schedule/claim",
+            ClaimSchedulesRequest(db: db, limit: limit, leaseMs: leaseMs)
+        )
+        return response.jobs
+    }
+
+    /// Complete an externally claimed job (`POST /api/schedule/{id}/complete`
+    /// `{db, lease}`). A one-shot is deleted (its terminal); a recurring job
+    /// advances to its next due instant. A stale `lease` is CONFLICT.
+    public func completeSchedule(_ id: String, lease: Int64) async throws {
+        try await finalizeSchedule(id, op: "complete", lease: lease, error: nil)
+    }
+
+    /// Re-arm an externally claimed job at `now + delayMs` (default 60_000)
+    /// recording `error` as `last_error` (`POST /api/schedule/{id}/retry`
+    /// `{db, lease, delayMs?, error?}`). A stale `lease` is CONFLICT.
+    public func retrySchedule(
+        _ id: String, lease: Int64, delayMs: Int64? = nil, error: String? = nil
+    ) async throws {
+        try await finalizeSchedule(id, op: "retry", lease: lease, delayMs: delayMs, error: error)
+    }
+
+    /// Mark an externally claimed job terminally failed with `error`
+    /// (`POST /api/schedule/{id}/fail` `{db, lease, error}`). A stale `lease`
+    /// is CONFLICT.
+    public func failSchedule(_ id: String, lease: Int64, error: String) async throws {
+        try await finalizeSchedule(id, op: "fail", lease: lease, error: error)
+    }
+
+    /// Shared body for the three external finalize ops (`{db, lease,
+    /// delayMs?, error?}`); nil optionals are omitted. A `{ok: true}` ack is
+    /// the success shape on every transition.
+    private func finalizeSchedule(
+        _ id: String, op: String, lease: Int64, delayMs: Int64? = nil, error: String?
+    ) async throws {
+        let response: OkResponse = try await postJson(
+            "schedule \(op)", "/api/schedule/\(encodePath(id))/\(op)",
+            FinalizeScheduleRequest(db: db, lease: lease, delayMs: delayMs, error: error)
+        )
+        _ = response.ok
     }
 
     /// Cancel a scheduled job (`POST /api/schedule/{id}/cancel`).
@@ -574,6 +633,20 @@ private struct ScheduleRequest: Encodable {
     let db: String
     let when: ScheduleWhen
     let txn: Transaction
+    let external: Bool?
+}
+
+private struct ClaimSchedulesRequest: Encodable {
+    let db: String
+    let limit: Int64?
+    let leaseMs: Int64?
+}
+
+private struct FinalizeScheduleRequest: Encodable {
+    let db: String
+    let lease: Int64
+    let delayMs: Int64?
+    let error: String?
 }
 
 private struct DbRequest: Encodable {
@@ -632,6 +705,10 @@ private struct SignalWorkflowResponse: Decodable {
 
 private struct SchedulesResponse: Decodable {
     let schedules: [ScheduleInfo]
+}
+
+private struct ClaimSchedulesResponse: Decodable {
+    let jobs: [ClaimedSchedule]
 }
 
 private struct WorkflowsResponse: Decodable {

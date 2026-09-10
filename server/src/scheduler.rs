@@ -111,7 +111,10 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
             status      text NOT NULL,
             last_error  text,
             created_at  bigint NOT NULL,
-            fired_count bigint NOT NULL DEFAULT 0
+            fired_count bigint NOT NULL DEFAULT 0,
+            external    boolean NOT NULL DEFAULT false,
+            claim_generation bigint NOT NULL DEFAULT 0,
+            lease_deadline_ms bigint
         )"
     ))
     .execute(pool)
@@ -121,6 +124,26 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
     sqlx::query(&format!(
         "ALTER TABLE \"{schema}\".scheduled_txns
          ADD COLUMN IF NOT EXISTS every_ms bigint"
+    ))
+    .execute(pool)
+    .await?;
+    // External-claim fencing columns (2026-09-09): pre-existing databases gain
+    // them via the same additive ALTER discipline.
+    sqlx::query(&format!(
+        "ALTER TABLE \"{schema}\".scheduled_txns
+         ADD COLUMN IF NOT EXISTS external boolean NOT NULL DEFAULT false"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(&format!(
+        "ALTER TABLE \"{schema}\".scheduled_txns
+         ADD COLUMN IF NOT EXISTS claim_generation bigint NOT NULL DEFAULT 0"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(&format!(
+        "ALTER TABLE \"{schema}\".scheduled_txns
+         ADD COLUMN IF NOT EXISTS lease_deadline_ms bigint"
     ))
     .execute(pool)
     .await?;
@@ -137,6 +160,7 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
 /// so a `Step::Schedule` inside `execute_txn` enqueues its row atomically with
 /// the txn's document writes (FM-28): the row becomes visible exactly at the
 /// caller's `tx.commit()` and rolls back with it. Identical SQL to `insert`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_on(
     conn: &mut PgConnection,
     db: &str,
@@ -145,6 +169,7 @@ pub(crate) async fn insert_on(
     txn: &Transaction,
     cron: Option<&str>,
     every_ms: Option<i64>,
+    external: bool,
 ) -> Result<String, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
@@ -155,8 +180,8 @@ pub(crate) async fn insert_on(
     })?;
     sqlx::query(&format!(
         "INSERT INTO \"{schema}\".scheduled_txns
-            (id, kind, due_at, txn, cron, every_ms, status, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)"
+            (id, kind, due_at, txn, cron, every_ms, status, created_at, external)
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8)"
     ))
     .bind(&id)
     .bind(kind)
@@ -165,11 +190,13 @@ pub(crate) async fn insert_on(
     .bind(cron)
     .bind(every_ms)
     .bind(now_ms())
+    .bind(external)
     .execute(&mut *conn)
     .await?;
     Ok(id)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn insert(
     pool: &PgPool,
     db: &str,
@@ -178,9 +205,10 @@ pub async fn insert(
     txn: &Transaction,
     cron: Option<&str>,
     every_ms: Option<i64>,
+    external: bool,
 ) -> Result<String, RtDbError> {
     let mut conn = pool.acquire().await?;
-    insert_on(&mut conn, db, kind, due_at, txn, cron, every_ms).await
+    insert_on(&mut conn, db, kind, due_at, txn, cron, every_ms, external).await
 }
 
 pub async fn list(pool: &PgPool, db: &str) -> Result<Vec<ScheduleInfo>, RtDbError> {
@@ -197,16 +225,28 @@ pub async fn list(pool: &PgPool, db: &str) -> Result<Vec<ScheduleInfo>, RtDbErro
         Option<String>,
         i64,
         i64,
+        bool,
     );
     let rows: Vec<ScheduleRow> = sqlx::query_as(&format!(
-        "SELECT id, kind, due_at, cron, every_ms, status, last_error, created_at, fired_count
+        "SELECT id, kind, due_at, cron, every_ms, status, last_error, created_at, fired_count, external
              FROM \"{schema}\".scheduled_txns ORDER BY due_at, created_at"
     ))
     .fetch_all(pool)
     .await?;
     rows.into_iter()
         .map(
-            |(id, kind, due_at, cron, every_ms, status, last_error, created_at, fired_count)| {
+            |(
+                id,
+                kind,
+                due_at,
+                cron,
+                every_ms,
+                status,
+                last_error,
+                created_at,
+                fired_count,
+                external,
+            )| {
                 let kind = kind.parse::<ScheduleKind>().map_err(|err| {
                     RtDbError::internal(format!("invalid scheduled_txns.kind: {err}"))
                 })?;
@@ -223,6 +263,7 @@ pub async fn list(pool: &PgPool, db: &str) -> Result<Vec<ScheduleInfo>, RtDbErro
                     last_error,
                     created_at,
                     fired_count,
+                    external,
                 })
             },
         )
@@ -329,21 +370,24 @@ pub async fn reset_running(pool: &PgPool, db: &str) -> Result<u64, RtDbError> {
     let schema = pg_schema(db);
     let res = sqlx::query(&format!(
         "UPDATE \"{schema}\".scheduled_txns SET status = 'pending'
-         WHERE status = 'running'"
+         WHERE status = 'running' AND NOT external"
     ))
     .execute(pool)
     .await?;
     Ok(res.rows_affected())
 }
 
-/// Min `due_at` among `pending` rows, or `None` if the table has nothing due.
-/// `MIN(due_at)` is SQL `NULL` when no rows match, which sqlx deserializes as
-/// `Option<i64> = None`, so this naturally returns `None` for an empty table.
+/// Min `due_at` among due-able INTERNAL (`NOT external`) `pending` rows, or
+/// `None`. `MIN(due_at)` is SQL `NULL` when no rows match, which sqlx
+/// deserializes as `Option<i64> = None`, so this naturally returns `None` for
+/// an empty table. External jobs are claimed by application workers over the
+/// claim API, so the internal wake target ignores them.
 pub async fn next_due(pool: &PgPool, db: &str) -> Result<Option<i64>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
     let row: Option<(Option<i64>,)> = sqlx::query_as(&format!(
-        "SELECT MIN(due_at) FROM \"{schema}\".scheduled_txns WHERE status = 'pending'"
+        "SELECT MIN(due_at) FROM \"{schema}\".scheduled_txns
+         WHERE status = 'pending' AND NOT external"
     ))
     .fetch_optional(pool)
     .await?;
@@ -352,7 +396,9 @@ pub async fn next_due(pool: &PgPool, db: &str) -> Result<Option<i64>, RtDbError>
 
 /// Atomically claims up to `batch` due rows: `pending`+`due_at <= now` →
 /// `running`. `FOR UPDATE SKIP LOCKED` makes the claim safe even if a second
-/// claimer ever exists (today there is exactly one scheduler per db).
+/// claimer ever exists (today there is exactly one scheduler per db). External
+/// jobs are excluded — they are never internally executed; application workers
+/// claim them through `claim_external`.
 pub async fn claim_due(
     pool: &PgPool,
     db: &str,
@@ -373,7 +419,7 @@ pub async fn claim_due(
         "UPDATE \"{schema}\".scheduled_txns SET status = 'running'
              WHERE id IN (
                  SELECT id FROM \"{schema}\".scheduled_txns
-                 WHERE status = 'pending' AND due_at <= $1
+                 WHERE status = 'pending' AND due_at <= $1 AND NOT external
                  ORDER BY due_at LIMIT $2
                  FOR UPDATE SKIP LOCKED
              )
@@ -400,6 +446,250 @@ pub async fn claim_due(
         .collect()
 }
 
+/// The externally-claimable row view returned by [`claim_external`].
+pub struct ClaimedExternalJob {
+    pub id: String,
+    pub kind: String,
+    pub due_at: i64,
+    pub txn: Transaction,
+    pub cron: Option<String>,
+    pub every_ms: Option<i64>,
+    /// Per-job monotonic fencing token, assigned atomically by the claim.
+    pub lease_generation: i64,
+    /// Lease expiry instant, epoch ms.
+    pub lease_deadline_ms: i64,
+}
+
+/// Default/max claim batch (`POST /api/schedule/claim`), mirroring the
+/// internal scheduler's own sweep bound.
+pub const CLAIM_DEFAULT: i64 = 8;
+/// Default external lease length, in ms (5 minutes).
+pub const LEASE_DEFAULT_MS: i64 = 300_000;
+/// Minimum external lease length, in ms — a lease shorter than the claim
+/// round-trip would race itself.
+pub const LEASE_MIN_MS: i64 = 1_000;
+/// Maximum external lease length, in ms (24h) — beyond this a stuck holder
+/// blocks its job for too long without an explicit extend/renew surface.
+pub const LEASE_MAX_MS: i64 = 24 * 60 * 60 * 1000;
+/// Default `retry` re-arm delay, in ms (60s) — the transient-failure backoff
+/// an external worker gets when it doesn't pass an explicit `delayMs`.
+pub const RETRY_DEFAULT_MS: i64 = 60_000;
+
+/// Atomically claims up to `limit` due external jobs for an application
+/// worker: `pending` rows past `due_at`, or `running` rows whose lease has
+/// expired, in `due_at` order. `FOR UPDATE SKIP LOCKED` makes concurrent
+/// claims safe; the claim assigns each row the NEXT per-job
+/// `claim_generation` (monotonic fencing token) and stamps its new lease
+/// deadline, and the claim response carries both — the worker's
+/// complete/retry/fail transitions are rejected `CONFLICT` once a newer
+/// generation exists.
+pub async fn claim_external(
+    pool: &PgPool,
+    db: &str,
+    now: i64,
+    limit: i64,
+    lease_ms: i64,
+) -> Result<Vec<ClaimedExternalJob>, RtDbError> {
+    validate_db_name(db)?;
+    let schema = pg_schema(db);
+    // Column order matches the RETURNING list below.
+    type ClaimRow = (
+        String,
+        String,
+        i64,
+        serde_json::Value,
+        Option<String>,
+        Option<i64>,
+        i64,
+        i64,
+    );
+    let rows: Vec<ClaimRow> = sqlx::query_as(&format!(
+        "UPDATE \"{schema}\".scheduled_txns
+         SET status = 'running',
+             claim_generation = claim_generation + 1,
+             lease_deadline_ms = $3
+         WHERE id IN (
+             SELECT id FROM \"{schema}\".scheduled_txns
+             WHERE external
+               AND (
+                   (status = 'pending' AND due_at <= $1)
+                   OR (status = 'running' AND lease_deadline_ms < $1)
+               )
+             ORDER BY due_at
+             LIMIT $2
+             FOR UPDATE SKIP LOCKED
+         )
+         RETURNING id, kind, due_at, txn, cron, every_ms, claim_generation, lease_deadline_ms"
+    ))
+    .bind(now)
+    .bind(limit)
+    .bind(now + lease_ms)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(
+            |(id, kind, due_at, txn_json, cron, every_ms, lease_generation, lease_deadline_ms)| {
+                let txn: Transaction = serde_json::from_value(txn_json).map_err(|err| {
+                    tracing::error!(error = %err, db, %id, "failed to deserialize scheduled txn");
+                    RtDbError::internal("failed to read scheduled txn")
+                })?;
+                Ok(ClaimedExternalJob {
+                    id,
+                    kind,
+                    due_at,
+                    txn,
+                    cron,
+                    every_ms,
+                    lease_generation,
+                    lease_deadline_ms,
+                })
+            },
+        )
+        .collect()
+}
+
+/// The outcome of an external finalize call (`complete` / `retry` / `fail`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalOutcome {
+    /// The work succeeded. One-shots are deleted; recurring jobs advance to
+    /// their next due instant (`fired_count` +1).
+    Complete,
+    /// The work failed transiently: re-arm `pending` at `now + delay_ms` and
+    /// record `last_error`. The generation history is preserved.
+    Retry { delay_ms: i64 },
+    /// The work failed permanently: terminal `error` status + `last_error`.
+    Fail,
+}
+
+/// Finalizes an externally-claimed job. Guarded by the fencing token: the row
+/// must still be `external AND status='running' AND claim_generation = $lease`
+/// — anything else (never claimed, already finalized, re-claimed after lease
+/// expiry by another worker, or an ordinary internal job) is a `409 CONFLICT`,
+/// never a silent no-op. `missing_row` names the 404 case (unknown id).
+#[allow(clippy::too_many_lines)]
+pub async fn finalize_external(
+    pool: &PgPool,
+    db: &str,
+    id: &str,
+    lease_generation: i64,
+    outcome: ExternalOutcome,
+    error_text: Option<&str>,
+) -> Result<bool, RtDbError> {
+    validate_db_name(db)?;
+    let schema = pg_schema(db);
+
+    // Shared guard: locate the row and verify the fence in ONE statement so
+    // the check and the write are atomic. `rows_affected == 0` means either
+    // the id is unknown (404) or the fence failed (409); disambiguate after.
+    let affected = match outcome {
+        ExternalOutcome::Complete => {
+            // Recurring jobs need their next due instant first (cron recompute
+            // / interval shift), exactly like the internal finalize path.
+            let row: Option<(String, Option<String>, Option<i64>)> = sqlx::query_as(&format!(
+                "SELECT kind, cron, every_ms FROM \"{schema}\".scheduled_txns
+                 WHERE id = $1 AND external
+                   AND status = 'running' AND claim_generation = $2"
+            ))
+            .bind(id)
+            .bind(lease_generation)
+            .fetch_optional(pool)
+            .await?;
+            match row {
+                Some((ref kind, cron, every_ms)) if kind != "oneshot" => {
+                    let next = match (kind.as_str(), cron.as_deref(), every_ms) {
+                        ("cron", Some(expr), _) => next_fire(expr, now_ms())?,
+                        ("interval", _, Some(every_ms)) => now_ms() + every_ms,
+                        _ => {
+                            return Err(RtDbError::internal(format!(
+                                "invalid scheduled_txns row kind: {kind}"
+                            )));
+                        }
+                    };
+                    let res = sqlx::query(&format!(
+                        "UPDATE \"{schema}\".scheduled_txns
+                         SET status = 'pending', due_at = $3,
+                             fired_count = fired_count + 1, last_error = NULL,
+                             lease_deadline_ms = NULL
+                         WHERE id = $1 AND external
+                           AND status = 'running' AND claim_generation = $2"
+                    ))
+                    .bind(id)
+                    .bind(lease_generation)
+                    .bind(next)
+                    .execute(pool)
+                    .await?;
+                    res.rows_affected() > 0
+                }
+                Some(_) => {
+                    // One-shot complete = same terminal as the internal path:
+                    // the row is gone.
+                    sqlx::query(&format!(
+                        "DELETE FROM \"{schema}\".scheduled_txns
+                         WHERE id = $1 AND external
+                           AND status = 'running' AND claim_generation = $2"
+                    ))
+                    .bind(id)
+                    .bind(lease_generation)
+                    .execute(pool)
+                    .await?;
+                    true
+                }
+                None => false,
+            }
+        }
+        ExternalOutcome::Retry { delay_ms } => {
+            let res = sqlx::query(&format!(
+                "UPDATE \"{schema}\".scheduled_txns
+                 SET status = 'pending', due_at = $3, last_error = $4,
+                     lease_deadline_ms = NULL
+                 WHERE id = $1 AND external
+                   AND status = 'running' AND claim_generation = $2"
+            ))
+            .bind(id)
+            .bind(lease_generation)
+            .bind(now_ms() + delay_ms)
+            .bind(error_text)
+            .execute(pool)
+            .await?;
+            res.rows_affected() > 0
+        }
+        ExternalOutcome::Fail => {
+            let res = sqlx::query(&format!(
+                "UPDATE \"{schema}\".scheduled_txns
+                 SET status = 'error', last_error = $3, lease_deadline_ms = NULL
+                 WHERE id = $1 AND external
+                   AND status = 'running' AND claim_generation = $2"
+            ))
+            .bind(id)
+            .bind(lease_generation)
+            .bind(error_text.unwrap_or("failed"))
+            .execute(pool)
+            .await?;
+            res.rows_affected() > 0
+        }
+    };
+
+    if !affected {
+        // Distinguish unknown id (404) from a failed fence (409): the id
+        // exists only if the fence is what failed.
+        let exists: Option<(i32,)> = sqlx::query_as(&format!(
+            "SELECT 1 FROM \"{schema}\".scheduled_txns WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        if exists.is_none() {
+            return Err(RtDbError::not_found(format!("schedule {id} not found")));
+        }
+        return Err(RtDbError::conflict(
+            "lease stale — job was re-claimed, finalized, or is not an externally-claimed running job",
+        ));
+    }
+    Ok(true)
+}
+
+/// Finalizes an internal one-shot job after a successful fire: the row is
+/// gone (its effects are durable in the document tables).
 pub async fn finalize_one_shot_done(pool: &PgPool, db: &str, id: &str) -> Result<(), RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);

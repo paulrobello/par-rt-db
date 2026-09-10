@@ -134,13 +134,64 @@ struct WireTests {
         let msg = ClientMessage.schedule(
             scheduleId: "s1",
             when: .afterMs(ms: 100),
-            txn: Transaction(steps: [])
+            txn: Transaction(steps: []),
+            external: nil
         )
         try expectEncodes(
             msg,
             as: #"{"type":"schedule","scheduleId":"s1","when":{"type":"afterMs","ms":100},"txn":{"steps":[]}}"#
         )
         #expect(try roundTrip(msg) == msg)
+    }
+
+    @Test func externalScheduleClientMessageAndStep() throws {
+        // The corpus `external` schedule fixtures: the WS frame and the
+        // transaction step carry the optional flag omit-when-nil.
+        let frame = ClientMessage.schedule(
+            scheduleId: "s9",
+            when: .afterMs(ms: 100),
+            txn: Transaction(steps: []),
+            external: true
+        )
+        try expectEncodes(
+            frame,
+            // swiftlint:disable:next line_length
+            as: #"{"type":"schedule","scheduleId":"s9","when":{"type":"afterMs","ms":100},"txn":{"steps":[]},"external":true}"#
+        )
+        #expect(try roundTrip(frame) == frame)
+        let explicitFalse = ClientMessage.schedule(
+            scheduleId: "s9",
+            when: .afterMs(ms: 100),
+            txn: Transaction(steps: []),
+            external: false
+        )
+        #expect(
+            try decode(
+                ClientMessage.self,
+                // swiftlint:disable:next line_length
+                #"{"type":"schedule","scheduleId":"s9","when":{"type":"afterMs","ms":100},"txn":{"steps":[]},"external":false}"#
+            ) == explicitFalse
+        )
+        let stepTxn = Transaction(steps: [
+            .schedule(
+                when: .afterMs(ms: 60000),
+                txn: Transaction(steps: [
+                    .insert(table: "workItems", doc: ["title": .string("later")])
+                ]),
+                external: true
+            )
+        ])
+        try expectEncodes(
+            stepTxn,
+            as: """
+            {"steps":[
+            {"op":"schedule","when":{"type":"afterMs","ms":60000},
+            "txn":{"steps":[{"op":"insert","table":"workItems","doc":{"title":"later"}}]},
+            "external":true}
+            ]}
+            """
+        )
+        #expect(try roundTrip(stepTxn) == stepTxn)
     }
 
     @Test func scheduleControlFrames() throws {
@@ -499,6 +550,69 @@ struct WireDslTests {
         for json in rejectFixtures {
             expectDecodingThrows(ScheduleInfo.self, json)
         }
+    }
+
+    @Test func scheduleInfoExternalFlag() throws {
+        // External-claim flag on ScheduleInfo: decodes tolerantly (absent →
+        // false) and re-encodes omit-when-false so pre-flag payloads
+        // round-trip; present → carried on the round trip.
+        let plain = try decode(
+            ScheduleInfo.self,
+            #"{"id":"j1","kind":"oneshot","dueAt":1000,"status":"pending","createdAt":500,"firedCount":0}"#
+        )
+        #expect(plain.external == false)
+        try expectEncodes(
+            plain,
+            as: #"{"id":"j1","kind":"oneshot","dueAt":1000,"status":"pending","createdAt":500,"firedCount":0}"#
+        )
+        let external = try decode(
+            ScheduleInfo.self,
+            // swiftlint:disable:next line_length
+            #"{"id":"jx","kind":"oneshot","dueAt":3000,"status":"running","createdAt":500,"firedCount":0,"external":true}"#
+        )
+        #expect(external.external == true)
+        try expectEncodes(
+            external,
+            // swiftlint:disable:next line_length
+            as: #"{"id":"jx","kind":"oneshot","dueAt":3000,"status":"running","createdAt":500,"firedCount":0,"external":true}"#
+        )
+        #expect(try roundTrip(external) == external)
+    }
+
+    @Test func claimedScheduleWireShape() throws {
+        // protocol.rs ClaimedSchedule — the claim response's job body. The
+        // fencing token is required; cron/everyMs ride along omit-when-nil.
+        let job = try decode(
+            ClaimedSchedule.self,
+            """
+            {"id":"j1","kind":"oneshot","dueAt":1700000000000,
+            "txn":{"steps":[{"op":"insert","table":"items","doc":{"n":1}}]},
+            "leaseGeneration":3,"leaseDeadlineMs":1700000300000}
+            """
+        )
+        #expect(job.id == "j1")
+        #expect(job.kind == .oneshot)
+        #expect(job.cron == nil && job.everyMs == nil)
+        #expect(job.leaseGeneration == 3)
+        #expect(job.leaseDeadlineMs == 1_700_000_300_000)
+        try expectEncodes(
+            job,
+            as: """
+            {"id":"j1","kind":"oneshot","dueAt":1700000000000,
+            "txn":{"steps":[{"op":"insert","table":"items","doc":{"n":1}}]},
+            "leaseGeneration":3,"leaseDeadlineMs":1700000300000}
+            """
+        )
+        let intervalJob = try decode(
+            ClaimedSchedule.self,
+            """
+            {"id":"j2","kind":"interval","dueAt":1700000000000,
+            "txn":{"steps":[]},"everyMs":60000,
+            "leaseGeneration":1,"leaseDeadlineMs":1700000300000}
+            """
+        )
+        #expect(intervalJob.everyMs == 60000)
+        #expect(try roundTrip(intervalJob) == intervalJob)
     }
 
     // MARK: - Workflow status / retry / spec
@@ -974,7 +1088,8 @@ struct WireFilterQueryTests {
                 when: .afterMs(ms: 60000),
                 txn: Transaction(steps: [
                     .insert(table: "workItems", doc: ["title": .string("later")])
-                ])
+                ]),
+                external: nil
             ),
             .cancelSchedule(id: "j1")
         ])

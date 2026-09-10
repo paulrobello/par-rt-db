@@ -46,7 +46,11 @@ interface Corpus {
   server_messages: ServerMessage[];
   authed_users: AuthedUser[];
   schedule_whens: ScheduleWhen[];
-  schedule_infos: ScheduleInfo[];
+  // `external` is required on the SERIALIZED ScheduleInfo wire (the server
+  // always emits it) but serde-`default`s on decode, so the corpus's
+  // pre-feature entries legitimately omit it. The corpus is typed through
+  // that decode view; the external-jobs block below pins the serialized form.
+  schedule_infos: Array<Omit<ScheduleInfo, "external"> & { external?: boolean }>;
   // Untyped-on-purpose sections: query_results / error_envelopes / queries are
   // raw JSON values, not TS wire types (QueryResult is untagged on the wire,
   // and the error envelope model lives in errors.ts). We assert JSON
@@ -142,12 +146,54 @@ describe("wire-corpus: schedule_whens", () => {
 describe("wire-corpus: schedule_infos (ARC-004 enums)", () => {
   const corpus = loadCorpus();
   for (const [idx, entry] of corpus.schedule_infos.entries()) {
-    const _typeCheck: ScheduleInfo = entry; // narrows `kind`/`status` to literals
+    const _typeCheck: Omit<ScheduleInfo, "external"> & { external?: boolean } = entry; // narrows `kind`/`status` to literals
     void _typeCheck;
     it(`schedule_infos #${idx} (kind=${entry.kind}, status=${entry.status}) round-trips`, () => {
       assertJsonRoundTrip(entry);
     });
   }
+});
+
+/**
+ * External job claims (2026-09-09): the corpus gained a `schedule` client
+ * message with the create flag (`external: true`, omitted-on-the-wire when
+ * absent like the server's skip_serializing_if) and a `schedule_infos` entry
+ * (`jx`) carrying the REQUIRED `external` field. The generic loops above
+ * round-trip them raw; this block additionally asserts the entries are
+ * present with their load-bearing fields intact — a corpus or protocol drift
+ * on the external surface fails here, not just silently round-tripping.
+ */
+describe("wire-corpus: external job claims entries (external field on schedules)", () => {
+  const corpus = loadCorpus();
+
+  it("carries a schedule frame with external:true (the WS create flag)", () => {
+    const frames = corpus.client_messages.filter(
+      (m): m is Extract<ClientMessage, { type: "schedule" }> =>
+        m.type === "schedule" && m.external === true,
+    );
+    expect(frames).toHaveLength(1);
+    expect(frames[0].when).toEqual({ type: "afterMs", ms: 100 });
+    expect(frames[0].txn).toEqual({ steps: [] });
+    // The pre-feature schedule frames omit the flag entirely.
+    const withoutFlag = corpus.client_messages.filter(
+      (m): m is Extract<ClientMessage, { type: "schedule" }> =>
+        m.type === "schedule" && !("external" in m),
+    );
+    expect(withoutFlag.length).toBeGreaterThan(0);
+  });
+
+  it("carries a schedule_infos entry with the required external:true", () => {
+    const external = corpus.schedule_infos.filter((s) => s.external === true);
+    expect(external).toHaveLength(1);
+    const jx = external[0];
+    expect(jx.id).toBe("jx");
+    expect(jx.kind).toBe("oneshot");
+    expect(jx.status).toBe("running");
+    expect(jx.firedCount).toBe(0);
+    // Defaulting the decode view satisfies the full serialized ScheduleInfo.
+    const _typeCheck: ScheduleInfo = { ...jx, external: jx.external ?? false };
+    void _typeCheck;
+  });
 });
 
 describe("wire-corpus: migrate_requests (admin Directive list)", () => {

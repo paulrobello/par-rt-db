@@ -307,11 +307,14 @@ final class ScheduledJob {
     let createdAt: Int64
     var firedCount: Int64
     var lastError: String?
+    /// External-claim mode: `tick` skips it entirely — an application worker
+    /// claims the job over HTTP and finalizes it with the fencing token.
+    let external: Bool
 
     init(
         id: String, kind: ScheduleKind, txn: Transaction, dueAt: Int64, cron: String?,
         everyMs: Int64?, status: ScheduleStatus, createdAt: Int64, firedCount: Int64,
-        lastError: String? = nil
+        lastError: String? = nil, external: Bool = false
     ) {
         self.id = id
         self.kind = kind
@@ -323,6 +326,7 @@ final class ScheduledJob {
         self.createdAt = createdAt
         self.firedCount = firedCount
         self.lastError = lastError
+        self.external = external
     }
 }
 
@@ -1143,14 +1147,20 @@ public final class InMemoryRtDbClient: MigrationStore {
 
     /// Stores `txn` scheduled for `when` and returns its id (store.ts
     /// `schedule`, whose `{ id }` result object collapses to the id here).
+    /// `external: true` never fires via `tick` — the harness does not model
+    /// the claim surface; an application worker owns the job's execution.
     @discardableResult
-    public func schedule(_ txn: Transaction, when: ScheduleWhen) throws -> String {
-        try scheduleJob(txn, when)
+    public func schedule(
+        _ txn: Transaction, when: ScheduleWhen, external: Bool = false
+    ) throws -> String {
+        try scheduleJob(txn, when, external: external)
     }
 
     /// Sync core of `schedule` — the `Step.schedule` transaction step reuses
     /// it from the sync executeStep path.
-    private func scheduleJob(_ txn: Transaction, _ when: ScheduleWhen) throws -> String {
+    private func scheduleJob(
+        _ txn: Transaction, _ when: ScheduleWhen, external: Bool = false
+    ) throws -> String {
         let id = newId()
         let now = nowFn()
         var kind = ScheduleKind.oneshot
@@ -1184,7 +1194,8 @@ public final class InMemoryRtDbClient: MigrationStore {
             everyMs: everyMs,
             status: .pending,
             createdAt: now,
-            firedCount: 0
+            firedCount: 0,
+            external: external
         )
         schedules[id] = job
         scheduleOrder.append(id)
@@ -1248,7 +1259,8 @@ public final class InMemoryRtDbClient: MigrationStore {
             status: job.status,
             lastError: job.lastError,
             createdAt: job.createdAt,
-            firedCount: job.firedCount
+            firedCount: job.firedCount,
+            external: job.external
         )
     }
 
@@ -1430,18 +1442,21 @@ public final class InMemoryRtDbClient: MigrationStore {
 
     // MARK: Tick
 
-    /// Fires every due non-paused job by applying its txn through the same
-    /// atomic path as `mutate`; advances due workflow runs (FM-29); reaps
-    /// expired TTL documents (FM-33-aware hard delete). Pass `nowMs` to drive
-    /// the clock deterministically. Returns the count of documents reaped
-    /// (store.ts `tick` — whose reaper cascade can throw here too, exactly
-    /// like the TS propagates it out of `tick`).
+    /// Fires every due non-paused, non-external job by applying its txn
+    /// through the same atomic path as `mutate`; advances due workflow runs
+    /// (FM-29); reaps expired TTL documents (FM-33-aware hard delete). Pass
+    /// `nowMs` to drive the clock deterministically. Returns the count of
+    /// documents reaped (store.ts `tick` — whose reaper cascade can throw here
+    /// too, exactly like the TS propagates it out of `tick`).
     @discardableResult
     public func tick(nowMs: Int64? = nil) throws -> Int {
         let now = nowMs ?? nowFn()
         for id in scheduleOrder {
             guard let job = schedules[id] else { continue }
-            if job.status == .paused || job.dueAt > now {
+            // External jobs are never internally executed — they sit until an
+            // application worker claims them over HTTP (server `claim_due`
+            // excludes `external` rows the same way).
+            if job.external || job.status == .paused || job.dueAt > now {
                 continue
             }
             do {
@@ -1738,8 +1753,8 @@ public final class InMemoryRtDbClient: MigrationStore {
         // The schedule/workflow control-flow steps target their own stores,
         // not a table; cancel mirrors the standalone ops (cancelled: false is
         // not an error).
-        if case let .schedule(when, txn) = step {
-            let id = try scheduleJob(txn, when)
+        if case let .schedule(when, txn, external) = step {
+            let id = try scheduleJob(txn, when, external: external ?? false)
             return StepExecution(
                 result: .object(["scheduleId": .string(id)]), table: nil, extraTables: []
             )

@@ -116,7 +116,7 @@ describe("schedule wire types", () => {
     });
   });
 
-  it("ScheduleInfo shape (cron + everyMs + lastError optional)", () => {
+  it("ScheduleInfo shape (cron/everyMs/lastError optional, external required)", () => {
     const oneshot: ScheduleInfo = {
       id: "job-1",
       kind: "oneshot",
@@ -124,6 +124,7 @@ describe("schedule wire types", () => {
       status: "pending",
       createdAt: 1700000000000,
       firedCount: 0,
+      external: false,
     };
     const cronErr: ScheduleInfo = {
       id: "job-2",
@@ -134,6 +135,7 @@ describe("schedule wire types", () => {
       lastError: "boom",
       createdAt: 1700000000000,
       firedCount: 3,
+      external: false,
     };
     const interval: ScheduleInfo = {
       id: "job-3",
@@ -143,6 +145,16 @@ describe("schedule wire types", () => {
       status: "pending",
       createdAt: 1700000000000,
       firedCount: 1,
+      external: false,
+    };
+    const external: ScheduleInfo = {
+      id: "job-4",
+      kind: "oneshot",
+      dueAt: 1700000000000,
+      status: "running",
+      createdAt: 1700000000000,
+      firedCount: 0,
+      external: true,
     };
 
     // oneshot omits the optional cron/everyMs/lastError fields entirely.
@@ -153,6 +165,7 @@ describe("schedule wire types", () => {
       status: "pending",
       createdAt: 1700000000000,
       firedCount: 0,
+      external: false,
     });
     expect(cronErr).toEqual({
       id: "job-2",
@@ -163,6 +176,7 @@ describe("schedule wire types", () => {
       lastError: "boom",
       createdAt: 1700000000000,
       firedCount: 3,
+      external: false,
     });
     expect(interval).toEqual({
       id: "job-3",
@@ -172,6 +186,17 @@ describe("schedule wire types", () => {
       status: "pending",
       createdAt: 1700000000000,
       firedCount: 1,
+      external: false,
+    });
+    // The external-claim flag is REQUIRED (always serialized by the server).
+    expect(external).toEqual({
+      id: "job-4",
+      kind: "oneshot",
+      dueAt: 1700000000000,
+      status: "running",
+      createdAt: 1700000000000,
+      firedCount: 0,
+      external: true,
     });
   });
 });

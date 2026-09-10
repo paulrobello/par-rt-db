@@ -251,9 +251,18 @@ export class TxnBuilder<S extends SchemaDefinition<any> = SchemaDefinition<any>>
   }
 
   /** Schedules `txn` to run later (FM-28). The inner transaction is executed
-   * by the server's per-db scheduler, not in this transaction's turn. */
-  schedule(when: ScheduleWhen, txn: TransactionJson): this {
-    this.steps.push({ op: "schedule", when, txn });
+   * by the server's per-db scheduler, not in this transaction's turn. Pass
+   * `external` to create an external job instead: one never executed by the
+   * server — an application worker claims it via `POST /api/schedule/claim`
+   * (a `claimSchedules` client call) and finalizes with the returned
+   * `leaseGeneration` fencing token. */
+  schedule(when: ScheduleWhen, txn: TransactionJson, external?: boolean): this {
+    this.steps.push({
+      op: "schedule",
+      when,
+      txn,
+      ...(external === true && { external: true }),
+    });
     return this;
   }
 

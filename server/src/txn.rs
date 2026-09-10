@@ -1460,7 +1460,9 @@ pub async fn execute_txn(
                 filter,
                 limit,
             } => step_delete_by_query(&mut sctx, table, filter, *limit).await?,
-            Step::Schedule { when, txn } => step_schedule(&mut sctx, when, txn).await?,
+            Step::Schedule { when, txn, external } => {
+                step_schedule(&mut sctx, when, txn, external.is_some_and(|e| e)).await?
+            }
             Step::CancelSchedule { id } => step_cancel_schedule(&mut sctx, id).await?,
             Step::StartWorkflow { spec } => step_start_workflow(&mut sctx, spec).await?,
             Step::CancelWorkflow { id } => step_cancel_workflow(&mut sctx, id).await?,
@@ -2202,6 +2204,7 @@ async fn step_schedule(
     sctx: &mut StepCtx<'_>,
     when: &crate::protocol::ScheduleWhen,
     txn: &Transaction,
+    external: bool,
 ) -> Result<(), RtDbError> {
     authorize_txn_tables(sctx.ctx, txn)?;
     let (kind, due_at, cron, every_ms) = scheduler::resolve_when(when.clone(), now_ms())?;
@@ -2213,6 +2216,7 @@ async fn step_schedule(
         txn,
         cron.as_deref(),
         every_ms,
+        external,
     )
     .await?;
     sctx.results.push(serde_json::json!({ "scheduleId": id }));
@@ -2320,6 +2324,7 @@ mod tests {
                     doc: serde_json::Map::new(),
                 },
                 Step::Schedule {
+                    external: None,
                     when: crate::protocol::ScheduleWhen::AfterMs { ms: 1 },
                     txn: Box::new(Transaction {
                         steps: vec![
@@ -2328,6 +2333,7 @@ mod tests {
                                 id: "x".to_string(),
                             },
                             Step::Schedule {
+                                external: None,
                                 when: crate::protocol::ScheduleWhen::RunAt { ms: 2 },
                                 txn: Box::new(Transaction {
                                     steps: vec![Step::CancelSchedule {

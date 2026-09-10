@@ -586,7 +586,10 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
             status      text NOT NULL,
             last_error  text,
             created_at  bigint NOT NULL,
-            fired_count bigint NOT NULL DEFAULT 0
+            fired_count bigint NOT NULL DEFAULT 0,
+            external    boolean NOT NULL DEFAULT false,
+            claim_generation bigint NOT NULL DEFAULT 0,
+            lease_deadline_ms bigint
         )"
     ))
     .execute(&mut *tx)

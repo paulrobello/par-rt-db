@@ -1056,6 +1056,33 @@ struct InMemoryTests {
         #expect(try count(client.query(Query(table: "items", count: true))) == 1)
     }
 
+    @Test func externalScheduleSkippedByTick() throws {
+        // External-claim jobs are never internally executed: the tick loop
+        // skips them (server `claim_due` excludes `external` rows), so the
+        // job sits pending until an application worker claims it. The harness
+        // does not model the claim surface.
+        let client = deterministicClient()
+        try client.pushSchema(itemsSchema())
+        let id = try client.schedule(
+            Transaction(steps: [.insert(table: "items", doc: ["title": .string("s"), "n": .int(1)])]),
+            when: .afterMs(ms: 0),
+            external: true
+        )
+        _ = try client.tick(nowMs: pinnedNow + 10000)
+        #expect(try count(client.query(Query(table: "items", count: true))) == 0)
+        let job = try #require(client.listSchedules().first { $0.id == id })
+        #expect(job.status == .pending)
+        #expect(job.external)
+        // An ordinary job created through the same path keeps firing.
+        _ = try client.schedule(
+            Transaction(steps: [.insert(table: "items", doc: ["title": .string("o"), "n": .int(2)])]),
+            when: .afterMs(ms: 0)
+        )
+        _ = try client.tick(nowMs: pinnedNow + 20000)
+        #expect(try count(client.query(Query(table: "items", count: true))) == 1)
+        #expect(try client.listSchedules().first { $0.id == id }?.external == true)
+    }
+
     @Test func intervalScheduleFiresEveryIntervalAndRearmsFromFireTime() throws {
         let client = deterministicClient()
         try client.pushSchema(itemsSchema())
@@ -1139,7 +1166,7 @@ struct InMemoryTests {
         _ = try client.schedule(txn, when: .interval(everyMs: InMemoryLimits.maxEveryMs))
         do {
             _ = try client.mutate(Transaction(steps: [
-                .schedule(when: .interval(everyMs: 0), txn: Transaction(steps: []))
+                .schedule(when: .interval(everyMs: 0), txn: Transaction(steps: []), external: nil)
             ]))
             Issue.record("expected the schedule step to reject a non-positive everyMs")
         } catch let error as RtDbError {

@@ -220,6 +220,20 @@ impl Mutation {
         self.steps.push(Step::Schedule {
             when,
             txn: Box::new(txn),
+            external: None,
+        });
+        self
+    }
+
+    /// Schedule `txn` to run later as an EXTERNAL job — never executed by the
+    /// server's internal scheduler; an application worker claims it via
+    /// `POST /api/schedule/claim` and finalizes it with the returned
+    /// `leaseGeneration` fencing token.
+    pub fn schedule_external(mut self, when: ScheduleWhen, txn: Transaction) -> Self {
+        self.steps.push(Step::Schedule {
+            when,
+            txn: Box::new(txn),
+            external: Some(true),
         });
         self
     }
@@ -467,6 +481,39 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[test]
+    fn schedule_external_serializes_flag_and_round_trips() {
+        // `schedule_external` stamps `external: Some(true)`, serialized as the
+        // wire key `external`; the ordinary `schedule` builder keeps the key
+        // omitted (see the test above) — same omit-when-absent rule as the
+        // server's `Step::Schedule` serde attrs.
+        let txn = Mutation::new()
+            .schedule_external(
+                ScheduleWhen::AfterMs { ms: 60_000 },
+                Transaction { steps: vec![] },
+            )
+            .build();
+        let v = serde_json::to_value(&txn).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "steps": [
+                    { "op": "schedule", "when": { "type": "afterMs", "ms": 60000 },
+                      "txn": { "steps": [] }, "external": true }
+                ]
+            })
+        );
+        // Round-trips back to the typed step with the flag intact.
+        let back: Transaction = serde_json::from_value(v).unwrap();
+        assert!(matches!(
+            back.steps.as_slice(),
+            [Step::Schedule {
+                external: Some(true),
+                ..
+            }]
+        ));
     }
 
     #[test]

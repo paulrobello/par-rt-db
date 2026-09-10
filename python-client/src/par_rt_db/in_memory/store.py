@@ -283,7 +283,9 @@ class StoredBlob:
 @dataclass
 class _ScheduledJob:
     """A stored scheduled job. :meth:`InMemoryRtDb.tick` fires due non-paused
-    jobs by applying ``txn`` through the same atomic path as :meth:`mutate`."""
+    jobs by applying ``txn`` through the same atomic path as :meth:`mutate`.
+    External jobs (2026-09-09 external-claim feature) are never fired by
+    ``tick()`` — they sit until an application worker claims them over HTTP."""
 
     id: str
     kind: str  # "oneshot" | "cron" | "interval"
@@ -295,6 +297,7 @@ class _ScheduledJob:
     created_at: int
     fired_count: int
     last_error: str | None
+    external: bool = False
 
 
 # The awaitSignal slot's "no delivery" state — a sentinel, not None, because
@@ -1252,6 +1255,7 @@ def _schedule_info(job: _ScheduledJob) -> ScheduleInfo:
             "lastError": job.last_error,
             "createdAt": job.created_at,
             "firedCount": job.fired_count,
+            "external": job.external,
         }
     )
 
@@ -1655,12 +1659,17 @@ class _InMemoryStoreCore:
                 for row in take:
                     self._delete_row_cascade(table, row.id, visited, cascade_rows, False, touched)
                 return _delete_by_query_result(len(take), truncated), touched
-            case _Schedule(when=when, txn=nested_txn):
+            case _Schedule(when=when, txn=nested_txn, external=step_external):
                 # FM-28: enqueue, don't execute — tick() fires the nested txn
                 # later through _execute_transaction (which re-validates it).
                 # Routes through schedule() so the when is validated (everyMs
-                # bounds) identically on the step and standalone paths.
-                return _schedule_result(self.schedule(nested_txn, when)), set()
+                # bounds) identically on the step and standalone paths. An
+                # external step enqueues an external job — tick() skips it the
+                # same way the server's claim_due/next_due exclude external rows.
+                return (
+                    _schedule_result(self.schedule(nested_txn, when, external=bool(step_external))),
+                    set(),
+                )
             case _CancelSchedule(id=job_id):
                 # Unlike the standalone cancel op (NOT_FOUND on a miss), the
                 # step reports {"cancelled": bool} — a miss is not an error.
@@ -2218,11 +2227,14 @@ class _InMemoryStoreCore:
             case _:
                 return "oneshot", self._due_at_for(when, now), None, None
 
-    def schedule(self, txn: Transaction, when: ScheduleWhen) -> str:
+    def schedule(self, txn: Transaction, when: ScheduleWhen, *, external: bool = False) -> str:
         """Store ``txn`` scheduled for ``when`` and return its id. Cron
         validation is deferred to the live server; the harness accepts any
         expression. ``everyMs`` (interval) IS validated — positive and at most
-        :data:`MAX_EVERY_MS` — mirroring the server's ``resolve_when``."""
+        :data:`MAX_EVERY_MS` — mirroring the server's ``resolve_when``. An
+        external job is never fired by :meth:`tick` — it sits ``pending`` until
+        an application worker claims it (mirrors the server's external-claim
+        surface)."""
         new_id = self._new_id()
         kind, due_at, cron, every_ms = self._prepare_job(when)
         self._schedules.append(
@@ -2237,6 +2249,7 @@ class _InMemoryStoreCore:
                 created_at=self._now(),
                 fired_count=0,
                 last_error=None,
+                external=external,
             )
         )
         return new_id
@@ -2626,7 +2639,8 @@ class _InMemoryStoreCore:
         :data:`CRON_STEP_MS` and interval jobs by their ``everyMs`` (missed
         windows are skipped, never backfilled). A job whose txn fails is marked
         ``error`` but left in place (recurring kinds re-arm), so a subsequent
-        ``tick`` retries it.
+        ``tick`` retries it. External jobs are NEVER fired — the worker that
+        claims them over HTTP owns their execution.
 
         Workflows (FM-29): after schedules, one claim pass advances every due
         pending run (see :meth:`_advance_workflows`)."""
@@ -2636,7 +2650,10 @@ class _InMemoryStoreCore:
         i = 0
         while i < len(self._schedules):
             job = self._schedules[i]
-            if job.status == "paused" or job.due_at > now:
+            # External jobs are never internally executed (server claim_due/
+            # next_due exclude external rows) — tick skips them so the job
+            # stays pending for its claiming worker.
+            if job.status == "paused" or job.external or job.due_at > now:
                 i += 1
                 continue
             txn = job.txn

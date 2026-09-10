@@ -153,7 +153,7 @@ export type ScheduleWhen =
   | { type: "cron"; expr: string }
   | { type: "interval"; everyMs: number };
 
-/** Mirrors server `protocol::ScheduleInfo` (camelCase; `cron`/`everyMs`/`lastError` omitted when absent). */
+/** Mirrors server `protocol::ScheduleInfo` (camelCase; `cron`/`everyMs`/`lastError` omitted when absent; `external` omitted when false — server serde-`default`s it on decode, so old payloads without it still parse). */
 export interface ScheduleInfo {
   id: string;
   kind: "oneshot" | "cron" | "interval";
@@ -164,6 +164,31 @@ export interface ScheduleInfo {
   lastError?: string;
   createdAt: number;
   firedCount: number;
+  /** True when the job is never executed by the internal scheduler and is served to application workers via the external claim surface (`claimSchedules`) instead. */
+  external?: boolean;
+}
+
+/** One externally-claimed job returned by `POST /api/schedule/claim`. Mirrors
+ * server `protocol::ClaimedSchedule` byte-for-byte (camelCase; `cron`/`everyMs`
+ * omitted when absent). `leaseGeneration` is the per-job monotonic fencing
+ * token: it increments on every claim (including re-claims after lease
+ * expiry), and the worker's complete/retry/fail calls are rejected `CONFLICT`
+ * once a newer generation exists. */
+export interface ClaimedSchedule {
+  id: string;
+  kind: "oneshot" | "cron" | "interval";
+  /** When the job came due, epoch ms. */
+  dueAt: number;
+  /** The declarative transaction the worker executes externally. */
+  txn: TransactionJson;
+  /** The cron expression, for cron jobs. */
+  cron?: string;
+  /** The fixed recurrence in ms, for interval jobs. */
+  everyMs?: number;
+  /** Per-job monotonic fencing token assigned atomically by the claim. */
+  leaseGeneration: number;
+  /** Lease expiry instant, epoch ms — past this the job is re-claimable. */
+  leaseDeadlineMs: number;
 }
 
 // ---- Workflow wire types (FM-29) --------------------------------------------
@@ -320,7 +345,16 @@ export type StepJson =
       filter: FilterExpr;
       limit?: number;
     }
-  | { op: "schedule"; when: ScheduleWhen; txn: TransactionJson }
+  | {
+      op: "schedule";
+      when: ScheduleWhen;
+      txn: TransactionJson;
+      /** External-claim job mode: when set, the job is never executed by the
+       * server's internal scheduler — an application worker claims it via
+       * `POST /api/schedule/claim` and finalizes with the returned
+       * `leaseGeneration` fencing token. Omitted = ordinary internal job. */
+      external?: true;
+    }
   | { op: "cancelSchedule"; id: string }
   | { op: "startWorkflow"; spec: WorkflowSpec }
   | { op: "cancelWorkflow"; id: string };
@@ -529,7 +563,13 @@ export type ClientMessage =
   | { type: "subscribe"; queryId: string; query: QueryJson }
   | { type: "unsubscribe"; queryId: string }
   | { type: "mutate"; mutId: string; idempotencyKey?: string; txn: TransactionJson }
-  | { type: "schedule"; scheduleId: string; when: ScheduleWhen; txn: TransactionJson }
+  | {
+      type: "schedule";
+      scheduleId: string;
+      when: ScheduleWhen;
+      txn: TransactionJson;
+      external?: true;
+    }
   | { type: "cancelSchedule"; scheduleId: string; id: string }
   | { type: "pauseSchedule"; scheduleId: string; id: string }
   | { type: "resumeSchedule"; scheduleId: string; id: string }

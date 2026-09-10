@@ -669,6 +669,7 @@ async fn spec_bounds_and_allowlist_rejected() -> anyhow::Result<()> {
                         spec: Box::new(nested),
                     }],
                 }),
+                external: None,
             }],
         },
         &scoped,

@@ -227,6 +227,23 @@ struct MutationBuilderTests {
         ])])
     }
 
+    @Test func scheduleExternalSetsTheFlag() throws {
+        // `scheduleExternal` builds the step with `external: true`; the plain
+        // `schedule` builder keeps the flag off the wire.
+        let external = try MutationBuilder()
+            .scheduleExternal(.afterMs(ms: 60000), Transaction(steps: []))
+            .build()
+        #expect(external.steps == [
+            .schedule(when: .afterMs(ms: 60000), txn: Transaction(steps: []), external: true)
+        ])
+        let plain = try MutationBuilder()
+            .schedule(.afterMs(ms: 60000), Transaction(steps: []))
+            .build()
+        #expect(plain.steps == [
+            .schedule(when: .afterMs(ms: 60000), txn: Transaction(steps: []), external: nil)
+        ])
+    }
+
     @Test func startAndCancelWorkflowSerialize() throws {
         // Mirrors rust `start_and_cancel_workflow_serialize`.
         let spec = try WorkflowSpec(name: "drip", steps: [

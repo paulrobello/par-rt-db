@@ -212,7 +212,10 @@ interface Subscription {
 type ScheduleStatus = "pending" | "running" | "paused" | "error";
 
 /** A stored scheduled job in the in-memory harness. `tick` fires due non-paused
- * jobs by applying `txn` through the same atomic path as `mutate`. */
+ * jobs by applying `txn` through the same atomic path as `mutate`; `external`
+ * jobs are never fired by `tick` (the server's internal scheduler likewise
+ * excludes them — application workers claim them through the external claim
+ * surface instead). */
 interface ScheduledJob {
   id: string;
   kind: "oneshot" | "cron" | "interval";
@@ -223,6 +226,9 @@ interface ScheduledJob {
   status: ScheduleStatus;
   createdAt: number;
   firedCount: number;
+  /** Never executed by the harness's `tick` — served to application workers
+   * via the external claim surface (server `scheduled_txns.external`). */
+  external: boolean;
   lastError?: string;
 }
 
@@ -1330,15 +1336,23 @@ export class InMemoryRtDbClient {
    * deferred to the live server; the harness accepts any expression. An
    * interval's `everyMs` IS validated here (mirroring server
    * `scheduler::resolve_when`) — the shared core of the public `schedule` and
-   * the `Schedule` txn step. */
-  async schedule(txn: TransactionJson, when: ScheduleWhen): Promise<{ id: string }> {
-    return this.scheduleJob(txn, when);
+   * the `Schedule` txn step. Pass `external` to create an external job: one
+   * never fired by the harness's `tick` (the server's internal scheduler
+   * excludes them too) — an application worker claims it via
+   * `POST /api/schedule/claim` and finalizes with the returned
+   * `leaseGeneration` fencing token. */
+  async schedule(
+    txn: TransactionJson,
+    when: ScheduleWhen,
+    external?: boolean,
+  ): Promise<{ id: string }> {
+    return this.scheduleJob(txn, when, external);
   }
 
   /** Sync core of {@link schedule} — the body is synchronous, and the
    * `Step::Schedule` transaction step (FM-28) reuses it from the sync
    * `executeStep` path. */
-  private scheduleJob(txn: TransactionJson, when: ScheduleWhen): { id: string } {
+  private scheduleJob(txn: TransactionJson, when: ScheduleWhen, external = false): { id: string } {
     if (when.type === "interval") {
       if (when.everyMs <= 0) {
         throw new RtDbError("BAD_REQUEST", "everyMs must be positive");
@@ -1357,6 +1371,7 @@ export class InMemoryRtDbClient {
       status: "pending",
       createdAt: now,
       firedCount: 0,
+      external,
     };
     if (when.type === "cron") {
       job.cron = when.expr;
@@ -1631,7 +1646,11 @@ export class InMemoryRtDbClient {
   tick(nowMs?: number): number {
     const now = nowMs ?? this.now();
     for (const job of this.schedules.values()) {
-      if (job.status === "paused" || job.dueAt > now) {
+      // External jobs are never internally executed (server `claim_due`/
+      // `next_due`/`reset_running` all exclude `external` rows): they sit
+      // pending until an application worker claims them through the external
+      // claim surface.
+      if (job.status === "paused" || job.external || job.dueAt > now) {
         continue;
       }
       try {
@@ -1893,6 +1912,9 @@ export class InMemoryRtDbClient {
       createdAt: job.createdAt,
       firedCount: job.firedCount,
     };
+    if (job.external) {
+      info.external = job.external;
+    }
     if (job.cron !== undefined) {
       info.cron = job.cron;
     }
@@ -1916,7 +1938,7 @@ export class InMemoryRtDbClient {
     // table. Cancel mirrors the server's standalone op: `cancelled: false`
     // (not an error) when the id is missing or already fired/cancelled.
     if (step.op === "schedule") {
-      const { id } = this.scheduleJob(step.txn, step.when);
+      const { id } = this.scheduleJob(step.txn, step.when, step.external === true);
       return { result: { scheduleId: id } };
     }
     if (step.op === "cancelSchedule") {

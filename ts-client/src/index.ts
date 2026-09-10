@@ -132,6 +132,7 @@ export type {
   PresenceMember,
   QueryJson,
   SampleChangeJson,
+  ClaimedSchedule,
   ScheduleInfo,
   ScheduleWhen,
   SchemaHistoryEntry,

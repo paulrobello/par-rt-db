@@ -27,7 +27,10 @@ use crate::db::now_ms;
 use crate::error::RtDbError;
 use crate::image_transform::{Resolved, TransformParams};
 use crate::metrics::SlowQueryRecord;
-use crate::protocol::{ScheduleInfo, ScheduleWhen, WorkflowInfo, WorkflowSpec, WorkflowStatus};
+use crate::protocol::{
+    ClaimedSchedule, ScheduleInfo, ScheduleKind, ScheduleWhen, WorkflowInfo, WorkflowSpec,
+    WorkflowStatus,
+};
 use crate::query::{Query, QueryResult, compile_query, execute_query};
 use crate::rate_limit::{check_http_rate_limits, check_storage_public_rate_limit};
 use crate::scheduler;
@@ -384,6 +387,11 @@ struct ScheduleRequest {
     db: String,
     when: ScheduleWhen,
     txn: Transaction,
+    /// External-claim job mode: never internally executed — an application
+    /// worker claims the job via `POST /api/schedule/claim` and finalizes it
+    /// with the returned `leaseGeneration` fencing token.
+    #[serde(default)]
+    external: bool,
 }
 
 #[derive(Serialize)]
@@ -426,9 +434,175 @@ async fn schedule_handler(
         &body.txn,
         cron.as_deref(),
         every_ms,
+        body.external,
     )
     .await?;
     Ok(Json(ScheduleResponse { id }))
+}
+
+/// `POST /api/schedule/claim` — atomically claim due external jobs for an
+/// application worker. Each claim assigns the per-job monotonic
+/// `leaseGeneration` fencing token and stamps the lease deadline; the
+/// finalize surface rejects any transition whose token is no longer current.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaimSchedulesRequest {
+    db: String,
+    /// Max jobs to claim (default [`scheduler::CLAIM_DEFAULT`], capped at
+    /// [`scheduler::CLAIM_BATCH`]).
+    #[serde(default)]
+    limit: Option<i64>,
+    /// Lease length in ms (default [`scheduler::LEASE_DEFAULT_MS`], bounded by
+    /// [`scheduler::LEASE_MIN_MS`] / [`scheduler::LEASE_MAX_MS`]).
+    #[serde(default)]
+    lease_ms: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaimSchedulesResponse {
+    jobs: Vec<ClaimedSchedule>,
+}
+
+async fn claim_schedules_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ApiJson(body): ApiJson<ClaimSchedulesRequest>,
+) -> Result<Json<ClaimSchedulesResponse>, RtDbError> {
+    let principal = authed(&state, &headers, &body.db).await?;
+    if principal.is_read_only() {
+        return Err(RtDbError::forbidden("read-only token cannot mutate"));
+    }
+    check_http_rate_limits(&state, &principal, &body.db).await?;
+    // Cold-db guard (claim is direct table access; no scheduler task needed —
+    // external jobs are never internally executed).
+    scheduler::ensure_table(&state.pool, &body.db).await?;
+
+    let limit = body
+        .limit
+        .unwrap_or(scheduler::CLAIM_DEFAULT)
+        .clamp(1, scheduler::CLAIM_BATCH);
+    let lease_ms = body
+        .lease_ms
+        .unwrap_or(scheduler::LEASE_DEFAULT_MS)
+        .clamp(scheduler::LEASE_MIN_MS, scheduler::LEASE_MAX_MS);
+    let now = now_ms();
+    let claimed = scheduler::claim_external(&state.pool, &body.db, now, limit, lease_ms).await?;
+    let jobs = claimed
+        .into_iter()
+        .map(|job| {
+            Ok::<ClaimedSchedule, RtDbError>(ClaimedSchedule {
+                id: job.id,
+                kind: job.kind.parse::<ScheduleKind>().map_err(|err| {
+                    RtDbError::internal(format!("invalid scheduled_txns.kind: {err}"))
+                })?,
+                due_at: job.due_at,
+                txn: job.txn,
+                cron: job.cron,
+                every_ms: job.every_ms,
+                lease_generation: job.lease_generation,
+                lease_deadline_ms: job.lease_deadline_ms,
+            })
+        })
+        .collect::<Result<Vec<_>, RtDbError>>()?;
+    Ok(Json(ClaimSchedulesResponse { jobs }))
+}
+
+/// Shared authorize-then-finalize body for the three external transitions.
+/// `outcome` and `error_text` come from the concrete handler; the fence
+/// (external + running + token) is enforced inside `finalize_external`.
+async fn run_finalize_op(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    db: &str,
+    id: &str,
+    lease: i64,
+    outcome: scheduler::ExternalOutcome,
+    error_text: Option<&str>,
+) -> Result<Json<ManageResponse>, RtDbError> {
+    let principal = authed(state, headers, db).await?;
+    if principal.is_read_only() {
+        return Err(RtDbError::forbidden("read-only token cannot mutate"));
+    }
+    check_http_rate_limits(state, &principal, db).await?;
+    scheduler::ensure_table(&state.pool, db).await?;
+    scheduler::finalize_external(&state.pool, db, id, lease, outcome, error_text).await?;
+    Ok(Json(ManageResponse { ok: true }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FinalizeScheduleRequest {
+    db: String,
+    /// The per-job fencing token returned by the claim.
+    lease: i64,
+    /// `retry` only: re-arm delay in ms (default 60_000, max MAX_EVERY_MS).
+    #[serde(default)]
+    delay_ms: Option<i64>,
+    /// `retry`/`fail`: recorded on the job as `last_error`.
+    #[serde(default)]
+    error: Option<String>,
+}
+
+async fn complete_schedule_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    ApiJson(body): ApiJson<FinalizeScheduleRequest>,
+) -> Result<Json<ManageResponse>, RtDbError> {
+    run_finalize_op(
+        &state,
+        &headers,
+        &body.db,
+        &id,
+        body.lease,
+        scheduler::ExternalOutcome::Complete,
+        None,
+    )
+    .await
+}
+
+async fn retry_schedule_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    ApiJson(body): ApiJson<FinalizeScheduleRequest>,
+) -> Result<Json<ManageResponse>, RtDbError> {
+    let delay_ms = body
+        .delay_ms
+        .unwrap_or(scheduler::RETRY_DEFAULT_MS)
+        .clamp(1, scheduler::MAX_EVERY_MS);
+    run_finalize_op(
+        &state,
+        &headers,
+        &body.db,
+        &id,
+        body.lease,
+        scheduler::ExternalOutcome::Retry { delay_ms },
+        body.error.as_deref(),
+    )
+    .await
+}
+
+async fn fail_schedule_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    ApiJson(body): ApiJson<FinalizeScheduleRequest>,
+) -> Result<Json<ManageResponse>, RtDbError> {
+    if body.error.is_none() {
+        return Err(RtDbError::bad_request("`error` is required to fail a job"));
+    }
+    run_finalize_op(
+        &state,
+        &headers,
+        &body.db,
+        &id,
+        body.lease,
+        scheduler::ExternalOutcome::Fail,
+        body.error.as_deref(),
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -672,6 +846,13 @@ pub fn http_api_routes() -> Router<Arc<AppState>> {
         .route("/api/query-batch", post(batch_query_handler))
         .route("/api/mutate", post(mutate_handler))
         .route("/api/schedule", post(schedule_handler))
+        .route("/api/schedule/claim", post(claim_schedules_handler))
+        .route(
+            "/api/schedule/{id}/complete",
+            post(complete_schedule_handler),
+        )
+        .route("/api/schedule/{id}/retry", post(retry_schedule_handler))
+        .route("/api/schedule/{id}/fail", post(fail_schedule_handler))
         .route("/api/schedule/{id}/cancel", post(cancel_handler))
         .route("/api/schedule/{id}/pause", post(pause_handler))
         .route("/api/schedule/{id}/resume", post(resume_handler))

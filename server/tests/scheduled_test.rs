@@ -16,6 +16,7 @@ use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::committer::{CommitterConfig, Committers};
 use rtdb_server::db::SchemaCache;
 use rtdb_server::ddl;
+use rtdb_server::error::ErrorCode;
 use rtdb_server::metrics::Metrics;
 use rtdb_server::op_feed::OpFeed;
 use rtdb_server::protocol::{ScheduleKind, ScheduleStatus};
@@ -55,7 +56,7 @@ async fn insert_list_cancel_roundtrip() {
     scheduler::ensure_table(&pool, &db).await.unwrap();
 
     let txn = empty_txn();
-    let id = scheduler::insert(&pool, &db, "oneshot", 123, &txn, None, None)
+    let id = scheduler::insert(&pool, &db, "oneshot", 123, &txn, None, None, false)
         .await
         .unwrap();
     let listed = scheduler::list(&pool, &db).await.unwrap();
@@ -76,9 +77,18 @@ async fn pause_resume_cron_recomputes_due() {
     let db = unique_db(&pool).await;
     scheduler::ensure_table(&pool, &db).await.unwrap();
     let txn = empty_txn();
-    let id = scheduler::insert(&pool, &db, "cron", 1, &txn, Some("*/5 * * * *"), None)
-        .await
-        .unwrap();
+    let id = scheduler::insert(
+        &pool,
+        &db,
+        "cron",
+        1,
+        &txn,
+        Some("*/5 * * * *"),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
 
     assert!(scheduler::set_paused(&pool, &db, &id, true).await.unwrap());
     let info = &scheduler::list(&pool, &db).await.unwrap()[0];
@@ -101,12 +111,21 @@ async fn claim_due_and_finalize() {
     let db = unique_db(&pool).await;
     scheduler::ensure_table(&pool, &db).await.unwrap();
     let txn = empty_txn();
-    let one = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None)
+    let one = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, false)
         .await
         .unwrap();
-    let cron = scheduler::insert(&pool, &db, "cron", 1, &txn, Some("*/5 * * * *"), None)
-        .await
-        .unwrap();
+    let cron = scheduler::insert(
+        &pool,
+        &db,
+        "cron",
+        1,
+        &txn,
+        Some("*/5 * * * *"),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
 
     let claimed = scheduler::claim_due(&pool, &db, i64::MAX, scheduler::CLAIM_BATCH)
         .await
@@ -134,7 +153,7 @@ async fn reset_running_recovers_orphans() {
     let db = unique_db(&pool).await;
     scheduler::ensure_table(&pool, &db).await.unwrap();
     let txn = empty_txn();
-    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None)
+    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, false)
         .await
         .unwrap();
     // Simulate a crash mid-fire: the committer claimed but never finalized.
@@ -159,13 +178,13 @@ async fn next_due_and_mark_error() {
     // Empty table → nothing due.
     assert!(scheduler::next_due(&pool, &db).await.unwrap().is_none());
 
-    let _a = scheduler::insert(&pool, &db, "oneshot", 50, &txn, None, None)
+    let _a = scheduler::insert(&pool, &db, "oneshot", 50, &txn, None, None, false)
         .await
         .unwrap();
-    let b = scheduler::insert(&pool, &db, "oneshot", 10, &txn, None, None)
+    let b = scheduler::insert(&pool, &db, "oneshot", 10, &txn, None, None, false)
         .await
         .unwrap();
-    let _c = scheduler::insert(&pool, &db, "oneshot", 90, &txn, None, None)
+    let _c = scheduler::insert(&pool, &db, "oneshot", 90, &txn, None, None, false)
         .await
         .unwrap();
 
@@ -191,7 +210,7 @@ async fn pause_resume_one_shot_keeps_due_at() {
     let db = unique_db(&pool).await;
     scheduler::ensure_table(&pool, &db).await.unwrap();
     let txn = empty_txn();
-    let id = scheduler::insert(&pool, &db, "oneshot", 42, &txn, None, None)
+    let id = scheduler::insert(&pool, &db, "oneshot", 42, &txn, None, None, false)
         .await
         .unwrap();
 
@@ -345,7 +364,7 @@ async fn one_shot_fires_and_writes() {
             doc: serde_json::json!({ "n": 42 }).as_object().unwrap().clone(),
         }],
     };
-    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None)
+    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, false)
         .await
         .unwrap();
 
@@ -404,7 +423,7 @@ async fn cron_fires_and_stays_pending() {
             doc: serde_json::json!({ "n": 7 }).as_object().unwrap().clone(),
         }],
     };
-    let _id = scheduler::insert(&pool, &db, "cron", 1, &txn, Some("* * * * *"), None)
+    let _id = scheduler::insert(&pool, &db, "cron", 1, &txn, Some("* * * * *"), None, false)
         .await
         .unwrap();
 
@@ -470,7 +489,7 @@ async fn failing_cron_reschedules_anyway() {
             version: 999,
         }],
     };
-    let _id = scheduler::insert(&pool, &db, "cron", 1, &txn, Some("* * * * *"), None)
+    let _id = scheduler::insert(&pool, &db, "cron", 1, &txn, Some("* * * * *"), None, false)
         .await
         .unwrap();
 
@@ -557,7 +576,7 @@ async fn one_shot_catches_up_after_being_past_due() {
         }],
     };
     let one_hour_ago = rtdb_server::db::now_ms() - 3_600_000;
-    let _id = scheduler::insert(&pool, &db, "oneshot", one_hour_ago, &txn, None, None)
+    let _id = scheduler::insert(&pool, &db, "oneshot", one_hour_ago, &txn, None, None, false)
         .await
         .unwrap();
 
@@ -614,6 +633,7 @@ async fn cron_skips_missed_windows() {
         &txn,
         Some("* * * * *"),
         None,
+        false,
     )
     .await
     .unwrap();
@@ -707,7 +727,7 @@ async fn failing_txn_marks_error_one_shot() {
             },
         ],
     };
-    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None)
+    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, false)
         .await
         .unwrap();
 
@@ -757,7 +777,7 @@ async fn pause_resume_interval_shifts_due_from_resume() {
     let db = unique_db(&pool).await;
     scheduler::ensure_table(&pool, &db).await.unwrap();
     let txn = empty_txn();
-    let id = scheduler::insert(&pool, &db, "interval", 1, &txn, None, Some(60_000))
+    let id = scheduler::insert(&pool, &db, "interval", 1, &txn, None, Some(60_000), false)
         .await
         .unwrap();
 
@@ -814,7 +834,7 @@ async fn interval_fires_repeatedly_and_skips_paused_windows() {
     // Due in the past so the first fire is immediate (catch-up path); every
     // later fire re-arms one interval out from its fire time.
     let txn = empty_txn();
-    let id = scheduler::insert(&pool, &db, "interval", 1, &txn, None, Some(EVERY_MS))
+    let id = scheduler::insert(&pool, &db, "interval", 1, &txn, None, Some(EVERY_MS), false)
         .await
         .unwrap();
 
@@ -896,4 +916,371 @@ async fn interval_fires_repeatedly_and_skips_paused_windows() {
     })
     .await;
     assert!(f2.is_some(), "interval job should fire again after resume");
+}
+
+// --- External job claims with fencing tokens (2026-09-09 spec) ------------
+//
+// External jobs (`external = true` on insert) are never executed by the
+// internal scheduler: `next_due`/`claim_due`/`reset_running` all exclude them,
+// and application workers claim them through `claim_external`, which assigns a
+// monotonic per-job `claim_generation` (fencing token) plus a lease deadline.
+// The complete/retry/fail transitions (`finalize_external`) reject anything
+// but the current generation — a stale token is a 409, never a silent no-op.
+
+/// Reads `(status, claim_generation, lease_deadline_ms)` straight off the row.
+/// `list` (the `ScheduleInfo` wire view) does not surface the fencing columns,
+/// so the lease-level assertions below go through the table directly.
+async fn fence_row(pool: &PgPool, db: &str, id: &str) -> (String, i64, Option<i64>) {
+    let schema = rtdb_server::ddl::pg_schema(db);
+    sqlx::query_as(&format!(
+        "SELECT status, claim_generation, lease_deadline_ms
+         FROM \"{schema}\".scheduled_txns WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("read scheduled_txns fence row")
+}
+
+#[tokio::test]
+async fn external_jobs_are_never_internally_claimed() {
+    let pool = test_pool().await;
+    let db = unique_db(&pool).await;
+    scheduler::ensure_table(&pool, &db).await.unwrap();
+    let txn = empty_txn();
+    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, true)
+        .await
+        .unwrap();
+
+    // The internal wake target ignores external rows entirely — an external
+    // job due in the past must not even register as "due".
+    assert_eq!(scheduler::next_due(&pool, &db).await.unwrap(), None);
+
+    // ...and the internal claim sweep must never pick one up, even at now =
+    // i64::MAX (every internal job would be due at that instant).
+    let claimed = scheduler::claim_due(&pool, &db, i64::MAX, scheduler::CLAIM_BATCH)
+        .await
+        .unwrap();
+    assert!(claimed.is_empty());
+
+    // The row itself is untouched: still pending and still listed, flagged
+    // external so only the worker claim surface can take it.
+    let listed = scheduler::list(&pool, &db).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].external);
+    assert_eq!(listed[0].status, ScheduleStatus::Pending);
+}
+
+#[tokio::test]
+async fn external_claim_assigns_monotonic_generation() {
+    let pool = test_pool().await;
+    let db = unique_db(&pool).await;
+    scheduler::ensure_table(&pool, &db).await.unwrap();
+    let txn = empty_txn();
+    let id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, true)
+        .await
+        .unwrap();
+
+    // First claim: exactly one job, generation 1, lease stamped now + leaseMs.
+    let now = rtdb_server::db::now_ms();
+    let claimed = scheduler::claim_external(&pool, &db, now, 8, 60_000)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].id, id);
+    assert_eq!(claimed[0].lease_generation, 1);
+    assert_eq!(claimed[0].lease_deadline_ms, now + 60_000);
+
+    // A live lease is not re-claimable.
+    let live = scheduler::claim_external(&pool, &db, now + 1000, 8, 60_000)
+        .await
+        .unwrap();
+    assert!(live.is_empty());
+
+    // Once the lease expires the job is re-claimable, and the claim bumps the
+    // generation — the fencing token only ever increases.
+    let deadline = claimed[0].lease_deadline_ms;
+    let reclaimed = scheduler::claim_external(&pool, &db, deadline + 1, 8, 60_000)
+        .await
+        .unwrap();
+    assert_eq!(reclaimed.len(), 1);
+    assert_eq!(reclaimed[0].lease_generation, 2);
+
+    // The former owner's generation-1 token is now stale: its finalize is a
+    // 409, not a silent no-op against the new holder's lease.
+    let err = scheduler::finalize_external(
+        &pool,
+        &db,
+        &id,
+        1,
+        scheduler::ExternalOutcome::Complete,
+        None,
+    )
+    .await
+    .expect_err("stale generation-1 token must be rejected");
+    assert_eq!(err.code, ErrorCode::Conflict);
+}
+
+#[tokio::test]
+async fn external_finalize_rejects_stale_and_unknown() {
+    let pool = test_pool().await;
+    let db = unique_db(&pool).await;
+    scheduler::ensure_table(&pool, &db).await.unwrap();
+    let txn = empty_txn();
+
+    // An unknown id is a 404, not a conflict — the fence never had a row to
+    // guard.
+    let err = scheduler::finalize_external(
+        &pool,
+        &db,
+        "no-such-job",
+        1,
+        scheduler::ExternalOutcome::Complete,
+        None,
+    )
+    .await
+    .expect_err("unknown id must be NotFound");
+    assert_eq!(err.code, ErrorCode::NotFound);
+
+    let id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, true)
+        .await
+        .unwrap();
+    let claimed = scheduler::claim_external(&pool, &db, rtdb_server::db::now_ms(), 8, 60_000)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    let lease = claimed[0].lease_generation;
+
+    // Completing with the CURRENT lease on a one-shot deletes the row — the
+    // same terminal as an internal one-shot's success.
+    scheduler::finalize_external(
+        &pool,
+        &db,
+        &id,
+        lease,
+        scheduler::ExternalOutcome::Complete,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(scheduler::list(&pool, &db).await.unwrap().is_empty());
+
+    // Finalizing again on the now-gone row is NotFound (not Conflict): the
+    // 404 disambiguation wins when the row no longer exists.
+    let err = scheduler::finalize_external(
+        &pool,
+        &db,
+        &id,
+        lease,
+        scheduler::ExternalOutcome::Complete,
+        None,
+    )
+    .await
+    .expect_err("finalizing a deleted row must be NotFound");
+    assert_eq!(err.code, ErrorCode::NotFound);
+}
+
+#[tokio::test]
+async fn external_finalize_complete_advance_retry_fail() {
+    let pool = test_pool().await;
+    let db = unique_db(&pool).await;
+    scheduler::ensure_table(&pool, &db).await.unwrap();
+    let txn = empty_txn();
+
+    // --- Complete on an external cron advances it to its next due instant.
+    let cron_id = scheduler::insert(&pool, &db, "cron", 1, &txn, Some("*/5 * * * *"), None, true)
+        .await
+        .unwrap();
+    let claimed = scheduler::claim_external(&pool, &db, rtdb_server::db::now_ms(), 8, 60_000)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].id, cron_id);
+
+    let before = rtdb_server::db::now_ms();
+    scheduler::finalize_external(
+        &pool,
+        &db,
+        &cron_id,
+        claimed[0].lease_generation,
+        scheduler::ExternalOutcome::Complete,
+        None,
+    )
+    .await
+    .unwrap();
+    let info = &scheduler::list(&pool, &db).await.unwrap()[0];
+    assert_eq!(info.status, ScheduleStatus::Pending);
+    assert_eq!(info.fired_count, 1);
+    assert!(
+        info.due_at > before,
+        "complete must advance a cron's due_at to its next fire"
+    );
+    // Finalize releases the lease: the deadline NULLs out and the generation
+    // is preserved (both invisible to `list`, hence the direct row read).
+    let (_, claim_gen, lease_deadline) = fence_row(&pool, &db, &cron_id).await;
+    assert_eq!(claim_gen, 1);
+    assert_eq!(lease_deadline, None);
+    // The advanced due lands within 5 minutes, so an immediate re-claim
+    // finds nothing due.
+    let claimed = scheduler::claim_external(&pool, &db, rtdb_server::db::now_ms(), 8, 60_000)
+        .await
+        .unwrap();
+    assert!(claimed.is_empty());
+
+    // Out of the way so the claim assertions below see only the retry job.
+    assert!(scheduler::cancel(&pool, &db, &cron_id).await.unwrap());
+
+    // --- Retry re-arms a one-shot at now + delayMs, keeping the generation.
+    let one_id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, true)
+        .await
+        .unwrap();
+    let claimed = scheduler::claim_external(&pool, &db, rtdb_server::db::now_ms(), 8, 60_000)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].id, one_id);
+
+    let t_before = rtdb_server::db::now_ms();
+    scheduler::finalize_external(
+        &pool,
+        &db,
+        &one_id,
+        claimed[0].lease_generation,
+        scheduler::ExternalOutcome::Retry { delay_ms: 1000 },
+        Some("boom"),
+    )
+    .await
+    .unwrap();
+    let t_after = rtdb_server::db::now_ms();
+    let info = scheduler::list(&pool, &db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == one_id)
+        .unwrap();
+    assert_eq!(info.status, ScheduleStatus::Pending);
+    assert!(
+        info.due_at >= t_before + 1000 && info.due_at <= t_after + 1000,
+        "retry must re-arm at now + delayMs, got {} vs [{}, {}]",
+        info.due_at,
+        t_before + 1000,
+        t_after + 1000
+    );
+    assert_eq!(info.last_error.as_deref(), Some("boom"));
+    // Retry preserves the generation history — no bump on a same-lease
+    // transition.
+    let (_, claim_gen, lease_deadline) = fence_row(&pool, &db, &one_id).await;
+    assert_eq!(claim_gen, 1);
+    assert_eq!(lease_deadline, None);
+
+    // Re-claiming after the retry delay bumps the token to 2.
+    let reclaimed = scheduler::claim_external(&pool, &db, t_after + 1100, 8, 60_000)
+        .await
+        .unwrap();
+    assert_eq!(reclaimed.len(), 1);
+    assert_eq!(reclaimed[0].lease_generation, 2);
+
+    // Fail with the current lease is terminal: error status + last_error.
+    scheduler::finalize_external(
+        &pool,
+        &db,
+        &one_id,
+        reclaimed[0].lease_generation,
+        scheduler::ExternalOutcome::Fail,
+        Some("boom"),
+    )
+    .await
+    .unwrap();
+    let info = scheduler::list(&pool, &db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == one_id)
+        .unwrap();
+    assert_eq!(info.status, ScheduleStatus::Error);
+    assert_eq!(info.last_error.as_deref(), Some("boom"));
+    // An errored row is terminal for the claim surface too — no one can
+    // re-claim it, at any time. (Far-future `now` minus the max lease so the
+    // claim's `now + lease_ms` stays in range.)
+    let claimed =
+        scheduler::claim_external(&pool, &db, i64::MAX - scheduler::LEASE_MAX_MS, 8, 60_000)
+            .await
+            .unwrap();
+    assert!(claimed.is_empty());
+}
+
+#[tokio::test]
+async fn reset_running_preserves_external_leases() {
+    let pool = test_pool().await;
+    let db = unique_db(&pool).await;
+    scheduler::ensure_table(&pool, &db).await.unwrap();
+    let txn = empty_txn();
+    let internal = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, false)
+        .await
+        .unwrap();
+    let external = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, true)
+        .await
+        .unwrap();
+
+    // Claim each through its own surface: the internal one via the scheduler's
+    // sweep, the external one via a worker claim with a 60s lease.
+    let now = rtdb_server::db::now_ms();
+    let claimed_internal = scheduler::claim_due(&pool, &db, now, scheduler::CLAIM_BATCH)
+        .await
+        .unwrap();
+    assert_eq!(claimed_internal.len(), 1);
+    let claimed_external = scheduler::claim_external(&pool, &db, now, 8, 60_000)
+        .await
+        .unwrap();
+    assert_eq!(claimed_external.len(), 1);
+    assert_eq!(claimed_external[0].id, external);
+    let deadline = claimed_external[0].lease_deadline_ms;
+
+    // Crash recovery resets only the internal orphan: the external lease is
+    // not recovery's to cancel — a live lease survives a restart.
+    let n = scheduler::reset_running(&pool, &db).await.unwrap();
+    assert_eq!(n, 1);
+
+    let listed = scheduler::list(&pool, &db).await.unwrap();
+    let internal_info = listed.iter().find(|s| s.id == internal).unwrap();
+    assert_eq!(internal_info.status, ScheduleStatus::Pending);
+    let external_info = listed.iter().find(|s| s.id == external).unwrap();
+    assert_eq!(external_info.status, ScheduleStatus::Running);
+
+    // (a) Direct row read: the external row kept its generation AND its lease
+    // deadline — reset_running left it byte-for-byte alone.
+    let (status, claim_gen, lease_deadline) = fence_row(&pool, &db, &external).await;
+    assert_eq!(status, "running");
+    assert_eq!(claim_gen, 1);
+    assert_eq!(lease_deadline, Some(deadline));
+
+    // And with the lease still live, a claim takes NOTHING — the row is
+    // untouched by recovery, so the worker's token is still current.
+    let live = scheduler::claim_external(&pool, &db, now + 1000, 8, 60_000)
+        .await
+        .unwrap();
+    assert!(live.is_empty());
+
+    // (b) After the lease expires, the job is re-claimable through the claim
+    // predicate alone (no recovery needed) and the token bumps to 2.
+    let reclaimed = scheduler::claim_external(&pool, &db, deadline + 1, 8, 60_000)
+        .await
+        .unwrap();
+    assert_eq!(reclaimed.len(), 1);
+    assert_eq!(reclaimed[0].id, external);
+    assert_eq!(reclaimed[0].lease_generation, 2);
+
+    // The former owner's generation-1 token stays stale after the re-claim:
+    // its Complete is a 409, not a silent success against the new holder.
+    let err = scheduler::finalize_external(
+        &pool,
+        &db,
+        &external,
+        1,
+        scheduler::ExternalOutcome::Complete,
+        None,
+    )
+    .await
+    .expect_err("generation-1 token must be stale after the re-claim");
+    assert_eq!(err.code, ErrorCode::Conflict);
 }

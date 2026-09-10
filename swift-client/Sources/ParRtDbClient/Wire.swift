@@ -166,8 +166,10 @@ public enum ClientMessage: Equatable, Codable, Sendable {
     case unsubscribe(queryId: String)
     /// Run a transaction; `idempotencyKey` replays a cached result when set.
     case mutate(mutId: String, idempotencyKey: String?, txn: Transaction)
-    /// Schedule a transaction for later.
-    case schedule(scheduleId: String, when: ScheduleWhen, txn: Transaction)
+    /// Schedule a transaction for later. `external` marks an external-claim
+    /// job: never executed by the server's internal scheduler, served to
+    /// application workers via `POST /api/schedule/claim` instead.
+    case schedule(scheduleId: String, when: ScheduleWhen, txn: Transaction, external: Bool?)
     /// Cancel a scheduled job.
     case cancelSchedule(scheduleId: String, id: String)
     /// Pause a cron job.
@@ -197,6 +199,7 @@ public enum ClientMessage: Equatable, Codable, Sendable {
     enum CodingKeys: String, CodingKey, CaseIterable {
         case type, token, db, protocolVersion, queryId, query, mutId, idempotencyKey, txn
         case scheduleId, when, id, workflowId, spec, status, name, payload
+        case external
         case room, state, ttlMs
     }
 
@@ -243,12 +246,13 @@ public enum ClientMessage: Equatable, Codable, Sendable {
         case "schedule":
             try rejectUnknownVariantFields(
                 "ClientMessage", variant: payload.tag, keys: payload.keys,
-                allowed: ["type", "scheduleId", "when", "txn"]
+                allowed: ["type", "scheduleId", "when", "txn", "external"]
             )
             self = try .schedule(
                 scheduleId: container.decode(String.self, forKey: .scheduleId),
                 when: container.decode(ScheduleWhen.self, forKey: .when),
-                txn: container.decode(Transaction.self, forKey: .txn)
+                txn: container.decode(Transaction.self, forKey: .txn),
+                external: container.decodeIfPresent(Bool.self, forKey: .external)
             )
         case "cancelSchedule":
             try rejectUnknownVariantFields(
@@ -383,11 +387,12 @@ public enum ClientMessage: Equatable, Codable, Sendable {
             try container.encode(mutId, forKey: .mutId)
             try container.encodeIfPresent(idempotencyKey, forKey: .idempotencyKey)
             try container.encode(txn, forKey: .txn)
-        case let .schedule(scheduleId, when, txn):
+        case let .schedule(scheduleId, when, txn, external):
             try container.encode("schedule", forKey: .type)
             try container.encode(scheduleId, forKey: .scheduleId)
             try container.encode(when, forKey: .when)
             try container.encode(txn, forKey: .txn)
+            try container.encodeIfPresent(external, forKey: .external)
         case let .cancelSchedule(scheduleId, id):
             try container.encode("cancelSchedule", forKey: .type)
             try container.encode(scheduleId, forKey: .scheduleId)
@@ -778,10 +783,16 @@ public struct ScheduleInfo: Equatable, Codable, Sendable {
     public var createdAt: Int64
     /// Total number of times this schedule has fired.
     public var firedCount: Int64
+    /// True when the job is never executed by the internal scheduler and is
+    /// served to application workers via the external claim surface instead.
+    /// Decodes tolerantly (absent → false, the server's `#[serde(default)]`);
+    /// omitted on encode when false so pre-flag payloads round-trip.
+    public var external: Bool
 
     public init(
         id: String, kind: ScheduleKind, dueAt: Int64, cron: String? = nil, everyMs: Int64? = nil,
-        status: ScheduleStatus, lastError: String? = nil, createdAt: Int64, firedCount: Int64
+        status: ScheduleStatus, lastError: String? = nil, createdAt: Int64, firedCount: Int64,
+        external: Bool = false
     ) {
         self.id = id
         self.kind = kind
@@ -792,10 +803,11 @@ public struct ScheduleInfo: Equatable, Codable, Sendable {
         self.lastError = lastError
         self.createdAt = createdAt
         self.firedCount = firedCount
+        self.external = external
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
-        case id, kind, dueAt, cron, everyMs, status, lastError, createdAt, firedCount
+        case id, kind, dueAt, cron, everyMs, status, lastError, createdAt, firedCount, external
     }
 
     public init(from decoder: Decoder) throws {
@@ -809,6 +821,7 @@ public struct ScheduleInfo: Equatable, Codable, Sendable {
         lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
         createdAt = try container.decode(Int64.self, forKey: .createdAt)
         firedCount = try container.decode(Int64.self, forKey: .firedCount)
+        external = try container.decodeIfPresent(Bool.self, forKey: .external) ?? false
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -822,6 +835,76 @@ public struct ScheduleInfo: Equatable, Codable, Sendable {
         try container.encodeIfPresent(lastError, forKey: .lastError)
         try container.encode(createdAt, forKey: .createdAt)
         try container.encode(firedCount, forKey: .firedCount)
+        if external {
+            try container.encode(external, forKey: .external)
+        }
+    }
+}
+
+/// Mirrors server/src/protocol.rs::ClaimedSchedule — one job returned by
+/// `POST /api/schedule/claim`, camelCase; `cron`/`everyMs` are omitted when
+/// absent. The `leaseGeneration` is the per-job monotonic fencing token: it
+/// increments on every claim, and the worker's complete/retry/fail calls are
+/// rejected CONFLICT once a newer generation exists.
+public struct ClaimedSchedule: Equatable, Codable, Sendable {
+    /// The claimed job's id.
+    public var id: String
+    /// One-shot, cron, or interval.
+    public var kind: ScheduleKind
+    /// When the job came due, epoch ms.
+    public var dueAt: Int64
+    /// The declarative transaction the worker executes externally.
+    public var txn: Transaction
+    /// The cron expression, for cron jobs.
+    public var cron: String?
+    /// The fixed recurrence in ms, for interval jobs.
+    public var everyMs: Int64?
+    /// Per-job monotonic fencing token assigned atomically by the claim.
+    public var leaseGeneration: Int64
+    /// Lease expiry instant, epoch ms — past this the job is re-claimable by
+    /// another worker (or another claim by the same worker).
+    public var leaseDeadlineMs: Int64
+
+    public init(
+        id: String, kind: ScheduleKind, dueAt: Int64, txn: Transaction, cron: String? = nil,
+        everyMs: Int64? = nil, leaseGeneration: Int64, leaseDeadlineMs: Int64
+    ) {
+        self.id = id
+        self.kind = kind
+        self.dueAt = dueAt
+        self.txn = txn
+        self.cron = cron
+        self.everyMs = everyMs
+        self.leaseGeneration = leaseGeneration
+        self.leaseDeadlineMs = leaseDeadlineMs
+    }
+
+    enum CodingKeys: String, CodingKey, CaseIterable {
+        case id, kind, dueAt, txn, cron, everyMs, leaseGeneration, leaseDeadlineMs
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        kind = try container.decode(ScheduleKind.self, forKey: .kind)
+        dueAt = try container.decode(Int64.self, forKey: .dueAt)
+        txn = try container.decode(Transaction.self, forKey: .txn)
+        cron = try container.decodeIfPresent(String.self, forKey: .cron)
+        everyMs = try container.decodeIfPresent(Int64.self, forKey: .everyMs)
+        leaseGeneration = try container.decode(Int64.self, forKey: .leaseGeneration)
+        leaseDeadlineMs = try container.decode(Int64.self, forKey: .leaseDeadlineMs)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(dueAt, forKey: .dueAt)
+        try container.encode(txn, forKey: .txn)
+        try container.encodeIfPresent(cron, forKey: .cron)
+        try container.encodeIfPresent(everyMs, forKey: .everyMs)
+        try container.encode(leaseGeneration, forKey: .leaseGeneration)
+        try container.encode(leaseDeadlineMs, forKey: .leaseDeadlineMs)
     }
 }
 

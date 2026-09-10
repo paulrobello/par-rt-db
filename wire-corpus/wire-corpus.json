@@ -23,6 +23,7 @@
     { "type": "schedule", "scheduleId": "s1", "when": { "type": "runAt", "ms": 1700000000000 }, "txn": { "steps": [] } },
     { "type": "schedule", "scheduleId": "s1", "when": { "type": "cron", "expr": "*/5 * * * *" }, "txn": { "steps": [] } },
     { "type": "schedule", "scheduleId": "s1", "when": { "type": "interval", "everyMs": 300000 }, "txn": { "steps": [] } },
+    { "type": "schedule", "scheduleId": "s9", "when": { "type": "afterMs", "ms": 100 }, "txn": { "steps": [] }, "external": true },
     { "type": "cancelSchedule", "scheduleId": "s1", "id": "job-9" },
     { "type": "pauseSchedule", "scheduleId": "s1", "id": "job-9" },
     { "type": "resumeSchedule", "scheduleId": "s1", "id": "job-9" },
@@ -96,7 +97,8 @@
     { "id": "j7", "kind": "cron", "dueAt": 2200, "cron": "0 * * * *", "status": "paused", "createdAt": 500, "firedCount": 4 },
     { "id": "j8", "kind": "cron", "dueAt": 2300, "cron": "0 * * * *", "status": "error", "lastError": "kaboom", "createdAt": 500, "firedCount": 7 },
     { "id": "j9", "kind": "interval", "dueAt": 2400, "everyMs": 300000, "status": "pending", "createdAt": 500, "firedCount": 0 },
-    { "id": "j10", "kind": "interval", "dueAt": 2500, "everyMs": 60000, "status": "error", "lastError": "boom", "createdAt": 500, "firedCount": 2 }
+    { "id": "j10", "kind": "interval", "dueAt": 2500, "everyMs": 60000, "status": "error", "lastError": "boom", "createdAt": 500, "firedCount": 2 },
+    { "id": "jx", "kind": "oneshot", "dueAt": 3000, "status": "running", "createdAt": 500, "firedCount": 0, "external": true }
   ],
   "query_results": [
     null,

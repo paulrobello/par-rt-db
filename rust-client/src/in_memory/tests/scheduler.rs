@@ -35,7 +35,7 @@ async fn schedule_and_tick_fires_a_due_oneshot_and_write_is_visible() {
     // visible via query".
     let (mut c, clock) = new_clock_client();
     let id = c
-        .schedule(insert_todo_txn(), ScheduleWhen::AfterMs { ms: 1000 })
+        .schedule(insert_todo_txn(), ScheduleWhen::AfterMs { ms: 1000 }, false)
         .expect("schedule ok");
     assert!(is_hex_id(&json!(id)), "id is 32 hex chars: {id}");
 
@@ -58,7 +58,7 @@ async fn schedule_and_tick_fires_a_due_oneshot_and_write_is_visible() {
 #[tokio::test]
 async fn tick_does_not_fire_a_not_yet_due_oneshot() {
     let (mut c, clock) = new_clock_client();
-    c.schedule(insert_todo_txn(), ScheduleWhen::AfterMs { ms: 5000 })
+    c.schedule(insert_todo_txn(), ScheduleWhen::AfterMs { ms: 5000 }, false)
         .expect("schedule ok");
 
     *clock.lock().expect("not poisoned") += 1000; // before the due time
@@ -75,7 +75,7 @@ async fn tick_does_not_fire_a_paused_job() {
     // Ports TS "a paused scheduled job does not fire on tick".
     let (mut c, clock) = new_clock_client();
     let id = c
-        .schedule(insert_todo_txn(), ScheduleWhen::AfterMs { ms: 1000 })
+        .schedule(insert_todo_txn(), ScheduleWhen::AfterMs { ms: 1000 }, false)
         .expect("schedule ok");
     c.pause_schedule(&id).expect("pause ok");
 
@@ -99,7 +99,7 @@ async fn cancel_schedule_removes_the_job() {
     // Ports TS "cancelSchedule removes the job so it does not fire on tick".
     let (mut c, clock) = new_clock_client();
     let id = c
-        .schedule(insert_todo_txn(), ScheduleWhen::AfterMs { ms: 1000 })
+        .schedule(insert_todo_txn(), ScheduleWhen::AfterMs { ms: 1000 }, false)
         .expect("schedule ok");
     c.cancel_schedule(&id).expect("cancel ok");
     assert!(
@@ -121,7 +121,7 @@ async fn pause_then_resume_lets_the_job_fire_on_a_later_tick() {
     // Ports TS "pause then resume lets the job fire on a later tick".
     let (mut c, clock) = new_clock_client();
     let id = c
-        .schedule(insert_todo_txn(), ScheduleWhen::AfterMs { ms: 1000 })
+        .schedule(insert_todo_txn(), ScheduleWhen::AfterMs { ms: 1000 }, false)
         .expect("schedule ok");
     c.pause_schedule(&id).expect("pause ok");
     *clock.lock().expect("not poisoned") += 2000;
@@ -160,6 +160,7 @@ async fn list_schedules_returns_server_aligned_info() {
             ScheduleWhen::Cron {
                 expr: "* * * * *".to_string(),
             },
+            false,
         )
         .expect("schedule ok");
 
@@ -203,6 +204,7 @@ async fn tick_cron_re_arms_and_fires_again_on_a_later_tick() {
         ScheduleWhen::Cron {
             expr: "* * * * *".to_string(),
         },
+        false,
     )
     .expect("schedule ok");
 
@@ -252,6 +254,7 @@ async fn tick_cron_skips_missed_windows_does_not_backfill() {
         ScheduleWhen::Cron {
             expr: "* * * * *".to_string(),
         },
+        false,
     )
     .expect("schedule ok");
 
@@ -283,6 +286,7 @@ async fn interval_schedule_initial_due_is_one_interval_out() {
     c.schedule(
         insert_todo_txn(),
         ScheduleWhen::Interval { every_ms: EVERY_MS },
+        false,
     )
     .expect("schedule ok");
 
@@ -301,6 +305,7 @@ async fn tick_interval_re_arms_and_fires_again_on_a_later_tick() {
     c.schedule(
         insert_todo_txn(),
         ScheduleWhen::Interval { every_ms: EVERY_MS },
+        false,
     )
     .expect("schedule ok");
 
@@ -342,6 +347,7 @@ async fn tick_interval_skips_missed_windows_does_not_backfill() {
     c.schedule(
         insert_todo_txn(),
         ScheduleWhen::Interval { every_ms: EVERY_MS },
+        false,
     )
     .expect("schedule ok");
 
@@ -368,6 +374,7 @@ async fn pause_halts_interval_and_resume_shifts_one_full_interval() {
         .schedule(
             insert_todo_txn(),
             ScheduleWhen::Interval { every_ms: EVERY_MS },
+            false,
         )
         .expect("schedule ok");
     c.pause_schedule(&id).expect("pause ok");
@@ -426,6 +433,7 @@ async fn schedule_interval_rejects_invalid_everyms() {
                 ScheduleWhen::Interval {
                     every_ms: bad_every_ms,
                 },
+                false,
             )
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::BadRequest, "everyMs={bad_every_ms}");
@@ -439,6 +447,7 @@ async fn schedule_interval_rejects_invalid_everyms() {
         ScheduleWhen::Interval {
             every_ms: MAX_EVERY_MS,
         },
+        false,
     )
     .expect("the cap itself is accepted");
     assert_eq!(c.list_schedules()[0].every_ms, Some(MAX_EVERY_MS));
@@ -455,6 +464,7 @@ async fn tick_interval_with_failing_txn_re_arms_and_retries_next_interval() {
             // Reference an unknown table to force a NOT_FOUND.
             Mutation::new().insert("missing", json!({"x": 1})).build(),
             ScheduleWhen::Interval { every_ms: EVERY_MS },
+            false,
         )
         .expect("schedule ok");
 
@@ -501,6 +511,7 @@ async fn tick_oneshot_in_the_past_fires_immediately_catch_up() {
         ScheduleWhen::RunAt {
             ms: 1_600_000_000_000, // 100B ms before the clock's starting value
         },
+        false,
     )
     .expect("schedule ok");
     c.tick(None);
@@ -521,6 +532,7 @@ async fn tick_oneshot_with_failing_txn_marks_error_and_keeps_it() {
             // Reference an unknown table to force a NOT_FOUND.
             Mutation::new().insert("missing", json!({"x": 1})).build(),
             ScheduleWhen::AfterMs { ms: 0 },
+            false,
         )
         .expect("schedule ok");
     c.tick(None);
@@ -566,7 +578,7 @@ async fn failed_txn_rolls_back_cancel_schedule_step() {
     // survives a txn that cancelled it and then failed.
     let (mut c, clock) = new_clock_client();
     let id = c
-        .schedule(insert_todo_txn(), ScheduleWhen::AfterMs { ms: 1000 })
+        .schedule(insert_todo_txn(), ScheduleWhen::AfterMs { ms: 1000 }, false)
         .expect("schedule ok");
     let txn = Mutation::new()
         .cancel_schedule(id.clone())

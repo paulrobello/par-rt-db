@@ -15,6 +15,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from par_rt_db.wire import (
     AuthedUser,
+    ClaimedSchedule,
     ClientMessage,
     FilterExpr,
     HybridSearchQuery,
@@ -110,6 +111,37 @@ def test_schedule_info_omits_optional_when_absent() -> None:
     di = interval.model_dump(by_alias=True, mode="json")
     assert di["kind"] == "interval" and di["everyMs"] == 300000
     assert "cron" not in di and "lastError" not in di
+
+
+def test_schedule_info_external_default_false_and_true_encodes() -> None:
+    # 2026-09-09 external-claim feature: `external` decodes tolerantly
+    # (absent key -> False; old server payloads keep parsing) and an ordinary
+    # job's wire shape is unchanged (omitted when False).
+    absent = ScheduleInfo.model_validate(
+        {
+            "id": "j1",
+            "kind": "oneshot",
+            "dueAt": 100,
+            "status": "pending",
+            "createdAt": 1,
+            "firedCount": 0,
+        }
+    )
+    assert absent.external is False
+    assert "external" not in absent.model_dump(by_alias=True, mode="json")
+    external = ScheduleInfo.model_validate(
+        {
+            "id": "jx",
+            "kind": "oneshot",
+            "dueAt": 3000,
+            "status": "running",
+            "createdAt": 500,
+            "firedCount": 0,
+            "external": True,
+        }
+    )
+    assert external.external is True
+    assert external.model_dump(by_alias=True, mode="json")["external"] is True
 
 
 def test_filter_expr_leaves_and_combinators() -> None:
@@ -378,6 +410,84 @@ def test_client_schedule():
         "when": {"type": "afterMs", "ms": 100},
         "txn": {"steps": []},
     }
+
+
+def test_client_schedule_external_true_round_trips_false_omitted() -> None:
+    # 2026-09-09 external-claim feature: `external` rides only on external jobs
+    # (server: Option<bool> + skip_serializing_if Option::is_none) — an
+    # ordinary schedule frame's wire shape is unchanged.
+    d = {
+        "type": "schedule",
+        "scheduleId": "s9",
+        "when": {"type": "afterMs", "ms": 100},
+        "txn": {"steps": []},
+        "external": True,
+    }
+    assert _client_adapter.validate_python(d).model_dump(by_alias=True, mode="json") == d
+    plain = _client_adapter.validate_python(
+        {
+            "type": "schedule",
+            "scheduleId": "s1",
+            "when": {"type": "afterMs", "ms": 100},
+            "txn": {"steps": []},
+        }
+    )
+    assert plain.external is None
+    assert "external" not in plain.model_dump(by_alias=True, mode="json")
+
+
+def test_claimed_schedule_decode() -> None:
+    # Mirrors the server's ClaimedSchedule (POST /api/schedule/claim response
+    # rows): camelCase aliases, cron/everyMs omitted when None.
+    full = ClaimedSchedule.model_validate(
+        {
+            "id": "job-1",
+            "kind": "cron",
+            "dueAt": 1000,
+            "txn": {"steps": []},
+            "cron": "*/5 * * * *",
+            "leaseGeneration": 3,
+            "leaseDeadlineMs": 86_000,
+        }
+    )
+    assert full.due_at == 1000
+    assert full.lease_generation == 3
+    assert full.lease_deadline_ms == 86_000
+    assert full.model_dump(by_alias=True, mode="json") == {
+        "id": "job-1",
+        "kind": "cron",
+        "dueAt": 1000,
+        "txn": {"steps": []},
+        "cron": "*/5 * * * *",
+        "leaseGeneration": 3,
+        "leaseDeadlineMs": 86_000,
+    }
+    interval = ClaimedSchedule.model_validate(
+        {
+            "id": "job-2",
+            "kind": "interval",
+            "dueAt": 2000,
+            "txn": {"steps": []},
+            "everyMs": 60_000,
+            "leaseGeneration": 1,
+            "leaseDeadlineMs": 87_000,
+        }
+    )
+    assert interval.every_ms == 60_000 and interval.cron is None
+    dumped = interval.model_dump(by_alias=True, mode="json")
+    assert "cron" not in dumped  # omitted when None
+    oneshot = ClaimedSchedule.model_validate(
+        {
+            "id": "job-3",
+            "kind": "oneshot",
+            "dueAt": 3000,
+            "txn": {"steps": [{"op": "insert", "table": "t", "doc": {"a": 1}}]},
+            "leaseGeneration": 1,
+            "leaseDeadlineMs": 88_000,
+        }
+    )
+    dumped = oneshot.model_dump(by_alias=True, mode="json")
+    assert "cron" not in dumped and "everyMs" not in dumped
 
 
 def test_client_cancel_pause_resume_carry_id():

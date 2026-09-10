@@ -211,6 +211,21 @@ principal like scheduled jobs — records the step outcome, and applies
 per step; a crash mid-advance leaves the row `running`, and scheduler startup
 `reset_running` re-arms it.
 
+**External job claims (fencing tokens, 2026-09-09)**: `external` rows on the
+same `scheduled_txns` side table are the app-worker boundary — the internal
+scheduler never touches them (`claim_due`/`next_due` exclude `external`, and
+`reset_running` resets internal rows only, so a live external lease survives a
+restart). Workers claim over HTTP (`claim_external` — the claim UPDATE bumps
+the per-job monotonic `claim_generation` fencing token under the same
+`FOR UPDATE SKIP LOCKED` row lock) and finalize with `complete`/`retry`/`fail`
+(`finalize_external` — every transition is a conditional UPDATE on
+`external AND status='running' AND claim_generation = $lease`; stale → `409
+CONFLICT`, 404/409 disambiguated after the guard returns zero rows). HTTP-only
+by design: no committer arm changes, no tap-site change (external jobs never
+execute document writes server-side), and the single-writer invariant is
+untouched — the claim/finalize writes are ordinary direct side-table writes
+like `cancel`/`set_paused`.
+
 A step is either a txn or an `awaitSignal {name, timeoutMs?}` wait (exactly
 one per step). An `awaitSignal` step parks the run in a non-terminal
 `waiting` state; inside the same advance arm, `waited_since` is the

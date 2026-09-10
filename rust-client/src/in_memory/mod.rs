@@ -169,6 +169,10 @@ pub struct ScheduledJob {
     pub fired_count: i64,
     /// The last firing error, if any.
     pub last_error: Option<String>,
+    /// Never internally executed; claimed by application workers via the
+    /// external claim surface with a fencing token. Mirrors the server's
+    /// `scheduled_txns.external` column.
+    pub external: bool,
 }
 
 /// A stored file blob with its server-side metadata. Mirrors the TS
@@ -785,8 +789,13 @@ impl InMemoryRtDbClient {
                     self.delete_by_query(table, filter, *limit)?;
                 Ok((StepResult::DeleteByQuery { deleted, truncated }, touched))
             }
-            Step::Schedule { when, txn } => {
-                let schedule_id = self.schedule((**txn).clone(), when.clone())?;
+            Step::Schedule {
+                when,
+                txn,
+                external,
+            } => {
+                let schedule_id =
+                    self.schedule((**txn).clone(), when.clone(), external.is_some_and(|e| e))?;
                 Ok((StepResult::Schedule { schedule_id }, Vec::new()))
             }
             Step::CancelSchedule { id } => {
@@ -1753,7 +1762,12 @@ impl InMemoryRtDbClient {
     /// but an interval `everyMs` is validated here (positive and at most
     /// [`MAX_EVERY_MS`], mirroring the server's `resolve_when`). Ports
     /// `schedule` (`ts-client/src/in_memory.ts:600-617`).
-    pub fn schedule(&mut self, txn: Transaction, when: ScheduleWhen) -> Result<String, RtDbError> {
+    pub fn schedule(
+        &mut self,
+        txn: Transaction,
+        when: ScheduleWhen,
+        external: bool,
+    ) -> Result<String, RtDbError> {
         let every_ms = match &when {
             ScheduleWhen::Interval { every_ms } => {
                 if *every_ms <= 0 {
@@ -1794,6 +1808,7 @@ impl InMemoryRtDbClient {
             created_at: now,
             fired_count: 0,
             last_error: None,
+            external,
         };
         self.schedules.push(job);
         Ok(id)
@@ -1879,7 +1894,10 @@ impl InMemoryRtDbClient {
         let mut i = 0;
         while i < self.schedules.len() {
             let job = &mut self.schedules[i];
-            if job.status == ScheduleStatus::Paused || job.due_at > now {
+            // External jobs are never internally executed — they are claimed
+            // by application workers over the claim surface (mirrors the
+            // server's claim_due / next_due external exclusion).
+            if job.external || job.status == ScheduleStatus::Paused || job.due_at > now {
                 i += 1;
                 continue;
             }
@@ -2148,6 +2166,7 @@ fn schedule_info(job: &ScheduledJob) -> ScheduleInfo {
         last_error: job.last_error.clone(),
         created_at: job.created_at,
         fired_count: job.fired_count,
+        external: job.external,
     }
 }
 

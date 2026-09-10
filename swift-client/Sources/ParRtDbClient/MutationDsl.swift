@@ -109,7 +109,15 @@ public struct MutationBuilder: Sendable {
 
     /// Queue `txn` to run later.
     public func schedule(_ when: ScheduleWhen, _ txn: Transaction) -> MutationBuilder {
-        adding(.schedule(when: when, txn: txn))
+        adding(.schedule(when: when, txn: txn, external: nil))
+    }
+
+    /// Queue `txn` to run later as an external-claim job: the internal
+    /// scheduler never executes it; an application worker claims it over HTTP
+    /// (`claimSchedules`) and finalizes it with the returned `leaseGeneration`
+    /// fencing token.
+    public func scheduleExternal(_ when: ScheduleWhen, _ txn: Transaction) -> MutationBuilder {
+        adding(.schedule(when: when, txn: txn, external: true))
     }
 
     /// Cancel a previously scheduled job.
@@ -177,8 +185,8 @@ public struct MutationBuilder: Sendable {
                 filter: filter,
                 limit: limit.map { try uint32($0, "deleteByQuery limit") }
             )
-        case let .schedule(when, txn):
-            .schedule(when: when, txn: txn)
+        case let .schedule(when, txn, external):
+            .schedule(when: when, txn: txn, external: external)
         case let .cancelSchedule(id):
             .cancelSchedule(id: id)
         case let .startWorkflow(spec):
@@ -209,7 +217,7 @@ private enum PendingStep: Sendable {
     )
     case patchByQuery(table: String, filter: FilterExpr, patch: [String: JSONValue], limit: Int?)
     case deleteByQuery(table: String, filter: FilterExpr, limit: Int?)
-    case schedule(when: ScheduleWhen, txn: Transaction)
+    case schedule(when: ScheduleWhen, txn: Transaction, external: Bool?)
     case cancelSchedule(id: String)
     case startWorkflow(spec: WorkflowSpec)
     case cancelWorkflow(id: String)
@@ -223,7 +231,7 @@ private enum PendingStep: Sendable {
 func countSteps(_ txn: Transaction) -> Int {
     txn.steps.reduce(0) { total, step in
         switch step {
-        case let .schedule(_, nested):
+        case let .schedule(_, nested, _):
             total + 1 + countSteps(nested)
         case let .startWorkflow(spec):
             total + 1 + spec.steps.reduce(0) { $0 + ($1.txn.map(countSteps) ?? 0) }

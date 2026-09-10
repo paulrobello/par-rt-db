@@ -61,6 +61,12 @@ pub enum ClientMessage {
         schedule_id: String,
         when: ScheduleWhen,
         txn: Transaction,
+        /// External-claim job mode (2026-09-09): when set, the job is never
+        /// executed by the internal scheduler — an application worker claims
+        /// it via `POST /api/schedule/claim` and finalizes with the returned
+        /// `leaseGeneration` fencing token. Omitted = ordinary internal job.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external: Option<bool>,
     },
     CancelSchedule {
         schedule_id: String,
@@ -284,6 +290,37 @@ pub use par_rt_db_core::mutation::{ScheduleKind, ScheduleWhen};
 /// keeps resolving. `scheduler` re-exports `ScheduleInfo` for its `list`
 /// return type. Mirrored byte-for-byte in `ts-client/src/protocol.ts`.
 pub use par_rt_db_core::mutation::{ScheduleInfo, ScheduleStatus};
+
+/// One externally-claimed job returned by `POST /api/schedule/claim`. The
+/// `lease_generation` is the per-job monotonic fencing token: it increments on
+/// every claim (including re-claims after lease expiry), and the worker's
+/// complete/retry/fail calls are rejected `CONFLICT` once a newer generation
+/// exists. `txn` is the full declarative transaction the worker executes
+/// externally; `cron`/`everyMs` ride along for recurring jobs so a `complete`
+/// can advance the job to its next due instant.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimedSchedule {
+    /// The claimed job's id.
+    pub id: String,
+    /// One-shot, cron, or interval.
+    pub kind: ScheduleKind,
+    /// When the job came due, epoch ms.
+    pub due_at: i64,
+    /// The declarative transaction to execute externally.
+    pub txn: Transaction,
+    /// The cron expression, for cron jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    /// The fixed recurrence in ms, for interval jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub every_ms: Option<i64>,
+    /// Per-job monotonic fencing token assigned atomically by the claim.
+    pub lease_generation: i64,
+    /// Lease expiry instant, epoch ms — past this the job is re-claimable by
+    /// another worker (or another claim by the same worker).
+    pub lease_deadline_ms: i64,
+}
 
 /// `StepRetry`/`AwaitSignalSpec`/`WorkflowStepSpec`/`WorkflowSpec`/
 /// `WorkflowStatus` are now `par_rt_db_core::mutation` types (ARC-004
@@ -581,6 +618,7 @@ mod tests {
             schedule_id: "s1".to_string(),
             when: ScheduleWhen::AfterMs { ms: 100 },
             txn: sample_txn(),
+            external: None,
         })
         .unwrap();
         assert_eq!(s["type"], serde_json::json!("schedule"));

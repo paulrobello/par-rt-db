@@ -242,7 +242,9 @@ since browsers cannot set headers on a WS handshake.
 | `POST /api/query` | Bearer token | One-shot query against a database; see [Query shape](#query-shape). |
 | `POST /api/query-batch` | Bearer token | Fans out N queries in one round trip (per-query error isolation); each slot returns `{ok, result}` or `{ok:false, error}`. |
 | `POST /api/mutate` | Bearer token | One-shot transaction (`insert`/`patch`/`replace`/`delete`/`undelete`/`expectVersion`/`expectAbsent`/`upsert` + `patchByQuery`/`deleteByQuery` + `schedule`/`cancelSchedule` + `startWorkflow`/`cancelWorkflow` steps). |
-| `POST /api/schedule` | Bearer token | Schedules a transaction: `afterMs`/`runAt` one-shot, `cron` (5-field, UTC, min-first), or `interval` (fixed `everyMs`); returns `{id}`. |
+| `POST /api/schedule` | Bearer token | Schedules a transaction: `afterMs`/`runAt` one-shot, `cron` (5-field, UTC, min-first), or `interval` (fixed `everyMs`); returns `{id}`. Pass `"external": true` to create an external-claim job (never internally executed; claimed by an app worker via `/api/schedule/claim` with a fencing token). |
+| `POST /api/schedule/claim` | Bearer token | Atomically claims up to `limit` due external jobs (`leaseMs` lease each), returning `ClaimedSchedule[]` with per-job monotonic `leaseGeneration` fencing tokens. |
+| `POST /api/schedule/{id}/{complete,retry,fail}` | Bearer token | Worker-owned finalize transitions for a claimed external job, each guarded by the claim's `lease` token — a stale token (job re-claimed after lease expiry) is `409 CONFLICT`. `complete` deletes a one-shot or advances a recurring job to its next due instant; `retry` re-arms at `now + delayMs` (default 60s) recording `error`; `fail` (requires `error`) parks the job in a terminal `error` state. |
 | `POST /api/schedule/{id}/{cancel,pause,resume}` | Bearer token | Cancels, pauses, or resumes a scheduled job. |
 | `POST /api/schedules` | Bearer token | Lists scheduled jobs for a database (`ScheduleInfo[]`). |
 | `POST /api/workflows` | Bearer token | Starts a durable workflow run from a `WorkflowSpec` (FM-29); returns `{id}`. See [Durable workflows](#durable-workflows). |
@@ -813,6 +815,47 @@ due; a cron or interval job **skips** missed windows with no backfill (each fire
 re-arms from its actual fire time, and `resume` shifts the next fire one full
 interval/expression step from the resume). Each job's lifecycle is
 managed with `cancel` / `pause` / `resume` and listed via `listSchedules`.
+
+#### External jobs (app-worker claims with fencing tokens)
+
+Pass `"external": true` on any schedule create (HTTP, WS, or the `schedule`
+txn step) to create a job the server **never executes itself**. An application
+worker claims due external jobs over HTTP and executes them externally — the
+pattern for actions the server cannot run (third-party HTTP calls, native
+push, anything imperative):
+
+```bash
+# Create an external job.
+curl -s -X POST http://localhost:8300/api/schedule \
+  -H "Authorization: Bearer <machine-token>" -H "Content-Type: application/json" \
+  -d '{"db": "myapp", "external": true,
+       "when": {"type": "afterMs", "ms": 0},
+       "txn": {"steps": [{"op": "patch", "table": "orders", "id": "o1",
+                          "doc": {"status": "notify-customer"}}]}}'
+
+# A worker claims due jobs (limit/leaseMs optional; lease 1s–24h, default 5min).
+curl -s -X POST http://localhost:8300/api/schedule/claim \
+  -H "Authorization: Bearer <machine-token>" -H "Content-Type: application/json" \
+  -d '{"db": "myapp", "limit": 8, "leaseMs": 300000}'
+# {"jobs":[{"id":"<id>","kind":"oneshot","dueAt":...,"txn":{...},
+#           "leaseGeneration":1,"leaseDeadlineMs":...}]}
+
+# Finalize with the claim's fencing token (stale token → 409 CONFLICT).
+curl -s -X POST http://localhost:8300/api/schedule/<id>/complete \
+  -H "Authorization: Bearer <machine-token>" -H "Content-Type: application/json" \
+  -d '{"db": "myapp", "lease": 1}'
+```
+
+The claim atomically assigns the per-job monotonic `leaseGeneration` (starts at
+1, +1 per claim) and stamps `leaseDeadlineMs`; the job is re-claimable only
+once the lease expires. Every finalize transition
+(`complete`/`retry`/`fail`) is rejected `409 CONFLICT` once a newer generation
+exists, so a worker that stalls past its lease cannot finalize over its
+replacement — and a restart's recovery (`reset_running`) never resets external
+rows or generations, so a live lease survives a server restart while the
+former owner's token stays stale after any re-claim. Recurring external jobs
+advance to their next due instant on `complete`; `fail` is terminal (revive via
+`cancel` + re-create; `resume` only lifts `paused`).
 
 ### HTTP example: schedule a one-shot, then list
 

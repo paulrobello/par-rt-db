@@ -3,6 +3,7 @@ import { parseStepResults, type StepResult } from "./mutation.js";
 import type {
   AuthedUser,
   BatchQueryOutcomeJson,
+  ClaimedSchedule,
   QueryJson,
   ScheduleInfo,
   ScheduleWhen,
@@ -154,9 +155,22 @@ export class RtDbHttpClient {
     return parseStepResults((body as { results: unknown[] }).results);
   }
 
-  /** Schedules `txn` for `when`; the server validates cron expressions. */
-  async schedule(txn: TransactionJson, when: ScheduleWhen): Promise<{ id: string }> {
-    const body = await this.post("/api/schedule", { db: this.db, when, txn });
+  /** Schedules `txn` for `when`; the server validates cron expressions. Pass
+   * `external` to create an external job instead: one never executed by the
+   * server — an application worker claims it via `POST /api/schedule/claim`
+   * (a `claimSchedules` call) and finalizes with the returned
+   * `leaseGeneration` fencing token. */
+  async schedule(
+    txn: TransactionJson,
+    when: ScheduleWhen,
+    external?: boolean,
+  ): Promise<{ id: string }> {
+    const body = await this.post("/api/schedule", {
+      db: this.db,
+      when,
+      txn,
+      ...(external === true && { external: true }),
+    });
     return { id: (body as { id: string }).id };
   }
 
@@ -184,6 +198,63 @@ export class RtDbHttpClient {
       db: this.db,
     });
     return (body as { ok: boolean }).ok;
+  }
+
+  /** Atomically claims up to `opts.limit` due external jobs
+   * (`POST /api/schedule/claim`): rows marked `external` at create time that
+   * the server's internal scheduler never executes. Each claim assigns the
+   * job's per-job monotonic `leaseGeneration` fencing token and stamps a
+   * `leaseMs` (default 5min, bounded 1s–24h) lease deadline; re-claims after
+   * expiry bump the token again, so a finalize from a stale holder rejects
+   * `CONFLICT`. The worker executes each claimed job's `txn` itself, then
+   * finalizes with {@link completeSchedule}/{@link retrySchedule}/
+   * {@link failSchedule}. */
+  async claimSchedules(opts?: { limit?: number; leaseMs?: number }): Promise<ClaimedSchedule[]> {
+    const body = await this.post("/api/schedule/claim", {
+      db: this.db,
+      ...(opts?.limit !== undefined && { limit: opts.limit }),
+      ...(opts?.leaseMs !== undefined && { leaseMs: opts.leaseMs }),
+    });
+    return (body as { jobs: ClaimedSchedule[] }).jobs;
+  }
+
+  /** Completes an externally-claimed job (`POST /api/schedule/{id}/complete`)
+   * with the claim's `lease` fencing token: a one-shot is deleted (the same
+   * terminal as internal one-shot success); cron/interval advance to their
+   * next due instant. A stale token, or a row no longer running/external,
+   * rejects with `CONFLICT`. */
+  async completeSchedule(id: string, lease: number): Promise<void> {
+    await this.post(`/api/schedule/${encodeURIComponent(id)}/complete`, {
+      db: this.db,
+      lease,
+    });
+  }
+
+  /** Retries an externally-claimed job (`POST /api/schedule/{id}/retry`):
+   * re-arms it at `now + opts.delayMs` (default 60s) and records
+   * `opts.error` as `last_error`. Stale lease → `CONFLICT`. */
+  async retrySchedule(
+    id: string,
+    lease: number,
+    opts?: { delayMs?: number; error?: string },
+  ): Promise<void> {
+    await this.post(`/api/schedule/${encodeURIComponent(id)}/retry`, {
+      db: this.db,
+      lease,
+      ...(opts?.delayMs !== undefined && { delayMs: opts.delayMs }),
+      ...(opts?.error !== undefined && { error: opts.error }),
+    });
+  }
+
+  /** Fails an externally-claimed job terminally
+   * (`POST /api/schedule/{id}/fail`): the job moves to `error` status with
+   * `error` recorded as `last_error`. Stale lease → `CONFLICT`. */
+  async failSchedule(id: string, lease: number, error: string): Promise<void> {
+    await this.post(`/api/schedule/${encodeURIComponent(id)}/fail`, {
+      db: this.db,
+      lease,
+      error,
+    });
   }
 
   /**

@@ -179,6 +179,7 @@ async fn owner_scheduled_write_pushes_b_subscriber() -> anyhow::Result<()> {
         schedule_id: SCHED_ID.to_string(),
         when: ScheduleWhen::AfterMs { ms: 1_000 },
         txn: insert_item("from-scheduler"),
+        external: None,
     })
     .await;
     let ack = ws_next(&mut ws_a, SCHEDULER_WAIT, |m| {

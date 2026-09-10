@@ -26,6 +26,11 @@ use crate::{AppState, db};
 pub(super) struct AdminScheduleCreateRequest {
     when: ScheduleWhen,
     txn: Transaction,
+    /// External-claim job mode — same semantics as the per-db
+    /// `POST /api/schedule` surface (never internally executed; claimed by
+    /// app workers over the claim API with a fencing token).
+    #[serde(default)]
+    external: bool,
 }
 
 #[derive(Serialize)]
@@ -95,6 +100,7 @@ pub(super) async fn admin_create_schedule(
         &body.txn,
         cron.as_deref(),
         every_ms,
+        body.external,
     )
     .await?;
     Ok(Json(AdminScheduleCreateResponse { id }))

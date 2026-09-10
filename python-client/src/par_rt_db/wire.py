@@ -145,6 +145,11 @@ class ScheduleInfo(_Camel):
     (only interval jobs carry ``everyMs`` — exactly like ``cron``). ``kind`` and
     ``status`` are narrowed to ``Literal`` unions (ARC-004/QA-008) mirroring the
     server's ``ScheduleKind`` / ``ScheduleStatus`` enums.
+
+    ``external`` (2026-09-09 external-claim feature): the attribute is always a
+    ``bool`` and decodes tolerantly (absent key → ``False``), but it is omitted
+    from the serialized form when ``False`` so an ordinary job's wire shape is
+    unchanged.
     """
 
     id: str
@@ -156,11 +161,44 @@ class ScheduleInfo(_Camel):
     last_error: str | None = None
     created_at: int
     fired_count: int
+    external: bool = False
 
     @model_serializer(mode="wrap")
     def _drop_none_optional(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
         for alias in ("cron", "everyMs", "lastError"):
+            if out.get(alias) is None:
+                out.pop(alias, None)
+        if not out.get("external"):
+            out.pop("external", None)
+        return out
+
+
+class ClaimedSchedule(_Camel):
+    """One externally-claimed job returned by ``POST /api/schedule/claim``.
+
+    Mirrors the server's ``ClaimedSchedule`` (``server/src/protocol.rs``). The
+    ``lease_generation`` is the per-job monotonic fencing token: it increments
+    on every claim (including re-claims after lease expiry), and the worker's
+    complete/retry/fail calls are rejected ``CONFLICT`` once a newer generation
+    exists. ``txn`` is the full declarative transaction the worker executes
+    externally; ``cron``/``everyMs`` ride along for recurring jobs so a
+    ``complete`` can advance the job to its next due instant.
+    """
+
+    id: str
+    kind: Literal["oneshot", "cron", "interval"]
+    due_at: int
+    txn: dict[str, Any]
+    cron: str | None = None
+    every_ms: int | None = None
+    lease_generation: int
+    lease_deadline_ms: int
+
+    @model_serializer(mode="wrap")
+    def _drop_none_optional(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        for alias in ("cron", "everyMs"):
             if out.get(alias) is None:
                 out.pop(alias, None)
         return out
@@ -613,10 +651,24 @@ class _ClientMutate(_Camel):
 
 
 class _ClientSchedule(_Camel):
+    """2026-09-09 external-claim feature: ``external`` flags the job as never
+    internally executed — an application worker claims it via
+    ``POST /api/schedule/claim`` and finalizes it with the returned
+    ``leaseGeneration`` fencing token. Omitted on the wire when ``None``
+    (mirrors the server's ``skip_serializing_if = "Option::is_none"``)."""
+
     type: Literal["schedule"] = "schedule"
     schedule_id: str
     when: ScheduleWhen
     txn: dict[str, Any]
+    external: bool | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_none_external(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("external") is None:
+            out.pop("external", None)
+        return out
 
 
 class _ClientCancelSchedule(_Camel):

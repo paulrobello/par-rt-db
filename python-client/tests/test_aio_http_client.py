@@ -307,6 +307,99 @@ async def test_list_schedules_returns_schedule_info_list() -> None:
     assert schedules[1].cron == "0 9 * * *"
 
 
+async def test_claim_schedules_posts_db_limit_leasems_and_decodes_jobs() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "jobs": [
+                    {
+                        "id": "job-1",
+                        "kind": "cron",
+                        "dueAt": 1000,
+                        "txn": {"steps": []},
+                        "cron": "*/5 * * * *",
+                        "leaseGeneration": 3,
+                        "leaseDeadlineMs": 86_000,
+                    },
+                    {
+                        "id": "job-2",
+                        "kind": "oneshot",
+                        "dueAt": 2000,
+                        "txn": {"steps": []},
+                        "leaseGeneration": 1,
+                        "leaseDeadlineMs": 87_000,
+                    },
+                ]
+            },
+        )
+
+    async with _client(handler) as c:
+        jobs = await c.claim_schedules(limit=2, lease_ms=30_000)
+    assert captured["body"] == {"db": DB, "limit": 2, "leaseMs": 30_000}
+    assert [j.id for j in jobs] == ["job-1", "job-2"]
+    assert jobs[0].kind == "cron"
+    assert jobs[0].lease_generation == 3
+    assert jobs[0].lease_deadline_ms == 86_000
+    assert jobs[0].cron == "*/5 * * * *"
+    assert jobs[1].every_ms is None and jobs[1].cron is None
+    assert jobs[1].lease_generation == 1
+
+
+async def test_claim_schedules_body_omits_unset_options() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"jobs": []})
+
+    async with _client(handler) as c:
+        assert await c.claim_schedules() == []
+    assert captured["body"] == {"db": DB}
+
+
+@pytest.mark.parametrize("op", ["complete", "retry", "fail"])
+async def test_finalize_ops_post_to_id_paths(op: str) -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    async with _client(handler) as c:
+        if op == "complete":
+            ok = await c.complete_schedule("job-1", lease=3)
+        elif op == "retry":
+            ok = await c.retry_schedule("job-1", lease=3, delay_ms=5_000, error="flaky")
+        else:
+            ok = await c.fail_schedule("job-1", lease=3, error="boom")
+    assert ok is True
+    assert captured["path"] == f"/api/schedule/job-1/{op}"
+    expected: dict[str, Any] = {"db": DB, "lease": 3}
+    if op == "retry":
+        expected["delayMs"] = 5_000
+        expected["error"] = "flaky"
+    elif op == "fail":
+        expected["error"] = "boom"
+    assert captured["body"] == expected
+
+
+async def test_finalize_op_stale_lease_conflict_raises() -> None:
+    # The server rejects a stale fencing token with 409 CONFLICT; the client
+    # surfaces the envelope like any other error.
+    async with _client(
+        lambda r: httpx.Response(409, json={"code": "CONFLICT", "message": "stale lease"})
+    ) as c:
+        with pytest.raises(RtDbError) as ei:
+            await c.complete_schedule("job-1", lease=1)
+    assert ei.value.code.value == "CONFLICT"
+    assert ei.value.status_code == 409
+
+
 async def test_batch_query_returns_one_outcome_per_input() -> None:
     captured: dict[str, Any] = {}
 

@@ -117,6 +117,7 @@ from .schema import SchemaDef
 from .wire import (
     PROTOCOL_VERSION,
     BatchQueryOutcome,
+    ClaimedSchedule,
     ScheduleInfo,
     ScheduleWhen,
     WorkflowInfo,
@@ -180,6 +181,7 @@ __all__ = [
 # ``_STEP_RESULT_ADAPTER`` is imported from :mod:`par_rt_db.admin_models` (one
 # shared adapter across the data-plane and admin clients).
 _SCHEDULES_ADAPTER = TypeAdapter(list[ScheduleInfo])
+_CLAIMED_ADAPTER = TypeAdapter(list[ClaimedSchedule])
 _WORKFLOWS_ADAPTER = TypeAdapter(list[WorkflowInfo])
 _BATCH_ADAPTER = TypeAdapter(list[BatchQueryOutcome])
 
@@ -359,19 +361,32 @@ class RtDbHttpClient:
 
     # --- data plane: scheduling (POST /api/schedule*) ---
 
-    def schedule(self, txn: Transaction, when: ScheduleWhen) -> str:
+    def schedule(
+        self,
+        txn: Transaction,
+        when: ScheduleWhen,
+        *,
+        external: bool = False,
+    ) -> str:
         """``POST /api/schedule`` → the new schedule's id.
 
         ``when`` is a ``ScheduleWhen`` (``AfterMs``/``RunAt``/``Cron``/
         ``Interval``, imported from the package root — ``from par_rt_db import
         AfterMs``). One-shot jobs past due run immediately; recurring jobs
         (cron/interval) skip missed windows (server-side semantics).
+
+        ``external=True`` creates an external-claim job (2026-09-09): the job is
+        never executed by the server's internal scheduler — a worker claims it
+        via :meth:`claim_schedules` and finalizes it with the returned
+        ``leaseGeneration`` fencing token.
         """
-        body = {
+        body: dict[str, Any] = {
             "db": self._db,
             "when": when.model_dump(by_alias=True, mode="json"),
             "txn": txn.model_dump(by_alias=True, mode="json"),
         }
+        if external:
+            body["external"] = True
         resp = self._send("POST", "/api/schedule", json=body)
         return str(resp.json()["id"])
 
@@ -402,6 +417,93 @@ class RtDbHttpClient:
         """``POST /api/schedules`` → every schedule for this db."""
         resp = self._send("POST", "/api/schedules", json={"db": self._db})
         return _SCHEDULES_ADAPTER.validate_python(resp.json()["schedules"])
+
+    # --- data plane: external claims (2026-09-09) ----------------------------
+
+    def claim_schedules(
+        self,
+        *,
+        limit: int | None = None,
+        lease_ms: int | None = None,
+    ) -> list[ClaimedSchedule]:
+        """``POST /api/schedule/claim`` → the claimed jobs with their fencing
+        tokens.
+
+        Atomically claims due external jobs (due ``pending`` rows, or
+        ``running`` rows whose lease expired), flipping each to ``running`` and
+        assigning a monotonic per-job ``leaseGeneration``. Each job's
+        :attr:`ClaimedSchedule.lease_generation` is the fencing token the
+        worker passes to :meth:`complete_schedule` / :meth:`retry_schedule` /
+        :meth:`fail_schedule`; a stale token (the job was re-claimed after lease
+        expiry) is rejected ``CONFLICT``.
+
+        Args:
+            limit: Max jobs to claim (default 8, capped at 64 server-side).
+            lease_ms: Lease length in ms (default 300_000; bounded
+                1_000..86_400_000 server-side).
+        """
+        body: dict[str, Any] = {"db": self._db}
+        if limit is not None:
+            body["limit"] = limit
+        if lease_ms is not None:
+            body["leaseMs"] = lease_ms
+        resp = self._send("POST", "/api/schedule/claim", json=body)
+        return _CLAIMED_ADAPTER.validate_python(resp.json()["jobs"])
+
+    def complete_schedule(self, id: str, lease: int) -> bool:
+        """``POST /api/schedule/{id}/complete`` → ``True`` on success. A
+        one-shot job is deleted (same terminal as internal success); cron/
+        interval jobs advance to their next due instant. ``CONFLICT`` when
+        ``lease`` is stale or the job is not running/external.
+
+        Args:
+            id: The claimed job's id.
+            lease: The ``leaseGeneration`` fencing token from the claim.
+        """
+        resp = self._send(
+            "POST", f"/api/schedule/{id}/complete", json={"db": self._db, "lease": lease}
+        )
+        return bool(resp.json()["ok"])
+
+    def retry_schedule(
+        self, id: str, lease: int, *, delay_ms: int | None = None, error: str | None = None
+    ) -> bool:
+        """``POST /api/schedule/{id}/retry`` → ``True`` on success. Re-arms the
+        job at ``now + delayMs`` (default 60_000 server-side) and records
+        ``error`` (when given) as its ``lastError``. ``CONFLICT`` when ``lease``
+        is stale.
+
+        Args:
+            id: The claimed job's id.
+            lease: The ``leaseGeneration`` fencing token from the claim.
+            delay_ms: Re-arm delay in ms (default 60_000, capped server-side).
+            error: Optional note recorded as the job's ``lastError``.
+        """
+        body: dict[str, Any] = {"db": self._db, "lease": lease}
+        if delay_ms is not None:
+            body["delayMs"] = delay_ms
+        if error is not None:
+            body["error"] = error
+        resp = self._send("POST", f"/api/schedule/{id}/retry", json=body)
+        return bool(resp.json()["ok"])
+
+    def fail_schedule(self, id: str, lease: int, error: str) -> bool:
+        """``POST /api/schedule/{id}/fail`` → ``True`` on success. Moves the job
+        to the terminal ``error`` status with ``lastError`` set (reviving an
+        errored external job is future scope). ``CONFLICT`` when ``lease`` is
+        stale.
+
+        Args:
+            id: The claimed job's id.
+            lease: The ``leaseGeneration`` fencing token from the claim.
+            error: Why the job failed (required — recorded as ``lastError``).
+        """
+        resp = self._send(
+            "POST",
+            f"/api/schedule/{id}/fail",
+            json={"db": self._db, "lease": lease, "error": error},
+        )
+        return bool(resp.json()["ok"])
 
     # --- data plane: workflows (POST /api/workflows*) — FM-29 ---
 

@@ -71,6 +71,12 @@ pub enum ClientMessage {
         when: ScheduleWhen,
         /// The transaction to fire when due.
         txn: Transaction,
+        /// External-claim job mode (2026-09-09): when set, the job is never
+        /// executed by the internal scheduler — an application worker claims
+        /// it via `POST /api/schedule/claim` and finalizes it with the returned
+        /// `leaseGeneration` fencing token. Omitted = ordinary internal job.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external: Option<bool>,
     },
     /// Cancel a scheduled job.
     CancelSchedule {
@@ -380,6 +386,38 @@ pub use par_rt_db_core::mutation::{ScheduleKind, ScheduleWhen};
 /// resolving. Mirrors `server/src/protocol.rs::{ScheduleStatus, ScheduleInfo}`
 /// byte-for-byte.
 pub use par_rt_db_core::mutation::{ScheduleInfo, ScheduleStatus};
+
+/// One externally-claimed job returned by `POST /api/schedule/claim`. The
+/// `lease_generation` is the per-job monotonic fencing token: it increments on
+/// every claim (including re-claims after lease expiry), and the worker's
+/// complete/retry/fail calls are rejected `CONFLICT` once a newer generation
+/// exists. `txn` is the full declarative transaction the worker executes
+/// externally; `cron`/`everyMs` ride along for recurring jobs so a `complete`
+/// can advance the job to its next due instant. Mirrors
+/// `server/src/protocol.rs::ClaimedSchedule` byte-for-byte.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimedSchedule {
+    /// The claimed job's id.
+    pub id: String,
+    /// One-shot, cron, or interval.
+    pub kind: ScheduleKind,
+    /// When the job came due, epoch ms.
+    pub due_at: i64,
+    /// The declarative transaction to execute externally.
+    pub txn: Transaction,
+    /// The cron expression, for cron jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    /// The fixed recurrence in ms, for interval jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub every_ms: Option<i64>,
+    /// Per-job monotonic fencing token assigned atomically by the claim.
+    pub lease_generation: i64,
+    /// Lease expiry instant, epoch ms — past this the job is re-claimable by
+    /// another worker (or another claim by the same worker).
+    pub lease_deadline_ms: i64,
+}
 
 /// Per-step retry policy (FM-29). `maxAttempts` counts TOTAL attempts — the
 /// first try included. `StepRetry`/`AwaitSignalSpec`/`WorkflowStepSpec`/
@@ -1539,6 +1577,7 @@ mod tests {
             schedule_id: "s1".into(),
             when: ScheduleWhen::AfterMs { ms: 100 },
             txn: empty_txn(),
+            external: None,
         })
         .unwrap();
         assert_eq!(
@@ -1548,6 +1587,25 @@ mod tests {
                 "scheduleId": "s1",
                 "when": {"type": "afterMs", "ms": 100},
                 "txn": {"steps": []}
+            })
+        );
+        // External-claim mode rides the same frame; `None` above is omitted
+        // entirely, never serialized as `null`.
+        let ext = serde_json::to_value(ClientMessage::Schedule {
+            schedule_id: "s1".into(),
+            when: ScheduleWhen::AfterMs { ms: 100 },
+            txn: empty_txn(),
+            external: Some(true),
+        })
+        .unwrap();
+        assert_eq!(
+            ext,
+            json!({
+                "type": "schedule",
+                "scheduleId": "s1",
+                "when": {"type": "afterMs", "ms": 100},
+                "txn": {"steps": []},
+                "external": true
             })
         );
         assert_eq!(
@@ -1658,6 +1716,7 @@ mod tests {
             last_error: None,
             created_at: 500,
             fired_count: 0,
+            external: false,
         };
         let v = serde_json::to_value(&oneshot).unwrap();
         assert_eq!(
@@ -1681,6 +1740,7 @@ mod tests {
             last_error: Some("boom".into()),
             created_at: 500,
             fired_count: 3,
+            external: false,
         };
         let v = serde_json::to_value(&cron).unwrap();
         assert_eq!(
@@ -1706,6 +1766,7 @@ mod tests {
             last_error: None,
             created_at: 500,
             fired_count: 0,
+            external: false,
         };
         let iv = serde_json::to_value(&interval).unwrap();
         assert_eq!(
@@ -1726,6 +1787,68 @@ mod tests {
         assert_eq!(back.last_error.as_deref(), Some("boom"));
         let back: ScheduleInfo = serde_json::from_value(iv).unwrap();
         assert_eq!(back.every_ms, Some(300_000));
+    }
+
+    #[test]
+    fn claimed_schedule_round_trip_omits_absent_optionals() {
+        // Cron job: `cron` rides along, `everyMs` absent. The fencing token
+        // pair (`leaseGeneration`/`leaseDeadlineMs`) always serializes.
+        let cron = ClaimedSchedule {
+            id: "j5".into(),
+            kind: ScheduleKind::Cron,
+            due_at: 2000,
+            txn: empty_txn(),
+            cron: Some("*/5 * * * *".into()),
+            every_ms: None,
+            lease_generation: 3,
+            lease_deadline_ms: 86_400_000,
+        };
+        let v = serde_json::to_value(&cron).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "id": "j5",
+                "kind": "cron",
+                "dueAt": 2000,
+                "txn": {"steps": []},
+                "cron": "*/5 * * * *",
+                "leaseGeneration": 3,
+                "leaseDeadlineMs": 86400000
+            })
+        );
+        let back: ClaimedSchedule = serde_json::from_value(v).unwrap();
+        assert_eq!(back.cron.as_deref(), Some("*/5 * * * *"));
+        assert_eq!(back.every_ms, None);
+        assert_eq!(back.lease_generation, 3);
+
+        // Interval job: `everyMs` present, `cron` absent. `kind` mirrors the
+        // server's lowercase enum.
+        let interval = ClaimedSchedule {
+            id: "j9".into(),
+            kind: ScheduleKind::Interval,
+            due_at: 2400,
+            txn: empty_txn(),
+            cron: None,
+            every_ms: Some(300_000),
+            lease_generation: 1,
+            lease_deadline_ms: 300_000,
+        };
+        let iv = serde_json::to_value(&interval).unwrap();
+        assert_eq!(
+            iv,
+            json!({
+                "id": "j9",
+                "kind": "interval",
+                "dueAt": 2400,
+                "txn": {"steps": []},
+                "everyMs": 300000,
+                "leaseGeneration": 1,
+                "leaseDeadlineMs": 300000
+            })
+        );
+        let back: ClaimedSchedule = serde_json::from_value(iv).unwrap();
+        assert_eq!(back.every_ms, Some(300_000));
+        assert_eq!(back.cron, None);
     }
 
     // ---- FM-29 workflow wire (fixtures mirror server protocol.rs tests) ----

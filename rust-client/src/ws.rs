@@ -1511,6 +1511,11 @@ where
             schedule_id: q.schedule_id.clone(),
             when: when.clone(),
             txn: txn.clone(),
+            // The WS `schedule` surface stays internal-job-only (external
+            // jobs are created via the DSL's `schedule_external` step or the
+            // HTTP `schedule` op); the field exists on the frame to mirror
+            // the server's wire vocabulary. Omitted on the wire when `None`.
+            external: None,
         },
         ScheduleMsg::Cancel { id } => ClientMessage::CancelSchedule {
             schedule_id: q.schedule_id.clone(),
@@ -2093,6 +2098,7 @@ mod tests {
                 expr: "*/5 * * * *".into(),
             },
             txn: Transaction { steps: vec![] },
+            external: None,
         })
         .unwrap();
         assert_eq!(
@@ -2102,6 +2108,25 @@ mod tests {
                 "scheduleId":"sch-1",
                 "when":{"type":"cron","expr":"*/5 * * * *"},
                 "txn":{"steps":[]}
+            })
+        );
+        // `external: true` (external-claim mode) rides on the same frame;
+        // `None` above is omitted entirely, never serialized as `null`.
+        let ext = serde_json::to_value(ClientMessage::Schedule {
+            schedule_id: "sch-1".into(),
+            when: ScheduleWhen::AfterMs { ms: 100 },
+            txn: Transaction { steps: vec![] },
+            external: Some(true),
+        })
+        .unwrap();
+        assert_eq!(
+            ext,
+            json!({
+                "type":"schedule",
+                "scheduleId":"sch-1",
+                "when":{"type":"afterMs","ms":100},
+                "txn":{"steps":[]},
+                "external":true
             })
         );
         assert_eq!(
@@ -2711,6 +2736,7 @@ mod tests {
                     last_error: None,
                     created_at: 1000,
                     fired_count: 0,
+                    external: false,
                 }],
             },
             &mut queues,
