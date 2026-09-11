@@ -179,7 +179,7 @@ pub(crate) fn validate_dump_name(name: &str) -> Result<(), RtDbError> {
 /// `validate_dump_name`-valid filename.
 pub(crate) fn restore_target_name(name: &str) -> String {
     let stem = &name["rtdb-".len()..name.len() - ".dump".len()];
-    format!("rtdb_restored_{stem}")
+    format!("rtdb_restored_{}", stem.to_ascii_lowercase())
 }
 
 /// Builds the dump filename `<dir>/rtdb-<UTC stamp>.dump` for the given
@@ -588,7 +588,7 @@ mod tests {
     fn restore_target_name_is_scoped_stamp() {
         assert_eq!(
             restore_target_name("rtdb-20260728T143045Z.dump"),
-            "rtdb_restored_20260728T143045Z"
+            "rtdb_restored_20260728t143045z"
         );
     }
 
