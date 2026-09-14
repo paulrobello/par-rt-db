@@ -490,6 +490,119 @@ async fn schedule_and_manage_over_http() -> anyhow::Result<()> {
     Ok(())
 }
 
+// (k2) The external-claim worker contract end-to-end over the routes: a due
+// external job created through POST /api/schedule lists with its external
+// state, POST /api/schedule/claim returns it with a monotonic lease
+// generation, a stale generation is a 409 CONFLICT after the lease is
+// re-claimed, and the current generation completes the one-shot (row gone).
+#[tokio::test]
+async fn external_schedule_claim_over_http() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let (_, token) = mint_token(addr, &name).await;
+
+    let resp = api_post(
+        addr,
+        "/api/schedule",
+        &token,
+        json!({
+            "db": name,
+            "when": {"type": "afterMs", "ms": 0},
+            "txn": {"steps": []},
+            "external": true,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let id = body["id"].as_str().expect("schedule id").to_string();
+
+    let resp = api_post(addr, "/api/schedules", &token, json!({"db": name})).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let listed = body["schedules"].as_array().expect("schedules array");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["id"], json!(id));
+    assert_eq!(listed[0]["external"], json!(true));
+
+    // The claim assigns generation 1 with a stamped lease deadline.
+    let resp = api_post(
+        addr,
+        "/api/schedule/claim",
+        &token,
+        json!({"db": name, "limit": 8, "leaseMs": 1_000}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let jobs = body["jobs"].as_array().expect("jobs array");
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0]["id"], json!(id));
+    assert_eq!(jobs[0]["kind"], json!("oneshot"));
+    assert_eq!(jobs[0]["leaseGeneration"], json!(1));
+    assert!(jobs[0]["leaseDeadlineMs"].as_i64().expect("deadline") > 0);
+
+    // Once the 1s lease (the surface's minimum) expires the job is
+    // re-claimable, and the fencing token only ever increases.
+    let mut gen2 = 0i64;
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let resp = api_post(
+            addr,
+            "/api/schedule/claim",
+            &token,
+            json!({"db": name, "limit": 8, "leaseMs": 1_000}),
+        )
+        .await;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await?;
+        let jobs = body["jobs"].as_array().expect("jobs array");
+        if !jobs.is_empty() {
+            gen2 = jobs[0]["leaseGeneration"].as_i64().expect("generation");
+            break;
+        }
+    }
+    assert!(gen2 > 1, "re-claim must bump the generation past 1");
+
+    // The generation-1 token is now stale: its complete is a 409 CONFLICT,
+    // never a silent no-op against the new lease.
+    let resp = api_post(
+        addr,
+        &format!("/api/schedule/{id}/complete"),
+        &token,
+        json!({"db": name, "lease": 1}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], "CONFLICT");
+
+    // The current generation completes the job; a one-shot's success deletes
+    // the row, so the final list is empty.
+    let resp = api_post(
+        addr,
+        &format!("/api/schedule/{id}/complete"),
+        &token,
+        json!({"db": name, "lease": gen2}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["ok"], json!(true));
+
+    let resp = api_post(addr, "/api/schedules", &token, json!({"db": name})).await;
+    let body: serde_json::Value = resp.json().await?;
+    assert!(
+        body["schedules"]
+            .as_array()
+            .expect("schedules array")
+            .is_empty()
+    );
+
+    Ok(())
+}
+
 // (l) negative afterMs is rejected before any row is written.
 #[tokio::test]
 async fn schedule_rejects_negative_after_ms_http() -> anyhow::Result<()> {
