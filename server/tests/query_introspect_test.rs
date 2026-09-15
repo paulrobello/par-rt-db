@@ -6,6 +6,7 @@
 //! routes end-to-end.
 
 use std::net::SocketAddr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::common::{
     admin_get, admin_post, fresh_db, kanban_schema_json, spawn_app, test_state,
@@ -525,6 +526,48 @@ async fn slow_query_logged_when_threshold_enabled() -> anyhow::Result<()> {
         http_mine >= 1,
         "expected >=1 slow-query row in HTTP response, got {queries:?}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_response_server_time_header_brackets_query_and_preserves_body() -> anyhow::Result<()>
+{
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, db.as_str()).await;
+    let schema: SchemaDef =
+        serde_json::from_value(kanban_schema_json()).expect("parse kanban schema");
+    seed_projects(&state.pool, db.as_str(), &schema, 1).await;
+
+    let request_started_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+    let response = api_post(
+        addr,
+        "/api/query",
+        &token,
+        serde_json::json!({"db": db.as_str(), "query": {"table": "projects"}}),
+    )
+    .await;
+    let response_received_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let server_time_ms = response
+        .headers()
+        .get("x-rtdb-server-time-ms")
+        .expect("query response server time header")
+        .to_str()?
+        .parse::<i64>()?;
+    assert!(
+        (request_started_ms..=response_received_ms).contains(&server_time_ms),
+        "server time {server_time_ms} should bracket the query in {request_started_ms}..={response_received_ms}"
+    );
+
+    let body: serde_json::Value = response.json().await?;
+    let body = body.as_object().expect("query response object");
+    assert_eq!(body.len(), 1, "response body keeps the existing wrapper");
+    let projects = body["result"].as_array().expect("query result array");
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0]["name"], "proj-0");
     Ok(())
 }
 

@@ -15,7 +15,7 @@ use axum::body::Body;
 use axum::extract::{
     ConnectInfo, DefaultBodyLimit, FromRequest, Path, Query as AxumQuery, Request, State,
 };
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -139,7 +139,7 @@ async fn query_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     ApiJson(body): ApiJson<QueryRequest>,
-) -> Result<Json<QueryResponse>, RtDbError> {
+) -> Result<(HeaderMap, Json<QueryResponse>), RtDbError> {
     let principal = authed(&state, &headers, &body.db).await?;
     check_http_rate_limits(&state, &principal, &body.db).await?;
 
@@ -168,7 +168,14 @@ async fn query_handler(
         started_at_ms,
         elapsed_us,
     );
-    Ok(Json(QueryResponse { result }))
+    let server_time = HeaderValue::from_bytes(now_ms().to_string().as_bytes())
+        .map_err(|_| RtDbError::internal("failed to encode server time header"))?;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        HeaderName::from_static("x-rtdb-server-time-ms"),
+        server_time,
+    );
+    Ok((response_headers, Json(QueryResponse { result })))
 }
 
 #[derive(Deserialize)]
