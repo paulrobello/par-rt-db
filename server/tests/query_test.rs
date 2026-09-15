@@ -6,6 +6,7 @@ use rtdb_server::AppState;
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::db;
 use rtdb_server::ddl;
+use rtdb_server::dsl::EqBind;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::pagination::encode_cursor;
 use rtdb_server::query::{
@@ -4488,6 +4489,27 @@ fn sorted_doc_keys(doc: &serde_json::Value) -> Vec<&str> {
     keys
 }
 
+async fn fetch_raw_compiled_docs(
+    pool: &PgPool,
+    compiled: rtdb_server::query::CompiledQuery,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&compiled.sql);
+    for bind in compiled.binds {
+        query = match bind {
+            EqBind::Text(value) => query.bind(value),
+            EqBind::Num(value) => query.bind(value),
+            EqBind::Bool(value) => query.bind(value),
+            EqBind::I64(value) => query.bind(value),
+        };
+    }
+    Ok(query
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|(_, doc, _, _)| doc)
+        .collect())
+}
+
 // (a) collect + fields: docs carry exactly the system fields + the listed
 // user fields; every unlisted user field is dropped.
 #[tokio::test]
@@ -4740,5 +4762,224 @@ async fn projection_doc_less_terminals_unaffected() -> anyhow::Result<()> {
     )
     .await?;
     assert!(matches!(agg, QueryResult::Aggregate(ref v) if v.as_f64() == Some(15.0)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn projection_collect_sql_returns_only_requested_fields() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    let schema = kanban_schema();
+    let project_id = insert_project(&pool, &db, &schema, "Projection").await?;
+    let large_title = "x".repeat(10_000);
+
+    for (title, status, order, completed_at) in [
+        (
+            large_title.as_str(),
+            "backlog",
+            1.0,
+            Some(serde_json::Value::Null),
+        ),
+        ("small", "done", 2.0, None),
+        ("skip", "blocked", 3.0, None),
+    ] {
+        let mut item = serde_json::json!({
+            "projectId": project_id,
+            "title": title,
+            "status": status,
+            "order": order
+        });
+        if let Some(value) = completed_at {
+            item["completedAt"] = value;
+        }
+        execute_txn(
+            &pool,
+            &db,
+            &schema,
+            &Transaction {
+                steps: vec![Step::Insert {
+                    table: "workItems".to_string(),
+                    doc: doc(item),
+                }],
+            },
+            &PrincipalCtx::bypass(),
+        )
+        .await?;
+    }
+    sqlx::query(&format!(
+        "UPDATE \"{}\".\"{}\" SET \"doc\" = jsonb_set(\"doc\", '{{completedAt}}', 'null'::jsonb, true) WHERE \"doc\"->>'title' = $1",
+        rtdb_server::ddl::pg_schema(&db),
+        rtdb_server::ddl::pg_table("workItems")
+    ))
+    .bind(&large_title)
+    .execute(&pool)
+    .await?;
+
+    let query = projection_query(
+        "workItems",
+        serde_json::json!({
+            "index": "by_project_and_order",
+            "eq": [project_id],
+            "order": "desc",
+            "filter": {"op": "neq", "field": "title", "value": "skip"}
+        }),
+        &["status", "completedAt", "status"],
+    );
+    let (compiled, _) =
+        rtdb_server::query::compile_query(&db, &schema, &query, &PrincipalCtx::bypass(), false)?;
+    let raw_docs = fetch_raw_compiled_docs(&pool, compiled).await?;
+
+    assert_eq!(raw_docs.len(), 2);
+    assert_eq!(raw_docs[0], serde_json::json!({"status": "done"}));
+    assert_eq!(
+        raw_docs[1],
+        serde_json::json!({"completedAt": null, "status": "backlog"})
+    );
+    assert!(!raw_docs[0].as_object().unwrap().contains_key("title"));
+    assert!(!raw_docs[1].as_object().unwrap().contains_key("title"));
+
+    let first_query = Query {
+        first: true,
+        order: Some(Order::Asc),
+        ..query.clone()
+    };
+    let (first, _) = rtdb_server::query::compile_query(
+        &db,
+        &schema,
+        &first_query,
+        &PrincipalCtx::bypass(),
+        false,
+    )?;
+    assert_eq!(first.terminal, "first");
+    let first_docs = fetch_raw_compiled_docs(&pool, first).await?;
+    assert_eq!(
+        first_docs,
+        vec![serde_json::json!({"completedAt": null, "status": "backlog"})]
+    );
+    assert!(!first_docs[0].as_object().unwrap().contains_key("title"));
+
+    let unique_query = Query {
+        unique: true,
+        eq: vec![serde_json::json!(project_id), serde_json::json!(1.0)],
+        order: None,
+        ..query.clone()
+    };
+    let (unique, _) = rtdb_server::query::compile_query(
+        &db,
+        &schema,
+        &unique_query,
+        &PrincipalCtx::bypass(),
+        false,
+    )?;
+    assert_eq!(unique.terminal, "unique");
+    let unique_docs = fetch_raw_compiled_docs(&pool, unique).await?;
+    assert_eq!(
+        unique_docs,
+        vec![serde_json::json!({"completedAt": null, "status": "backlog"})]
+    );
+    assert!(!unique_docs[0].as_object().unwrap().contains_key("title"));
+
+    let unprojected = rtdb_server::query::compile_query(
+        &db,
+        &schema,
+        &Query {
+            fields: None,
+            ..query
+        },
+        &PrincipalCtx::bypass(),
+        false,
+    )?
+    .0;
+    assert!(
+        unprojected
+            .sql
+            .contains("SELECT \"id\", \"doc\", \"created_at\"")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn projection_keeps_owner_and_collaborator_authorization() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = crate::common::wrap_test_db(format!("t{}", uuid::Uuid::now_v7().simple()));
+    db::create_database(&pool, &db).await?;
+    let schema: SchemaDef = serde_json::from_value(serde_json::json!({
+        "tables": {
+            "notes": {
+                "fields": {
+                    "title": {"type": "string"},
+                    "userId": {"type": "string"},
+                    "collaborators": {
+                        "type": "optional",
+                        "inner": {"type": "array", "element": {"type": "string"}}
+                    }
+                },
+                "ownerField": "userId",
+                "collaboratorsField": "collaborators"
+            }
+        }
+    }))?;
+    ddl::push_schema(&pool, &db, schema.clone()).await?;
+    execute_txn(
+        &pool,
+        &db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "notes".to_string(),
+                doc: doc(serde_json::json!({
+                    "title": "shared",
+                    "userId": "alice",
+                    "collaborators": ["bob"]
+                })),
+            }],
+        },
+        &PrincipalCtx::bypass(),
+    )
+    .await?;
+
+    let owner_ctx = PrincipalCtx {
+        user_id: Some("alice".to_string()),
+        ..Default::default()
+    };
+    let auth_query = projection_query("notes", serde_json::json!({}), &[]);
+    let (compiled, _) =
+        rtdb_server::query::compile_query(&db, &schema, &auth_query, &owner_ctx, false)?;
+    assert!(
+        compiled
+            .sql
+            .contains("SELECT \"id\", '{}'::jsonb, \"created_at\"")
+    );
+    assert!(compiled.sql.contains("doc->>'userId'"));
+    assert!(!compiled.sql.contains("jsonb_each(\"doc\")"));
+
+    for (user_id, expected_count) in [("alice", 1), ("bob", 1), ("carol", 0)] {
+        let result = execute_query(
+            &pool,
+            &db,
+            &schema,
+            &projection_query("notes", serde_json::json!({}), &[]),
+            &PrincipalCtx {
+                user_id: Some(user_id.to_string()),
+                ..Default::default()
+            },
+            false,
+        )
+        .await?;
+        match result {
+            QueryResult::Docs(docs) => {
+                assert_eq!(docs.len(), expected_count);
+                for projected in docs {
+                    assert_eq!(
+                        sorted_doc_keys(&projected),
+                        vec!["_creationTime", "_id", "_version"]
+                    );
+                }
+            }
+            other => panic!("expected Docs variant, got {other:?}"),
+        }
+    }
     Ok(())
 }

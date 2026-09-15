@@ -194,7 +194,7 @@ pub fn compile_query(
     }
 
     Ok((
-        compile_collect_terminal(w, q.unique, q.first, q.take, &order_by, db, &q.table)?,
+        compile_collect_terminal(w, q, &order_by, db, &q.table)?,
         warnings,
     ))
 }
@@ -979,13 +979,11 @@ pub(crate) async fn execute_paginate_terminal(
 /// compiled window's WHERE clause ordered by `order_by`, applies a `limit`
 /// derived from `unique` (2), `first` (1), or `take` (defaulting to `MAX_TAKE`),
 /// and shapes the result (`Doc`/`Doc(None)` for unique/first, `Docs` for
-/// collect). Compile half of the former inline fall-through block — SQL and
-/// bind-order byte-for-byte identical to the pre-refactor cascade.
+/// collect). Unprojected queries keep the former SQL and bind order byte-for-
+/// byte; projected queries select only the validated user keys in SQL.
 fn compile_collect_terminal(
     w: QueryWindow<'_>,
-    unique: bool,
-    first: bool,
-    take: Option<u32>,
+    q: &Query,
     order_by: &str,
     db: &str,
     table: &str,
@@ -998,18 +996,45 @@ fn compile_collect_terminal(
         limit_placeholder,
         ..
     } = w;
-    let limit: u32 = if unique {
+    let limit: u32 = if q.unique {
         2
-    } else if first {
+    } else if q.first {
         1
     } else {
-        take.unwrap_or(MAX_TAKE)
+        q.take.unwrap_or(MAX_TAKE)
     };
 
     let pg_schema_name = pg_schema(db);
     let table_ident = pg_table(table);
+    let (doc_select, projection_binds) = match q.fields.as_deref() {
+        None => ("\"doc\"".to_string(), Vec::new()),
+        Some(fields) => {
+            let projection_fields = fields
+                .iter()
+                .filter(|field| !field.starts_with('_'))
+                .collect::<std::collections::BTreeSet<_>>();
+            if projection_fields.is_empty() {
+                ("'{}'::jsonb".to_string(), Vec::new())
+            } else {
+                let placeholders = projection_fields
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| format!("${}", limit_placeholder + index + 1))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "(SELECT COALESCE(jsonb_object_agg(projected.key, projected.value), '{{}}'::jsonb) FROM jsonb_each(\"doc\") AS projected WHERE projected.key IN ({placeholders}))"
+                );
+                let binds = projection_fields
+                    .into_iter()
+                    .map(|field| EqBind::Text(field.clone()))
+                    .collect::<Vec<_>>();
+                (sql, binds)
+            }
+        }
+    };
     let mut sql = format!(
-        "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\""
+        "SELECT \"id\", {doc_select}, \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\""
     );
     if !where_conditions.is_empty() {
         sql.push_str(" WHERE ");
@@ -1019,16 +1044,19 @@ fn compile_collect_terminal(
     sql.push_str(order_by);
     sql.push_str(&format!(" LIMIT ${limit_placeholder}"));
 
-    let mut all = Vec::with_capacity(binds.len() + range_binds.len() + filter_binds.len() + 1);
+    let mut all = Vec::with_capacity(
+        binds.len() + range_binds.len() + filter_binds.len() + 1 + projection_binds.len(),
+    );
     all.extend(binds);
     all.extend(range_binds);
     all.extend(filter_binds);
     all.push(EqBind::I64(i64::from(limit)));
+    all.extend(projection_binds);
     // The wire terminal name distinguishes the three shapes (unique/first/
     // collect) for the executor's result-shaping switch and for /explain.
-    let terminal: &'static str = if unique {
+    let terminal: &'static str = if q.unique {
         "unique"
-    } else if first {
+    } else if q.first {
         "first"
     } else {
         "collect"
