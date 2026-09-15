@@ -903,7 +903,9 @@ struct WsClientTests {
             try await waitUntil("backoff sleep \(attempt)") {
                 scheduler.sleepRequests.count >= backoffCount
             }
-            scheduler.advance(backoff)
+            if attempt < 5 {
+                scheduler.advance(backoff)
+            }
         }
         #expect(scheduler.sleepRequests == expected)
         #expect(
