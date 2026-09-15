@@ -438,13 +438,20 @@ calls and are mirrored in the ts/rust/python admin clients.
 
 Enable the built-in managed backup loop with `RTDB_BACKUP_ENABLED=true`
 (default `false`) plus `RTDB_BACKUP_CRON` (5-field UTC cron, default
-`0 3 * * *`), `RTDB_BACKUP_DIR` (default `./backups`), and
-`RTDB_BACKUP_RETENTION` (count, default `7`) — see `BackupEnv::from_env` in
-`server/src/config.rs` for the full semantics and `.env.example` for the
-commented reference values. The docker image installs the pinned PostgreSQL 17
-client (`postgresql-client-17`) so its `pg_dump` major version matches the
-`pgvector/pgvector:pg17` database image, and `GET /admin/backups` lists the
-dumps. Data also persists in the `rtdb-pg` named volume.
+`0 3 * * *`), `RTDB_BACKUP_DIR` (Compose default `/backups`), and
+`RTDB_BACKUP_RETENTION` (count, default `7`). The canonical Compose file mounts
+`/backups` from the persistent `rtdb-backups` named volume. Keep
+`RTDB_BACKUP_DIR=/backups` for retained backups; changing it requires mounting
+another persistent path. The generic server and `.env.example` default remains
+`./backups`, which resolves to `/backups` in the image's default `/` working
+directory. See `BackupConfig::from_env` in `server/src/config/backup.rs` and
+`.env.example` for the full semantics and reference values. The Docker image
+creates `/backups` owned by UID 10001 with mode 0700 before switching to the
+non-root server user, so a newly created Compose volume is writable. The image
+installs the pinned PostgreSQL 17 client (`postgresql-client-17`) so its
+`pg_dump` major version matches the `pgvector/pgvector:pg17` database image,
+and `GET /admin/backups` lists the dumps. PostgreSQL data persists separately
+in the `rtdb-pg` named volume.
 
 ### Manual trigger, download, delete
 

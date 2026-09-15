@@ -22,7 +22,7 @@ SWIFT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(1),$(SW
 	dashboard-test \
 	python-client-install python-client-test python-client-lint python-client-fmt \
 	python-client-typecheck python-client-checkall rust-client-check-features rtdb-cli deploy \
-	env-drift-check dockerfile-stub-check cli-docs cli-docs-check \
+	env-drift-check dockerfile-stub-check backup-persistence-check cli-docs cli-docs-check \
 	rust-client-doc ts-client-doc python-client-doc swift-client-doc docs-api \
 	swift-client-build swift-client-test swift-client-lint swift-client-fmt \
 	swift-client-fmt-check swift-client-typecheck swift-client-checkall \
@@ -236,7 +236,10 @@ env-drift-check:
 dockerfile-stub-check:
 	./scripts/dockerfile-stub-check.sh
 
-checkall: env-drift-check dockerfile-stub-check cli-docs-check docs-api fmt-check lint typecheck test rust-client-check-features
+backup-persistence-check:
+	./scripts/backup-persistence-check.sh
+
+checkall: env-drift-check dockerfile-stub-check backup-persistence-check cli-docs-check docs-api fmt-check lint typecheck test rust-client-check-features
 
 # ENH-033: criterion micro-benchmarks over the pure hot paths (server) and the
 # in-memory engine (rust-client). No Postgres, no server process. Deliberately

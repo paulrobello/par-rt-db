@@ -113,10 +113,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     # SEC-136: run the server as a non-root, non-login, no-home system user.
     # Port 8300 > 1024 so no CAP_NET_BIND_SERVICE is needed; the binary and the
-    # SPA dir are world-readable/executable; runtime writes go to /tmp and the
-    # backup dir, both provided as tmpfs in docker-compose (read_only rootfs).
+    # SPA dir are world-readable/executable; runtime writes go to /tmp (tmpfs)
+    # and /backups (a persistent named volume in docker-compose).
     && groupadd --system --gid 10001 rtdb \
-    && useradd --system --uid 10001 --gid rtdb --home-dir /app --no-create-home --shell /usr/sbin/nologin rtdb
+    && useradd --system --uid 10001 --gid rtdb --home-dir /app --no-create-home --shell /usr/sbin/nologin rtdb \
+    && install -d -o rtdb -g rtdb -m 0700 /backups
 COPY --from=builder /build/target/release/rtdb-server /usr/local/bin/rtdb-server
 COPY --from=dashboard /build/dashboard/dist /app/dashboard-dist
 RUN chown -R rtdb:rtdb /app

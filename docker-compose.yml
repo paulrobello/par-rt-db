@@ -226,12 +226,12 @@ services:
       # pg_dump is present. See deploy/README.md §Backups.
       RTDB_BACKUP_ENABLED: ${RTDB_BACKUP_ENABLED:-false}
       RTDB_BACKUP_CRON: ${RTDB_BACKUP_CRON:-0 3 * * *}
-      RTDB_BACKUP_DIR: ${RTDB_BACKUP_DIR:-./backups}
+      RTDB_BACKUP_DIR: ${RTDB_BACKUP_DIR:-/backups}
       RTDB_BACKUP_RETENTION: ${RTDB_BACKUP_RETENTION:-7}
       RUST_LOG: ${RUST_LOG:-info}
     # SEC-136: container hardening for the RCE surface (the image-decode path).
     # read_only rootfs — the server's only runtime disk writes are temp files
-    # (/tmp) and the backup dump dir; both are writable tmpfs below. Everything
+    # (/tmp tmpfs) and persistent backup dumps (/backups named volume). Everything
     # else (moka cache, blobs, audit, webhooks) lives in Postgres or in memory.
     # cap_drop ALL + no-new-privileges: the server binds 8300 (>1024, no cap
     # needed) and never escalates; the non-root USER is set in the Dockerfile.
@@ -239,18 +239,15 @@ services:
     tmpfs:
       # tokio/TLS temp files + pg_dump scratch space under a read-only rootfs.
       - /tmp:rw,noexec,nosuid,nodev
-      # Default backup dir: RTDB_BACKUP_DIR defaults to ./backups, which at the
-      # container's CWD (/) resolves to /backups. tmpfs is RAM-backed: operators
-      # enabling RTDB_BACKUP_ENABLED for *retained* dumps must replace this tmpfs
-      # with a named/bind volume at their backup path (the persistence gap is
-      # pre-existing — the container writable layer was never retained either).
-      - /backups:rw,noexec,nosuid,nodev
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
     ports:
       - "127.0.0.1:8300:8300"
+    volumes:
+      - rtdb-backups:/backups
 
 volumes:
   rtdb-pg:
+  rtdb-backups:
