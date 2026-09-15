@@ -28,7 +28,7 @@
 //! the `MigrateResult` compared like any op result; a follow-up `then` reads
 //! against the DERIVED schema.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::common::{test_state, wrap_test_db};
@@ -63,7 +63,24 @@ fn db_name_for(case: &str) -> String {
         })
         .collect();
     let uid = uuid::Uuid::now_v7().simple().to_string();
-    format!("sc_{stem}_{}", &uid[..12])
+    format!("sc_{stem}_{}", &uid[20..])
+}
+
+#[test]
+fn db_name_for_same_prefix_burst_is_valid_and_unique() {
+    let names: Vec<String> = (0..512)
+        .map(|_| db_name_for("migrate-counterexample-preview-rollback-replays"))
+        .collect();
+    let unique: HashSet<&str> = names.iter().map(String::as_str).collect();
+
+    assert_eq!(unique.len(), names.len(), "database names must not collide");
+    assert!(names.iter().all(|name| {
+        name.len() <= 33
+            && name.starts_with(|c: char| c.is_ascii_lowercase())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    }));
 }
 
 /// Resolve one `seed` entry into `(table, doc, label)`. A wrapped entry is an
