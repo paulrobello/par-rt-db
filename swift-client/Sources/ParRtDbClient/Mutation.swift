@@ -49,6 +49,11 @@ public enum Step: Equatable, Codable, Sendable {
     case insert(table: String, doc: [String: JSONValue])
     /// Merge `fields` into an existing document; result is null.
     case patch(table: String, id: String, fields: [String: JSONValue])
+    /// Atomically add an integer delta to a numeric field; result is null.
+    case adjustCounter(
+        table: String, id: String, field: String, delta: Int64,
+        min: Int64?, max: Int64?, expected: [String: JSONValue]?
+    )
     /// Overwrite the whole document; result is null.
     case replace(table: String, id: String, doc: [String: JSONValue])
     /// Delete a document; result is null.
@@ -82,7 +87,7 @@ public enum Step: Equatable, Codable, Sendable {
     case undelete(table: String, id: String)
 
     enum CodingKeys: String, CodingKey, CaseIterable {
-        case op, table, doc, id, fields, version, index, eq, insert, patch
+        case op, table, doc, id, fields, field, delta, min, max, expected, version, index, eq, insert, patch
         case filter, limit, when, txn, spec, external
     }
 
@@ -109,6 +114,20 @@ public enum Step: Equatable, Codable, Sendable {
                 table: container.decode(String.self, forKey: .table),
                 id: container.decode(String.self, forKey: .id),
                 fields: container.decode([String: JSONValue].self, forKey: .fields)
+            )
+        case "adjustCounter":
+            try rejectUnknownVariantFields(
+                "Step", variant: payload.tag, keys: payload.keys,
+                allowed: ["op", "table", "id", "field", "delta", "min", "max", "expected"]
+            )
+            self = try .adjustCounter(
+                table: container.decode(String.self, forKey: .table),
+                id: container.decode(String.self, forKey: .id),
+                field: container.decode(String.self, forKey: .field),
+                delta: container.decode(Int64.self, forKey: .delta),
+                min: container.decodeIfPresent(Int64.self, forKey: .min),
+                max: container.decodeIfPresent(Int64.self, forKey: .max),
+                expected: container.decodeIfPresent([String: JSONValue].self, forKey: .expected)
             )
         case "replace":
             try rejectUnknownVariantFields(
@@ -242,6 +261,15 @@ public enum Step: Equatable, Codable, Sendable {
             try container.encode(table, forKey: .table)
             try container.encode(id, forKey: .id)
             try container.encode(fields, forKey: .fields)
+        case let .adjustCounter(table, id, field, delta, minimum, maximum, expected):
+            try container.encode("adjustCounter", forKey: .op)
+            try container.encode(table, forKey: .table)
+            try container.encode(id, forKey: .id)
+            try container.encode(field, forKey: .field)
+            try container.encode(delta, forKey: .delta)
+            try container.encodeIfPresent(minimum, forKey: .min)
+            try container.encodeIfPresent(maximum, forKey: .max)
+            try container.encodeIfPresent(expected, forKey: .expected)
         case let .replace(table, id, doc):
             try container.encode("replace", forKey: .op)
             try container.encode(table, forKey: .table)

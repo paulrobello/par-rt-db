@@ -64,6 +64,29 @@ struct MutationTests {
 /// Task 9 — the fluent `MutationBuilder`. Wire shapes mirror the rust-client
 /// builder fixtures one-to-one; whole-object equality so a stray key fails.
 struct MutationBuilderTests {
+    @Test func adjustCounterWireShapeOmitsAbsentOptions() throws {
+        let txn = try MutationBuilder()
+            .adjustCounter(
+                "items", "i1", field: "count", delta: -2,
+                min: 0, max: 8, expected: ["state": .string("ready")]
+            )
+            .adjustCounter("items", "i2", field: "count", delta: 1)
+            .build()
+        #expect(try txn.wireObject() == ["steps": .array([
+            .object([
+                "op": .string("adjustCounter"), "table": .string("items"),
+                "id": .string("i1"), "field": .string("count"), "delta": .int(-2),
+                "min": .int(0), "max": .int(8),
+                "expected": .object(["state": .string("ready")])
+            ]),
+            .object([
+                "op": .string("adjustCounter"), "table": .string("items"),
+                "id": .string("i2"), "field": .string("count"), "delta": .int(1)
+            ])
+        ])])
+        #expect(try roundTrip(txn) == txn)
+    }
+
     @Test func threeStepChainBuildsExactShape() throws {
         // The brief's chained fixture, with the shipped wire key: patch carries
         // `fields` (rust: {"op":"patch",...,"fields":{...}}), not `doc`.

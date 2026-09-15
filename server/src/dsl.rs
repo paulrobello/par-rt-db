@@ -328,6 +328,7 @@ impl StepTableExt for Step {
         match self {
             Step::Insert { table, .. }
             | Step::Patch { table, .. }
+            | Step::AdjustCounter { table, .. }
             | Step::Replace { table, .. }
             | Step::Delete { table, .. }
             | Step::ExpectVersion { table, .. }

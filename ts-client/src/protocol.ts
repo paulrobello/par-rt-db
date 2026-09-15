@@ -319,6 +319,16 @@ export type OnDeleteAction = "cascade" | "restrict" | "setNull";
 export type StepJson =
   | { op: "insert"; table: string; doc: Record<string, unknown> }
   | { op: "patch"; table: string; id: string; fields: Record<string, unknown> }
+  | {
+      op: "adjustCounter";
+      table: string;
+      id: string;
+      field: string;
+      delta: number;
+      min?: number;
+      max?: number;
+      expected?: Record<string, unknown>;
+    }
   | { op: "replace"; table: string; id: string; doc: Record<string, unknown> }
   | { op: "delete"; table: string; id: string }
   | { op: "undelete"; table: string; id: string }

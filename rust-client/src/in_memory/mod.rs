@@ -38,6 +38,41 @@ use crate::wire::{
     ScheduleStatus, ScheduleWhen,
 };
 
+fn expected_json_eq(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(a), Value::Number(b)) => {
+            let integer = |number: &serde_json::Number| {
+                number
+                    .as_i64()
+                    .map(i128::from)
+                    .or_else(|| number.as_u64().map(i128::from))
+                    .or_else(|| {
+                        let value = number.as_f64()?;
+                        (value.is_finite()
+                            && value.fract() == 0.0
+                            && value.abs() < 2.0_f64.powi(127))
+                        .then_some(value as i128)
+                    })
+            };
+            match (integer(a), integer(b)) {
+                (Some(a), Some(b)) => a == b,
+                _ => a.as_f64() == b.as_f64(),
+            }
+        }
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| expected_json_eq(a, b))
+        }
+        (Value::Object(a), Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter().all(|(key, value)| {
+                    b.get(key)
+                        .is_some_and(|other| expected_json_eq(value, other))
+                })
+        }
+        _ => left == right,
+    }
+}
+
 /// Maximum number of steps in a single transaction (mirrors the server cap).
 pub const MAX_STEPS: usize = 1024;
 /// Maximum rows returned from a single `take`/`collect` (mirrors the server cap).
@@ -679,6 +714,134 @@ impl InMemoryRtDbClient {
             Step::Patch { table, id, fields } => {
                 let table_def = self.require_table(table)?.clone();
                 self.do_patch(&table_def, table, id, fields)?;
+                Ok((StepResult::Null, vec![table.clone()]))
+            }
+            Step::AdjustCounter {
+                table,
+                id,
+                field,
+                delta,
+                min,
+                max,
+                expected,
+            } => {
+                let table_def = self.require_table(table)?.clone();
+                const MAX_SAFE: i64 = 9_007_199_254_740_991;
+                if delta.unsigned_abs() > MAX_SAFE as u64
+                    || min.is_some_and(|n| n.unsigned_abs() > MAX_SAFE as u64)
+                    || max.is_some_and(|n| n.unsigned_abs() > MAX_SAFE as u64)
+                    || (*min).zip(*max).is_some_and(|(lo, hi)| lo > hi)
+                {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        "counter delta and bounds must be safe integers with min <= max",
+                    ));
+                }
+                let ty = table_def.fields.get(field).ok_or_else(|| {
+                    RtDbError::new(
+                        ErrorCode::SchemaViolation,
+                        format!("unknown field '{field}'"),
+                    )
+                })?;
+                if table_def.computed.contains_key(field) {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!("computed field '{field}' cannot be adjusted"),
+                    ));
+                }
+                if table_def.auto_increment_field.as_deref() == Some(field) {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!("autoIncrementField '{field}' cannot be changed"),
+                    ));
+                }
+                if table_def.updated_at_field.as_deref() == Some(field) {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!("updatedAtField '{field}' cannot be adjusted"),
+                    ));
+                }
+                let numeric = matches!(ty, FieldType::Number)
+                    || matches!(ty, FieldType::Optional { inner } if matches!(inner.as_ref(), FieldType::Number));
+                if !numeric {
+                    return Err(RtDbError::new(
+                        ErrorCode::SchemaViolation,
+                        format!("counter field '{field}' must be number or optional(number)"),
+                    ));
+                }
+                let key = (table.clone(), id.clone());
+                let row = self
+                    .docs
+                    .get(&key)
+                    .filter(|row| row.deleted_at.is_none())
+                    .cloned()
+                    .ok_or_else(|| {
+                        RtDbError::new(ErrorCode::NotFound, format!("document '{id}' not found"))
+                    })?;
+                for (expected_field, wanted) in expected.iter().flat_map(|m| m.iter()) {
+                    if !table_def.fields.contains_key(expected_field) {
+                        return Err(RtDbError::new(
+                            ErrorCode::SchemaViolation,
+                            format!("unknown expected field '{expected_field}'"),
+                        ));
+                    }
+                    if !row
+                        .doc
+                        .get(expected_field)
+                        .is_some_and(|actual| expected_json_eq(actual, wanted))
+                    {
+                        return Err(RtDbError::new(
+                            ErrorCode::PreconditionFailed,
+                            format!("expected field '{expected_field}' did not match"),
+                        ));
+                    }
+                }
+                let ty = match ty {
+                    FieldType::Optional { inner } => inner.as_ref(),
+                    other => other,
+                };
+                let current = match ty {
+                    FieldType::Number => row
+                        .doc
+                        .get(field)
+                        .and_then(Value::as_f64)
+                        .filter(|n| {
+                            n.is_finite()
+                                && n.fract() == 0.0
+                                && *n >= -(MAX_SAFE as f64)
+                                && *n <= MAX_SAFE as f64
+                        })
+                        .map(|n| n as i64),
+                    _ => None,
+                }
+                .ok_or_else(|| {
+                    RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!("counter field '{field}' must contain a safe integer"),
+                    )
+                })?;
+                let next = current
+                    .checked_add(*delta)
+                    .filter(|n| n.unsigned_abs() <= MAX_SAFE as u64)
+                    .ok_or_else(|| {
+                        RtDbError::new(
+                            ErrorCode::BadRequest,
+                            "counter result is outside the safe integer range",
+                        )
+                    })?;
+                if min.is_some_and(|n| next < n) || max.is_some_and(|n| next > n) {
+                    return Err(RtDbError::new(
+                        ErrorCode::PreconditionFailed,
+                        "counter result is outside the configured bounds",
+                    ));
+                }
+                let value = Value::from(next);
+                self.do_patch(
+                    &table_def,
+                    table,
+                    id,
+                    &Map::from_iter([(field.clone(), value)]),
+                )?;
                 Ok((StepResult::Null, vec![table.clone()]))
             }
             Step::Replace { table, id, doc } => {

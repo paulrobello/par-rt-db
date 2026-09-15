@@ -1,4 +1,4 @@
-"""Tests for ``par_rt_db.mutation``: ``Step`` (14 ops), ``StepResult``, ``Transaction``,
+"""Tests for ``par_rt_db.mutation``: ``Step`` (15 ops), ``StepResult``, ``Transaction``,
 and the ``Mutation`` builder.
 
 Mirrors ``server/src/txn.rs`` (the ``Step`` enum + ``Transaction`` struct +
@@ -385,3 +385,49 @@ def test_undelete_rejects_unknown_field():
         Transaction.model_validate(
             {"steps": [{"op": "undelete", "table": "t", "id": "x", "bogus": 1}]}
         )
+
+
+def test_adjust_counter_wire_shape_and_optional_omission():
+    wire = json.loads(
+        Mutation.builder()
+        .adjust_counter("items", "i1", "order", 2, min=0, max=9, expected={"status": "todo"})
+        .build()
+        .model_dump_json(by_alias=True)
+    )
+    assert wire["steps"][0] == {
+        "op": "adjustCounter",
+        "table": "items",
+        "id": "i1",
+        "field": "order",
+        "delta": 2,
+        "min": 0,
+        "max": 9,
+        "expected": {"status": "todo"},
+    }
+    bare = json.loads(
+        Mutation.builder()
+        .adjust_counter("items", "i1", "order", -1)
+        .build()
+        .model_dump_json(by_alias=True)
+    )
+    assert bare["steps"][0] == {
+        "op": "adjustCounter",
+        "table": "items",
+        "id": "i1",
+        "field": "order",
+        "delta": -1,
+    }
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"delta": 1.0},
+        {"delta": 1, "min": 0.0},
+        {"delta": 1, "max": 4.0},
+    ],
+)
+def test_adjust_counter_builder_rejects_float_integer_arguments(options):
+    with pytest.raises(RtDbError) as ei:
+        Mutation.builder().adjust_counter("items", "i1", "order", **options)
+    assert ei.value.code is ErrorCode.BAD_REQUEST

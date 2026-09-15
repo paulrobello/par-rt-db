@@ -27,7 +27,7 @@ use crate::auth::{PrincipalCtx, authorize_table};
 use crate::db::{new_id, now_ms, validate_db_name};
 use crate::ddl::{pg_col, pg_schema, pg_sequence, pg_table};
 use crate::dsl::{FilterExpr, StepTableExt, filter_matches};
-use crate::error::RtDbError;
+use crate::error::{ErrorCode, RtDbError};
 use crate::scheduler;
 use crate::schema::{
     FieldType, OnDeleteAction, SchemaDef, SchemaDefExt, TableDef, TableDefExt, indexed_column_type,
@@ -1433,6 +1433,9 @@ pub async fn execute_txn(
         match step {
             Step::Insert { table, doc } => step_insert(&mut sctx, table, doc).await?,
             Step::Patch { table, id, fields } => step_patch(&mut sctx, table, id, fields).await?,
+            Step::AdjustCounter { table, id, field, delta, min, max, expected } => {
+                step_adjust_counter(&mut sctx, table, id, field, *delta, *min, *max, expected.as_ref()).await?
+            }
             Step::Replace { table, id, doc } => step_replace(&mut sctx, table, id, doc).await?,
             Step::Delete { table, id } => step_delete(&mut sctx, table, id).await?,
             Step::Undelete { table, id } => step_undelete(&mut sctx, table, id).await?,
@@ -1547,6 +1550,185 @@ async fn step_patch(
     // `before` = pre-merge body (frozen on first touch by the helper
     // so a doc inserted earlier this txn stays `before = None`);
     // `after` = merged body.
+    sctx.write_set.capture_doc(
+        table,
+        id,
+        Some(Some(&pre_doc)),
+        Some(Some(&merged)),
+        Some(created_at),
+    );
+    sctx.results.push(serde_json::Value::Null);
+    Ok(())
+}
+
+const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+
+fn expected_json_eq(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    match (left, right) {
+        (serde_json::Value::Number(a), serde_json::Value::Number(b)) => {
+            let integer = |number: &serde_json::Number| {
+                number
+                    .as_i64()
+                    .map(i128::from)
+                    .or_else(|| number.as_u64().map(i128::from))
+                    .or_else(|| {
+                        let value = number.as_f64()?;
+                        (value.is_finite()
+                            && value.fract() == 0.0
+                            && value.abs() < 2.0_f64.powi(127))
+                        .then_some(value as i128)
+                    })
+            };
+            match (integer(a), integer(b)) {
+                (Some(a), Some(b)) => a == b,
+                _ => a.as_f64() == b.as_f64(),
+            }
+        }
+        (serde_json::Value::Array(a), serde_json::Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| expected_json_eq(a, b))
+        }
+        (serde_json::Value::Object(a), serde_json::Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter().all(|(key, value)| {
+                    b.get(key)
+                        .is_some_and(|other| expected_json_eq(value, other))
+                })
+        }
+        _ => left == right,
+    }
+}
+
+fn counter_value(
+    field_type: &FieldType,
+    value: &serde_json::Value,
+    field: &str,
+) -> Result<i64, RtDbError> {
+    let n = match field_type {
+        FieldType::Number => value
+            .as_f64()
+            .filter(|n| n.is_finite() && n.fract() == 0.0)
+            .and_then(|n| {
+                (n >= -(MAX_SAFE_INTEGER as f64) && n <= MAX_SAFE_INTEGER as f64)
+                    .then_some(n as i64)
+            }),
+        FieldType::Optional { inner } if matches!(inner.as_ref(), FieldType::Number) => {
+            return counter_value(inner, value, field);
+        }
+        _ => None,
+    };
+    n.ok_or_else(|| {
+        RtDbError::bad_request(format!(
+            "counter field '{field}' must contain a safe integer"
+        ))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn step_adjust_counter(
+    sctx: &mut StepCtx<'_>,
+    table: &str,
+    id: &str,
+    field: &str,
+    delta: i64,
+    min: Option<i64>,
+    max: Option<i64>,
+    expected: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<(), RtDbError> {
+    let table_def = sctx.schema.table(table)?;
+    if delta.unsigned_abs() > MAX_SAFE_INTEGER as u64
+        || min.is_some_and(|n| n.unsigned_abs() > MAX_SAFE_INTEGER as u64)
+        || max.is_some_and(|n| n.unsigned_abs() > MAX_SAFE_INTEGER as u64)
+        || min.zip(max).is_some_and(|(lo, hi)| lo > hi)
+    {
+        return Err(RtDbError::bad_request(
+            "counter delta and bounds must be safe integers with min <= max",
+        ));
+    }
+    let field_type = table_def
+        .fields
+        .get(field)
+        .ok_or_else(|| RtDbError::schema(format!("unknown field '{field}'")))?;
+    if table_def.computed.contains_key(field) {
+        return Err(RtDbError::bad_request(format!(
+            "computed field '{field}' cannot be adjusted"
+        )));
+    }
+    if table_def.auto_increment_field.as_deref() == Some(field) {
+        return Err(RtDbError::bad_request(format!(
+            "autoIncrementField '{field}' cannot be changed"
+        )));
+    }
+    if table_def.updated_at_field.as_deref() == Some(field) {
+        return Err(RtDbError::bad_request(format!(
+            "updatedAtField '{field}' cannot be adjusted"
+        )));
+    }
+    let numeric = matches!(field_type, FieldType::Number)
+        || matches!(field_type, FieldType::Optional { inner } if matches!(inner.as_ref(), FieldType::Number));
+    if !numeric {
+        return Err(RtDbError::schema(format!(
+            "counter field '{field}' must be number or optional(number)"
+        )));
+    }
+    check_owner(sctx.tx, sctx.pg_schema_name, table_def, table, id, sctx.ctx).await?;
+    let table_ident = pg_table(table);
+    let live_only = if table_def.soft_delete {
+        " AND \"deleted_at\" IS NULL"
+    } else {
+        ""
+    };
+    let row: Option<serde_json::Value> = sqlx::query_scalar(&format!(
+        "SELECT \"doc\" FROM \"{}\".\"{}\" WHERE \"id\" = $1{live_only} FOR UPDATE",
+        sctx.pg_schema_name, table_ident
+    ))
+    .bind(id)
+    .fetch_optional(&mut *sctx.tx)
+    .await?;
+    let doc = row.ok_or_else(|| RtDbError::not_found(format!("document '{id}' not found")))?;
+    let doc = doc
+        .as_object()
+        .ok_or_else(|| RtDbError::internal("stored doc is not a JSON object"))?;
+    if let Some(expected) = expected {
+        for (key, wanted) in expected {
+            if !table_def.fields.contains_key(key) {
+                return Err(RtDbError::schema(format!("unknown expected field '{key}'")));
+            }
+            if !doc
+                .get(key)
+                .is_some_and(|actual| expected_json_eq(actual, wanted))
+            {
+                return Err(RtDbError::new(
+                    ErrorCode::PreconditionFailed,
+                    format!("expected field '{key}' did not match"),
+                ));
+            }
+        }
+    }
+    let current_json = doc
+        .get(field)
+        .ok_or_else(|| RtDbError::bad_request(format!("counter field '{field}' is missing")))?;
+    let current = counter_value(field_type, current_json, field)?;
+    let next = current
+        .checked_add(delta)
+        .filter(|n| n.unsigned_abs() <= MAX_SAFE_INTEGER as u64)
+        .ok_or_else(|| {
+            RtDbError::bad_request("counter result is outside the safe integer range")
+        })?;
+    if min.is_some_and(|n| next < n) || max.is_some_and(|n| next > n) {
+        return Err(RtDbError::new(
+            ErrorCode::PreconditionFailed,
+            "counter result is outside the configured bounds",
+        ));
+    }
+    let next = serde_json::json!(next);
+    let fields = serde_json::Map::from_iter([(field.to_string(), next)]);
+    let fields = stamp_owner(table_def, fields, sctx.owner);
+    let fields = stamp_authorize(table_def, fields, sctx.ctx);
+    let fields = stamp_updated_at(table_def, fields, now_ms());
+    let (pre_doc, merged, created_at) =
+        do_patch(sctx.tx, sctx.pg_schema_name, table_def, table, id, &fields).await?;
+    verify_authorize_doc(table_def, &merged, sctx.ctx)?;
+    sctx.write_set.touch(table, id, OpKind::Patch);
     sctx.write_set.capture_doc(
         table,
         id,

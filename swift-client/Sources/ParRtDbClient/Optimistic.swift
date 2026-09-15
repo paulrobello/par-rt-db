@@ -134,7 +134,7 @@ private func projectUnfilteredArray(
             // nothing unambiguous to overlay — the authoritative update
             // delivers the restored row (ts-client fallthrough).
             continue
-        case .upsert:
+        case .upsert, .adjustCounter:
             return .skip
         case .expectVersion, .expectAbsent:
             continue
@@ -175,7 +175,7 @@ private func projectFilteredArray(
             // Restores a doc whose body is not in this cached result —
             // nothing unambiguous to overlay (ts-client fallthrough).
             continue
-        case .insert, .patch, .replace, .upsert:
+        case .insert, .patch, .replace, .upsert, .adjustCounter:
             // Membership-ambiguous under a filter.
             return .skip
         case .expectVersion, .expectAbsent:
@@ -224,7 +224,7 @@ private func projectGet(
                 replacement.removeValue(forKey: "_version")
                 working = .object(replacement)
             }
-        case .upsert:
+        case .upsert, .adjustCounter:
             return .skip
         case .patchByQuery, .deleteByQuery:
             // A by-query step may patch/delete the target row, but the filter
@@ -256,6 +256,7 @@ private extension Step {
         switch self {
         case let .insert(table, _),
              let .patch(table, _, _),
+             let .adjustCounter(table, _, _, _, _, _, _),
              let .replace(table, _, _),
              let .delete(table, _),
              let .undelete(table, _),

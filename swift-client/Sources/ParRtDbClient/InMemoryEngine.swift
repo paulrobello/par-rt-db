@@ -993,8 +993,7 @@ public final class InMemoryRtDbClient: MigrationStore {
         // shallow — the TS shares the job/run objects too.
         let schedulesSnapshot = schedules
         let scheduleOrderSnapshot = scheduleOrder
-        let workflowsSnapshot = workflows
-        let workflowOrderSnapshot = workflowOrder
+        let workflowsSnapshot = WorkflowTransactionSnapshot(workflows, order: workflowOrder)
         var results: [JSONValue] = []
         var writeSet: Set<String> = []
         do {
@@ -1016,8 +1015,7 @@ public final class InMemoryRtDbClient: MigrationStore {
             restoreTables(snapshot)
             schedules = schedulesSnapshot
             scheduleOrder = scheduleOrderSnapshot
-            workflows = workflowsSnapshot
-            workflowOrder = workflowOrderSnapshot
+            workflowsSnapshot.restore(into: &workflows, order: &workflowOrder)
             throw error
         }
         notifySubs(writeSet)
@@ -1787,6 +1785,13 @@ public final class InMemoryRtDbClient: MigrationStore {
             let tableDef = try requireTable(table)
             try doPatch(tableDef, table, id, fields)
             return StepExecution(result: .null, table: table, extraTables: [])
+        case let .adjustCounter(table, id, field, delta, minimum, maximum, expected):
+            let tableDef = try requireTable(table)
+            let adjustment = CounterAdjustment(
+                field: field, delta: delta, min: minimum, max: maximum, expected: expected
+            )
+            try doAdjustCounter(tableDef, table, id, adjustment)
+            return StepExecution(result: .null, table: table, extraTables: [])
         case let .replace(table, id, doc):
             let tableDef = try requireTable(table)
             try doReplace(tableDef, table, id, doc)
@@ -1913,6 +1918,15 @@ public final class InMemoryRtDbClient: MigrationStore {
         let stamped = stampUpdatedAt(tableDef, fields, nowFn())
         let merged = try applyPatch(tableDef, row.doc, stamped, now: nowFn())
         try doUpdate(tableName, tableDef, row, merged)
+    }
+
+    private func doAdjustCounter(
+        _ tableDef: TableDef, _ tableName: String, _ id: String, _ adjustment: CounterAdjustment
+    ) throws {
+        try adjustment.validate(table: tableDef)
+        let row = try requireRow(tableName, id)
+        let value = try adjustment.value(in: row.doc)
+        try doPatch(tableDef, tableName, id, [adjustment.field: value])
     }
 
     private func doReplace(

@@ -46,6 +46,26 @@ pub enum Step {
         /// Keys to merge in.
         fields: serde_json::Map<String, serde_json::Value>,
     },
+    /// Atomically add a safe integer delta to a declared numeric field.
+    AdjustCounter {
+        /// Target table.
+        table: String,
+        /// Document id.
+        id: String,
+        /// Counter field.
+        field: String,
+        /// Signed safe-integer delta.
+        delta: i64,
+        /// Inclusive minimum result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min: Option<i64>,
+        /// Inclusive maximum result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<i64>,
+        /// Stable row fields that must match before applying the delta.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected: Option<serde_json::Map<String, serde_json::Value>>,
+    },
     /// Overwrite the whole document; result is `null`.
     Replace {
         /// Target table.

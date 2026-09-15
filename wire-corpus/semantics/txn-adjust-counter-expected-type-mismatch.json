@@ -1,0 +1,32 @@
+{
+  "name": "txn-adjust-counter-expected-type-mismatch",
+  "$comment": "A stored boolean does not equal the JSON number 1 in expected, despite their truth-like relationship in some languages.",
+  "schema": {
+    "tables": {
+      "counters": {
+        "fields": {
+          "value": { "type": "number" },
+          "enabled": { "type": "boolean" }
+        }
+      }
+    }
+  },
+  "seed": [
+    { "$id": "counter", "doc": { "value": 1, "enabled": true } }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "adjustCounter",
+          "table": "counters",
+          "id": { "$idRef": "counter" },
+          "field": "value",
+          "delta": 0,
+          "expected": { "enabled": 1 }
+        }
+      ]
+    }
+  },
+  "expect": { "error": { "code": "PRECONDITION_FAILED" } }
+}

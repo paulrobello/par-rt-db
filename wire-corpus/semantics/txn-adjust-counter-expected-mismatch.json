@@ -1,0 +1,43 @@
+{
+  "name": "txn-adjust-counter-expected-mismatch",
+  "$comment": "A nested expected field value that differs from the row rejects the adjustment.",
+  "schema": {
+    "tables": {
+      "counters": {
+        "fields": {
+          "value": { "type": "number" },
+          "metadata": {
+            "type": "object",
+            "fields": {
+              "limits": {
+                "type": "object",
+                "fields": { "hourly": { "type": "number" } }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "seed": [
+    {
+      "$id": "counter",
+      "doc": { "value": 2, "metadata": { "limits": { "hourly": 4 } } }
+    }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "adjustCounter",
+          "table": "counters",
+          "id": { "$idRef": "counter" },
+          "field": "value",
+          "delta": 1,
+          "expected": { "metadata": { "limits": { "hourly": 5 } } }
+        }
+      ]
+    }
+  },
+  "expect": { "error": { "code": "PRECONDITION_FAILED" } }
+}

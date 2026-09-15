@@ -1,6 +1,92 @@
 use super::*;
 
 #[tokio::test]
+async fn adjust_counter_checks_expected_bounds_and_rolls_back_the_transaction() {
+    let mut c = new_client();
+    let inserted = c
+        .mutate(
+            &Mutation::new()
+                .insert("items", json!({"name":"n","status":"todo","order":4.0}))
+                .build(),
+            None,
+        )
+        .await
+        .unwrap();
+    let StepResult::Insert { id } = &inserted[0] else {
+        panic!("expected insert")
+    };
+    let adjusted = c
+        .mutate(
+            &Mutation::new()
+                .adjust_counter(
+                    "items",
+                    id,
+                    "order",
+                    3,
+                    Some(0),
+                    Some(8),
+                    Some(json!({"status":"todo","order":4})),
+                )
+                .build(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(adjusted[0], StepResult::Null));
+    assert_eq!(c.get("items", id).unwrap()["order"], 7);
+
+    let err = c
+        .mutate(
+            &Mutation::new()
+                .adjust_counter("items", id, "order", 2, Some(0), Some(8), None)
+                .build(),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::PreconditionFailed);
+    assert_eq!(c.get("items", id).unwrap()["order"], 7);
+
+    let err = c
+        .mutate(
+            &Transaction {
+                steps: vec![
+                    Step::Insert {
+                        table: "items".into(),
+                        doc: json!({"name":"rollback","status":"todo","order":1})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    },
+                    Step::AdjustCounter {
+                        table: "items".into(),
+                        id: id.clone(),
+                        field: "order".into(),
+                        delta: -8,
+                        min: Some(0),
+                        max: None,
+                        expected: None,
+                    },
+                ],
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::PreconditionFailed);
+    assert_eq!(c.docs.len(), 1, "earlier insert must roll back");
+}
+
+#[test]
+fn adjust_counter_expected_values_compare_json_numbers_without_coercing_booleans() {
+    assert!(super::super::expected_json_eq(
+        &json!({"nested":[1.0,{"enabled":true}]}),
+        &json!({"nested":[1,{"enabled":true}]})
+    ));
+    assert!(!super::super::expected_json_eq(&json!(true), &json!(1)));
+}
+
+#[tokio::test]
 async fn insert_merges_system_fields_at_read_time() {
     let mut c = new_client();
     let txn = Mutation::new()

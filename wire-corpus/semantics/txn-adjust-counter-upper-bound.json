@@ -1,0 +1,27 @@
+{
+  "name": "txn-adjust-counter-upper-bound",
+  "$comment": "The inclusive upper bound rejects a resulting value above max.",
+  "schema": {
+    "tables": {
+      "counters": {
+        "fields": { "value": { "type": "number" } }
+      }
+    }
+  },
+  "seed": [{ "$id": "counter", "doc": { "value": 5 } }],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "adjustCounter",
+          "table": "counters",
+          "id": { "$idRef": "counter" },
+          "field": "value",
+          "delta": 1,
+          "max": 5
+        }
+      ]
+    }
+  },
+  "expect": { "error": { "code": "PRECONDITION_FAILED" } }
+}

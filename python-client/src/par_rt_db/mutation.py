@@ -1,4 +1,4 @@
-"""Transaction DSL: ``Step`` (14 ops), ``StepResult``, ``Transaction``,
+"""Transaction DSL: ``Step`` (15 ops), ``StepResult``, ``Transaction``,
 and the ``Mutation`` builder.
 
 Mirrors ``server/src/txn.rs`` (the ``Step`` enum + ``Transaction`` struct +
@@ -41,6 +41,15 @@ from .wire import AwaitSignalSpec, FilterExpr, ScheduleWhen, WorkflowSpec, to_ca
 #: (1024); the server rejects anything longer, so the builder raises eagerly to
 #: keep the over-cap payload off the wire.
 MAX_STEPS = 1024
+_MAX_SAFE_COUNTER_INTEGER = 2**53 - 1
+
+
+def _is_safe_counter_integer(value: Any) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and -_MAX_SAFE_COUNTER_INTEGER <= value <= _MAX_SAFE_COUNTER_INTEGER
+    )
 
 
 class _Step(BaseModel):
@@ -64,6 +73,25 @@ class _Patch(_Step):
     table: str
     id: str
     fields: dict[str, Any]
+
+
+class _AdjustCounter(_Step):
+    op: Literal["adjustCounter"] = "adjustCounter"
+    table: str
+    id: str
+    field: str
+    delta: Any
+    min: Any = None
+    max: Any = None
+    expected: dict[str, Any] | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_none_options(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        for key in ("min", "max", "expected"):
+            if out.get(key) is None:
+                out.pop(key, None)
+        return out
 
 
 class _Replace(_Step):
@@ -195,12 +223,13 @@ class _CancelWorkflow(_Step):
     id: str
 
 
-#: Discriminated union of all 14 step ops. The ``op`` literal drives dispatch;
+#: Discriminated union of all 15 step ops. The ``op`` literal drives dispatch;
 #: ``deny_unknown_fields`` is per-variant via ``extra="forbid"`` on ``_Step``.
 Step = Annotated[
     (
         _Insert
         | _Patch
+        | _AdjustCounter
         | _Replace
         | _Delete
         | _Undelete
@@ -372,6 +401,40 @@ class _MutationBuilder:
     def patch(self, table: str, id: str, fields: dict[str, Any]) -> _MutationBuilder:
         """Patch step: merge ``fields`` into the existing document at ``id`` in ``table``."""
         self._steps.append(_Patch(table=table, id=id, fields=fields))
+        return self
+
+    def adjust_counter(
+        self,
+        table: str,
+        id: str,
+        field: str,
+        delta: int,
+        *,
+        min: int | None = None,
+        max: int | None = None,
+        expected: dict[str, Any] | None = None,
+    ) -> _MutationBuilder:
+        """Atomically add ``delta`` to a declared numeric field."""
+        if any(
+            value is not None and not _is_safe_counter_integer(value) for value in (delta, min, max)
+        ):
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                "adjustCounter numeric arguments must be safe integers",
+            )
+        if min is not None and max is not None and min > max:
+            raise RtDbError(ErrorCode.BAD_REQUEST, "adjustCounter min must not exceed max")
+        self._steps.append(
+            _AdjustCounter(
+                table=table,
+                id=id,
+                field=field,
+                delta=delta,
+                min=min,
+                max=max,
+                expected=expected,
+            )
+        )
         return self
 
     def replace(self, table: str, id: str, doc: dict[str, Any]) -> _MutationBuilder:

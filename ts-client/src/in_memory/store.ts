@@ -1200,6 +1200,7 @@ export class InMemoryRtDbClient {
     // FM-29: same for startWorkflow/cancelWorkflow and the workflow store.
     const schedulesSnapshot = new Map(this.schedules);
     const workflowsSnapshot = new Map(this.workflows);
+    const workflowStates = structuredClone(this.workflows);
     const results: unknown[] = [];
     const writeSet = new Set<string>();
     try {
@@ -1223,6 +1224,9 @@ export class InMemoryRtDbClient {
       }
       this.workflows.clear();
       for (const [id, run] of workflowsSnapshot) {
+        // tick keeps the run reference while executing its step transaction.
+        for (const key of Object.keys(run)) Reflect.deleteProperty(run, key);
+        Object.assign(run, workflowStates.get(id));
         this.workflows.set(id, run);
       }
       throw error;
@@ -1978,6 +1982,11 @@ export class InMemoryRtDbClient {
         this.doPatch(tableDef, table, step.id, step.fields);
         return { result: null, table };
       }
+      case "adjustCounter": {
+        const tableDef = this.requireTable(table);
+        this.doAdjustCounter(tableDef, step);
+        return { result: null, table };
+      }
       case "replace": {
         const tableDef = this.requireTable(table);
         this.doReplace(tableDef, table, step.id, step.doc);
@@ -2097,6 +2106,51 @@ export class InMemoryRtDbClient {
     const id = this.newId();
     this.rowsFor(tableName).set(id, { id, doc: stored, createdAt: this.now(), version: 1 });
     return id;
+  }
+
+  private doAdjustCounter(
+    tableDef: TableJson,
+    step: Extract<TransactionJson["steps"][number], { op: "adjustCounter" }>,
+  ): void {
+    for (const value of [step.delta, step.min, step.max]) {
+      if (value !== undefined && !Number.isSafeInteger(value))
+        throw new RtDbError("BAD_REQUEST", "counter values must be safe integers");
+    }
+    if (
+      !Number.isSafeInteger(step.delta) ||
+      (step.min !== undefined && step.max !== undefined && step.min > step.max)
+    )
+      throw new RtDbError("BAD_REQUEST", "invalid counter delta or bounds");
+    if (step.expected !== undefined && !isPlainObject(step.expected))
+      throw new RtDbError("BAD_REQUEST", "expected counter fields must be an object");
+    if (!Object.hasOwn(tableDef.fields, step.field))
+      throw new RtDbError("SCHEMA_VIOLATION", `unknown field '${step.field}'`);
+    if (
+      Object.hasOwn(tableDef.computed ?? {}, step.field) ||
+      tableDef.autoIncrementField === step.field ||
+      tableDef.updatedAtField === step.field
+    )
+      throw new RtDbError("BAD_REQUEST", "server-controlled fields cannot be counters");
+    const fieldType = tableDef.fields[step.field];
+    const numericType = fieldType.type === "optional" ? fieldType.inner : fieldType;
+    if (numericType.type !== "number")
+      throw new RtDbError("SCHEMA_VIOLATION", "counter field must have numeric type");
+    const row = this.requireRow(step.table, step.id);
+    for (const [field, expected] of Object.entries(step.expected ?? {})) {
+      if (!Object.hasOwn(tableDef.fields, field))
+        throw new RtDbError("SCHEMA_VIOLATION", `unknown expected field '${field}'`);
+      if (!Object.hasOwn(row.doc, field) || canonical(row.doc[field]) !== canonical(expected))
+        throw new RtDbError("PRECONDITION_FAILED", "counter expected fields do not match");
+    }
+    const current = row.doc[step.field];
+    if (typeof current !== "number" || !Number.isSafeInteger(current))
+      throw new RtDbError("BAD_REQUEST", "stored counter must be a safe integer");
+    const next = current + step.delta;
+    if (!Number.isSafeInteger(next))
+      throw new RtDbError("BAD_REQUEST", "counter result must be a safe integer");
+    if ((step.min !== undefined && next < step.min) || (step.max !== undefined && next > step.max))
+      throw new RtDbError("PRECONDITION_FAILED", "counter result is outside its bounds");
+    this.doPatch(tableDef, step.table, step.id, { [step.field]: next });
   }
 
   private doPatch(

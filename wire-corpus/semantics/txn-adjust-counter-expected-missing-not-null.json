@@ -1,0 +1,30 @@
+{
+  "name": "txn-adjust-counter-expected-missing-not-null",
+  "$comment": "An absent optional field does not satisfy an expected JSON null.",
+  "schema": {
+    "tables": {
+      "counters": {
+        "fields": {
+          "value": { "type": "number" },
+          "note": { "type": "optional", "inner": { "type": "string" } }
+        }
+      }
+    }
+  },
+  "seed": [{ "$id": "counter", "doc": { "value": 1 } }],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "adjustCounter",
+          "table": "counters",
+          "id": { "$idRef": "counter" },
+          "field": "value",
+          "delta": 0,
+          "expected": { "note": null }
+        }
+      ]
+    }
+  },
+  "expect": { "error": { "code": "PRECONDITION_FAILED" } }
+}

@@ -24,6 +24,7 @@ from ..mutation import (
     Step,
     StepResult,
     Transaction,
+    _AdjustCounter,
     _CancelSchedule,
     _CancelWorkflow,
     _Delete,
@@ -31,6 +32,7 @@ from ..mutation import (
     _ExpectAbsent,
     _ExpectVersion,
     _Insert,
+    _is_safe_counter_integer,
     _Patch,
     _PatchByQuery,
     _Replace,
@@ -121,6 +123,22 @@ MAX_EVERY_MS = 365 * 24 * 60 * 60 * 1000
 #: ``signal_workflow`` before any run lookup — the same first-check position
 #: the server's ``deliver_signal`` uses.
 MAX_SIGNAL_PAYLOAD_BYTES = 64 * 1024
+
+
+def _json_structurally_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left is right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left == right
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(
+            _json_structurally_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            _json_structurally_equal(a, b) for a, b in zip(left, right, strict=True)
+        )
+    return type(left) is type(right) and left == right
 
 
 def worst_case_affected(txn: Transaction) -> int:
@@ -1478,9 +1496,7 @@ class _InMemoryStoreCore:
                 f"transaction could affect up to {worst} documents, exceeding the limit "
                 f"of {MAX_AFFECTED_ROWS_PER_TXN}",
             )
-        snapshot = dict(
-            self._docs
-        )  # shallow copy; StoredRow values are replaced, not mutated in place
+        snapshot = deepcopy(self._docs)
         # FM-28: schedule/cancelSchedule steps mutate the pending-jobs store, so
         # it joins the rollback snapshot — a failed later step must not leave a
         # phantom enqueued (or cancelled) job behind, mirroring the server's
@@ -1522,6 +1538,20 @@ class _InMemoryStoreCore:
             case _Patch(table=table, id=sid, fields=fields):
                 table_def = self._require_table(table)
                 self._do_patch(table_def, table, sid, fields)
+                return None, {table}
+            case _AdjustCounter(
+                table=table,
+                id=sid,
+                field=field,
+                delta=delta,
+                min=minimum,
+                max=maximum,
+                expected=expected,
+            ):
+                table_def = self._require_table(table)
+                self._do_adjust_counter(
+                    table_def, table, sid, field, delta, minimum, maximum, expected
+                )
                 return None, {table}
             case _Replace(table=table, id=sid, doc=doc):
                 table_def = self._require_table(table)
@@ -1748,6 +1778,75 @@ class _InMemoryStoreCore:
             now=self._now(),
         )
         self._do_update(table_def, table_name, sid, merged)
+
+    def _do_adjust_counter(
+        self,
+        table_def: TableDef,
+        table_name: str,
+        sid: str,
+        field: str,
+        delta: Any,
+        minimum: Any,
+        maximum: Any,
+        expected: dict[str, Any] | None,
+    ) -> None:
+        def safe_number_integer(value: Any) -> bool:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return False
+            if isinstance(value, float):
+                return math.isfinite(value) and value.is_integer() and abs(value) <= 2**53 - 1
+            return abs(value) <= 2**53 - 1
+
+        if (
+            not _is_safe_counter_integer(delta)
+            or (minimum is not None and not _is_safe_counter_integer(minimum))
+            or (maximum is not None and not _is_safe_counter_integer(maximum))
+            or (minimum is not None and maximum is not None and minimum > maximum)
+        ):
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST, "adjustCounter numeric arguments must be safe integers"
+            )
+        field_type = table_def.fields.get(field)
+        if field_type is None:
+            raise RtDbError(ErrorCode.SCHEMA_VIOLATION, f"unknown field '{field}'")
+        if field in table_def.computed or field in (
+            table_def.auto_increment_field,
+            table_def.updated_at_field,
+        ):
+            raise RtDbError(ErrorCode.BAD_REQUEST, f"field '{field}' is server-managed")
+        if not (
+            isinstance(field_type, _FNumber)
+            or (isinstance(field_type, _FOptional) and isinstance(field_type.inner, _FNumber))
+        ):
+            raise RtDbError(
+                ErrorCode.SCHEMA_VIOLATION, f"field '{field}' must be number or optional(number)"
+            )
+        if expected is not None:
+            unknown = set(expected) - set(table_def.fields)
+            if unknown:
+                raise RtDbError(
+                    ErrorCode.SCHEMA_VIOLATION, f"unknown expected field '{sorted(unknown)[0]}'"
+                )
+        key = (table_name, sid)
+        row = self._docs.get(key)
+        if row is None or not _is_live(row):
+            raise RtDbError(ErrorCode.NOT_FOUND, f"document '{sid}' not found")
+        if expected is not None and any(
+            name not in row.doc or not _json_structurally_equal(row.doc[name], value)
+            for name, value in expected.items()
+        ):
+            raise RtDbError(ErrorCode.PRECONDITION_FAILED, "expected field values do not match")
+        current = row.doc.get(field)
+        if not safe_number_integer(current):
+            raise RtDbError(ErrorCode.BAD_REQUEST, f"field '{field}' must contain a safe integer")
+        result = current + delta
+        if not safe_number_integer(result):
+            raise RtDbError(ErrorCode.BAD_REQUEST, "adjustCounter result must be a safe integer")
+        if (minimum is not None and result < minimum) or (maximum is not None and result > maximum):
+            raise RtDbError(
+                ErrorCode.PRECONDITION_FAILED, "adjustCounter result is outside the allowed bounds"
+            )
+        self._do_patch(table_def, table_name, sid, {field: result})
 
     def _do_replace(
         self,

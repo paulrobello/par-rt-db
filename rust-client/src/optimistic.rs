@@ -136,7 +136,7 @@ fn project_unfiltered_array(
             // unambiguous to overlay — the authoritative update delivers the
             // restored row. Same fallthrough as the ts-client's switch.
             Step::Undelete { .. } => {}
-            Step::Upsert { .. } => return OptimisticProjection::Skip,
+            Step::Upsert { .. } | Step::AdjustCounter { .. } => return OptimisticProjection::Skip,
             Step::ExpectVersion { .. } | Step::ExpectAbsent { .. } => {}
             // By-query steps match an unbounded set of rows by a filter this
             // projection can't evaluate (no table store, no schema) — the effect
@@ -175,7 +175,8 @@ fn project_filtered_array(query: &Query, last: &Value, txn: &Transaction) -> Opt
             Step::Insert { .. }
             | Step::Patch { .. }
             | Step::Replace { .. }
-            | Step::Upsert { .. } => return OptimisticProjection::Skip,
+            | Step::Upsert { .. }
+            | Step::AdjustCounter { .. } => return OptimisticProjection::Skip,
             Step::ExpectVersion { .. } | Step::ExpectAbsent { .. } => {}
             // By-query steps match rows by a filter we can't evaluate here —
             // the effect on the filtered result is ambiguous, so decline.
@@ -269,6 +270,7 @@ impl OptimisticStepTable for Step {
             | Step::Undelete { table, .. }
             | Step::ExpectVersion { table, .. }
             | Step::Upsert { table, .. }
+            | Step::AdjustCounter { table, .. }
             | Step::PatchByQuery { table, .. }
             | Step::DeleteByQuery { table, .. } => Some(table.as_str()),
             Step::ExpectAbsent { .. }

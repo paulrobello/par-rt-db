@@ -38,7 +38,8 @@
     { "type": "signalWorkflow", "workflowId": "w1", "id": "wf-1", "name": "approve", "payload": { "ok": true, "count": 2 } },
     { "type": "signalWorkflow", "workflowId": "w2", "id": "wf-2", "name": "approve" },
     { "type": "mutate", "mutId": "m10", "txn": { "steps": [ { "op": "startWorkflow", "spec": { "name": "gated", "steps": [ { "txn": { "steps": [ { "op": "insert", "table": "workItems", "doc": { "title": "pre" } } ] } }, { "awaitSignal": { "name": "approve", "timeoutMs": 3600000 } }, { "awaitSignal": { "name": "audit" } } ] } } ] } },
-    { "type": "mutate", "mutId": "m11", "txn": { "steps": [ { "op": "patchByQuery", "table": "workItems", "filter": { "op": "olderThan", "field": "completedAt", "ms": 604800000 }, "patch": { "status": "archived" } }, { "op": "deleteByQuery", "table": "sessions", "filter": { "op": "and", "exprs": [ { "op": "olderThan", "field": "claimExpiresAt", "ms": 0 }, { "op": "exists", "field": "claimExpiresAt" } ] }, "limit": 500 } ] } }
+    { "type": "mutate", "mutId": "m11", "txn": { "steps": [ { "op": "patchByQuery", "table": "workItems", "filter": { "op": "olderThan", "field": "completedAt", "ms": 604800000 }, "patch": { "status": "archived" } }, { "op": "deleteByQuery", "table": "sessions", "filter": { "op": "and", "exprs": [ { "op": "olderThan", "field": "claimExpiresAt", "ms": 0 }, { "op": "exists", "field": "claimExpiresAt" } ] }, "limit": 500 } ] } },
+    { "type": "mutate", "mutId": "m12", "txn": { "steps": [ { "op": "adjustCounter", "table": "storageUsage", "id": "usage-1", "field": "usedBytes", "delta": -8, "min": 0, "max": 100, "expected": { "key": "retained-data", "initialized": true, "metadata": { "limits": { "daily": 12, "hourly": 4 } } } } ] } }
   ],
   "server_messages": [
     { "type": "authOk", "user": { "kind": "user", "email": "a@b.com", "name": null, "githubLogin": "alice", "githubId": 12345 } },

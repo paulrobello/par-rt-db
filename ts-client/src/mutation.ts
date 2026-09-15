@@ -168,6 +168,19 @@ export class TxnBuilder<S extends SchemaDefinition<any> = SchemaDefinition<any>>
     return this;
   }
 
+  /** Atomically adjusts a safe-integer counter, aborting the transaction when
+   * inclusive bounds or expected stable field values do not match. */
+  adjustCounter<T extends TableNames<S>>(
+    table: T,
+    id: string,
+    field: keyof WithoutSystemFields<S, T> & string,
+    delta: number,
+    options: { min?: number; max?: number; expected?: Partial<WithoutSystemFields<S, T>> } = {},
+  ): this {
+    this.steps.push({ op: "adjustCounter", table, id, field, delta, ...options });
+    return this;
+  }
+
   /**
    * Adds a replace step to the transaction.
    */

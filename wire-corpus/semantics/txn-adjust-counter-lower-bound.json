@@ -1,0 +1,27 @@
+{
+  "name": "txn-adjust-counter-lower-bound",
+  "$comment": "The inclusive lower bound rejects a negative result below min.",
+  "schema": {
+    "tables": {
+      "counters": {
+        "fields": { "value": { "type": "number" } }
+      }
+    }
+  },
+  "seed": [{ "$id": "counter", "doc": { "value": 0 } }],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "adjustCounter",
+          "table": "counters",
+          "id": { "$idRef": "counter" },
+          "field": "value",
+          "delta": -1,
+          "min": 0
+        }
+      ]
+    }
+  },
+  "expect": { "error": { "code": "PRECONDITION_FAILED" } }
+}

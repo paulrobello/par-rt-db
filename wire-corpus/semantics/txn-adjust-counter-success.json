@@ -1,0 +1,118 @@
+{
+  "name": "txn-adjust-counter-success",
+  "$comment": "A chained counter transaction pins positive, negative, zero-delta, and inclusive-bound success. Each adjustment checks nested expected JSON, and the final read verifies the computed ratio was recomputed from the adjusted count.",
+  "schema": {
+    "tables": {
+      "counters": {
+        "fields": {
+          "value": { "type": "number" },
+          "divisor": { "type": "number" },
+          "metadata": {
+            "type": "object",
+            "fields": {
+              "bucket": { "type": "string" },
+              "limits": {
+                "type": "object",
+                "fields": {
+                  "hourly": { "type": "number" },
+                  "daily": { "type": "number" }
+                }
+              },
+              "flags": {
+                "type": "object",
+                "fields": { "enabled": { "type": "boolean" } }
+              }
+            }
+          },
+          "ratio": { "type": "number" }
+        },
+        "computed": {
+          "ratio": {
+            "op": "div",
+            "left": { "op": "field", "field": "value" },
+            "right": { "op": "field", "field": "divisor" }
+          }
+        }
+      }
+    }
+  },
+  "seed": [
+    {
+      "$id": "counter",
+      "doc": {
+        "value": 4,
+        "divisor": 2,
+        "metadata": {
+          "bucket": "primary",
+          "limits": { "hourly": 4.0, "daily": 12 },
+          "flags": { "enabled": true }
+        }
+      }
+    }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "adjustCounter",
+          "table": "counters",
+          "id": { "$idRef": "counter" },
+          "field": "value",
+          "delta": 3,
+          "min": 0,
+          "max": 8,
+          "expected": {
+            "metadata": {
+              "bucket": "primary",
+              "limits": { "hourly": 4, "daily": 12 },
+              "flags": { "enabled": true }
+            }
+          }
+        },
+        {
+          "op": "adjustCounter",
+          "table": "counters",
+          "id": { "$idRef": "counter" },
+          "field": "value",
+          "delta": 1,
+          "min": 0,
+          "max": 8,
+          "expected": { "divisor": 2 }
+        },
+        {
+          "op": "adjustCounter",
+          "table": "counters",
+          "id": { "$idRef": "counter" },
+          "field": "value",
+          "delta": -8,
+          "min": 0,
+          "expected": { "metadata": { "flags": { "enabled": true }, "bucket": "primary", "limits": { "daily": 12, "hourly": 4 } } }
+        },
+        {
+          "op": "adjustCounter",
+          "table": "counters",
+          "id": { "$idRef": "counter" },
+          "field": "value",
+          "delta": 0,
+          "min": 0,
+          "max": 8,
+          "expected": { "metadata": { "bucket": "primary", "limits": { "daily": 12, "hourly": 4 }, "flags": { "enabled": true } } }
+        }
+      ]
+    }
+  },
+  "expect": [null, null, null, null],
+  "then": {
+    "query": { "table": "counters", "get": { "$idRef": "counter" } },
+    "expect": {
+      "value": 0,
+      "divisor": 2,
+      "ratio": 0,
+      "metadata": {
+        "bucket": "primary",
+        "limits": { "hourly": 4, "daily": 12 },
+        "flags": { "enabled": true }
+      }
+    }
+  }
+}

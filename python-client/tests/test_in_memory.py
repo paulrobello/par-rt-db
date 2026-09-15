@@ -1665,6 +1665,107 @@ def test_patch_updates_a_field_and_bumps_version() -> None:
     assert doc["_version"] == 2
 
 
+def test_adjust_counter_checks_expected_bounds_and_rolls_back():
+    c = _new_client()
+    [res] = c.mutate(
+        Mutation.builder().insert("items", {"name": "a", "status": "todo", "order": 1}).build()
+    )
+    assert res is not None
+    doc_id = _id_of(res)
+    c.mutate(
+        Mutation.builder()
+        .adjust_counter(
+            "items",
+            doc_id,
+            "order",
+            3,
+            min=0,
+            max=5,
+            expected={"status": "todo", "name": "a", "order": 1.0},
+        )
+        .build()
+    )
+    doc = c.run_query(TableQuery("items").get(doc_id).build())
+    assert doc["order"] == 4
+    assert doc["_version"] == 2
+    with pytest.raises(RtDbError) as mismatch:
+        c.mutate(
+            Mutation.builder()
+            .adjust_counter("items", doc_id, "order", 1, expected={"status": None})
+            .build()
+        )
+    assert mismatch.value.code is ErrorCode.PRECONDITION_FAILED
+    with pytest.raises(RtDbError) as bool_mismatch:
+        c.mutate(
+            Mutation.builder()
+            .adjust_counter("items", doc_id, "order", 0, expected={"order": True})
+            .build()
+        )
+    assert bool_mismatch.value.code is ErrorCode.PRECONDITION_FAILED
+    with pytest.raises(RtDbError) as bound:
+        c.mutate(Mutation.builder().adjust_counter("items", doc_id, "order", 2, max=5).build())
+    assert bound.value.code is ErrorCode.PRECONDITION_FAILED
+    with pytest.raises(RtDbError):
+        c.mutate(
+            Mutation.builder()
+            .patch("items", doc_id, {"status": "changed"})
+            .adjust_counter("items", doc_id, "order", 1, max=4)
+            .build()
+        )
+    after = c.run_query(TableQuery("items").get(doc_id).build())
+    assert after["status"] == "todo" and after["order"] == 4 and after["_version"] == 2
+
+
+def test_adjust_counter_rejects_bad_types_and_non_safe_stored_values():
+    c = _new_client()
+    [res] = c.mutate(
+        Mutation.builder().insert("items", {"name": "a", "status": "todo", "order": 1.5}).build()
+    )
+    assert res is not None
+    with pytest.raises(RtDbError) as stored:
+        c.mutate(Mutation.builder().adjust_counter("items", _id_of(res), "order", 1).build())
+    assert stored.value.code is ErrorCode.BAD_REQUEST
+    with pytest.raises(RtDbError) as unknown:
+        c.mutate(Mutation.builder().adjust_counter("items", _id_of(res), "missing", 1).build())
+    assert unknown.value.code is ErrorCode.SCHEMA_VIOLATION
+    with pytest.raises(RtDbError) as bad_delta:
+        c.mutate(Mutation.builder().adjust_counter("items", _id_of(res), "order", True).build())
+    assert bad_delta.value.code is ErrorCode.BAD_REQUEST
+
+
+def test_adjust_counter_rejects_float_wire_arguments_but_accepts_integral_float_counter():
+    c = _new_client()
+    [res] = c.mutate(
+        Mutation.builder().insert("items", {"name": "a", "status": "todo", "order": 1.0}).build()
+    )
+    assert res is not None
+    doc_id = _id_of(res)
+    for step in (
+        {"op": "adjustCounter", "table": "items", "id": doc_id, "field": "order", "delta": 1.0},
+        {
+            "op": "adjustCounter",
+            "table": "items",
+            "id": doc_id,
+            "field": "order",
+            "delta": 1,
+            "min": 0.0,
+        },
+        {
+            "op": "adjustCounter",
+            "table": "items",
+            "id": doc_id,
+            "field": "order",
+            "delta": 1,
+            "max": 3.0,
+        },
+    ):
+        with pytest.raises(RtDbError) as ei:
+            c.mutate(Mutation.model_validate({"steps": [step]}))
+        assert ei.value.code is ErrorCode.BAD_REQUEST
+    c.mutate(Mutation.builder().adjust_counter("items", doc_id, "order", 1).build())
+    assert c.run_query(TableQuery("items").get(doc_id).build())["order"] == 2.0
+
+
 def test_replace_overwrites_the_whole_doc() -> None:
     c = _new_client()
     [res] = c.mutate(

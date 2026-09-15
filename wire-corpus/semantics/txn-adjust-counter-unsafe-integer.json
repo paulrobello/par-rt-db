@@ -1,0 +1,26 @@
+{
+  "name": "txn-adjust-counter-unsafe-integer",
+  "$comment": "A delta outside the safe-integer range is BAD_REQUEST before any counter change.",
+  "schema": {
+    "tables": {
+      "counters": {
+        "fields": { "value": { "type": "number" } }
+      }
+    }
+  },
+  "seed": [{ "$id": "counter", "doc": { "value": 1 } }],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "adjustCounter",
+          "table": "counters",
+          "id": { "$idRef": "counter" },
+          "field": "value",
+          "delta": 9007199254740992
+        }
+      ]
+    }
+  },
+  "expect": { "error": { "code": "BAD_REQUEST" } }
+}

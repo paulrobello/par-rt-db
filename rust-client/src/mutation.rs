@@ -131,6 +131,29 @@ impl Mutation {
         });
         self
     }
+    /// Atomically adjust a safe-integer counter, optionally enforcing inclusive bounds and stable expected fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn adjust_counter(
+        mut self,
+        table: &str,
+        id: &str,
+        field: &str,
+        delta: i64,
+        min: Option<i64>,
+        max: Option<i64>,
+        expected: Option<Value>,
+    ) -> Self {
+        self.steps.push(Step::AdjustCounter {
+            table: table.into(),
+            id: id.into(),
+            field: field.into(),
+            delta,
+            min,
+            max,
+            expected: expected.map(Self::obj),
+        });
+        self
+    }
     /// Queue a replace step (overwrite the row).
     pub fn replace(mut self, table: &str, id: &str, doc: Value) -> Self {
         self.steps.push(Step::Replace {

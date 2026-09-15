@@ -125,6 +125,142 @@ async fn validation_error_db(state: &rtdb_server::AppState) -> crate::common::Te
     wrap_test_db(name)
 }
 
+#[tokio::test]
+async fn adjust_counter_is_atomic_and_rolls_back_prior_steps_on_a_bound_failure() {
+    let state = test_state().await;
+    let schema_json = serde_json::json!({"tables":{"tickets":{"fields":{"title":{"type":"string"},"count":{"type":"number"}},"indexes":[{"name":"by_title","fields":["title"]}]}}});
+    let (db, schema) = fresh_db_with(&state, schema_json).await;
+    let id = insert(
+        &state.pool,
+        &db,
+        &schema,
+        serde_json::json!({"title":"counter","count":4.0}),
+    )
+    .await;
+    let adjusted = run(
+        &state.pool,
+        &db,
+        &schema,
+        vec![Step::AdjustCounter {
+            table: "tickets".into(),
+            id: id.clone(),
+            field: "count".into(),
+            delta: 3,
+            min: Some(0),
+            max: Some(8),
+            expected: Some(
+                serde_json::json!({"title":"counter","count":4})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(adjusted.results, vec![serde_json::Value::Null]);
+    assert_eq!(fetch_doc(&state.pool, &db, &id).await["count"], 7);
+
+    run(
+        &state.pool,
+        &db,
+        &schema,
+        vec![Step::Patch {
+            table: "tickets".into(),
+            id: id.clone(),
+            fields: serde_json::json!({"count":4}).as_object().unwrap().clone(),
+        }],
+    )
+    .await
+    .unwrap();
+    let (first, second) = tokio::join!(
+        run(
+            &state.pool,
+            &db,
+            &schema,
+            vec![Step::AdjustCounter {
+                table: "tickets".into(),
+                id: id.clone(),
+                field: "count".into(),
+                delta: 3,
+                min: Some(0),
+                max: Some(8),
+                expected: None,
+            }]
+        ),
+        run(
+            &state.pool,
+            &db,
+            &schema,
+            vec![Step::AdjustCounter {
+                table: "tickets".into(),
+                id: id.clone(),
+                field: "count".into(),
+                delta: 3,
+                min: Some(0),
+                max: Some(8),
+                expected: None,
+            }]
+        ),
+    );
+    assert_ne!(
+        first.is_ok(),
+        second.is_ok(),
+        "only one concurrent admission may fit"
+    );
+    let losing_error = first
+        .err()
+        .or_else(|| second.err())
+        .expect("one bound failure");
+    assert_eq!(
+        rtdb_err(losing_error).code,
+        rtdb_server::error::ErrorCode::PreconditionFailed
+    );
+    assert_eq!(fetch_doc(&state.pool, &db, &id).await["count"], 7);
+
+    let err = run(
+        &state.pool,
+        &db,
+        &schema,
+        vec![
+            Step::Insert {
+                table: "tickets".into(),
+                doc: serde_json::json!({"title":"must-rollback","count":1})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            },
+            Step::AdjustCounter {
+                table: "tickets".into(),
+                id: id.clone(),
+                field: "count".into(),
+                delta: 2,
+                min: Some(0),
+                max: Some(8),
+                expected: None,
+            },
+        ],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        rtdb_err(err).code,
+        rtdb_server::error::ErrorCode::PreconditionFailed
+    );
+    assert_eq!(fetch_doc(&state.pool, &db, &id).await["count"], 7);
+    let missing: Option<String> = sqlx::query_scalar(&format!(
+        "SELECT \"id\" FROM \"db_{}\".\"t_tickets\" WHERE \"doc\"->>'title' = 'must-rollback'",
+        db.0
+    ))
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap();
+    assert!(
+        missing.is_none(),
+        "earlier insert must roll back with failed counter guard"
+    );
+}
+
 /// `run` wraps in anyhow; step-path assertions need the `RtDbError` back out.
 fn rtdb_err(err: anyhow::Error) -> rtdb_server::error::RtDbError {
     err.downcast::<rtdb_server::error::RtDbError>()

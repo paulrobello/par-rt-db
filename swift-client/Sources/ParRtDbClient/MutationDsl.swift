@@ -48,6 +48,18 @@ public struct MutationBuilder: Sendable {
         adding(.patch(table: table, id: id, fields: fields))
     }
 
+    /// Atomically add an integer delta to a numeric field, optionally checking
+    /// declared values and inclusive result bounds.
+    public func adjustCounter(
+        _ table: String, _ id: String, field: String, delta: Int64,
+        min: Int64? = nil, max: Int64? = nil, expected: [String: JSONValue]? = nil
+    ) -> MutationBuilder {
+        adding(.adjustCounter(
+            table: table, id: id, field: field, delta: delta,
+            min: min, max: max, expected: expected
+        ))
+    }
+
     /// Queue a replace step (overwrite the row).
     public func replace(_ table: String, _ id: String, _ doc: [String: JSONValue]) -> MutationBuilder {
         adding(.replace(table: table, id: id, doc: doc))
@@ -160,6 +172,11 @@ public struct MutationBuilder: Sendable {
             .insert(table: table, doc: doc)
         case let .patch(table, id, fields):
             .patch(table: table, id: id, fields: fields)
+        case let .adjustCounter(table, id, field, delta, minimum, maximum, expected):
+            .adjustCounter(
+                table: table, id: id, field: field, delta: delta,
+                min: minimum, max: maximum, expected: expected
+            )
         case let .replace(table, id, doc):
             .replace(table: table, id: id, doc: doc)
         case let .delete(table, id):
@@ -203,6 +220,10 @@ public struct MutationBuilder: Sendable {
 private enum PendingStep: Sendable {
     case insert(table: String, doc: [String: JSONValue])
     case patch(table: String, id: String, fields: [String: JSONValue])
+    case adjustCounter(
+        table: String, id: String, field: String, delta: Int64,
+        min: Int64?, max: Int64?, expected: [String: JSONValue]?
+    )
     case replace(table: String, id: String, doc: [String: JSONValue])
     case delete(table: String, id: String)
     case undelete(table: String, id: String)

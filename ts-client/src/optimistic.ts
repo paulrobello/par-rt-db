@@ -146,6 +146,8 @@ function projectUnfilteredArray(
         }
         break;
       }
+      case "adjustCounter":
+        return SKIP;
       case "upsert":
         return SKIP;
       // expectVersion / expectAbsent are preconditions with no data effect.
@@ -181,6 +183,7 @@ function projectFilteredArray(
       step.op === "insert" ||
       step.op === "patch" ||
       step.op === "replace" ||
+      step.op === "adjustCounter" ||
       step.op === "upsert"
     ) {
       return SKIP;
@@ -219,6 +222,8 @@ function projectGet(query: QueryJson, last: unknown, txn: TransactionJson): Opti
           working = { ...step.doc, _id: working._id, _creationTime: working._creationTime };
         }
         break;
+      case "adjustCounter":
+        return SKIP;
       case "insert":
         break;
       case "upsert":

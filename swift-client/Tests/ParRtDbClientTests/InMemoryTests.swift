@@ -85,6 +85,72 @@ struct InMemoryTests {
         #expect(doc.objectValue?["_version"] == .int(1))
     }
 
+    @Test func adjustCounterChecksExpectedAndBoundsAndRollsBack() throws {
+        let (client, ids) = try seededEngine()
+        _ = try client.mutate(Transaction(steps: [
+            .adjustCounter(
+                table: "items", id: ids[0], field: "n", delta: 4,
+                min: 0, max: 8,
+                expected: ["title": .string("a"), "tag": .string("x"), "n": .double(3)]
+            )
+        ]))
+        let current = try client.query(Query(table: "items", get: ids[0]))
+        #expect(current.objectValue?["n"] == .int(7))
+        #expect(current.objectValue?["_version"] == .int(2))
+        #expect(throws: RtDbError.self) {
+            try client.mutate(Transaction(steps: [
+                .adjustCounter(
+                    table: "items", id: ids[0], field: "n", delta: 1,
+                    min: nil, max: nil, expected: ["tag": .null]
+                )
+            ]))
+        }
+        #expect(throws: RtDbError.self) {
+            try client.mutate(Transaction(steps: [
+                .adjustCounter(
+                    table: "items", id: ids[0], field: "n", delta: 0,
+                    min: nil, max: nil, expected: ["n": .bool(true)]
+                )
+            ]))
+        }
+        #expect(throws: RtDbError.self) {
+            try client.mutate(Transaction(steps: [
+                .patch(table: "items", id: ids[0], fields: ["title": .string("changed")]),
+                .adjustCounter(
+                    table: "items", id: ids[0], field: "n", delta: 2,
+                    min: nil, max: 8, expected: nil
+                )
+            ]))
+        }
+        let after = try client.query(Query(table: "items", get: ids[0]))
+        #expect(after.objectValue?["title"] == .string("a"))
+        #expect(after.objectValue?["n"] == .int(7))
+        #expect(after.objectValue?["_version"] == .int(2))
+    }
+
+    @Test func adjustCounterRejectsNonNumericTargetAndUnsafeCurrentValue() throws {
+        let (client, ids) = try seededEngine()
+        #expect(throws: RtDbError.self) {
+            try client.mutate(Transaction(steps: [
+                .adjustCounter(
+                    table: "items", id: ids[0], field: "title", delta: 1,
+                    min: nil, max: nil, expected: nil
+                )
+            ]))
+        }
+        #expect(throws: RtDbError.self) {
+            try client.mutate(Transaction(steps: [
+                .patch(table: "items", id: ids[0], fields: ["n": .double(1.5)]),
+                .adjustCounter(
+                    table: "items", id: ids[0], field: "n", delta: 1,
+                    min: nil, max: nil, expected: nil
+                )
+            ]))
+        }
+        let restored = try client.query(Query(table: "items", get: ids[0]))
+        #expect(restored.objectValue?["n"] == .int(3))
+    }
+
     @Test func connectionIdDefaultsToCounterToken() {
         let client = InMemoryRtDbClient()
         #expect(client.connectionId == "c1")
@@ -1213,6 +1279,62 @@ struct InMemoryTests {
         #expect(full.stepOutcomes.count == 1)
         #expect(full.stepOutcomes.first?.status == .success)
         #expect(try count(client.query(Query(table: "items", count: true))) == 1)
+    }
+
+    @Test func failedTransactionRestoresCancelledWorkflowStateAndIdentity() throws {
+        let client = deterministicClient()
+        try client.pushSchema(itemsSchema())
+        let info = try client.startWorkflow(WorkflowSpec(name: "rollback", steps: [
+            WorkflowStepSpec(txn: Transaction(steps: [
+                .insert(table: "items", doc: ["title": .string("step"), "n": .int(1)])
+            ]))
+        ]))
+
+        #expect(throws: RtDbError.self) {
+            try client.mutate(Transaction(steps: [
+                .cancelWorkflow(id: info.id),
+                .adjustCounter(
+                    table: "items", id: "missing", field: "title", delta: 1,
+                    min: nil, max: nil, expected: nil
+                )
+            ]))
+        }
+        #expect(try client.getWorkflow(info.id).info.status == .pending)
+        _ = try client.tick(nowMs: pinnedNow)
+        #expect(try client.getWorkflow(info.id).info.status == .success)
+        #expect(try count(client.query(Query(table: "items", count: true))) == 1)
+    }
+
+    @Test func adjustCounterExpectedNumbersDoNotRoundUnsafeIntegers() throws {
+        let client = deterministicClient()
+        let schema = try SchemaBuilder()
+            .table("counts") {
+                $0.field("counter", .number).field("wide", .number)
+            }
+            .build()
+        try client.pushSchema(schema)
+        let inserted = try client.mutate(Transaction(steps: [
+            .insert(
+                table: "counts",
+                doc: ["counter": .int(1), "wide": .int(9_007_199_254_740_993)]
+            )
+        ]))
+        guard case let .insert(id) = inserted.first else {
+            Issue.record("expected inserted counter row")
+            return
+        }
+        do {
+            try client.mutate(Transaction(steps: [
+                .adjustCounter(
+                    table: "counts", id: id, field: "counter", delta: 1,
+                    min: nil, max: nil, expected: ["wide": .double(9_007_199_254_740_992)]
+                )
+            ]))
+            Issue.record("unsafe integer and rounded double must not compare equal")
+        } catch let error as RtDbError {
+            #expect(error.code == .preconditionFailed)
+        }
+        #expect(try client.query(Query(table: "counts", get: id)).objectValue?["counter"] == .int(1))
     }
 
     @Test func awaitSignalParksThenDeliversPayload() throws {

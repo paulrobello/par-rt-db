@@ -1,0 +1,37 @@
+{
+  "name": "txn-adjust-counter-computed-target",
+  "$comment": "A computed numeric field remains server-controlled and cannot be an adjustCounter target.",
+  "schema": {
+    "tables": {
+      "counters": {
+        "fields": {
+          "value": { "type": "number" },
+          "divisor": { "type": "number" },
+          "ratio": { "type": "number" }
+        },
+        "computed": {
+          "ratio": {
+            "op": "div",
+            "left": { "op": "field", "field": "value" },
+            "right": { "op": "field", "field": "divisor" }
+          }
+        }
+      }
+    }
+  },
+  "seed": [{ "$id": "counter", "doc": { "value": 4, "divisor": 2 } }],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "adjustCounter",
+          "table": "counters",
+          "id": { "$idRef": "counter" },
+          "field": "ratio",
+          "delta": 1
+        }
+      ]
+    }
+  },
+  "expect": { "error": { "code": "BAD_REQUEST" } }
+}
