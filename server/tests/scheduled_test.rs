@@ -890,8 +890,8 @@ async fn interval_fires_repeatedly_and_skips_paused_windows() {
 
     // Resume: the next fire shifts one full interval from the resume instant
     // — it must NOT be immediately due (that would be backfill).
+    let resume_started_at = rtdb_server::db::now_ms();
     assert!(scheduler::set_paused(&pool, &db, &id, false).await.unwrap());
-    let resumed_at = rtdb_server::db::now_ms();
     let info = scheduler::list(&pool, &db)
         .await
         .unwrap()
@@ -900,11 +900,11 @@ async fn interval_fires_repeatedly_and_skips_paused_windows() {
         .unwrap();
     assert_eq!(info.status, ScheduleStatus::Pending);
     assert!(
-        info.due_at >= resumed_at + EVERY_MS - 100,
-        "resume must shift due_at one interval out (>= resume + {}ms), got due_at {} vs resumed_at {}",
-        EVERY_MS - 100,
+        info.due_at >= resume_started_at + EVERY_MS,
+        "resume must shift due_at at least one interval from the resume request ({}ms), got due_at {} vs resume_started_at {}",
+        EVERY_MS,
         info.due_at,
-        resumed_at
+        resume_started_at
     );
 
     // And it fires exactly once more from the shifted due — observed as
