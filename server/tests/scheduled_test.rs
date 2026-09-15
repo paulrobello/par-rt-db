@@ -148,6 +148,61 @@ async fn claim_due_and_finalize() {
 }
 
 #[tokio::test]
+async fn concurrent_internal_claims_never_exceed_the_batch() {
+    let pool = test_pool().await;
+    let db = unique_db(&pool).await;
+    scheduler::ensure_table(&pool, &db).await.unwrap();
+    let txn = empty_txn();
+    for _ in 0..5 {
+        scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, false)
+            .await
+            .unwrap();
+    }
+
+    let now = rtdb_server::db::now_ms();
+    let barrier = Arc::new(tokio::sync::Barrier::new(4));
+    let db_name = db.to_string();
+    let mut claimers = Vec::new();
+    for _ in 0..4 {
+        let pool = pool.clone();
+        let db = db_name.clone();
+        let barrier = Arc::clone(&barrier);
+        claimers.push(tokio::spawn(async move {
+            barrier.wait().await;
+            scheduler::claim_due(&pool, &db, now, 1).await.unwrap()
+        }));
+    }
+
+    let mut claimed_ids = std::collections::HashSet::new();
+    for claimer in claimers {
+        let claimed = claimer.await.unwrap();
+        assert_eq!(claimed.len(), 1, "each sweep is limited to one job");
+        for job in claimed {
+            assert!(claimed_ids.insert(job.id), "jobs must be disjoint");
+        }
+    }
+
+    assert_eq!(claimed_ids.len(), 4);
+    let listed = scheduler::list(&pool, &db).await.unwrap();
+    assert_eq!(listed.len(), 5);
+    assert_eq!(
+        listed
+            .iter()
+            .filter(|job| job.status == ScheduleStatus::Running)
+            .count(),
+        4
+    );
+    assert_eq!(
+        listed
+            .iter()
+            .filter(|job| job.status == ScheduleStatus::Pending)
+            .count(),
+        1,
+        "one due job remains pending after four batch-one claims"
+    );
+}
+
+#[tokio::test]
 async fn reset_running_recovers_orphans() {
     let pool = test_pool().await;
     let db = unique_db(&pool).await;
@@ -1019,6 +1074,62 @@ async fn external_claim_assigns_monotonic_generation() {
     .await
     .expect_err("stale generation-1 token must be rejected");
     assert_eq!(err.code, ErrorCode::Conflict);
+}
+
+#[tokio::test]
+async fn concurrent_external_claims_never_exceed_the_limit() {
+    let pool = test_pool().await;
+    let db = unique_db(&pool).await;
+    scheduler::ensure_table(&pool, &db).await.unwrap();
+    let txn = empty_txn();
+    for _ in 0..5 {
+        scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, true)
+            .await
+            .unwrap();
+    }
+
+    let now = rtdb_server::db::now_ms();
+    let barrier = Arc::new(tokio::sync::Barrier::new(4));
+    let db_name = db.to_string();
+    let mut claimers = Vec::new();
+    for _ in 0..4 {
+        let pool = pool.clone();
+        let db = db_name.clone();
+        let barrier = Arc::clone(&barrier);
+        claimers.push(tokio::spawn(async move {
+            barrier.wait().await;
+            scheduler::claim_external(&pool, &db, now, 1, 60_000)
+                .await
+                .unwrap()
+        }));
+    }
+
+    let mut claimed_ids = std::collections::HashSet::new();
+    for claimer in claimers {
+        let claimed = claimer.await.unwrap();
+        assert_eq!(claimed.len(), 1, "each worker is limited to one job");
+        for job in claimed {
+            assert!(claimed_ids.insert(job.id.clone()), "jobs must be disjoint");
+            assert_eq!(job.lease_generation, 1);
+            assert_eq!(job.lease_deadline_ms, now + 60_000);
+            let (status, generation, deadline) = fence_row(&pool, &db, &job.id).await;
+            assert_eq!(status, "running");
+            assert_eq!(generation, 1);
+            assert_eq!(deadline, Some(now + 60_000));
+        }
+    }
+
+    assert_eq!(claimed_ids.len(), 4);
+    let listed = scheduler::list(&pool, &db).await.unwrap();
+    assert_eq!(listed.len(), 5);
+    assert_eq!(
+        listed
+            .iter()
+            .filter(|job| job.status == ScheduleStatus::Pending)
+            .count(),
+        1,
+        "one due job remains pending after four limit-one claims"
+    );
 }
 
 #[tokio::test]

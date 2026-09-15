@@ -416,14 +416,18 @@ pub async fn claim_due(
         Option<i64>,
     );
     let rows: Vec<ClaimRow> = sqlx::query_as(&format!(
-        "UPDATE \"{schema}\".scheduled_txns SET status = 'running'
-             WHERE id IN (
-                 SELECT id FROM \"{schema}\".scheduled_txns
-                 WHERE status = 'pending' AND due_at <= $1 AND NOT external
-                 ORDER BY due_at LIMIT $2
-                 FOR UPDATE SKIP LOCKED
-             )
-             RETURNING id, kind, txn, cron, every_ms"
+        "WITH candidates AS MATERIALIZED (
+             SELECT id FROM \"{schema}\".scheduled_txns
+             WHERE status = 'pending' AND due_at <= $1 AND NOT external
+             ORDER BY due_at
+             LIMIT $2
+             FOR UPDATE SKIP LOCKED
+         )
+         UPDATE \"{schema}\".scheduled_txns AS target
+         SET status = 'running'
+         FROM candidates
+         WHERE target.id = candidates.id
+         RETURNING target.id, target.kind, target.txn, target.cron, target.every_ms"
     ))
     .bind(now)
     .bind(batch)
@@ -504,11 +508,7 @@ pub async fn claim_external(
         i64,
     );
     let rows: Vec<ClaimRow> = sqlx::query_as(&format!(
-        "UPDATE \"{schema}\".scheduled_txns
-         SET status = 'running',
-             claim_generation = claim_generation + 1,
-             lease_deadline_ms = $3
-         WHERE id IN (
+        "WITH candidates AS MATERIALIZED (
              SELECT id FROM \"{schema}\".scheduled_txns
              WHERE external
                AND (
@@ -519,7 +519,14 @@ pub async fn claim_external(
              LIMIT $2
              FOR UPDATE SKIP LOCKED
          )
-         RETURNING id, kind, due_at, txn, cron, every_ms, claim_generation, lease_deadline_ms"
+         UPDATE \"{schema}\".scheduled_txns AS target
+         SET status = 'running',
+             claim_generation = claim_generation + 1,
+             lease_deadline_ms = $3
+         FROM candidates
+         WHERE target.id = candidates.id
+         RETURNING target.id, target.kind, target.due_at, target.txn, target.cron,
+                   target.every_ms, target.claim_generation, target.lease_deadline_ms"
     ))
     .bind(now)
     .bind(limit)
