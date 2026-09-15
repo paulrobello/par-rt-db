@@ -441,9 +441,10 @@ Enable the built-in managed backup loop with `RTDB_BACKUP_ENABLED=true`
 `0 3 * * *`), `RTDB_BACKUP_DIR` (default `./backups`), and
 `RTDB_BACKUP_RETENTION` (count, default `7`) — see `BackupEnv::from_env` in
 `server/src/config.rs` for the full semantics and `.env.example` for the
-commented reference values. The docker image installs `postgresql-client`
-so `pg_dump` is present, and `GET /admin/backups` lists the dumps. Data also
-persists in the `rtdb-pg` named volume.
+commented reference values. The docker image installs the pinned PostgreSQL 17
+client (`postgresql-client-17`) so its `pg_dump` major version matches the
+`pgvector/pgvector:pg17` database image, and `GET /admin/backups` lists the
+dumps. Data also persists in the `rtdb-pg` named volume.
 
 ### Manual trigger, download, delete
 

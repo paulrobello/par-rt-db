@@ -93,13 +93,23 @@ RUN cd dashboard && bun run build
 
 # ── Runtime stage ────────────────────────────────────────────────────────────
 # Minimal image: the release binary, CA roots (GitHub OAuth TLS), the SPA, and
-# `pg_dump` (postgresql-client) for the optional managed-backup scheduler
+# the PostgreSQL 17 `pg_dump` client for the optional managed-backup scheduler
 # (RTDB_BACKUP_ENABLED). The backup task self-logs and continues if pg_dump is
 # absent, but shipping it here means flipping the env flag is sufficient to
 # turn backups on — no image rebuild needed.
 FROM debian:bookworm-slim
+ARG POSTGRES_CLIENT_VERSION=17.10-1.pgdg12+1
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates postgresql-client \
+    && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+    && install -d -m 0755 /etc/apt/keyrings \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+        | gpg --dearmor -o /etc/apt/keyrings/postgresql.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+        > /etc/apt/sources.list.d/postgresql.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        "postgresql-client-17=${POSTGRES_CLIENT_VERSION}" \
+    && pg_dump --version | grep -q " 17\." \
     && rm -rf /var/lib/apt/lists/* \
     # SEC-136: run the server as a non-root, non-login, no-home system user.
     # Port 8300 > 1024 so no CAP_NET_BIND_SERVICE is needed; the binary and the
