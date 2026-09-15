@@ -4828,6 +4828,14 @@ async fn projection_collect_sql_returns_only_requested_fields() -> anyhow::Resul
     );
     let (compiled, _) =
         rtdb_server::query::compile_query(&db, &schema, &query, &PrincipalCtx::bypass(), false)?;
+    assert!(compiled.sql.contains("\"doc\" - ARRAY("));
+    assert!(compiled.sql.contains("jsonb_object_keys(\"doc\")"));
+    assert!(compiled.sql.contains("<> ALL(ARRAY["));
+    assert!(!compiled.sql.contains("jsonb_each(\"doc\")"));
+    assert!(compiled.binds.ends_with(&[
+        EqBind::Text("completedAt".to_string()),
+        EqBind::Text("status".to_string()),
+    ]));
     let raw_docs = fetch_raw_compiled_docs(&pool, compiled).await?;
 
     assert_eq!(raw_docs.len(), 2);

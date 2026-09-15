@@ -1019,11 +1019,11 @@ fn compile_collect_terminal(
                 let placeholders = projection_fields
                     .iter()
                     .enumerate()
-                    .map(|(index, _)| format!("${}", limit_placeholder + index + 1))
+                    .map(|(index, _)| format!("${}::text", limit_placeholder + index + 1))
                     .collect::<Vec<_>>()
                     .join(", ");
                 let sql = format!(
-                    "(SELECT COALESCE(jsonb_object_agg(projected.key, projected.value), '{{}}'::jsonb) FROM jsonb_each(\"doc\") AS projected WHERE projected.key IN ({placeholders}))"
+                    "(\"doc\" - ARRAY(SELECT key FROM jsonb_object_keys(\"doc\") AS keys(key) WHERE key <> ALL(ARRAY[{placeholders}])))"
                 );
                 let binds = projection_fields
                     .into_iter()
