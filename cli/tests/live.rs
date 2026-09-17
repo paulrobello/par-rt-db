@@ -120,7 +120,10 @@ fn cli_round_trip() {
         .arg(r#"{"steps":[{"op":"insert","table":"items","doc":{"name":"a","n":1}}]}"#)
         .assert()
         .success()
-        .stdout(contains("Insert"));
+        // StepResult is deliberately #[serde(untagged)] (see
+        // rust-client/src/mutation.rs) — an insert result is a bare `{"id": ..}`,
+        // never an op-tagged shape.
+        .stdout(contains("\"id\""));
 
     // query — scan it back via the by_n index.
     rtdb(&url)
