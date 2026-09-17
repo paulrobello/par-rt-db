@@ -5,6 +5,7 @@
 
 use rtdb_server::{AppState, auth, build_router, config::Config, db};
 use sqlx::postgres::PgPoolOptions;
+use std::future::IntoFuture;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -198,6 +199,8 @@ async fn main() {
     };
 
     let port = config.port;
+    // Read before `config` moves into `AppState`.
+    let drain_bound = std::time::Duration::from_millis(config.shutdown_drain_ms);
     let state = AppState::new(pool, config, hot);
     // Cloned so `state` survives past `build_router` (which consumes its
     // argument into the router's extension state) for the ARC-009 shutdown
@@ -220,11 +223,34 @@ async fn main() {
     // route (SEC-004). When deploying behind a trusted proxy (the Cloudflare
     // tunnel in production) the IP is read from `X-Forwarded-For` first, with
     // ConnectInfo as the fallback for direct connections.
-    axum::serve(
+    // The shutdown signal has two consumers — axum's graceful drain and the
+    // deadline that bounds it (`RTDB_SHUTDOWN_DRAIN_MS`) — but
+    // `with_graceful_shutdown` takes its future by value, so a token carries
+    // the single `shutdown_signal()` await to both.
+    let serve_token = CancellationToken::new();
+    tokio::spawn({
+        let token = serve_token.clone();
+        async move {
+            shutdown_signal().await;
+            token.cancel();
+        }
+    });
+
+    let serve = axum::serve(
         listener,
         router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown({
+        let token = serve_token.clone();
+        async move { token.cancelled().await }
+    })
+    .into_future();
+
+    rtdb_server::shutdown::serve_with_drain_bound(
+        serve,
+        async move { serve_token.cancelled().await },
+        drain_bound,
+    )
     .await
     .unwrap_or_else(|err| {
         eprintln!("server error: {err}");
@@ -232,8 +258,8 @@ async fn main() {
     });
 
     // ARC-009: the axum server itself has already stopped accepting new
-    // connections and drained in-flight requests (that's what
-    // `with_graceful_shutdown` resolving means) — now stop the fire-and-forget
+    // connections and has either drained in-flight requests or hit the
+    // `RTDB_SHUTDOWN_DRAIN_MS` bound — now stop the fire-and-forget
     // background tasks that outlive it. `AppState`'s own tasks (idle
     // reclaimer*, presence flush, PgListener loops, rate-limit sweep, forward
     // listener/sweeper) go through `BackgroundTasks::shutdown`; the tasks

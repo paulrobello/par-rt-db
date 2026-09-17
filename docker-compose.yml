@@ -41,6 +41,10 @@ services:
         # Bake the live git sha into /healthz; "unknown" if unset. Set in .env.
         RTDB_BUILD_COMMIT: ${RTDB_BUILD_COMMIT:-unknown}
     restart: unless-stopped
+    # Must exceed RTDB_SHUTDOWN_DRAIN_MS (default 30000) plus the bounded
+    # post-serve cleanup (5s + 5s), or Docker SIGKILLs the container before
+    # the graceful drain can finish and the bound is dead config here.
+    stop_grace_period: 45s
     depends_on:
       postgres:
         condition: service_healthy
@@ -136,6 +140,11 @@ services:
       # db's per-db tasks live for the process once spawned. Non-zero retires a
       # db's tasks after this many idle seconds with no subs and no pending jobs.
       RTDB_DB_IDLE_RECLAIM_SECS: ${RTDB_DB_IDLE_RECLAIM_SECS:-0}
+      # Upper bound (ms) on the graceful-shutdown drain; 30000 matches the
+      # server's code default. 0 = wait forever. `stop_grace_period` (set
+      # above) must exceed this plus the bounded post-serve cleanup, or
+      # Docker SIGKILLs the container before the drain finishes.
+      RTDB_SHUTDOWN_DRAIN_MS: ${RTDB_SHUTDOWN_DRAIN_MS:-30000}
       # OpenTelemetry / OTLP tracing (ENH-018). Forwarded so env-drift-check
       # passes; inert unless the server image was built `--features otel` AND
       # RTDB_OTEL_ENABLED=true. Defaults match the server's code defaults.

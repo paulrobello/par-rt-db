@@ -90,7 +90,7 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 
 ### Technical Excellence
 - **Single serialized committer per database**: all writes flow through one committer task per database and reads run under READ COMMITTED — realtime correctness without distributed coordination
-- **Rust on axum/tokio with Postgres 17 storage**: graceful shutdown waits for in-flight requests and open WebSockets before exiting
+- **Rust on axum/tokio with Postgres 17 storage**: graceful shutdown drains in-flight requests before exiting, bounded by `RTDB_SHUTDOWN_DRAIN_MS`
 - **One wire contract, five implementations**: the server and the ts/rust/python clients stay byte-identical, enforced by a shared semantics corpus ([`wire-corpus/`](wire-corpus/README.md)); the Swift client mirrors the same wire types, pinned by the wire-parity corpus
 - **Security defaults**: constant-time key comparison, generic client-facing 500 messages (detail only in logs), typed `confirm` guards on destructive operations, path-traversal-guarded downloads
 
@@ -446,6 +446,7 @@ behind a proxy or runs as more than one replica.
 | `RTDB_POOL_MAX_CONNECTIONS` | `75` | Postgres pool ceiling. One committer task plus N subscription re-runs per database, so a many-database instance needs headroom. |
 | `RTDB_ADMIN_EMAILS` | empty | Comma-separated emails seeded into `rtdb_auth.admins` at startup, so an OAuth login can reach the dashboard before any admin exists. |
 | `RTDB_BACKUP_ENABLED` | `false` | Enables scheduled `pg_dump` backups. Paired with `RTDB_BACKUP_CRON` (default daily at 03:00 UTC), `RTDB_BACKUP_DIR`, and `RTDB_BACKUP_RETENTION` (default `7` dumps kept). Defaults and semantics live in `server/src/config/`. |
+| `RTDB_SHUTDOWN_DRAIN_MS` | `30000` | Upper bound in milliseconds on the graceful-shutdown drain; `0` waits forever (the behavior before this knob existed). See [Graceful shutdown](#graceful-shutdown). |
 
 
 The hot-reloadable settings (live on `AppState` as `Arc<ArcSwap<HotConfig>>`,
@@ -1158,11 +1159,23 @@ name.
 
 ## Graceful shutdown
 
-The server exits cleanly on `SIGINT` or `SIGTERM`: in-flight requests are allowed to
-finish (via `axum::serve(...).with_graceful_shutdown(...)`) before the process stops. This
-includes open WebSocket connections — shutdown waits for them to close rather than forcibly
-dropping them, with no timeout of its own; Docker's SIGTERM→SIGKILL window is the backstop
-that ultimately terminates a connection that never closes on its own.
+The server exits cleanly on `SIGINT` or `SIGTERM`: it stops accepting new connections and
+lets in-flight requests finish (via `axum::serve(...).with_graceful_shutdown(...)`) before
+the process stops.
+
+What the drain waits for is any connection whose response is still in flight — most
+realistically a large storage download to a client that has stopped reading, which holds
+its connection open indefinitely. **Open WebSockets are not in that set**: `on_upgrade`
+hands the socket to a detached task, so the connection future completes at the handshake
+and an idle subscriber never holds shutdown open.
+
+`RTDB_SHUTDOWN_DRAIN_MS` (default `30000`) bounds that wait. When it elapses the
+remaining connections are closed and shutdown proceeds to the background-task cleanup,
+itself bounded at 5 s. `0` restores the previous behavior of waiting forever, where
+Docker's SIGTERM→SIGKILL window was the only backstop. The bundled
+`docker-compose.yml` sets `stop_grace_period: 45s` so the bound can actually elapse
+there; any other deploy recipe needs a container grace period larger than the drain
+bound (plus the ~10 s of bounded cleanup) or Docker's 10 s default SIGKILL wins.
 
 ## Multi-instance
 
@@ -1245,10 +1258,6 @@ Design and as-built notes:
   `is_admin` on every admin op: an expired session or revoked admin is rejected on the
   next op with `UNAUTHORIZED`/`FORBIDDEN` while the connection stays open, so the client
   can refresh its token and retry without reconnecting. See FEATURE_MATRIX #8.
-- Graceful shutdown waits for open WebSocket connections to close on their own rather
-  than forcibly dropping them, with no timeout of its own — Docker's SIGTERM→SIGKILL
-  window is the backstop that ultimately terminates a connection that never closes (see
-  [Graceful shutdown](#graceful-shutdown) above).
 - `AuthedUser.name` is display-only and may be `null`. It is filled from the OAuth
   provider's profile at sign-in (GitHub's `name`, falling back to the `login` handle;
   Google/GitLab/Microsoft/OIDC `name`; Apple's rarely-present `name` claim), stored on

@@ -157,6 +157,7 @@ pub fn test_config() -> Config {
         db_idle_reclaim_secs: 0,
         cookie_secure: false,
         trusted_proxy: false,
+        shutdown_drain_ms: 30_000,
         otel_enabled: false,
         otel_endpoint: String::new(),
         otel_service_name: String::new(),

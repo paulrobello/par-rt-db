@@ -209,6 +209,15 @@ pub struct Config {
     /// cannot have rate-limit buckets rotated via spoofed headers (SEC-201).
     /// Boot-only (not hot-reloadable), like `cookie_secure`.
     pub trusted_proxy: bool,
+    /// RTDB_SHUTDOWN_DRAIN_MS (default 30000). Upper bound, in
+    /// milliseconds, on axum's graceful drain after SIGINT/SIGTERM. The drain
+    /// waits for every connection task to finish, and an upgraded WebSocket
+    /// whose peer never speaks never does — so without this bound the wait had
+    /// no end of its own and Docker's SIGTERM→SIGKILL window was the only
+    /// backstop. When the bound elapses the remaining connections are closed
+    /// and shutdown proceeds to the (already bounded) background-task cleanup.
+    /// 0 = wait forever, the pre-bound behavior. Boot-only (not hot).
+    pub shutdown_drain_ms: u64,
     // ---- OpenTelemetry / OTLP tracing export (ENH-018) ----
     // All boot-only. The cargo `otel` feature gates the dependency + subscriber
     // wiring; RTDB_OTEL_ENABLED gates it at runtime so a feature-compiled binary
@@ -284,6 +293,7 @@ impl Default for Config {
             db_idle_reclaim_secs: 0,
             cookie_secure: true,
             trusted_proxy: false,
+            shutdown_drain_ms: 30_000,
             otel_enabled: false,
             otel_endpoint: "http://127.0.0.1:4317".to_string(),
             otel_service_name: "par-rt-db".to_string(),
@@ -587,6 +597,10 @@ impl Config {
         // HSTS) with arbitrary header values.
         let trusted_proxy = env_bool("RTDB_TRUSTED_PROXY", false);
 
+        // Deliberately unclamped: 0 selects the pre-bound "wait forever" drain,
+        // so `max(1)` here would make that setting unreachable.
+        let shutdown_drain_ms = env_parsed("RTDB_SHUTDOWN_DRAIN_MS", 30_000u64)?;
+
         let otel = OtelEnv::from_env()?;
 
         // ENH-022 Stage 2: cross-instance op-feed fan-out. Off by default — a
@@ -632,6 +646,7 @@ impl Config {
             db_idle_reclaim_secs,
             cookie_secure,
             trusted_proxy,
+            shutdown_drain_ms,
             otel_enabled: otel.enabled,
             otel_endpoint: otel.endpoint,
             otel_service_name: otel.service_name,
