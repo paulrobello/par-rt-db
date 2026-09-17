@@ -61,6 +61,10 @@ impl AppleProvider {
 struct AppleIdentity {
     sub: String,
     email: String,
+    /// Apple's optional `name` claim. Usually absent: Apple relays the user's
+    /// name once, in the authorization form post, not in the id_token — so an
+    /// Apple-only account normally has no display name at all.
+    name: Option<String>,
 }
 
 #[async_trait]
@@ -162,6 +166,7 @@ impl OAuthProvider for AppleProvider {
                 provider_id: &identity.sub,
                 login: &login,
                 email: &email,
+                display_name: identity.name.as_deref(),
                 allow_email_link: true,
                 conflict_style: ConflictStyle::Conflict,
             },
@@ -319,7 +324,10 @@ fn parse_identity(value: serde_json::Value) -> Result<AppleIdentity, RtDbError> 
         return Err(RtDbError::forbidden("email is not verified"));
     }
 
-    Ok(AppleIdentity { sub, email })
+    let name = crate::auth::normalize_display_name(value.get("name").and_then(|v| v.as_str()))
+        .map(String::from);
+
+    Ok(AppleIdentity { sub, email, name })
 }
 
 #[cfg(test)]
@@ -610,6 +618,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(verified["sub"], "000123.abc");
+    }
+
+    /// Apple relays the user's name once, in the authorization form post —
+    /// not in the id_token — so `name` is normally absent and the account
+    /// legitimately has no display name.
+    #[test]
+    fn parse_identity_extracts_the_name_claim_when_apple_sends_one() {
+        let named = parse_identity(json!({
+            "sub": "sub-named",
+            "email": "named@example.com",
+            "email_verified": "true",
+            "name": "Ada Lovelace"
+        }))
+        .unwrap();
+        assert_eq!(named.name.as_deref(), Some("Ada Lovelace"));
+
+        let unnamed = parse_identity(json!({
+            "sub": "sub-unnamed",
+            "email": "unnamed@example.com",
+            "email_verified": "true"
+        }))
+        .unwrap();
+        assert_eq!(unnamed.name, None);
     }
 
     #[test]

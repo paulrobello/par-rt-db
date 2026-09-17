@@ -35,6 +35,10 @@ struct GitlabIdentity {
     id: String,
     email: String,
     login: String,
+    /// GitLab's `name` field on its own — unlike `login`, it never falls back
+    /// to the username or the email, so an account with no name yields no
+    /// display name rather than one showing an email address.
+    name: Option<String>,
 }
 
 #[async_trait]
@@ -100,6 +104,7 @@ impl OAuthProvider for GitlabProvider {
                 provider_id: &identity.id,
                 login: &identity.login,
                 email: &email,
+                display_name: identity.name.as_deref(),
                 allow_email_link: true,
                 conflict_style: ConflictStyle::Conflict,
             },
@@ -153,6 +158,7 @@ fn parse_user(value: serde_json::Value) -> Result<GitlabIdentity, RtDbError> {
         id,
         email: email.to_string(),
         login,
+        name: auth::normalize_display_name(name).map(String::from),
     })
 }
 
@@ -175,6 +181,43 @@ mod tests {
         assert_eq!(id.email, "Alice@Example.com");
         assert_eq!(id.login, "Alice");
         assert_eq!(id.id, "42", "the numeric id is the durable identity key");
+    }
+
+    /// `name` is the profile name on its own. `login` keeps its existing
+    /// fallback chain (name → username → email); the display name does not,
+    /// so an account with no name shows nothing rather than an email address.
+    #[test]
+    fn parse_user_extracts_the_profile_name_separately_from_login() {
+        let named = parse_user(json!({
+            "id": 50,
+            "username": "alice",
+            "name": "Alice",
+            "email": "alice@example.com",
+            "confirmed_at": "2024-01-02T03:04:05Z"
+        }))
+        .unwrap();
+        assert_eq!(named.name.as_deref(), Some("Alice"));
+        assert_eq!(named.login, "Alice");
+
+        let unnamed = parse_user(json!({
+            "id": 51,
+            "username": "bob",
+            "email": "bob@example.com",
+            "confirmed_at": "2024-01-02T03:04:05Z"
+        }))
+        .unwrap();
+        assert_eq!(unnamed.name, None, "no name claim means no display name");
+        assert_eq!(unnamed.login, "bob", "login still falls back to the handle");
+
+        let blank = parse_user(json!({
+            "id": 52,
+            "username": "carol",
+            "name": "  ",
+            "email": "carol@example.com",
+            "confirmed_at": "2024-01-02T03:04:05Z"
+        }))
+        .unwrap();
+        assert_eq!(blank.name, None, "a blank name is no name");
     }
 
     #[test]
@@ -374,6 +417,7 @@ mod tests {
                 provider_id: &gitlab_id,
                 login: "Bob",
                 email: &email,
+                display_name: None,
                 allow_email_link: true,
                 conflict_style: ConflictStyle::Conflict,
             },
@@ -388,6 +432,7 @@ mod tests {
                 provider_id: &gitlab_id,
                 login: "Bob Renamed",
                 email: &new_email,
+                display_name: None,
                 allow_email_link: true,
                 conflict_style: ConflictStyle::Conflict,
             },

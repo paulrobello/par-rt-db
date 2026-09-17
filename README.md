@@ -1249,9 +1249,15 @@ Design and as-built notes:
   than forcibly dropping them, with no timeout of its own — Docker's SIGTERM→SIGKILL
   window is the backstop that ultimately terminates a connection that never closes (see
   [Graceful shutdown](#graceful-shutdown) above).
-- `AuthedUser.name` is always `null`: the `rtdb_auth.users` table has no `name` column, so
-  users are identified on the wire by `kind`, `email`, and (for GitHub-linked accounts)
-  `githubLogin` / `githubId` — never by a free-form display name.
+- `AuthedUser.name` is display-only and may be `null`. It is filled from the OAuth
+  provider's profile at sign-in (GitHub's `name`, falling back to the `login` handle;
+  Google/GitLab/Microsoft/OIDC `name`; Apple's rarely-present `name` claim), stored on
+  `rtdb_auth.users.name`, and returned on every identity surface — `GET /auth/me`,
+  `/auth/validate`, the WS `authOk` frame, and presence members. Identity itself is
+  still keyed on the stable per-provider subject columns plus the verified email, never
+  on this name; a provider that supplies none leaves any previously stored name intact,
+  and anonymous users and machine tokens are always `null`. Existing accounts are not
+  backfilled — a name appears on the user's next sign-in.
 
 ## Clients
 

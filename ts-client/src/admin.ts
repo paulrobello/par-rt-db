@@ -128,12 +128,15 @@ export interface TokenInfo {
 }
 /** One active interactive session from `GET /admin/sessions`. `tokenHash` is a
  *  non-reversible sha256 digest (the plaintext token is never stored), safe to
- *  surface to an admin and used to target a row for revoke. `email`/`login` are
- *  `null` when the user has none (e.g. an anonymous session). */
+ *  surface to an admin and used to target a row for revoke. `email`/`name`/`login`
+ *  are `null` when the user has none (e.g. an anonymous session). */
 export interface SessionInfo {
   tokenHash: string;
   userId: string;
   email: string | null;
+  /** The OAuth provider's display name, when one was supplied. Unlike `login`
+   *  this is never a handle or an email fallback. */
+  name: string | null;
   login: string | null;
   anonymous: boolean;
   createdAt: number;

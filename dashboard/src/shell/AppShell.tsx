@@ -57,8 +57,8 @@ function OpLine({ op, fresh }: { op: OpEvent; fresh?: boolean }) {
 export function AppShell() {
   const { databases, ops, connection } = useAdmin();
   const { user, method, signOut } = useSession();
-  const email = (user as { email?: string } | null)?.email;
-  const identity = email ?? (method === "adminkey" ? "admin key" : "—");
+  const profile = user as { email?: string | null; name?: string | null } | null;
+  const identity = profile?.name ?? profile?.email ?? (method === "adminkey" ? "admin key" : "—");
 
   // Op-feed settle: flash the newest event as it lands. prevTopKey starts null
   // so the initial batch (page load / reconnect backfill) does NOT animate —

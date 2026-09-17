@@ -204,6 +204,11 @@ pub struct SessionInfo {
     /// `None` when the user has no email (e.g. an anonymous session).
     #[serde(default)]
     pub email: Option<String>,
+    /// The OAuth provider's display name, when one was supplied. Unlike
+    /// `login` this is never a handle or an email fallback. `serde(default)`
+    /// keeps this parsing against a server predating the field.
+    #[serde(default)]
+    pub name: Option<String>,
     /// `None` when the user has no login handle.
     #[serde(default)]
     pub login: Option<String>,

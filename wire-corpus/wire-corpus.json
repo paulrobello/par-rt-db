@@ -79,6 +79,7 @@
   "authed_users": [
     { "kind": "user", "email": "a@b.com", "name": null, "githubLogin": "alice", "githubId": 12345 },
     { "kind": "user", "email": "a@b.com", "name": "Alice" },
+    { "kind": "user", "email": "a@b.com", "name": "Alice Example", "githubLogin": "alice", "githubId": 12345 },
     { "kind": "machine", "email": null, "name": null },
     { "kind": "machine", "email": null, "name": null, "githubLogin": "ci-bot", "githubId": 999 }
   ],

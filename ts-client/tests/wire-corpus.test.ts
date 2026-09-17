@@ -132,6 +132,24 @@ describe("wire-corpus: authed_users (ARC-009 narrowing)", () => {
   }
 });
 
+describe("AuthedUser: older-server compatibility", () => {
+  // A server predating `AuthedUser.name` omits the key entirely rather than
+  // sending `null`. `name` is optional on the interface exactly so such a
+  // payload still satisfies the type and reads as absent, not as a crash.
+  it("accepts a payload with no name field", () => {
+    const user = JSON.parse(`{"kind":"user","email":"a@b.com"}`) as AuthedUser;
+    const _typeCheck: AuthedUser = { kind: "user", email: "a@b.com" };
+    void _typeCheck;
+    expect(user.kind).toBe("user");
+    expect(user.name ?? null).toBeNull();
+  });
+
+  it("keeps an explicit null name null", () => {
+    const user = JSON.parse(`{"kind":"user","email":"a@b.com","name":null}`) as AuthedUser;
+    expect(user.name).toBeNull();
+  });
+});
+
 describe("wire-corpus: schedule_whens", () => {
   const corpus = loadCorpus();
   for (const [idx, entry] of corpus.schedule_whens.entries()) {

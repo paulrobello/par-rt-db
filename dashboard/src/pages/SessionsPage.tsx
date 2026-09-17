@@ -138,7 +138,7 @@ export function SessionsPage() {
                 return (
                   <tr key={row.tokenHash}>
                     <td className={s.nameCell} title={row.userId}>
-                      {row.login ?? row.email ?? row.userId}
+                      {row.name ?? row.login ?? row.email ?? row.userId}
                     </td>
                     <td>{row.email === null ? <span className={s.hint}>—</span> : row.email}</td>
                     <td>

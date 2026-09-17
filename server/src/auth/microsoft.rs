@@ -198,6 +198,7 @@ impl OAuthProvider for MicrosoftProvider {
                 provider_id: &identity.microsoft_sub,
                 login: &login,
                 email: &email,
+                display_name: auth::normalize_display_name(identity.name.as_deref()),
                 allow_email_link: identity.email_domain_verified,
                 conflict_style: ConflictStyle::Precondition,
             },
@@ -1114,6 +1115,7 @@ mod tests {
             provider_id: sub,
             login,
             email,
+            display_name: None,
             allow_email_link: email_domain_verified,
             conflict_style: ConflictStyle::Precondition,
         }

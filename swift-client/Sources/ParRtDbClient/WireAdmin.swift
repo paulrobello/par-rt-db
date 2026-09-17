@@ -197,6 +197,9 @@ public struct SessionInfo: Equatable, Codable, Sendable {
     public var userId: String
     /// nil when the user has no email (e.g. an anonymous session).
     public var email: String?
+    /// The OAuth provider's display name, when one was supplied. Unlike
+    /// `login` this is never a handle or an email fallback.
+    public var name: String?
     /// nil when the user has no login handle.
     public var login: String?
     /// Whether this is an anonymous session.
@@ -210,6 +213,7 @@ public struct SessionInfo: Equatable, Codable, Sendable {
         tokenHash: String,
         userId: String,
         email: String? = nil,
+        name: String? = nil,
         login: String? = nil,
         anonymous: Bool,
         createdAt: Int64,
@@ -218,6 +222,7 @@ public struct SessionInfo: Equatable, Codable, Sendable {
         self.tokenHash = tokenHash
         self.userId = userId
         self.email = email
+        self.name = name
         self.login = login
         self.anonymous = anonymous
         self.createdAt = createdAt
@@ -225,7 +230,7 @@ public struct SessionInfo: Equatable, Codable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case tokenHash, userId, email, login, anonymous, createdAt, expiresAt
+        case tokenHash, userId, email, name, login, anonymous, createdAt, expiresAt
     }
 
     public init(from decoder: Decoder) throws {
@@ -233,6 +238,7 @@ public struct SessionInfo: Equatable, Codable, Sendable {
         tokenHash = try container.decode(String.self, forKey: .tokenHash)
         userId = try container.decode(String.self, forKey: .userId)
         email = try container.decodeIfPresent(String.self, forKey: .email)
+        name = try container.decodeIfPresent(String.self, forKey: .name)
         login = try container.decodeIfPresent(String.self, forKey: .login)
         anonymous = try container.decode(Bool.self, forKey: .anonymous)
         createdAt = try container.decode(Int64.self, forKey: .createdAt)

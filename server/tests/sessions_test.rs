@@ -1,6 +1,8 @@
 use crate::common::{admin_delete, admin_get, mint_user_session, spawn_app, test_state};
+use rtdb_server::auth::Principal;
 use rtdb_server::auth::session::{
-    create_admin_session, delete_session_by_hash, delete_sessions_for_user, list_sessions,
+    create_admin_session, create_session, delete_session_by_hash, delete_sessions_for_user,
+    list_sessions, resolve_session,
 };
 use rtdb_server::db::sha256_hex;
 use serde_json::Value;
@@ -51,6 +53,67 @@ async fn list_and_delete_sessions_works() -> anyhow::Result<()> {
 
     // idempotent: deleting a gone hash is 0, not an error
     assert_eq!(delete_session_by_hash(&state.pool, &real_hash).await?, 0);
+    Ok(())
+}
+
+/// `users.name` is read back onto the resolved principal, which is what makes
+/// `AuthedUser.name` non-null on `/auth/me`, the WS `authOk` frame, and every
+/// presence member — they all serialize the same principal.
+#[tokio::test]
+async fn resolve_session_carries_the_stored_display_name() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let suffix = uuid::Uuid::now_v7().simple();
+    let user_id = format!("u-name-{suffix}");
+    let email = format!("name-{suffix}@example.com");
+    mint_user_session(&state.pool, &user_id, &email).await;
+    sqlx::query("UPDATE rtdb_auth.users SET name = $1 WHERE id = $2")
+        .bind("Ada Lovelace")
+        .bind(&user_id)
+        .execute(&state.pool)
+        .await?;
+
+    let token = create_session(&state.pool, &user_id, 1).await?;
+    let principal = resolve_session(&state.pool, &token)
+        .await?
+        .expect("session resolves");
+    match principal {
+        Principal::User { name, .. } => assert_eq!(name.as_deref(), Some("Ada Lovelace")),
+        Principal::Machine { .. } => panic!("a session must resolve to a user principal"),
+    }
+
+    // A user with no stored name stays null rather than borrowing `login`.
+    let bare_id = format!("u-noname-{suffix}");
+    let bare_email = format!("noname-{suffix}@example.com");
+    mint_user_session(&state.pool, &bare_id, &bare_email).await;
+    let bare_token = create_session(&state.pool, &bare_id, 1).await?;
+    let bare = resolve_session(&state.pool, &bare_token)
+        .await?
+        .expect("session resolves");
+    match bare {
+        Principal::User { name, .. } => assert_eq!(name, None),
+        Principal::Machine { .. } => panic!("a session must resolve to a user principal"),
+    }
+    Ok(())
+}
+
+/// The admin session list surfaces the display name alongside `login`, so an
+/// operator UI can prefer it without a second lookup.
+#[tokio::test]
+async fn list_sessions_surfaces_the_display_name() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let suffix = uuid::Uuid::now_v7().simple();
+    let user_id = format!("u-listname-{suffix}");
+    let email = format!("listname-{suffix}@example.com");
+    mint_user_session(&state.pool, &user_id, &email).await;
+    sqlx::query("UPDATE rtdb_auth.users SET name = $1 WHERE id = $2")
+        .bind("Grace Hopper")
+        .bind(&user_id)
+        .execute(&state.pool)
+        .await?;
+
+    let rows = list_sessions(&state.pool, Some(&user_id), 1000).await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].name.as_deref(), Some("Grace Hopper"));
     Ok(())
 }
 

@@ -21,7 +21,7 @@ import Testing
 // booleans stay distinct from numbers inside containers.
 //
 // Sections covered: client_messages (38), server_messages (33),
-// authed_users (4), schedule_whens (4), schedule_infos (11), queries (15),
+// authed_users (5), schedule_whens (4), schedule_infos (11), queries (15),
 // the admin-plane migrate sections — migrate_requests (3) and
 // migrate_results (3), through MigrateRequest/MigrateResult — the six
 // rejects_* sections (7 total), and protocol_constants.max_steps.

@@ -278,6 +278,43 @@ async fn me_with_session_token_returns_email() -> anyhow::Result<()> {
     Ok(())
 }
 
+// (b1) the provider's display name is stored at sign-in and returned on the
+// identity surfaces: `/auth/me` over HTTP and the WS `authOk` frame. The
+// mocked GitHub `/user` payload carries `"name": "Paul"`, so a null here means
+// the name was never extracted, never persisted, or never read back onto the
+// resolved principal — both surfaces serialize that same principal.
+#[tokio::test]
+async fn display_name_is_returned_by_me_and_the_ws_auth_ok_frame() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    mount_github_mocks(&mock, verified_primary_email("named@example.com")).await;
+    let (state, addr) = oauth_state(&mock).await;
+    let db_name = fresh_db(&state).await;
+    let token = login_flow(addr, "http://localhost:5173").await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/auth/me"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await?;
+    assert_eq!(body["user"]["name"], json!("Paul"));
+
+    let add_resp = admin_post(
+        addr,
+        "/admin/allowlist",
+        json!({"db": db_name, "action": "add", "email": "named@example.com"}),
+    )
+    .await;
+    assert_eq!(add_resp.status(), reqwest::StatusCode::OK);
+
+    let mut ws = ws_connect(addr).await;
+    let msg = ws_auth(&mut ws, &token, &db_name).await;
+    assert_eq!(msg["type"], json!("authOk"));
+    assert_eq!(msg["user"]["name"], json!("Paul"));
+    Ok(())
+}
+
 // (b2) /auth/validate with a real session token returns the authed user with
 // GitHub identity — same machinery as /auth/me, but available to a trusted
 // backend validating a player's token rather than the connection's own.

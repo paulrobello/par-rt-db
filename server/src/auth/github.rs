@@ -142,6 +142,7 @@ impl OAuthProvider for GithubProvider {
                 provider_id: &github_id_str,
                 login: &user.login,
                 email: &email,
+                display_name: Some(display_name(&user)),
                 allow_email_link: true,
                 conflict_style: ConflictStyle::Precondition,
             },
@@ -168,6 +169,16 @@ struct TokenExchangeRequest<'a> {
 struct GithubUser {
     id: i64,
     login: String,
+    /// GitHub's optional profile name — `null` for a user who never set one.
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// The display name for a GitHub account: the profile `name` when set, else
+/// the `login` handle (every GitHub account has one), so a GitHub user always
+/// has something to show.
+fn display_name(user: &GithubUser) -> &str {
+    auth::normalize_display_name(user.name.as_deref()).unwrap_or(&user.login)
 }
 
 #[derive(Deserialize)]
@@ -220,6 +231,28 @@ mod tests {
     use super::*;
     use crate::config::OAuthConfig;
     use serde_json::json;
+
+    fn github_user(value: serde_json::Value) -> GithubUser {
+        serde_json::from_value(value).expect("parse /user payload")
+    }
+
+    #[test]
+    fn display_name_uses_the_profile_name_when_set() {
+        let user = github_user(json!({"id": 1, "login": "octocat", "name": "The Octocat"}));
+        assert_eq!(display_name(&user), "The Octocat");
+    }
+
+    #[test]
+    fn display_name_falls_back_to_login_when_the_name_is_null_or_blank() {
+        let null_name = github_user(json!({"id": 1, "login": "octocat", "name": null}));
+        assert_eq!(display_name(&null_name), "octocat");
+
+        let absent = github_user(json!({"id": 1, "login": "octocat"}));
+        assert_eq!(display_name(&absent), "octocat");
+
+        let blank = github_user(json!({"id": 1, "login": "octocat", "name": "   "}));
+        assert_eq!(display_name(&blank), "octocat");
+    }
 
     #[test]
     fn parse_token_response_returns_access_token_on_success() {

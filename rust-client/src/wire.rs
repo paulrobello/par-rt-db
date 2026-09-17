@@ -797,6 +797,27 @@ mod tests {
         assert!(serde_json::from_value::<ClientMessage>(raw).is_err());
     }
 
+    /// A server predating `AuthedUser.name` omits the key entirely. Serde
+    /// defaults a missing `Option` to `None`, so such a payload still parses
+    /// — this pins that, since a future `deny_unknown_fields`-style tightening
+    /// or a required field would silently break older servers.
+    #[test]
+    fn authed_user_parses_without_a_name_field() {
+        let absent: AuthedUser =
+            serde_json::from_value(json!({"kind":"user","email":"a@b.com"})).unwrap();
+        assert_eq!(absent.kind, UserKind::User);
+        assert_eq!(absent.name, None);
+
+        let explicit_null: AuthedUser =
+            serde_json::from_value(json!({"kind":"user","email":"a@b.com","name":null})).unwrap();
+        assert_eq!(explicit_null.name, None);
+
+        let present: AuthedUser =
+            serde_json::from_value(json!({"kind":"user","email":"a@b.com","name":"Alice"}))
+                .unwrap();
+        assert_eq!(present.name.as_deref(), Some("Alice"));
+    }
+
     #[test]
     fn server_message_tags_and_fields() {
         let ok = serde_json::to_value(ServerMessage::AuthOk {

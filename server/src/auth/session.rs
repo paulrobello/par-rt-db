@@ -99,13 +99,26 @@ pub async fn resolve_admin_session(pool: &PgPool, token: &str) -> Result<bool, R
 /// principal carries GitHub identity. `login` is treated as a GitHub handle
 /// only when paired with a `github_id` — for a Google-only user `login` holds
 /// the display name, so `github_login` stays `None`.
+///
+/// `u.name` is the provider's display name, read here so every identity
+/// surface built from a principal (`GET /auth/me`, the WS `authOk` frame,
+/// presence members) carries it. `None` for a user whose provider supplied
+/// none and for anonymous users.
 pub async fn resolve_session(pool: &PgPool, token: &str) -> Result<Option<Principal>, RtDbError> {
     let hash = sha256_hex(token);
 
-    // `(user_id, expires_at, email, github_id, login, anonymous)`.
-    type SessionUserRow = (String, i64, Option<String>, Option<i64>, String, bool);
+    // `(user_id, expires_at, email, github_id, login, anonymous, name)`.
+    type SessionUserRow = (
+        String,
+        i64,
+        Option<String>,
+        Option<i64>,
+        String,
+        bool,
+        Option<String>,
+    );
     let row: Option<SessionUserRow> = sqlx::query_as(
-        "SELECT s.user_id, s.expires_at, u.email, u.github_id, u.login, u.anonymous \
+        "SELECT s.user_id, s.expires_at, u.email, u.github_id, u.login, u.anonymous, u.name \
          FROM rtdb_auth.sessions s JOIN rtdb_auth.users u ON u.id = s.user_id \
          WHERE s.token_hash = $1",
     )
@@ -113,7 +126,7 @@ pub async fn resolve_session(pool: &PgPool, token: &str) -> Result<Option<Princi
     .fetch_optional(pool)
     .await?;
 
-    let Some((user_id, expires_at, email, github_id, login, anonymous)) = row else {
+    let Some((user_id, expires_at, email, github_id, login, anonymous, name)) = row else {
         return Ok(None);
     };
 
@@ -128,7 +141,7 @@ pub async fn resolve_session(pool: &PgPool, token: &str) -> Result<Option<Princi
     Ok(Some(Principal::User {
         user_id,
         email,
-        name: None,
+        name,
         expires_at,
         anonymous,
         github_id,
@@ -157,6 +170,10 @@ pub struct SessionInfo {
     pub token_hash: String,
     pub user_id: String,
     pub email: Option<String>,
+    /// The provider's display name (`users.name`), when one was supplied.
+    /// Unlike `login` this is never a handle or an email fallback, so an
+    /// operator UI can prefer it and fall back to `login`/`email` itself.
+    pub name: Option<String>,
     /// Display hint: GitHub handle when the user has a `github_id`, else the
     /// stored display name (same convention as `resolve_session`).
     pub login: Option<String>,
@@ -175,10 +192,11 @@ pub async fn list_sessions(
     user_filter: Option<&str>,
     limit: i64,
 ) -> Result<Vec<SessionInfo>, RtDbError> {
-    // (token_hash, user_id, email, login, anonymous, created_at, expires_at)
+    // (token_hash, user_id, email, name, login, anonymous, created_at, expires_at)
     type Row = (
         String,
         String,
+        Option<String>,
         Option<String>,
         Option<String>,
         bool,
@@ -190,7 +208,7 @@ pub async fn list_sessions(
         // sessions carry no user_id and don't belong to any user, so they are
         // excluded from a filtered query (they DO appear in the unfiltered list).
         sqlx::query_as(
-            "SELECT s.token_hash, s.user_id, u.email, u.login, u.anonymous, \
+            "SELECT s.token_hash, s.user_id, u.email, u.name, u.login, u.anonymous, \
                     s.created_at, s.expires_at \
              FROM rtdb_auth.sessions s JOIN rtdb_auth.users u ON u.id = s.user_id \
              WHERE s.user_id = $1 OR u.email = $1 \
@@ -202,11 +220,11 @@ pub async fn list_sessions(
         .await?
     } else {
         sqlx::query_as(
-            "SELECT s.token_hash, s.user_id, u.email, u.login, u.anonymous, \
+            "SELECT s.token_hash, s.user_id, u.email, u.name, u.login, u.anonymous, \
                     s.created_at, s.expires_at \
              FROM rtdb_auth.sessions s JOIN rtdb_auth.users u ON u.id = s.user_id \
              UNION ALL \
-             SELECT token_hash, '(admin key)', NULL, 'Admin key', false, \
+             SELECT token_hash, '(admin key)', NULL, NULL, 'Admin key', false, \
                     created_at, expires_at \
              FROM rtdb_auth.admin_sessions \
              ORDER BY created_at DESC LIMIT $1",
@@ -218,14 +236,17 @@ pub async fn list_sessions(
     Ok(rows
         .into_iter()
         .map(
-            |(token_hash, user_id, email, login, anonymous, created_at, expires_at)| SessionInfo {
-                token_hash,
-                user_id,
-                email,
-                login,
-                anonymous,
-                created_at,
-                expires_at,
+            |(token_hash, user_id, email, name, login, anonymous, created_at, expires_at)| {
+                SessionInfo {
+                    token_hash,
+                    user_id,
+                    email,
+                    name,
+                    login,
+                    anonymous,
+                    created_at,
+                    expires_at,
+                }
             },
         )
         .collect())

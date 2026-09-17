@@ -460,10 +460,11 @@ struct WireDslTests {
     }
 
     @Test func authedUserCorpusFixtures() throws {
-        // Corpus authed_users — all four round-trip byte-parity.
+        // Corpus authed_users — all five round-trip byte-parity.
         let fixtures = [
             #"{"kind":"user","email":"a@b.com","name":null,"githubLogin":"alice","githubId":12345}"#,
             #"{"kind":"user","email":"a@b.com","name":"Alice"}"#,
+            #"{"kind":"user","email":"a@b.com","name":"Alice Example","githubLogin":"alice","githubId":12345}"#,
             #"{"kind":"machine","email":null,"name":null}"#,
             #"{"kind":"machine","email":null,"name":null,"githubLogin":"ci-bot","githubId":999}"#
         ]
@@ -480,6 +481,15 @@ struct WireDslTests {
         #expect(out.contains(#""name":null"#))
         #expect(!out.contains("githubLogin"))
         #expect(!out.contains("githubId"))
+    }
+
+    /// A server predating `AuthedUser.name` omits the key entirely rather
+    /// than sending `null`; `decodeIfPresent` keeps such a payload parsing
+    /// with a nil name instead of failing the whole frame.
+    @Test func authedUserDecodesAPayloadWithoutAName() throws {
+        let user = try decode(AuthedUser.self, #"{"kind":"user","email":"a@b.com"}"#)
+        #expect(user.kind == .user)
+        #expect(user.name == nil)
     }
 
     @Test func authedUserRejectsUnknownKind() {

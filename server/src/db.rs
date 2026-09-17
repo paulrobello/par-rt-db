@@ -244,6 +244,16 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
         .execute(&mut *conn)
         .await?;
 
+    // The provider's free-form display name, surfaced as `AuthedUser.name`.
+    // Display-only: identity still keys on the per-provider subject columns
+    // above, so this is neither unique nor indexed and may legitimately be
+    // NULL (Apple rarely relays a name; a GitHub user may never have set one).
+    // Additive and idempotent, with no backfill — an existing user's name
+    // fills in on their next sign-in.
+    sqlx::query("ALTER TABLE rtdb_auth.users ADD COLUMN IF NOT EXISTS name TEXT NULL")
+        .execute(&mut *conn)
+        .await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS rtdb_auth.sessions (
             token_hash text PRIMARY KEY,

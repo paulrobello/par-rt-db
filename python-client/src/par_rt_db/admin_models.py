@@ -84,14 +84,16 @@ class SessionInfo(_Wire):
 
     ``tokenHash`` is a non-reversible sha256 digest (the plaintext token is
     never stored), safe to surface to an admin and used to target a row for
-    revoke. ``email``/``login`` are ``None`` when the user has none (e.g. an
-    anonymous session). Mirrors the ts-client ``SessionInfo`` byte-for-byte
-    (camelCase on the wire).
+    revoke. ``email``/``name``/``login`` are ``None`` when the user has none
+    (e.g. an anonymous session); ``name`` is the OAuth provider's display name
+    and, unlike ``login``, is never a handle or an email fallback. Mirrors the
+    ts-client ``SessionInfo`` byte-for-byte (camelCase on the wire).
     """
 
     token_hash: str
     user_id: str
     email: str | None = None
+    name: str | None = None
     login: str | None = None
     anonymous: bool = False
     created_at: int

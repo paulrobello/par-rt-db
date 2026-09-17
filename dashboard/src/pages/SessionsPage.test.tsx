@@ -29,6 +29,7 @@ function row(over: Partial<SessionRow>): SessionRow {
     tokenHash: "a".repeat(64),
     userId: "u1",
     email: "user@example.com",
+    name: null,
     login: "user",
     anonymous: false,
     createdAt: now - 60_000,

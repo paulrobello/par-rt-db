@@ -1147,13 +1147,14 @@ describe("RtDbAdminClient subscriptions", () => {
 
 describe("RtDbAdminClient sessions", () => {
   it("listSessions GETs /admin/sessions with user+limit and unwraps {sessions}", async () => {
-    // Two fixture rows: one interactive (email/login populated), one anonymous
-    // where email/login come back as JSON null.
+    // Two fixture rows: one interactive (email/name/login populated), one
+    // anonymous where email/name/login come back as JSON null.
     const sessions: SessionInfo[] = [
       {
         tokenHash: "a".repeat(64),
         userId: "u1",
         email: "user@example.com",
+        name: "Real User",
         login: "user",
         anonymous: false,
         createdAt: 1_700_000_000_000,
@@ -1163,6 +1164,7 @@ describe("RtDbAdminClient sessions", () => {
         tokenHash: "b".repeat(64),
         userId: "u2",
         email: null,
+        name: null,
         login: null,
         anonymous: true,
         createdAt: 1_700_000_000_001,

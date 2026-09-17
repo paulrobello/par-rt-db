@@ -466,6 +466,15 @@ pub enum ConflictStyle {
     Conflict,
 }
 
+/// Normalizes a provider-supplied profile name for `ProviderIdentity::display_name`:
+/// trims surrounding whitespace and treats an empty result as no name at all.
+/// Several providers return `""` rather than omitting the field, and a blank
+/// display name is worse than none — `None` lets a consumer fall back to the
+/// email, `Some("")` renders as nothing.
+pub fn normalize_display_name(raw: Option<&str>) -> Option<&str> {
+    raw.map(str::trim).filter(|name| !name.is_empty())
+}
+
 /// The identity a provider extracted from its token exchange / claims,
 /// normalized for `resolve_user`.
 pub struct ProviderIdentity<'a> {
@@ -473,6 +482,11 @@ pub struct ProviderIdentity<'a> {
     pub provider_id: &'a str,
     pub login: &'a str,
     pub email: &'a str,
+    /// The provider's free-form profile name, stored on `users.name` and
+    /// surfaced as `AuthedUser.name`. Display-only and never an identity key.
+    /// `None` when the provider supplies no usable name, which leaves any
+    /// stored name intact rather than clearing it (see `resolve_user`).
+    pub display_name: Option<&'a str>,
     /// Whether step (b) below — linking an existing email-keyed row that has
     /// no value for `provider_id_column` — is permitted at all. `true` for
     /// every provider except Microsoft, which passes
@@ -495,6 +509,10 @@ pub struct ProviderIdentity<'a> {
 /// 1. An existing user with this `provider_id_column` value (a returning
 ///    user of this provider) is reused, with `login`/`email` refreshed — so a
 ///    provider-side email change follows the account instead of forking it.
+///    `name` refreshes the same way, except that a `display_name` of `None`
+///    leaves the stored value alone (`COALESCE`): a provider with no profile
+///    name must not erase one another provider supplied. The email-link step
+///    below writes `name` under the same rule.
 /// 2. Otherwise, when `id.allow_email_link` is true and the verified email
 ///    already belongs to an account not yet linked to this provider
 ///    (`provider_id_column IS NULL`), that account is linked by setting its
@@ -531,13 +549,18 @@ pub async fn resolve_user(pool: &PgPool, id: ProviderIdentity<'_>) -> Result<Str
         .fetch_optional(&mut *tx)
         .await?
     {
-        sqlx::query("UPDATE rtdb_auth.users SET login = $1, email = $2 WHERE id = $3")
-            .bind(id.login)
-            .bind(id.email)
-            .bind(&row_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| map_conflict(e, id.conflict_style))?;
+        sqlx::query(
+            "UPDATE rtdb_auth.users \
+             SET login = $1, email = $2, name = COALESCE($3::text, name) \
+             WHERE id = $4",
+        )
+        .bind(id.login)
+        .bind(id.email)
+        .bind(id.display_name)
+        .bind(&row_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| map_conflict(e, id.conflict_style))?;
         tx.commit().await?;
         return Ok(row_id);
     }
@@ -546,14 +569,15 @@ pub async fn resolve_user(pool: &PgPool, id: ProviderIdentity<'_>) -> Result<Str
     if id.allow_email_link {
         let link_sql = format!(
             "UPDATE rtdb_auth.users \
-             SET {col} = $1{cast}, login = $2 \
-             WHERE email = $3 AND {col} IS NULL \
+             SET {col} = $1{cast}, login = $2, name = COALESCE($3::text, name) \
+             WHERE email = $4 AND {col} IS NULL \
              RETURNING id",
             col = id.provider_id_column,
         );
         if let Some((row_id,)) = sqlx::query_as::<_, (String,)>(&link_sql)
             .bind(id.provider_id)
             .bind(id.login)
+            .bind(id.display_name)
             .bind(id.email)
             .fetch_optional(&mut *tx)
             .await?
@@ -567,8 +591,8 @@ pub async fn resolve_user(pool: &PgPool, id: ProviderIdentity<'_>) -> Result<Str
     let row_id = new_id();
     let now = now_ms();
     let insert_sql = format!(
-        "INSERT INTO rtdb_auth.users (id, {col}, login, email, created_at) \
-         VALUES ($1, $2{cast}, $3, $4, $5)",
+        "INSERT INTO rtdb_auth.users (id, {col}, login, email, name, created_at) \
+         VALUES ($1, $2{cast}, $3, $4, $5, $6)",
         col = id.provider_id_column,
     );
     sqlx::query(&insert_sql)
@@ -576,6 +600,7 @@ pub async fn resolve_user(pool: &PgPool, id: ProviderIdentity<'_>) -> Result<Str
         .bind(id.provider_id)
         .bind(id.login)
         .bind(id.email)
+        .bind(id.display_name)
         .bind(now)
         .execute(&mut *tx)
         .await
@@ -607,6 +632,17 @@ fn map_conflict(err: sqlx::Error, style: ConflictStyle) -> RtDbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_display_name_trims_and_drops_blanks() {
+        assert_eq!(
+            normalize_display_name(Some("  Ada Lovelace  ")),
+            Some("Ada Lovelace")
+        );
+        assert_eq!(normalize_display_name(Some("")), None);
+        assert_eq!(normalize_display_name(Some("   ")), None);
+        assert_eq!(normalize_display_name(None), None);
+    }
 
     #[test]
     fn authed_user_for_machine_has_no_email_or_name() {
@@ -722,9 +758,20 @@ mod resolve_user_tests {
             provider_id: sub,
             login,
             email,
+            display_name: None,
             allow_email_link: true,
             conflict_style: ConflictStyle::Conflict,
         }
+    }
+
+    async fn name_of(pool: &PgPool, id: &str) -> Option<String> {
+        let (value,): (Option<String>,) =
+            sqlx::query_as("SELECT name FROM rtdb_auth.users WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("user row exists");
+        value
     }
 
     // --- id-keyed path (github_id / apple_sub / microsoft_sub) -------------
@@ -859,6 +906,7 @@ mod resolve_user_tests {
                 provider_id: &github_id_str,
                 login: &login,
                 email: &email,
+                display_name: None,
                 allow_email_link: true,
                 conflict_style: ConflictStyle::Precondition,
             },
@@ -888,6 +936,7 @@ mod resolve_user_tests {
             provider_id: subject,
             login,
             email,
+            display_name: None,
             allow_email_link: true,
             conflict_style: ConflictStyle::Conflict,
         }
@@ -998,5 +1047,109 @@ mod resolve_user_tests {
         .await
         .expect("second login after the email changed");
         assert_eq!(again, existing);
+    }
+
+    // --- display name (ENH: AuthedUser.name) ------------------------------
+    //
+    // `display_name` is the provider's free-form profile name, stored purely
+    // so identity surfaces can show it. It is never an identity key: the
+    // subject column still decides which row a login resolves to.
+
+    #[tokio::test]
+    async fn display_name_is_persisted_on_insert() {
+        let pool = users_pool().await;
+        let sub = uniq("sub");
+        let login = uniq("login");
+        let email = format!("{}@resolve-user-test.example", uniq("named"));
+
+        let mut identity = apple_identity(&sub, &login, &email);
+        identity.display_name = Some("Ada Lovelace");
+        let id = resolve_user(&pool, identity).await.expect("insert");
+
+        assert_eq!(name_of(&pool, &id).await.as_deref(), Some("Ada Lovelace"));
+    }
+
+    #[tokio::test]
+    async fn display_name_is_refreshed_on_a_returning_sign_in() {
+        let pool = users_pool().await;
+        let sub = uniq("sub");
+        let login = uniq("login");
+        let email = format!("{}@resolve-user-test.example", uniq("rename"));
+
+        let mut first = apple_identity(&sub, &login, &email);
+        first.display_name = Some("Old Name");
+        let id = resolve_user(&pool, first).await.expect("initial insert");
+
+        let mut second = apple_identity(&sub, &login, &email);
+        second.display_name = Some("New Name");
+        let again = resolve_user(&pool, second).await.expect("returning login");
+
+        assert_eq!(again, id);
+        assert_eq!(name_of(&pool, &id).await.as_deref(), Some("New Name"));
+    }
+
+    /// A provider that supplies no profile name (Apple usually, GitHub for a
+    /// user who never set one) must not wipe a name a different provider
+    /// already stored — hence `COALESCE` rather than a plain assignment.
+    #[tokio::test]
+    async fn a_stored_display_name_survives_a_provider_that_omits_it() {
+        let pool = users_pool().await;
+        let sub = uniq("sub");
+        let login = uniq("login");
+        let email = format!("{}@resolve-user-test.example", uniq("keep"));
+
+        let mut first = apple_identity(&sub, &login, &email);
+        first.display_name = Some("Grace Hopper");
+        let id = resolve_user(&pool, first).await.expect("initial insert");
+
+        // Same subject, no name this time.
+        let second = apple_identity(&sub, &login, &email);
+        let again = resolve_user(&pool, second).await.expect("returning login");
+
+        assert_eq!(again, id);
+        assert_eq!(name_of(&pool, &id).await.as_deref(), Some("Grace Hopper"));
+    }
+
+    #[tokio::test]
+    async fn display_name_is_written_when_linking_an_email_keyed_row() {
+        let pool = users_pool().await;
+        let email = format!("{}@resolve-user-test.example", uniq("link"));
+        let existing = insert_email_user(&pool, &uniq("legacy-login"), &email).await;
+
+        let sub = uniq("sub");
+        let login = uniq("login");
+        let mut identity = apple_identity(&sub, &login, &email);
+        identity.display_name = Some("Linked Name");
+        let id = resolve_user(&pool, identity).await.expect("link by email");
+
+        assert_eq!(id, existing);
+        assert_eq!(
+            name_of(&pool, &existing).await.as_deref(),
+            Some("Linked Name")
+        );
+    }
+
+    #[tokio::test]
+    async fn linking_without_a_display_name_keeps_the_stored_one() {
+        let pool = users_pool().await;
+        let email = format!("{}@resolve-user-test.example", uniq("link-keep"));
+        let existing = insert_email_user(&pool, &uniq("legacy-login"), &email).await;
+        sqlx::query("UPDATE rtdb_auth.users SET name = $1 WHERE id = $2")
+            .bind("Prior Name")
+            .bind(&existing)
+            .execute(&pool)
+            .await
+            .expect("seed a stored display name");
+
+        let sub = uniq("sub");
+        let id = resolve_user(&pool, apple_identity(&sub, &uniq("login"), &email))
+            .await
+            .expect("link by email without a name");
+
+        assert_eq!(id, existing);
+        assert_eq!(
+            name_of(&pool, &existing).await.as_deref(),
+            Some("Prior Name")
+        );
     }
 }
