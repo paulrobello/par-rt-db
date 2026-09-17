@@ -19,9 +19,16 @@ default = ["runtime"]
 runtime = ["dep:tokio"]
 
 [dependencies]
-par-rt-db-client = { path = "../rust-client", features = ["http", "admin"] }
+# `ws` powers `rtdb watch` (the reactive subscribe); `signal` powers its
+# Ctrl-C arm. Both are declared here rather than leaned on via workspace
+# feature unification, so a standalone build of this crate still compiles.
+par-rt-db-client = { path = "../rust-client", features = ["http", "admin", "ws"] }
 clap = { version = "4", features = ["derive", "env"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"], optional = true }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "signal",
+], optional = true }
 serde_json.workspace = true
 anyhow.workspace = true
 

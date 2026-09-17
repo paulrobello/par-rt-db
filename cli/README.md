@@ -72,6 +72,7 @@ Commands:
   sessions      Manage active interactive sessions. (admin)
   merge-users   Merge an anonymous user into a real one, synchronously. (admin)
   query         Run a Query JSON against `--db` and print the result. (machine token)
+  watch         Tail a live Query against `--db`: print the initial result, then every subsequent update until Ctrl-C. (machine token)
   mutate        Run a Transaction JSON against `--db` and print step results. (machine token)
   migrate       Apply (or preview with `--dry-run`) a migration directives JSON file to `--db`. (admin)
   explain       Explain a Query's compiled SQL against `--db` without running it. (admin)
@@ -81,8 +82,8 @@ Commands:
 
 Options:
       --url <URL>              Server base URL (e.g. https://rtdb.example.com) [env: RTDB_URL=]
-      --db <DB>                Database name — used by `query`, `mutate`, and `push-schema` [env: RTDB_DB=]
-      --token <TOKEN>          Machine token for `query` / `mutate` [env: RTDB_TOKEN]
+      --db <DB>                Database name — used by `query`, `watch`, `mutate`, and `push-schema` [env: RTDB_DB=]
+      --token <TOKEN>          Machine token for `query` / `watch` / `mutate` [env: RTDB_TOKEN]
       --admin-key <ADMIN_KEY>  Instance admin key — bearer for every admin subcommand [env: RTDB_ADMIN_KEY]
   -h, --help                   Print help
   -V, --version                Print version
@@ -93,8 +94,8 @@ Options:
 | Flag | Env var | Description |
 | --- | --- | --- |
 | `--url <URL>` | `RTDB_URL` | Server base URL (e.g. https://rtdb.example.com) **(required)** |
-| `--db <DB>` | `RTDB_DB` | Database name — used by `query`, `mutate`, and `push-schema` |
-| `--token <TOKEN>` | `RTDB_TOKEN` | Machine token for `query` / `mutate` |
+| `--db <DB>` | `RTDB_DB` | Database name — used by `query`, `watch`, `mutate`, and `push-schema` |
+| `--token <TOKEN>` | `RTDB_TOKEN` | Machine token for `query` / `watch` / `mutate` |
 | `--admin-key <ADMIN_KEY>` | `RTDB_ADMIN_KEY` | Instance admin key — bearer for every admin subcommand |
 
 ### `rtdb list-dbs`
@@ -245,6 +246,20 @@ Usage: rtdb query <QUERY>
 
 Arguments:
   <QUERY>  Query JSON, e.g. `{"table":"items","take":10}`. Prefix with `@` to read from a file (`@query.json`)
+
+Options:
+  -h, --help  Print help
+```
+
+### `rtdb watch`
+
+```text
+Tail a live Query against `--db`: print the initial result, then every subsequent update until Ctrl-C. (machine token)
+
+Usage: rtdb watch <QUERY>
+
+Arguments:
+  <QUERY>  Query JSON, e.g. `{"table":"items","take":10}`. Prefix with `@` to read from a file (`@query.json`). Each result is printed as one compact JSON line (NDJSON) so the stream pipes into `jq`; `query` pretty-prints its single result instead
 
 Options:
   -h, --help  Print help

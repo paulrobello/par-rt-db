@@ -9,8 +9,9 @@
 //! Admin subcommands (`list-dbs`, `create-db`, `clone-db`, `push-schema`,
 //! `mint-token`, `revoke-token`, `sessions list|revoke`, `merge-users`,
 //! `workflows list|get|start|cancel|signal`) send the instance admin key as the
-//! bearer. Data-plane subcommands (`query`, `mutate`) send a machine token
-//! scoped to `--db`.
+//! bearer. Data-plane subcommands (`query`, `watch`, `mutate`) send a machine
+//! token scoped to `--db` — `watch` over the reactive WebSocket client, the
+//! rest one-shot over HTTP.
 //!
 //! Layout: [`args`] holds the clap definitions and the SEC-204 argv-secret
 //! predicate, [`commands`] the per-family handlers plus the shared
@@ -60,6 +61,7 @@ async fn dispatch(cli: &Cli) -> Result<()> {
             confirm,
         } => commands::sessions::run_merge_users(cli, anon, real, confirm).await,
         Command::Query { query } => commands::data::run_query(cli, query).await,
+        Command::Watch { query } => commands::data::run_watch(cli, query).await,
         Command::Mutate { txn } => commands::data::run_mutate(cli, txn).await,
         Command::Migrate { file, dry_run } => {
             commands::schema::run_migrate(cli, file, *dry_run).await
@@ -170,17 +172,51 @@ mod tests {
             .await
             .is_err()
         );
+        // `watch` is a data-plane subcommand too: same gate, and it must fail
+        // there rather than opening a socket that never returns.
+        assert!(
+            dispatch(&cli_with_command(Command::Watch {
+                query: r#"{"table":"x"}"#.into()
+            }))
+            .await
+            .is_err()
+        );
         // With --db but no --token, still errors (require_token fires).
-        let with_db_no_token = Cli {
-            url: "http://x".into(),
-            db: Some("d".into()),
-            token: None,
-            admin_key: None,
-            command: Command::Query {
+        for command in [
+            Command::Query {
                 query: r#"{"table":"x"}"#.into(),
             },
+            Command::Watch {
+                query: r#"{"table":"x"}"#.into(),
+            },
+        ] {
+            let with_db_no_token = Cli {
+                url: "http://x".into(),
+                db: Some("d".into()),
+                token: None,
+                admin_key: None,
+                command,
+            };
+            assert!(dispatch(&with_db_no_token).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_watch_parses_query_before_connecting() {
+        // The Query JSON is parsed before the ws client is built, so a
+        // malformed query surfaces its parse error instead of dialing a socket
+        // the test would then have to wait out.
+        let bad = Cli {
+            url: "http://127.0.0.1:1".into(),
+            db: Some("d".into()),
+            token: Some("t".into()),
+            admin_key: None,
+            command: Command::Watch {
+                query: "{not json".into(),
+            },
         };
-        assert!(dispatch(&with_db_no_token).await.is_err());
+        let err = dispatch(&bad).await.unwrap_err().to_string();
+        assert!(err.contains("parsing Query JSON"), "got: {err}");
     }
 
     #[tokio::test]

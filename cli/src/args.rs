@@ -20,11 +20,11 @@ pub(crate) struct Cli {
     #[arg(long, env = "RTDB_URL")]
     pub(crate) url: String,
 
-    /// Database name — used by `query`, `mutate`, and `push-schema`.
+    /// Database name — used by `query`, `watch`, `mutate`, and `push-schema`.
     #[arg(long, env = "RTDB_DB")]
     pub(crate) db: Option<String>,
 
-    /// Machine token for `query` / `mutate`.
+    /// Machine token for `query` / `watch` / `mutate`.
     #[arg(long, env = "RTDB_TOKEN", hide_env_values = true)]
     pub(crate) token: Option<String>,
 
@@ -99,6 +99,15 @@ pub(crate) enum Command {
     Query {
         /// Query JSON, e.g. `{"table":"items","take":10}`. Prefix with `@` to
         /// read from a file (`@query.json`).
+        query: String,
+    },
+    /// Tail a live Query against `--db`: print the initial result, then every
+    /// subsequent update until Ctrl-C. (machine token)
+    Watch {
+        /// Query JSON, e.g. `{"table":"items","take":10}`. Prefix with `@` to
+        /// read from a file (`@query.json`). Each result is printed as one
+        /// compact JSON line (NDJSON) so the stream pipes into `jq`; `query`
+        /// pretty-prints its single result instead.
         query: String,
     },
     /// Run a Transaction JSON against `--db` and print step results. (machine token)
@@ -452,6 +461,22 @@ mod tests {
             panic!("expected Mutate");
         };
         assert_eq!(t, txn);
+    }
+
+    #[test]
+    fn parses_watch() {
+        // `watch` takes the same positional Query JSON as `query`, inline or
+        // `@file`, and is credentialed with a machine token like `query`.
+        for arg in [r#"{"table":"items","take":5}"#, "@query.json"] {
+            let cli = Cli::try_parse_from([
+                "rtdb", "--url", "http://x", "--db", "d", "--token", "t", "watch", arg,
+            ])
+            .unwrap();
+            let Command::Watch { query } = cli.command else {
+                panic!("expected Watch");
+            };
+            assert_eq!(query, arg);
+        }
     }
 
     #[test]
