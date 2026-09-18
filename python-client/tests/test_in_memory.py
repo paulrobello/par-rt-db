@@ -1349,6 +1349,257 @@ def test_vector_search_filter_rejects_unknown_field() -> None:
     assert ei.value.code is ErrorCode.BAD_REQUEST
 
 
+# ---------------------------------------------------------------------------
+# ENH-030: paginate composed with the ranked terminals
+# ---------------------------------------------------------------------------
+
+
+def _drain_pages(
+    c: InMemoryRtDbClient, make_query: Any, num_items: int
+) -> tuple[list[dict[str, Any]], int]:
+    """Page a query to exhaustion, returning every doc in page order and the
+    page count. Fails loudly on a cursor that does not advance (the failure
+    mode a broken keyset predicate produces) rather than looping forever."""
+    docs: list[dict[str, Any]] = []
+    cursor: str | None = None
+    pages = 0
+    while True:
+        page = c.run_query(make_query(cursor, num_items))
+        pages += 1
+        docs.extend(page["docs"])
+        cursor = page.get("nextCursor")
+        if cursor is None:
+            return docs, pages
+        assert page["docs"], "a cursor was minted from an empty page"
+        assert pages <= 32, "pagination did not terminate — the cursor is not advancing"
+
+
+def _seed_ranked_notes(c: InMemoryRtDbClient) -> None:
+    """Three notes whose tsquery scores for "task" are a strict total order
+    (1 / 2 / 3 occurrences), seeded OUT of rank order so an engine returning
+    insertion order fails loudly. Mirrors the corpus cases
+    ``search-paginate-first-page`` / ``search-paginate-cursor-resumes``."""
+    for row in (
+        {"title": "beta", "body": "task task", "status": "open"},
+        {"title": "alpha", "body": "task", "status": "open"},
+        {"title": "gamma", "body": "task task task", "status": "open"},
+    ):
+        c.mutate(Mutation.builder().insert("notes", row).build())
+
+
+def test_search_paginate_pages_the_ranked_result() -> None:
+    # ENH-030: `paginate` composes with `search` as a peer clause. The pages
+    # are non-overlapping, ranked (score desc), and concatenate to the full
+    # ranked result; the short last page carries no cursor.
+    c = _new_search_client()
+    _seed_ranked_notes(c)
+
+    def q(cursor: str | None, n: int) -> Query:
+        b = TableQuery("notes").search("search_all", "task")
+        return b.paginate(cursor=cursor, num_items=n).build()
+
+    page1 = c.run_query(q(None, 2))
+    assert [d["title"] for d in page1["docs"]] == ["gamma", "beta"]
+    assert page1["nextCursor"] is not None
+    page2 = c.run_query(q(page1["nextCursor"], 2))
+    assert [d["title"] for d in page2["docs"]] == ["alpha"]
+    assert "nextCursor" not in page2, "a short last page carries no cursor"
+
+    # Same result at every page size, and no row is skipped or duplicated.
+    for n in (1, 2, 3, 10):
+        drained, pages = _drain_pages(c, q, n)
+        titles = [d["title"] for d in drained]
+        assert titles == ["gamma", "beta", "alpha"], f"page size {n}"
+        assert len(set(titles)) == len(titles), f"page size {n}: duplicate row across pages"
+        assert pages == (3 + n - 1) // n
+
+
+def test_search_paginate_leaves_the_unpaginated_arm_unranked() -> None:
+    # The tsquery score exists ONLY to give `paginate` a deterministic total
+    # order; the unpaginated arm still returns matches in insertion order, with
+    # ts_rank explicitly unmodeled.
+    c = _new_search_client()
+    _seed_ranked_notes(c)
+    docs = c.run_query(TableQuery("notes").search("search_all", "task").build())
+    assert [d["title"] for d in docs] == ["beta", "alpha", "gamma"]
+
+
+def test_search_paginate_breaks_score_ties_by_created_at_desc() -> None:
+    # Equal scores fall through to the ranked terminals' shared tie-breakers
+    # (created_at desc, then id desc) — the pair that makes the order total.
+    c = _new_search_client()
+    for title in ("one", "two", "three"):
+        c.mutate(
+            Mutation.builder()
+            .insert("notes", {"title": title, "body": "task", "status": "open"})
+            .build()
+        )
+
+    def q(cursor: str | None, n: int) -> Query:
+        b = TableQuery("notes").search("search_all", "task")
+        return b.paginate(cursor=cursor, num_items=n).build()
+
+    drained, _pages = _drain_pages(c, q, 1)
+    assert [d["title"] for d in drained] == ["three", "two", "one"]
+
+
+def test_search_paginate_trgm_pages_by_similarity() -> None:
+    # trgm mode pages by the similarity stand-in the unpaginated arm already
+    # ranks by (4/6 > 4/13 > 4/19), not by the tsquery lexeme count.
+    c = _new_search_client()
+    _seed_trgm_rows(c)
+
+    def q(cursor: str | None, n: int) -> Query:
+        b = TableQuery("notes").search("search_all", "conv", mode="trgm")
+        return b.paginate(cursor=cursor, num_items=n).build()
+
+    page1 = c.run_query(q(None, 2))
+    assert [d["title"] for d in page1["docs"]] == ["convex", "ConVex Mirror"]
+    assert page1["nextCursor"] is not None
+    drained, _pages = _drain_pages(c, q, 2)
+    assert [d["title"] for d in drained] == ["convex", "ConVex Mirror", "misc"]
+
+
+def test_search_paginate_attaches_snippets() -> None:
+    # `snippet` lives inside the search block, so it composes with paginate —
+    # each page doc still carries its <mark>-highlighted `_searchSnippet`.
+    c = _new_search_client()
+    _seed_ranked_notes(c)
+    page = c.run_query(
+        TableQuery("notes").search("search_all", "task", snippet=True).paginate(num_items=2).build()
+    )
+    assert [d["title"] for d in page["docs"]] == ["gamma", "beta"]
+    assert all("<mark>task</mark>" in d["_searchSnippet"] for d in page["docs"])
+
+
+def test_search_paginate_still_rejects_take() -> None:
+    # `take` and `paginate` remain mutually exclusive — the shared combination
+    # table rejects the pair before terminal dispatch, so removing `paginate`
+    # from the search guard did not open this combination.
+    c = _new_search_client()
+    _seed_ranked_notes(c)
+    with pytest.raises(RtDbError) as ei:
+        c.run_query(
+            TableQuery("notes").search("search_all", "task").take(1).paginate(num_items=1).build()
+        )
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+
+
+def test_search_paginate_rejects_a_malformed_cursor() -> None:
+    # A ranked cursor is [rank, created_at, id]; a wrong arity and a
+    # non-numeric rank value are both BAD_REQUEST, never a silent mis-page.
+    from par_rt_db.cursor import encode_cursor
+
+    c = _new_search_client()
+    _seed_ranked_notes(c)
+    # Each case asserts its OWN message, so the non-numeric-rank case pins the
+    # `rank` arm of the cursor validator rather than passing on whatever the
+    # comparator would have raised downstream had that arm been missing.
+    for bad, want in (
+        (encode_cursor([1.0, 2.0]), "cursor has 2 value(s) but this query sorts over 3 column(s)"),
+        (encode_cursor(["nope", 1.0, "x"]), "cursor value for rank must be a number"),
+    ):
+        with pytest.raises(RtDbError) as ei:
+            c.run_query(
+                TableQuery("notes")
+                .search("search_all", "task")
+                .paginate(cursor=bad, num_items=1)
+                .build()
+            )
+        assert ei.value.code is ErrorCode.BAD_REQUEST
+        assert ei.value.message == want
+
+
+def test_vector_search_paginate_bounds_the_pool_by_limit() -> None:
+    # Distance ordering is not modeled, so the pool is the filter-narrowed
+    # candidate set ordered by the tie-breakers (created_at desc, id desc) and
+    # cut to `limit` — `numItems` then slices that pool into pages.
+    c = _new_client()
+    _seed_query_rows(c)  # a, b, c inserted in that order (created_at ascends)
+
+    def q(cursor: str | None, n: int, limit: int = 5) -> Query:
+        b = TableQuery("items").vector_search("vec", [1.0, 0.0], limit=limit)
+        return b.paginate(cursor=cursor, num_items=n).build()
+
+    drained, _pages = _drain_pages(c, q, 2)
+    assert [d["name"] for d in drained] == ["c", "b", "a"]
+
+    # `limit` sizes the POOL: a limit of 2 makes the two newest rows the whole
+    # result, whatever the page size — the pages concatenate to exactly it.
+    def q2(cursor: str | None, n: int) -> Query:
+        return q(cursor, n, limit=2)
+
+    page1 = c.run_query(q2(None, 1))
+    assert [d["name"] for d in page1["docs"]] == ["c"]
+    assert page1["nextCursor"] is not None
+    page2 = c.run_query(q2(page1["nextCursor"], 1))
+    assert [d["name"] for d in page2["docs"]] == ["b"]
+    assert "nextCursor" not in page2, "the pool is exhausted at `limit` rows"
+    pooled, _p = _drain_pages(c, q2, 1)
+    assert [d["name"] for d in pooled] == ["c", "b"]
+
+    # A pool smaller than the page: one doc, and no cursor — `has_next` is
+    # measured against the TRUNCATED pool, not the candidate set behind it.
+    small = c.run_query(q(None, 5, limit=1))
+    assert [d["name"] for d in small["docs"]] == ["c"]
+    assert "nextCursor" not in small
+
+
+def test_vector_search_paginate_applies_the_terminal_filter() -> None:
+    # The terminal's filter narrows the pool before it is cut and paged.
+    from par_rt_db.wire import FilterExpr
+
+    c = _new_client()
+    _seed_query_rows(c)  # a/todo, b/todo, c/done
+    flt = TypeAdapter(FilterExpr).validate_python({"op": "eq", "field": "status", "value": "todo"})
+    page = c.run_query(
+        TableQuery("items")
+        .vector_search("vec", [1.0, 0.0], limit=5, filter_=flt)
+        .paginate(num_items=5)
+        .build()
+    )
+    assert [d["name"] for d in page["docs"]] == ["b", "a"]
+    assert "nextCursor" not in page
+
+
+def test_hybrid_search_paginate_returns_an_empty_page() -> None:
+    # RRF ranking is not modeled, so the unpaginated stub has no rows — a
+    # paginated hybridSearch is an empty PAGE with no cursor to mint.
+    c = _new_search_client()
+    _seed_ranked_notes(c)
+    page = c.run_query(
+        TableQuery("notes").hybrid_search("task", [1.0, 0.0], limit=5).paginate(num_items=2).build()
+    )
+    assert page == {"docs": []}
+    # A supplied cursor is inert rather than an error: the stub has nothing to
+    # resume past, and the server answers the same request with a page.
+    resumed = c.run_query(
+        TableQuery("notes")
+        .hybrid_search("task", [1.0, 0.0], limit=5)
+        .paginate(cursor="whatever", num_items=2)
+        .build()
+    )
+    assert resumed == {"docs": []}
+
+
+def test_ranked_paginate_composes_with_a_fields_projection() -> None:
+    # The cursor is minted from the unprojected row inside the terminal, so a
+    # projected ranked page still paginates.
+    c = _new_search_client()
+    _seed_ranked_notes(c)
+
+    def q(cursor: str | None, n: int) -> Query:
+        b = TableQuery("notes").search("search_all", "task")
+        return b.paginate(cursor=cursor, num_items=n).fields("title").build()
+
+    page1 = c.run_query(q(None, 2))
+    assert [d["title"] for d in page1["docs"]] == ["gamma", "beta"]
+    assert all(sorted(d) == ["_creationTime", "_id", "_version", "title"] for d in page1["docs"])
+    assert page1["nextCursor"] is not None
+    drained, _pages = _drain_pages(c, q, 2)
+    assert [d["title"] for d in drained] == ["gamma", "beta", "alpha"]
+
+
 def test_paginate_keyset_pages_through_the_sorted_set() -> None:
     c = _new_client()
     _seed_query_rows(c)  # todo: order 2,1 ; done: order 3

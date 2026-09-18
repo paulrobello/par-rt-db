@@ -1,0 +1,33 @@
+{
+  "name": "search-paginate-cursor-resumes",
+  "$comment": "ENH-030 continuation of search-paginate-first-page: the \"$prev\" sentinel runs page one, then resumes with its nextCursor. Page two must start strictly AFTER page one's last row (no boundary duplicate) and, being a short page (1 of 2), carry no nextCursor — so the two cases together pin non-overlapping, correctly ordered pages whose concatenation is the full ranked result. Same ranking derivation as the first-page case.",
+  "schema": {
+    "tables": {
+      "notes": {
+        "fields": {
+          "name": { "type": "string" },
+          "body": { "type": "string" }
+        },
+        "indexes": [
+          { "name": "search_body", "fields": ["body"], "search": true }
+        ]
+      }
+    }
+  },
+  "seed": [
+    { "name": "b", "body": "task task" },
+    { "name": "a", "body": "task" },
+    { "name": "c", "body": "task task task" }
+  ],
+  "op": {
+    "query": {
+      "table": "notes",
+      "search": { "index": "search_body", "query": "task" },
+      "paginate": { "cursor": "$prev", "numItems": 2 }
+    }
+  },
+  "expect": {
+    "docs": [{ "name": "a", "body": "task" }]
+  },
+  "expect_next_cursor": false
+}

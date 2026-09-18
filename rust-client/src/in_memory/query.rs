@@ -35,7 +35,10 @@ impl InMemoryRtDbClient {
     /// compile-then-execute order), then evaluated per row via
     /// [`eval_filter_expr`]. `paginate` returns the wire `Paginated<T>` shape
     /// (`{docs, nextCursor?}`) via keyset-cursor paging over the sorted set;
-    /// its combination guards reject `count`/`unique`/`first`/`take`.
+    /// its combination guards reject `count`/`unique`/`first`/`take`. Since
+    /// ENH-030 it also composes as a peer of the three ranked terminals,
+    /// paging their ranking rather than replacing it — the envelope is the
+    /// same, only the sort columns differ.
     pub fn run_query(&self, q: &Query) -> Result<Value, RtDbError> {
         let table_def = self.require_table(&q.table)?.clone();
         // Projection validation runs before every early return so all terminals
@@ -279,6 +282,9 @@ impl InMemoryRtDbClient {
     /// order is unspecified (no ranking) so callers compare as a set. QA-103:
     /// the previous stub returned `[]` unconditionally, which diverged from
     /// the server (and the other clients) on every non-empty match.
+    ///
+    /// With `paginate` (ENH-030) the candidate set is the same, but paging
+    /// needs a total order the unpaginated path does not: see the in-body note.
     fn execute_vector_search_terminal(
         &self,
         q: &Query,
@@ -296,6 +302,26 @@ impl InMemoryRtDbClient {
         if let Some(filter) = &vector.filter {
             rows.retain(|d| matches_filter(filter, d, &table_def.fields));
         }
+        if let Some(pag) = &q.paginate {
+            // ENH-030. This harness does NOT model pgvector distance, so there
+            // is no distance to page by: the paged order is the deterministic
+            // `_creationTime` desc / `_id` desc tie-breaker order the server
+            // applies UNDER its distance ranking, not a distance ranking. The
+            // keyset is therefore `[created_at, id]` (two columns, no rank
+            // value) — cursors are minted and consumed by this engine alone,
+            // so its shape need not match the server's three-value one.
+            //
+            // Sorting BEFORE the `limit` truncation is what makes the pool
+            // stable: `collect_all` walks a `HashMap`, so truncating first
+            // would hand each page a different candidate set.
+            let mut ranked: Vec<RankedRow> = rows
+                .into_iter()
+                .map(|doc| RankedRow::new(None, doc))
+                .collect();
+            sort_ranked_rows(&mut ranked);
+            ranked.truncate(vector.limit as usize);
+            return paginate_ranked(pag, ranked, false);
+        }
         rows.truncate(vector.limit as usize);
         Ok(Value::Array(rows))
     }
@@ -307,6 +333,9 @@ impl InMemoryRtDbClient {
     /// every table doc is a candidate, capped at `limit`. Same
     /// over-approximation the ts/python clients use; result order is
     /// unspecified (no ranking) so callers compare as a set.
+    ///
+    /// With `paginate` (ENH-030) the page is always EMPTY and carries no
+    /// `nextCursor`: see the in-body note.
     fn execute_hybrid_search_terminal(
         &self,
         q: &Query,
@@ -316,6 +345,16 @@ impl InMemoryRtDbClient {
     ) -> Result<Value, RtDbError> {
         // Peer-rejection now runs once, up front, in `execute_query`'s call
         // to `check_query_combinations` — see the ENH-028 phase 2 note there.
+        if let Some(pag) = &q.paginate {
+            // ENH-030. There is no in-memory ts_rank + distance fusion, so
+            // there is no fused score to page by and no honest ordering to
+            // invent: a paginated hybrid returns an empty page with no
+            // `nextCursor`, the paginated form of the empty result the
+            // unpaginated arm would give once ranking mattered. Routing the
+            // empty list through `paginate_ranked` keeps the cursor
+            // validation identical to the other two ranked terminals.
+            return paginate_ranked(pag, Vec::new(), true);
+        }
         let mut rows: Vec<Value> = self.collect_all(&q.table);
         rows.truncate(hybrid.limit as usize);
         Ok(Value::Array(rows))
@@ -347,6 +386,12 @@ impl InMemoryRtDbClient {
     /// ≤35-word excerpt over the index's fields with matched words wrapped in
     /// `<mark>…</mark>` (the harness's `ts_headline` approximation). In both
     /// modes the carried `filter` narrows the candidate set.
+    ///
+    /// With `paginate` (ENH-030) the result is the wire `Paginated` envelope
+    /// keyset-paged over `[score, created_at, id]`, all three columns desc.
+    /// The trgm arm pages its existing similarity ranking; the tsquery arm,
+    /// which returns its matches unranked, scores them with
+    /// [`tsquery_score`] first — a total order is what makes paging stable.
     fn execute_search_terminal(
         &self,
         q: &Query,
@@ -444,6 +489,16 @@ impl InMemoryRtDbClient {
                     .then_with(|| b.1.cmp(&a.1))
                     .then_with(|| b.2.cmp(&a.2))
             });
+            if let Some(pag) = &q.paginate {
+                // ENH-030: this arm already ranks by the similarity stand-in,
+                // so paging keysets over that same `[score, created_at, id]`
+                // order — the ordering the rows are already in.
+                let mut ranked = Vec::with_capacity(scored.len());
+                for (score, _, _, doc) in scored {
+                    ranked.push(RankedRow::new(Some(rank_value(score)?), doc));
+                }
+                return paginate_ranked(pag, ranked, true);
+            }
             let limit = q.take.map(|t| t as usize).unwrap_or(MAX_TAKE);
             scored.truncate(limit);
             return Ok(Value::Array(
@@ -472,6 +527,27 @@ impl InMemoryRtDbClient {
         }
         if snippet {
             attach_search_snippets(&mut rows, &index_fields, &parsed);
+        }
+        if let Some(pag) = &q.paginate {
+            // ENH-030. The unpaginated tsquery arm returns its matches in
+            // `HashMap` iteration order — no ranking at all — and paging needs
+            // a total order, so the paginated path scores each hit with the
+            // relevance stand-in the ts and swift engines pin
+            // ([`tsquery_score`]) and pages the resulting
+            // `[score, created_at, id]` order. The unpaginated arm above is
+            // deliberately left as it was.
+            let lexemes = positive_lexemes(&parsed);
+            let positives: std::collections::HashSet<&str> =
+                lexemes.iter().map(String::as_str).collect();
+            let mut ranked: Vec<RankedRow> = rows
+                .into_iter()
+                .map(|doc| {
+                    let score = tsquery_score(&doc, &index_fields, &positives);
+                    RankedRow::new(Some(Value::Number(serde_json::Number::from(score))), doc)
+                })
+                .collect();
+            sort_ranked_rows(&mut ranked);
+            return paginate_ranked(pag, ranked, true);
         }
         Ok(Value::Array(rows))
     }
@@ -1276,6 +1352,73 @@ fn search_operand_matches(op: &SearchOperand, field_texts: &[String]) -> bool {
     }
 }
 
+/// The positive lexemes of a parsed websearch query: every plain term plus
+/// every word of every phrase, across all or-groups. Excluded (`-term`)
+/// operands are not lexemes a hit is scored or highlighted on, so they are
+/// left out. Shared by [`tsquery_score`] and [`attach_search_snippets`] so the
+/// two cannot drift — note they CONSUME the list differently (scoring by exact
+/// token membership, highlighting by substring containment).
+fn positive_lexemes(parsed: &WebsearchQuery) -> Vec<String> {
+    parsed
+        .groups
+        .iter()
+        .flatten()
+        .flat_map(|op| match op {
+            SearchOperand::Term(t) => vec![t.clone()],
+            SearchOperand::Phrase(words) => words.clone(),
+        })
+        .collect()
+}
+
+/// The text a doc contributes to full-text matching for one indexed field —
+/// a port of TS `ftsStringify` (`ts-client/src/in_memory/query.ts:50-55`).
+/// Absent/null contributes nothing, strings ride verbatim, numbers and
+/// booleans stringify, anything else falls back to its JSON form.
+fn fts_stringify(v: Option<&Value>) -> String {
+    match v {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// Lowercase, then the maximal ASCII-alphanumeric runs — a port of TS
+/// `ftsTokens` (`ts-client/src/in_memory/query.ts:61-63`, `/[a-z0-9]+/g` over
+/// the lowercased text). The harness's stand-in for the lexemes
+/// `to_tsvector` produces; stemming and stopwords are deliberately not
+/// modelled.
+fn fts_tokens(s: &str) -> Vec<String> {
+    s.to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The tsquery relevance stand-in every client engine pins for cross-runner
+/// agreement (ENH-030; ts `executeSearchTerminal`): how many tokens of the
+/// doc's search text — the search index's declared fields, stringified and
+/// concatenated — are positive query lexemes. Like the server's `ts_rank` it
+/// is monotonic in query-lexeme frequency, which is what makes a paged split
+/// land the same way on every runner even though the scores themselves differ.
+fn tsquery_score(
+    doc: &Value,
+    index_fields: &[String],
+    positives: &std::collections::HashSet<&str>,
+) -> i64 {
+    let source = index_fields
+        .iter()
+        .map(|f| fts_stringify(doc.get(f)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    fts_tokens(&source)
+        .iter()
+        .filter(|t| positives.contains(t.as_str()))
+        .count() as i64
+}
+
 /// Lowercased string values of the index's fields on `doc` (missing and
 /// non-string fields contribute nothing) — the searchable text per doc.
 fn search_field_texts(doc: &Value, index_fields: &[String]) -> Vec<String> {
@@ -1293,15 +1436,9 @@ fn search_field_texts(doc: &Value, index_fields: &[String]) -> Vec<String> {
 /// ts_headline StartSel/StopSel; MaxWords=35). The excerpt window is centered
 /// on the first matched word so it shows why the doc is a hit.
 fn attach_search_snippets(rows: &mut [Value], index_fields: &[String], parsed: &WebsearchQuery) {
-    let terms: Vec<String> = parsed
-        .groups
-        .iter()
-        .flatten()
-        .flat_map(|op| match op {
-            SearchOperand::Term(t) => vec![t.clone()],
-            SearchOperand::Phrase(words) => words.clone(),
-        })
-        .collect();
+    // Substring containment, not token equality — a word is marked when it
+    // CONTAINS a lexeme, which is how the pre-ENH-030 highlighter behaved.
+    let terms = positive_lexemes(parsed);
     for doc in rows.iter_mut() {
         let text = index_fields
             .iter()
@@ -1791,11 +1928,24 @@ fn is_after_cursor(
     col_types: &[PgType],
     dir: Order,
 ) -> bool {
-    for i in 0..sort_cols.len() {
+    let row_values: Vec<Value> = sort_cols.iter().map(|c| sort_value(row, c)).collect();
+    keyset_is_after(&row_values, cursor_values, col_types, dir)
+}
+
+/// The resume predicate itself, over an already-extracted keyset. Factored out
+/// of [`is_after_cursor`] so the ranked terminals (ENH-030), whose leading sort
+/// column is a synthetic ranking key rather than a [`SortCol`], evaluate the
+/// SAME predicate rather than a second copy of it.
+fn keyset_is_after(
+    row_values: &[Value],
+    cursor_values: &[Value],
+    col_types: &[PgType],
+    dir: Order,
+) -> bool {
+    for i in 0..row_values.len() {
         let mut prefix_equal = true;
         for j in 0..i {
-            let row_v = sort_value(row, &sort_cols[j]);
-            if compare_index_values(&row_v, &cursor_values[j], col_types[j])
+            if compare_index_values(&row_values[j], &cursor_values[j], col_types[j])
                 != std::cmp::Ordering::Equal
             {
                 prefix_equal = false;
@@ -1805,8 +1955,7 @@ fn is_after_cursor(
         if !prefix_equal {
             continue;
         }
-        let row_v = sort_value(row, &sort_cols[i]);
-        let cmp = compare_index_values(&row_v, &cursor_values[i], col_types[i]);
+        let cmp = compare_index_values(&row_values[i], &cursor_values[i], col_types[i]);
         let ahead = match dir {
             Order::Asc => cmp == std::cmp::Ordering::Greater,
             Order::Desc => cmp == std::cmp::Ordering::Less,
@@ -1816,6 +1965,212 @@ fn is_after_cursor(
         }
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// ENH-030: cursor pagination over the ranked terminals. `paginate` composes
+// with `search`/`vectorSearch`/`hybridSearch` as a PEER clause, the way `take`
+// already composes with `search`: it does not change WHICH terminal runs, only
+// the row cap, the resume predicate, and the envelope. The cursor codec and
+// the resume predicate are the btree path's ([`crate::cursor`] +
+// [`keyset_is_after`]); only the sort columns differ, and every one of them
+// pages DESC, matching each ranked terminal's ORDER BY.
+//
+// Cursors are minted and consumed by this engine alone, so their shape need
+// not match the server's — `vectorSearch` mints two values here where the
+// server mints three, because this harness models no distance to page by.
+// ---------------------------------------------------------------------------
+
+/// One ranked candidate: the scalar ranking key (absent for `vectorSearch`),
+/// the `_creationTime`/`_id` tie-breakers, and the merged doc.
+struct RankedRow {
+    rank: Option<Value>,
+    created_at: i64,
+    id: String,
+    doc: Value,
+}
+
+impl RankedRow {
+    /// Lift a merged doc into a ranked candidate, reading the tie-breakers off
+    /// its system fields. A doc reaching here always carries them
+    /// ([`merge_doc`] layers them on at read time); the fallbacks keep the
+    /// order total rather than panicking if one were ever absent.
+    fn new(rank: Option<Value>, doc: Value) -> Self {
+        let created_at = doc
+            .get("_creationTime")
+            .and_then(Value::as_i64)
+            .unwrap_or(i64::MIN);
+        let id = doc
+            .get("_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        Self {
+            rank,
+            created_at,
+            id,
+            doc,
+        }
+    }
+
+    /// This row's keyset, parallel to the column types [`paginate_ranked`]
+    /// derives from the same `has_rank` flag.
+    fn keyset(&self, has_rank: bool) -> Vec<Value> {
+        let mut out = Vec::with_capacity(3);
+        if has_rank {
+            out.push(self.rank.clone().unwrap_or(Value::Null));
+        }
+        out.push(Value::Number(serde_json::Number::from(self.created_at)));
+        out.push(Value::String(self.id.clone()));
+        out
+    }
+}
+
+/// The cursor-encodable form of an `f64` ranking key. `Number::from_f64`
+/// rejects NaN and infinity, which no ranking key can be — the trgm arm's
+/// score is a finite ratio guarded against a zero-length field — so a miss is
+/// an internal invariant break, not a caller error.
+fn rank_value(score: f64) -> Result<Value, RtDbError> {
+    serde_json::Number::from_f64(score)
+        .map(Value::Number)
+        .ok_or_else(|| {
+            RtDbError::new(
+                ErrorCode::Internal,
+                "search ranking key is not a finite number",
+            )
+        })
+}
+
+/// Sorts ranked candidates by rank desc, then `_creationTime` desc, then `_id`
+/// desc — the total order every ranked terminal pages over, matching the
+/// server's `ORDER BY <rank> DESC, created_at DESC, id DESC`. Rows with no
+/// rank (`vectorSearch`) compare equal on that column and fall through to the
+/// tie-breakers.
+fn sort_ranked_rows(rows: &mut [RankedRow]) {
+    rows.sort_by(|a, b| {
+        let null = Value::Null;
+        let cmp = compare_index_values(
+            a.rank.as_ref().unwrap_or(&null),
+            b.rank.as_ref().unwrap_or(&null),
+            PgType::Number,
+        );
+        if cmp != std::cmp::Ordering::Equal {
+            return cmp.reverse();
+        }
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+}
+
+/// Keyset pagination over an already-ranked candidate list — the ranked
+/// terminals' counterpart to [`paginate_result`], sharing its cursor codec,
+/// its resume predicate, its `MAX_TAKE` page cap, and its probe-row has-next
+/// detection. `rows` must already be in [`sort_ranked_rows`] order.
+///
+/// `has_rank` selects the keyset shape: `[rank, created_at, id]` for the
+/// scored terminals, `[created_at, id]` for `vectorSearch`. Returns the wire
+/// `Paginated` envelope (`{docs, nextCursor?}`) — never a bare array, which
+/// would make `Paginated<T>` deserialization and the projection seam in
+/// [`map_result_docs`] miss the docs.
+fn paginate_ranked(
+    pag: &crate::query::Paginate,
+    rows: Vec<RankedRow>,
+    has_rank: bool,
+) -> Result<Value, RtDbError> {
+    let num_items = std::cmp::min(pag.num_items as usize, MAX_TAKE);
+    let col_types: Vec<PgType> = if has_rank {
+        vec![PgType::Number, PgType::Number, PgType::Text]
+    } else {
+        vec![PgType::Number, PgType::Text]
+    };
+
+    // Decode + structurally validate the cursor (BAD_REQUEST on any failure,
+    // like the btree path — the codec itself returns INTERNAL).
+    let cursor_values: Option<Vec<Value>> = match &pag.cursor {
+        None => None,
+        Some(cursor) => {
+            let decoded = crate::cursor::decode_cursor(cursor).map_err(|e| {
+                RtDbError::new(
+                    ErrorCode::BadRequest,
+                    format!("invalid cursor: {}", e.message),
+                )
+            })?;
+            if decoded.len() != col_types.len() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    format!(
+                        "cursor has {} value(s) but this query sorts over {} column(s)",
+                        decoded.len(),
+                        col_types.len()
+                    ),
+                ));
+            }
+            validate_ranked_cursor_values(&decoded, has_rank)?;
+            Some(decoded)
+        }
+    };
+
+    // One row past the page is all it takes to know a next page exists; the
+    // probe is dropped before the docs are built (server `LIMIT n+1`).
+    let mut page: Vec<&RankedRow> = Vec::with_capacity(num_items + 1);
+    for row in &rows {
+        if let Some(cv) = &cursor_values
+            && !keyset_is_after(&row.keyset(has_rank), cv, &col_types, Order::Desc)
+        {
+            continue;
+        }
+        page.push(row);
+        if page.len() > num_items {
+            break;
+        }
+    }
+    let has_next = page.len() > num_items;
+    page.truncate(num_items);
+
+    let next_cursor = match (has_next, page.last()) {
+        (true, Some(last)) => Some(crate::cursor::encode_cursor(&last.keyset(has_rank))?),
+        _ => None,
+    };
+    let docs: Vec<Value> = page.into_iter().map(|row| row.doc.clone()).collect();
+
+    let mut out = Map::new();
+    out.insert("docs".to_string(), Value::Array(docs));
+    if let Some(nc) = next_cursor {
+        out.insert("nextCursor".to_string(), Value::String(nc));
+    }
+    Ok(Value::Object(out))
+}
+
+/// Type-checks a ranked terminal's decoded cursor positionally — the ranked
+/// sort columns are synthetic rather than schema fields, so this is the
+/// [`validate_cursor_values`] counterpart for them. The caller has already
+/// checked the arity, so the indexing is in bounds.
+fn validate_ranked_cursor_values(values: &[Value], has_rank: bool) -> Result<(), RtDbError> {
+    let tail = if has_rank {
+        if !values[0].is_number() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "cursor value for rank must be a number",
+            ));
+        }
+        1
+    } else {
+        0
+    };
+    if !values[tail].is_number() {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            "cursor value for created_at must be a number",
+        ));
+    }
+    if !values[tail + 1].is_string() {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            "cursor value for id must be a string",
+        ));
+    }
+    Ok(())
 }
 
 /// Sort value for a column, normalizing an absent optional index field to

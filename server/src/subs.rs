@@ -642,9 +642,14 @@ impl ReadSet {
     /// `paginate` query. Returns `None` (⇒ `Table`) when ANY of:
     /// - the terminal is not one of `take` / `first` / `paginate`, or a
     ///   value-sensitive / ranking terminal is also set (`count` / `unique` /
-    ///   `distinct` / `aggregate` / `search` / `vector` / `hybrid`) — those
-    ///   combinations are rejected by `execute_query`'s cascade anyway, so
-    ///   checking them here is purely defensive;
+    ///   `distinct` / `aggregate` / `search` / `vector` / `hybrid`). Most of
+    ///   those combinations are rejected by `execute_query`'s cascade anyway,
+    ///   but the three RANKING ones are load-bearing, not defensive, since
+    ///   ENH-030: `paginate` now legally composes with `search` /
+    ///   `vectorSearch` / `hybridSearch`. Such a page is ordered by a
+    ///   relevance/distance/fusion score, not by the index tail this boundary
+    ///   logic models, so it must fall back to `Table` (always re-run) rather
+    ///   than be skipped against a boundary that does not describe it;
     /// - the declared index, an eq value, or a sort field fails to resolve or
     ///   type (any doubt ⇒ `Table`, which can only over-approximate).
     ///
@@ -1809,6 +1814,39 @@ mod tests {
             ReadSet::from_query(&query, &td),
             ReadSet::Ordered(o) if o.desc
         ));
+    }
+
+    /// ENH-030: `paginate` now legally composes with the ranked terminals, so
+    /// the ranking guard in `try_ordered` is load-bearing rather than
+    /// defensive. A paginated ranked query is ordered by relevance/distance/
+    /// fusion score, which the index-tail boundary does not model, so it must
+    /// degrade to `Table` (always re-run). Skipping such a re-run against a
+    /// boundary that does not describe the query would UNDER-approximate and
+    /// silently drop pushes.
+    #[test]
+    fn paginated_ranked_terminals_fall_back_to_table() {
+        let td = test_table_def();
+        // search + paginate ⇒ Table.
+        let query = q(serde_json::json!({
+            "table": "t",
+            "search": {"index": "search_body", "query": "x"},
+            "paginate": {"numItems": 10}
+        }));
+        assert!(matches!(ReadSet::from_query(&query, &td), ReadSet::Table));
+        // vectorSearch + paginate ⇒ Table.
+        let query = q(serde_json::json!({
+            "table": "t",
+            "vectorSearch": {"index": "by_embedding", "vector": [0.0, 0.0, 0.0], "limit": 5},
+            "paginate": {"numItems": 10}
+        }));
+        assert!(matches!(ReadSet::from_query(&query, &td), ReadSet::Table));
+        // hybridSearch + paginate ⇒ Table.
+        let query = q(serde_json::json!({
+            "table": "t",
+            "hybridSearch": {"query": "x", "vector": [0.0, 0.0, 0.0], "limit": 5},
+            "paginate": {"numItems": 10}
+        }));
+        assert!(matches!(ReadSet::from_query(&query, &td), ReadSet::Table));
     }
 
     #[test]

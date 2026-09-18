@@ -27,7 +27,10 @@ public enum QueryTerminal: Equatable, Sendable {
     case aggregate
     /// Grouped aggregate (`aggregate(groupBy: true)`) — `[{key, value}]` rows.
     case aggregateGroups
-    /// Cursor pagination — `{docs, nextCursor?}`.
+    /// Cursor pagination — `{docs, nextCursor?}`. Also the payload shape of a
+    /// ranked terminal composed with `paginate` (ENH-030): `search`/
+    /// `vectorSearch`/`hybridSearch` return the same envelope once a
+    /// `paginate` block is present, so pass `.paginate` for those too.
     case paginate
     /// Full-text search — array.
     case search
@@ -211,7 +214,10 @@ public struct TableQuery: Sendable {
     }
 
     /// Cursor-pagination terminal. Pass the previous page's `nextCursor` (nil
-    /// starts at the first page) and the page size.
+    /// starts at the first page) and the page size. Composes with the index/
+    /// eq/order scan and — since ENH-030 — with the three ranked terminals
+    /// (`search`/`vectorSearch`/`hybridSearch`), where it pages the ranked
+    /// order rather than the btree order. `take` remains excluded.
     public func paginate(cursor: String? = nil, numItems: Int) -> TableQuery {
         with {
             $0.paginateCursor = cursor
@@ -219,8 +225,9 @@ public struct TableQuery: Sendable {
         }
     }
 
-    /// Full-text `search` terminal over a declared search index. Composes only
-    /// with `take`. `filter` here is NESTED on the terminal — distinct from the
+    /// Full-text `search` terminal over a declared search index. Composes with
+    /// `take` and, since ENH-030, with `paginate` (which pages the ranked
+    /// order). `filter` here is NESTED on the terminal — distinct from the
     /// top-level `.filter()` builder, which the server rejects alongside
     /// `search`. `mode: .trgm` opts into substring matching; `snippet: true`
     /// attaches a `_searchSnippet` highlight per hit.
@@ -238,9 +245,11 @@ public struct TableQuery: Sendable {
         }
     }
 
-    /// Vector-similarity `vectorSearch` terminal. Standalone: carries its own
-    /// `limit` and conflicts with every other terminal. `filter` is nested on
-    /// the terminal (the top-level `.filter()` builder conflicts with it).
+    /// Vector-similarity `vectorSearch` terminal. Carries its own `limit` and
+    /// conflicts with every other terminal except `paginate` (ENH-030), where
+    /// `limit` keeps its meaning — the size of the ranked candidate POOL — and
+    /// `paginate`'s `numItems` slices that pool into pages. `filter` is nested
+    /// on the terminal (the top-level `.filter()` builder conflicts with it).
     public func vectorSearch(
         _ index: String,
         _ vector: [Double],
@@ -255,7 +264,8 @@ public struct TableQuery: Sendable {
     }
 
     /// Hybrid `hybridSearch` terminal: RRF fusion of full-text and vector
-    /// ranking over the same table. Standalone, like `vectorSearch`.
+    /// ranking over the same table. Composes with `paginate` only, like
+    /// `vectorSearch`.
     /// `searchIndex`/`vectorIndex` auto-select server-side when nil; `k` is the
     /// RRF constant (server default 60) when nil.
     public func hybridSearch(
@@ -421,7 +431,7 @@ private enum ConflictMessage {
     static let vectorSearch = "vectorSearch cannot be combined with any other terminal"
     static let hybridSearch = "hybridSearch cannot be combined with any other terminal"
     static let search = "search cannot be combined with index, eq, range bounds, order, "
-        + "unique, first, count, distinct, aggregate, paginate, filter, or vector search"
+        + "unique, first, count, distinct, aggregate, filter, or vector search"
 }
 
 extension TableQuery {
@@ -472,6 +482,9 @@ extension TableQuery {
         (.hybridSearch, "aggregate cannot be combined with hybrid search")
     ]
 
+    // ENH-030: `search`/`vectorSearch`/`hybridSearch` are deliberately absent —
+    // `paginate` composes with all three as a peer clause (it pages their
+    // ranked order), exactly the way `take` already composes with `search`.
     private static let paginateIncompatibles: [(Peer, String)] = [
         (.get, "paginate cannot be combined with get"),
         (.count, "paginate cannot be combined with count"),
@@ -523,12 +536,17 @@ extension TableQuery {
 
     /// The ranked-search terminals run their checks after the btree terminals
     /// (server cascade order): vectorSearch → hybridSearch → search.
+    /// `.paginate` is absent from all three lists (ENH-030): it composes with
+    /// every ranked terminal as a peer clause. The messages keep naming
+    /// `paginate` because they are verbatim copies of the server's — which
+    /// wire-corpus/query-combinations.json still spells that way for the
+    /// combinations that ARE still rejected.
     private func validateRankedTerminals() throws {
         if acc.vectorSearch != nil {
             try rejectIfAnySet(
                 [
                     .index, .eq, .gt, .gte, .lt, .lte, .order, .unique, .first, .count, .distinct,
-                    .aggregate, .paginate, .filter, .search, .take, .hybridSearch
+                    .aggregate, .filter, .search, .take, .hybridSearch
                 ],
                 message: ConflictMessage.vectorSearch
             )
@@ -537,7 +555,7 @@ extension TableQuery {
             try rejectIfAnySet(
                 [
                     .index, .eq, .gt, .gte, .lt, .lte, .order, .take, .unique, .first, .count,
-                    .distinct, .aggregate, .paginate, .filter, .search, .vectorSearch
+                    .distinct, .aggregate, .filter, .search, .vectorSearch
                 ],
                 message: ConflictMessage.hybridSearch
             )
@@ -547,7 +565,7 @@ extension TableQuery {
             try rejectIfAnySet(
                 [
                     .index, .eq, .gt, .gte, .lt, .lte, .order, .unique, .first, .count, .distinct,
-                    .aggregate, .paginate, .filter, .vectorSearch, .hybridSearch
+                    .aggregate, .filter, .vectorSearch, .hybridSearch
                 ],
                 message: ConflictMessage.search
             )

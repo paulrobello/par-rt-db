@@ -78,20 +78,24 @@ pub struct Query {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aggregate: Option<AggregateSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Cursor-pagination terminal.
+    /// Cursor-pagination terminal. Also composes as a PEER clause with the
+    /// ranked terminals `search`/`vectorSearch`/`hybridSearch` (ENH-030),
+    /// paging that terminal's own ranking rather than replacing it.
     pub paginate: Option<Paginate>,
     /// Additional db-side WHERE predicate over doc fields; composes with
     /// index/order/take/cursor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<FilterExpr>,
     /// Full-text search terminal: ranks by `ts_rank` over a search index's
-    /// tsvector; composes with `take`.
+    /// tsvector; composes with `take` and with `paginate` (ENH-030).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<SearchQuery>,
     /// Vector-similarity terminal: ranks by cosine distance over a vector index;
-    /// carries its own limit. The wire key is camelCase `vectorSearch` (matches
-    /// the server's explicit `#[serde(rename = "vectorSearch")]`; this struct
-    /// has no `rename_all`, so the rename must be explicit).
+    /// carries its own limit. Composes with `paginate` (ENH-030), where `limit`
+    /// keeps its meaning as the ranked candidate POOL and `paginate.num_items`
+    /// slices that pool into pages. The wire key is camelCase `vectorSearch`
+    /// (matches the server's explicit `#[serde(rename = "vectorSearch")]`; this
+    /// struct has no `rename_all`, so the rename must be explicit).
     #[serde(
         default,
         rename = "vectorSearch",
@@ -99,8 +103,10 @@ pub struct Query {
     )]
     pub vector_search: Option<crate::wire::VectorSearchQuery>,
     /// Hybrid terminal: fuses full-text (`search`) and vector (`vectorSearch`)
-    /// ranking via Reciprocal Rank Fusion; carries its own limit. The wire key
-    /// is camelCase `hybridSearch` (explicit rename, matching `vector_search`).
+    /// ranking via Reciprocal Rank Fusion; carries its own limit. Composes with
+    /// `paginate` (ENH-030) on the same pool-and-page terms as `vectorSearch`.
+    /// The wire key is camelCase `hybridSearch` (explicit rename, matching
+    /// `vector_search`).
     #[serde(
         default,
         rename = "hybridSearch",
@@ -292,9 +298,13 @@ impl TableQuery {
         self
     }
 
-    /// Full-text `search` terminal over a declared search index. Composes only
-    /// with `take` (e.g. `.search("idx", "text", ()).take(10)`); the server
-    /// rejects every other terminal alongside it.
+    /// Full-text `search` terminal over a declared search index. Composes with
+    /// `take` (e.g. `.search("idx", "text", ()).take(10)`) and, since ENH-030,
+    /// with `paginate` (`.search("idx", "text", ()).paginate(None, 20)`), which
+    /// pages the terminal's own `ts_rank` ordering and returns a [`Paginated`]
+    /// envelope instead of a plain doc array. `take` and `paginate` remain
+    /// mutually exclusive; the server rejects every other terminal alongside
+    /// `search`.
     ///
     /// `opts` accepts any `Into<SearchOpts>`: pass `()` to omit the filter
     /// (`.search(idx, text, ())`), or a `SearchOpts { filter, mode, snippet }`
@@ -323,9 +333,12 @@ impl TableQuery {
     /// Vector-similarity `vectorSearch` over a declared vector index. The server
     /// ranks by cosine distance and applies the carried `limit`; `filter` is an
     /// optional `FilterExpr` (the db-side `filter()` DSL) that narrows the
-    /// vector search `WHERE` server-side. Standalone terminal — unlike `search`,
-    /// it carries its own `limit` and does NOT compose with `take`/`collect`
-    /// (the server rejects `vectorSearch` combined with any other terminal).
+    /// vector search `WHERE` server-side. Unlike `search`, it carries its own
+    /// `limit` and does NOT compose with `take`/`collect`. It DOES compose with
+    /// `paginate` (ENH-030): `limit` keeps its meaning as the size of the ranked
+    /// candidate POOL and `paginate.num_items` slices that pool into pages, so
+    /// the result is a [`Paginated`] envelope over the same neighbors the
+    /// unpaginated call returns.
     ///
     /// `opts` accepts any `Into<VectorSearchOpts>`: pass `()` to omit the
     /// filter (`.vector_search(idx, vec, lim, ())`), or a
@@ -353,10 +366,10 @@ impl TableQuery {
 
     /// Hybrid `hybridSearch` terminal: fuses full-text and vector ranking over
     /// the same table via Reciprocal Rank Fusion. The table must declare BOTH a
-    /// search index and a vector index. Standalone terminal — like
-    /// `vector_search`, it carries its own `limit` and does NOT compose with
-    /// `take`/`collect` (the server rejects `hybridSearch` combined with any
-    /// other terminal).
+    /// search index and a vector index. Like `vector_search`, it carries its own
+    /// `limit` and does NOT compose with `take`/`collect`, but DOES compose with
+    /// `paginate` (ENH-030) on the same pool-and-page terms: `limit` sizes the
+    /// fused candidate pool, `paginate.num_items` the page.
     ///
     /// `opts` accepts any `Into<HybridSearchOpts>`: pass `()` for the
     /// auto-select / server-default-`k` case
@@ -432,7 +445,11 @@ impl TableQuery {
         self.q
     }
     /// Finish with the cursor-pagination terminal. Pass the previous page's
-    /// `next_cursor` (or `None` to start) and the page size.
+    /// `next_cursor` (or `None` to start) and the page size. Chains after a
+    /// ranked terminal too (ENH-030) — `.search(..).paginate(..)`,
+    /// `.vector_search(..).paginate(..)`, `.hybrid_search(..).paginate(..)` —
+    /// where it pages that terminal's ranking instead of replacing it. Parse
+    /// the result as [`Paginated<T>`](Paginated).
     pub fn paginate(mut self, cursor: Option<&str>, num_items: u32) -> Query {
         self.q.paginate = Some(Paginate {
             cursor: cursor.map(|c| c.into()),
@@ -601,6 +618,48 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&q).unwrap(),
             json!({"table":"items","index":"by_status","eq":["backlog"],"paginate":{"numItems":20}})
+        );
+    }
+
+    #[test]
+    fn paginate_chains_after_each_ranked_terminal() {
+        // ENH-030: `paginate` rides alongside a ranked terminal as a peer
+        // clause — both keys are present and the terminal's own shape (the
+        // search text, the vector, the carried `limit`) is untouched.
+        let searched = TableQuery::new("notes")
+            .search("search_body", "task", ())
+            .paginate(None, 2);
+        assert_eq!(
+            serde_json::to_value(&searched).unwrap(),
+            json!({
+                "table":"notes",
+                "search":{"index":"search_body","query":"task"},
+                "paginate":{"numItems":2}
+            })
+        );
+
+        let vectored = TableQuery::new("docs")
+            .vector_search("by_embedding", vec![1.0, 0.0, 0.0], 5, ())
+            .paginate(Some("Y3Vyc29y"), 2);
+        assert_eq!(
+            serde_json::to_value(&vectored).unwrap(),
+            json!({
+                "table":"docs",
+                "vectorSearch":{"index":"by_embedding","vector":[1.0,0.0,0.0],"limit":5},
+                "paginate":{"cursor":"Y3Vyc29y","numItems":2}
+            })
+        );
+
+        let hybrid = TableQuery::new("docs")
+            .hybrid_search("hello", vec![1.0, 0.0, 0.0], 5, ())
+            .paginate(None, 3);
+        assert_eq!(
+            serde_json::to_value(&hybrid).unwrap(),
+            json!({
+                "table":"docs",
+                "hybridSearch":{"query":"hello","vector":[1.0,0.0,0.0],"limit":5},
+                "paginate":{"numItems":3}
+            })
         );
     }
 

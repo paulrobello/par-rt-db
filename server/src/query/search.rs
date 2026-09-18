@@ -8,13 +8,15 @@ use sqlx::PgPool;
 use super::MAX_TAKE;
 use super::filter::compile_filter;
 use super::row_auth::{authorize_predicate_body, row_auth_enforced_uid, row_auth_predicate_body};
-use super::terminals::{CompiledQuery, merge_doc};
+use super::terminals::{CompiledQuery, SortCol, build_cursor_conditions, merge_doc};
 use crate::auth::PrincipalCtx;
 use crate::ddl::{pg_col, pg_schema, pg_search_col, pg_table, pg_vector_col};
 use crate::dsl::{
-    EqBind, HybridSearchQuery, QueryResult, SearchMode, SearchQuery, VectorSearchQuery,
+    EqBind, HybridSearchQuery, Paginate, PaginatedResult, QueryResult, SearchMode, SearchQuery,
+    VectorSearchQuery,
 };
 use crate::error::RtDbError;
+use crate::pagination::{decode_cursor, encode_cursor};
 use crate::schema::TableDef;
 
 /// Hard cap on `vectorSearch` `limit`.
@@ -106,6 +108,69 @@ pub(crate) struct CompileSearchCtx<'a> {
     pub(crate) include_deleted: bool,
 }
 
+// ============ ENH-030: cursor pagination over the ranked terminals ==========
+//
+// `search`/`vectorSearch`/`hybridSearch` each rank rows by a scalar key —
+// `ts_rank`/`similarity`, the index's metric distance, and the RRF fused score
+// respectively. `paginate` composes with all three as a peer clause exactly
+// the way `take` already composes with `search`: it does not change WHICH
+// terminal runs (`cq.terminal` stays the terminal's own name), only how many
+// rows come back and whether the result is a `Paginated` envelope.
+//
+// The resume predicate is the same keyset OR-of-AND `paginate` uses on the
+// btree path, over `[<ranking key>, created_at, id]` — the two tie-breakers
+// make the order total, which is what guarantees no row is skipped or
+// duplicated across pages. `id` is globally unique, so three columns always
+// suffice; every ranked terminal therefore mints a three-value cursor.
+
+/// The ranked terminals' cursor sort columns: the ranking key, then the
+/// `created_at`/`id` tie-breakers. Kept as one list so the length check, the
+/// bind typing, and the minted cursor cannot drift apart.
+const RANKED_SORT_COL_COUNT: usize = 3;
+
+/// Decodes a ranked terminal's cursor into its keyset resume predicate.
+///
+/// `rank_sql` is the SQL for the ranking key AS THE CONSUMING STAGE SEES IT —
+/// the raw ranking expression for `search` (whose keyset sits in the same
+/// SELECT that computes it) or the CTE's output column for `vectorSearch` /
+/// `hybridSearch`. `rank_dir` is `ASC` for a distance (nearest first) and
+/// `DESC` for a relevance score; the tie-breakers are always `DESC`, matching
+/// every ranked terminal's existing ORDER BY.
+///
+/// Returns `("", [])` when the paginate block carries no cursor (the first
+/// page), so callers can splice the fragment in unconditionally.
+fn ranked_cursor_clause(
+    paginate: &Paginate,
+    rank_sql: &str,
+    rank_dir: &str,
+    next_bind_idx: usize,
+) -> Result<(String, Vec<EqBind>), RtDbError> {
+    let Some(cursor) = &paginate.cursor else {
+        return Ok((String::new(), Vec::new()));
+    };
+    let cursor_values = decode_cursor(cursor)?;
+    if cursor_values.len() != RANKED_SORT_COL_COUNT {
+        return Err(RtDbError::bad_request(format!(
+            "cursor has {} value(s) but this query sorts over {RANKED_SORT_COL_COUNT} column(s)",
+            cursor_values.len(),
+        )));
+    }
+    let sort_cols = [
+        rank_sql.to_string(),
+        "\"created_at\"".to_string(),
+        "\"id\"".to_string(),
+    ];
+    let sort_col_types = [SortCol::Rank, SortCol::CreatedAt, SortCol::Id];
+    let dirs = [rank_dir, "DESC", "DESC"];
+    build_cursor_conditions(
+        &cursor_values,
+        &sort_cols,
+        &sort_col_types,
+        &dirs,
+        next_bind_idx,
+    )
+}
+
 /// Full-text search terminal SQL compilation. Compile half of the former
 /// inline `execute_search` body. Bind order: `$1` is the search query text;
 /// in `trgm` mode `$2` is the server-built `'%…%'` ILIKE pattern (so
@@ -120,6 +185,7 @@ pub(crate) fn compile_search(
     sctx: &CompileSearchCtx<'_>,
     search: &SearchQuery,
     take: Option<u32>,
+    paginate: Option<&Paginate>,
 ) -> Result<CompiledQuery, RtDbError> {
     let db = sctx.db;
     let table_def = sctx.table_def;
@@ -227,20 +293,24 @@ pub(crate) fn compile_search(
     if table_def.soft_delete && !sctx.include_deleted {
         extra.push_str(" AND \"deleted_at\" IS NULL");
     }
-    let limit_ph = start + binds.len();
-    let sql = match mode {
-        SearchMode::Tsquery => format!(
-            "SELECT \"id\", \"doc\", \"created_at\", \"version\"{snippet_col} FROM \"{pg_schema_name}\".\"{table_ident}\" \
-             WHERE \"{sv_col}\" @@ {tsq}{extra} \
-             ORDER BY ts_rank(\"{sv_col}\", {tsq}) DESC, \"created_at\" DESC, \"id\" DESC \
-             LIMIT ${limit_ph}"
+    // The match predicate and the ranking expression, derived ONCE per mode and
+    // reused by the WHERE, the ORDER BY, the paginated SELECT's extra ranking
+    // column, and the keyset resume predicate. Deriving them together is what
+    // keeps `trgm` mode's keyset paging on `GREATEST(similarity(...))` rather
+    // than silently on `ts_rank` — a mismatch there would page by the wrong
+    // key with no compile error.
+    //
+    // Trgm (FM-30): substring match over the index's text `f_` columns. `$1`
+    // (raw query text) feeds `similarity`; `$2` is the server-built
+    // `'%' || query || '%'` ILIKE pattern, bound — never interpolated. A result
+    // row ILIKE-matched some field, so at least one `similarity` argument is
+    // non-NULL and GREATEST is well-defined. The `created_at`/`id` tiebreaks
+    // keep ordering deterministic like the tsquery arm.
+    let (match_clause, rank_expr) = match mode {
+        SearchMode::Tsquery => (
+            format!("\"{sv_col}\" @@ {tsq}"),
+            format!("ts_rank(\"{sv_col}\", {tsq})"),
         ),
-        // Trgm (FM-30): substring match over the index's text `f_` columns.
-        // `$1` (raw query text) feeds `similarity`; `$2` is the server-built
-        // `'%' || query || '%'` ILIKE pattern, bound — never interpolated. A
-        // result row ILIKE-matched some field, so at least one `similarity`
-        // argument is non-NULL and GREATEST is well-defined. The `created_at`/
-        // `id` tiebreaks keep ordering deterministic like the tsquery arm.
         SearchMode::Trgm => {
             let ilike = index_def
                 .fields
@@ -254,24 +324,58 @@ pub(crate) fn compile_search(
                 .map(|field_name| format!("similarity(\"{}\", $1)", pg_col(field_name)))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!(
-                "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" \
-                 WHERE ({ilike}){extra} \
-                 ORDER BY GREATEST({sim}) DESC, \"created_at\" DESC, \"id\" DESC \
-                 LIMIT ${limit_ph}"
-            )
+            (format!("({ilike})"), format!("GREATEST({sim})"))
         }
     };
+
+    // ENH-030: with `paginate`, the keyset predicate binds after every
+    // filter/auth bind and before the LIMIT, the LIMIT becomes the page size
+    // plus one probe row, and the ranking key is selected as an extra column so
+    // the executor can mint the next cursor from the page's last row. Without
+    // it, SQL and bind order stay byte-identical to the pre-ENH-030 form.
+    let cursor_start = start + binds.len();
+    let (cursor_predicate, cursor_binds) = match paginate {
+        Some(p) => ranked_cursor_clause(p, &rank_expr, "DESC", cursor_start)?,
+        None => (String::new(), Vec::new()),
+    };
+    let cursor_clause = if cursor_predicate.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {cursor_predicate}")
+    };
+    let rank_col = if paginate.is_some() {
+        // `ts_rank` is `real`; the cast makes the minted cursor value a lossless
+        // float8 promotion of exactly what the ORDER BY compared, so the resume
+        // boundary is exact rather than approximate.
+        format!(", {rank_expr}::float8")
+    } else {
+        String::new()
+    };
+    let limit_ph = cursor_start + cursor_binds.len();
+    let limit_value = match paginate {
+        // One extra row so a next page is detectable without a second
+        // round-trip; the executor discards it after the has-next check.
+        Some(p) => i64::from(p.num_items.min(MAX_TAKE)) + 1,
+        None => i64::from(limit),
+    };
+    let sql = format!(
+        "SELECT \"id\", \"doc\", \"created_at\", \"version\"{snippet_col}{rank_col} FROM \"{pg_schema_name}\".\"{table_ident}\" \
+         WHERE {match_clause}{extra}{cursor_clause} \
+         ORDER BY {rank_expr} DESC, \"created_at\" DESC, \"id\" DESC \
+         LIMIT ${limit_ph}"
+    );
     // The leading bind(s) are the search text (and, in trgm mode, its
-    // `%…%` ILIKE pattern); the trailing bind is the LIMIT. All are folded
-    // into the same Vec<EqBind> the executor drains in order.
-    let mut all = Vec::with_capacity(start - 1 + binds.len() + 1);
+    // `%…%` ILIKE pattern); then the filter/auth binds, then the cursor's
+    // keyset values, and the trailing bind is the LIMIT. All are folded into
+    // the same Vec<EqBind> the executor drains in order.
+    let mut all = Vec::with_capacity(start - 1 + binds.len() + cursor_binds.len() + 1);
     all.push(EqBind::Text(search.query.clone()));
     if mode == SearchMode::Trgm {
         all.push(EqBind::Text(format!("%{}%", search.query)));
     }
     all.extend(binds);
-    all.push(EqBind::I64(i64::from(limit)));
+    all.extend(cursor_binds);
+    all.push(EqBind::I64(limit_value));
     Ok(CompiledQuery {
         sql,
         binds: all,
@@ -345,6 +449,7 @@ pub(crate) async fn execute_search(
 pub(crate) fn compile_vector_search(
     sctx: &CompileSearchCtx<'_>,
     vs: &VectorSearchQuery,
+    paginate: Option<&Paginate>,
 ) -> Result<CompiledQuery, RtDbError> {
     let db = sctx.db;
     let table_def = sctx.table_def;
@@ -447,17 +552,73 @@ pub(crate) fn compile_vector_search(
 
     let dist_op = vec_spec.metric.distance_op();
     let where_clause = format!("\"{v_col}\" IS NOT NULL{extra}");
-    let sql = format!(
-        "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" \
-         WHERE {where_clause} \
-         ORDER BY \"{v_col}\" {dist_op} ${qvec_ph}::vector \
-         LIMIT ${limit_ph}"
-    );
+    let Some(paginate) = paginate else {
+        let sql = format!(
+            "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" \
+             WHERE {where_clause} \
+             ORDER BY \"{v_col}\" {dist_op} ${qvec_ph}::vector \
+             LIMIT ${limit_ph}"
+        );
+        let mut all = Vec::with_capacity(binds.len() + 2);
+        all.extend(binds);
+        all.push(EqBind::Text(qvec_text));
+        all.push(EqBind::I64(i64::from(vs.limit)));
+        return Ok(CompiledQuery {
+            sql,
+            binds: all,
+            terminal: "vectorSearch",
+        });
+    };
 
-    let mut all = Vec::with_capacity(binds.len() + 2);
+    // ENH-030, paginated form. `limit` keeps its meaning — the size of the
+    // ranked candidate POOL — and `numItems` slices that pool into pages, so
+    // paging a `vectorSearch` delivers the same top-`limit` neighbors the
+    // unpaginated call returns, just in instalments.
+    //
+    // The pool is a CTE rather than a predicate on the same SELECT for two
+    // reasons. First, a keyset predicate on the distance in the SELECT that
+    // computes it would sit beside the ANN `ORDER BY`, where it risks
+    // defeating the HNSW index (`ddl.rs` creates one per vector index); a
+    // materialized `LIMIT`ed CTE keeps the ANN top-K intact and pages over the
+    // (at most `limit`) rows it produced. Second, `dist` becomes a real column
+    // of `cand`, so the outer WHERE can reference it — a SELECT-list alias is
+    // not visible to a WHERE at the same level.
+    //
+    // The inner stage keeps EVERY filter/owner/authorize/soft-delete predicate
+    // and the bare `ORDER BY <distance>` it has today, so the pool a paginated
+    // scan walks is exactly the row set (and order) the unpaginated terminal
+    // would return. Only the total order needed to resume — the `created_at`/
+    // `id` tie-breakers — is added, on the outer stage, where it sorts at most
+    // `limit` already-materialized rows and cannot reach the index.
+    let cursor_start = limit_ph + 1;
+    let (cursor_predicate, cursor_binds) =
+        ranked_cursor_clause(paginate, "dist", "ASC", cursor_start)?;
+    let cursor_clause = if cursor_predicate.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {cursor_predicate}")
+    };
+    let page_limit_ph = cursor_start + cursor_binds.len();
+    let sql = format!(
+        "WITH cand AS ( \
+           SELECT \"id\", \"doc\", \"created_at\", \"version\", \
+                  (\"{v_col}\" {dist_op} ${qvec_ph}::vector) AS dist \
+           FROM \"{pg_schema_name}\".\"{table_ident}\" \
+           WHERE {where_clause} \
+           ORDER BY \"{v_col}\" {dist_op} ${qvec_ph}::vector \
+           LIMIT ${limit_ph} \
+         ) \
+         SELECT \"id\", \"doc\", \"created_at\", \"version\", dist FROM cand{cursor_clause} \
+         ORDER BY dist ASC, \"created_at\" DESC, \"id\" DESC \
+         LIMIT ${page_limit_ph}"
+    );
+    let mut all = Vec::with_capacity(binds.len() + cursor_binds.len() + 3);
     all.extend(binds);
     all.push(EqBind::Text(qvec_text));
     all.push(EqBind::I64(i64::from(vs.limit)));
+    all.extend(cursor_binds);
+    // One extra row so a next page is detectable without a second round-trip.
+    all.push(EqBind::I64(i64::from(paginate.num_items.min(MAX_TAKE)) + 1));
     Ok(CompiledQuery {
         sql,
         binds: all,
@@ -506,6 +667,7 @@ pub(crate) async fn execute_vector_search(
 pub(crate) fn compile_hybrid_search(
     sctx: &CompileSearchCtx<'_>,
     hs: &HybridSearchQuery,
+    paginate: Option<&Paginate>,
 ) -> Result<CompiledQuery, RtDbError> {
     let db = sctx.db;
     let table_def = sctx.table_def;
@@ -643,7 +805,9 @@ pub(crate) fn compile_hybrid_search(
     // LAST). The final ORDER BY tie-breakers (created_at, id) keep output
     // deterministic when RRF scores collide.
     let dist_op = vec_spec.metric.distance_op();
-    let sql = format!(
+    // The `matched` + `ranked` prefix is identical in both forms; only what
+    // consumes `ranked` differs.
+    let ranked_ctes = format!(
         "WITH matched AS ( \
            SELECT \"id\", \"doc\", \"created_at\", \"version\", \
                   ts_rank(\"{sv_col}\", {tsq}) AS trank, \
@@ -655,18 +819,72 @@ pub(crate) fn compile_hybrid_search(
                   ROW_NUMBER() OVER (ORDER BY trank DESC, \"created_at\" DESC, \"id\" DESC) AS r_text, \
                   ROW_NUMBER() OVER (ORDER BY dist ASC NULLS LAST, \"created_at\" DESC, \"id\" DESC) AS r_vec \
            FROM matched \
-         ) \
-         SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM ranked \
-         ORDER BY (1.0/(${k_ph} + r_text) + 1.0/(${k_ph} + r_vec)) DESC, \"created_at\" DESC, \"id\" DESC \
-         LIMIT ${limit_ph}"
+         )"
     );
+    let Some(paginate) = paginate else {
+        let sql = format!(
+            "{ranked_ctes} \
+             SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM ranked \
+             ORDER BY (1.0/(${k_ph} + r_text) + 1.0/(${k_ph} + r_vec)) DESC, \"created_at\" DESC, \"id\" DESC \
+             LIMIT ${limit_ph}"
+        );
+        let mut all = Vec::with_capacity(1 + auth_binds.len() + 3);
+        all.push(EqBind::Text(hs.query.clone()));
+        all.extend(auth_binds);
+        all.push(EqBind::Text(qvec_text));
+        all.push(EqBind::I64(k));
+        all.push(EqBind::I64(i64::from(hs.limit)));
+        return Ok(CompiledQuery {
+            sql,
+            binds: all,
+            terminal: "hybridSearch",
+        });
+    };
 
-    let mut all = Vec::with_capacity(1 + auth_binds.len() + 3);
+    // ENH-030, paginated form. The unpaginated query computes the RRF score
+    // inline in its final ORDER BY, where a WHERE at the same level cannot see
+    // it (a SELECT-list computation is not in scope for its own WHERE). Two
+    // more CTE stages fix that without a second round-trip: `scored` turns the
+    // fusion into a real column, and `topk` applies `limit` — which keeps its
+    // unpaginated meaning as the size of the ranked candidate POOL, with
+    // `numItems` slicing that pool into pages. The keyset predicate then sits
+    // on the outer SELECT over `topk`, where `score` is an ordinary column.
+    //
+    // `::float8` makes `score` a double rather than the `numeric` the `1.0`
+    // literals would otherwise produce, so the value the executor mints into
+    // the cursor is bit-identical to the one the resume predicate compares.
+    let cursor_start = limit_ph + 1;
+    let (cursor_predicate, cursor_binds) =
+        ranked_cursor_clause(paginate, "score", "DESC", cursor_start)?;
+    let cursor_clause = if cursor_predicate.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {cursor_predicate}")
+    };
+    let page_limit_ph = cursor_start + cursor_binds.len();
+    let sql = format!(
+        "{ranked_ctes}, scored AS ( \
+           SELECT \"id\", \"doc\", \"created_at\", \"version\", \
+                  (1.0/(${k_ph} + r_text) + 1.0/(${k_ph} + r_vec))::float8 AS score \
+           FROM ranked \
+         ), topk AS ( \
+           SELECT \"id\", \"doc\", \"created_at\", \"version\", score FROM scored \
+           ORDER BY score DESC, \"created_at\" DESC, \"id\" DESC \
+           LIMIT ${limit_ph} \
+         ) \
+         SELECT \"id\", \"doc\", \"created_at\", \"version\", score FROM topk{cursor_clause} \
+         ORDER BY score DESC, \"created_at\" DESC, \"id\" DESC \
+         LIMIT ${page_limit_ph}"
+    );
+    let mut all = Vec::with_capacity(1 + auth_binds.len() + cursor_binds.len() + 4);
     all.push(EqBind::Text(hs.query.clone()));
     all.extend(auth_binds);
     all.push(EqBind::Text(qvec_text));
     all.push(EqBind::I64(k));
     all.push(EqBind::I64(i64::from(hs.limit)));
+    all.extend(cursor_binds);
+    // One extra row so a next page is detectable without a second round-trip.
+    all.push(EqBind::I64(i64::from(paginate.num_items.min(MAX_TAKE)) + 1));
     Ok(CompiledQuery {
         sql,
         binds: all,
@@ -694,4 +912,98 @@ pub(crate) async fn execute_hybrid_search(
         .map(|(id, doc, created_at, version)| merge_doc(id, doc, created_at, version))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(QueryResult::Docs(docs))
+}
+
+/// Execute tail shared by `search`/`vectorSearch`/`hybridSearch` when the
+/// query carries a `paginate` block (ENH-030). Every one of the three compiles
+/// to the same paginated row shape — the terminal's four document columns, the
+/// `search` snippet when opted in, and the ranking key as the trailing column
+/// — so one tail serves all three, the same way `execute_collect_terminal`
+/// serves `unique`/`first`/`collect`.
+///
+/// `num_items` is the requested page size already capped to `MAX_TAKE`; the
+/// compiled `LIMIT` asked for one more than that, so a full-plus-one fetch is
+/// the has-next signal. The next cursor is minted from the page's LAST row
+/// after the probe row is discarded — the ranking key is the value the ORDER BY
+/// compared, so resuming lands exactly one row past it.
+pub(crate) async fn execute_ranked_paginated(
+    cq: CompiledQuery,
+    pool: &PgPool,
+    num_items: u32,
+    snippet: bool,
+) -> Result<QueryResult, RtDbError> {
+    let CompiledQuery { sql, binds, .. } = cq;
+    // `(id, doc, created_at, version, snippet?, rank)` — the snippet column is
+    // present only for `search` with `snippet: true`, so the two row shapes are
+    // fetched separately and normalized to one tuple.
+    type RankedRow = (String, serde_json::Value, i64, i64, Option<String>, f64);
+    let mut rows: Vec<RankedRow> = if snippet {
+        let mut query =
+            sqlx::query_as::<_, (String, serde_json::Value, i64, i64, String, f64)>(&sql);
+        for bind in binds {
+            query = match bind {
+                EqBind::Text(v) => query.bind(v),
+                EqBind::Num(v) => query.bind(v),
+                EqBind::Bool(v) => query.bind(v),
+                EqBind::I64(v) => query.bind(v),
+            };
+        }
+        query
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(|(id, doc, created_at, version, snip, rank)| {
+                (id, doc, created_at, version, Some(snip), rank)
+            })
+            .collect()
+    } else {
+        let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64, f64)>(&sql);
+        for bind in binds {
+            query = match bind {
+                EqBind::Text(v) => query.bind(v),
+                EqBind::Num(v) => query.bind(v),
+                EqBind::Bool(v) => query.bind(v),
+                EqBind::I64(v) => query.bind(v),
+            };
+        }
+        query
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(|(id, doc, created_at, version, rank)| (id, doc, created_at, version, None, rank))
+            .collect()
+    };
+
+    let has_next = rows.len() > num_items as usize;
+    if has_next {
+        rows.pop();
+    }
+    let next_cursor =
+        if has_next && let Some((last_id, _, last_created_at, _, _, last_rank)) = rows.last() {
+            Some(encode_cursor(&[
+                serde_json::json!(last_rank),
+                serde_json::json!(*last_created_at),
+                serde_json::Value::String(last_id.clone()),
+            ])?)
+        } else {
+            None
+        };
+
+    let docs = rows
+        .into_iter()
+        .map(|(id, doc, created_at, version, snip, _)| {
+            let mut merged = merge_doc(id, doc, created_at, version)?;
+            // Write-time validation rejects `_`-prefixed keys, so the additive
+            // field never collides with stored data (same seam as
+            // `execute_search`'s non-paginated snippet path).
+            if let Some(text) = snip {
+                merged["_searchSnippet"] = serde_json::Value::String(text);
+            }
+            Ok::<_, RtDbError>(merged)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(QueryResult::Paginated(PaginatedResult {
+        docs,
+        next_cursor,
+    }))
 }

@@ -175,6 +175,47 @@ def test_query_paginate():
     }
 
 
+def test_query_paginate_chains_after_every_ranked_terminal():
+    # ENH-030: `paginate` composes with search / vectorSearch / hybridSearch as
+    # a peer clause, the way `take` already composes with `search`. The builder
+    # emits both keys, and the terminal stays `paginate` so `parse_result`
+    # hands back the existing `Paginated` envelope rather than a docs list.
+    search = (TableQuery("t").search("idx", "hello").paginate(num_items=2).build()).model_dump(
+        by_alias=True, mode="json"
+    )
+    assert search["search"] == {"index": "idx", "query": "hello"}
+    assert search["paginate"] == {"numItems": 2}
+
+    vector = (
+        TableQuery("t")
+        .vector_search("vidx", [1.0, 0.0], limit=10)
+        .paginate(cursor="Abc", num_items=3)
+        .build()
+    ).model_dump(by_alias=True, mode="json")
+    assert vector["vectorSearch"] == {"index": "vidx", "vector": [1.0, 0.0], "limit": 10}
+    assert vector["paginate"] == {"cursor": "Abc", "numItems": 3}
+
+    hybrid = (
+        TableQuery("t").hybrid_search("hello", [1.0, 0.0], limit=10).paginate(num_items=4).build()
+    ).model_dump(by_alias=True, mode="json")
+    assert hybrid["hybridSearch"] == {"query": "hello", "vector": [1.0, 0.0], "limit": 10}
+    assert hybrid["paginate"] == {"numItems": 4}
+
+
+def test_query_terminal_of_is_paginate_for_a_ranked_page():
+    # A ranked terminal + paginate parses through the existing `paginate` arm,
+    # so the caller gets `Paginated[T]` — no new response type.
+    for build in (
+        lambda b: b.search("idx", "hello"),
+        lambda b: b.vector_search("vidx", [1.0, 0.0], limit=10),
+        lambda b: b.hybrid_search("hello", [1.0, 0.0], limit=10),
+    ):
+        q = build(TableQuery("t")).paginate(num_items=2).build()
+        assert _terminal_of(q) == "paginate"
+    page = parse_result(Box, "paginate", {"docs": [{"id": "1", "status": "a"}], "nextCursor": "C"})
+    assert isinstance(page, Paginated) and page.next_cursor == "C"
+
+
 def test_query_filter_uses_op_discriminator():
     # FilterExpr is tagged by `op` (lowercase), NOT `type`.
     f = _filter_adapter.validate_python({"op": "eq", "field": "status", "value": "active"})

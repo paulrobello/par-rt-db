@@ -291,12 +291,6 @@ export const QUERY_COMBO_RULES: readonly QueryComboRule[] = [
     message: "vectorSearch cannot be combined with any other terminal",
   },
   {
-    id: "paginate-excludes-vectorSearch",
-    forbid: ["paginate", "vectorSearch"],
-    code: "BAD_REQUEST",
-    message: "vectorSearch cannot be combined with any other terminal",
-  },
-  {
     id: "filter-excludes-vectorSearch",
     forbid: ["filter", "vectorSearch"],
     code: "BAD_REQUEST",
@@ -375,12 +369,6 @@ export const QUERY_COMBO_RULES: readonly QueryComboRule[] = [
     message: "hybridSearch cannot be combined with any other terminal",
   },
   {
-    id: "hybridSearch-excludes-paginate",
-    forbid: ["hybridSearch", "paginate"],
-    code: "BAD_REQUEST",
-    message: "hybridSearch cannot be combined with any other terminal",
-  },
-  {
     id: "filter-excludes-hybridSearch",
     forbid: ["filter", "hybridSearch"],
     code: "BAD_REQUEST",
@@ -391,83 +379,76 @@ export const QUERY_COMBO_RULES: readonly QueryComboRule[] = [
     forbid: ["index", "search"],
     code: "BAD_REQUEST",
     message:
-      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, paginate, filter, or vector search",
+      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, filter, or vector search",
   },
   {
     id: "eq-excludes-search",
     forbid: ["eq", "search"],
     code: "BAD_REQUEST",
     message:
-      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, paginate, filter, or vector search",
+      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, filter, or vector search",
   },
   {
     id: "gt-excludes-search",
     forbid: ["gt", "search"],
     code: "BAD_REQUEST",
     message:
-      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, paginate, filter, or vector search",
+      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, filter, or vector search",
   },
   {
     id: "gte-excludes-search",
     forbid: ["gte", "search"],
     code: "BAD_REQUEST",
     message:
-      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, paginate, filter, or vector search",
+      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, filter, or vector search",
   },
   {
     id: "lt-excludes-search",
     forbid: ["lt", "search"],
     code: "BAD_REQUEST",
     message:
-      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, paginate, filter, or vector search",
+      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, filter, or vector search",
   },
   {
     id: "lte-excludes-search",
     forbid: ["lte", "search"],
     code: "BAD_REQUEST",
     message:
-      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, paginate, filter, or vector search",
+      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, filter, or vector search",
   },
   {
     id: "order-excludes-search",
     forbid: ["order", "search"],
     code: "BAD_REQUEST",
     message:
-      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, paginate, filter, or vector search",
+      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, filter, or vector search",
   },
   {
     id: "search-excludes-unique",
     forbid: ["search", "unique"],
     code: "BAD_REQUEST",
     message:
-      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, paginate, filter, or vector search",
+      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, filter, or vector search",
   },
   {
     id: "first-excludes-search",
     forbid: ["first", "search"],
     code: "BAD_REQUEST",
     message:
-      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, paginate, filter, or vector search",
+      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, filter, or vector search",
   },
   {
     id: "count-excludes-search",
     forbid: ["count", "search"],
     code: "BAD_REQUEST",
     message:
-      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, paginate, filter, or vector search",
-  },
-  {
-    id: "paginate-excludes-search",
-    forbid: ["paginate", "search"],
-    code: "BAD_REQUEST",
-    message:
-      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, paginate, filter, or vector search",
+      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, filter, or vector search",
   },
   {
     id: "filter-excludes-search",
     forbid: ["filter", "search"],
     code: "BAD_REQUEST",
     message:
-      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, paginate, filter, or vector search",
+      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, filter, or vector search",
   },
 ];

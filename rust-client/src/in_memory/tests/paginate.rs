@@ -339,3 +339,233 @@ async fn paginate_rejects_combination_with_take_count_unique_or_first() {
         );
     }
 }
+
+// ---- ENH-030: paginate over the ranked terminals ------------------
+//
+// `paginate` composes with `search`/`vectorSearch`/`hybridSearch` as a peer
+// clause: the terminal still runs, only the row cap, the resume predicate, and
+// the `{docs, nextCursor?}` envelope come from `paginate`. The engine's
+// cursors are its own — minted and consumed here, never compared to the
+// server's — so these tests pin the ORDER and the page split, not the bytes.
+
+/// Seed `items` whose `name` (the `by_content` search index's only field)
+/// repeats the word `task` the given number of times. The tsquery relevance
+/// stand-in counts query lexemes, so the repeat count IS the score. The
+/// insertion order deliberately differs from the score order, so a page that
+/// fell back to insertion order fails loudly.
+async fn seed_task_repeats(c: &mut InMemoryRtDbClient, repeats: &[usize]) {
+    for (i, n) in repeats.iter().enumerate() {
+        let name = vec!["task"; *n].join(" ");
+        let txn = Mutation::new()
+            .insert(
+                "items",
+                json!({ "name": name, "status": "todo", "order": i as i64 }),
+            )
+            .build();
+        c.mutate(&txn, None).await.expect("insert ok");
+    }
+}
+
+fn names_of(docs: &[Value]) -> Vec<String> {
+    docs.iter()
+        .map(|d| d["name"].as_str().expect("name string").to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn paginate_search_walks_ranked_pages_without_overlap() {
+    // Pages are non-overlapping, correctly ordered, and their concatenation
+    // is the full ranked result: score (query-lexeme count) desc.
+    let mut c = new_client();
+    seed_task_repeats(&mut c, &[2, 5, 1, 4, 3]).await;
+    let (page_sizes, cursors, docs) = walk_pages(&c, |cursor| {
+        TableQuery::new("items")
+            .search("by_content", "task", ())
+            .paginate(cursor, 2)
+    })
+    .await;
+    assert_eq!(page_sizes, vec![2, 2, 1]);
+    // Every page but the last carries a cursor; the short last page does not.
+    assert!(cursors[..cursors.len() - 1].iter().all(Option::is_some));
+    assert!(cursors.last().is_some_and(Option::is_none));
+
+    assert_eq!(
+        names_of(&docs),
+        vec![
+            "task task task task task",
+            "task task task task",
+            "task task task",
+            "task task",
+            "task",
+        ]
+    );
+    // No duplicates across pages, and the walk covers exactly the set the
+    // unpaginated (unranked, so set-compared) search returns.
+    let mut walked = names_of(&docs);
+    walked.sort();
+    let unpaginated: Vec<Value> = c
+        .run(
+            &TableQuery::new("items")
+                .search("by_content", "task", ())
+                .build(),
+        )
+        .expect("unpaginated search");
+    let mut all = names_of(&unpaginated);
+    all.sort();
+    assert_eq!(walked, all);
+}
+
+#[tokio::test]
+async fn paginate_search_short_last_page_carries_no_cursor() {
+    // Mirrors the `search-paginate-*` corpus pair: 3 hits, numItems 2 ⇒ a
+    // full first page with a cursor, then a short page with none.
+    let mut c = new_client();
+    seed_task_repeats(&mut c, &[2, 1, 3]).await;
+    let first: Paginated<Value> = c
+        .run(
+            &TableQuery::new("items")
+                .search("by_content", "task", ())
+                .paginate(None, 2),
+        )
+        .expect("first page");
+    assert_eq!(names_of(&first.docs), vec!["task task task", "task task"]);
+    let cursor = first.next_cursor.expect("first page has a nextCursor");
+
+    let second: Paginated<Value> = c
+        .run(
+            &TableQuery::new("items")
+                .search("by_content", "task", ())
+                .paginate(Some(&cursor), 2),
+        )
+        .expect("second page");
+    assert_eq!(names_of(&second.docs), vec!["task"]);
+    assert!(
+        second.next_cursor.is_none(),
+        "short last page has no cursor"
+    );
+}
+
+#[tokio::test]
+async fn paginate_search_cursor_encodes_score_created_at_and_id() {
+    // The ranked keyset is `[score, _creationTime, _id]` of the page's last
+    // row — three columns, unlike the btree path's index-field columns.
+    let mut c = new_client();
+    seed_task_repeats(&mut c, &[1, 3, 2]).await;
+    let first: Paginated<Value> = c
+        .run(
+            &TableQuery::new("items")
+                .search("by_content", "task", ())
+                .paginate(None, 2),
+        )
+        .expect("first page");
+    let cursor = first.next_cursor.clone().expect("nextCursor");
+    let decoded = crate::cursor::decode_cursor(&cursor).expect("cursor decodes");
+    let last = &first.docs[1];
+    assert_eq!(decoded.len(), 3);
+    assert_eq!(decoded[0], json!(2)); // "task task" ⇒ two query lexemes
+    assert_eq!(decoded[1], last["_creationTime"]);
+    assert_eq!(decoded[2], last["_id"]);
+}
+
+#[tokio::test]
+async fn paginate_search_trgm_pages_by_similarity() {
+    // The trgm arm ranks by query.len()/field.len(), so a SHORTER containing
+    // field is more similar — the exact reverse of the tsquery ordering over
+    // this seed. Paging must follow the arm's own ranking.
+    let mut c = new_client();
+    seed_task_repeats(&mut c, &[2, 5, 1, 4, 3]).await;
+    let (page_sizes, _cursors, docs) = walk_pages(&c, |cursor| {
+        TableQuery::new("items")
+            .search(
+                "by_content",
+                "task",
+                SearchOpts {
+                    filter: None,
+                    mode: Some(SearchMode::Trgm),
+                    snippet: None,
+                },
+            )
+            .paginate(cursor, 2)
+    })
+    .await;
+    assert_eq!(page_sizes, vec![2, 2, 1]);
+    assert_eq!(
+        names_of(&docs),
+        vec![
+            "task",
+            "task task",
+            "task task task",
+            "task task task task",
+            "task task task task task",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn paginate_vector_search_pages_the_candidate_pool() {
+    // `limit` sizes the candidate POOL, `numItems` slices it into pages. The
+    // harness models no vector distance, so the pool's order is the
+    // `_creationTime` desc / `_id` desc tie-breaker order — the three newest
+    // rows, newest first.
+    let mut c = new_client();
+    seed_items(&mut c, 5, &["todo"]).await;
+    let (page_sizes, cursors, docs) = walk_pages(&c, |cursor| {
+        TableQuery::new("items")
+            .vector_search("by_embedding", vec![1.0, 0.0, 0.0], 3, ())
+            .paginate(cursor, 2)
+    })
+    .await;
+    assert_eq!(page_sizes, vec![2, 1]);
+    assert!(cursors[0].is_some());
+    assert!(cursors[1].is_none());
+    assert_eq!(names_of(&docs), vec!["n5", "n4", "n3"]);
+    // Two-column keyset here (no distance to page by), unlike `search`.
+    let decoded =
+        crate::cursor::decode_cursor(cursors[0].as_deref().expect("cursor")).expect("decodes");
+    assert_eq!(decoded.len(), 2);
+    assert_eq!(decoded[1], docs[1]["_id"]);
+}
+
+#[tokio::test]
+async fn paginate_hybrid_search_returns_an_empty_page() {
+    // No in-memory ts_rank + distance fusion, so there is nothing to rank and
+    // nothing to resume: an empty page with no cursor — as an ENVELOPE, not a
+    // bare array (the wire `Paginated` shape every paginate terminal returns).
+    let mut c = new_client();
+    seed_items(&mut c, 3, &["todo"]).await;
+    let page: Paginated<Value> = c
+        .run(
+            &TableQuery::new("items")
+                .hybrid_search("task", vec![1.0, 0.0, 0.0], 5, ())
+                .paginate(None, 2),
+        )
+        .expect("hybrid paginate ok");
+    assert!(page.docs.is_empty());
+    assert!(page.next_cursor.is_none());
+    let raw = c
+        .run_query(
+            &TableQuery::new("items")
+                .hybrid_search("task", vec![1.0, 0.0, 0.0], 5, ())
+                .paginate(None, 2),
+        )
+        .expect("hybrid paginate ok");
+    assert_eq!(raw, json!({"docs": []}));
+}
+
+#[tokio::test]
+async fn paginate_ranked_rejects_a_cursor_of_the_wrong_arity() {
+    // A `search` page sorts over three columns; a two-value cursor (the
+    // `vectorSearch` shape) is rejected rather than silently mis-resumed.
+    let mut c = new_client();
+    seed_task_repeats(&mut c, &[1, 2]).await;
+    let bad = crate::cursor::encode_cursor(&[json!(1), json!("id")]).expect("encode");
+    let err = c
+        .run_query(
+            &TableQuery::new("items")
+                .search("by_content", "task", ())
+                .paginate(Some(&bad), 2),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(err.message.contains("sorts over 3 column(s)"), "got: {err}");
+}

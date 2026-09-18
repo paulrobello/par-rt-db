@@ -461,12 +461,12 @@ struct QueryExclusivityTests {
         #expect(
             buildError { $0.search("idx", "q").filter(.eq(field: "a", value: .int(1))) }?.message
                 == "search cannot be combined with index, eq, range bounds, order, unique, first, "
-                + "count, distinct, aggregate, paginate, filter, or vector search"
+                + "count, distinct, aggregate, filter, or vector search"
         )
         #expect(
             buildError { $0.search("idx", "q").count() }?.message
                 == "search cannot be combined with index, eq, range bounds, order, unique, first, "
-                + "count, distinct, aggregate, paginate, filter, or vector search"
+                + "count, distinct, aggregate, filter, or vector search"
         )
         // search+vectorSearch: the vectorSearch check runs BEFORE search, so its
         // message wins (first-match-wins order, same as the server).

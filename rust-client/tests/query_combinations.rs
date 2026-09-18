@@ -788,13 +788,15 @@ fn cases() -> Vec<Case> {
             },
             expected: Outcome::Reject,
         },
+        // ENH-030: `paginate` composes with every ranked terminal — the cursor
+        // pages the terminal's own ranking instead of replacing it.
         Case {
             name: "vectorSearch+paginate",
             build: |q| {
                 q.insert("vectorSearch".into(), vector_embedding_limit_1());
                 q.insert("paginate".into(), paginate_num_1());
             },
-            expected: Outcome::Reject,
+            expected: Outcome::Accept,
         },
         Case {
             name: "vectorSearch+filter",
@@ -909,13 +911,14 @@ fn cases() -> Vec<Case> {
             },
             expected: Outcome::Reject,
         },
+        // ENH-030: see the `vectorSearch+paginate` note above.
         Case {
             name: "search+paginate",
             build: |q| {
                 q.insert("search".into(), search_body_x());
                 q.insert("paginate".into(), paginate_num_1());
             },
-            expected: Outcome::Reject,
+            expected: Outcome::Accept,
         },
         Case {
             name: "search+filter",
@@ -1038,13 +1041,14 @@ fn cases() -> Vec<Case> {
             },
             expected: Outcome::Reject,
         },
+        // ENH-030: see the `vectorSearch+paginate` note above.
         Case {
             name: "hybridSearch+paginate",
             build: |q| {
                 q.insert("hybridSearch".into(), hybrid_query_database_x());
                 q.insert("paginate".into(), paginate_num_1());
             },
-            expected: Outcome::Reject,
+            expected: Outcome::Accept,
         },
         Case {
             name: "hybridSearch+filter",

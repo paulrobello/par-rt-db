@@ -676,13 +676,15 @@ CASES: list[Case] = [
         ),
         "reject",
     ),
+    # ENH-030: `paginate` composes with every ranked terminal — the cursor
+    # pages the terminal's own ranking instead of replacing it.
     Case(
         "vectorSearch+paginate",
         lambda q: (
             q.__setitem__("vectorSearch", _vector_embedding_limit1()),
             q.__setitem__("paginate", _paginate_num1()),
         ),
-        "reject",
+        "accept",
     ),
     Case(
         "vectorSearch+filter",
@@ -797,13 +799,14 @@ CASES: list[Case] = [
         ),
         "reject",
     ),
+    # ENH-030: see the `vectorSearch+paginate` note above.
     Case(
         "search+paginate",
         lambda q: (
             q.__setitem__("search", _search_body_x()),
             q.__setitem__("paginate", _paginate_num1()),
         ),
-        "reject",
+        "accept",
     ),
     Case(
         "search+filter",
@@ -927,13 +930,14 @@ CASES: list[Case] = [
         ),
         "reject",
     ),
+    # ENH-030: see the `vectorSearch+paginate` note above.
     Case(
         "hybridSearch+paginate",
         lambda q: (
             q.__setitem__("hybridSearch", _hybrid_query_x()),
             q.__setitem__("paginate", _paginate_num1()),
         ),
-        "reject",
+        "accept",
     ),
     Case(
         "hybridSearch+filter",
@@ -1043,6 +1047,30 @@ def _run_case(case: Case) -> None:
 def test_combination_matrix(case_name: str) -> None:
     """Run one matrix case (parametrized for per-case failure granularity)."""
     _run_case(_CASE_BY_NAME[case_name])
+
+
+def test_enh030_paginate_rules_are_gone_from_the_shared_table() -> None:
+    """ENH-030 drift guard: the engine loads its combination rules from
+    ``wire-corpus/query-combinations.json``, so the three removed
+    ``paginate``-vs-ranked-terminal rules must be absent from the table the
+    engine actually reads — not merely absent from the matrix above. If one
+    comes back, the accept cases turn into rejections with no local edit to
+    blame.
+    """
+    from par_rt_db.in_memory.query import _load_combination_rules
+
+    ids = {rule["id"] for rule in _load_combination_rules()}
+    for removed in (
+        "paginate-excludes-search",
+        "paginate-excludes-vectorSearch",
+        "hybridSearch-excludes-paginate",
+    ):
+        assert removed not in ids, f"ENH-030 removed rule is back in the shared table: {removed}"
+    # `paginate` still belongs to the row-returning terminal clique, so it
+    # stays mutually exclusive with `take`/`count`/`first`/... — ENH-030 only
+    # made it a PEER of the ranked terminals, which are not in that clique.
+    clique = next(r for r in _load_combination_rules() if r["id"] == "terminal-exclusive")
+    assert {"paginate", "take"} <= set(clique["atMostOne"])
 
 
 def test_matrix_covers_qa001_drift_cases() -> None:

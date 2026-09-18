@@ -675,7 +675,7 @@ function executeGetTerminal(
 }
 
 /** `vectorSearch` terminal: filter-narrowed candidates (in-memory does not
- *  rank by vector distance). */
+ *  rank by vector distance), optionally paged by `paginate` (ENH-030). */
 function executeVectorSearchTerminal(
   q: QueryJson,
   tableDef: TableJson,
@@ -693,7 +693,6 @@ function executeVectorSearchTerminal(
     q.count ||
     q.distinct ||
     q.aggregate !== undefined ||
-    q.paginate !== undefined ||
     q.filter !== undefined ||
     q.search !== undefined ||
     q.take !== undefined ||
@@ -716,18 +715,37 @@ function executeVectorSearchTerminal(
   if (vs.filter) {
     validateFilter(vs.filter, tableDef);
   }
-  const out: unknown[] = [];
+  const pool: StoredRow[] = [];
   for (const row of rowsFor(q.table).values()) {
     if (row.deletedAt !== undefined) continue; // FM-33: stamped rows are invisible
     if (vs.filter && !evalFilterExpr(vs.filter, row.doc, tableDef.fields)) {
       continue;
     }
-    out.push(row.doc);
-    if (out.length >= vs.limit) {
+    pool.push(row);
+    if (pool.length >= vs.limit) {
       break;
     }
   }
-  return out;
+  if (q.paginate !== undefined) {
+    // ENH-030. `limit` keeps its unpaginated meaning — the size of the ranked
+    // candidate POOL — and `numItems` slices that pool into pages, exactly as
+    // on the server. What the harness cannot mirror is the RANKING: it models
+    // no pgvector distance, so the pool is the filter-narrowed candidates in
+    // insertion order and the page order is the `created_at`/`id` tie-breaker
+    // order the server applies BELOW the distance, not a distance ranking.
+    // Paging over those two columns alone is a total order (`id` is unique),
+    // so pages still never skip or duplicate a row.
+    const page = [...pool].sort(compareTiebreakDesc);
+    return paginateResult(q.paginate, page, {
+      sortKeys: RANKED_TIEBREAK_KEYS,
+      sortPgs: RANKED_TIEBREAK_PGS,
+      dir: "desc",
+      sortValueOf: sortValue,
+      toDoc: mergeDoc,
+      validateCursor: validateTiebreakCursorValues,
+    });
+  }
+  return pool.map((row) => row.doc);
 }
 
 /** `hybridSearch` terminal: in-memory returns an empty result (no ts_rank +
@@ -743,7 +761,6 @@ function executeHybridSearchTerminal(q: QueryJson, eq: unknown[], hasRange: bool
     q.count ||
     q.distinct ||
     q.aggregate !== undefined ||
-    q.paginate !== undefined ||
     q.filter !== undefined ||
     q.search !== undefined ||
     q.vectorSearch !== undefined ||
@@ -753,6 +770,14 @@ function executeHybridSearchTerminal(q: QueryJson, eq: unknown[], hasRange: bool
   }
   // No in-memory hybrid ranking; return an empty result rather than silently
   // misranking by falling through to the collect path.
+  if (q.paginate !== undefined) {
+    // ENH-030: `paginate` composes, but there is nothing to page — the harness
+    // fuses no ts_rank with any vector distance, so every hybrid result is
+    // empty. An empty page is therefore always the LAST page, and mints no
+    // `nextCursor`. (Deliberately not the empty array the unpaginated arm
+    // returns: `paginate` still changes the result ENVELOPE.)
+    return { docs: [] } satisfies PaginatedResultJson;
+  }
   return [];
 }
 
@@ -777,14 +802,13 @@ function executeSearchTerminal(
     q.count ||
     q.distinct ||
     q.aggregate !== undefined ||
-    q.paginate !== undefined ||
     q.filter !== undefined ||
     q.vectorSearch !== undefined ||
     q.hybridSearch !== undefined
   ) {
     throw new RtDbError(
       "BAD_REQUEST",
-      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, paginate, filter, or vector search",
+      "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, filter, or vector search",
     );
   }
   // Full-text matching (not ts_rank ordering): mirror
@@ -825,7 +849,7 @@ function executeSearchTerminal(
     throw new RtDbError("BAD_REQUEST", "snippet is only supported in tsquery mode");
   }
   const limit = q.take ?? MAX_TAKE;
-  const scored: Array<{ row: StoredRow; score: number; snippet?: string }> = [];
+  const scored: SearchHit[] = [];
   if (search.mode === "trgm") {
     // `trgm` mode (ILIKE '%q%' + similarity() on the server): a doc matches
     // when ANY indexed field's lowercased text contains the lowercased query
@@ -870,27 +894,31 @@ function executeSearchTerminal(
       for (const dt of docTokens) {
         if (positives.has(dt)) score++;
       }
-      const hit: { row: StoredRow; score: number; snippet?: string } = { row, score };
+      const hit: SearchHit = { row, score };
       if (snippet) hit.snippet = buildSearchSnippet(source, positives);
       scored.push(hit);
     }
   }
   scored.sort((a, b) =>
-    a.score !== b.score
-      ? b.score - a.score
-      : a.row.createdAt !== b.row.createdAt
-        ? b.row.createdAt - a.row.createdAt
-        : a.row.id > b.row.id
-          ? -1
-          : a.row.id < b.row.id
-            ? 1
-            : 0,
+    a.score !== b.score ? b.score - a.score : compareTiebreakDesc(a.row, b.row),
   );
-  return scored
-    .slice(0, limit)
-    .map((s) =>
-      s.snippet !== undefined ? { ...mergeDoc(s.row), _searchSnippet: s.snippet } : mergeDoc(s.row),
-    );
+  if (q.paginate !== undefined) {
+    // ENH-030: page the SAME ranked order the unpaginated arm returns — score
+    // desc, then `created_at` desc, then `id` desc — so the concatenation of
+    // the pages is exactly the full ranked result. `take` is forbidden
+    // alongside `paginate`, so the whole scored set is the pool, mirroring the
+    // server's paginated form (whose `LIMIT` is `numItems + 1` with no pool
+    // cap). `_searchSnippet` still rides along on each page when opted in.
+    return paginateResult(q.paginate, scored, {
+      sortKeys: SEARCH_SORT_KEYS,
+      sortPgs: SEARCH_SORT_PGS,
+      dir: "desc",
+      sortValueOf: searchHitSortValue,
+      toDoc: searchHitDoc,
+      validateCursor: validateSearchCursorValues,
+    });
+  }
+  return scored.slice(0, limit).map(searchHitDoc);
 }
 
 /** `count` terminal: COUNT(*) over the matching set. */
@@ -1058,7 +1086,93 @@ function executePaginateTerminal(
   dir: Order,
 ): PaginatedResultJson {
   const { sortKeys, sortPgs } = sortKeysFor(tableDef, plan.indexDef, plan.typedEq.length);
-  return paginateResult(paginate, tableDef, filtered, sortKeys, sortPgs, dir);
+  return paginateResult(paginate, filtered, {
+    sortKeys,
+    sortPgs,
+    dir,
+    sortValueOf: sortValue,
+    toDoc: mergeDoc,
+    validateCursor: (values) => validateCursorValues(values, sortKeys, tableDef),
+  });
+}
+
+// ====== ENH-030: cursor pagination over the ranked terminals ======
+//
+// `search`/`vectorSearch`/`hybridSearch` each rank rows by a scalar key, and
+// `paginate` composes with all three as a PEER clause exactly the way `take`
+// already composes with `search`: it does not change which terminal runs, only
+// the row cap, the keyset resume predicate, and the result envelope. The server
+// pages over `[<ranking key>, created_at, id]`, all `DESC` bar `vectorSearch`'s
+// ascending distance. This harness models `search`'s relevance ranking (a
+// query-lexeme-frequency stand-in) but not vector distance, so its sort columns
+// are `[__score, __createdAt, __id]` for `search` and `[__createdAt, __id]` for
+// `vectorSearch` — every column `desc`, so no per-column direction is needed.
+// Cursors are minted and consumed by this engine alone, so their bytes need not
+// match the server's; only the round-trip must hold.
+
+/** One scored `search` hit: the row, its relevance stand-in, and the snippet
+ *  when `snippet: true` was requested. `score` is REQUIRED — an absent score
+ *  would compare as `null` and sort last, silently corrupting the one column
+ *  that carries the ranking. */
+interface SearchHit {
+  row: StoredRow;
+  score: number;
+  snippet?: string;
+}
+
+/** `search`'s keyset sort columns: the relevance stand-in, then the same
+ *  `created_at`/`id` tie-breakers the unpaginated ranking already applies. */
+const SEARCH_SORT_KEYS: string[] = ["__score", "__createdAt", "__id"];
+const SEARCH_SORT_PGS: PgType[] = ["number", "number", "text"];
+
+/** `vectorSearch`'s keyset sort columns. The distance column the server pages
+ *  on has no counterpart here (no pgvector in the harness), leaving the two
+ *  tie-breakers as the total order. */
+const RANKED_TIEBREAK_KEYS: string[] = ["__createdAt", "__id"];
+const RANKED_TIEBREAK_PGS: PgType[] = ["number", "text"];
+
+/** Renders one scored `search` hit as its wire doc, carrying `_searchSnippet`
+ *  when the query opted in (server `execute_ranked_paginated`'s snippet arm). */
+function searchHitDoc(hit: SearchHit): Record<string, unknown> {
+  return hit.snippet !== undefined
+    ? { ...mergeDoc(hit.row), _searchSnippet: hit.snippet }
+    : mergeDoc(hit.row);
+}
+
+/** Sort-column reader for a scored `search` hit: the synthetic `__score`
+ *  column, else the shared `StoredRow` accessor. */
+function searchHitSortValue(hit: SearchHit, key: string): unknown {
+  return key === "__score" ? hit.score : sortValue(hit.row, key);
+}
+
+/** Type-checks a ranked terminal's cursor values positionally — the ranking
+ *  key, then `created_at`, then `id` (server `SortCol::Rank`/`CreatedAt`/`Id`
+ *  cursor binds). The column count is checked by `paginateResult` first. */
+function validateSearchCursorValues(values: unknown[]): void {
+  if (typeof values[0] !== "number") {
+    throw new RtDbError("BAD_REQUEST", "cursor value for the ranking key must be a number");
+  }
+  validateTiebreakCursorValues(values.slice(1));
+}
+
+/** Type-checks the `created_at`/`id` tie-breaker cursor values a ranked
+ *  terminal's cursor always ends with. */
+function validateTiebreakCursorValues(values: unknown[]): void {
+  if (typeof values[0] !== "number") {
+    throw new RtDbError("BAD_REQUEST", "cursor value for created_at must be a number");
+  }
+  if (typeof values[1] !== "string") {
+    throw new RtDbError("BAD_REQUEST", "cursor value for id must be a string");
+  }
+}
+
+/** Orders two rows by the `created_at` DESC, `id` DESC tie-breakers every
+ *  ranked terminal shares. */
+function compareTiebreakDesc(a: StoredRow, b: StoredRow): number {
+  if (a.createdAt !== b.createdAt) {
+    return b.createdAt - a.createdAt;
+  }
+  return a.id > b.id ? -1 : a.id < b.id ? 1 : 0;
 }
 
 /** Collect terminal: the post-sort tail covering `unique` (at-most-one
@@ -1078,21 +1192,40 @@ function executeCollectTerminal(q: QueryJson, filtered: StoredRow[]): unknown {
   return filtered.slice(0, limit).map((row) => mergeDoc(row));
 }
 
+/** How a keyset page reads, type-checks and renders rows of one particular
+ *  shape. `paginateResult` is generic over the row type so the btree `paginate`
+ *  terminal (bare `StoredRow`s sorted over index fields) and the ranked
+ *  terminals (ENH-030: scored hits sorted over a ranking key) share ONE cursor
+ *  implementation instead of growing a second one. */
+interface KeysetSpec<R> {
+  /** Sort columns, outermost first; the cursor carries one value per column. */
+  sortKeys: string[];
+  /** Storage type of each sort column, for the int64-aware comparator. */
+  sortPgs: PgType[];
+  /** Sort direction, shared by every column. The ranked terminals sort every
+   *  column `desc`; the btree terminal uses the query's own `order`. */
+  dir: Order;
+  /** Reads one sort column's value off one row. */
+  sortValueOf: (row: R, key: string) => unknown;
+  /** Renders a page row as its wire doc. */
+  toDoc: (row: R) => unknown;
+  /** Positional type check of the decoded cursor values (a port of server
+   *  `SortCol::cursor_bind`); runs after the column-count check. */
+  validateCursor: (values: unknown[]) => void;
+}
+
 /** Cursor keyset pagination — a port of server `query.rs`'s paginate branch.
- *  `sorted` is already filtered (eq/range) and sorted over `sortKeys` (unbound
- *  index fields, then `__createdAt`, then `__id`) in direction `dir`. The
- *  cursor stores one value per sort column; the resume predicate is the
- *  standard OR-of-AND row-value comparison, so paging is stable (the unique
- *  `id` tiebreaker means no row is skipped or duplicated across pages).
- *  `sortPgs[i]` is the storage type of `sortKeys[i]` so the resume predicate
- *  uses the same int64-aware comparator as the producing sort. */
-function paginateResult(
+ *  `sorted` is already filtered and sorted over `spec.sortKeys` in direction
+ *  `spec.dir`. The cursor stores one value per sort column; the resume
+ *  predicate is the standard OR-of-AND row-value comparison, so paging is
+ *  stable (the unique `id` tiebreaker means no row is skipped or duplicated
+ *  across pages). `spec.sortPgs[i]` is the storage type of `spec.sortKeys[i]`
+ *  so the resume predicate uses the same int64-aware comparator as the
+ *  producing sort. */
+function paginateResult<R>(
   paginate: Paginate,
-  tableDef: TableJson,
-  sorted: StoredRow[],
-  sortKeys: string[],
-  sortPgs: PgType[],
-  dir: Order,
+  sorted: R[],
+  spec: KeysetSpec<R>,
 ): PaginatedResultJson {
   const { numItems: requested, cursor } = paginate;
   const numItems = Math.min(requested, MAX_TAKE);
@@ -1100,14 +1233,14 @@ function paginateResult(
   let rows = sorted;
   if (cursor) {
     const cursorValues = decodePaginateCursor(cursor);
-    if (cursorValues.length !== sortKeys.length) {
+    if (cursorValues.length !== spec.sortKeys.length) {
       throw new RtDbError(
         "BAD_REQUEST",
-        `cursor has ${cursorValues.length} value(s) but this query sorts over ${sortKeys.length} column(s)`,
+        `cursor has ${cursorValues.length} value(s) but this query sorts over ${spec.sortKeys.length} column(s)`,
       );
     }
-    validateCursorValues(cursorValues, sortKeys, tableDef);
-    rows = sorted.filter((row) => isAfterCursor(row, cursorValues, sortKeys, sortPgs, dir));
+    spec.validateCursor(cursorValues);
+    rows = sorted.filter((row) => isAfterCursor(row, cursorValues, spec));
   }
 
   // Fetch one past the page size so a next page is detectable without a second
@@ -1117,14 +1250,14 @@ function paginateResult(
   if (hasNext) {
     fetched.pop();
   }
-  const docs = fetched.map((row) => mergeDoc(row));
+  const docs = fetched.map((row) => spec.toDoc(row));
   // The next cursor is built from the page's last row; absent when the page is
   // empty or this was the final page. ARC-133:PaginatedResultJson.nextCursor
   // is `?:`-optional, so the key is included only when a cursor exists
   // (exactOptionalPropertyTypes forbids assigning literal `undefined`).
   const nextCursor =
     hasNext && fetched.length > 0
-      ? encodeCursor(sortKeys.map((key) => sortValue(fetched[fetched.length - 1], key)))
+      ? encodeCursor(spec.sortKeys.map((key) => spec.sortValueOf(fetched[fetched.length - 1], key)))
       : undefined;
   return { docs, ...(nextCursor === undefined ? {} : { nextCursor }) };
 }
@@ -1178,17 +1311,12 @@ function validateCursorValues(
  *
  *  where OP is `>` (asc) / `<` (desc). Evaluated with the same `null`-sorts-last
  *  comparator as the sort, so it agrees with the ordering that produced `sorted`. */
-function isAfterCursor(
-  row: StoredRow,
-  cursorValues: unknown[],
-  sortKeys: string[],
-  sortPgs: PgType[],
-  dir: Order,
-): boolean {
+function isAfterCursor<R>(row: R, cursorValues: unknown[], spec: KeysetSpec<R>): boolean {
+  const { sortKeys, sortPgs, dir, sortValueOf } = spec;
   for (let i = 0; i < sortKeys.length; i++) {
     let prefixEqual = true;
     for (let j = 0; j < i; j++) {
-      if (compareIndexValues(sortValue(row, sortKeys[j]), cursorValues[j], sortPgs[j]) !== 0) {
+      if (compareIndexValues(sortValueOf(row, sortKeys[j]), cursorValues[j], sortPgs[j]) !== 0) {
         prefixEqual = false;
         break;
       }
@@ -1196,7 +1324,7 @@ function isAfterCursor(
     if (!prefixEqual) {
       continue;
     }
-    const cmp = compareIndexValues(sortValue(row, sortKeys[i]), cursorValues[i], sortPgs[i]);
+    const cmp = compareIndexValues(sortValueOf(row, sortKeys[i]), cursorValues[i], sortPgs[i]);
     if (dir === "desc" ? cmp < 0 : cmp > 0) {
       return true;
     }

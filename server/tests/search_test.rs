@@ -1444,3 +1444,188 @@ async fn projection_composes_with_search_and_keeps_snippet() {
         other => panic!("expected Docs variant, got {other:?}"),
     }
 }
+
+// ============ ENH-030: `paginate` composed with the `search` terminal ========
+
+/// Drains every page of `q` (which must carry a `paginate` block), following
+/// `nextCursor` until it is absent. Returns the concatenated titles and the
+/// per-page title lists. Panics past `max_pages` — a cursor that never
+/// terminates is a bug, not a slow test.
+async fn drain_search_pages(
+    pool: &PgPool,
+    db: &str,
+    schema: &SchemaDef,
+    mut q: Query,
+    max_pages: usize,
+) -> (Vec<String>, Vec<Vec<String>>) {
+    let mut all: Vec<String> = Vec::new();
+    let mut pages: Vec<Vec<String>> = Vec::new();
+    for _ in 0..max_pages {
+        let res = execute_query(pool, db, schema, &q, &PrincipalCtx::bypass(), false)
+            .await
+            .expect("paginated search page");
+        let page = match res {
+            QueryResult::Paginated(p) => p,
+            other => panic!("expected Paginated variant, got {other:?}"),
+        };
+        let page_titles: Vec<String> = page
+            .docs
+            .iter()
+            .map(|d| d["title"].as_str().expect("title string").to_string())
+            .collect();
+        all.extend(page_titles.clone());
+        pages.push(page_titles);
+        match page.next_cursor {
+            Some(cursor) => {
+                let paginate = q.paginate.as_mut().expect("query carries paginate");
+                paginate.cursor = Some(cursor);
+            }
+            None => return (all, pages),
+        }
+    }
+    panic!("cursor did not terminate within {max_pages} pages");
+}
+
+/// Paging a ranked `search` with a cursor yields non-overlapping pages in the
+/// same relevance order the unpaginated search returns, and the concatenation
+/// of every page reconstructs the full unpaginated result exactly.
+#[tokio::test]
+async fn search_paginate_pages_reconstruct_the_unpaginated_ranking() {
+    let state = test_state().await;
+    let (db, schema) = fresh_search_db(&state).await;
+    let pool = &state.pool;
+    // Distinct occurrence counts ⇒ distinct ts_rank values ⇒ a total order
+    // that does not lean on the created_at/id tie-breakers.
+    for (title, occurrences) in [
+        ("five", 5),
+        ("four", 4),
+        ("three", 3),
+        ("two", 2),
+        ("one", 1),
+    ] {
+        let body = vec!["database"; occurrences].join(" ");
+        insert_note(pool, &db, &schema, title, &body).await;
+    }
+    insert_note(pool, &db, &schema, "cooking", "recipes for dinner").await;
+
+    let unpaginated = titles(
+        &execute_query(
+            pool,
+            &db,
+            &schema,
+            &search_query("search_content", "database"),
+            &PrincipalCtx::bypass(),
+            false,
+        )
+        .await
+        .expect("unpaginated search"),
+    );
+    assert_eq!(
+        unpaginated,
+        vec!["five", "four", "three", "two", "one"],
+        "ts_rank orders by occurrence count"
+    );
+
+    let mut q = search_query("search_content", "database");
+    q.paginate =
+        Some(serde_json::from_value(serde_json::json!({"numItems": 2})).expect("paginate block"));
+    let (drained, pages) = drain_search_pages(pool, &db, &schema, q, 10).await;
+
+    assert_eq!(
+        pages,
+        vec![
+            vec!["five".to_string(), "four".to_string()],
+            vec!["three".to_string(), "two".to_string()],
+            vec!["one".to_string()],
+        ],
+        "pages are non-overlapping and correctly ordered"
+    );
+    assert_eq!(
+        drained, unpaginated,
+        "concatenated pages reconstruct the unpaginated ranking exactly"
+    );
+}
+
+/// The keyset placeholders are numbered after the `search` terminal's own
+/// `filter` binds, so a filtered paged scan pages the filtered ranking rather
+/// than binding the cursor values into the filter's positions.
+#[tokio::test]
+async fn search_paginate_composes_with_the_search_filter() {
+    let state = test_state().await;
+    let (db, schema) = fresh_search_db(&state).await;
+    let pool = &state.pool;
+    insert_note(pool, &db, &schema, "keep", "database database database").await;
+    insert_note(pool, &db, &schema, "drop", "database database").await;
+    insert_note(pool, &db, &schema, "keep", "database").await;
+
+    let q: Query = serde_json::from_value(serde_json::json!({
+        "table": "notes",
+        "search": {
+            "index": "search_content",
+            "query": "database",
+            "filter": {"op": "eq", "field": "title", "value": "keep"}
+        },
+        "paginate": {"numItems": 1}
+    }))
+    .expect("filtered paginated search");
+    let (drained, pages) = drain_search_pages(pool, &db, &schema, q, 10).await;
+    assert_eq!(
+        drained,
+        vec!["keep".to_string(), "keep".to_string()],
+        "only the filtered docs are paged"
+    );
+    assert_eq!(pages.len(), 2, "one doc per page, two matching docs");
+}
+
+/// An exactly-full final page carries no `nextCursor` — the extra probe row
+/// the compiler fetches is what distinguishes "full page, more to come" from
+/// "full page, that was the end".
+#[tokio::test]
+async fn search_paginate_exactly_full_last_page_has_no_cursor() {
+    let state = test_state().await;
+    let (db, schema) = fresh_search_db(&state).await;
+    let pool = &state.pool;
+    insert_note(pool, &db, &schema, "b", "database database").await;
+    insert_note(pool, &db, &schema, "a", "database").await;
+
+    let mut q = search_query("search_content", "database");
+    q.paginate =
+        Some(serde_json::from_value(serde_json::json!({"numItems": 2})).expect("paginate block"));
+    let res = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass(), false)
+        .await
+        .expect("paginated search");
+    match res {
+        QueryResult::Paginated(p) => {
+            assert_eq!(p.docs.len(), 2);
+            assert!(
+                p.next_cursor.is_none(),
+                "an exactly-full final page carries no cursor"
+            );
+        }
+        other => panic!("expected Paginated variant, got {other:?}"),
+    }
+}
+
+/// A cursor whose value count does not match the ranked terminal's three sort
+/// columns is a BadRequest, never a 500 or a silently wrong page.
+#[tokio::test]
+async fn search_paginate_rejects_a_mismatched_cursor() {
+    let state = test_state().await;
+    let (db, schema) = fresh_search_db(&state).await;
+    let pool = &state.pool;
+    insert_note(pool, &db, &schema, "a", "database").await;
+
+    // Two values where the ranked terminal sorts over three.
+    let cursor =
+        rtdb_server::pagination::encode_cursor(&[serde_json::json!(0.1), serde_json::json!("x")])
+            .expect("encode cursor");
+    let mut q = search_query("search_content", "database");
+    q.paginate = Some(
+        serde_json::from_value(serde_json::json!({"numItems": 2, "cursor": cursor}))
+            .expect("paginate block"),
+    );
+    let err = execute_query(pool, &db, &schema, &q, &PrincipalCtx::bypass(), false)
+        .await
+        .expect_err("mismatched cursor rejected");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+}

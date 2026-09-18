@@ -130,14 +130,27 @@ pub fn compile_query(
         return Ok((compile_point_read(&sctx, id)?, warnings));
     }
 
+    // The ranked terminals take `paginate` as a peer parameter exactly the way
+    // `search` already takes `take` (ENH-030): it does not change which
+    // terminal runs — `cq.terminal` stays the terminal's own name — only the
+    // row cap, the keyset resume predicate, and the result envelope.
     if let Some(vs) = &q.vector_search {
-        return Ok((compile_vector_search(&sctx, vs)?, warnings));
+        return Ok((
+            compile_vector_search(&sctx, vs, q.paginate.as_ref())?,
+            warnings,
+        ));
     }
     if let Some(hs) = &q.hybrid_search {
-        return Ok((compile_hybrid_search(&sctx, hs)?, warnings));
+        return Ok((
+            compile_hybrid_search(&sctx, hs, q.paginate.as_ref())?,
+            warnings,
+        ));
     }
     if let Some(search) = &q.search {
-        return Ok((compile_search(&sctx, search, q.take)?, warnings));
+        return Ok((
+            compile_search(&sctx, search, q.take, q.paginate.as_ref())?,
+            warnings,
+        ));
     }
 
     let w = compile_query_window(
@@ -855,11 +868,14 @@ fn compile_paginate_terminal<'a>(
                 sort_cols.len()
             )));
         }
+        // The btree scan sorts every column the same way, so the per-column
+        // `dirs` slice is that one direction repeated.
+        let dirs = vec![dir; sort_cols.len()];
         let (clause, binds) = build_cursor_conditions(
             &cursor_values,
             &sort_cols,
             &sort_col_types,
-            dir,
+            &dirs,
             cursor_start,
         )?;
         where_conditions.push(clause);
@@ -1120,10 +1136,12 @@ pub(crate) async fn execute_collect_terminal(
     Ok(QueryResult::Docs(docs))
 }
 
-/// A sort column's nature, used to type cursor binds. The sort order is always
-/// the unbound index fields (those after the `eq` prefix) followed by
-/// `created_at` then `id`.
-enum SortCol<'a> {
+/// A sort column's nature, used to type cursor binds. For the btree terminals
+/// the sort order is always the unbound index fields (those after the `eq`
+/// prefix) followed by `created_at` then `id`; the ranked terminals
+/// (`search`/`vectorSearch`/`hybridSearch`) sort by a [`SortCol::Rank`] key
+/// followed by the same two tie-breakers.
+pub(crate) enum SortCol<'a> {
     /// An unbound indexed user field — typed via its declared `FieldType`, so
     /// cursor binds reuse the same `eq_bind_for` path as `eq` prefixes.
     IndexField(&'a FieldType),
@@ -1133,6 +1151,15 @@ enum SortCol<'a> {
     CreatedAt,
     /// `id` column — stored as `text`.
     Id,
+    /// A ranked terminal's ranking key: `search`'s `ts_rank`/`similarity`
+    /// (Postgres `real`), `vectorSearch`'s metric distance, or
+    /// `hybridSearch`'s RRF fused score (both `double precision`). The cursor
+    /// value is bound as float8 and the placeholder carries an explicit
+    /// `::float8` cast, so the comparison is float8-vs-float8 for the two
+    /// double-precision keys and a lossless float4→float8 promotion for
+    /// `ts_rank` (the minted cursor value is that same promotion, so the
+    /// resume boundary is exact). ENH-030.
+    Rank,
 }
 
 impl SortCol<'_> {
@@ -1157,14 +1184,24 @@ impl SortCol<'_> {
                 })?;
                 Ok((format!("${pos}"), EqBind::Text(s.to_string())))
             }
+            SortCol::Rank => {
+                let n = value.as_f64().ok_or_else(|| {
+                    RtDbError::bad_request("cursor value for the ranking key must be a number")
+                })?;
+                Ok((format!("${pos}::float8"), EqBind::Num(n)))
+            }
         }
     }
 }
 
 /// Builds the keyset-pagination resume predicate for a cursor over `sort_cols`
-/// in direction `dir` ("ASC"/"DESC"). The cursor stores one value per sort
-/// column, in order; the predicate is the standard row-value comparison
-/// expanded to OR-of-AND:
+/// with per-column directions `dirs` (`"ASC"`/`"DESC"`, one entry per sort
+/// column). Per-column rather than one shared direction because
+/// `vectorSearch` sorts nearest-distance-first (`ASC`) but keeps the
+/// `created_at`/`id` tie-breakers `DESC` like every other ranked terminal
+/// (ENH-030); the btree `paginate` terminal passes the same direction for
+/// every column. The cursor stores one value per sort column, in order; the
+/// predicate is the standard row-value comparison expanded to OR-of-AND:
 ///
 /// ```text
 /// (c0 OP v0)
@@ -1173,19 +1210,23 @@ impl SortCol<'_> {
 ///   OR (c0 = v0 AND ... AND cN-1 = vN-1 AND cN OP vN)
 /// ```
 ///
-/// where OP is `>` (ASC) or `<` (DESC). Because `id` is always the final sort
-/// column and is globally unique, this fully determines a stable order — no
-/// row is skipped or duplicated across pages. `next_bind_idx` is the 1-based
-/// position of the first new bind. Returns the fully parenthesized predicate
-/// and the binds in placeholder order.
-fn build_cursor_conditions(
+/// where OP is `>` (ASC) or `<` (DESC) for that column. Because `id` is always
+/// the final sort column and is globally unique, this fully determines a
+/// stable order — no row is skipped or duplicated across pages. `dirs` carries
+/// one direction per sort column rather than one shared direction because
+/// `vectorSearch` sorts nearest-distance-first (`ASC`) while keeping the
+/// `created_at`/`id` tie-breakers `DESC` like every other ranked terminal
+/// (ENH-030); the btree `paginate` terminal passes the same direction for
+/// every column. `next_bind_idx` is the 1-based position of the first new
+/// bind. Returns the fully parenthesized predicate and the binds in
+/// placeholder order.
+pub(crate) fn build_cursor_conditions(
     cursor_values: &[serde_json::Value],
     sort_cols: &[String],
     sort_col_types: &[SortCol<'_>],
-    dir: &str,
+    dirs: &[&str],
     next_bind_idx: usize,
 ) -> Result<(String, Vec<EqBind>), RtDbError> {
-    let op = if dir == "DESC" { "<" } else { ">" };
     let mut binds: Vec<EqBind> = Vec::new();
     let mut branches: Vec<String> = Vec::new();
     for i in 0..sort_cols.len() {
@@ -1193,7 +1234,13 @@ fn build_cursor_conditions(
         for j in 0..=i {
             let pos = next_bind_idx + binds.len();
             let (placeholder, bind) = sort_col_types[j].cursor_bind(&cursor_values[j], pos)?;
-            let cmp = if j < i { "=" } else { op };
+            let cmp = if j < i {
+                "="
+            } else if dirs[j] == "DESC" {
+                "<"
+            } else {
+                ">"
+            };
             conjuncts.push(format!("{} {cmp} {placeholder}", sort_cols[j]));
             binds.push(bind);
         }

@@ -1,0 +1,36 @@
+{
+  "name": "search-paginate-first-page",
+  "$comment": "ENH-030: `paginate` composed with the ranked `search` terminal. Three docs all match the term, but each repeats it a different number of times, so every runner's ranking is a strict total order and the page SPLIT is deterministic without leaning on the created_at/id tie-breakers (determinism ruling 5). The server ranks by ts_rank, which is monotonic in lexeme frequency and independent of document length — measured against Postgres 17: 'task task task' 0.0827 > 'task task' 0.0760 > 'task' 0.0608. The client engines score by query-lexeme frequency, which orders the same three docs identically. numItems=2 of 3 ⇒ page one is the two highest-ranked docs and a nextCursor must be present. Seeded out of rank order so an engine that returned insertion order instead of ranked order fails loudly here. The cursor value is minted per runner and never compared — only its presence.",
+  "schema": {
+    "tables": {
+      "notes": {
+        "fields": {
+          "name": { "type": "string" },
+          "body": { "type": "string" }
+        },
+        "indexes": [
+          { "name": "search_body", "fields": ["body"], "search": true }
+        ]
+      }
+    }
+  },
+  "seed": [
+    { "name": "b", "body": "task task" },
+    { "name": "a", "body": "task" },
+    { "name": "c", "body": "task task task" }
+  ],
+  "op": {
+    "query": {
+      "table": "notes",
+      "search": { "index": "search_body", "query": "task" },
+      "paginate": { "numItems": 2 }
+    }
+  },
+  "expect": {
+    "docs": [
+      { "name": "c", "body": "task task task" },
+      { "name": "b", "body": "task task" }
+    ]
+  },
+  "expect_next_cursor": true
+}

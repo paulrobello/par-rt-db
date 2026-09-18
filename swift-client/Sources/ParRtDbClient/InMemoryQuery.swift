@@ -739,7 +739,7 @@ private func executeVectorSearchTerminal(
 ) throws -> JSONValue {
     let combined = query.index != nil || !eq.isEmpty || hasRange || query.order != nil
         || query.unique || query.first || query.count || query.distinct
-        || query.aggregate != nil || query.paginate != nil || query.filter != nil
+        || query.aggregate != nil || query.filter != nil
         || query.search != nil || query.take != nil || query.hybridSearch != nil
     if combined {
         throw RtDbError(
@@ -757,7 +757,7 @@ private func executeVectorSearchTerminal(
     if let filter = vectorSearch.filter {
         try validateFilter(filter, tableDef)
     }
-    var out: [JSONValue] = []
+    var candidates: [StoredRow] = []
     for row in rowsFor(query.table).values {
         if row.deletedAt != nil {
             continue
@@ -765,12 +765,37 @@ private func executeVectorSearchTerminal(
         if let filter = vectorSearch.filter, !evalFilterExpr(filter, row.doc, tableDef.fields) {
             continue
         }
-        out.append(.object(row.doc))
-        if out.count >= Int(vectorSearch.limit) {
-            break
-        }
+        candidates.append(row)
     }
-    return .array(out)
+
+    if let paginate = query.paginate {
+        // ENH-030: `limit` keeps its meaning — the size of the ranked candidate
+        // POOL — and `numItems` slices that pool into pages, so paging delivers
+        // the same candidates the unpaginated call returns, in instalments.
+        //
+        // Distance ordering is NOT modelled here, so the paged order is the
+        // deterministic tie-breaker order (createdAt DESC, id DESC) rather than
+        // a distance ranking. The pool is taken AFTER that sort, not before:
+        // `rowsFor` hands back a Dictionary whose iteration order varies with
+        // the per-process hash seed, so cutting the pool first would make the
+        // page CONTENTS differ run to run whenever candidates exceed `limit`.
+        candidates.sort { left, right in
+            left.createdAt != right.createdAt
+                ? left.createdAt > right.createdAt
+                : left.id > right.id
+        }
+        let pool = candidates.prefix(Int(vectorSearch.limit))
+        return try paginateRanked(
+            paginate,
+            pool.map {
+                RankedRow(
+                    sortValues: [.int($0.createdAt), .string($0.id)], doc: .object($0.doc)
+                )
+            },
+            [.createdAt, .id]
+        )
+    }
+    return .array(candidates.prefix(Int(vectorSearch.limit)).map { .object($0.doc) })
 }
 
 // swiftlint:enable function_parameter_count
@@ -783,13 +808,19 @@ private func executeHybridSearchTerminal(
 ) throws -> JSONValue {
     let combined = query.index != nil || !eq.isEmpty || hasRange || query.order != nil
         || query.unique || query.first || query.count || query.distinct
-        || query.aggregate != nil || query.paginate != nil || query.filter != nil
+        || query.aggregate != nil || query.filter != nil
         || query.search != nil || query.vectorSearch != nil || query.take != nil
     if combined {
         throw RtDbError(
             code: .badRequest,
             message: "hybridSearch cannot be combined with any other terminal"
         )
+    }
+    // ENH-030: `paginate` composes, but there is nothing to page — this engine
+    // fuses no ranking, so every page of an empty result is an empty page, and
+    // an empty page is by definition the last one (no `nextCursor`).
+    if query.paginate != nil {
+        return .object(["docs": .array([])])
     }
     return .array([])
 }
@@ -808,13 +839,13 @@ private func executeSearchTerminal(
 ) throws -> JSONValue {
     let combined = query.index != nil || !eq.isEmpty || hasRange || query.order != nil
         || query.unique || query.first || query.count || query.distinct
-        || query.aggregate != nil || query.paginate != nil || query.filter != nil
+        || query.aggregate != nil || query.filter != nil
         || query.vectorSearch != nil || query.hybridSearch != nil
     if combined {
         throw RtDbError(
             code: .badRequest,
             message: "search cannot be combined with index, eq, range bounds, order, unique, "
-                + "first, count, distinct, aggregate, paginate, filter, or vector search"
+                + "first, count, distinct, aggregate, filter, or vector search"
         )
     }
     if search.query.trimmingCharacters(in: .whitespaces).isEmpty {
@@ -920,12 +951,31 @@ private func executeSearchTerminal(
         }
         return first.row.id > second.row.id
     }
-    return .array(scored.prefix(limit).map { scored in
+    func resultDoc(_ scored: Scored) -> JSONValue {
         guard let snippetText = scored.snippet else { return mergeDoc(scored.row) }
         guard case var .object(doc) = mergeDoc(scored.row) else { return mergeDoc(scored.row) }
         doc["_searchSnippet"] = .string(snippetText)
         return .object(doc)
-    })
+    }
+    if let paginate = query.paginate {
+        // ENH-030: page the ranked order the sort above just produced — score
+        // DESC, createdAt DESC, id DESC — keyset-resuming over exactly those
+        // three columns. `take` cannot be set alongside `paginate`, so `limit`
+        // is the untouched MAX_TAKE default and the page size governs instead.
+        return try paginateRanked(
+            paginate,
+            scored.map {
+                RankedRow(
+                    sortValues: [
+                        jsonNumber($0.score), .int($0.row.createdAt), .string($0.row.id)
+                    ],
+                    doc: resultDoc($0)
+                )
+            },
+            [.rank, .createdAt, .id]
+        )
+    }
+    return .array(scored.prefix(limit).map(resultDoc))
 }
 
 // swiftlint:enable cyclomatic_complexity function_body_length function_parameter_count
@@ -1202,13 +1252,29 @@ private func isAfterCursor(
     _ sortPgs: [PgType],
     _ dir: Order
 ) -> Bool {
-    for index in sortKeys.indices {
+    isAfterCursorValues(
+        sortKeys.map { sortValue(row, $0) }, cursorValues, sortPgs, dir
+    )
+}
+
+/// `isAfterCursor` over sort-key VALUES rather than a `StoredRow` — the one
+/// implementation of the predicate. The btree path resolves a row's values
+/// through `sortValue`; a ranked terminal's leading sort column is a computed
+/// score that no stored field holds, so it passes its values in directly
+/// (ENH-030). Same comparator, same OR-of-AND shape, same direction handling.
+private func isAfterCursorValues(
+    _ rowValues: [JSONValue],
+    _ cursorValues: [JSONValue],
+    _ sortPgs: [PgType],
+    _ dir: Order
+) -> Bool {
+    for index in rowValues.indices {
         var prefixEqual = true
         for prior in 0 ..< index {
-            let cmp = compareIndexValues(
-                sortValue(row, sortKeys[prior]), cursorValues[prior], sortPgs[prior]
+            let priorCmp = compareIndexValues(
+                rowValues[prior], cursorValues[prior], sortPgs[prior]
             )
-            if cmp != 0 {
+            if priorCmp != 0 {
                 prefixEqual = false
                 break
             }
@@ -1216,10 +1282,110 @@ private func isAfterCursor(
         if !prefixEqual {
             continue
         }
-        let cmp = compareIndexValues(sortValue(row, sortKeys[index]), cursorValues[index], sortPgs[index])
+        let cmp = compareIndexValues(rowValues[index], cursorValues[index], sortPgs[index])
         if dir == .desc ? cmp < 0 : cmp > 0 {
             return true
         }
     }
     return false
+}
+
+// MARK: - Ranked-terminal pagination (ENH-030)
+
+// `paginate` composes with `search`/`vectorSearch`/`hybridSearch` as a peer
+// clause exactly the way `take` already composes with `search`: it does not
+// change WHICH terminal runs, only the row cap, the keyset resume predicate,
+// and the result envelope (`{docs, nextCursor?}` instead of a doc array).
+//
+// The btree path's `paginateResult` keys off `StoredRow` columns by name; a
+// ranked terminal sorts by a computed key first, so these twins take each
+// row's sort-key values precomputed. Everything else — the cursor codec, the
+// resume predicate, the `numItems + 1` probe — is shared.
+
+/// One sort column of a ranked terminal's cursor. The ranking key is the
+/// server's `SortCol::Rank`; `createdAt`/`id` are the tie-breakers that make
+/// the order total, which is what guarantees no row is skipped or duplicated
+/// across pages.
+private enum RankedSortCol {
+    case rank
+    case createdAt
+    case id
+
+    /// Storage type handed to `compareIndexValues` for this column.
+    var pg: PgType {
+        switch self {
+        case .rank, .createdAt: .number
+        case .id: .text
+        }
+    }
+
+    /// The server's `SortCol::cursor_bind` message for a wrongly typed value.
+    var cursorTypeMessage: String {
+        switch self {
+        case .rank: "cursor value for the ranking key must be a number"
+        case .createdAt: "cursor value for created_at must be a number"
+        case .id: "cursor value for id must be a string"
+        }
+    }
+}
+
+/// One already-ranked row prepared for `paginateRanked`: its sort-key values
+/// (in `cols` order) and the result doc to emit, snippet and all.
+private struct RankedRow {
+    var sortValues: [JSONValue]
+    var doc: JSONValue
+}
+
+/// Keyset pagination over a ranked terminal's result. `ranked` must already be
+/// sorted in that terminal's own order, which is DESC on every column
+/// (the server's ranked `ORDER BY <rank> DESC, created_at DESC, id DESC`).
+private func paginateRanked(
+    _ paginate: Paginate, _ ranked: [RankedRow], _ cols: [RankedSortCol]
+) throws -> JSONValue {
+    let numItems = min(Int(paginate.numItems), maxQueryTake)
+    let sortPgs = cols.map(\.pg)
+
+    var rows = ranked
+    if let cursor = paginate.cursor {
+        let cursorValues = try decodePaginateCursor(cursor)
+        guard cursorValues.count == cols.count else {
+            throw RtDbError(
+                code: .badRequest,
+                message: "cursor has \(cursorValues.count) value(s) but this query sorts over "
+                    + "\(cols.count) column(s)"
+            )
+        }
+        try validateRankedCursorValues(cursorValues, cols)
+        rows = ranked.filter { isAfterCursorValues($0.sortValues, cursorValues, sortPgs, .desc) }
+    }
+
+    // One past the page size so a next page is detectable (server LIMIT n+1);
+    // the probe row is discarded after the has-next check.
+    var fetched = Array(rows.prefix(numItems + 1))
+    let hasNext = fetched.count > numItems
+    if hasNext {
+        fetched.removeLast()
+    }
+    var result: [String: JSONValue] = ["docs": .array(fetched.map(\.doc))]
+    if hasNext, let last = fetched.last {
+        result["nextCursor"] = .string(encodeCursor(last.sortValues))
+    }
+    return .object(result)
+}
+
+/// Type-checks a ranked terminal's decoded cursor positionally against its
+/// sort columns — the ranked twin of `validateCursorValues` (server
+/// `SortCol::cursor_bind`), whose index-field arm has no counterpart here.
+private func validateRankedCursorValues(
+    _ cursorValues: [JSONValue], _ cols: [RankedSortCol]
+) throws {
+    for (index, col) in cols.enumerated() {
+        let ok = switch col.pg {
+        case .text: cursorValues[index].stringValue != nil
+        default: isJSONNumber(cursorValues[index])
+        }
+        if !ok {
+            throw RtDbError(code: .badRequest, message: col.cursorTypeMessage)
+        }
+    }
 }

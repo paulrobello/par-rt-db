@@ -267,7 +267,9 @@ class TableQuery:
         """Vector-similarity terminal. ``filter_`` is a ``FilterExpr`` (the same
         type ``.filter()`` and ``search`` use) that narrows vector-search results
         server-side; omitted when ``None``. The trailing underscore mirrors
-        ``search``'s ``filter_`` keyword."""
+        ``search``'s ``filter_`` keyword. Chained with ``.paginate()``
+        (ENH-030), ``limit`` keeps its meaning as the size of the ranked
+        candidate pool and ``num_items`` slices that pool into pages."""
         payload: dict[str, Any] = {"index": index, "vector": vector, "limit": limit}
         if filter_ is not None:
             payload["filter"] = filter_
@@ -288,7 +290,9 @@ class TableQuery:
         Reciprocal Rank Fusion. The table must declare BOTH a search index and a
         vector index. ``search_index``/``vector_index`` optionally name the
         indexes (auto-selected server-side when ``None``); ``k`` is the RRF
-        constant (default 60). Mutually exclusive with every other terminal."""
+        constant (default 60). Mutually exclusive with every other terminal
+        except ``paginate``, which pages the fused ranking (ENH-030); ``limit``
+        then sizes the ranked candidate pool that ``paginate`` slices."""
         payload: dict[str, Any] = {"query": query, "vector": vector, "limit": limit}
         if search_index is not None:
             payload["searchIndex"] = search_index
@@ -345,7 +349,14 @@ class TableQuery:
     def paginate(self, *, cursor: str | None = None, num_items: int) -> TableQuery:
         """``paginate`` terminal: return a page of ``num_items`` rows starting after
         the opaque ``cursor`` (``None`` for the first page). The result carries a
-        ``next_cursor`` that is ``None`` once exhausted."""
+        ``next_cursor`` that is ``None`` once exhausted.
+
+        Composes with the ranked terminals (ENH-030): chain it after
+        ``.search()``, ``.vector_search()`` or ``.hybrid_search()`` to page that
+        terminal's own ranking — the cursor walks the ranked order rather than
+        replacing it, exactly the way ``.take()`` already caps ``.search()``.
+        ``take`` and ``paginate`` remain mutually exclusive, and ``get`` still
+        excludes both."""
         self._paginate = _Paginate.model_validate({"cursor": cursor, "numItems": num_items})
         return self
 

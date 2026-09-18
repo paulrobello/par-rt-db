@@ -11,7 +11,7 @@ mirroring the server's single ``execute_query`` tail."""
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import cache, cmp_to_key
 from importlib import resources
@@ -200,6 +200,20 @@ def _project_docs(docs: list[dict[str, Any]], fields: list[str] | None) -> list[
     return out
 
 
+def _project_ranked_result(result: Any, fields: list[str] | None) -> Any:
+    """Apply a ``Query.fields`` projection to a ranked terminal's result, which
+    is a plain docs list or — when the query also carried ``paginate``
+    (ENH-030) — a ``{"docs": [...], "nextCursor"?}`` page. Mirrors the seam
+    :meth:`_QueryEngine.run_query` applies to the btree ``paginate`` branch:
+    the cursor is minted from the unprojected row inside the terminal, so a
+    projected page still paginates."""
+    if isinstance(result, dict):
+        if fields is not None:
+            result["docs"] = _project_docs(result["docs"], fields)
+        return result
+    return _project_docs(result, fields)
+
+
 @dataclass
 class _ScanPlan:
     """Everything the row scan needs besides the query itself: the resolved
@@ -368,6 +382,17 @@ def _dir_order(o: int, direction: str) -> int:
     return o if direction == "asc" else -o
 
 
+def _created_at_id_desc(a: StoredRow, b: StoredRow) -> int:
+    """``created_at`` desc, then ``id`` desc — the tie-breaker pair every ranked
+    terminal's ``ORDER BY`` ends with on the server, and the pair that makes a
+    ranked order total (``id`` is globally unique). One definition so the
+    paginated and unpaginated ranked paths cannot break ties differently."""
+    c = (a.created_at < b.created_at) - (a.created_at > b.created_at)
+    if c != 0:
+        return c
+    return (a.id < b.id) - (a.id > b.id)
+
+
 def _paginate_result(
     paginate: Any,
     table_def: TableDef,
@@ -375,7 +400,19 @@ def _paginate_result(
     sort_cols: list[tuple[str, str | None]],
     col_types: list[_PgType],
     direction: str,
+    ranks: Mapping[str, float] | None = None,
+    make_doc: Callable[[StoredRow], dict[str, Any]] = _merge_doc,
 ) -> dict[str, Any]:
+    """Keyset paging over an already-sorted row list: cap ``numItems`` to
+    ``MAX_TAKE``, drop everything at or before the cursor, cut the page, and
+    mint the next cursor from the page's LAST row only when a further row
+    survived the cut.
+
+    ``ranks`` supplies the ``"rank"`` sort column's value per row id (the
+    ranked terminals' score lives beside the row, not in its doc — ENH-030);
+    ``make_doc`` renders one page row (``search`` overrides it to attach
+    ``_searchSnippet``). Both default to the btree ``paginate`` behavior, so
+    that call site is unchanged."""
     num_items = min(int(paginate.num_items), MAX_TAKE)
     cursor_values: list[Any] | None = None
     if paginate.cursor is not None:
@@ -396,19 +433,19 @@ def _paginate_result(
         rows = [
             row
             for row in sorted_rows
-            if _is_after_cursor(row, cursor_values, sort_cols, col_types, direction)
+            if _is_after_cursor(row, cursor_values, sort_cols, col_types, direction, ranks)
         ]
     else:
         rows = sorted_rows
 
     has_next = len(rows) > num_items
     page = rows[:num_items]
-    docs = [_merge_doc(row) for row in page]
+    docs = [make_doc(row) for row in page]
 
     out: dict[str, Any] = {"docs": docs}
     if has_next and page:
         last = page[-1]
-        keyset = [_sort_value(last, col) for col in sort_cols]
+        keyset = [_sort_value(last, col, ranks) for col in sort_cols]
         out["nextCursor"] = encode_cursor(keyset)
     return out
 
@@ -427,6 +464,10 @@ def _validate_cursor_values(
                 ErrorCode.BAD_REQUEST,
                 "cursor value for created_at must be a number",
             )
+        elif kind == "rank" and not _is_number(value):
+            # ENH-030: a ranked terminal's cursor carries its score first; a
+            # non-numeric value there would otherwise reach the comparator.
+            raise RtDbError(ErrorCode.BAD_REQUEST, "cursor value for rank must be a number")
         elif kind == "id" and not isinstance(value, str):
             raise RtDbError(ErrorCode.BAD_REQUEST, "cursor value for id must be a string")
 
@@ -437,17 +478,18 @@ def _is_after_cursor(
     sort_cols: list[tuple[str, str | None]],
     col_types: list[_PgType],
     direction: str,
+    ranks: Mapping[str, float] | None = None,
 ) -> bool:
     for i in range(len(sort_cols)):
         prefix_equal = True
         for j in range(i):
-            rv = _sort_value(row, sort_cols[j])
+            rv = _sort_value(row, sort_cols[j], ranks)
             if _compare_index_values(rv, cursor_values[j], col_types[j]) != 0:
                 prefix_equal = False
                 break
         if not prefix_equal:
             continue
-        rv = _sort_value(row, sort_cols[i])
+        rv = _sort_value(row, sort_cols[i], ranks)
         c = _compare_index_values(rv, cursor_values[i], col_types[i])
         ahead = c > 0 if direction == "asc" else c < 0
         if ahead:
@@ -455,12 +497,18 @@ def _is_after_cursor(
     return False
 
 
-def _sort_value(row: StoredRow, col: tuple[str, str | None]) -> Any:
+def _sort_value(
+    row: StoredRow, col: tuple[str, str | None], ranks: Mapping[str, float] | None = None
+) -> Any:
     kind, fld = col
     if kind == "createdAt":
         return row.created_at
     if kind == "id":
         return row.id
+    if kind == "rank":
+        # ENH-030: a ranked terminal's score is computed per query, not stored
+        # on the row, so it arrives in `ranks` keyed by the row's unique id.
+        return ranks[row.id] if ranks is not None else None
     return row.doc.get(fld) if fld is not None else None
 
 
@@ -592,13 +640,59 @@ def _websearch_matches(parsed: _Websearch, words: list[str]) -> bool:
     )
 
 
+def _positive_lexemes(parsed: _Websearch) -> set[str]:
+    """Every positive lexeme of a parsed websearch query: each bare term plus
+    each phrase's words, flattened across the OR-segments. This is the query
+    tree the server's ``ts_headline`` marks AND the set :func:`_tsquery_rank`
+    counts against, so the snippet highlight and the ranked score are derived
+    from one definition and cannot drift apart."""
+    return {w for segment in parsed.segments for unit in segment for w in unit}
+
+
+def _tsquery_rank(parsed: _Websearch, words: list[str]) -> float:
+    """The ``tsquery``-mode relevance stand-in (ENH-030): how many of the doc's
+    search-text words are positive query lexemes. Pinned across the client
+    harnesses (identical to ``ts-client``'s ``executeSearchTerminal`` score and
+    the swift engine's) because ``paginate`` needs a deterministic total order
+    to split pages on, and exact ``ts_rank`` is not modeled anywhere in-memory.
+
+    It orders the same way ``ts_rank`` does on the cases that matter: both are
+    monotonic in query-lexeme frequency. Used ONLY by the paginated path — the
+    unpaginated ``search`` arm still returns matches in insertion order (see
+    :meth:`_QueryEngine._execute_tsquery_search`)."""
+    positives = _positive_lexemes(parsed)
+    return float(sum(1 for w in words if w.lower() in positives))
+
+
+def _trgm_score(search_def: IndexDef, doc: dict[str, Any], needle: str) -> float | None:
+    """The ``trgm``-mode similarity stand-in for one doc, pinned across the
+    client harnesses: over the search index's declared string fields whose
+    lowercased value contains the lowercased query, ``len(query) /
+    len(field)`` (a shorter containing field is a closer match), maxed across
+    fields — mirroring the server's ``GREATEST(similarity(...))``. ``None``
+    when no field contains the query, i.e. the doc does not match."""
+    best: float | None = None
+    for field in search_def.fields:
+        value = doc.get(field)
+        if not isinstance(value, str):
+            continue
+        text = value.lower()
+        if needle in text:
+            # An empty field cannot contain a non-empty query; keep the
+            # empty-field case to a finite 0.0 score (rust harness parity).
+            score = len(needle) / len(text) if text else 0.0
+            if best is None or score > best:
+                best = score
+    return best
+
+
 def _websearch_snippet(parsed: _Websearch, words: list[str]) -> str:
     """The ``_searchSnippet`` stand-in: a ≤35-word excerpt (the server's
     ``ts_headline`` ``MaxWords`` bound) starting at the first matched word,
     with every positive-unit word wrapped in ``<mark>...</mark>`` — phrases
     render as adjacent per-word marks, like the server. Excluded words are
     not marked (the headline renders the positive tree only)."""
-    mark = {w for segment in parsed.segments for unit in segment for w in unit}
+    mark = _positive_lexemes(parsed)
     start = next((i for i, w in enumerate(words) if w.lower() in mark), 0)
     window = words[start : start + _WEBSEARCH_SNIPPET_MAX_WORDS]
     return " ".join(f"<mark>{w}</mark>" if w.lower() in mark else w for w in window)
@@ -621,6 +715,12 @@ class _QueryEngine(_Core):
         * ``vectorSearch`` → list of merged docs narrowed by the terminal's
           optional ``filter`` (vector similarity is not modeled — every table
           row is a candidate; ``hybridSearch`` still returns an empty list).
+        * any ranked terminal ``+ paginate`` (ENH-030) → the same
+          ``{"docs": [...], "nextCursor"?: str}`` envelope the btree
+          ``paginate`` terminal returns. ``paginate`` composes with
+          ``search``/``vectorSearch``/``hybridSearch`` as a peer clause the way
+          ``take`` already composes with ``search``: it changes the row cap and
+          the result shape, never which terminal runs.
 
         ``filter`` is structurally validated once up front, then evaluated per
         row. A ``fields`` projection is validated once up front (before every
@@ -645,13 +745,17 @@ class _QueryEngine(_Core):
         _check_query_combinations(q)
 
         if q.vector_search is not None:
-            return _project_docs(
+            return _project_ranked_result(
                 self._execute_vector_search_terminal(q, table_def, eq, has_range), fields
             )
         if q.search is not None:
-            return _project_docs(self._execute_search_terminal(q, table_def, eq, has_range), fields)
+            return _project_ranked_result(
+                self._execute_search_terminal(q, table_def, eq, has_range), fields
+            )
         if q.hybrid_search is not None:
-            return _project_docs(self._execute_hybrid_search_terminal(q, eq, has_range), fields)
+            return _project_ranked_result(
+                self._execute_hybrid_search_terminal(q, eq, has_range), fields
+            )
 
         plan = _prepare_scan(q, table_def, eq, has_range)
         filtered = self._fetch_filtered_rows(q, plan, table_def.fields)
@@ -726,15 +830,18 @@ class _QueryEngine(_Core):
 
     def _execute_vector_search_terminal(
         self, q: Query, table_def: TableDef, eq: list[Any], has_range: bool
-    ) -> list[dict[str, Any]]:
+    ) -> Any:
         """``vectorSearch`` terminal.
 
         Lift of the former inline ``if q.vector_search is not None:`` arm of
         :meth:`run_query`; mirrors ``ts-client``'s ``executeVectorSearchTerminal``.
         Vector similarity is not modeled in-memory, so every table row is a
         candidate (the sound over-approximation); a declared ``filter`` narrows
-        the set via :func:`_eval_filter_expr`. The terminal's ``limit`` is not
-        applied: without ranking there is no meaningful "top N".
+        the set via :func:`_eval_filter_expr`. Without ``paginate`` the
+        terminal's ``limit`` is not applied — without ranking there is no
+        meaningful "top N". With ``paginate`` (ENH-030) ``limit`` regains its
+        server meaning as the candidate-pool size; see
+        :meth:`_execute_vector_search_paginated`.
         """
         assert q.vector_search is not None  # caller dispatches only when set
         if (
@@ -748,7 +855,6 @@ class _QueryEngine(_Core):
             or q.filter is not None
             or q.search is not None
             or q.take is not None
-            or q.paginate is not None
             or q.hybrid_search is not None
         ):
             raise RtDbError(
@@ -766,11 +872,44 @@ class _QueryEngine(_Core):
                 for row in vector_candidates
                 if _eval_filter_expr(q.vector_search.filter, row.doc, table_def.fields)
             ]
+        if q.paginate is not None:
+            return self._execute_vector_search_paginated(
+                q.paginate, table_def, vector_candidates, q.vector_search.limit
+            )
         return [_merge_doc(row) for row in vector_candidates]
+
+    def _execute_vector_search_paginated(
+        self,
+        paginate: Any,
+        table_def: TableDef,
+        candidates: list[StoredRow],
+        limit: int,
+    ) -> dict[str, Any]:
+        """``vectorSearch`` + ``paginate`` (ENH-030): keyset paging over the
+        filter-narrowed candidate set.
+
+        DISTANCE ORDERING IS NOT MODELLED. The unpaginated terminal returns
+        filter-narrowed candidates rather than metric-ranked neighbors, and
+        that stays true here — so the paged order is the deterministic
+        tie-breaker order the server applies *after* its distance key
+        (``created_at`` desc, then ``id`` desc), never a distance ranking. What
+        this path pins is the page SPLIT (non-overlapping, resumable, totally
+        ordered), not which neighbors rank first.
+
+        The terminal's ``limit`` keeps its server meaning — the size of the
+        ranked candidate POOL — and ``num_items`` slices that pool into pages.
+        The pool is cut AFTER the sort, so its membership is a property of the
+        order rather than of dict insertion order; that is what makes the pages
+        concatenate to exactly the pool.
+        """
+        pool = sorted(candidates, key=cmp_to_key(_created_at_id_desc))[:limit]
+        sort_cols: list[tuple[str, str | None]] = [("createdAt", None), ("id", None)]
+        col_types: list[_PgType] = [_NUMBER, _TEXT]
+        return _paginate_result(paginate, table_def, pool, sort_cols, col_types, "desc")
 
     def _execute_search_terminal(
         self, q: Query, table_def: TableDef, eq: list[Any], has_range: bool
-    ) -> list[dict[str, Any]]:
+    ) -> Any:
         """``search`` terminal.
 
         Lift of the former inline ``if q.search is not None:`` arm of
@@ -783,6 +922,11 @@ class _QueryEngine(_Core):
         and routes to :meth:`_execute_tsquery_search`. ``trgm`` mode (FM-30)
         matches for real — substring containment is modeled — and routes to
         :meth:`_execute_trgm_search`.
+
+        ENH-030: ``paginate`` composes here as a peer clause, the same way
+        ``take`` does, and routes both modes to
+        :meth:`_execute_search_paginated` instead. ``take`` + ``paginate``
+        remains rejected — by the shared combination table, before dispatch.
         """
         assert q.search is not None  # caller dispatches only when set
         if (
@@ -795,13 +939,12 @@ class _QueryEngine(_Core):
             or q.count
             or q.filter is not None
             or q.vector_search is not None
-            or q.paginate is not None
             or q.hybrid_search is not None
         ):
             raise RtDbError(
                 ErrorCode.BAD_REQUEST,
                 "search cannot be combined with index, eq, range bounds, order, "
-                "unique, first, count, filter, vector search, paginate, or hybrid search",
+                "unique, first, count, filter, vector search, or hybrid search",
             )
         # Shared validation prologue — mirrors the server's ``compile_search``
         # order and applies to BOTH modes: empty query text, then search-index
@@ -835,9 +978,93 @@ class _QueryEngine(_Core):
                 for row in candidates
                 if _eval_filter_expr(q.search.filter, row.doc, table_def.fields)
             ]
+        if q.paginate is not None:
+            return self._execute_search_paginated(q, table_def, search_def, candidates)
         if q.search.mode == "trgm":
             return self._execute_trgm_search(q, search_def, candidates)
         return self._execute_tsquery_search(q, search_def, candidates)
+
+    def _execute_search_paginated(
+        self,
+        q: Query,
+        table_def: TableDef,
+        search_def: IndexDef,
+        candidates: list[StoredRow],
+    ) -> dict[str, Any]:
+        """``search`` + ``paginate`` (ENH-030): keyset paging over the RANKED
+        match set, in both search modes.
+
+        The server pages the terminal's own ``ORDER BY`` — ``<rank> DESC,
+        created_at DESC, id DESC`` — so a correct page split needs a
+        deterministic TOTAL order over the matches. This engine's unpaginated
+        ``tsquery`` arm has none: it returns matches in insertion order and
+        documents ``ts_rank`` as unmodeled. The paginated path therefore scores
+        each match with the ranking stand-in pinned across the client harnesses
+        (:func:`_tsquery_rank` for ``tsquery``, :func:`_trgm_score` for
+        ``trgm`` — the same similarity the unpaginated ``trgm`` arm already
+        ranks by) and sorts by it before paging. The UNPAGINATED arms are
+        untouched.
+
+        The cursor is ``[rank, created_at, id]``, all three descending, minted
+        by :func:`_paginate_result` from the page's last row. Cursor bytes are
+        this engine's own — minted and consumed here, never compared to the
+        server's.
+        """
+        assert q.search is not None and q.paginate is not None  # dispatched only when both set
+        snippet = q.search.snippet is True
+        ranks: dict[str, float] = {}
+        snippets: dict[str, str] = {}
+        matched: list[StoredRow] = []
+        if q.search.mode == "trgm":
+            needle = q.search.query.lower()
+            for row in candidates:
+                score = _trgm_score(search_def, row.doc, needle)
+                if score is None:
+                    continue
+                ranks[row.id] = score
+                matched.append(row)
+        else:
+            parsed = _parse_websearch(q.search.query)
+            for row in candidates:
+                words = _search_field_words(search_def, row.doc)
+                if not _websearch_matches(parsed, words):
+                    continue
+                ranks[row.id] = _tsquery_rank(parsed, words)
+                if snippet:
+                    snippets[row.id] = _websearch_snippet(parsed, words)
+                matched.append(row)
+
+        def cmp(a: StoredRow, b: StoredRow) -> int:
+            c = (ranks[a.id] < ranks[b.id]) - (ranks[a.id] > ranks[b.id])
+            return c if c != 0 else _created_at_id_desc(a, b)
+
+        matched.sort(key=cmp_to_key(cmp))
+
+        def make_doc(row: StoredRow) -> dict[str, Any]:
+            doc = _merge_doc(row)
+            if snippet:
+                # The lookup is total: the shared prologue rejects
+                # `snippet` + `mode="trgm"`, so `snippet` implies the tsquery
+                # branch above, which fills `snippets` for every matched row.
+                doc["_searchSnippet"] = snippets[row.id]
+            return doc
+
+        sort_cols: list[tuple[str, str | None]] = [
+            ("rank", None),
+            ("createdAt", None),
+            ("id", None),
+        ]
+        col_types: list[_PgType] = [_NUMBER, _NUMBER, _TEXT]
+        return _paginate_result(
+            q.paginate,
+            table_def,
+            matched,
+            sort_cols,
+            col_types,
+            "desc",
+            ranks=ranks,
+            make_doc=make_doc,
+        )
 
     def _execute_tsquery_search(
         self, q: Query, search_def: IndexDef, candidates: list[StoredRow]
@@ -892,46 +1119,28 @@ class _QueryEngine(_Core):
         needle = q.search.query.lower()
         scored: list[tuple[float, StoredRow]] = []
         for row in candidates:
-            best: float | None = None
-            for field in search_def.fields:
-                value = row.doc.get(field)
-                if not isinstance(value, str):
-                    continue
-                text = value.lower()
-                if needle in text:
-                    # An empty field cannot contain a non-empty query; keep the
-                    # empty-field case to a finite 0.0 score (rust harness parity).
-                    score = len(needle) / len(text) if text else 0.0
-                    if best is None or score > best:
-                        best = score
+            best = _trgm_score(search_def, row.doc, needle)
             if best is not None:
                 scored.append((best, row))
 
         def cmp(a: tuple[float, StoredRow], b: tuple[float, StoredRow]) -> int:
             (sa, ra), (sb, rb) = a, b
             c = (sa < sb) - (sa > sb)
-            if c != 0:
-                return c
-            c = (ra.created_at < rb.created_at) - (ra.created_at > rb.created_at)
-            if c != 0:
-                return c
-            return (ra.id < rb.id) - (ra.id > rb.id)
+            return c if c != 0 else _created_at_id_desc(ra, rb)
 
         scored.sort(key=cmp_to_key(cmp))
         limit = q.take if q.take is not None else MAX_TAKE
         return [_merge_doc(row) for _score, row in scored[:limit]]
 
-    def _execute_hybrid_search_terminal(
-        self, q: Query, eq: list[Any], has_range: bool
-    ) -> list[Any]:
+    def _execute_hybrid_search_terminal(self, q: Query, eq: list[Any], has_range: bool) -> Any:
         """``hybridSearch`` terminal.
 
         Lift of the former inline ``if q.hybrid_search is not None:`` arm of
         :meth:`run_query`; mirrors ``ts-client``'s ``executeHybridSearchTerminal``.
-        Standalone like ``vectorSearch``: rejects every peer. RRF ranking is not
-        modeled in-memory, so a valid (peer-free) hybridSearch returns an empty
-        list (the sound stub — the combination guards the server enforces are
-        still exercised).
+        Standalone apart from ``paginate`` (ENH-030): it rejects every other
+        peer. RRF ranking is not modeled in-memory, so a valid hybridSearch
+        returns an empty list (the sound stub — the combination guards the
+        server enforces are still exercised).
         """
         assert q.hybrid_search is not None  # caller dispatches only when set
         if (
@@ -944,7 +1153,6 @@ class _QueryEngine(_Core):
             or q.count
             or q.distinct
             or q.aggregate is not None
-            or q.paginate is not None
             or q.filter is not None
             or q.search is not None
             or q.vector_search is not None
@@ -954,6 +1162,14 @@ class _QueryEngine(_Core):
                 ErrorCode.BAD_REQUEST,
                 "hybridSearch cannot be combined with any other terminal",
             )
+        if q.paginate is not None:
+            # ENH-030: RRF ranking is not modeled, so the unpaginated stub has
+            # no rows — a paginated hybridSearch is therefore an empty PAGE
+            # with NO `nextCursor` (there is no last row to mint one from). A
+            # supplied cursor is inert and deliberately neither decoded nor
+            # validated: the stub has nothing to resume past, and rejecting a
+            # cursor the server answers with a page would be the worse lie.
+            return {"docs": []}
         return []
 
     def _execute_count_terminal(self, filtered: list[StoredRow]) -> int:

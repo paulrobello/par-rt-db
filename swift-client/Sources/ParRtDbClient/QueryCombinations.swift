@@ -285,13 +285,6 @@ enum QueryCombinationRules {
             message: "vectorSearch cannot be combined with any other terminal"
         ),
         QueryCombinationRule(
-            id: "paginate-excludes-vectorSearch",
-            forbid: ["paginate", "vectorSearch"],
-            atMostOne: nil,
-            code: "BAD_REQUEST",
-            message: "vectorSearch cannot be combined with any other terminal"
-        ),
-        QueryCombinationRule(
             id: "filter-excludes-vectorSearch",
             forbid: ["filter", "vectorSearch"],
             atMostOne: nil,
@@ -383,13 +376,6 @@ enum QueryCombinationRules {
             message: "hybridSearch cannot be combined with any other terminal"
         ),
         QueryCombinationRule(
-            id: "hybridSearch-excludes-paginate",
-            forbid: ["hybridSearch", "paginate"],
-            atMostOne: nil,
-            code: "BAD_REQUEST",
-            message: "hybridSearch cannot be combined with any other terminal"
-        ),
-        QueryCombinationRule(
             id: "filter-excludes-hybridSearch",
             forbid: ["filter", "hybridSearch"],
             atMostOne: nil,
@@ -402,7 +388,7 @@ enum QueryCombinationRules {
             atMostOne: nil,
             code: "BAD_REQUEST",
             message: "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, "
-                + "aggregate, paginate, filter, or vector search"
+                + "aggregate, filter, or vector search"
         ),
         QueryCombinationRule(
             id: "eq-excludes-search",
@@ -410,7 +396,7 @@ enum QueryCombinationRules {
             atMostOne: nil,
             code: "BAD_REQUEST",
             message: "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, "
-                + "aggregate, paginate, filter, or vector search"
+                + "aggregate, filter, or vector search"
         ),
         QueryCombinationRule(
             id: "gt-excludes-search",
@@ -418,7 +404,7 @@ enum QueryCombinationRules {
             atMostOne: nil,
             code: "BAD_REQUEST",
             message: "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, "
-                + "aggregate, paginate, filter, or vector search"
+                + "aggregate, filter, or vector search"
         ),
         QueryCombinationRule(
             id: "gte-excludes-search",
@@ -426,7 +412,7 @@ enum QueryCombinationRules {
             atMostOne: nil,
             code: "BAD_REQUEST",
             message: "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, "
-                + "aggregate, paginate, filter, or vector search"
+                + "aggregate, filter, or vector search"
         ),
         QueryCombinationRule(
             id: "lt-excludes-search",
@@ -434,7 +420,7 @@ enum QueryCombinationRules {
             atMostOne: nil,
             code: "BAD_REQUEST",
             message: "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, "
-                + "aggregate, paginate, filter, or vector search"
+                + "aggregate, filter, or vector search"
         ),
         QueryCombinationRule(
             id: "lte-excludes-search",
@@ -442,7 +428,7 @@ enum QueryCombinationRules {
             atMostOne: nil,
             code: "BAD_REQUEST",
             message: "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, "
-                + "aggregate, paginate, filter, or vector search"
+                + "aggregate, filter, or vector search"
         ),
         QueryCombinationRule(
             id: "order-excludes-search",
@@ -450,7 +436,7 @@ enum QueryCombinationRules {
             atMostOne: nil,
             code: "BAD_REQUEST",
             message: "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, "
-                + "aggregate, paginate, filter, or vector search"
+                + "aggregate, filter, or vector search"
         ),
         QueryCombinationRule(
             id: "search-excludes-unique",
@@ -458,7 +444,7 @@ enum QueryCombinationRules {
             atMostOne: nil,
             code: "BAD_REQUEST",
             message: "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, "
-                + "aggregate, paginate, filter, or vector search"
+                + "aggregate, filter, or vector search"
         ),
         QueryCombinationRule(
             id: "first-excludes-search",
@@ -466,7 +452,7 @@ enum QueryCombinationRules {
             atMostOne: nil,
             code: "BAD_REQUEST",
             message: "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, "
-                + "aggregate, paginate, filter, or vector search"
+                + "aggregate, filter, or vector search"
         ),
         QueryCombinationRule(
             id: "count-excludes-search",
@@ -474,15 +460,7 @@ enum QueryCombinationRules {
             atMostOne: nil,
             code: "BAD_REQUEST",
             message: "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, "
-                + "aggregate, paginate, filter, or vector search"
-        ),
-        QueryCombinationRule(
-            id: "paginate-excludes-search",
-            forbid: ["paginate", "search"],
-            atMostOne: nil,
-            code: "BAD_REQUEST",
-            message: "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, "
-                + "aggregate, paginate, filter, or vector search"
+                + "aggregate, filter, or vector search"
         ),
         QueryCombinationRule(
             id: "filter-excludes-search",
@@ -490,7 +468,7 @@ enum QueryCombinationRules {
             atMostOne: nil,
             code: "BAD_REQUEST",
             message: "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, "
-                + "aggregate, paginate, filter, or vector search"
+                + "aggregate, filter, or vector search"
         )
     ]
 }

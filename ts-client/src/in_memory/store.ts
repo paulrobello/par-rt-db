@@ -2630,10 +2630,14 @@ function queryTerminal(q: QueryJson): string {
   if (q.unique) return "unique";
   if (q.distinct) return "distinct";
   if (q.aggregate !== undefined) return "aggregate";
-  if (q.paginate !== undefined) return "paginate";
+  // ENH-030: the ranked terminals outrank `paginate`, which composes with them
+  // as a peer clause rather than replacing them — the server's `cq.terminal`
+  // likewise stays `search`/`vectorSearch`/`hybridSearch` for a paginated
+  // ranked query, so these three must be tested first.
   if (q.search !== undefined) return "search";
   if (q.vectorSearch !== undefined) return "vectorSearch";
   if (q.hybridSearch !== undefined) return "hybridSearch";
+  if (q.paginate !== undefined) return "paginate";
   return "collect";
 }
 

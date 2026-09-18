@@ -1135,3 +1135,442 @@ async fn vector_search_honors_declared_metric() {
         );
     }
 }
+
+// ==== ENH-030: `paginate` composed with vectorSearch / hybridSearch =========
+
+/// Drains every page of a paginated ranked query, following `nextCursor` until
+/// it is absent, and returns the `name` of each doc per page plus the
+/// concatenation. Panics past `max_pages` — a non-terminating cursor is a bug.
+async fn drain_ranked_pages(
+    state: &std::sync::Arc<rtdb_server::AppState>,
+    db: &str,
+    schema: &SchemaDef,
+    mut q: Query,
+    ctx: &PrincipalCtx,
+    max_pages: usize,
+) -> (Vec<String>, Vec<Vec<String>>) {
+    let mut all: Vec<String> = Vec::new();
+    let mut pages: Vec<Vec<String>> = Vec::new();
+    for _ in 0..max_pages {
+        let res = execute_query(&state.pool, db, schema, &q, ctx, false)
+            .await
+            .expect("paginated ranked page");
+        let page = match res {
+            QueryResult::Paginated(p) => p,
+            other => panic!("expected Paginated variant, got {other:?}"),
+        };
+        let names: Vec<String> = page
+            .docs
+            .iter()
+            .map(|d| d["name"].as_str().expect("name string").to_string())
+            .collect();
+        all.extend(names.clone());
+        pages.push(names);
+        match page.next_cursor {
+            Some(cursor) => {
+                q.paginate.as_mut().expect("paginate block").cursor = Some(cursor);
+            }
+            None => return (all, pages),
+        }
+    }
+    panic!("cursor did not terminate within {max_pages} pages");
+}
+
+fn names_of(res: &QueryResult) -> Vec<String> {
+    match res {
+        QueryResult::Docs(docs) => docs
+            .iter()
+            .map(|d| d["name"].as_str().expect("name string").to_string())
+            .collect(),
+        other => panic!("expected Docs variant, got {other:?}"),
+    }
+}
+
+/// An owner-gated table with a filterable tag: the `vectorSearch` compile path
+/// then binds a client filter AND a per-row owner uid before the query vector,
+/// so the cursor placeholders land after a non-trivial bind prefix. A paged
+/// scan that binds those positions wrong returns the wrong rows (or a type
+/// error), never a compile error — which is exactly what this pins.
+fn owned_vector_schema_json() -> serde_json::Value {
+    serde_json::json!({"tables":{"docs":{
+        "fields":{
+            "name":{"type":"string"},
+            "tag":{"type":"string"},
+            "userId":{"type":"string"},
+            "embedding":{"type":"vector","dimensions":3}
+        },
+        "indexes":[
+            {"name":"by_embedding","fields":["embedding"],
+             "vector":{"dimensions":3,"filterFields":["tag"]}}
+        ],
+        "ownerField":"userId"
+    }}})
+}
+
+/// Paging a `vectorSearch` reconstructs the unpaginated distance ranking
+/// exactly, with the cursor placeholders numbered after the terminal's filter
+/// and owner binds.
+#[tokio::test]
+async fn vector_search_paginate_pages_reconstruct_the_unpaginated_ranking() {
+    let state = test_state().await;
+    let db = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&state.pool, &db)
+        .await
+        .expect("create database");
+    let db = crate::common::wrap_test_db(db);
+    let schema: SchemaDef =
+        serde_json::from_value(owned_vector_schema_json()).expect("parse owned vector schema");
+    push_schema(&state.pool, &db, schema.clone())
+        .await
+        .expect("push owned vector schema");
+
+    // Five `keep` docs owned by u1 at strictly increasing cosine distance from
+    // [1,0,0], plus two docs that must never surface: a different owner and a
+    // different tag.
+    let seeds: Vec<(&str, &str, &str, Vec<f64>)> = vec![
+        ("n0", "keep", "u1", vec![1.0, 0.0, 0.0]),
+        ("n1", "keep", "u1", vec![1.0, 0.1, 0.0]),
+        ("n2", "keep", "u1", vec![1.0, 0.3, 0.0]),
+        ("n3", "keep", "u1", vec![1.0, 0.6, 0.0]),
+        ("n4", "keep", "u1", vec![1.0, 1.0, 0.0]),
+        ("other-owner", "keep", "u2", vec![1.0, 0.01, 0.0]),
+        ("other-tag", "skip", "u1", vec![1.0, 0.02, 0.0]),
+    ];
+    for (name, tag, user, emb) in seeds {
+        execute_txn(
+            &state.pool,
+            &db,
+            &schema,
+            &Transaction {
+                steps: vec![Step::Insert {
+                    table: "docs".to_string(),
+                    doc: serde_json::json!({
+                        "name": name, "tag": tag, "userId": user, "embedding": emb
+                    })
+                    .as_object()
+                    .expect("doc object")
+                    .clone(),
+                }],
+            },
+            &PrincipalCtx::bypass(),
+        )
+        .await
+        .expect("insert doc");
+    }
+
+    let ctx = PrincipalCtx {
+        user_id: Some("u1".to_string()),
+        email: None,
+        tables: None,
+    };
+    let base = serde_json::json!({
+        "table": "docs",
+        "vectorSearch": {
+            "index": "by_embedding",
+            "vector": [1.0, 0.0, 0.0],
+            "limit": 5,
+            "filter": {"op": "eq", "field": "tag", "value": "keep"}
+        }
+    });
+    let unpaginated: Query = serde_json::from_value(base.clone()).expect("vectorSearch query");
+    let expected = names_of(
+        &execute_query(&state.pool, &db, &schema, &unpaginated, &ctx, false)
+            .await
+            .expect("unpaginated vectorSearch"),
+    );
+    assert_eq!(
+        expected,
+        vec!["n0", "n1", "n2", "n3", "n4"],
+        "nearest-first over the owner's `keep` docs only"
+    );
+
+    let mut paged = base;
+    paged["paginate"] = serde_json::json!({"numItems": 2});
+    let q: Query = serde_json::from_value(paged).expect("paginated vectorSearch query");
+    let (drained, pages) = drain_ranked_pages(&state, &db, &schema, q, &ctx, 10).await;
+    assert_eq!(
+        pages,
+        vec![
+            vec!["n0".to_string(), "n1".to_string()],
+            vec!["n2".to_string(), "n3".to_string()],
+            vec!["n4".to_string()],
+        ],
+        "pages are non-overlapping and nearest-first"
+    );
+    assert_eq!(
+        drained, expected,
+        "concatenated pages reconstruct the unpaginated distance ranking"
+    );
+}
+
+/// `limit` still bounds the ranked candidate pool when `paginate` is set —
+/// `numItems` only decides how that pool is sliced into pages.
+#[tokio::test]
+async fn vector_search_paginate_limit_bounds_the_candidate_pool() {
+    let state = test_state().await;
+    let db = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&state.pool, &db)
+        .await
+        .expect("create database");
+    let db = crate::common::wrap_test_db(db);
+    let schema: SchemaDef =
+        serde_json::from_value(owned_vector_schema_json()).expect("parse owned vector schema");
+    push_schema(&state.pool, &db, schema.clone())
+        .await
+        .expect("push owned vector schema");
+    for (name, emb) in [
+        ("n0", vec![1.0, 0.0, 0.0]),
+        ("n1", vec![1.0, 0.1, 0.0]),
+        ("n2", vec![1.0, 0.3, 0.0]),
+        ("n3", vec![1.0, 0.6, 0.0]),
+    ] {
+        execute_txn(
+            &state.pool,
+            &db,
+            &schema,
+            &Transaction {
+                steps: vec![Step::Insert {
+                    table: "docs".to_string(),
+                    doc: serde_json::json!({
+                        "name": name, "tag": "keep", "userId": "u1", "embedding": emb
+                    })
+                    .as_object()
+                    .expect("doc object")
+                    .clone(),
+                }],
+            },
+            &PrincipalCtx::bypass(),
+        )
+        .await
+        .expect("insert doc");
+    }
+
+    let q: Query = serde_json::from_value(serde_json::json!({
+        "table": "docs",
+        "vectorSearch": {"index": "by_embedding", "vector": [1.0, 0.0, 0.0], "limit": 3},
+        "paginate": {"numItems": 2}
+    }))
+    .expect("paginated vectorSearch query");
+    let (drained, pages) =
+        drain_ranked_pages(&state, &db, &schema, q, &PrincipalCtx::bypass(), 10).await;
+    assert_eq!(
+        drained,
+        vec!["n0".to_string(), "n1".to_string(), "n2".to_string()],
+        "the pool stops at `limit`, so n3 is never paged"
+    );
+    assert_eq!(pages.len(), 2, "3 candidates in pages of 2");
+}
+
+/// Paging a `hybridSearch` reconstructs the unpaginated RRF ranking exactly.
+#[tokio::test]
+async fn hybrid_search_paginate_pages_reconstruct_the_unpaginated_ranking() {
+    let state = test_state().await;
+    let (db, schema) = hybrid_db(&state).await;
+    for (title, body, emb) in [
+        ("h0", "database database database", vec![1.0, 0.0, 0.0]),
+        ("h1", "database database", vec![0.9, 0.1, 0.0]),
+        ("h2", "database", vec![0.5, 0.5, 0.0]),
+        ("h3", "unrelated", vec![0.2, 0.9, 0.0]),
+        ("h4", "unrelated", vec![0.0, 1.0, 0.0]),
+    ] {
+        execute_txn(
+            &state.pool,
+            &db,
+            &schema,
+            &Transaction {
+                steps: vec![Step::Insert {
+                    table: "docs".to_string(),
+                    doc: hybrid_doc(title, body, emb),
+                }],
+            },
+            &PrincipalCtx::bypass(),
+        )
+        .await
+        .expect("insert hybrid doc");
+    }
+
+    let base = serde_json::json!({
+        "table": "docs",
+        "hybridSearch": {"query": "database", "vector": [1.0, 0.0, 0.0], "limit": 5}
+    });
+    let unpaginated: Query = serde_json::from_value(base.clone()).expect("hybridSearch query");
+    let expected = match execute_query(
+        &state.pool,
+        &db,
+        &schema,
+        &unpaginated,
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .expect("unpaginated hybridSearch")
+    {
+        QueryResult::Docs(docs) => docs
+            .iter()
+            .map(|d| d["title"].as_str().expect("title").to_string())
+            .collect::<Vec<_>>(),
+        other => panic!("expected Docs variant, got {other:?}"),
+    };
+    assert_eq!(expected.len(), 5, "all five docs are RRF candidates");
+
+    let mut paged = base;
+    paged["paginate"] = serde_json::json!({"numItems": 2});
+    let mut q: Query = serde_json::from_value(paged).expect("paginated hybridSearch query");
+    let mut drained: Vec<String> = Vec::new();
+    let mut page_count = 0usize;
+    loop {
+        page_count += 1;
+        assert!(page_count <= 10, "cursor did not terminate");
+        let page = match execute_query(
+            &state.pool,
+            &db,
+            &schema,
+            &q,
+            &PrincipalCtx::bypass(),
+            false,
+        )
+        .await
+        .expect("paginated hybridSearch page")
+        {
+            QueryResult::Paginated(p) => p,
+            other => panic!("expected Paginated variant, got {other:?}"),
+        };
+        drained.extend(
+            page.docs
+                .iter()
+                .map(|d| d["title"].as_str().expect("title").to_string()),
+        );
+        match page.next_cursor {
+            Some(cursor) => q.paginate.as_mut().expect("paginate").cursor = Some(cursor),
+            None => break,
+        }
+    }
+    assert_eq!(
+        drained, expected,
+        "concatenated pages reconstruct the unpaginated RRF ranking"
+    );
+    assert_eq!(page_count, 3, "5 docs in pages of 2");
+}
+
+/// `hybridSearch` has the longest bind prefix of the three ranked terminals —
+/// text query, then the per-row auth binds, then the query vector, the RRF
+/// constant, and the candidate-pool limit, with the cursor's keyset values
+/// numbered after ALL of that. An owner-gated table makes that prefix
+/// non-empty, so an off-by-one in the placeholder arithmetic shows up as wrong
+/// rows or a bind type error rather than compiling silently.
+#[tokio::test]
+async fn hybrid_search_paginate_binds_after_the_owner_predicate() {
+    let state = test_state().await;
+    let db = format!("t{}", uuid::Uuid::now_v7().simple());
+    rtdb_server::db::create_database(&state.pool, &db)
+        .await
+        .expect("create database");
+    let db = crate::common::wrap_test_db(db);
+    let schema: SchemaDef = serde_json::from_value(serde_json::json!({"tables":{"docs":{
+        "fields":{
+            "title":{"type":"string"},
+            "body":{"type":"string"},
+            "userId":{"type":"string"},
+            "embedding":{"type":"vector","dimensions":3}
+        },
+        "indexes":[
+            {"name":"search_body","fields":["title","body"],"search":true},
+            {"name":"by_embedding","fields":["embedding"],"vector":{"dimensions":3}}
+        ],
+        "ownerField":"userId"
+    }}}))
+    .expect("parse owner-gated hybrid schema");
+    push_schema(&state.pool, &db, schema.clone())
+        .await
+        .expect("push owner-gated hybrid schema");
+
+    for (title, body, user, emb) in [
+        (
+            "h0",
+            "database database database",
+            "u1",
+            vec![1.0, 0.0, 0.0],
+        ),
+        ("h1", "database database", "u1", vec![0.9, 0.1, 0.0]),
+        ("h2", "database", "u1", vec![0.5, 0.5, 0.0]),
+        (
+            "intruder",
+            "database database database",
+            "u2",
+            vec![1.0, 0.0, 0.0],
+        ),
+    ] {
+        execute_txn(
+            &state.pool,
+            &db,
+            &schema,
+            &Transaction {
+                steps: vec![Step::Insert {
+                    table: "docs".to_string(),
+                    doc: serde_json::json!({
+                        "title": title, "body": body, "userId": user, "embedding": emb
+                    })
+                    .as_object()
+                    .expect("doc object")
+                    .clone(),
+                }],
+            },
+            &PrincipalCtx::bypass(),
+        )
+        .await
+        .expect("insert hybrid doc");
+    }
+
+    let ctx = PrincipalCtx {
+        user_id: Some("u1".to_string()),
+        email: None,
+        tables: None,
+    };
+    let base = serde_json::json!({
+        "table": "docs",
+        "hybridSearch": {"query": "database", "vector": [1.0, 0.0, 0.0], "limit": 10}
+    });
+    let unpaginated: Query = serde_json::from_value(base.clone()).expect("hybridSearch query");
+    let expected = match execute_query(&state.pool, &db, &schema, &unpaginated, &ctx, false)
+        .await
+        .expect("unpaginated owner-gated hybridSearch")
+    {
+        QueryResult::Docs(docs) => docs
+            .iter()
+            .map(|d| d["title"].as_str().expect("title").to_string())
+            .collect::<Vec<_>>(),
+        other => panic!("expected Docs variant, got {other:?}"),
+    };
+    assert_eq!(expected.len(), 3, "only u1's docs are candidates");
+    assert!(
+        !expected.contains(&"intruder".to_string()),
+        "the owner predicate excludes u2's doc"
+    );
+
+    let mut paged = base;
+    paged["paginate"] = serde_json::json!({"numItems": 1});
+    let mut q: Query = serde_json::from_value(paged).expect("paginated hybridSearch query");
+    let mut drained: Vec<String> = Vec::new();
+    for _ in 0..10 {
+        let page = match execute_query(&state.pool, &db, &schema, &q, &ctx, false)
+            .await
+            .expect("paginated owner-gated hybridSearch page")
+        {
+            QueryResult::Paginated(p) => p,
+            other => panic!("expected Paginated variant, got {other:?}"),
+        };
+        drained.extend(
+            page.docs
+                .iter()
+                .map(|d| d["title"].as_str().expect("title").to_string()),
+        );
+        match page.next_cursor {
+            Some(cursor) => q.paginate.as_mut().expect("paginate").cursor = Some(cursor),
+            None => break,
+        }
+    }
+    assert_eq!(
+        drained, expected,
+        "pages bind after the owner predicate and reconstruct the owner-scoped ranking"
+    );
+}

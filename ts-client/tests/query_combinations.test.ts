@@ -771,13 +771,15 @@ const CASES: readonly Case[] = [
     },
     expected: Outcome.Reject,
   },
+  // ENH-030: `paginate` composes with every ranked terminal — the cursor
+  // pages the terminal's own ranking instead of replacing it.
   {
     name: "vectorSearch+paginate",
     build: (q) => {
       q.vectorSearch = vectorEmbeddingLimit1();
       q.paginate = paginateNum1();
     },
-    expected: Outcome.Reject,
+    expected: Outcome.Accept,
   },
   {
     name: "vectorSearch+filter",
@@ -892,13 +894,14 @@ const CASES: readonly Case[] = [
     },
     expected: Outcome.Reject,
   },
+  // ENH-030: see the `vectorSearch+paginate` note above.
   {
     name: "search+paginate",
     build: (q) => {
       q.search = searchBodyX();
       q.paginate = paginateNum1();
     },
-    expected: Outcome.Reject,
+    expected: Outcome.Accept,
   },
   {
     name: "search+filter",
@@ -1021,13 +1024,14 @@ const CASES: readonly Case[] = [
     },
     expected: Outcome.Reject,
   },
+  // ENH-030: see the `vectorSearch+paginate` note above.
   {
     name: "hybridSearch+paginate",
     build: (q) => {
       q.hybridSearch = hybridQueryDatabaseX();
       q.paginate = paginateNum1();
     },
-    expected: Outcome.Reject,
+    expected: Outcome.Accept,
   },
   {
     name: "hybridSearch+filter",

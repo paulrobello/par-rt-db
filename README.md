@@ -498,7 +498,10 @@ mirrored as the HTTP `Retry-After` header); every other code omits it:
 
 `{"table": "<name>", "get"?, "index"?, "eq"?, "order"?, "take"?, "unique"?, "first"?,
 "count"?, "filter"?, "search"?, "vectorSearch"?, "hybridSearch"?, "paginate"?, "distinct"?, "aggregate"?, "fields"?}`
-— exactly one terminal per query (terminals are mutually exclusive). See
+— exactly one terminal per query (terminals are mutually exclusive), except
+that `paginate` pages a ranked terminal rather than replacing it, so it may
+accompany `search`/`vectorSearch`/`hybridSearch` (see
+[Pagination](#pagination)). See
 `server/src/query/` for full semantics: index prefix binds, range predicates
 (`gt`/`gte`/`lt`/`lte`) follow the `eq` prefix, `order: "asc"|"desc"`, `take`
 capped at 4096, `unique` de-duplicates on the indexed fields, `count` is an
@@ -638,16 +641,62 @@ curl -s -X POST http://localhost:8300/api/query \
 
 ## Pagination
 
-Keyset pagination over an index is supported via the `paginate` query terminal. A
-page request carries an opaque cursor (omitted for the first page) and a page
-size; the response is `{docs, nextCursor}`, where `nextCursor` is omitted when
-there is no next page. The cursor encodes the sort-column values of the last row on the
-page, so the server resumes strictly *after* it — stable under concurrent
-inserts/deletes unlike offset pagination.
+Keyset pagination is supported via the `paginate` query terminal, over an index
+scan or over any of the ranked terminals. A page request carries an opaque
+cursor (omitted for the first page) and a page size; the response is
+`{docs, nextCursor}`, where `nextCursor` is omitted when there is no next page.
+The cursor encodes the sort-column values of the last row on the page, so the
+server resumes strictly *after* it — stable under concurrent inserts/deletes
+unlike offset pagination.
 
-The `paginate` terminal composes with `index`, `eq`, range bounds (`gt`/`gte`/
-`lt`/`lte`), and `order`, and is mutually exclusive with `get`, `take`, `unique`,
-`first`, and `count`. `numItems` is capped at 4096 (`MAX_TAKE`).
+`paginate` composes with `index`, `eq`, range bounds (`gt`/`gte`/`lt`/`lte`),
+and `order`, and is mutually exclusive with `get`, `take`, `unique`, `first`,
+and `count`. `numItems` is capped at 4096 (`MAX_TAKE`).
+
+### Paginating a ranked terminal
+
+`paginate` also composes with `search`, `vectorSearch`, and `hybridSearch`.
+(Before ENH-030 the combination was rejected outright: the ranked terminals
+return early from query compilation and never reached the paginated scan, so
+there was no way to page a relevance-ranked result at all.) It composes the way
+`take` already composes with `search` — it does not change which terminal runs,
+only how many rows come back and whether the result is a page envelope. The
+keyset runs over the terminal's own ranking key plus the `created_at`/`id`
+tie-breakers that make the order total, so pages are non-overlapping and their
+concatenation is exactly the unpaginated ranking:
+
+| Terminal | Ranking key | Page order |
+| --- | --- | --- |
+| `search` | `ts_rank` (or `similarity` in `trgm` mode) | relevance desc |
+| `vectorSearch` | the index's metric distance | nearest first |
+| `hybridSearch` | the RRF fused score | score desc |
+
+For `vectorSearch` and `hybridSearch` the terminal's own `limit` keeps its
+meaning — the size of the ranked candidate pool — and `numItems` slices that
+pool into pages, so paging delivers the same top-`limit` results the
+unpaginated call returns, in instalments. `search` has no `limit` of its own
+(`take` is mutually exclusive with `paginate`), so a paged search walks the
+whole match set.
+
+```jsonc
+// First page of a relevance-ranked search
+{"table": "notes", "search": {"index": "search_body", "query": "postgres"},
+ "paginate": {"numItems": 20}}
+
+// Next page — feed the returned nextCursor back in
+{"table": "notes", "search": {"index": "search_body", "query": "postgres"},
+ "paginate": {"cursor": "<opaque-cursor>", "numItems": 20}}
+
+// Top 100 nearest neighbours, 20 at a time
+{"table": "docs", "vectorSearch": {"index": "by_embedding", "vector": [/* … */], "limit": 100},
+ "paginate": {"numItems": 20}}
+```
+
+A paginated `vectorSearch` adds `created_at`/`id` tie-breakers to the page
+ordering, which the unpaginated form does not have — without a total order a
+distance tie makes "resume after this row" ambiguous. They are applied only to
+the already-materialized candidate pool, so the unpaginated query's plan (and
+its use of the HNSW index) is unchanged.
 
 ### Pagination query shape
 

@@ -28,7 +28,10 @@ use tracing::Instrument;
 use crate::auth::PrincipalCtx;
 use crate::error::RtDbError;
 use crate::schema::{SchemaDef, SchemaDefExt, TableDef};
-use search::{SearchCtx, execute_hybrid_search, execute_search, execute_vector_search};
+use search::{
+    SearchCtx, execute_hybrid_search, execute_ranked_paginated, execute_search,
+    execute_vector_search,
+};
 use terminals::{
     PaginateExecCtx, compile_query_window, execute_aggregate_terminal, execute_collect_terminal,
     execute_count_terminal, execute_distinct_terminal, execute_paginate_terminal, point_read,
@@ -310,6 +313,14 @@ pub fn diff_canonical(result: &QueryResult, q: &Query) -> String {
     canonical(&stripped)
 }
 
+/// The page size for a ranked terminal (`search`/`vectorSearch`/
+/// `hybridSearch`) composed with `paginate`, or `None` when the query carries
+/// no `paginate` block. Capped to `MAX_TAKE` exactly as the compile side caps
+/// it, so the executor's has-next probe matches the `LIMIT` that was compiled.
+fn ranked_page_size(q: &Query) -> Option<u32> {
+    q.paginate.as_ref().map(|p| p.num_items.min(MAX_TAKE))
+}
+
 pub async fn execute_query(
     pool: &PgPool,
     db: &str,
@@ -359,10 +370,23 @@ pub async fn execute_query(
             // arm below uses.
             "search" => {
                 let snippet = q.search.as_ref().is_some_and(|s| s.snippet == Some(true));
-                execute_search(cq, pool, snippet).await
+                // ENH-030: `paginate` composes with the ranked terminals as a
+                // peer clause, so the terminal tag is unchanged and the page
+                // size is re-derived here — the same re-derive `snippet` above
+                // and the `paginate` arm below already use.
+                match ranked_page_size(q) {
+                    Some(num_items) => execute_ranked_paginated(cq, pool, num_items, snippet).await,
+                    None => execute_search(cq, pool, snippet).await,
+                }
             }
-            "vectorSearch" => execute_vector_search(cq, pool).await,
-            "hybridSearch" => execute_hybrid_search(cq, pool).await,
+            "vectorSearch" => match ranked_page_size(q) {
+                Some(num_items) => execute_ranked_paginated(cq, pool, num_items, false).await,
+                None => execute_vector_search(cq, pool).await,
+            },
+            "hybridSearch" => match ranked_page_size(q) {
+                Some(num_items) => execute_ranked_paginated(cq, pool, num_items, false).await,
+                None => execute_hybrid_search(cq, pool).await,
+            },
             "count" => execute_count_terminal(cq, pool).await,
             "distinct" => execute_distinct_terminal(cq, pool).await,
             "aggregate" => execute_aggregate_terminal(cq, pool).await,

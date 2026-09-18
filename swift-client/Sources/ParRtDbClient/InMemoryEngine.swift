@@ -2383,9 +2383,12 @@ func queryTerminal(_ query: Query) -> String {
     if query.aggregate != nil {
         return "aggregate"
     }
-    if query.paginate != nil {
-        return "paginate"
-    }
+    // ENH-030: the ranked terminals are checked BEFORE `paginate` — mirroring
+    // server `Query::terminal_name` — because `paginate` now composes with all
+    // three, and the server reports the ranked terminal's own name for such a
+    // query. (The payload-shape discriminator in `HttpClient` deliberately
+    // stays paginate-first: a ranked+paginate result IS the paginated
+    // envelope.)
     if query.search != nil {
         return "search"
     }
@@ -2394,6 +2397,9 @@ func queryTerminal(_ query: Query) -> String {
     }
     if query.hybridSearch != nil {
         return "hybridSearch"
+    }
+    if query.paginate != nil {
+        return "paginate"
     }
     return "collect"
 }

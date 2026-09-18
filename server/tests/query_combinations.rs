@@ -582,10 +582,12 @@ const CASES: &[Case] = &[
         build: vs_count,
         expected: Outcome::Reject,
     },
+    // ENH-030: `paginate` composes with every ranked terminal — the cursor
+    // pages the terminal's own ranking instead of replacing it.
     Case {
         name: "vectorSearch+paginate",
         build: vs_paginate,
-        expected: Outcome::Reject,
+        expected: Outcome::Accept,
     },
     Case {
         name: "vectorSearch+filter",
@@ -658,10 +660,11 @@ const CASES: &[Case] = &[
         build: sr_count,
         expected: Outcome::Reject,
     },
+    // ENH-030: see the `vectorSearch+paginate` note above.
     Case {
         name: "search+paginate",
         build: sr_paginate,
-        expected: Outcome::Reject,
+        expected: Outcome::Accept,
     },
     Case {
         name: "search+filter",
@@ -741,10 +744,11 @@ const CASES: &[Case] = &[
         build: hs_aggregate,
         expected: Outcome::Reject,
     },
+    // ENH-030: see the `vectorSearch+paginate` note above.
     Case {
         name: "hybridSearch+paginate",
         build: hs_paginate,
-        expected: Outcome::Reject,
+        expected: Outcome::Accept,
     },
     Case {
         name: "hybridSearch+filter",

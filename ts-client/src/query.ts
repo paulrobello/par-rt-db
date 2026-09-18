@@ -78,9 +78,12 @@ export class TableQuery<DocT, Indexes extends string> {
     return new TableQuery({ ...this.json, fields: names });
   }
 
-  /** Full-text `search` over a declared search index. Composes only with `take`
-   * (e.g. `.search("idx", "text").take(10)`); the server rejects every other
-   * terminal alongside it. The optional `filter` narrows results server-side via
+  /** Full-text `search` over a declared search index. Composes with `take`
+   * (e.g. `.search("idx", "text").take(10)`) and, since ENH-030, with
+   * `paginate` (`.search("idx", "text").paginate(cursor, 20)`), which pages the
+   * same relevance ranking and returns a `PaginatedResultJson` envelope instead
+   * of a doc array; `take` and `paginate` stay mutually exclusive. The server
+   * rejects every other terminal alongside it. The optional `filter` narrows results server-side via
    * the full `FilterExpr` DSL (not to be confused with the query-level
    * `.filter()` builder, which is mutually exclusive with `search`); the
    * optional `mode` selects the match strategy — `tsquery` (default, word/stem
@@ -107,8 +110,12 @@ export class TableQuery<DocT, Indexes extends string> {
    * ranks by the index's distance metric and applies `limit`; the optional
    * `filter` narrows results server-side via the full `FilterExpr` DSL (not to
    * be confused with the query-level `.filter()` builder); omitted on the wire
-   * when absent so existing requests stay byte-identical. Terminal — the server
-   * rejects other terminals alongside it. */
+   * when absent so existing requests stay byte-identical. The server rejects
+   * other terminals alongside it, with one exception: since ENH-030 `paginate`
+   * composes as a peer clause. `limit` then keeps its meaning as the size of
+   * the ranked candidate POOL and `paginate`'s `numItems` slices that pool into
+   * pages, so the result is a `PaginatedResultJson` envelope over the same
+   * top-`limit` neighbors the unpaginated call returns. */
   vectorSearch(
     index: string,
     vector: number[],
@@ -127,7 +134,11 @@ export class TableQuery<DocT, Indexes extends string> {
    * same table via Reciprocal Rank Fusion. The table must declare BOTH a search
    * index and a vector index. `opts.searchIndex`/`opts.vectorIndex` optionally
    * name the indexes (auto-selected when omitted); `opts.k` is the RRF constant
-   * (default 60). Terminal — the server rejects other terminals alongside it. */
+   * (default 60). The server rejects other terminals alongside it, with one
+   * exception: since ENH-030 `paginate` composes as a peer clause. `limit` then
+   * keeps its meaning as the size of the fused candidate POOL and `paginate`'s
+   * `numItems` slices that pool into pages, so the result is a
+   * `PaginatedResultJson` envelope over the same top-`limit` fused hits. */
   hybridSearch(
     query: string,
     vector: number[],
@@ -199,7 +210,9 @@ export class TableQuery<DocT, Indexes extends string> {
   /** Terminal: cursor-based pagination. `cursor` is the opaque cursor from
    * a prior page (`undefined`/empty starts from the beginning); `numItems`
    * caps the page size. Use `decodeCursor`/`encodeCursor` to inspect or
-   * construct cursors. */
+   * construct cursors. Since ENH-030 this also composes as a peer clause with
+   * the ranked terminals `search`/`vectorSearch`/`hybridSearch`, paging their
+   * own ranking rather than replacing it. */
   paginate(cursor: string | undefined, numItems: number): RtQuery<PaginatedResultJson> {
     // ARC-133: Paginate.cursor is `?:`-optional, so include it only when set
     // (exactOptionalPropertyTypes forbids literal `undefined`). `cursor || ""`
