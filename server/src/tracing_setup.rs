@@ -14,7 +14,7 @@
 //! down the tracer provider on SIGTERM (a docker `compose down` otherwise drops
 //! the last in-flight batch).
 
-use crate::config::Config;
+use crate::config::{Config, LogFormat};
 
 /// Initializes the global tracing subscriber. Returns a guard whose `Drop`
 /// flushes the OTLP exporter and shuts the provider down so the last batch of
@@ -37,11 +37,15 @@ pub fn init(config: &Config) -> Option<OtelGuard> {
         }
     }
     // Default path (feature off, or feature on but RTDB_OTEL_ENABLED=false):
-    // stdout-only, byte-compatible with pre-ENH-018 behavior. The `config` arg
-    // is used only on the otel path above; reference it so the off-build does
-    // not warn under `-D warnings`.
-    let _ = config;
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    // stdout-only, byte-compatible with pre-ENH-018 behavior in the default
+    // `text` log format.
+    match config.log_format {
+        LogFormat::Text => tracing_subscriber::fmt().with_env_filter(env_filter).init(),
+        LogFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter)
+            .init(),
+    }
     None
 }
 
@@ -90,7 +94,13 @@ fn install_otel(config: &Config, env_filter: tracing_subscriber::EnvFilter) -> O
                 endpoint = %config.otel_endpoint,
                 "failed to build OTLP exporter; falling back to stdout-only tracing"
             );
-            tracing_subscriber::fmt().with_env_filter(env_filter).init();
+            match config.log_format {
+                LogFormat::Text => tracing_subscriber::fmt().with_env_filter(env_filter).init(),
+                LogFormat::Json => tracing_subscriber::fmt()
+                    .json()
+                    .with_env_filter(env_filter)
+                    .init(),
+            }
             return None;
         }
     };
@@ -119,11 +129,22 @@ fn install_otel(config: &Config, env_filter: tracing_subscriber::EnvFilter) -> O
     let tracer = global::tracer("par-rt-db");
     let otel_layer = OpenTelemetryLayer::new(tracer);
 
-    let registry = tracing_subscriber::registry()
-        .with(env_filter)
-        .with(otel_layer)
-        .with(tracing_subscriber::fmt::layer());
-    if registry.try_init().is_err() {
+    // The `text` and `json` fmt layers are distinct concrete types, so the
+    // registry is assembled once per format inside the match; both arms
+    // unify on `try_init`'s `Result<(), TryInitError>`.
+    let install_result = match config.log_format {
+        LogFormat::Text => tracing_subscriber::registry()
+            .with(env_filter)
+            .with(otel_layer)
+            .with(tracing_subscriber::fmt::layer())
+            .try_init(),
+        LogFormat::Json => tracing_subscriber::registry()
+            .with(env_filter)
+            .with(otel_layer)
+            .with(tracing_subscriber::fmt::layer().json())
+            .try_init(),
+    };
+    if install_result.is_err() {
         // A global subscriber is already installed (e.g. a test harness).
         // Keep the provider around so the guard still shuts it down cleanly.
         tracing::warn!("global tracing subscriber already set; OTLP layer not installed");

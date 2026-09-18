@@ -407,6 +407,7 @@ mod tests {
                 forward_timeout_ms: 5000,
                 forward_concurrency: 64,
             },
+            ..Default::default()
         };
         assert!(GithubProvider::from_config(&cfg).is_none());
         cfg.oauth.github.client_id = Some("id".into());

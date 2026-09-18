@@ -311,6 +311,7 @@ mod tests {
                 forward_timeout_ms: 5000,
                 forward_concurrency: 64,
             },
+            ..Default::default()
         };
         assert!(GoogleProvider::from_config(&cfg).is_none());
         cfg.oauth.google.client_id = Some("id".into());

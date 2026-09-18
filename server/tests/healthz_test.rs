@@ -79,6 +79,7 @@ fn test_config() -> Config {
         },
         database_url: std::env::var("RTDB_TEST_DATABASE_URL")
             .unwrap_or_else(|_| "postgres://rtdb:rtdb@127.0.0.1:55434/rtdb".into()),
+        ..Default::default()
     }
 }
 

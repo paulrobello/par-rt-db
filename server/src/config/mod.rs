@@ -38,6 +38,16 @@ pub(crate) const MIN_ADMIN_KEY_LEN: usize = 16;
 /// (pre-empts ARC-118).
 pub(crate) const DEFAULT_SUBS_VERIFY_SKIP_EVERY: u64 = 1000;
 
+/// Stdout log output format (RTDB_LOG_FORMAT). `Text` is the default human
+/// formatter, byte-identical to the historical output; `Json` emits one JSON
+/// object per line so container log pipelines (Loki/Datadog) ingest stdout
+/// without regex parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFormat {
+    Text,
+    Json,
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub port: u16,            // RTDB_PORT, default 8300
@@ -237,6 +247,14 @@ pub struct Config {
     /// A malformed value fails boot (ARC-118 via `env_parsed`) rather than
     /// silently defaulting.
     pub otel_sample_ratio: f64,
+    // ---- Log output format ----
+    // Boot-only. `text` (default) keeps stdout byte-identical to the
+    // historical human formatter; `json` makes every stdout log line a
+    // single JSON object so container log pipelines (Loki/Datadog) ingest
+    // it without regex parsing. Applies to the stdout formatter on the
+    // default path and to the fmt layer composed under the otel path.
+    /// RTDB_LOG_FORMAT (default `text`). `text` | `json`.
+    pub log_format: LogFormat,
     // ---- Cross-instance op-feed fan-out (ENH-022 Stage 2) ----
     // Boot-only. See `config::multi_instance` for each knob's field doc.
     pub multi_instance: MultiInstanceConfig,
@@ -298,6 +316,7 @@ impl Default for Config {
             otel_endpoint: "http://127.0.0.1:4317".to_string(),
             otel_service_name: "par-rt-db".to_string(),
             otel_sample_ratio: 0.05,
+            log_format: LogFormat::Text,
             multi_instance: MultiInstanceConfig::default(),
         }
     }
@@ -603,6 +622,23 @@ impl Config {
 
         let otel = OtelEnv::from_env()?;
 
+        // Boot-only stdout log format. `text` (default) keeps the historical
+        // human formatter; `json` emits one JSON object per line. Present-but-
+        // unrecognized fails boot (ARC-118 posture): an operator who asked for
+        // json and silently got text would debug the wrong pipeline.
+        let log_format = match std::env::var("RTDB_LOG_FORMAT") {
+            Ok(v) if !v.trim().is_empty() => match v.trim().to_ascii_lowercase().as_str() {
+                "text" => LogFormat::Text,
+                "json" => LogFormat::Json,
+                other => {
+                    return Err(format!(
+                        "RTDB_LOG_FORMAT: unrecognized value {other:?} (expected \"text\" or \"json\")"
+                    ));
+                }
+            },
+            _ => LogFormat::Text,
+        };
+
         // ENH-022 Stage 2: cross-instance op-feed fan-out. Off by default — a
         // single-instance deploy is the supported topology.
         let multi_instance = MultiInstanceConfig::from_env()?;
@@ -651,6 +687,7 @@ impl Config {
             otel_endpoint: otel.endpoint,
             otel_service_name: otel.service_name,
             otel_sample_ratio: otel.sample_ratio,
+            log_format,
             multi_instance,
         })
     }
@@ -923,6 +960,59 @@ mod tests {
         assert!(validate_admin_key("my-admin-key-is-strong-0123").is_ok());
         // Contains "secret" but is long and not an exact match.
         assert!(validate_admin_key("a1b2c3secretd4e5f6a1b2").is_ok());
+    }
+
+    /// RTDB_LOG_FORMAT: defaults to `text` when unset, honors case-insensitive
+    /// `text`/`json`, and an unrecognized value fails boot naming the var
+    /// (ARC-118 posture — a silent text fallback would leave an operator who
+    /// asked for json debugging the wrong pipeline). Mirrors the
+    /// `otel_env_defaults_and_overrides` env-mutation pattern.
+    #[test]
+    #[serial_test::serial]
+    fn log_format_env_defaults_and_overrides() {
+        unsafe {
+            let saved_db = std::env::var("RTDB_DATABASE_URL").ok();
+            let saved_key = std::env::var("RTDB_ADMIN_KEY").ok();
+            std::env::set_var("RTDB_DATABASE_URL", "postgres://test");
+            std::env::set_var("RTDB_ADMIN_KEY", "test-admin-key-0123");
+
+            // Unset: text (the historical formatter).
+            std::env::remove_var("RTDB_LOG_FORMAT");
+            let c = Config::from_env().expect("from_env with required vars set");
+            assert_eq!(c.log_format, LogFormat::Text, "unset defaults to text");
+
+            // Both spellings, case-insensitive.
+            for (value, expected) in [
+                ("text", LogFormat::Text),
+                ("TEXT", LogFormat::Text),
+                ("json", LogFormat::Json),
+                ("JSON", LogFormat::Json),
+            ] {
+                std::env::set_var("RTDB_LOG_FORMAT", value);
+                let c = Config::from_env().expect("from_env with required vars set");
+                assert_eq!(c.log_format, expected, "value {value:?}");
+            }
+
+            // ARC-118: present-but-unrecognized fails boot naming the var.
+            std::env::set_var("RTDB_LOG_FORMAT", "logfmt");
+            let err =
+                Config::from_env().expect_err("unrecognized format must fail boot, not default");
+            assert!(
+                err.contains("RTDB_LOG_FORMAT"),
+                "error names the var: {err}"
+            );
+            std::env::remove_var("RTDB_LOG_FORMAT");
+
+            // Restore the required vars' original state.
+            match saved_db {
+                Some(v) => std::env::set_var("RTDB_DATABASE_URL", v),
+                None => std::env::remove_var("RTDB_DATABASE_URL"),
+            }
+            match saved_key {
+                Some(v) => std::env::set_var("RTDB_ADMIN_KEY", v),
+                None => std::env::remove_var("RTDB_ADMIN_KEY"),
+            }
+        }
     }
 
     /// ENH-018: the four `RTDB_OTEL_*` boot knobs — defaults when unset, env
