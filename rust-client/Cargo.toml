@@ -81,6 +81,13 @@ required-features = ["admin"]
 name = "ws_integration"
 required-features = ["ws", "http"]
 
+# In-process mock-server liveness test (no live server needed): the heartbeat
+# is answered with app-level pongs only, and the session must survive past
+# 2 × heartbeat.
+[[test]]
+name = "ws_liveness"
+required-features = ["ws"]
+
 [[test]]
 name = "http_integration"
 required-features = ["admin", "http"]

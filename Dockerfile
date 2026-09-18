@@ -52,6 +52,7 @@ RUN mkdir -p server/src server/benches rust-client/src rust-client/tests rust-cl
     && touch rust-client/tests/golden_vector.rs rust-client/tests/query_combinations.rs \
               rust-client/tests/semantics_corpus.rs rust-client/tests/hot_config_test.rs \
               rust-client/tests/ws_integration.rs rust-client/tests/http_integration.rs \
+              rust-client/tests/ws_liveness.rs \
               rust-client/benches/in_memory.rs \
               server/benches/compile_query.rs server/benches/value_expr.rs \
               server/benches/validate_doc.rs server/benches/migrate_validate.rs \

@@ -1440,7 +1440,14 @@ async fn run_session(
             incoming = stream.next() => match incoming {
                 Some(Ok(WsMessage::Text(t))) => {
                     if let Ok(msg) = serde_json::from_str::<ServerMessage>(t.as_str()) {
-                        apply_server_message(&driver.inner, msg, queues);
+                        match msg {
+                            // The heartbeat is an app-level `{type:"ping"}` TEXT
+                            // frame answered by `{type:"pong"}`; neither side
+                            // sends protocol-level pings, so this is the only
+                            // path that refreshes `Liveness` on a healthy link.
+                            ServerMessage::Pong => liveness.note_pong(),
+                            msg => apply_server_message(&driver.inner, msg, queues),
+                        }
                     }
                 }
                 Some(Ok(WsMessage::Ping(p))) => {
