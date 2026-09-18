@@ -11,13 +11,6 @@ repository = "https://github.com/paulrobello/par-rt-db"
 name = "rtdb"
 path = "src/main.rs"
 
-# ARC-131: tokio powers `#[tokio::main]` + the async `RtDbHttpClient`. Default-on
-# `runtime` feature preserves the shipped behavior; disabling it lets a downstream
-# that brings its own executor drop the dep.
-[features]
-default = ["runtime"]
-runtime = ["dep:tokio"]
-
 [dependencies]
 # `ws` powers `rtdb watch` (the reactive subscribe); `signal` powers its
 # Ctrl-C arm. Both are declared here rather than leaned on via workspace
@@ -28,7 +21,7 @@ tokio = { workspace = true, features = [
     "macros",
     "rt-multi-thread",
     "signal",
-], optional = true }
+] }
 serde_json.workspace = true
 anyhow.workspace = true
 
@@ -40,7 +33,7 @@ predicates = "3"
 # The `ops watch` reconnect tests stand up an in-process WebSocket server, so
 # the tail is exercised across a dropped connection without a live par-rt-db.
 # `net`/`io-util` are declared here rather than leaned on via feature
-# unification with tokio-tungstenite, matching the `runtime` feature note above.
+# unification with tokio-tungstenite.
 tokio = { workspace = true, features = ["net", "io-util"] }
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
