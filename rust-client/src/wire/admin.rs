@@ -402,6 +402,39 @@ pub struct MetricsSnapshot {
     /// that omits it still deserializes to an empty vec.
     #[serde(default)]
     pub per_db_subs: Vec<DbSubCounters>,
+    /// Per-room presence inspector rows (`presenceDetail` on the wire).
+    /// `#[serde(default)]` so an older server that omits it still
+    /// deserializes to an empty vec.
+    #[serde(default)]
+    pub presence_detail: Vec<PresenceRoomInspect>,
+}
+
+/// One room's live footprint — the rows of `GET /admin/presence` and
+/// `presenceDetail` on `/admin/metrics`. Presence is in-memory per replica,
+/// so multi-instance replicas report their own rooms.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PresenceRoomInspect {
+    /// Room name.
+    pub room: String,
+    /// Live members in the room.
+    pub member_count: i64,
+    /// Sum of serialized `presenceState` blob sizes across the room's members.
+    pub state_bytes: i64,
+    /// Age of the oldest member's join, in ms (a re-join refreshes it).
+    pub oldest_member_age_ms: i64,
+}
+
+/// `GET /admin/presence` response — per-replica live room inspector.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PresenceRoomsResponse {
+    /// One row per room with at least one live member; empty when this
+    /// replica has no live presence.
+    #[serde(default)]
+    pub rooms: Vec<PresenceRoomInspect>,
 }
 
 /// Subscriber identity for [`SubscriptionInfo`]. The server emits `null`

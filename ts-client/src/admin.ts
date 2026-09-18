@@ -227,6 +227,26 @@ export interface MetricsSnapshot {
   /** Per-db rollup of the subscription counters above, when the server
    *  includes it on `/admin/metrics`. Absent on older server builds. */
   perDbSubs?: DbSubCounters[];
+  /** Per-room presence inspector rows, when the server includes them on
+   *  `/admin/metrics`. Absent on older server builds. */
+  presenceDetail?: PresenceRoomInspect[];
+}
+/**
+ * One room's live footprint — the rows of `GET /admin/presence` and
+ * `presenceDetail` on `/admin/metrics`. Presence is in-memory per replica,
+ * so multi-instance replicas report their own rooms.
+ */
+export interface PresenceRoomInspect {
+  room: string;
+  memberCount: number;
+  stateBytes: number;
+  oldestMemberAgeMs: number;
+}
+/**
+ * `GET /admin/presence` response — per-replica live room inspector.
+ */
+export interface PresenceRoomsResponse {
+  rooms: PresenceRoomInspect[];
 }
 /**
  * Represents the runtime configuration variables that can be hot-patched on the server.
@@ -844,6 +864,10 @@ export class RtDbAdminClient {
   /** Server metrics snapshot (GET /admin/metrics). */
   async metrics(): Promise<MetricsSnapshot> {
     return (await this.request("GET", "/admin/metrics")) as MetricsSnapshot;
+  }
+  /** Live per-room presence inspector (GET /admin/presence). */
+  async presenceRooms(): Promise<PresenceRoomsResponse> {
+    return (await this.request("GET", "/admin/presence")) as PresenceRoomsResponse;
   }
 
   /** Redacted server config (GET /admin/config). Secrets surface as configured-bools, not values. */

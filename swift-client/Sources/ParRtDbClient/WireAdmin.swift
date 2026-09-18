@@ -413,6 +413,9 @@ public struct MetricsSnapshot: Equatable, Codable, Sendable {
     public var subsMissedPushesTotal: Int64
     /// ENH-010 per-db breakdown of the subscription counters above.
     public var perDbSubs: [DbSubCounters]
+    /// Per-room presence inspector rows (the `GET /admin/presence` rows,
+    /// also surfaced as `presenceDetail` on `/admin/metrics`).
+    public var presenceDetail: [PresenceRoomInspect]
 
     public init(
         queriesTotal: Int64,
@@ -432,7 +435,8 @@ public struct MetricsSnapshot: Equatable, Codable, Sendable {
         subsSkipsOrderedTotal: Int64 = 0,
         subsSkipVerificationsTotal: Int64 = 0,
         subsMissedPushesTotal: Int64 = 0,
-        perDbSubs: [DbSubCounters] = []
+        perDbSubs: [DbSubCounters] = [],
+        presenceDetail: [PresenceRoomInspect] = []
     ) {
         self.queriesTotal = queriesTotal
         self.mutationsTotal = mutationsTotal
@@ -452,6 +456,7 @@ public struct MetricsSnapshot: Equatable, Codable, Sendable {
         self.subsSkipVerificationsTotal = subsSkipVerificationsTotal
         self.subsMissedPushesTotal = subsMissedPushesTotal
         self.perDbSubs = perDbSubs
+        self.presenceDetail = presenceDetail
     }
 
     enum CodingKeys: String, CodingKey {
@@ -460,7 +465,7 @@ public struct MetricsSnapshot: Equatable, Codable, Sendable {
         case queryLatency, mutateLatency, subscribeLatency
         case subsRerunsTotal, subsSkipsPointTotal, subsSkipsIndexedTotal
         case subsSkipsOrderedTotal, subsSkipVerificationsTotal, subsMissedPushesTotal
-        case perDbSubs
+        case perDbSubs, presenceDetail
     }
 
     public init(from decoder: Decoder) throws {
@@ -488,6 +493,54 @@ public struct MetricsSnapshot: Equatable, Codable, Sendable {
         subsMissedPushesTotal =
             try container.decodeIfPresent(Int64.self, forKey: .subsMissedPushesTotal) ?? 0
         perDbSubs = try container.decodeIfPresent([DbSubCounters].self, forKey: .perDbSubs) ?? []
+        presenceDetail =
+            try container.decodeIfPresent([PresenceRoomInspect].self, forKey: .presenceDetail) ?? []
+    }
+}
+
+/// One room's live footprint — the rows of `GET /admin/presence` and
+/// `presenceDetail` on `/admin/metrics`. Presence is in-memory per replica,
+/// so multi-instance replicas report their own rooms.
+public struct PresenceRoomInspect: Equatable, Codable, Sendable {
+    /// Room name.
+    public var room: String
+    /// Live members in the room.
+    public var memberCount: Int64
+    /// Sum of serialized `presenceState` blob sizes across the room's members.
+    public var stateBytes: Int64
+    /// Age of the oldest member's join, in ms (a re-join refreshes it).
+    public var oldestMemberAgeMs: Int64
+
+    public init(
+        room: String,
+        memberCount: Int64,
+        stateBytes: Int64,
+        oldestMemberAgeMs: Int64
+    ) {
+        self.room = room
+        self.memberCount = memberCount
+        self.stateBytes = stateBytes
+        self.oldestMemberAgeMs = oldestMemberAgeMs
+    }
+}
+
+/// `GET /admin/presence` response — per-replica live room inspector.
+public struct PresenceRoomsResponse: Equatable, Codable, Sendable {
+    /// One row per room with at least one live member; empty when this
+    /// replica has no live presence.
+    public var rooms: [PresenceRoomInspect]
+
+    public init(rooms: [PresenceRoomInspect] = []) {
+        self.rooms = rooms
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case rooms
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        rooms = try container.decodeIfPresent([PresenceRoomInspect].self, forKey: .rooms) ?? []
     }
 }
 

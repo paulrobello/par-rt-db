@@ -51,6 +51,7 @@ from .admin import (
     _op_mint_token,
     _op_ops_recent,
     _op_patch_config,
+    _op_presence_rooms,
     _op_push_schema,
     _op_restore_backup,
     _op_revoke_token,
@@ -85,6 +86,7 @@ from .http_client import (
     MigrateResult,
     MintedToken,
     OpEvent,
+    PresenceRoomsResponse,
     SignedUrl,
     TokenInfo,
     UploadResult,
@@ -665,6 +667,10 @@ class RtDbAsyncHttpClient:
     async def metrics(self) -> MetricsSnapshot:
         """``GET /admin/metrics`` → server-wide counters and gauges (async)."""
         return await self._admin_executor.run(_op_metrics())
+
+    async def presence_rooms(self) -> PresenceRoomsResponse:
+        """``GET /admin/presence`` → per-replica live room inspector (async)."""
+        return await self._admin_executor.run(_op_presence_rooms())
 
     async def get_config(self) -> ConfigResponse:
         """``GET /admin/config`` → redacted running config + build identity + admins (async)."""

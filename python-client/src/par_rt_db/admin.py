@@ -95,6 +95,7 @@ from .admin_models import (
     MigrateResult,
     MintedToken,
     OpEvent,
+    PresenceRoomsResponse,
     SchemaHistoryEntry,
     SchemaHistorySummary,
     SchemaPreviewDiff,
@@ -417,6 +418,10 @@ def _op_db_stats(db: str) -> _AdminRequest:
 
 def _op_metrics() -> _AdminRequest:
     return _AdminRequest("GET", "/admin/metrics", {}, _parse_model(MetricsSnapshot))
+
+
+def _op_presence_rooms() -> _AdminRequest:
+    return _AdminRequest("GET", "/admin/presence", {}, _parse_model(PresenceRoomsResponse))
 
 
 def _op_ops_recent(
@@ -1167,6 +1172,10 @@ class RtDbAdminClient:
         """``GET /admin/metrics`` → server-wide counters and gauges."""
         return self._executor.run(_op_metrics())
 
+    def presence_rooms(self) -> PresenceRoomsResponse:
+        """``GET /admin/presence`` → per-replica live room inspector."""
+        return self._executor.run(_op_presence_rooms())
+
     def ops_recent(
         self,
         *,
@@ -1900,6 +1909,10 @@ class AsyncRtDbAdminClient:
     async def metrics(self) -> MetricsSnapshot:
         """``GET /admin/metrics`` → server-wide counters and gauges (async)."""
         return await self._executor.run(_op_metrics())
+
+    async def presence_rooms(self) -> PresenceRoomsResponse:
+        """``GET /admin/presence`` → per-replica live room inspector (async)."""
+        return await self._executor.run(_op_presence_rooms())
 
     async def ops_recent(
         self,

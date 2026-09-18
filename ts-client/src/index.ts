@@ -55,6 +55,8 @@ export type {
   MintTokenOptions,
   OpEvent,
   OpEventKind,
+  PresenceRoomInspect,
+  PresenceRoomsResponse,
   RestoreResult,
   RtDbAdminClientOptions,
   SchemaPreviewColumnAdd,

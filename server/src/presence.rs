@@ -72,6 +72,11 @@ struct Session {
     state: serde_json::Value,
     tx: UnboundedSender<ServerMessage>,
     updated_at: i64,
+    /// Epoch-ms when this connection joined the room — the basis for the
+    /// `oldestMemberAgeMs` column of `GET /admin/presence`. Never updated
+    /// after join (a re-join DOES refresh it, matching the idempotent-join
+    /// semantics that also refresh `state`).
+    joined_at: i64,
     /// Absolute epoch-ms at which `state` should be cleared to null by
     /// `expire_once`. `None` = permanent (no ttl armed). Joins never arm it
     /// (ttl rides on `presenceState` only); only `update_state` sets/clears it.
@@ -109,6 +114,21 @@ impl DbPresence {
 struct PeerSnapshot {
     members: Vec<PresenceMember>,
     last_beat: i64,
+}
+
+/// One room's live footprint as surfaced by `GET /admin/presence` and the
+/// `presenceDetail` field on `/admin/metrics`. Presence is in-memory per
+/// replica, so in multi-instance mode each replica reports its own rooms
+/// with no coordination.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomInspect {
+    pub room: String,
+    pub member_count: u64,
+    /// Sum of serialized `presenceState` blob sizes across the room's members.
+    pub state_bytes: u64,
+    /// Age of the oldest member's join, in ms (a re-join refreshes it).
+    pub oldest_member_age_ms: u64,
 }
 
 pub struct PresenceManager {
@@ -245,6 +265,7 @@ impl PresenceManager {
                 state: st,
                 tx,
                 updated_at: now,
+                joined_at: now,
                 expires_at: None,
             },
         );
@@ -574,6 +595,40 @@ impl PresenceManager {
             sessions += p.rooms.values().map(|m| m.len()).sum::<usize>();
         }
         (rooms, sessions)
+    }
+
+    /// Per-room inspector rows across all shards: name, member count, state
+    /// bytes, oldest member age. Consumed by `GET /admin/presence` and the
+    /// `presenceDetail` field on `/admin/metrics`. Presence is in-memory per
+    /// replica, so in multi-instance mode each replica reports its own rooms
+    /// with no coordination. Same lock discipline as `counts()`: clone each
+    /// shard `Arc` under the brief outer lock, release it, then lock each
+    /// shard individually (never hold the outer lock across a shard lock).
+    pub async fn inspect(&self) -> Vec<RoomInspect> {
+        let shards: Vec<Arc<Mutex<DbPresence>>> = {
+            let dbs = self.dbs.lock().await;
+            dbs.values().cloned().collect()
+        };
+        let now = crate::db::now_ms();
+        let mut rooms = Vec::new();
+        for shard in shards {
+            let p = shard.lock().await;
+            for (room, members) in &p.rooms {
+                let mut state_bytes = 0u64;
+                let mut oldest = i64::MAX;
+                for s in members.values() {
+                    state_bytes += serde_json::to_vec(&s.state).map_or(0, |b| b.len() as u64);
+                    oldest = oldest.min(s.joined_at);
+                }
+                rooms.push(RoomInspect {
+                    room: room.clone(),
+                    member_count: members.len() as u64,
+                    state_bytes,
+                    oldest_member_age_ms: now.saturating_sub(oldest) as u64,
+                });
+            }
+        }
+        rooms
     }
 
     /// Clear every session whose armed TTL has elapsed: set its `state` to
@@ -929,6 +984,39 @@ mod tests {
             .unwrap();
         let members = m.snapshot("db", "room").await;
         assert_eq!(members[0].state, serde_json::json!({"x": 5}));
+    }
+
+    #[tokio::test]
+    async fn inspect_lists_rooms_with_counts_bytes_and_oldest_age() {
+        let m = mgr();
+        let (t, _r) = tx();
+        m.join("db", 1, "lobby", None, user("a@b.com"), t)
+            .await
+            .unwrap();
+        let (t2, _r2) = tx();
+        m.join(
+            "db",
+            2,
+            "lobby",
+            Some(serde_json::json!({"k": "v"})),
+            user("c@d.com"),
+            t2,
+        )
+        .await
+        .unwrap();
+        let rooms = m.inspect().await;
+        assert_eq!(rooms.len(), 1, "one room across shards");
+        let r = &rooms[0];
+        assert_eq!(r.room, "lobby");
+        assert_eq!(r.member_count, 2);
+        // Sum of serialized member state sizes: `null` (4 bytes) + `{"k":"v"}`
+        // (9 bytes).
+        assert_eq!(r.state_bytes, 13);
+        assert!(
+            r.oldest_member_age_ms <= 1_000,
+            "oldest join is this test's own age: {}",
+            r.oldest_member_age_ms
+        );
     }
 
     #[tokio::test]

@@ -681,6 +681,27 @@ async fn metrics_returns_snapshot() {
 }
 
 #[tokio::test]
+async fn presence_rooms_lists_rooms() {
+    let (server, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/admin/presence"))
+        .and(header("authorization", BEARER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "rooms": [
+                {"room": "lobby", "memberCount": 2, "stateBytes": 13, "oldestMemberAgeMs": 5000}
+            ]
+        })))
+        .mount(&server)
+        .await;
+    let resp = client.presence_rooms().await.unwrap();
+    assert_eq!(resp.rooms.len(), 1);
+    assert_eq!(resp.rooms[0].room, "lobby");
+    assert_eq!(resp.rooms[0].member_count, 2);
+    assert_eq!(resp.rooms[0].state_bytes, 13);
+    assert_eq!(resp.rooms[0].oldest_member_age_ms, 5000);
+}
+
+#[tokio::test]
 async fn get_metrics_parses_invalidation_counters() {
     let (server, client) = setup().await;
     Mock::given(method("GET"))

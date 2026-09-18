@@ -72,6 +72,7 @@ from .admin import (
     _op_mint_token,
     _op_ops_recent,
     _op_patch_config,
+    _op_presence_rooms,
     _op_push_schema,
     _op_restore_backup,
     _op_revoke_token,
@@ -95,6 +96,8 @@ from .admin_models import (
     MigrateResult,
     MintedToken,
     OpEvent,
+    PresenceRoomInspect,
+    PresenceRoomsResponse,
     SampleChange,
     SchemaHistoryEntry,
     SchemaHistorySummary,
@@ -155,6 +158,8 @@ __all__ = [
     "MigrateResult",
     "MintedToken",
     "OpEvent",
+    "PresenceRoomInspect",
+    "PresenceRoomsResponse",
     "SampleChange",
     "SchemaHistoryEntry",
     "SchemaHistorySummary",
@@ -766,6 +771,10 @@ class RtDbHttpClient:
     def metrics(self) -> MetricsSnapshot:
         """``GET /admin/metrics`` → server-wide counters and gauges."""
         return self._admin_executor.run(_op_metrics())
+
+    def presence_rooms(self) -> PresenceRoomsResponse:
+        """``GET /admin/presence`` → per-replica live room inspector."""
+        return self._admin_executor.run(_op_presence_rooms())
 
     def get_config(self) -> ConfigResponse:
         """``GET /admin/config`` → redacted running config + build identity + admins."""

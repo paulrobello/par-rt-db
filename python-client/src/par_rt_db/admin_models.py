@@ -182,6 +182,44 @@ class DbSubCounters(_Wire):
     rerun_ratio: float = 0.0
 
 
+class DbQuotaCounters(_Wire):
+    """One db's quota-rejection counters (``perDbQuota[]`` on ``GET /admin/metrics``)."""
+
+    db: str
+    tables: int
+    storage: int
+    subs: int
+
+
+class DbWorkflowStatusCounts(_Wire):
+    """One db's workflow-run counts by status (``perDbWorkflows[]`` on ``GET /admin/metrics``)."""
+
+    db: str
+    pending: int
+    running: int
+    waiting: int
+    success: int
+    failed: int
+    cancelled: int
+
+
+class PresenceRoomInspect(_Wire):
+    """One room's live footprint — the rows of ``GET /admin/presence`` and
+    ``presenceDetail`` on ``GET /admin/metrics``. Presence is in-memory per
+    replica, so multi-instance replicas report their own rooms."""
+
+    room: str
+    member_count: int
+    state_bytes: int
+    oldest_member_age_ms: int
+
+
+class PresenceRoomsResponse(_Wire):
+    """``GET /admin/presence`` response — per-replica live room inspector."""
+
+    rooms: list[PresenceRoomInspect] = Field(default_factory=list)
+
+
 class MetricsSnapshot(_Wire):
     """``GET /admin/metrics`` response — server-wide counters and gauges.
 
@@ -210,6 +248,23 @@ class MetricsSnapshot(_Wire):
     subs_skip_verifications_total: int = 0
     subs_missed_pushes_total: int = 0
     per_db_subs: list[DbSubCounters] = Field(default_factory=list)
+    # ``presence_*`` counters landed with ENH-015 (2026-08); the quota/workflow
+    # fields with ENH-011 / FM-29. All default so a client built against this
+    # model still parses an older server's response. Without them, the
+    # ``extra="forbid"`` config rejects the live response and
+    # ``AdminClient.metrics()`` raises a validation error.
+    presence_rooms: int = 0
+    presence_sessions: int = 0
+    presence_detail: list[PresenceRoomInspect] = Field(default_factory=list)
+    quota_rejections_tables_total: int = 0
+    quota_rejections_storage_total: int = 0
+    quota_rejections_subs_total: int = 0
+    admin_auth_failures_total: int = 0
+    per_db_quota: list[DbQuotaCounters] = Field(default_factory=list)
+    workflow_steps_success_total: int = 0
+    workflow_steps_retry_total: int = 0
+    workflow_steps_fail_total: int = 0
+    per_db_workflows: list[DbWorkflowStatusCounts] = Field(default_factory=list)
 
 
 class HotConfig(_Wire):

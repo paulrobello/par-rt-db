@@ -298,6 +298,16 @@ describe("RtDbAdminClient — new endpoints", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/metrics");
   });
 
+  it("presenceRooms GETs /admin/presence and returns the room rows", async () => {
+    const body = {
+      rooms: [{ room: "lobby", memberCount: 2, stateBytes: 13, oldestMemberAgeMs: 5000 }],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(body));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.presenceRooms()).resolves.toEqual(body);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/presence");
+  });
+
   it("getConfig GETs /admin/config and returns the redacted response", async () => {
     const cfg = {
       port: 8300,

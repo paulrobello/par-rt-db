@@ -678,6 +678,7 @@ impl Metrics {
             presence_ttl_expiries_total: self.presence_ttl_expiries_total.load(Ordering::Relaxed),
             presence_rooms,
             presence_sessions,
+            presence_detail: Vec::new(),
             per_db_subs: self.per_db_subs_snapshot(),
             quota_rejections_tables_total: self
                 .quota_rejections_tables_total
@@ -801,6 +802,10 @@ pub struct MetricsSnapshot {
     pub presence_rooms: usize,
     /// Total presence sessions across all rooms at snapshot time (ENH-015).
     pub presence_sessions: usize,
+    /// Per-room presence inspector rows (GET /admin/presence). Populated in
+    /// the `/admin/metrics` handler rather than `snapshot` so the periodic
+    /// stream gauge ticks don't enumerate rooms every second.
+    pub presence_detail: Vec<crate::presence::RoomInspect>,
     /// Per-database breakdown of the subscription-invalidation counters above
     /// (ENH-010). Empty until a `fan_out` records a decision; sorted by db.
     pub per_db_subs: Vec<DbSubCounterRow>,
@@ -1108,6 +1113,7 @@ mod tests {
             workflow_steps_retry_total: 0,
             workflow_steps_fail_total: 0,
             per_db_workflows: Vec::new(),
+            presence_detail: Vec::new(),
         };
         let body = render_prometheus(&snap, Some(("0.0.0", "abc")));
         assert!(
@@ -1173,6 +1179,7 @@ mod tests {
             workflow_steps_retry_total: 0,
             workflow_steps_fail_total: 0,
             per_db_workflows: Vec::new(),
+            presence_detail: Vec::new(),
         };
         let body = render_prometheus(&snap, Some(("0.0.0", "abc")));
         // One metric name, one sample per skip class.
@@ -1315,6 +1322,7 @@ mod tests {
             workflow_steps_retry_total: 0,
             workflow_steps_fail_total: 0,
             per_db_workflows: Vec::new(),
+            presence_detail: Vec::new(),
         };
         let body = render_prometheus(&snap, Some(("0.0.0", "abc")));
         assert!(
@@ -1403,6 +1411,7 @@ mod tests {
             workflow_steps_retry_total: 1,
             workflow_steps_fail_total: 1,
             per_db_workflows: Vec::new(),
+            presence_detail: Vec::new(),
         };
         let body = render_prometheus(&snap, Some(("0.0.0", "abc")));
         assert!(

@@ -41,7 +41,26 @@ pub(super) async fn metrics_handler(
     // per database), populated here rather than inside `snapshot` so the
     // periodic `/admin/stream` gauge ticks don't fan it out every second.
     snap.per_db_workflows = crate::metrics::per_db_workflows_rows(&state.pool).await;
+    snap.presence_detail = state.realtime.presence.inspect().await;
     Ok(Json(snap))
+}
+
+#[derive(Serialize)]
+pub(super) struct PresenceRoomsResponse {
+    rooms: Vec<crate::presence::RoomInspect>,
+}
+
+/// `GET /admin/presence` — per-replica live room inspector: one row per room
+/// with member count, state bytes, and oldest member age. Presence is
+/// in-memory per replica; in multi-instance mode each replica reports its
+/// own rooms, no coordination (per the card's design note).
+pub(super) async fn presence_handler(
+    State(state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+) -> Result<Json<PresenceRoomsResponse>, RtDbError> {
+    Ok(Json(PresenceRoomsResponse {
+        rooms: state.realtime.presence.inspect().await,
+    }))
 }
 
 #[derive(Deserialize)]

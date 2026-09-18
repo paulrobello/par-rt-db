@@ -412,6 +412,7 @@ pub fn admin_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             get(admin_get_workflow).delete(admin_delete_workflow),
         )
         .route("/admin/metrics", get(metrics_handler))
+        .route("/admin/presence", get(presence_handler))
         // ENH-019: query introspection. `/explain` compiles a Query DSL body
         // for inspection (no execution); `/slow-queries` reads the bounded
         // slow-query log. Both are admin-gated at the router layer like every

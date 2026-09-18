@@ -445,6 +445,25 @@ async fn metrics_counters_and_subs_count() -> anyhow::Result<()> {
     Ok(())
 }
 
+// GET /admin/presence lists per-replica rooms (name, member count, state
+// bytes, oldest member age). Fresh app state has no connections, so the
+// route contract verified here is the live-server empty case; the row
+// content (member count / state bytes / oldest age) is covered by
+// `inspect_lists_rooms_with_counts_bytes_and_oldest_age` in presence.rs's
+// unit tests against a real join.
+#[tokio::test]
+async fn presence_endpoint_lists_rooms() -> anyhow::Result<()> {
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state.clone()).await;
+
+    let resp: serde_json::Value = crate::common::admin_get(addr, "/admin/presence")
+        .await
+        .json()
+        .await?;
+    assert!(resp["rooms"].is_array(), "rooms array present: {resp}");
+    Ok(())
+}
+
 // GET /admin/metrics returns the snapshot; a real mutation bumps mutationsTotal.
 #[tokio::test]
 async fn metrics_endpoint_reflects_a_mutation() -> anyhow::Result<()> {

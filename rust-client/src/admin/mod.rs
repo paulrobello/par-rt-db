@@ -441,6 +441,16 @@ impl RtDbAdminClient {
         self.get_json("/admin/metrics", &[]).await
     }
 
+    /// `GET /admin/presence` → per-replica live room inspector: one row per
+    /// room (name, member count, state bytes, oldest member age). Presence
+    /// is in-memory per replica; in multi-instance mode each replica reports
+    /// its own rooms without coordination.
+    pub async fn presence_rooms(
+        &self,
+    ) -> Result<crate::wire::admin::PresenceRoomsResponse, RtDbError> {
+        self.get_json("/admin/presence", &[]).await
+    }
+
     /// `GET /admin/subscriptions?db=<optional>` → live subscription inspector
     /// (ENH-010): every active subscription's db/table/terminal/read-set
     /// class/principal, plus invalidation-effectiveness counters (re-runs vs.
