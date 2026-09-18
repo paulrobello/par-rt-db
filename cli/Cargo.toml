@@ -37,6 +37,13 @@ anyhow.workspace = true
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+# The `ops watch` reconnect tests stand up an in-process WebSocket server, so
+# the tail is exercised across a dropped connection without a live par-rt-db.
+# `net`/`io-util` are declared here rather than leaned on via feature
+# unification with tokio-tungstenite, matching the `runtime` feature note above.
+tokio = { workspace = true, features = ["net", "io-util"] }
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
 
 [[test]]
 name = "live"

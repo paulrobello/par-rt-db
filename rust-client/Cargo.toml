@@ -35,7 +35,18 @@ futures-util = { workspace = true }
 sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `net`/`io-util` are dev-only on purpose: the library never names
+# `tokio::net::TcpStream` (see `ws::send_text`), but the `/admin/stream` tests
+# stand up an in-process WebSocket server to drive the consumer without a live
+# par-rt-db. Declared explicitly rather than inherited from
+# `tokio-tungstenite`'s own feature set, which would break the moment that dep
+# changed.
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+] }
 wiremock.workspace = true
 # ENH-033: criterion micro-benchmark over the in_memory engine.
 criterion.workspace = true

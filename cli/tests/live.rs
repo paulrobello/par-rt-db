@@ -365,3 +365,146 @@ fn cli_watch_subscribe_failure_prints_error_envelope() {
         .failure()
         .stderr(contains("NOT_FOUND"));
 }
+
+/// `rtdb ops watch` tails the admin op feed: every committed document op shows
+/// up as one compact JSON line, `--db` scopes the feed to that database, and
+/// Ctrl-C exits 0.
+///
+/// Mirrors `cli_watch_tails_live_updates`, one plane up — that one tails a
+/// single query with a machine token, this one tails every write on the
+/// instance with the admin key over `/admin/stream`.
+#[test]
+#[ignore = "set RTDB_TEST_SERVER_URL + RTDB_TEST_ADMIN_KEY and run with --ignored"]
+fn cli_ops_watch_tails_live_op_events() {
+    let Some((url, admin_key)) = env() else {
+        return;
+    };
+    let (db, token) = provision(&url, &admin_key);
+    // A second database whose writes must NOT appear: without it, a feed that
+    // ignores `--db` would look identical to one that honors it.
+    let (other_db, other_token) = provision(&url, &admin_key);
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("rtdb"))
+        .args([
+            "--url",
+            &url,
+            "--admin-key",
+            &admin_key,
+            "ops",
+            "watch",
+            "--db",
+            &db,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn rtdb ops watch");
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    // The socket needs to be up before the write, or the op lands in the replay
+    // ring instead of the live broadcast (still delivered, but then the test
+    // would not be proving the live path).
+    std::thread::sleep(Duration::from_secs(2));
+    insert_row(&url, &other_db, &other_token, "filtered-out", 9);
+    insert_row(&url, &db, &token, "alpha", 1);
+
+    // Collect first, assert after reaping, so a panic cannot leak the child.
+    let first = rx.recv_timeout(TAIL_TIMEOUT);
+
+    #[cfg(unix)]
+    let exit_code = {
+        std::process::Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .expect("send SIGINT");
+        let mut waited = Duration::ZERO;
+        let step = Duration::from_millis(100);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.code(),
+                Ok(None) if waited < Duration::from_secs(10) => {
+                    std::thread::sleep(step);
+                    waited += step;
+                }
+                _ => break None,
+            }
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // Everything the tail emitted before the SIGINT, including anything that
+    // arrived while the child was shutting down.
+    let mut lines = Vec::new();
+    if let Ok(line) = first {
+        lines.push(line);
+    }
+    while let Ok(line) = rx.recv_timeout(Duration::from_millis(200)) {
+        lines.push(line);
+    }
+    assert!(
+        !lines.is_empty(),
+        "expected at least one op event line within the timeout"
+    );
+
+    for line in &lines {
+        // NDJSON: each line stands alone, and carries the server's own OpEvent
+        // shape (camelCase `docId`, not a re-spelled one).
+        let parsed: serde_json::Value =
+            serde_json::from_str(line).expect("each line parses as standalone JSON");
+        assert!(
+            parsed.get("docId").is_some(),
+            "expected an OpEvent with docId, got: {line}"
+        );
+        // `--db` filters the feed: the other database's write must never show.
+        assert_eq!(
+            parsed.get("db").and_then(|v| v.as_str()),
+            Some(db.as_str()),
+            "--db should scope the feed to {db}, got: {line}"
+        );
+    }
+    assert!(
+        lines.iter().any(|l| l.contains(r#""kind":"insert""#)),
+        "expected the insert to appear on the feed, got: {lines:?}"
+    );
+
+    #[cfg(unix)]
+    assert_eq!(
+        exit_code,
+        Some(0),
+        "Ctrl-C (SIGINT) should exit cleanly with 0"
+    );
+}
+
+/// A rejected admin key must surface the `{code, message}` envelope and exit
+/// non-zero. The upgrade is gated before WS negotiation, so this is a plain
+/// 401 — the regression guard against retrying it forever, which from the
+/// outside is indistinguishable from a hang.
+#[test]
+#[ignore = "set RTDB_TEST_SERVER_URL + RTDB_TEST_ADMIN_KEY and run with --ignored"]
+fn cli_ops_watch_bad_admin_key_prints_error_envelope() {
+    let Some((url, _admin_key)) = env() else {
+        return;
+    };
+
+    let mut cmd = Command::cargo_bin("rtdb").expect("rtdb binary built");
+    cmd.arg("--url")
+        .arg(&url)
+        .arg("--admin-key")
+        .arg("not-a-real-admin-key")
+        .arg("ops")
+        .arg("watch")
+        .timeout(TAIL_TIMEOUT)
+        .assert()
+        .failure()
+        .stderr(contains("UNAUTHORIZED"));
+}

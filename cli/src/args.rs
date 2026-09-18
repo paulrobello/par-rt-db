@@ -147,6 +147,29 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: WorkflowsCommand,
     },
+    /// Inspect the instance-wide document op feed. (admin)
+    Ops {
+        #[command(subcommand)]
+        command: OpsCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum OpsCommand {
+    /// Tail the live op feed (`/admin/stream`): print every committed document
+    /// op until Ctrl-C.
+    Watch {
+        /// Filter to one database. Omit to watch every database on the
+        /// instance. This is the subcommand's own filter, not the global
+        /// `--db`, matching `slow-queries`.
+        #[arg(long)]
+        db: Option<String>,
+        /// Expand each event over multiple lines. The compact default is one
+        /// JSON line per event (NDJSON), which is the form that pipes into
+        /// `jq`/`while read`.
+        #[arg(long)]
+        pretty: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -711,11 +734,13 @@ mod tests {
     #[test]
     fn env_vars_supply_credentials_when_flags_absent() {
         // clap only consults these env vars when the matching flag is absent
-        // from argv; every other test passes flags explicitly, so setting them
-        // here cannot flake the rest of the suite.
-        // SAFETY: tests run single-threaded by default and no other test in
-        // this module reads these vars; we remove them at the end so the
-        // environment is clean for any future concurrent test executor.
+        // from argv, so a test that passes every flag explicitly is unaffected.
+        // A test that asserts on an ABSENT global flag is not: libtest runs
+        // tests on parallel threads (it is not single-threaded by default), and
+        // `set_var` is process-wide, so these are visible to whatever runs
+        // alongside. Assert on the flags you passed, not on the ones you did
+        // not. They are removed below to narrow, not close, that window.
+        // SAFETY: no other test in this module reads these vars.
         unsafe {
             std::env::set_var("RTDB_URL", "http://env");
             std::env::set_var("RTDB_ADMIN_KEY", "env-admin");

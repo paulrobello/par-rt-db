@@ -96,6 +96,9 @@ pub use http::{
 #[cfg(feature = "admin")]
 pub use admin::RtDbAdminClient;
 
+#[cfg(all(feature = "admin", feature = "ws"))]
+pub use admin::AdminStream;
+
 #[cfg(feature = "in_memory")]
 pub use in_memory::{InMemoryRtDbClient, PresenceHandle, PresenceRooms};
 
@@ -107,9 +110,9 @@ pub use ws::{
 
 #[cfg(feature = "admin")]
 pub use wire::admin::{
-    AdminMember, AuditEntry, AuditQuery, BackupsListResponse, CastFailure, ConfigResponse,
-    CreateWebhookOptions, DbStats, Directive, DirectiveReport, HotConfig, HotConfigPatch,
-    LatencyStats, ListDeliveriesOptions, MergeConflict, MergeDbResult, MergeReport,
+    AdminMember, AdminStreamFrame, AuditEntry, AuditQuery, BackupsListResponse, CastFailure,
+    ConfigResponse, CreateWebhookOptions, DbStats, Directive, DirectiveReport, HotConfig,
+    HotConfigPatch, LatencyStats, ListDeliveriesOptions, MergeConflict, MergeDbResult, MergeReport,
     MetricsSnapshot, MigrateRequest, MigrateRequestOwned, MigrateResult, MintTokenOptions,
     MintedToken, OpEvent, SampleChange, SchemaPreviewColumnAdd, SchemaPreviewDiff,
     SchemaPreviewIndexAdd, SchemaPreviewRejection, SchemaPreviewTableAdd, SessionInfo,

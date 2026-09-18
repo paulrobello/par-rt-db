@@ -578,7 +578,11 @@ pub struct HotConfigPatch {
 /// One row of `OpEvent` returned by `GET /admin/ops/recent`. `kind` is a
 /// `String` — the admin client passes it through; consumers match on it.
 /// `owner` is `Option<String>` for the `string | null` wire.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `Serialize` too, so an op read off the feed re-emits in the server's own
+/// shape (`rtdb ops watch` prints one per line). No `skip_serializing_if` on
+/// `owner`, matching server `op_feed::OpEvent`, which always writes the key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct OpEvent {
@@ -594,6 +598,33 @@ pub struct OpEvent {
     pub ts: i64,
     /// Per-row owner principal, when one applies.
     pub owner: Option<String>,
+}
+
+/// One frame on the `/admin/stream` op-feed WebSocket: a document op event
+/// (the ring replay, then live) or the ~1s server metrics snapshot. Mirrors
+/// ts-client's `AdminStreamFrame` union field-for-field — the server tags each
+/// frame with `kind` and carries the payload under `event` / `gauges`.
+///
+/// `#[non_exhaustive]` so a future server frame kind is an additive change
+/// here; consumers need a catch-all arm. A frame whose `kind` this client does
+/// not know fails to deserialize, and
+/// [`AdminStream::next`](crate::admin::AdminStream::next) skips it rather than
+/// ending the stream — the same forward-compatible behavior as ts-client's
+/// `parseAdminStreamFrame`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum AdminStreamFrame {
+    /// A document op event, from the replay ring or live.
+    Op {
+        /// The committed op.
+        event: OpEvent,
+    },
+    /// A periodic (~1s) server metrics snapshot.
+    Gauges {
+        /// The snapshot.
+        gauges: MetricsSnapshot,
+    },
 }
 
 // ---- schema migration (POST /admin/db/{db}/migrate) -------------------

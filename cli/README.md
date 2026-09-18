@@ -3,8 +3,8 @@
 A small operator CLI for [par-rt-db](../README.md), wrapping
 [`par-rt-db-client`](../rust-client) for CI and admin workflows against a running
 instance: list/create/clone databases, push schema, query/mutate, mint/revoke
-tokens, manage sessions, run schema migrations, and observe/cancel durable
-workflow runs. Cargo binary name `rtdb`.
+tokens, manage sessions, run schema migrations, observe/cancel durable
+workflow runs, and tail the live op feed. Cargo binary name `rtdb`.
 
 ## Install
 
@@ -78,6 +78,7 @@ Commands:
   explain       Explain a Query's compiled SQL against `--db` without running it. (admin)
   slow-queries  List recent slow queries across the instance. (admin)
   workflows     Manage durable workflow runs in `--db`. (admin)
+  ops           Inspect the instance-wide document op feed. (admin)
   help          Print this message or the help of the given subcommand(s)
 
 Options:
@@ -405,6 +406,34 @@ Options:
       --name <NAME>                  Signal name (must match the parked step's `awaitSignal.name`)
       --payload-json <PAYLOAD_JSON>  Optional JSON payload for the signal, e.g. `'{"approvedBy":"u1"}'`
   -h, --help                         Print help
+```
+
+### `rtdb ops`
+
+```text
+Inspect the instance-wide document op feed. (admin)
+
+Usage: rtdb ops <COMMAND>
+
+Commands:
+  watch  Tail the live op feed (`/admin/stream`): print every committed document op until Ctrl-C
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+#### `rtdb ops watch`
+
+```text
+Tail the live op feed (`/admin/stream`): print every committed document op until Ctrl-C
+
+Usage: rtdb ops watch [OPTIONS]
+
+Options:
+      --db <DB>  Filter to one database. Omit to watch every database on the instance. This is the subcommand's own filter, not the global `--db`, matching `slow-queries`
+      --pretty   Expand each event over multiple lines. The compact default is one JSON line per event (NDJSON), which is the form that pipes into `jq`/`while read`
+  -h, --help     Print help
 ```
 <!-- cli-reference:end -->
 

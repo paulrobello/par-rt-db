@@ -8,10 +8,11 @@
 //!
 //! Admin subcommands (`list-dbs`, `create-db`, `clone-db`, `push-schema`,
 //! `mint-token`, `revoke-token`, `sessions list|revoke`, `merge-users`,
-//! `workflows list|get|start|cancel|signal`) send the instance admin key as the
-//! bearer. Data-plane subcommands (`query`, `watch`, `mutate`) send a machine
-//! token scoped to `--db` — `watch` over the reactive WebSocket client, the
-//! rest one-shot over HTTP.
+//! `workflows list|get|start|cancel|signal`, `ops watch`) send the instance
+//! admin key as the bearer — all one-shot over HTTP except `ops watch`, which
+//! tails the `/admin/stream` op feed over a WebSocket. Data-plane subcommands
+//! (`query`, `watch`, `mutate`) send a machine token scoped to `--db` —
+//! `watch` over the reactive WebSocket client, the rest one-shot over HTTP.
 //!
 //! Layout: [`args`] holds the clap definitions and the SEC-204 argv-secret
 //! predicate, [`commands`] the per-family handlers plus the shared
@@ -23,7 +24,7 @@ mod commands;
 mod output;
 
 use anyhow::Result;
-use args::{Cli, Command};
+use args::{Cli, Command, OpsCommand};
 use clap::FromArgMatches;
 
 #[tokio::main]
@@ -71,6 +72,11 @@ async fn dispatch(cli: &Cli) -> Result<()> {
             commands::data::run_slow_queries(cli, db, *limit).await
         }
         Command::Workflows { command } => commands::workflows::run_workflows(cli, command).await,
+        Command::Ops { command } => match command {
+            OpsCommand::Watch { db, pretty } => {
+                commands::ops::run_ops_watch(cli, db, *pretty).await
+            }
+        },
     }
 }
 
@@ -78,6 +84,7 @@ async fn dispatch(cli: &Cli) -> Result<()> {
 mod tests {
     use super::*;
     use args::{SessionsCommand, WorkflowsCommand};
+    use clap::Parser;
 
     /// Build a `Cli` with the given command and no credentials. Used to verify
     /// each subcommand fails fast (credential or arg validation) before network.
@@ -132,6 +139,53 @@ mod tests {
             .await
             .is_err()
         );
+        // `ops watch` opens a socket, so it must fail at the credential gate
+        // rather than dialing one that would never authenticate.
+        let err = dispatch(&cli_with_command(Command::Ops {
+            command: OpsCommand::Watch {
+                db: Some("d".into()),
+                pretty: false,
+            },
+        }))
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--admin-key"), "got: {err}");
+    }
+
+    #[test]
+    fn ops_watch_parses_its_own_db_and_pretty_flags() {
+        // Pins the grammar: `ops` is a subcommand group (like `sessions` /
+        // `workflows`) and `--db` after `watch` binds to the subcommand's own
+        // filter, not the global flag. (Nothing is asserted about the global
+        // `--db` here: it reads `RTDB_DB`, which a sibling test sets
+        // process-wide.)
+        let cli = Cli::try_parse_from([
+            "rtdb", "--url", "http://x", "ops", "watch", "--db", "kanban", "--pretty",
+        ])
+        .expect("`rtdb ops watch --db … --pretty` parses");
+        match cli.command {
+            Command::Ops {
+                command: OpsCommand::Watch { db, pretty },
+            } => {
+                assert_eq!(db.as_deref(), Some("kanban"));
+                assert!(pretty);
+            }
+            other => panic!("expected ops watch, got {other:?}"),
+        }
+
+        // Both flags are optional: the unfiltered, compact form is the default.
+        let bare = Cli::try_parse_from(["rtdb", "--url", "http://x", "ops", "watch"])
+            .expect("`rtdb ops watch` parses with no flags");
+        match bare.command {
+            Command::Ops {
+                command: OpsCommand::Watch { db, pretty },
+            } => {
+                assert!(db.is_none());
+                assert!(!pretty);
+            }
+            other => panic!("expected ops watch, got {other:?}"),
+        }
     }
 
     #[tokio::test]

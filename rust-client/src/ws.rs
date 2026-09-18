@@ -124,6 +124,16 @@ pub struct Config {
     pub optimistic_updates: bool,
 }
 
+impl Config {
+    /// How long to wait before reconnect attempt `attempt` (0-based): the
+    /// jittered exponential schedule `/sync` itself backs off with, exposed so
+    /// a caller driving its own socket — the `/admin/stream` tail — retries on
+    /// the same curve instead of inventing a second one.
+    pub fn backoff_for(&self, attempt: u32) -> Duration {
+        backoff_delay(self.backoff_base, self.backoff_max, attempt)
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -1981,7 +1991,10 @@ fn canonical_key(query: &Query) -> String {
 
 /// `http(s)://` → `ws(s)://`, trimming trailing slashes. Already-`ws(s)` URLs and
 /// anything else pass through unchanged.
-fn sync_url(url: &str) -> String {
+///
+/// `pub(crate)` so the admin `/admin/stream` consumer derives its ws base the
+/// same way `/sync` does instead of repeating the mapping.
+pub(crate) fn sync_url(url: &str) -> String {
     let trimmed = url.trim_end_matches('/');
     if let Some(rest) = trimmed.strip_prefix("https://") {
         format!("wss://{rest}")

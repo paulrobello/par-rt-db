@@ -1350,9 +1350,23 @@ impl RtDbAdminClient {
     }
 }
 
+/// `/admin/stream` op-feed consumer. Gated on `ws` (the rest of the admin
+/// surface is HTTP-only), so an `admin`-without-`ws` build compiles unchanged.
+#[cfg(feature = "ws")]
+mod stream;
+#[cfg(feature = "ws")]
+pub use stream::AdminStream;
+
 /// Mirrors `ts-client/tests/admin.test.ts`: each method posts/gets the right
 /// path with the admin-key bearer, the right body shape, and returns the right
 /// type. `wiremock` matchers assert the on-the-wire request; `#[ignore]`-free
 /// because they hit a mock, not a real server.
 #[cfg(all(test, feature = "admin"))]
 mod tests;
+
+/// Mini-WS-server tests for the `/admin/stream` consumer. Needs both features,
+/// so it is gated separately from the wiremock suite above — `cargo check
+/// --all-targets --features admin` (one of `rust-client-check-features`'
+/// combinations) must not see it.
+#[cfg(all(test, feature = "admin", feature = "ws"))]
+mod stream_tests;
