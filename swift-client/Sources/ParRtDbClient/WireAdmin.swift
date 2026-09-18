@@ -416,6 +416,29 @@ public struct MetricsSnapshot: Equatable, Codable, Sendable {
     /// Per-room presence inspector rows (the `GET /admin/presence` rows,
     /// also surfaced as `presenceDetail` on `/admin/metrics`).
     public var presenceDetail: [PresenceRoomInspect]
+    /// Distinct presence rooms at snapshot time (ENH-015). Defaults to 0 so a
+    /// client built against this struct still decodes an older server's response.
+    public var presenceRooms: Int64
+    /// Total presence sessions across all rooms at snapshot time (ENH-015).
+    public var presenceSessions: Int64
+    /// Aggregate quota rejections by kind (ENH-011).
+    public var quotaRejectionsTablesTotal: Int64
+    /// Total rejections of the per-db storage quota.
+    public var quotaRejectionsStorageTotal: Int64
+    /// Total rejections of the per-db subscription quota.
+    public var quotaRejectionsSubsTotal: Int64
+    /// SEC-109: total admin-key login failures (brute-force signal).
+    public var adminAuthFailuresTotal: Int64
+    /// Per-db quota-rejection counter rows (ENH-011).
+    public var perDbQuota: [DbQuotaCounters]
+    /// Workflow step attempts that ended in success (FM-29).
+    public var workflowStepsSuccessTotal: Int64
+    /// Workflow step attempts that ended in a retry.
+    public var workflowStepsRetryTotal: Int64
+    /// Workflow step attempts that failed permanently.
+    public var workflowStepsFailTotal: Int64
+    /// Per-db workflow-run counts by status (FM-29).
+    public var perDbWorkflows: [DbWorkflowStatusCounts]
 
     public init(
         queriesTotal: Int64,
@@ -436,7 +459,18 @@ public struct MetricsSnapshot: Equatable, Codable, Sendable {
         subsSkipVerificationsTotal: Int64 = 0,
         subsMissedPushesTotal: Int64 = 0,
         perDbSubs: [DbSubCounters] = [],
-        presenceDetail: [PresenceRoomInspect] = []
+        presenceDetail: [PresenceRoomInspect] = [],
+        presenceRooms: Int64 = 0,
+        presenceSessions: Int64 = 0,
+        quotaRejectionsTablesTotal: Int64 = 0,
+        quotaRejectionsStorageTotal: Int64 = 0,
+        quotaRejectionsSubsTotal: Int64 = 0,
+        adminAuthFailuresTotal: Int64 = 0,
+        perDbQuota: [DbQuotaCounters] = [],
+        workflowStepsSuccessTotal: Int64 = 0,
+        workflowStepsRetryTotal: Int64 = 0,
+        workflowStepsFailTotal: Int64 = 0,
+        perDbWorkflows: [DbWorkflowStatusCounts] = []
     ) {
         self.queriesTotal = queriesTotal
         self.mutationsTotal = mutationsTotal
@@ -457,6 +491,17 @@ public struct MetricsSnapshot: Equatable, Codable, Sendable {
         self.subsMissedPushesTotal = subsMissedPushesTotal
         self.perDbSubs = perDbSubs
         self.presenceDetail = presenceDetail
+        self.presenceRooms = presenceRooms
+        self.presenceSessions = presenceSessions
+        self.quotaRejectionsTablesTotal = quotaRejectionsTablesTotal
+        self.quotaRejectionsStorageTotal = quotaRejectionsStorageTotal
+        self.quotaRejectionsSubsTotal = quotaRejectionsSubsTotal
+        self.adminAuthFailuresTotal = adminAuthFailuresTotal
+        self.perDbQuota = perDbQuota
+        self.workflowStepsSuccessTotal = workflowStepsSuccessTotal
+        self.workflowStepsRetryTotal = workflowStepsRetryTotal
+        self.workflowStepsFailTotal = workflowStepsFailTotal
+        self.perDbWorkflows = perDbWorkflows
     }
 
     enum CodingKeys: String, CodingKey {
@@ -466,6 +511,12 @@ public struct MetricsSnapshot: Equatable, Codable, Sendable {
         case subsRerunsTotal, subsSkipsPointTotal, subsSkipsIndexedTotal
         case subsSkipsOrderedTotal, subsSkipVerificationsTotal, subsMissedPushesTotal
         case perDbSubs, presenceDetail
+        case presenceRooms, presenceSessions
+        case quotaRejectionsTablesTotal, quotaRejectionsStorageTotal, quotaRejectionsSubsTotal
+        case adminAuthFailuresTotal
+        case perDbQuota
+        case workflowStepsSuccessTotal, workflowStepsRetryTotal, workflowStepsFailTotal
+        case perDbWorkflows
     }
 
     public init(from decoder: Decoder) throws {
@@ -495,6 +546,28 @@ public struct MetricsSnapshot: Equatable, Codable, Sendable {
         perDbSubs = try container.decodeIfPresent([DbSubCounters].self, forKey: .perDbSubs) ?? []
         presenceDetail =
             try container.decodeIfPresent([PresenceRoomInspect].self, forKey: .presenceDetail) ?? []
+        presenceRooms =
+            try container.decodeIfPresent(Int64.self, forKey: .presenceRooms) ?? 0
+        presenceSessions =
+            try container.decodeIfPresent(Int64.self, forKey: .presenceSessions) ?? 0
+        quotaRejectionsTablesTotal =
+            try container.decodeIfPresent(Int64.self, forKey: .quotaRejectionsTablesTotal) ?? 0
+        quotaRejectionsStorageTotal =
+            try container.decodeIfPresent(Int64.self, forKey: .quotaRejectionsStorageTotal) ?? 0
+        quotaRejectionsSubsTotal =
+            try container.decodeIfPresent(Int64.self, forKey: .quotaRejectionsSubsTotal) ?? 0
+        adminAuthFailuresTotal =
+            try container.decodeIfPresent(Int64.self, forKey: .adminAuthFailuresTotal) ?? 0
+        perDbQuota = try container.decodeIfPresent([DbQuotaCounters].self, forKey: .perDbQuota) ?? []
+        workflowStepsSuccessTotal =
+            try container.decodeIfPresent(Int64.self, forKey: .workflowStepsSuccessTotal) ?? 0
+        workflowStepsRetryTotal =
+            try container.decodeIfPresent(Int64.self, forKey: .workflowStepsRetryTotal) ?? 0
+        workflowStepsFailTotal =
+            try container.decodeIfPresent(Int64.self, forKey: .workflowStepsFailTotal) ?? 0
+        perDbWorkflows =
+            try container.decodeIfPresent([DbWorkflowStatusCounts].self, forKey: .perDbWorkflows)
+                ?? []
     }
 }
 
@@ -521,6 +594,64 @@ public struct PresenceRoomInspect: Equatable, Codable, Sendable {
         self.memberCount = memberCount
         self.stateBytes = stateBytes
         self.oldestMemberAgeMs = oldestMemberAgeMs
+    }
+}
+
+/// One db's quota-rejection counters (`perDbQuota[]` on `GET /admin/metrics`).
+public struct DbQuotaCounters: Equatable, Codable, Sendable {
+    /// Which database.
+    public var db: String
+    /// Tables-quota rejections.
+    public var tables: Int64
+    /// Storage-quota rejections.
+    public var storage: Int64
+    /// Subscription-quota rejections.
+    public var subs: Int64
+
+    public init(db: String, tables: Int64, storage: Int64, subs: Int64) {
+        self.db = db
+        self.tables = tables
+        self.storage = storage
+        self.subs = subs
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case db, tables, storage, subs
+    }
+}
+
+/// One db's workflow-run counts by status (`perDbWorkflows[]` on `GET /admin/metrics`).
+public struct DbWorkflowStatusCounts: Equatable, Codable, Sendable {
+    /// Which database.
+    public var db: String
+    /// Waiting to run.
+    public var pending: Int64
+    /// Running now.
+    public var running: Int64
+    /// Awaiting a signal.
+    public var waiting: Int64
+    /// Completed successfully.
+    public var success: Int64
+    /// Failed.
+    public var failed: Int64
+    /// Cancelled.
+    public var cancelled: Int64
+
+    public init(
+        db: String, pending: Int64, running: Int64, waiting: Int64, success: Int64,
+        failed: Int64, cancelled: Int64
+    ) {
+        self.db = db
+        self.pending = pending
+        self.running = running
+        self.waiting = waiting
+        self.success = success
+        self.failed = failed
+        self.cancelled = cancelled
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case db, pending, running, waiting, success, failed, cancelled
     }
 }
 

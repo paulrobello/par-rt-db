@@ -320,6 +320,67 @@ fn metrics_snapshot_deserializes_per_db_subs() {
     assert!(older.per_db_subs.is_empty());
 }
 
+/// Confirms the presence/quota/workflow fields added to `MetricsSnapshot`
+/// (ENH-015 / ENH-011 / FM-29) deserialize under their camelCase keys and
+/// default (0 / empty) when an older server omits them — the same tolerance
+/// contract as `metrics_snapshot_deserializes_per_db_subs` above.
+#[cfg(feature = "admin")]
+#[test]
+fn metrics_snapshot_deserializes_presence_quota_workflows() {
+    use par_rt_db_client::wire::admin::MetricsSnapshot;
+    let base = || {
+        json!({
+            "queriesTotal": 0, "mutationsTotal": 0, "uploadsTotal": 0,
+            "wsConnections": 0, "activeSubscriptions": 0,
+            "poolSize": 0, "poolIdle": 0, "uptimeSeconds": 0,
+            "queryLatency": {"p50": 0, "p95": 0, "p99": 0},
+            "mutateLatency": {"p50": 0, "p95": 0, "p99": 0},
+            "subscribeLatency": {"p50": 0, "p95": 0, "p99": 0}
+        })
+    };
+    let mut full = base();
+    full["presenceRooms"] = json!(2);
+    full["presenceSessions"] = json!(5);
+    full["quotaRejectionsTablesTotal"] = json!(1);
+    full["quotaRejectionsStorageTotal"] = json!(2);
+    full["quotaRejectionsSubsTotal"] = json!(3);
+    full["adminAuthFailuresTotal"] = json!(7);
+    full["workflowStepsSuccessTotal"] = json!(10);
+    full["workflowStepsRetryTotal"] = json!(2);
+    full["workflowStepsFailTotal"] = json!(1);
+    full["perDbQuota"] = json!([{"db": "app", "tables": 1, "storage": 0, "subs": 0}]);
+    full["perDbWorkflows"] = json!([{
+        "db": "app", "pending": 1, "running": 1, "waiting": 0,
+        "success": 4, "failed": 0, "cancelled": 0
+    }]);
+    let m: MetricsSnapshot = serde_json::from_value(full).expect("parse with new fields");
+    assert_eq!(m.presence_rooms, 2);
+    assert_eq!(m.presence_sessions, 5);
+    assert_eq!(m.quota_rejections_tables_total, 1);
+    assert_eq!(m.quota_rejections_storage_total, 2);
+    assert_eq!(m.quota_rejections_subs_total, 3);
+    assert_eq!(m.admin_auth_failures_total, 7);
+    assert_eq!(m.workflow_steps_success_total, 10);
+    assert_eq!(m.workflow_steps_retry_total, 2);
+    assert_eq!(m.workflow_steps_fail_total, 1);
+    assert_eq!(m.per_db_quota.len(), 1);
+    assert_eq!(m.per_db_quota[0].db, "app");
+    assert_eq!(m.per_db_quota[0].tables, 1);
+    assert_eq!(m.per_db_workflows.len(), 1);
+    assert_eq!(m.per_db_workflows[0].db, "app");
+    assert_eq!(m.per_db_workflows[0].success, 4);
+
+    // Older server that omits the fields → defaults, not an error.
+    let older: MetricsSnapshot = serde_json::from_value(base()).expect("parse without new fields");
+    assert_eq!(older.presence_rooms, 0);
+    assert_eq!(older.presence_sessions, 0);
+    assert_eq!(older.quota_rejections_tables_total, 0);
+    assert_eq!(older.admin_auth_failures_total, 0);
+    assert_eq!(older.workflow_steps_fail_total, 0);
+    assert!(older.per_db_quota.is_empty());
+    assert!(older.per_db_workflows.is_empty());
+}
+
 #[test]
 fn rejects_unknown_fields() {
     let corpus = load_corpus();

@@ -1380,4 +1380,71 @@ struct WireEnumRoundTripTests {
         expectDecodingThrows(StepOutcome.self, #"{"stepIndex":0,"status":"bogus","attempts":1,"at":1}"#)
         expectDecodingThrows(StepOutcome.self, #"{"stepIndex":0,"status":"success","attempts":1,"zzz":1}"#)
     }
+
+    @Test func metricsSnapshotDecodesPresenceQuotaWorkflows() throws {
+        // The presence/quota/workflow fields (ENH-015 / ENH-011 / FM-29)
+        // decode under their camelCase keys.
+        let full = """
+        {
+          "queriesTotal": 1, "mutationsTotal": 2, "uploadsTotal": 3,
+          "wsConnections": 4, "activeSubscriptions": 5, "poolSize": 6,
+          "poolIdle": 7, "uptimeSeconds": 8,
+          "queryLatency": {"p50": 1, "p95": 2, "p99": 3},
+          "mutateLatency": {"p50": 1, "p95": 2, "p99": 3},
+          "subscribeLatency": {"p50": 1, "p95": 2, "p99": 3},
+          "subsRerunsTotal": 10, "subsSkipsPointTotal": 3,
+          "subsSkipsIndexedTotal": 4, "subsSkipsOrderedTotal": 5,
+          "subsSkipVerificationsTotal": 0, "subsMissedPushesTotal": 0,
+          "presenceRooms": 2, "presenceSessions": 5,
+          "quotaRejectionsTablesTotal": 1, "quotaRejectionsStorageTotal": 2,
+          "quotaRejectionsSubsTotal": 3, "adminAuthFailuresTotal": 7,
+          "workflowStepsSuccessTotal": 10, "workflowStepsRetryTotal": 2,
+          "workflowStepsFailTotal": 1,
+          "perDbQuota": [{"db": "app", "tables": 1, "storage": 0, "subs": 0}],
+          "perDbWorkflows": [{"db": "app", "pending": 1, "running": 1,
+                              "waiting": 0, "success": 4, "failed": 0,
+                              "cancelled": 0}]
+        }
+        """
+        let snapshot = try decode(MetricsSnapshot.self, full)
+        #expect(snapshot.queriesTotal == 1)
+        #expect(snapshot.presenceRooms == 2)
+        #expect(snapshot.presenceSessions == 5)
+        #expect(snapshot.quotaRejectionsTablesTotal == 1)
+        #expect(snapshot.quotaRejectionsStorageTotal == 2)
+        #expect(snapshot.quotaRejectionsSubsTotal == 3)
+        #expect(snapshot.adminAuthFailuresTotal == 7)
+        #expect(snapshot.workflowStepsSuccessTotal == 10)
+        #expect(snapshot.workflowStepsRetryTotal == 2)
+        #expect(snapshot.workflowStepsFailTotal == 1)
+        #expect(snapshot.perDbQuota.count == 1)
+        #expect(snapshot.perDbQuota[0].db == "app")
+        #expect(snapshot.perDbQuota[0].tables == 1)
+        #expect(snapshot.perDbWorkflows.count == 1)
+        #expect(snapshot.perDbWorkflows[0].db == "app")
+        #expect(snapshot.perDbWorkflows[0].success == 4)
+    }
+
+    @Test func metricsSnapshotDefaultsPresenceQuotaWorkflows() throws {
+        // Older server that omits the fields → defaults (0 / empty), not an
+        // error — the same tolerance contract as the subs_* fields.
+        let older = try decode(
+            MetricsSnapshot.self,
+            """
+            {"queriesTotal": 1, "mutationsTotal": 2, "uploadsTotal": 3,
+             "wsConnections": 4, "activeSubscriptions": 5, "poolSize": 6,
+             "poolIdle": 7, "uptimeSeconds": 8,
+             "queryLatency": {"p50": 1, "p95": 2, "p99": 3},
+             "mutateLatency": {"p50": 1, "p95": 2, "p99": 3},
+             "subscribeLatency": {"p50": 1, "p95": 2, "p99": 3}}
+            """
+        )
+        #expect(older.presenceRooms == 0)
+        #expect(older.presenceSessions == 0)
+        #expect(older.quotaRejectionsTablesTotal == 0)
+        #expect(older.adminAuthFailuresTotal == 0)
+        #expect(older.workflowStepsFailTotal == 0)
+        #expect(older.perDbQuota.isEmpty)
+        #expect(older.perDbWorkflows.isEmpty)
+    }
 }

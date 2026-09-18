@@ -224,12 +224,34 @@ export interface MetricsSnapshot {
    */
   subsSkipVerificationsTotal: number;
   subsMissedPushesTotal: number;
+  /** Presence gauges and counters (ENH-015): distinct rooms, total sessions,
+   *  `presence/update` frames processed, broadcasts fanned out, and sessions
+   *  whose per-state TTL expired. Absent on older server builds. */
+  presenceRooms?: number;
+  presenceSessions?: number;
+  /** Aggregate quota rejections by kind (ENH-011). Absent on older server builds. */
+  quotaRejectionsTablesTotal?: number;
+  quotaRejectionsStorageTotal?: number;
+  quotaRejectionsSubsTotal?: number;
+  /** SEC-109: total admin-key login failures (brute-force signal). Absent on
+   *  older server builds. */
+  adminAuthFailuresTotal?: number;
+  /** Workflow step attempts by outcome (FM-29). Absent on older server builds. */
+  workflowStepsSuccessTotal?: number;
+  workflowStepsRetryTotal?: number;
+  workflowStepsFailTotal?: number;
   /** Per-db rollup of the subscription counters above, when the server
    *  includes it on `/admin/metrics`. Absent on older server builds. */
   perDbSubs?: DbSubCounters[];
   /** Per-room presence inspector rows, when the server includes them on
    *  `/admin/metrics`. Absent on older server builds. */
   presenceDetail?: PresenceRoomInspect[];
+  /** Per-db quota-rejection counter rows (ENH-011), when the server includes
+   *  them on `/admin/metrics`. Absent on older server builds. */
+  perDbQuota?: DbQuotaCounters[];
+  /** Per-db workflow-run counts by status (FM-29), when the server includes
+   *  them on `/admin/metrics`. Absent on older server builds. */
+  perDbWorkflows?: DbWorkflowStatusCounts[];
 }
 /**
  * One room's live footprint — the rows of `GET /admin/presence` and
@@ -241,6 +263,23 @@ export interface PresenceRoomInspect {
   memberCount: number;
   stateBytes: number;
   oldestMemberAgeMs: number;
+}
+/** One db's quota-rejection counters (`perDbQuota[]` on `GET /admin/metrics`). */
+export interface DbQuotaCounters {
+  db: string;
+  tables: number;
+  storage: number;
+  subs: number;
+}
+/** One db's workflow-run counts by status (`perDbWorkflows[]` on `GET /admin/metrics`). */
+export interface DbWorkflowStatusCounts {
+  db: string;
+  pending: number;
+  running: number;
+  waiting: number;
+  success: number;
+  failed: number;
+  cancelled: number;
 }
 /**
  * `GET /admin/presence` response — per-replica live room inspector.

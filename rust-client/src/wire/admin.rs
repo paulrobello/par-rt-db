@@ -407,6 +407,45 @@ pub struct MetricsSnapshot {
     /// deserializes to an empty vec.
     #[serde(default)]
     pub presence_detail: Vec<PresenceRoomInspect>,
+    /// Presence room/session gauges (ENH-015): distinct rooms and total
+    /// sessions at snapshot time. `#[serde(default)]` so an older server
+    /// that omits them still deserializes to 0.
+    #[serde(default)]
+    pub presence_rooms: i64,
+    /// Total presence sessions across all rooms at snapshot time.
+    #[serde(default)]
+    pub presence_sessions: i64,
+    /// Aggregate quota rejections by kind (ENH-011), surfaced in BOTH the
+    /// JSON snapshot and the Prometheus scrape. Defaulted for older servers.
+    #[serde(default)]
+    pub quota_rejections_tables_total: i64,
+    /// Total rejections of the per-db storage quota.
+    #[serde(default)]
+    pub quota_rejections_storage_total: i64,
+    /// Total rejections of the per-db subscription quota.
+    #[serde(default)]
+    pub quota_rejections_subs_total: i64,
+    /// SEC-109: total admin-key login failures (brute-force signal).
+    #[serde(default)]
+    pub admin_auth_failures_total: i64,
+    /// Per-db quota-rejection counter rows (ENH-011). Defaulted so an older
+    /// server that omits it still deserializes to an empty vec.
+    #[serde(default)]
+    pub per_db_quota: Vec<DbQuotaCounters>,
+    /// Workflow step attempts by outcome (FM-29). Defaulted for older servers.
+    #[serde(default)]
+    pub workflow_steps_success_total: i64,
+    /// Workflow step attempts that ended in a retry.
+    #[serde(default)]
+    pub workflow_steps_retry_total: i64,
+    /// Workflow step attempts that failed permanently.
+    #[serde(default)]
+    pub workflow_steps_fail_total: i64,
+    /// Per-db workflow-run counts by status (FM-29). Populated only by the
+    /// `/admin/metrics` handler; defaulted so an older server that omits it
+    /// still deserializes to an empty vec.
+    #[serde(default)]
+    pub per_db_workflows: Vec<DbWorkflowStatusCounts>,
 }
 
 /// One room's live footprint — the rows of `GET /admin/presence` and
@@ -495,6 +534,44 @@ pub struct DbSubCounters {
     /// same older-server reason as `skips`.
     #[serde(default)]
     pub rerun_ratio: f64,
+}
+
+/// One db's quota-rejection counters — one row of
+/// [`MetricsSnapshot::per_db_quota`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct DbQuotaCounters {
+    /// Which database.
+    pub db: String,
+    /// Tables-quota rejections.
+    pub tables: u64,
+    /// Storage-quota rejections.
+    pub storage: u64,
+    /// Subscription-quota rejections.
+    pub subs: u64,
+}
+
+/// One db's workflow-run counts by status — one row of
+/// [`MetricsSnapshot::per_db_workflows`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct DbWorkflowStatusCounts {
+    /// Which database.
+    pub db: String,
+    /// Waiting to run.
+    pub pending: i64,
+    /// Running now.
+    pub running: i64,
+    /// Awaiting a signal.
+    pub waiting: i64,
+    /// Completed successfully.
+    pub success: i64,
+    /// Failed.
+    pub failed: i64,
+    /// Cancelled.
+    pub cancelled: i64,
 }
 
 /// `GET /admin/subscriptions?db=<optional>` response (ENH-010): the live
@@ -655,8 +732,10 @@ pub enum AdminStreamFrame {
     },
     /// A periodic (~1s) server metrics snapshot.
     Gauges {
-        /// The snapshot.
-        gauges: MetricsSnapshot,
+        /// The snapshot. Boxed so this variant stays under clippy's
+        /// `large_enum_variant` threshold now that MetricsSnapshot carries
+        /// the full server shape.
+        gauges: Box<MetricsSnapshot>,
     },
 }
 

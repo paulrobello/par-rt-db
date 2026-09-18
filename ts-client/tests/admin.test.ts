@@ -291,11 +291,53 @@ describe("RtDbAdminClient — new endpoints", () => {
       subsSkipsOrderedTotal: 5,
       subsSkipVerificationsTotal: 0,
       subsMissedPushesTotal: 0,
+      presenceRooms: 2,
+      presenceSessions: 5,
+      quotaRejectionsTablesTotal: 1,
+      quotaRejectionsStorageTotal: 2,
+      quotaRejectionsSubsTotal: 3,
+      adminAuthFailuresTotal: 7,
+      workflowStepsSuccessTotal: 10,
+      workflowStepsRetryTotal: 2,
+      workflowStepsFailTotal: 1,
+      perDbSubs: [
+        { db: "kanban", reruns: 9, skipsPoint: 1, skipsIndexed: 2, skipsOrdered: 0, missed: 0 },
+      ],
+      presenceDetail: [{ room: "lobby", memberCount: 2, stateBytes: 13, oldestMemberAgeMs: 5000 }],
+      perDbQuota: [{ db: "kanban", tables: 1, storage: 0, subs: 0 }],
+      perDbWorkflows: [
+        { db: "kanban", pending: 1, running: 1, waiting: 0, success: 4, failed: 0, cancelled: 0 },
+      ],
     };
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse(snap));
     const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
     await expect(admin.metrics()).resolves.toEqual(snap);
     expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/metrics");
+  });
+
+  it("metrics resolves a payload from an older server without the newer snapshot fields", async () => {
+    const snap = {
+      queriesTotal: 5,
+      mutationsTotal: 2,
+      uploadsTotal: 0,
+      wsConnections: 1,
+      activeSubscriptions: 1,
+      poolSize: 4,
+      poolIdle: 3,
+      uptimeSeconds: 99,
+      queryLatency: { p50: 110, p95: 220, p99: 330 },
+      mutateLatency: { p50: 440, p95: 550, p99: 660 },
+      subscribeLatency: { p50: 770, p95: 880, p99: 990 },
+      subsRerunsTotal: 12,
+      subsSkipsPointTotal: 3,
+      subsSkipsIndexedTotal: 4,
+      subsSkipsOrderedTotal: 5,
+      subsSkipVerificationsTotal: 0,
+      subsMissedPushesTotal: 0,
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(snap));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.metrics()).resolves.toEqual(snap);
   });
 
   it("presenceRooms GETs /admin/presence and returns the room rows", async () => {
