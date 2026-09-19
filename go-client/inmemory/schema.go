@@ -56,7 +56,7 @@ func (f *FieldType) equal(o *FieldType) bool {
 	if f.OnDelete != nil && *f.OnDelete != *o.OnDelete {
 		return false
 	}
-	if !jsonEq(f.Value, o.Value) {
+	if !strictValueEq(f.Value, o.Value) {
 		return false
 	}
 	if (f.Inner == nil) != (o.Inner == nil) {

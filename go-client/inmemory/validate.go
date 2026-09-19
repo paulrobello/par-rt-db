@@ -237,8 +237,10 @@ func stampUpdatedAt(table *TableDef, doc wire.Object, now int64) wire.Object {
 		return doc
 	}
 	out := cloneObject(doc)
+	// The value matches the field's wire convention: a decimal STRING on an
+	// int64 field, a JSON number otherwise (server stamp_updated_at).
 	if fty, declared := table.Fields[*table.UpdatedAtField]; declared && fty.Kind == "int64" {
-		out[*table.UpdatedAtField] = wire.Number(strconv.FormatInt(now, 10))
+		out[*table.UpdatedAtField] = wire.String(strconv.FormatInt(now, 10))
 	} else {
 		out[*table.UpdatedAtField] = wire.Number(strconv.FormatInt(now, 10))
 	}
@@ -326,7 +328,7 @@ func applyPatch(table *TableDef, doc wire.Object, fields wire.Object, now int64)
 		auto := *table.AutoIncrementField
 		if value, present := fields[auto]; present {
 			existing, had := doc[auto]
-			if !had || !jsonEq(existing, value) {
+			if !had || !strictValueEq(existing, value) {
 				return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
 					"autoIncrementField '"+auto+"' cannot be changed")
 			}

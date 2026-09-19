@@ -219,3 +219,59 @@ func TestPushSchemaRejectsAnIndexOverANonIndexableField(t *testing.T) {
 	})
 	expectPushError(t, bad, rtdberrors.CodeSchemaViolation, "field type 'array' is not indexable")
 }
+
+func TestUpdatedAtFieldStampsInt64AsString(t *testing.T) {
+	// Pins the T20-review Critical: an int64 updatedAtField takes the
+	// decimal-STRING wire form on every stamp (rust stamp_updated_at); a
+	// JSON number would fail validateValue's int64 arm.
+	schema := buildSchema(func(b *dsl.SchemaBuilder) {
+		b.Table("t", func(tb *dsl.TableBuilder) {
+			tb.Field("n", dsl.Int64()).UpdatedAtField("n")
+		})
+	})
+	s := NewStore()
+	if err := s.PushSchema(schema); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	table := s.SchemaSnapshot().Tables["t"]
+	doc, err := doInsert(s, "t", table, docObj())
+	if err != nil {
+		t.Fatalf("insert: %v (updatedAt=%v n-kind=%v)", err, table.UpdatedAtField, table.Fields["n"].Kind)
+	}
+	row := s.docs[rowKey{Table: "t", ID: doc}]
+	stamped, ok := row.Doc["n"].(wire.String)
+	if !ok {
+		t.Fatalf("int64 updatedAtField must store a decimal string, got %T", row.Doc["n"])
+	}
+	if _, valid := parseI64(string(stamped)); !valid {
+		t.Fatalf("stamp not a decimal string: %s", stamped)
+	}
+}
+
+func TestApplyPatchRejectsAutoIncrementValueReshuffle(t *testing.T) {
+	// Pins the T20-review Important: rust's auto-immutability check is
+	// strict serde equality — an integer-spelled stored counter does not
+	// equal a float-spelled 5.0, so re-submitting it reshaped must fail.
+	s := NewStore()
+	if err := s.PushSchema(buildSchema(func(b *dsl.SchemaBuilder) {
+		b.Table("t", func(tb *dsl.TableBuilder) {
+			tb.Field("name", dsl.Str()).Field("seq", dsl.Int64()).AutoIncrementField("seq")
+		})
+	})); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	table := s.SchemaSnapshot().Tables["t"]
+	id, err := doInsert(s, "t", table, docObj("name", "a"))
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	row := s.docs[rowKey{Table: "t", ID: id}]
+	// Round-trip the exact stored spelling: accepted.
+	if _, err := applyPatch(table, row.Doc, docObj("name", "b"), 0); err != nil {
+		t.Fatalf("round-trip patch must pass: %v", err)
+	}
+	// A float-spelled reshuffle of the same number: rejected.
+	if _, err := applyPatch(table, row.Doc, docObj("seq", 5.0), 0); err == nil {
+		t.Fatal("float-spelled autoIncrement patch must be rejected")
+	}
+}

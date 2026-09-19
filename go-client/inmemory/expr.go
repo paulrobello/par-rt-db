@@ -66,6 +66,29 @@ func jsonEq(lhs, rhs wire.JSONValue) bool {
 	}
 }
 
+// strictValueEq is serde_json Value equality (rust PartialEq): numbers are
+// equal only within their own backing class — integer-spelled with integer
+// value equal, float-spelled with float value equal; 1 and 1.0 are UNEQUAL.
+// Used where rust compares Values strictly (autoIncrement immutability,
+// FieldType::Literal equality); JS-style jsonEq stays for the surfaces the
+// other references treat JS-equal (literal validation, widening, contains).
+func strictValueEq(lhs, rhs wire.JSONValue) bool {
+	ln, lok := lhs.(wire.Number)
+	rn, rok := rhs.(wire.Number)
+	if lok && rok {
+		li, lokInt := parseI64(string(ln))
+		ri, rokInt := parseI64(string(rn))
+		if lokInt != rokInt {
+			return false
+		}
+		if lokInt {
+			return li == ri
+		}
+		return jsonNumberF64(ln) == jsonNumberF64(rn)
+	}
+	return jsonEq(lhs, rhs)
+}
+
 // isJSONNumber reports whether v is a JSON number kind.
 func isJSONNumber(v wire.JSONValue) bool {
 	_, ok := v.(wire.Number)
