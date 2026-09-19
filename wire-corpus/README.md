@@ -301,12 +301,11 @@ clauses of the read `Query` DSL may not be set together — the rule set that
 `server/src/query/mod.rs`/`terminals.rs`'s `compile_query`, the five clients'
 `check_query_combinations`/`checkQueryCombinations`/
 `_check_query_combinations` (plus, in every client, the `get`/`vectorSearch`/
-`hybridSearch`/`search` terminal-executor guards those functions don't own),
-swift's mirror hand-enforce today, and the Go client's in-memory engine
+`hybridSearch`/`search` terminal-executor guards those functions don't own)
+hand-enforce today, and the Go client's in-memory engine
 (`go-client/inmemory/combinations.go`) already evaluates this exact table at
-runtime. The plan to replace the remaining hand-written checkers with this one
-evaluator
-checkers with one evaluator reading this table); today it exists purely to
+runtime — the plan is to replace the remaining hand-written checkers with one
+evaluator reading this table; today it exists purely to
 **document and pin** the union of those rules with a corpus case per rule, so
 a rule silently added to one checker and missed in another shows up as a
 `query-combo-*` case failing on the runner that lacks it.
