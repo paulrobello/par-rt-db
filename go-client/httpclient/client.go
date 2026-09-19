@@ -61,6 +61,40 @@ func (c *Client) Call(ctx context.Context, method, path string, body, out any) e
 	return c.do(ctx, method, path, body, out)
 }
 
+// RawCall is Call's raw-body seam: same auth headers and error-envelope
+// decode, but the body goes on the wire verbatim (contentType overrides the
+// JSON default; empty omits the header) and the 2xx response bytes are
+// returned undecoded. Serves the admin client's raw routes (export/import,
+// backup download, storage upload) and dynamic-decode bodies.
+func (c *Client) RawCall(ctx context.Context, method, path, contentType string, body []byte) ([]byte, error) {
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, rdr)
+	if err != nil {
+		return nil, fmt.Errorf("httpclient: build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("X-Rtdb-Protocol", strconv.FormatUint(uint64(wire.PROTOCOL_VERSION), 10))
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("httpclient: transport: %w", err)
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("httpclient: read response: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		return nil, envelopeError(resp.StatusCode, data)
+	}
+	return data, nil
+}
+
 // do performs one request through the auth seam and decodes the response.
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
 	var rdr io.Reader

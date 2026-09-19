@@ -132,6 +132,49 @@ type WorkflowInfo struct {
 	FinishedAt  *int64         `json:"finishedAt,omitempty"`
 }
 
+// Mirrors server/src/protocol.rs::WorkflowInfoFull — the run info
+// projection flattened with the per-step outcome trail.
+type WorkflowInfoFull struct {
+	WorkflowInfo
+	StepOutcomes []StepOutcome `json:"stepOutcomes"`
+}
+
+// UnmarshalJSON rejects unknown fields at both levels: the info keys strict-
+// decode through WorkflowInfo's own UnmarshalJSON (the embedded strict
+// Unmarshaler defeats DisallowUnknownFields flattening, so the alias form
+// cannot see stepOutcomes as a declared field), and stepOutcomes decodes
+// through each element's signal-converting UnmarshalJSON.
+func (w *WorkflowInfoFull) UnmarshalJSON(b []byte) error {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(b, &m); err != nil {
+		return err
+	}
+	infoKeys := make(map[string]json.RawMessage, len(m))
+	for k, v := range m {
+		if k != "stepOutcomes" {
+			infoKeys[k] = v
+		}
+	}
+	var info WorkflowInfo
+	if len(infoKeys) > 0 {
+		rest, err := json.Marshal(infoKeys)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(rest, &info); err != nil {
+			return err
+		}
+	}
+	var outcomes []StepOutcome
+	if raw, ok := m["stepOutcomes"]; ok {
+		if err := json.Unmarshal(raw, &outcomes); err != nil {
+			return err
+		}
+	}
+	w.WorkflowInfo, w.StepOutcomes = info, outcomes
+	return nil
+}
+
 // Mirrors core/src/mutation.rs::ScheduleInfo — a scheduled job's public
 // view (listSchedules). cron/everyMs/lastError omitted when absent;
 // external omitted when false.
