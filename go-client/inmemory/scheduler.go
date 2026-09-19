@@ -16,7 +16,6 @@ const ScheduleStatusError ScheduleStatus = "error"
 // then reaps expired TTL docs. Returns the number of docs reaped.
 func (s *Store) Tick(now int64) int {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	i := 0
 	for i < len(s.scheduledJobs) {
 		job := s.scheduledJobs[i]
@@ -70,7 +69,13 @@ func (s *Store) Tick(now int64) int {
 		}
 		i++
 	}
-	return s.reapTTL(now)
+	reaped := s.reapTTL(now)
+	fires := s.takePendingFires()
+	s.mu.Unlock()
+	for _, f := range fires {
+		f.callback(f.value)
+	}
+	return reaped
 }
 
 func (s *Store) findJob(id string) *ScheduledJob {

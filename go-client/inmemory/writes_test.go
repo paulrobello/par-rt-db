@@ -3,8 +3,10 @@
 package inmemory
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/paulrobello/par-rt-db/go-client/dsl"
 	rtdberrors "github.com/paulrobello/par-rt-db/go-client/errors"
@@ -457,5 +459,84 @@ func TestScheduleStepEnqueuesAndCancels(t *testing.T) {
 	}
 	if *res3[0].Cancelled {
 		t.Fatal("second cancel must report false")
+	}
+}
+
+func TestByQueryRejectsNegativeLimit(t *testing.T) {
+	// Pins T23-review C2: rust's Option<u32> decode rejects a negative
+	// limit; the Go *int wire shape must reject it loudly (BAD_REQUEST), not
+	// panic on a negative slice bound or under-count the budget.
+	s := upsertStore(t)
+	neg := -1
+	_, err := ApplyTxn(s, wire.Transaction{Steps: []wire.Step{wire.StepPatchByQuery{
+		Table: "users", Filter: dsl.Eq("email", wire.String("a@x")),
+		Patch: docObj("hits", 1), Limit: &neg,
+	}}}, "")
+	re, ok := err.(*rtdberrors.RtDbError)
+	if !ok || re.Code != rtdberrors.CodeBadRequest {
+		t.Fatalf("patchByQuery negative limit: %v", err)
+	}
+	_, err = ApplyTxn(s, wire.Transaction{Steps: []wire.Step{wire.StepDeleteByQuery{
+		Table: "users", Filter: dsl.Eq("email", wire.String("a@x")), Limit: &neg,
+	}}}, "")
+	re, ok = err.(*rtdberrors.RtDbError)
+	if !ok || re.Code != rtdberrors.CodeBadRequest {
+		t.Fatalf("deleteByQuery negative limit: %v", err)
+	}
+}
+
+func TestStepResultNullMarshalsAsNull(t *testing.T) {
+	// Pins T23-review I1: a null step result serializes as JSON null (the
+	// server's untagged StepResult::Null), never {}.
+	data, err := json.Marshal(wire.StepResult{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "null" {
+		t.Fatalf("null step result: %s", data)
+	}
+	data, err = json.Marshal(wire.StepResult{ID: stringPtr2("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != `{"id":"x"}` {
+		t.Fatalf("insert result: %s", data)
+	}
+}
+
+func TestSubscriberCallbackMayReenterStore(t *testing.T) {
+	// Pins T23-review I2: fires flush AFTER the store lock releases — a
+	// callback that queries the store must not self-deadlock (rust fires
+	// outside the borrow).
+	s := newTestStore(t)
+	sub := &Subscription{
+		Query: wire.Query{Table: "items"},
+		Table: "items",
+		alive: &syncFlag{},
+		Callback: func(wire.JSONValue) {
+			// Re-enter the store from inside the callback.
+			if _, err := EvalQuery(s, wire.Query{Table: "items"}); err != nil {
+				t.Errorf("re-entrant query: %v", err)
+			}
+		},
+	}
+	sub.alive.set(true)
+	s.mu.Lock()
+	s.subscribers = append(s.subscribers, sub)
+	s.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		_, err := ApplyTxn(s, wire.Transaction{Steps: []wire.Step{wire.StepInsert{
+			Table: "items", Doc: docObj("name", "x", "status", "todo", "order", 1),
+		}}}, "")
+		if err != nil {
+			t.Errorf("mutate: %v", err)
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deadlock: subscriber callback re-entered the store")
 	}
 }

@@ -60,6 +60,24 @@ type Store struct {
 	subscribers []*Subscription
 	// storage is the file-upload stub: per-id blobs.
 	storage map[string]*StoredBlob
+	// pendingFires buffers subscriber callbacks queued while the lock was
+	// held; ApplyTxn/Tick flush them AFTER unlocking (rust fires outside
+	// the borrow — a callback re-entering the store must not deadlock).
+	pendingFires []notifyFire
+}
+
+// notifyFire is one deferred subscriber callback.
+type notifyFire struct {
+	callback func(wire.JSONValue)
+	value    wire.JSONValue
+}
+
+// takePendingFires drains the deferred callback queue (caller flushes after
+// releasing s.mu).
+func (s *Store) takePendingFires() []notifyFire {
+	fires := s.pendingFires
+	s.pendingFires = nil
+	return fires
 }
 
 // NewStore constructs the engine with the system clock and a constant 0.5

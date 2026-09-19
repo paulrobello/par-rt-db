@@ -36,18 +36,25 @@ const (
 // cached results. The Go mirror of rust mutate + execute_transaction.
 func ApplyTxn(s *Store, txn wire.Transaction, mutID string) ([]wire.StepResult, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if mutID != "" {
 		if cached, ok := s.idempotency[mutID]; ok {
+			s.mu.Unlock()
 			return cached, nil
 		}
 	}
 	results, err := executeTransaction(s, txn)
+	if err == nil && mutID != "" {
+		s.idempotency[mutID] = results
+	}
+	// Subscriber callbacks flush OUTSIDE the lock (rust fires outside the
+	// borrow): a re-entering callback would self-deadlock the mutex.
+	fires := s.takePendingFires()
+	s.mu.Unlock()
+	for _, f := range fires {
+		f.callback(f.value)
+	}
 	if err != nil {
 		return nil, err
-	}
-	if mutID != "" {
-		s.idempotency[mutID] = results
 	}
 	return results, nil
 }
@@ -73,13 +80,13 @@ func worstCaseAffected(txn wire.Transaction) int {
 		switch t := step.(type) {
 		case wire.StepPatchByQuery:
 			limit := maxByQueryRows
-			if t.Limit != nil && *t.Limit < limit {
+			if t.Limit != nil && *t.Limit >= 0 && *t.Limit < limit {
 				limit = *t.Limit
 			}
 			total += limit
 		case wire.StepDeleteByQuery:
 			limit := maxByQueryRows
-			if t.Limit != nil && *t.Limit < limit {
+			if t.Limit != nil && *t.Limit >= 0 && *t.Limit < limit {
 				limit = *t.Limit
 			}
 			total += limit
@@ -160,14 +167,12 @@ func cloneSchedules(jobs []*ScheduledJob) []*ScheduledJob {
 }
 
 // notifySubs re-runs each live subscriber whose table is in the write-set
-// and fires its callback iff the canonical result changed. Query errors are
-// suppressed (a failing subscriber query must not abort the write).
+// and QUEUES its callback iff the canonical result changed — the caller
+// flushes via takePendingFires after releasing s.mu (rust fires outside the
+// borrow; a re-entering callback would deadlock the non-reentrant mutex).
+// Query errors are suppressed (a failing subscriber query must not abort the
+// write).
 func notifySubs(s *Store, writeSet map[string]bool) {
-	type fire struct {
-		callback func(wire.JSONValue)
-		value    wire.JSONValue
-	}
-	var fires []fire
 	var live []*Subscription
 	for _, sub := range s.subscribers {
 		if !sub.alive.get() {
@@ -187,12 +192,9 @@ func notifySubs(s *Store, writeSet map[string]bool) {
 		}
 		sub.last = nextCanon
 		sub.hasLast = true
-		fires = append(fires, fire{callback: sub.Callback, value: next})
+		s.pendingFires = append(s.pendingFires, notifyFire{callback: sub.Callback, value: next})
 	}
 	s.subscribers = live
-	for _, f := range fires {
-		f.callback(f.value)
-	}
 }
 
 // diffCanonical is the push-decision form: the plain canonical for an
@@ -312,6 +314,10 @@ func executeStep(s *Store, step wire.Step) (wire.StepResult, []string, error) {
 		if err != nil {
 			return wire.StepResult{}, nil, err
 		}
+		if t.Limit != nil && *t.Limit < 0 {
+			return wire.StepResult{}, nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+				"limit must be >= 0")
+		}
 		patch, err := wireObject(t.Patch)
 		if err != nil {
 			return wire.StepResult{}, nil, err
@@ -325,6 +331,10 @@ func executeStep(s *Store, step wire.Step) (wire.StepResult, []string, error) {
 		tableDef, err := requireTable(s, t.Table)
 		if err != nil {
 			return wire.StepResult{}, nil, err
+		}
+		if t.Limit != nil && *t.Limit < 0 {
+			return wire.StepResult{}, nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+				"limit must be >= 0")
 		}
 		deleted, truncated, touched, err := deleteByQuery(s, tableDef, t.Table, t.Filter, t.Limit)
 		if err != nil {

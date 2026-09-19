@@ -725,6 +725,18 @@ type StepResult struct {
 	WorkflowID *string `json:"workflowId,omitempty"`
 }
 
+// MarshalJSON emits JSON null for a null step result (patch/delete/
+// expect*/undelete steps carry no payload; the server's untagged
+// StepResult::Null serializes as null, never {}).
+func (r StepResult) MarshalJSON() ([]byte, error) {
+	if r.ID == nil && r.Inserted == nil && r.Patched == nil && r.Truncated == nil &&
+		r.Deleted == nil && r.Cancelled == nil && r.ScheduleID == nil && r.WorkflowID == nil {
+		return []byte("null"), nil
+	}
+	type alias StepResult
+	return json.Marshal(alias(r))
+}
+
 // --- strict-decode wrappers for scalar-only wire structs (fix round 1:
 // unknown-field rejection on every wire type). ---
 
