@@ -868,6 +868,10 @@ pub fn http_api_routes() -> Router<Arc<AppState>> {
         .route("/api/workflows/list", post(list_workflows_handler))
         .route("/api/workflows/{id}/cancel", post(cancel_workflow_handler))
         .route("/api/workflows/{id}/signal", post(signal_workflow_handler))
+        // The pushed SchemaDef for a db, for machine tokens — the admin twin is
+        // `/admin/dbs/{db}/schema`. Serves tooling that holds only a data-plane
+        // credential (the CLI's `import --dry-run` validates lines against it).
+        .route("/api/db/{db}/schema", get(db_schema_handler))
         // Upload bypasses axum's 2 MiB default body limit; `to_bytes` inside
         // the handler enforces `RTDB_MAX_FILE_SIZE` as the sole ceiling.
         .route(
@@ -889,6 +893,20 @@ pub fn http_api_routes() -> Router<Arc<AppState>> {
         // server, by design. The opaque id resolves to its owning db via the
         // global index.
         .route("/storage/{id}", get(serve_public_handler))
+}
+
+/// GET /api/db/{db}/schema — the pushed `SchemaDef`, authorized with the same
+/// per-db bearer the query/mutate routes accept (machine token or session).
+/// Field metadata only — no document bytes — so a table-scoped token may read
+/// the full def; the tables it cannot touch are already enforced per step.
+async fn db_schema_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(db): Path<String>,
+) -> Result<Json<crate::schema::SchemaDef>, RtDbError> {
+    authed(&state, &headers, &db).await?;
+    let schema = state.schemas.get(&state.pool, &db).await?;
+    Ok(Json((*schema).clone()))
 }
 
 #[derive(Serialize)]

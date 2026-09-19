@@ -4,6 +4,7 @@
 
 pub(crate) mod data;
 pub(crate) mod dbs;
+pub(crate) mod import;
 pub(crate) mod ops;
 pub(crate) mod schema;
 pub(crate) mod sessions;

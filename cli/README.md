@@ -74,6 +74,7 @@ Commands:
   query         Run a Query JSON against `--db` and print the result. (machine token)
   watch         Tail a live Query against `--db`: print the initial result, then every subsequent update until Ctrl-C. (machine token)
   mutate        Run a Transaction JSON against `--db` and print step results. (machine token)
+  import        Bulk-load a JSONL file into one table of `--db`: one JSON object per line, sent as bounded insert/upsert transactions with per-batch progress on stderr. (machine token)
   migrate       Apply (or preview with `--dry-run`) a migration directives JSON file to `--db`. (admin)
   explain       Explain a Query's compiled SQL against `--db` without running it. (admin)
   slow-queries  List recent slow queries across the instance. (admin)
@@ -280,6 +281,30 @@ Options:
   -h, --help  Print help
 ```
 
+### `rtdb import`
+
+```text
+Bulk-load a JSONL file into one table of `--db`: one JSON object per line, sent as bounded insert/upsert transactions with per-batch progress on stderr. (machine token)
+
+Usage: rtdb import [OPTIONS] <TABLE> <FILE>
+
+Arguments:
+  <TABLE>  Target table — must exist in the pushed schema
+  <FILE>   Path to a JSONL file: one JSON object per line. Blank lines are skipped but keep counting toward line numbers
+
+Options:
+      --on-conflict <ON_CONFLICT>
+          What an existing row with the same `--key` value does: `update` merges the line's body into the row, `skip` leaves the row untouched. Omit to always insert (the server mints ids)
+      --key <KEY>
+          The single-field index backing `--on-conflict` lookups; every line must carry this field. A unique index is recommended
+      --batch <BATCH>
+          Lines per transaction (default 500, capped at 1000 — the server rejects transactions over 1024 steps)
+      --dry-run
+          Validate every line against the pushed schema without writing
+  -h, --help
+          Print help
+```
+
 ### `rtdb migrate`
 
 ```text
@@ -476,6 +501,38 @@ The closed `cast` set is `toString`/`toNumber`/`toInt64`/`toBoolean`; the option
 the whole migrate back atomically). `evalExpr` is the scoped raw-SQL escape hatch
 (one table's `doc` jsonb, no joins/DDL verbs). See the design spec at
 [`../docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md`](../docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md).
+
+## JSONL import (`rtdb import`)
+
+Bulk-load a seed file into one table of `--db` with a normal machine token —
+no admin key, no per-row shell loop. One JSON object per line; blank lines are
+skipped but keep counting toward line numbers.
+
+```sh
+# Preview: validate every line against the pushed schema without writing.
+rtdb --url $URL --db mydb --token $TOKEN import items seed.jsonl --dry-run
+
+# Load (ids minted by the server):
+rtdb --url $URL --db mydb --token $TOKEN import items seed.jsonl
+
+# Idempotent re-seed keyed on a unique index: update existing rows, add new.
+rtdb --url $URL --db mydb --token $TOKEN import items seed.jsonl \
+  --on-conflict update --key slug
+```
+
+Lines are sent as bounded insert (or upsert) transactions — 500 lines per
+transaction by default, `--batch` to change it (capped at 1000, since the
+server rejects transactions over 1024 steps). Progress goes to stderr; stdout
+stays empty on success so the command composes in scripts.
+
+Failure semantics are deliberate: the first failed batch exits non-zero naming
+its line range (e.g. `batch 3/9 (lines 1001-1500) failed: SCHEMA_VIOLATION:
+…`), and **batches before it stay committed** — the import is chunked, not
+atomic. Re-run with `--dry-run` to find the first offending line, fix the
+file, and import the remainder. `--on-conflict skip` leaves existing rows
+untouched instead of updating them; both conflict modes require `--key`, a
+single-field index on the table (unique recommended — a non-unique key aborts
+the batch when it matches several rows).
 
 ## Workflow runs (`rtdb workflows`)
 

@@ -959,6 +959,24 @@ impl RtDbHttpClient {
         let parsed = crate::http_common::deserialize::<ValidateResponse>(resp).await?;
         Ok(parsed.user)
     }
+
+    /// Fetch the database's pushed `SchemaDef` via `GET /api/db/{db}/schema` —
+    /// the machine-token twin of the admin client's
+    /// [`get_schema`](crate::admin::RtDbAdminClient::get_schema). Serves
+    /// tooling that holds only a data-plane credential (the CLI's
+    /// `import --dry-run` validates lines against it). Named `fetch_schema`
+    /// because the deprecated [`get_schema`](Self::get_schema) shim already
+    /// occupies that name on this type (admin route, admin key).
+    pub async fn fetch_schema(&self) -> Result<crate::schema::SchemaDef, RtDbError> {
+        let resp = self
+            .client
+            .get(format!("{}/api/db/{}/schema", self.url, self.db))
+            .authed(&self.token)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("fetch_schema request failed: {e}")))?;
+        crate::http_common::deserialize::<crate::schema::SchemaDef>(resp).await
+    }
 }
 
 /// Deprecated admin control-plane methods on [`RtDbHttpClient`]. Each delegates

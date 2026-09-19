@@ -116,6 +116,32 @@ pub(crate) enum Command {
         /// file (`@seed.json`).
         txn: String,
     },
+    /// Bulk-load a JSONL file into one table of `--db`: one JSON object per
+    /// line, sent as bounded insert/upsert transactions with per-batch
+    /// progress on stderr. (machine token)
+    Import {
+        /// Target table — must exist in the pushed schema.
+        table: String,
+        /// Path to a JSONL file: one JSON object per line. Blank lines are
+        /// skipped but keep counting toward line numbers.
+        file: PathBuf,
+        /// What an existing row with the same `--key` value does: `update`
+        /// merges the line's body into the row, `skip` leaves the row
+        /// untouched. Omit to always insert (the server mints ids).
+        #[arg(long)]
+        on_conflict: Option<String>,
+        /// The single-field index backing `--on-conflict` lookups; every
+        /// line must carry this field. A unique index is recommended.
+        #[arg(long)]
+        key: Option<String>,
+        /// Lines per transaction (default 500, capped at 1000 — the server
+        /// rejects transactions over 1024 steps).
+        #[arg(long)]
+        batch: Option<usize>,
+        /// Validate every line against the pushed schema without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Apply (or preview with `--dry-run`) a migration directives JSON file to
     /// `--db`. (admin)
     Migrate {
@@ -500,6 +526,68 @@ mod tests {
             };
             assert_eq!(query, arg);
         }
+    }
+
+    #[test]
+    fn parses_import() {
+        // Full form: every flag present.
+        let cli = Cli::try_parse_from([
+            "rtdb",
+            "--url",
+            "http://x",
+            "--db",
+            "d",
+            "--token",
+            "t",
+            "import",
+            "items",
+            "seed.jsonl",
+            "--on-conflict",
+            "update",
+            "--key",
+            "slug",
+            "--batch",
+            "250",
+            "--dry-run",
+        ])
+        .unwrap();
+        let Command::Import {
+            table,
+            file,
+            on_conflict,
+            key,
+            batch,
+            dry_run,
+        } = cli.command
+        else {
+            panic!("expected Import");
+        };
+        assert_eq!(table, "items");
+        assert_eq!(file, PathBuf::from("seed.jsonl"));
+        assert_eq!(on_conflict.as_deref(), Some("update"));
+        assert_eq!(key.as_deref(), Some("slug"));
+        assert_eq!(batch, Some(250));
+        assert!(dry_run);
+
+        // Bare form: positional table + file only.
+        let cli = Cli::try_parse_from([
+            "rtdb", "--url", "http://x", "--db", "d", "--token", "t", "import", "items", "f.jsonl",
+        ])
+        .unwrap();
+        let Command::Import {
+            on_conflict,
+            key,
+            batch,
+            dry_run,
+            ..
+        } = cli.command
+        else {
+            panic!("expected Import");
+        };
+        assert_eq!(on_conflict, None);
+        assert_eq!(key, None);
+        assert_eq!(batch, None);
+        assert!(!dry_run);
     }
 
     #[test]

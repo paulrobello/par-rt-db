@@ -15,7 +15,7 @@ path = "src/main.rs"
 # `ws` powers `rtdb watch` (the reactive subscribe); `signal` powers its
 # Ctrl-C arm. Both are declared here rather than leaned on via workspace
 # feature unification, so a standalone build of this crate still compiles.
-par-rt-db-client = { path = "../rust-client", features = ["http", "admin", "ws"] }
+par-rt-db-client = { path = "../rust-client", features = ["http", "admin", "ws", "in_memory"] }
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { workspace = true, features = [
     "macros",

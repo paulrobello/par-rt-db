@@ -508,3 +508,157 @@ fn cli_ops_watch_bad_admin_key_prints_error_envelope() {
         .failure()
         .stderr(contains("UNAUTHORIZED"));
 }
+
+/// Count the `items` rows through a machine-token query (`count` terminal →
+/// bare integer stdout).
+fn count_items(url: &str, db: &str, token: &str) -> u64 {
+    let out = rtdb(url)
+        .arg("--db")
+        .arg(db)
+        .arg("--token")
+        .arg(token)
+        .arg("query")
+        .arg(r#"{"table":"items","count":true}"#)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&out).expect("count terminal prints a bare integer")
+}
+
+/// Write a JSONL seed file of `rows` lines: `{"name":"row <i>","n":<i>}`.
+fn write_seed(path: &std::path::Path, rows: u32) {
+    use std::fmt::Write as _;
+    let mut body = String::new();
+    for i in 0..rows {
+        writeln!(&mut body, r#"{{"name":"row {i}","n":{i}}}"#).unwrap();
+    }
+    std::fs::write(path, body).expect("write seed file");
+}
+
+/// `rtdb import` end to end: a multi-thousand-line JSONL loads in chunked
+/// transactions with per-batch progress on stderr; `--on-conflict update`
+/// re-imports without duplicating; a bad line mid-file fails naming the line
+/// range while the earlier batch stays committed; `--dry-run` rejects the
+/// same line without writing anything.
+#[test]
+#[ignore = "set RTDB_TEST_SERVER_URL + RTDB_TEST_ADMIN_KEY and run with --ignored"]
+fn cli_import_round_trip() {
+    let Some((url, admin_key)) = env() else {
+        return;
+    };
+    let (db, token) = provision(&url, &admin_key);
+
+    // 1200 rows at batch 500 → three transactions (500 + 500 + 200).
+    let seed = std::env::temp_dir().join(format!("rtdb-cli-live-seed-{}.jsonl", unique_suffix()));
+    write_seed(&seed, 1200);
+    rtdb(&url)
+        .arg("--db")
+        .arg(&db)
+        .arg("--token")
+        .arg(&token)
+        .arg("import")
+        .arg("items")
+        .arg(&seed)
+        .arg("--batch")
+        .arg("500")
+        .assert()
+        .success()
+        .stderr(contains("batch 1/3 committed (500/1200 rows)"))
+        .stderr(contains("batch 2/3 committed (1000/1200 rows)"))
+        .stderr(contains("batch 3/3 committed (1200/1200 rows)"))
+        .stderr(contains("done — 1200 rows"))
+        .stdout(predicates::str::is_empty());
+    assert_eq!(count_items(&url, &db, &token), 1200);
+
+    // --on-conflict update keyed on `n` re-imports the same rows (bodies
+    // merged, no duplicates) alongside 5 genuinely new ones.
+    let updated = std::env::temp_dir().join(format!("rtdb-cli-live-upd-{}.jsonl", unique_suffix()));
+    write_seed(&updated, 1205);
+    rtdb(&url)
+        .arg("--db")
+        .arg(&db)
+        .arg("--token")
+        .arg(&token)
+        .arg("import")
+        .arg("items")
+        .arg(&updated)
+        .arg("--on-conflict")
+        .arg("update")
+        .arg("--key")
+        .arg("n")
+        .assert()
+        .success();
+    assert_eq!(count_items(&url, &db, &token), 1205);
+
+    // --dry-run validates without writing: a valid file passes; one bad line
+    // fails naming the line number, and nothing lands in the table either way.
+    rtdb(&url)
+        .arg("--db")
+        .arg(&db)
+        .arg("--token")
+        .arg(&token)
+        .arg("import")
+        .arg("items")
+        .arg(&updated)
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(contains("1205 lines valid against table 'items'"));
+
+    let dry_bad =
+        std::env::temp_dir().join(format!("rtdb-cli-live-drybad-{}.jsonl", unique_suffix()));
+    std::fs::write(
+        &dry_bad,
+        "{\"name\":\"ok\",\"n\":1}\n{\"name\":\"bad\",\"nope\":true}\n",
+    )
+    .unwrap();
+    rtdb(&url)
+        .arg("--db")
+        .arg(&db)
+        .arg("--token")
+        .arg(&token)
+        .arg("import")
+        .arg("items")
+        .arg(&dry_bad)
+        .arg("--dry-run")
+        .assert()
+        .failure()
+        .stderr(contains("line 2"));
+    assert_eq!(count_items(&url, &db, &token), 1205);
+
+    // A schema-invalid line mid-file fails its batch naming the line range;
+    // the first batch (lines 1-500) stays committed.
+    let (db2, token2) = provision(&url, &admin_key);
+    let mut body = String::new();
+    for i in 0..900 {
+        if i == 600 {
+            body.push_str("{\"name\":\"bad\",\"unknown_field\":1}\n");
+        } else {
+            body.push_str(format!("{{\"name\":\"row {i}\",\"n\":{i}}}\n").as_str());
+        }
+    }
+    let mid_bad =
+        std::env::temp_dir().join(format!("rtdb-cli-live-midbad-{}.jsonl", unique_suffix()));
+    std::fs::write(&mid_bad, body).unwrap();
+    rtdb(&url)
+        .arg("--db")
+        .arg(&db2)
+        .arg("--token")
+        .arg(&token2)
+        .arg("import")
+        .arg("items")
+        .arg(&mid_bad)
+        .arg("--batch")
+        .arg("500")
+        .assert()
+        .failure()
+        .stderr(contains("batch 2/2 (lines 501-900) failed"))
+        .stderr(contains("remain committed"));
+    assert_eq!(count_items(&url, &db2, &token2), 500);
+
+    for path in [&seed, &updated, &dry_bad, &mid_bad] {
+        std::fs::remove_file(path).ok();
+    }
+}

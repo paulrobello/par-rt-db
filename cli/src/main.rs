@@ -64,6 +64,25 @@ async fn dispatch(cli: &Cli) -> Result<()> {
         Command::Query { query } => commands::data::run_query(cli, query).await,
         Command::Watch { query } => commands::data::run_watch(cli, query).await,
         Command::Mutate { txn } => commands::data::run_mutate(cli, txn).await,
+        Command::Import {
+            table,
+            file,
+            on_conflict,
+            key,
+            batch,
+            dry_run,
+        } => {
+            commands::import::run_import(
+                cli,
+                table,
+                file,
+                on_conflict.as_deref(),
+                key.as_deref(),
+                batch.unwrap_or(commands::import::DEFAULT_BATCH),
+                *dry_run,
+            )
+            .await
+        }
         Command::Migrate { file, dry_run } => {
             commands::schema::run_migrate(cli, file, *dry_run).await
         }
