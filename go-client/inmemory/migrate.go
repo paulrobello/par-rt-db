@@ -106,6 +106,10 @@ func cloneTableDef(in *TableDef) *TableDef {
 			out.Indexes[i].WhereClause = cloneFilterExpr(in.Indexes[i].WhereClause)
 		}
 	}
+	if in.TTL != nil {
+		ttl := *in.TTL
+		out.TTL = &ttl
+	}
 	if in.OwnerField != nil {
 		v := *in.OwnerField
 		out.OwnerField = &v
@@ -756,7 +760,9 @@ func tableDefToWire(td *TableDef) (wire.JSONValue, error) {
 		fields[name] = fv
 	}
 	out["fields"] = fields
-	if len(td.Indexes) > 0 {
+	{
+		// The server's derived-schema serialization always carries indexes
+		// (an empty Vec serializes as []), so the migrate result does too.
 		indexes := wire.Array{}
 		for _, idx := range td.Indexes {
 			io := wire.Object{"name": wire.String(idx.Name), "fields": strArrayWire(idx.Fields)}
