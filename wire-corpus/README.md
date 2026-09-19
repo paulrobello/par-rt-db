@@ -6,7 +6,7 @@ implementations honest against each other. Three artifacts live here:
 - [`golden-vector.json`](golden-vector.json) — the **wire/behavior parity
   vector** for the query DSL over one shared seeded dataset (added by
   QA-001/QA-103). Catches wire-shape, sort-comparator, boundary, terminal, and
-  filter-semantics divergence across the five implementations.
+  filter-semantics divergence across the six implementations.
 - [`semantics/`](semantics/) — the **behavioral-semantics corpus** (ENH-023):
   one JSON file per case, each self-contained (own schema + seed + operation +
   expected result), covering behavior the golden vector does not — transactions
@@ -16,14 +16,14 @@ implementations honest against each other. Three artifacts live here:
 - [`wire-corpus.json`](wire-corpus.json) — the **wire-shape parity corpus**
   (ARC-008): client/server messages, authed users, schedule whens/infos, and
   queries that every wire implementation must encode/decode value-identically —
-  and the same unknown fields must be rejected. Run by the server and all four
-  clients (ts/rust/python/swift), so a drifted wire type fails whichever
+  and the same unknown fields must be rejected. Run by the server and all five
+  clients (ts/rust/python/swift/go), so a drifted wire type fails whichever
   package drifted.
 - [`error-codes.json`](error-codes.json) — the **error-code parity corpus**
   (ARC-017): the full `{code, httpStatus}` list for every `RtDbError` wire
   code, generated from `server/src/error.rs`'s `ErrorCode` enum. The
-  `ErrorCode` enum is a sixth hand-mirrored surface (server + four clients);
-  this corpus is what checks the five lists actually agree, so a code added to
+  `ErrorCode` enum is a seventh hand-mirrored surface (server + five clients);
+  this corpus is what checks the six lists actually agree, so a code added to
   the server can't silently go unknown to a client. See
   [Error-code parity](#error-code-parity) below.
 - [`query-combinations.json`](query-combinations.json) — the **query
@@ -36,12 +36,12 @@ implementations honest against each other. Three artifacts live here:
   pins* the rules every runner's hand-written checker already enforces
   (`compile_query` on the server; `check_query_combinations`/
   `checkQueryCombinations`/`_check_query_combinations` plus each engine's
-  terminal executors on the four clients) — a later phase replaces those five
+  terminal executors on the five clients) — a later phase replaces those six
   checkers with one evaluator that reads this table. See
   [Query combination rules](#query-combination-rules) below.
 
-**Runner scope:** the server and all four client in-memory engines
-(`ts-client`, `rust-client`, `python-client`, `swift-client`) execute
+**Runner scope:** the server and all five client in-memory engines
+(`ts-client`, `rust-client`, `python-client`, `swift-client`, `go-client`) execute
 `golden-vector.json` and `semantics/`; every client also runs
 `wire-corpus.json` (the swift client has since it landed; the semantics and
 golden-vector runners shipped with its in-memory engine on 2026-08-19).
@@ -69,11 +69,11 @@ exercising the new behavior — in the same change.** This mirrors the
 long-standing golden-vector convention (see the PR checklist in
 [`CONTRIBUTING.md`](../CONTRIBUTING.md)): the corpus is the source of truth for
 cross-engine agreement, and an uncovered behavior is a standing regression risk
-for the other four engines. A semantics change without a fixture fails review
+for the other five engines. A semantics change without a fixture fails review
 the same way an untested code change does.
 
 When a behavior is already pinned by a case, CHANGE the existing case in the
-same commit as the server change — all five runners consume the files directly,
+same commit as the server change — all six runners consume the files directly,
 so a deliberate semantic flip turns exactly the cases that pinned the old
 behavior red until the fixture is updated. Never delete a case to make a runner
 green; either the client is wrong or the fixture is stale.
@@ -97,7 +97,7 @@ JSON object:
 | `normalize` | no | Keys projected out of both the actual and expected trees before comparison — the projection applies RECURSIVELY to every object in both trees (docs nested inside `paginate.docs`, step results, ...). Defaults to `["_id", "_creationTime", "_version"]` when absent; a present list REPLACES the default (txn cases add `"id"` for minted step-result ids). |
 | `expect_next_cursor` | paginate cases | `true`/`false`: assert the `paginate` result carries (or omits) a `nextCursor`. The cursor value itself is generated and never compared. Required on every paginate case whose `expect` is a result (a paginate error case asserts the error instead and carries no `expect_next_cursor`). |
 | `then` | no | `{"query": <Query DSL>, "expect": ..., "unordered"?, "normalize"?}` — a follow-up read executed after `op` succeeds and its `expect` has been checked. For write-then-read visibility cases (soft delete, defaults, upsert-patch). Inherits the case-level `normalize` unless it gives its own. `then` runs only after `op` SUCCEEDS; an error case (`expect` is `{"error": ...}`) must not carry `then` (runners do not execute it there). |
-| `skip` | no | `{"ts" \| "rust" \| "python" \| "server" \| "swift": "reason"}` — a named runner may skip the case, loudly, until the gap is closed. Absent means every runner must execute the case. |
+| `skip` | no | `{"ts" \| "rust" \| "python" \| "server" \| "swift" \| "go": "reason"}` — a named runner may skip the case, loudly, until the gap is closed. Absent means every runner must execute the case. |
 
 ### `expect` shapes
 
@@ -269,7 +269,8 @@ or change its HTTP status) ships with an update to `error-codes.json` in the
 same commit, and a matching update to every client's error-code type
 (`ts-client/src/errors.ts`, `rust-client/src/error.rs`,
 `python-client/src/par_rt_db/errors.py`,
-`swift-client/Sources/ParRtDbClient/Errors.swift`). This mirrors the semantics
+`swift-client/Sources/ParRtDbClient/Errors.swift`, and the Go client's
+`go-client/errors/errors.go`). This mirrors the semantics
 corpus's authoring rule above.
 
 **Enforcement:**
@@ -279,28 +280,30 @@ corpus's authoring rule above.
   catch-all arm — so adding a variant fails the crate to compile until the
   match (and `RtDbError::status`, itself already exhaustive) is updated; the
   test then diffs the regenerated table against the committed JSON.
-- **Clients**: each of the four client corpus test files
+- **Clients**: each of the five client corpus test files
   (`rust-client/tests/wire_corpus.rs`, `ts-client/tests/wire-corpus.test.ts`,
   `python-client/tests/test_wire_parity.py`,
-  `swift-client/Tests/ParRtDbClientTests/WireCorpusTests.swift`) asserts every
+  `swift-client/Tests/ParRtDbClientTests/WireCorpusTests.swift`,
+  `go-client/wire/wire_corpus_test.go` + `go-client/wire/error_codes_test.go`) asserts every
   corpus code is known to that client's error-code type, and vice versa
   (Python's `StrEnum` and Swift's `CaseIterable` enumerate their own variants
   automatically; TS and Rust hand-maintain a parallel `ALL` list, so a
   forgotten update there is a test-time catch, not a compile-time one). Python
   additionally asserts its per-code HTTP status against `httpStatus`
-  (`RtDbError.status_code`); TS and Rust don't model an HTTP status per code,
+  (`RtDbError.status_code`); the Go client asserts it too (`errors.HTTPStatus`);
+TS and Rust don't model an HTTP status per code,
   so they check the code set only.
 
 ## Query combination rules
 
 `query-combinations.json` is the declarative source of truth for which
 clauses of the read `Query` DSL may not be set together — the rule set that
-`server/src/query/mod.rs`/`terminals.rs`'s `compile_query`, the four clients'
+`server/src/query/mod.rs`/`terminals.rs`'s `compile_query`, the five clients'
 `check_query_combinations`/`checkQueryCombinations`/
 `_check_query_combinations` (plus, in every client, the `get`/`vectorSearch`/
 `hybridSearch`/`search` terminal-executor guards those functions don't own),
 and swift's mirror all hand-enforce today. It is not itself executed by any
-runner yet (that lands in a later phase, replacing the five hand-written
+runner yet (that lands in a later phase, replacing the six hand-written
 checkers with one evaluator reading this table); today it exists purely to
 **document and pin** the union of those rules with a corpus case per rule, so
 a rule silently added to one checker and missed in another shows up as a

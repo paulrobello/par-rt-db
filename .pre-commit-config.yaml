@@ -50,3 +50,17 @@ repos:
         language: system
         files: ^python-client/.*\.py$
         pass_filenames: false
+      # gofmt + go vet over the go-client module (the stdlib-only dep guard
+      # lives in `make go-client-lint`, too slow for a pre-commit hook).
+      - id: gofmt-go-client
+        name: gofmt (go-client)
+        entry: bash -c 'cd go-client && test -z "$(gofmt -l .)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }'
+        language: system
+        files: ^go-client/.*\.go$
+        pass_filenames: false
+      - id: go-vet-go-client
+        name: go vet (go-client)
+        entry: bash -c 'cd go-client && go vet ./...'
+        language: system
+        files: ^go-client/.*\.go$
+        pass_filenames: false

@@ -32,11 +32,12 @@ par-rt-db is a monorepo with **eight packages** built from one root `Makefile`:
 | Rust client | `rust-client/` | Rust (`par-rt-db-client`) |
 | Python client | `python-client/` | Python (`par-rt-db`, uv) |
 | Swift client | `swift-client/` | Swift (`ParRtDbClient`/`ParRtDbUI`, swift) |
+| Go client | `go-client/` | Go (`github.com/paulrobello/par-rt-db/go-client`) |
 | Dashboard | `dashboard/` | Vite + React 19 + TS (bun) |
 | `rtdb` CLI | `cli/` | Rust (`rtdb` binary, cargo; wraps `par-rt-db-client`) |
 
 The server is the source of truth for the wire protocol and the DSL; the four
-client SDKs (`ts-client`, `rust-client`, `python-client`, `swift-client`)
+client SDKs (`ts-client`, `rust-client`, `python-client`, `swift-client`, `go-client`)
 mirror it — five implementations of one wire contract.
 [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) tracks parity
 against Convex with per-row notes on which clients mirror each feature.
@@ -51,6 +52,7 @@ You need `docker` (for the dev Postgres), `cargo` (Rust stable), `bun`, and
 make dev-db-up
 
 # 2. Install per-package dependencies (first time only).
+make go-client-install
 make ts-client-install
 make dashboard-install
 make python-client-install
