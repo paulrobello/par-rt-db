@@ -4,6 +4,7 @@
 package inmemory
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/paulrobello/par-rt-db/go-client/dsl"
@@ -115,4 +116,34 @@ func floatToJSONText(f float64) string {
 		return formatI64(int64(f))
 	}
 	return formatFloatText(f)
+}
+
+// seedRow inserts a stored row directly — the evaluator tests exercise
+// EvalQuery in isolation; the write path gets its own end-to-end tests with
+// the writes task (rust's ports go through mutate, which does not exist
+// until then; the row shape here is mergeDoc's input contract).
+var seedCounter uint64
+
+func seedRow(t testingTB, s *Store, table string, createdAt int64, doc wire.Object) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seedCounter++
+	// 32-char lowercase-hex id, unique per seeded row (the real clock +
+	// constant RNG would collide same-millisecond rows in the docs map).
+	id := fmt.Sprintf("%032x", seedCounter)
+	s.docs[rowKey{Table: table, ID: id}] = &StoredRow{
+		ID:        id,
+		Doc:       doc,
+		Version:   1,
+		CreatedAt: createdAt,
+	}
+	return id
+}
+
+// seedThreeRows mirrors tests/mod.rs seed_query_rows: order 3, 1, 2 so an
+// ascending sort differs from insertion order.
+func seedThreeRows(t testingTB, s *Store) {
+	seedRow(t, s, "items", 100, docObj("name", "n3", "status", "todo", "order", int64(3)))
+	seedRow(t, s, "items", 200, docObj("name", "n1", "status", "todo", "order", int64(1)))
+	seedRow(t, s, "items", 300, docObj("name", "n2", "status", "todo", "order", int64(2)))
 }
