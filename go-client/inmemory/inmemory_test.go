@@ -106,6 +106,8 @@ func mustJSON(v any) wire.JSONValue {
 		return wire.Number(formatI64(t))
 	case float64:
 		return wire.Number(floatToJSONText(t))
+	case wire.JSONValue:
+		return t
 	default:
 		panic("mustJSON: unsupported kind")
 	}
