@@ -7,13 +7,13 @@ package httpclient
 // /storage/{id}; admin/managed routes live under /api/storage/{db}.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
-	"strings"
 
 	"github.com/paulrobello/par-rt-db/go-client/wire"
 )
@@ -95,11 +95,21 @@ func (c *Client) UploadBytes(ctx context.Context, contentType string, data []byt
 	return &out, nil
 }
 
-// Download streams the file's bytes from the public serve route.
+// Download streams the file's bytes from the public serve route. Non-2xx
+// responses are surfaced as *errors.RtDbError, never as a body the caller
+// could mistake for the payload.
 func (c *Client) Download(ctx context.Context, id string) (io.ReadCloser, error) {
 	resp, err := c.doRawResponse(ctx, http_GET, "/storage/"+id, "", nil)
 	if err != nil {
 		return nil, err
+	}
+	if resp.StatusCode >= 400 {
+		defer resp.Body.Close()
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("httpclient: read error body: %w", err)
+		}
+		return nil, envelopeError(resp.StatusCode, data)
 	}
 	return resp.Body, nil
 }
@@ -176,8 +186,8 @@ func (c *Client) doRaw(ctx context.Context, method, path, contentType string, bo
 	if err != nil {
 		return err
 	}
-	data, err := io.ReadAll(resp.Body)
 	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("httpclient: read response: %w", err)
 	}
@@ -198,7 +208,7 @@ func (c *Client) doRawResponse(ctx context.Context, method, path, contentType st
 		return nil, fmt.Errorf("httpclient: build request: %w", err)
 	}
 	if body != nil {
-		req.Body = io.NopCloser(strings.NewReader(string(body)))
+		req.Body = io.NopCloser(bytes.NewReader(body))
 		req.ContentLength = int64(len(body))
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)

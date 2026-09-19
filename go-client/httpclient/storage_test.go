@@ -74,3 +74,19 @@ func TestDownloadAndDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestDownloadErrorSurfacesAsRtDbError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"code":"NOT_FOUND","message":"gone"}`))
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "d1", "tk")
+	_, err := c.Download(context.Background(), "missing")
+	if err == nil {
+		t.Fatal("404 download must error")
+	}
+	if err.Error() != "NOT_FOUND: gone" {
+		t.Fatalf("error %q", err.Error())
+	}
+}
