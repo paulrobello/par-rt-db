@@ -166,3 +166,50 @@ const (
 	ScheduleStatusPaused  ScheduleStatus = "paused"
 	ScheduleStatusError   ScheduleStatus = "error"
 )
+
+// --- strict-decode wrappers for scalar-only wire structs (fix round 1:
+// unknown-field rejection on every wire type). ---
+
+// UnmarshalJSON rejects unknown fields.
+func (u *AuthedUser) UnmarshalJSON(b []byte) error {
+	type alias AuthedUser
+	v, err := StrictUnmarshal[alias](b)
+	if err != nil {
+		return err
+	}
+	*u = AuthedUser(v)
+	return nil
+}
+
+// UnmarshalJSON rejects unknown fields.
+func (e *ErrorEnvelope) UnmarshalJSON(b []byte) error {
+	type alias ErrorEnvelope
+	v, err := StrictUnmarshal[alias](b)
+	if err != nil {
+		return err
+	}
+	*e = ErrorEnvelope(v)
+	return nil
+}
+
+// UnmarshalJSON rejects unknown fields.
+func (w *WorkflowInfo) UnmarshalJSON(b []byte) error {
+	type alias WorkflowInfo
+	v, err := StrictUnmarshal[alias](b)
+	if err != nil {
+		return err
+	}
+	*w = WorkflowInfo(v)
+	return nil
+}
+
+// UnmarshalJSON rejects unknown fields.
+func (s *ScheduleInfo) UnmarshalJSON(b []byte) error {
+	type alias ScheduleInfo
+	v, err := StrictUnmarshal[alias](b)
+	if err != nil {
+		return err
+	}
+	*s = ScheduleInfo(v)
+	return nil
+}

@@ -97,6 +97,24 @@ func TestQueryRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStrictDecodePins(t *testing.T) {
+	var p Paginate
+	if err := json.Unmarshal([]byte(`{"numItems":5,"bogus":1}`), &p); err == nil {
+		t.Fatal("Paginate must reject unknown fields")
+	}
+	var agg AggregateGroup
+	if err := json.Unmarshal([]byte(`{"key":"k1","value":42}`), &agg); err != nil {
+		t.Fatal(err)
+	}
+	if agg.Key != JSONValue(String("k1")) || agg.Value != JSONValue(Number("42")) {
+		t.Fatalf("group row decode: %+v", agg)
+	}
+	var h HybridSearchQuery
+	if err := json.Unmarshal([]byte(`{"query":"q","vector":[1],"limit":3,"bogus":1}`), &h); err == nil {
+		t.Fatal("HybridSearchQuery must reject unknown fields")
+	}
+}
+
 func strptr(s string) *string { return &s }
 func intptr(i int) *int       { return &i }
 func bytesContains(b []byte, s string) bool {

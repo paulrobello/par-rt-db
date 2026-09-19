@@ -715,10 +715,57 @@ func UnmarshalStep(data []byte) (Step, error) {
 type StepResult struct {
 	ID         *string `json:"id,omitempty"`
 	Inserted   *bool   `json:"inserted,omitempty"`
-	Patched    *int    `json:"patched,omitempty"`
+	Patched    *int64  `json:"patched,omitempty"`
 	Truncated  *bool   `json:"truncated,omitempty"`
-	Deleted    *int    `json:"deleted,omitempty"`
+	Deleted    *int64  `json:"deleted,omitempty"`
 	Cancelled  *bool   `json:"cancelled,omitempty"`
 	ScheduleID *string `json:"scheduleId,omitempty"`
 	WorkflowID *string `json:"workflowId,omitempty"`
+}
+
+// --- strict-decode wrappers for scalar-only wire structs (fix round 1:
+// unknown-field rejection on every wire type). ---
+
+// UnmarshalJSON rejects unknown fields.
+func (w *WorkflowSpec) UnmarshalJSON(b []byte) error {
+	type alias WorkflowSpec
+	v, err := StrictUnmarshal[alias](b)
+	if err != nil {
+		return err
+	}
+	*w = WorkflowSpec(v)
+	return nil
+}
+
+// UnmarshalJSON rejects unknown fields.
+func (w *WorkflowStepSpec) UnmarshalJSON(b []byte) error {
+	type alias WorkflowStepSpec
+	v, err := StrictUnmarshal[alias](b)
+	if err != nil {
+		return err
+	}
+	*w = WorkflowStepSpec(v)
+	return nil
+}
+
+// UnmarshalJSON rejects unknown fields.
+func (s *StepRetry) UnmarshalJSON(b []byte) error {
+	type alias StepRetry
+	v, err := StrictUnmarshal[alias](b)
+	if err != nil {
+		return err
+	}
+	*s = StepRetry(v)
+	return nil
+}
+
+// UnmarshalJSON rejects unknown fields.
+func (a *AwaitSignalSpec) UnmarshalJSON(b []byte) error {
+	type alias AwaitSignalSpec
+	v, err := StrictUnmarshal[alias](b)
+	if err != nil {
+		return err
+	}
+	*a = AwaitSignalSpec(v)
+	return nil
 }

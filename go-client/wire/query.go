@@ -266,3 +266,60 @@ func (v *VectorSearchQuery) UnmarshalJSON(b []byte) error {
 	}
 	return nil
 }
+
+// --- strict-decode wrappers for scalar-only wire structs (unknown-field
+// rejection on every wire type; decode still invokes nested methods). ---
+
+// UnmarshalJSON rejects unknown fields.
+func (p *Paginate) UnmarshalJSON(b []byte) error {
+	type alias Paginate
+	v, err := StrictUnmarshal[alias](b)
+	if err != nil {
+		return err
+	}
+	*p = Paginate(v)
+	return nil
+}
+
+// UnmarshalJSON rejects unknown fields.
+func (a *AggregateSpec) UnmarshalJSON(b []byte) error {
+	type alias AggregateSpec
+	v, err := StrictUnmarshal[alias](b)
+	if err != nil {
+		return err
+	}
+	*a = AggregateSpec(v)
+	return nil
+}
+
+// UnmarshalJSON rejects unknown fields.
+func (h *HybridSearchQuery) UnmarshalJSON(b []byte) error {
+	type alias HybridSearchQuery
+	v, err := StrictUnmarshal[alias](b)
+	if err != nil {
+		return err
+	}
+	*h = HybridSearchQuery(v)
+	return nil
+}
+
+// UnmarshalJSON converts the dynamic key/value cells.
+func (g *AggregateGroup) UnmarshalJSON(b []byte) error {
+	r, err := StrictUnmarshal[struct {
+		Key   json.RawMessage `json:"key"`
+		Value json.RawMessage `json:"value"`
+	}](b)
+	if err != nil {
+		return err
+	}
+	k, err := UnmarshalJSON(r.Key)
+	if err != nil {
+		return err
+	}
+	val, err := UnmarshalJSON(r.Value)
+	if err != nil {
+		return err
+	}
+	g.Key, g.Value = k, val
+	return nil
+}
