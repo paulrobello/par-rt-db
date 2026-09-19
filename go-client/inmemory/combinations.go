@@ -1,21 +1,23 @@
 // Query-combination rule evaluator — the Go port of core/src/query_combinations.rs,
-// driven by the same wire-corpus/query-combinations.json table the server and
-// rust client embed. The corpus file lives outside this module, so it is
-// resolved relative to this source file at first use (the same mechanism the
-// corpus runners use); a missing or malformed table is a loud INTERNAL error,
-// never a silent pass.
+// driven by a compile-time EMBEDDED copy of wire-corpus/query-combinations.json
+// (the same table the server and rust client embed). The wire-corpus drift
+// test asserts the embedded copy stays byte-identical with the repo fixture,
+// so the fixture remains the single source of truth while the module works
+// standalone from the module cache (a runtime sibling-file load would break
+// every consumer outside this repo).
 package inmemory
 
 import (
+	_ "embed"
 	"encoding/json"
-	"os"
-	"path/filepath"
-	"runtime"
 	"sync"
 
 	rtdberrors "github.com/paulrobello/par-rt-db/go-client/errors"
 	"github.com/paulrobello/par-rt-db/go-client/wire"
 )
+
+//go:embed query_combinations.json
+var embeddedRulesJSON []byte
 
 // maxTake caps take/collect/paginate page sizes (server MAX_TAKE).
 const maxTake = 4096
@@ -44,19 +46,8 @@ var (
 
 func loadRules() (*ruleTable, error) {
 	rulesOnce.Do(func() {
-		_, thisFile, _, ok := runtime.Caller(0)
-		if !ok {
-			rulesErr = rtdberrors.New(rtdberrors.CodeInternal, "cannot resolve query-combinations.json path")
-			return
-		}
-		path := filepath.Join(filepath.Dir(thisFile), "..", "..", "wire-corpus", "query-combinations.json")
-		data, err := os.ReadFile(path)
-		if err != nil {
-			rulesErr = rtdberrors.New(rtdberrors.CodeInternal, "read query-combinations.json: "+err.Error())
-			return
-		}
 		var t ruleTable
-		if err := json.Unmarshal(data, &t); err != nil {
+		if err := json.Unmarshal(embeddedRulesJSON, &t); err != nil {
 			rulesErr = rtdberrors.New(rtdberrors.CodeInternal, "parse query-combinations.json: "+err.Error())
 			return
 		}

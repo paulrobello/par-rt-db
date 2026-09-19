@@ -14,8 +14,6 @@ import (
 	"github.com/paulrobello/par-rt-db/go-client/wire"
 )
 
-// newIDID is retained for reference; newID lives in subscription.go.
-
 // envelopeToRtDb converts a wire error envelope into the shared error type.
 func envelopeToRtDb(e wire.ErrorEnvelope) *rtdberrors.RtDbError {
 	return &rtdberrors.RtDbError{

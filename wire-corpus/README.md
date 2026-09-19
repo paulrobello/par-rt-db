@@ -302,8 +302,10 @@ clauses of the read `Query` DSL may not be set together — the rule set that
 `check_query_combinations`/`checkQueryCombinations`/
 `_check_query_combinations` (plus, in every client, the `get`/`vectorSearch`/
 `hybridSearch`/`search` terminal-executor guards those functions don't own),
-and swift's mirror all hand-enforce today. It is not itself executed by any
-runner yet (that lands in a later phase, replacing the six hand-written
+swift's mirror hand-enforce today, and the Go client's in-memory engine
+(`go-client/inmemory/combinations.go`) already evaluates this exact table at
+runtime. The plan to replace the remaining hand-written checkers with this one
+evaluator
 checkers with one evaluator reading this table); today it exists purely to
 **document and pin** the union of those rules with a corpus case per rule, so
 a rule silently added to one checker and missed in another shows up as a

@@ -5,6 +5,7 @@
 package inmemory
 
 import (
+	"bytes"
 	"encoding/json"
 	"math"
 	"strconv"
@@ -140,6 +141,19 @@ func jsNumberString(f float64) string {
 	return strconv.FormatFloat(f, 'g', -1, 64)
 }
 
+// compactJSON renders a value as compact JSON WITHOUT HTML escaping —
+// encoding/json escapes <, >, & by default, which rust's serde to_string does
+// not, so text extraction must not either (M6).
+func compactJSON(v wire.JSONValue) (string, bool) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return "", false
+	}
+	return strings.TrimSuffix(buf.String(), "\n"), true
+}
+
 // valueText is the SQL `doc->>'field'` text extraction: nil means SQL NULL
 // (JSON null). Objects/arrays render as COMPACT JSON with keys sorted
 // (encoding/json marshals maps in sorted key order — the convention the
@@ -158,11 +172,8 @@ func valueText(v wire.JSONValue) (string, bool) {
 		}
 		return "false", true
 	default:
-		b, err := json.Marshal(v)
-		if err != nil {
-			return "", false
-		}
-		return string(b), true
+		text, ok := compactJSON(v)
+		return text, ok
 	}
 }
 

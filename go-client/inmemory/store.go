@@ -57,7 +57,7 @@ type Store struct {
 	// non-paused entries.
 	scheduledJobs []*ScheduledJob
 	// subscribers re-run their query on writes to affected tables.
-	subscribers []*Subscription
+	subscribers []*storeSubscription
 	// storage is the file-upload stub: per-id blobs.
 	storage map[string]*StoredBlob
 	// pendingFires buffers subscriber callbacks queued while the lock was

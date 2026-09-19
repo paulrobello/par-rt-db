@@ -24,6 +24,7 @@ way).
 | `wsclient` | Reactive WebSocket client over `/sync`: live-query subscriptions with snapshot channels, presence, mutate-over-WS, reconnect/backoff/dedupe. |
 | `admin` | The `/admin/*` control plane: db lifecycle, schema push/preview, tokens, sessions, webhooks, backups, ops feed, admin query/mutate, workflows, schedules, storage, anonymous access. |
 | `inmemory` | The in-memory engine (`inmemory.Client`) — the same usage surface as httpclient/wsclient with server-identical semantics for tests (schema validation, queries, transactions, migrate, scheduler, presence, subscriptions). |
+| `optimistic` | Optimistic-update layer: compose over any `MutationApplier` (httpclient or wsclient) with `optimistic.New`; the wsclient composition is manual (no wsclient option yet). |
 | `internal/corpus` | The wire-corpus semantics runner harness (internal; drives the engine in the repo's corpus tests). |
 
 ## Install

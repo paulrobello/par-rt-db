@@ -72,6 +72,10 @@ func (c *Client) Subscribe(ctx context.Context, q wire.Query) (*Subscription, er
 	if err != nil {
 		return nil, err
 	}
+	// One critical section across the dedupe check AND registration: two
+	// concurrent identical Subscribes must not both miss the check and
+	// double-register (the second registration would overwrite byKey, so the
+	// first handle's Close would delete the second's dedupe entry).
 	c.subsMu.Lock()
 	if existing := c.byKey[key]; existing != nil {
 		existing.mu.Lock()
@@ -80,7 +84,6 @@ func (c *Client) Subscribe(ctx context.Context, q wire.Query) (*Subscription, er
 		c.subsMu.Unlock()
 		return existing, nil
 	}
-	c.subsMu.Unlock()
 	id := newID()
 	sub := &Subscription{
 		queryID: id,
@@ -92,7 +95,6 @@ func (c *Client) Subscribe(ctx context.Context, q wire.Query) (*Subscription, er
 	}
 	sub.deliver(Snapshot{Kind: SnapshotPending})
 	// register before sending so an immediate queryUpdate is not dropped (M5)
-	c.subsMu.Lock()
 	c.subs[id] = sub
 	c.byKey[key] = sub
 	c.subsMu.Unlock()

@@ -5,7 +5,6 @@
 package inmemory
 
 import (
-	"encoding/json"
 	"math"
 	"strconv"
 	"strings"
@@ -517,11 +516,10 @@ func docToText(v wire.JSONValue) string {
 		}
 		return "false"
 	default:
-		b, err := json.Marshal(v)
-		if err != nil {
-			return "null"
+		if text, ok := compactJSON(v); ok {
+			return text
 		}
-		return string(b)
+		return "null"
 	}
 }
 

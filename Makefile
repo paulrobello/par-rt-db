@@ -75,6 +75,7 @@ lint:
 	cd dashboard && bun run lint
 	cd python-client && uv run ruff check .
 	cd go-client && go vet ./...
+	cd go-client && go vet -tags live ./...
 	$(call SWIFT_IF_DARWIN,swiftlint --strict)
 
 # ARC-014: workspace-level `cargo check`. This adds --all-features to core
@@ -163,6 +164,7 @@ go-client-fmt-check:
 
 go-client-lint:
 	cd go-client && go vet ./...
+	cd go-client && go vet -tags live ./...
 	cd go-client && go list -deps . ./wire ./dsl ./errors ./httpclient ./inmemory | grep -q coder/websocket && { echo 'stdlib-only package transitively imports coder/websocket'; exit 1; } || true
 
 go-client-typecheck: go-client-install

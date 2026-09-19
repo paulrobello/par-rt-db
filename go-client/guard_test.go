@@ -23,12 +23,7 @@ func TestNoWebsocketDepOutsideWsclient(t *testing.T) {
 	}
 	out, err := exec.Command("go", append([]string{"list", "-deps"}, pkgs...)...).CombinedOutput()
 	if err != nil {
-		// inmemory does not exist yet (Tasks 20-25); retry without it.
-		pkgs = pkgs[:len(pkgs)-1]
-		out, err = exec.Command("go", append([]string{"list", "-deps"}, pkgs...)...).CombinedOutput()
-		if err != nil {
-			t.Fatalf("go list -deps failed: %v\n%s", err, out)
-		}
+		t.Fatalf("go list -deps failed: %v\n%s", err, out)
 	}
 	for _, line := range strings.Split(string(out), "\n") {
 		if strings.Contains(line, "coder/websocket") {

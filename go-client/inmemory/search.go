@@ -4,7 +4,6 @@
 package inmemory
 
 import (
-	"encoding/json"
 	"sort"
 	"strings"
 
@@ -141,11 +140,8 @@ func ftsStringify(v wire.JSONValue) string {
 		}
 		return "false"
 	default:
-		b, err := json.Marshal(v)
-		if err != nil {
-			return ""
-		}
-		return string(b)
+		text, _ := compactJSON(v)
+		return text
 	}
 }
 

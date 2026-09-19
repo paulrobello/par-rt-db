@@ -509,7 +509,7 @@ func TestSubscriberCallbackMayReenterStore(t *testing.T) {
 	// callback that queries the store must not self-deadlock (rust fires
 	// outside the borrow).
 	s := newTestStore(t)
-	sub := &Subscription{
+	sub := &storeSubscription{
 		Query: wire.Query{Table: "items"},
 		Table: "items",
 		alive: &syncFlag{},

@@ -136,10 +136,11 @@ func DefineSchema() *SchemaBuilder {
 
 // Table opens a table builder; the closure registers the table when it
 // returns, mirroring rust's OnceTable form.
-func (s *SchemaBuilder) Table(name string, build func(*TableBuilder)) {
+func (s *SchemaBuilder) Table(name string, build func(*TableBuilder)) *SchemaBuilder {
 	t := &TableBuilder{name: name, fields: map[string]wire.JSONValue{}}
 	build(t)
 	s.add(name, t.Build())
+	return s
 }
 
 func (s *SchemaBuilder) add(name string, t wire.JSONValue) {

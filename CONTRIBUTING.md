@@ -36,9 +36,9 @@ par-rt-db is a monorepo with **eight packages** built from one root `Makefile`:
 | Dashboard | `dashboard/` | Vite + React 19 + TS (bun) |
 | `rtdb` CLI | `cli/` | Rust (`rtdb` binary, cargo; wraps `par-rt-db-client`) |
 
-The server is the source of truth for the wire protocol and the DSL; the four
+The server is the source of truth for the wire protocol and the DSL; the five
 client SDKs (`ts-client`, `rust-client`, `python-client`, `swift-client`, `go-client`)
-mirror it — five implementations of one wire contract.
+mirror it — six implementations of one wire contract.
 [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) tracks parity
 against Convex with per-row notes on which clients mirror each feature.
 

@@ -166,7 +166,21 @@ func min2(a, b int) int {
 	return b
 }
 
+type skipTB struct {
+	fakeTB
+	skipReason string
+	skipped    bool
+}
+
+func (s *skipTB) Skipf(format string, args ...any) {
+	s.skipped = true
+	s.skipReason = fmt.Sprintf(format, args...)
+	panic(s.skipReason)
+}
+
 func TestHarnessGoSkip(t *testing.T) {
+	// The named-runner skip must fire Skipf with the fixture's reason —
+	// asserted through a recording TB so the test itself stays green.
 	dir := writeCase(t, "skipped.json", `{
 		"name": "skipped",
 		"schema": {"tables": {"items": {"fields": {"name": {"type": "string"}, "n": {"type": "number"}}}}},
@@ -179,5 +193,16 @@ func TestHarnessGoSkip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	RunSemanticsCase(t, &cases[0])
+	stb := &skipTB{}
+	func() {
+		defer func() { _ = recover() }()
+		RunSemanticsCase(stb, &cases[0])
+	}()
+	if !stb.skipped {
+		t.Fatal("the go skip entry must Skipf")
+	}
+	// RunSemanticsCase renders the reason through tb.Skipf("go: %s", reason).
+	if stb.skipReason != "go: not wired yet" {
+		t.Fatalf("skip reason: %q", stb.skipReason)
+	}
 }

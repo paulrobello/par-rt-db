@@ -63,7 +63,7 @@ func (m Mutation) ExpectVersion(table, id string, version int64) Mutation {
 
 // ExpectAbsent queues the no-matching-row precondition on an index prefix.
 func (m Mutation) ExpectAbsent(table, index string, eq ...wire.JSONValue) Mutation {
-	m.t.Steps = append(m.t.Steps, wire.StepExpectAbsent{Index: index, Eq: eq})
+	m.t.Steps = append(m.t.Steps, wire.StepExpectAbsent{Table: table, Index: index, Eq: eq})
 	return m
 }
 

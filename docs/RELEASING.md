@@ -17,7 +17,6 @@ to crates.io / npm / PyPI is a separate, user-approved decision.
    - `server/Cargo.toml`, `core/Cargo.toml`, `rust-client/Cargo.toml`, `cli/Cargo.toml`
    - `ts-client/package.json`, `dashboard/package.json`
    - `python-client/pyproject.toml`
-   - `go-client/go.mod`
    Regenerate the lockfiles (`cargo build` for `Cargo.lock`; `bun install` from
    the root for the bun lockfile, which records the workspace package versions;
    `uv lock` in `python-client/` for `uv.lock`, which records the package's own
@@ -28,7 +27,8 @@ to crates.io / npm / PyPI is a separate, user-approved decision.
    add `swift-client` as a local package dependency (a path to a checkout of
    this repo) instead. `go-client` is the same story until the first release
    tag exists: a Go consumer pins it via a `replace` directive to a local
-   checkout (see `go-client/README.md`); once `go-client/v*` tags are cut as
+   checkout (see `go-client/README.md`), and `go.mod` carries no version field
+   so it has nothing to bump in this step; once `go-client/v*` tags are cut as
    part of ENH-031's tag-driven publish pipeline, Go module semver imports
    (`.../go-client@v0.1.1`) become available, with the module path's `/vN`
    major-suffix discipline starting at v2.

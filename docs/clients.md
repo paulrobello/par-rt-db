@@ -34,7 +34,7 @@ the package by local path (see its README), not as a remote git dependency.
 | File storage (upload, delete, serve/signed URLs) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Query DSL builders (`.filter()` / `.search()` / `.vector_search()`) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | In-memory test harness | ✅ | ✅ (`in_memory` feature) | ✅ (`par_rt_db.in_memory`) | ✅ | ✅ |
-| Optimistic updates | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Optimistic updates | ✅ | ✅ | ✅ | ✅ | ✅ (manual `optimistic.Layer` composition) |
 | React bindings (`@par-rt-db/client/react`) | ✅ | — | — | — | — |
 | SwiftUI bindings (`ParRtDbUI`) | — | — | — | ✅ | — |
 

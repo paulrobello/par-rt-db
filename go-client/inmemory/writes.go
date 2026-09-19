@@ -173,7 +173,7 @@ func cloneSchedules(jobs []*ScheduledJob) []*ScheduledJob {
 // Query errors are suppressed (a failing subscriber query must not abort the
 // write).
 func notifySubs(s *Store, writeSet map[string]bool) {
-	var live []*Subscription
+	var live []*storeSubscription
 	for _, sub := range s.subscribers {
 		if !sub.alive.get() {
 			continue

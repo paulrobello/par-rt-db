@@ -102,16 +102,16 @@ func (c *Client) Tick(now int64) int { return c.store.Tick(now) }
 // divergence). The channel is buffered; a subscriber that stops draining
 // will stall notify fan-out — the harness is driven synchronously by tests,
 // matching the rust/ts engines.
-func (c *Client) Subscribe(q dsl.TableQuery) *wsSubscription {
+func (c *Client) Subscribe(q dsl.TableQuery) *Subscription {
 	query := q.Build()
 	table := query.Table
-	sub := &Subscription{
+	sub := &storeSubscription{
 		Query: query,
 		Table: table,
 		alive: &syncFlag{},
 	}
 	sub.alive.set(true)
-	ws := &wsSubscription{
+	ws := &Subscription{
 		sub:     sub,
 		store:   c.store,
 		updates: make(chan wire.JSONValue, 16),
@@ -134,9 +134,10 @@ func (c *Client) Subscribe(q dsl.TableQuery) *wsSubscription {
 	return ws
 }
 
-// wsSubscription is the handle returned by Subscribe.
-type wsSubscription struct {
-	sub     *Subscription
+// Subscription is the handle returned by Subscribe: Updates receives the
+// initial snapshot then one snapshot per real change; Unsubscribe detaches.
+type Subscription struct {
+	sub     *storeSubscription
 	store   *Store
 	updates chan wire.JSONValue
 	closing syncFlag
@@ -144,10 +145,10 @@ type wsSubscription struct {
 }
 
 // Updates is the snapshot channel.
-func (s *wsSubscription) Updates() <-chan wire.JSONValue { return s.updates }
+func (s *Subscription) Updates() <-chan wire.JSONValue { return s.updates }
 
 // Unsubscribe detaches the listener and closes the updates channel.
-func (s *wsSubscription) Unsubscribe() {
+func (s *Subscription) Unsubscribe() {
 	s.closing.set(true)
 	s.sub.alive.set(false)
 	s.store.mu.Lock()

@@ -48,10 +48,10 @@ type ScheduledJob struct {
 	External bool
 }
 
-// Subscription is the inner state of one reactive subscription: alive is
+// storeSubscription is the inner state of one reactive subscription: alive is
 // cleared by unsubscribe, last holds the canonicalized previous result so
 // only real changes re-fire.
-type Subscription struct {
+type storeSubscription struct {
 	Query    wire.Query
 	Table    string
 	alive    *syncFlag
