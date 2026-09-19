@@ -161,3 +161,8 @@ func (s *Store) reapTTL(now int64) int {
 	}
 	return removed
 }
+
+// MaxSteps is the corpus-pinned per-txn step ceiling (ARC-104: the value is
+// recorded in wire-corpus.json's protocol_constants and asserted by the wire
+// corpus runner).
+const MaxSteps = maxSteps

@@ -220,6 +220,13 @@ func (u *AuthedUser) UnmarshalJSON(b []byte) error {
 	if err != nil {
 		return err
 	}
+	// ARC-009 narrowing: kind is a closed enum — an unknown kind is a decode
+	// error exactly like serde's `deny_unknown_fields` enum repr.
+	switch v.Kind {
+	case UserKindUser, UserKindMachine:
+	default:
+		return errUnknownKind
+	}
 	*u = AuthedUser(v)
 	return nil
 }
@@ -253,6 +260,23 @@ func (s *ScheduleInfo) UnmarshalJSON(b []byte) error {
 	if err != nil {
 		return err
 	}
+	switch v.Kind {
+	case ScheduleKindOneshot, ScheduleKindCron, ScheduleKindInterval:
+	default:
+		return errUnknownKind
+	}
+	switch v.Status {
+	case ScheduleStatusPending, ScheduleStatusRunning, ScheduleStatusPaused, ScheduleStatusError:
+	default:
+		return errUnknownStatus
+	}
 	*s = ScheduleInfo(v)
 	return nil
 }
+
+// Enum-value decode errors (the corpus's rejects_schedule_info_unknown_*
+// and rejects_authed_user_unknown_kind fixtures pin these).
+var (
+	errUnknownKind   = &json.UnmarshalTypeError{Value: "unknown enum kind"}
+	errUnknownStatus = &json.UnmarshalTypeError{Value: "unknown enum status"}
+)

@@ -6,7 +6,12 @@ package wire
 // omitempty only where the server has skip_serializing_if. Interface-typed
 // fields decode through the raw-conversion UnmarshalJSON below.
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+	"strconv"
+	"strings"
+)
 
 // Mirrors server/src/dsl.rs::Order — lowercase values ("asc"/"desc").
 type Order string
@@ -154,19 +159,19 @@ type SearchQuery struct {
 // Mirrors server/src/dsl.rs::VectorSearchQuery (camelCase).
 type VectorSearchQuery struct {
 	Index  string     `json:"index"`
-	Vector []float32  `json:"vector"`
+	Vector Vector     `json:"vector"`
 	Limit  int        `json:"limit"`
 	Filter FilterExpr `json:"filter,omitempty"`
 }
 
 // Mirrors server/src/dsl.rs::HybridSearchQuery (camelCase).
 type HybridSearchQuery struct {
-	Query       string    `json:"query"`
-	Vector      []float32 `json:"vector"`
-	Limit       int       `json:"limit"`
-	SearchIndex *string   `json:"searchIndex,omitempty"`
-	VectorIndex *string   `json:"vectorIndex,omitempty"`
-	K           *int      `json:"k,omitempty"`
+	Query       string  `json:"query"`
+	Vector      Vector  `json:"vector"`
+	Limit       int     `json:"limit"`
+	SearchIndex *string `json:"searchIndex,omitempty"`
+	VectorIndex *string `json:"vectorIndex,omitempty"`
+	K           *int    `json:"k,omitempty"`
 }
 
 // Mirrors server/src/dsl.rs::AggregateOp — lowercase values.
@@ -249,14 +254,18 @@ func (s *SearchQuery) UnmarshalJSON(b []byte) error {
 func (v *VectorSearchQuery) UnmarshalJSON(b []byte) error {
 	r, err := StrictUnmarshal[struct {
 		Index  string          `json:"index"`
-		Vector []float32       `json:"vector"`
+		Vector json.RawMessage `json:"vector"`
 		Limit  int             `json:"limit"`
 		Filter json.RawMessage `json:"filter,omitempty"`
 	}](b)
 	if err != nil {
 		return err
 	}
-	v.Index, v.Vector, v.Limit = r.Index, r.Vector, r.Limit
+	var vec Vector
+	if err := json.Unmarshal(r.Vector, &vec); err != nil {
+		return err
+	}
+	v.Index, v.Vector, v.Limit = r.Index, vec, r.Limit
 	if len(r.Filter) > 0 {
 		f, err := UnmarshalFilterExpr(r.Filter)
 		if err != nil {
@@ -321,5 +330,36 @@ func (g *AggregateGroup) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	g.Key, g.Value = k, val
+	return nil
+}
+
+// Vector is a pgvector embedding: f32 values on the wire. Integral values
+// marshal with a trailing ".0" — serde_json's ryu rendering of an f32 keeps
+// the wire bytes identical to the server's output (a bare "1" diverges).
+type Vector []float32
+
+func (v Vector) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	buf.WriteByte('[')
+	for i, f := range v {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		s := strconv.FormatFloat(float64(f), 'g', -1, 32)
+		if !strings.ContainsAny(s, ".eE") {
+			s += ".0"
+		}
+		buf.WriteString(s)
+	}
+	buf.WriteByte(']')
+	return buf.Bytes(), nil
+}
+
+func (v *Vector) UnmarshalJSON(b []byte) error {
+	var fs []float32
+	if err := json.Unmarshal(b, &fs); err != nil {
+		return err
+	}
+	*v = fs
 	return nil
 }
