@@ -279,6 +279,20 @@ func TestImportDBNDJSON(t *testing.T) {
 	}
 }
 
+// F1 fix-round pin: a 2xx {ok:false} body must surface as INTERNAL, like
+// rust's expect_ok — the body is never swallowed as success.
+func TestImportDBOKFalseIsError(t *testing.T) {
+	c := &capture{t: t, method: "POST", path: "/admin/import-db",
+		ctype:  wantStr("application/x-ndjson"),
+		body:   wantStr("line1\n"),
+		status: 200, respBody: `{"ok":false}`}
+	client := stub(t, c.handler)
+	err := client.ImportDB(context.Background(), "app", "line1\n")
+	if !rtdberrors.IsCode(err, rtdberrors.CodeInternal) {
+		t.Fatalf("want INTERNAL on ok=false, got %v", err)
+	}
+}
+
 func TestUploadFileRawBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/admin/db/app/storage" {

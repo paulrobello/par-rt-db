@@ -5,9 +5,11 @@ package admin
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 
+	rtdberrors "github.com/paulrobello/par-rt-db/go-client/errors"
 	"github.com/paulrobello/par-rt-db/go-client/wire"
 )
 
@@ -214,11 +216,23 @@ func (c *AdminClient) ExportDB(ctx context.Context, db string) (string, error) {
 }
 
 // ImportDB: POST /admin/import-db?db= with an application/x-ndjson body of
-// an ExportDB snapshot.
+// an ExportDB snapshot → {ok:true}, routed through the expect_ok analog.
 func (c *AdminClient) ImportDB(ctx context.Context, db, jsonl string) error {
-	_, err := c.raw(ctx, methodPost, withQuery("/admin/import-db", url.Values{"db": {db}}),
+	data, err := c.raw(ctx, methodPost, withQuery("/admin/import-db", url.Values{"db": {db}}),
 		"application/x-ndjson", []byte(jsonl))
-	return err
+	if err != nil {
+		return err
+	}
+	var resp struct {
+		OK bool `json:"ok"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return fmt.Errorf("admin: decode import ack: %w", err)
+	}
+	if !resp.OK {
+		return rtdberrors.New(rtdberrors.CodeInternal, "admin request returned ok=false")
+	}
+	return nil
 }
 
 // CloneDB: POST /admin/clone-db?from=&to= → {ok:true}. Clones schema +
