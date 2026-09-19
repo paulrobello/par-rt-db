@@ -8,10 +8,13 @@ package wsclient
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	rtdberrors "github.com/paulrobello/par-rt-db/go-client/errors"
 	"github.com/paulrobello/par-rt-db/go-client/wire"
 )
+
+// newIDID is retained for reference; newID lives in subscription.go.
 
 // envelopeToRtDb converts a wire error envelope into the shared error type.
 func envelopeToRtDb(e wire.ErrorEnvelope) *rtdberrors.RtDbError {
@@ -32,7 +35,7 @@ func (c *Client) Mutate(ctx context.Context, txn wire.Transaction, idempotencyKe
 	}
 	wait := c.expectReply(mutID)
 	if err := c.sendFrame(ctx, frame); err != nil {
-		wait.cancel()
+		c.dropReply(mutID)
 		return nil, err
 	}
 	msg := wait.await(ctx)
@@ -40,8 +43,13 @@ func (c *Client) Mutate(ctx context.Context, txn wire.Transaction, idempotencyKe
 	case wire.ServerMutateOk:
 		results := make([]wire.StepResult, len(m.Results))
 		for i, raw := range m.Results {
-			b, _ := json.Marshal(raw)
-			_ = json.Unmarshal(b, &results[i])
+			b, err := json.Marshal(raw)
+			if err != nil {
+				return nil, fmt.Errorf("wsclient: re-encode result %d: %w", i, err)
+			}
+			if err := json.Unmarshal(b, &results[i]); err != nil {
+				return nil, fmt.Errorf("wsclient: decode result %d: %w", i, err)
+			}
 		}
 		return results, nil
 	case wire.ServerMutateErr:
@@ -65,7 +73,7 @@ func (c *Client) Schedule(ctx context.Context, when wire.ScheduleWhen, txn wire.
 	}
 	wait := c.expectReply(corrID)
 	if err := c.sendFrame(ctx, frame); err != nil {
-		wait.cancel()
+		c.dropReply(corrID)
 		return "", err
 	}
 	msg := wait.await(ctx)
@@ -76,6 +84,27 @@ func (c *Client) Schedule(ctx context.Context, when wire.ScheduleWhen, txn wire.
 		return "", envelopeToRtDb(m.Error)
 	default:
 		return "", ctx.Err()
+	}
+}
+
+// ListSchedules lists jobs over WS (I4: the request side was missing).
+func (c *Client) ListSchedules(ctx context.Context) ([]wire.ScheduleInfo, error) {
+	corrID := newID()
+	frame, err := json.Marshal(wire.ClientListSchedules{ScheduleID: corrID})
+	if err != nil {
+		return nil, err
+	}
+	wait := c.expectReply(corrID)
+	if err := c.sendFrame(ctx, frame); err != nil {
+		c.dropReply(corrID)
+		return nil, err
+	}
+	msg := wait.await(ctx)
+	switch m := msg.(type) {
+	case wire.ServerListSchedulesOk:
+		return m.Schedules, nil
+	default:
+		return nil, ctx.Err()
 	}
 }
 
@@ -111,7 +140,7 @@ func (c *Client) scheduleManage(ctx context.Context, op, id string) (bool, error
 	}
 	wait := c.expectReply(corrID)
 	if err := c.sendFrame(ctx, frame); err != nil {
-		wait.cancel()
+		c.dropReply(corrID)
 		return false, err
 	}
 	msg := wait.await(ctx)
@@ -138,7 +167,7 @@ func (c *Client) StartWorkflow(ctx context.Context, spec wire.WorkflowSpec) (str
 	}
 	wait := c.expectReply(corrID)
 	if err := c.sendFrame(ctx, frame); err != nil {
-		wait.cancel()
+		c.dropReply(corrID)
 		return "", err
 	}
 	msg := wait.await(ctx)
@@ -161,7 +190,7 @@ func (c *Client) CancelWorkflow(ctx context.Context, id string) (bool, error) {
 	}
 	wait := c.expectReply(corrID)
 	if err := c.sendFrame(ctx, frame); err != nil {
-		wait.cancel()
+		c.dropReply(corrID)
 		return false, err
 	}
 	msg := wait.await(ctx)
@@ -185,7 +214,7 @@ func (c *Client) SignalWorkflow(ctx context.Context, id, name string, payload wi
 	}
 	wait := c.expectReply(corrID)
 	if err := c.sendFrame(ctx, frame); err != nil {
-		wait.cancel()
+		c.dropReply(corrID)
 		return false, err
 	}
 	msg := wait.await(ctx)
@@ -209,7 +238,7 @@ func (c *Client) ListWorkflows(ctx context.Context, status *wire.WorkflowStatus)
 	}
 	wait := c.expectReply(corrID)
 	if err := c.sendFrame(ctx, frame); err != nil {
-		wait.cancel()
+		c.dropReply(corrID)
 		return nil, err
 	}
 	msg := wait.await(ctx)
@@ -217,7 +246,10 @@ func (c *Client) ListWorkflows(ctx context.Context, status *wire.WorkflowStatus)
 	case wire.ServerListWorkflowsOk:
 		return m.Workflows, nil
 	default:
-		return nil, ctx.Err()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("wsclient: unexpected reply to listWorkflows")
 	}
 }
 
@@ -247,7 +279,13 @@ func (p *pendingReply) await(ctx context.Context) wire.ServerMessage {
 	}
 }
 
-func (p *pendingReply) cancel() {}
+// cancel removes a pending reply entry; every caller invokes it on the
+// failure/timeout paths so stale entries cannot leak (I5).
+func (c *Client) dropReply(corrID string) {
+	c.subsMu.Lock()
+	delete(c.replies, corrID)
+	c.subsMu.Unlock()
+}
 
 func (c *Client) routeReply(msg wire.ServerMessage) {
 	var corrID string

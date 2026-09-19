@@ -95,6 +95,55 @@ func TestConnectHandshake(t *testing.T) {
 	}
 }
 
+func TestSubscribeDedupesByCanonicalQuery(t *testing.T) {
+	fp := newFakePeer(t)
+	c := NewClient(wsURL(fp), "d1", func(ctx context.Context) (string, error) { return "tk", nil })
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = fp.waitAuth(t)
+	q := wire.Query{Table: "items"}
+	sub1, err := c.Subscribe(context.Background(), q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub1.Close()
+	sub2, err := c.Subscribe(context.Background(), q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sub1 != sub2 {
+		t.Fatal("identical queries must share one subscription")
+	}
+	// only ONE subscribe frame at the peer (watch a full second, then count)
+	deadline := time.After(1 * time.Second)
+	count := 0
+	watching := true
+	for watching {
+		select {
+		case data := <-fp.frames:
+			if strings.Contains(string(data), `"type":"subscribe"`) {
+				count++
+			}
+		case <-deadline:
+			watching = false
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly one subscribe frame, saw %d", count)
+	}
+	sub2.Close()
+	// one handle still held: no unsubscribe frame yet
+	select {
+	case data := <-fp.frames:
+		if strings.Contains(string(data), `"type":"unsubscribe"`) {
+			t.Fatal("unsubscribe must wait for the last handle")
+		}
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func TestReconnectReplaysAuth(t *testing.T) {
 	fp := newFakePeer(t)
 	c := NewClient(wsURL(fp), "d1", func(ctx context.Context) (string, error) { return "tk", nil },

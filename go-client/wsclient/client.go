@@ -31,12 +31,18 @@ type Client struct {
 
 	mu      sync.Mutex
 	conn    transport
-	authErr error
 	closed  bool
+	writeMu sync.Mutex // serializes conn.Write (coder/websocket: one writer)
 
-	// replayed on every reconnect: active queries by canonical key.
+	// onError observes connection-loss reasons (optionally wired via
+	// WithErrorHandler); never nil-checked at call sites.
+	onError func(error)
+
+	// replayed on every reconnect: active queries by query id (subs) and
+	// by canonical query key (byKey, the dedupe index).
 	subsMu sync.Mutex
 	subs   map[string]*Subscription
+	byKey  map[string]*Subscription
 	// replies waits by correlation id; guarded by subsMu (same lock space,
 	// correlation ids never collide with query ids).
 	replies map[string]*pendingReply
@@ -59,6 +65,7 @@ type clientConfig struct {
 	backoffBase time.Duration
 	backoffMax  time.Duration
 	heartbeat   time.Duration
+	onError     func(error)
 }
 
 func (c *clientConfig) apply(opts []Option) *clientConfig {
@@ -81,6 +88,12 @@ func WithHeartbeat(d time.Duration) Option {
 	return func(c *clientConfig) { c.heartbeat = d }
 }
 
+// WithErrorHandler installs a callback invoked with every connection-loss
+// or reconnect-failure error (observability hook; M3).
+func WithErrorHandler(fn func(error)) Option {
+	return func(c *clientConfig) { c.onError = fn }
+}
+
 // NewClient builds a ws client; Connect must be called before use.
 func NewClient(wsURL, db string, tokens TokenProvider, opts ...Option) *Client {
 	cfg := (&clientConfig{}).apply(opts)
@@ -90,12 +103,17 @@ func NewClient(wsURL, db string, tokens TokenProvider, opts ...Option) *Client {
 		tokens:    tokens,
 		backoff:   reconnectBackoff{base: cfg.backoffBase, max: cfg.backoffMax},
 		heartbeat: cfg.heartbeat,
+		onError:   cfg.onError,
 		subs:      map[string]*Subscription{},
+		byKey:     map[string]*Subscription{},
 	}
 }
 
 // Connect dials, authenticates, and starts the manager goroutine.
 func (c *Client) Connect(ctx context.Context) error {
+	if c.isClosed() {
+		return errors.New("wsclient: client is closed")
+	}
 	tok, err := c.tokens(ctx)
 	if err != nil {
 		return fmt.Errorf("wsclient: token: %w", err)
@@ -110,7 +128,6 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 	c.mu.Lock()
 	c.conn = tr
-	c.authErr = nil
 	c.mu.Unlock()
 	c.wg.Add(1)
 	go c.manager(context.WithoutCancel(ctx))
@@ -158,44 +175,104 @@ func wirePtr() *uint32 {
 	return &v
 }
 
-// manager drives the read pump; on connection loss it reconnects with
-// exponential backoff and replays auth + all live subscriptions.
+// manager drives the connection lifecycle: connect (with exponential
+// backoff until success or Close), read until loss, heartbeat while
+// healthy, repeat. Fixes C1 (a failed reconnect retries forever) and C2
+// (Close during backoff wins the race).
 func (c *Client) manager(ctx context.Context) {
 	defer c.wg.Done()
 	delay := c.backoff.base
 	for {
-		tr := c.current()
-		if tr == nil {
+		if c.isClosed() {
 			return
 		}
+		tr := c.current()
+		if tr == nil {
+			if err := c.ensureConnected(ctx); err != nil {
+				c.onError2(err)
+				if !c.sleepInterruptible(ctx, delay) {
+					return
+				}
+				delay = c.delayAfter(delay)
+				continue
+			}
+		}
+		delay = c.backoff.base
+		tr = c.current()
+		if tr == nil {
+			continue
+		}
+		// heartbeat: send a ping frame on cadence; write errors surface as
+		// connection loss through the same path (I1).
+		hbCtx, cancelHB := context.WithCancel(ctx)
+		hbDone := make(chan struct{})
+		go func() {
+			defer close(hbDone)
+			ticker := time.NewTicker(c.heartbeat)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-hbCtx.Done():
+					return
+				case <-ticker.C:
+					ping, err := json.Marshal(wire.ClientPing{})
+					if err == nil {
+						_ = c.sendFrame(hbCtx, ping)
+					}
+				}
+			}
+		}()
 		err := c.readPump(ctx, tr)
+		cancelHB()
+		<-hbDone
+		c.onError2(err)
 		if c.isClosed() || ctx.Err() != nil {
 			return
 		}
-		c.mu.Lock()
-		c.conn = nil
-		c.mu.Unlock()
-		_ = err
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return
-		case <-timer.C:
-		}
-		delay *= 2
-		if delay > c.backoff.max {
-			delay = c.backoff.max
-		}
-		if err := c.reconnect(ctx); err != nil {
-			continue
-		}
-		delay = c.backoff.base
+		c.clearConn()
 	}
 }
 
-// reconnect redials + re-auths + replays subscriptions.
-func (c *Client) reconnect(ctx context.Context) error {
+// sleepInterruptible waits d or until ctx is done / the client closes.
+// Returns false when the wait was abandoned.
+func (c *Client) sleepInterruptible(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return !c.isClosed()
+	}
+}
+
+func (c *Client) delayAfter(d time.Duration) time.Duration {
+	d *= 2
+	if d > c.backoff.max {
+		return c.backoff.max
+	}
+	return d
+}
+
+// onError2 invokes the error hook when set.
+func (c *Client) onError2(err error) {
+	if err == nil {
+		return
+	}
+	c.mu.Lock()
+	fn := c.onError
+	c.mu.Unlock()
+	if fn != nil {
+		fn(err)
+	}
+}
+
+// ensureConnected dials + authenticates + replays subscriptions if no live
+// connection exists.
+func (c *Client) ensureConnected(ctx context.Context) error {
+	if c.current() != nil {
+		return nil
+	}
 	tok, err := c.tokens(ctx)
 	if err != nil {
 		return err
@@ -222,6 +299,13 @@ func (c *Client) reconnect(ctx context.Context) error {
 		s.resubscribe(ctx, tr)
 	}
 	return nil
+}
+
+// clearConn drops the current connection reference.
+func (c *Client) clearConn() {
+	c.mu.Lock()
+	c.conn = nil
+	c.mu.Unlock()
 }
 
 func (c *Client) readPump(ctx context.Context, tr transport) error {
@@ -304,8 +388,12 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// sendFrame writes one client frame on the live connection.
+// sendFrame writes one client frame on the live connection. Writes are
+// serialized: coder/websocket permits at most one concurrent writer, and
+// user goroutines race the manager's replay here.
 func (c *Client) sendFrame(ctx context.Context, data []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	tr := c.current()
 	if tr == nil {
 		return errors.New("wsclient: not connected")

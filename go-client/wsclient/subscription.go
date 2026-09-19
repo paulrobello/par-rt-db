@@ -13,6 +13,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	rtdberrors "github.com/paulrobello/par-rt-db/go-client/errors"
 	"github.com/paulrobello/par-rt-db/go-client/wire"
@@ -62,20 +64,24 @@ type Subscription struct {
 const updatesChanCap = 64
 
 // Subscribe registers a live query; the first Pending snapshot is
-// delivered immediately.
+// delivered immediately. Identical queries (canonical JSON equality) share
+// ONE server-side subscription; each Subscribe acquires one handle of the
+// shared refcount.
 func (c *Client) Subscribe(ctx context.Context, q wire.Query) (*Subscription, error) {
 	key, err := canonicalKey(q)
 	if err != nil {
 		return nil, err
 	}
+	c.subsMu.Lock()
+	if existing := c.byKey[key]; existing != nil {
+		existing.mu.Lock()
+		existing.refs++
+		existing.mu.Unlock()
+		c.subsMu.Unlock()
+		return existing, nil
+	}
+	c.subsMu.Unlock()
 	id := newID()
-	frame, err := json.Marshal(wire.ClientSubscribe{QueryID: id, Query: q})
-	if err != nil {
-		return nil, err
-	}
-	if err := c.sendFrame(ctx, frame); err != nil {
-		return nil, err
-	}
 	sub := &Subscription{
 		queryID: id,
 		key:     key,
@@ -85,11 +91,18 @@ func (c *Client) Subscribe(ctx context.Context, q wire.Query) (*Subscription, er
 		updates: make(chan Snapshot, updatesChanCap),
 	}
 	sub.deliver(Snapshot{Kind: SnapshotPending})
+	// register before sending so an immediate queryUpdate is not dropped (M5)
 	c.subsMu.Lock()
-	// dedupe: identical queries share one server-side subscription, but each
-	// handle keeps its own channel; the registry keys by query id.
 	c.subs[id] = sub
+	c.byKey[key] = sub
 	c.subsMu.Unlock()
+	frame, err := json.Marshal(wire.ClientSubscribe{QueryID: id, Query: q})
+	if err != nil {
+		return nil, err
+	}
+	if err := c.sendFrame(ctx, frame); err != nil {
+		return nil, err
+	}
 	return sub, nil
 }
 
@@ -119,15 +132,23 @@ func (s *Subscription) Close() {
 	}
 	s.client.subsMu.Lock()
 	delete(s.client.subs, s.queryID)
+	delete(s.client.byKey, s.key)
 	s.client.subsMu.Unlock()
 }
 
-// deliver pushes a snapshot without blocking the read pump.
+// deliver pushes a snapshot without blocking the read pump. The send (and
+// the closed check) happen under s.mu so a concurrent Close can never race
+// a send on the closed channel (C3): Close closes under the same lock.
 func (s *Subscription) deliver(snap Snapshot) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
 	select {
 	case s.updates <- snap:
 	default:
-		// buffer full: drop the oldest pending and enqueue
+		// buffer full: drop the oldest and enqueue
 		select {
 		case <-s.updates:
 		default:
@@ -166,8 +187,14 @@ func canonicalKey(q wire.Query) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
+// newID mints a 128-bit hex id; if the crypto RNG fails (cannot on normal
+// platforms), a time-and-counter fallback keeps ids unique within a run.
 func newID() string {
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+	if _, err := rand.Read(b); err == nil {
+		return hex.EncodeToString(b)
+	}
+	return fmt.Sprintf("fallback-%d-%d", time.Now().UnixNano(), idFallback.Add(1))
 }
+
+var idFallback atomic.Uint64
