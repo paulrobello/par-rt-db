@@ -62,13 +62,15 @@ func executeQuery(s *Store, q *wire.Query, table *TableDef) (wire.JSONValue, err
 			"take exceeds maximum of "+strconv.Itoa(maxTake))
 	}
 
-	// get terminal — exclusive of every other clause.
+	// get terminal — exclusive of every other clause. Direct row lookup:
+	// the engine already holds s.mu here (Store.Get re-locks and would
+	// self-deadlock on the non-reentrant mutex).
 	if q.Get != nil {
-		doc := s.Get(q.Table, *q.Get)
-		if doc == nil {
+		row, ok := s.docs[rowKey{Table: q.Table, ID: *q.Get}]
+		if !ok || row.DeletedAt != nil {
 			return wire.Null{}, nil
 		}
-		return doc, nil
+		return mergeDoc(row), nil
 	}
 
 	if q.VectorSearch != nil {
