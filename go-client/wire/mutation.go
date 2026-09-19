@@ -261,6 +261,7 @@ func (v *StepExpectVersion) UnmarshalJSON(b []byte) error {
 
 // Mirrors core/src/mutation.rs::Step::ExpectAbsent
 type StepExpectAbsent struct {
+	Table string      `json:"table"`
 	Index string      `json:"index"`
 	Eq    []JSONValue `json:"eq"`
 }
@@ -274,6 +275,7 @@ func (v StepExpectAbsent) MarshalJSON() ([]byte, error) {
 
 func (v *StepExpectAbsent) UnmarshalJSON(b []byte) error {
 	r, err := StrictUnmarshal[struct {
+		Table string            `json:"table"`
 		Index string            `json:"index"`
 		Eq    []json.RawMessage `json:"eq"`
 	}](b)
@@ -288,7 +290,7 @@ func (v *StepExpectAbsent) UnmarshalJSON(b []byte) error {
 		}
 		eq[i] = v
 	}
-	v.Index, v.Eq = r.Index, eq
+	v.Table, v.Index, v.Eq = r.Table, r.Index, eq
 	return nil
 }
 
