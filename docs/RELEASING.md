@@ -2,7 +2,7 @@
 
 The repeatable cut procedure. Everything versions in **lockstep** — `server`,
 `cli`, `dashboard`, and the client SDKs (`ts-client`, `rust-client`,
-`python-client`, `swift-client`) share one version (see
+`python-client`, `swift-client`, `go-client`) share one version (see
 [`../CONTRIBUTING.md`'s Versioning section](../CONTRIBUTING.md#versioning)).
 `swift-client` has no manifest version to bump — SPM carries no version field,
 so the release tag identifies which commit a build was cut from, though there
@@ -25,7 +25,13 @@ to crates.io / npm / PyPI is a separate, user-approved decision.
    `Package.swift` lives in `swift-client/`, not the repo root, so a Swift
    consumer cannot resolve this as a remote git package pinned to a tag —
    add `swift-client` as a local package dependency (a path to a checkout of
-   this repo) instead.
+   this repo) instead. `go-client` is the same story until the first release
+   tag exists: a Go consumer pins it via a `replace` directive to a local
+   checkout (see `go-client/README.md`), and `go.mod` carries no version field
+   so it has nothing to bump in this step; once `go-client/v*` tags are cut as
+   part of ENH-031's tag-driven publish pipeline, Go module semver imports
+   (`.../go-client@v0.1.1`) become available, with the module path's `/vN`
+   major-suffix discipline starting at v2.
 2. **Update `CHANGELOG.md`**: move the accumulated `[Unreleased]` entries under
    a new `## [0.x.y] - <date>` heading, leave a fresh empty `## [Unreleased]`
    on top, and update the footer compare links

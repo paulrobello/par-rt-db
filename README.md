@@ -91,7 +91,7 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 ### Technical Excellence
 - **Single serialized committer per database**: all writes flow through one committer task per database and reads run under READ COMMITTED — realtime correctness without distributed coordination
 - **Rust on axum/tokio with Postgres 17 storage**: graceful shutdown drains in-flight requests before exiting, bounded by `RTDB_SHUTDOWN_DRAIN_MS`
-- **One wire contract, five implementations**: the server and the ts/rust/python clients stay byte-identical, enforced by a shared semantics corpus ([`wire-corpus/`](wire-corpus/README.md)); the Swift client mirrors the same wire types, pinned by the wire-parity corpus
+- **One wire contract, six implementations**: the server and the ts/rust/python/go clients stay byte-identical, enforced by a shared semantics corpus ([`wire-corpus/`](wire-corpus/README.md)); the Swift client mirrors the same wire types, pinned by the wire-parity corpus
 - **Security defaults**: constant-time key comparison, generic client-facing 500 messages (detail only in logs), typed `confirm` guards on destructive operations, path-traversal-guarded downloads
 
 ## Packages
@@ -974,9 +974,9 @@ on the side table row (like cancel) — `awaitSignal` steps write no documents.
 Start runs via the HTTP `POST /api/workflows` routes, the WS
 `startWorkflow` / `cancelWorkflow` / `listWorkflows` frames, the admin CRUD
 routes, or the `startWorkflow` / `cancelWorkflow` txn steps (insertion atomic
-with the enclosing writes). All four clients mirror the surface:
+with the enclosing writes). All five clients mirror the surface:
 `startWorkflow` / `cancelWorkflow` / `listWorkflows` / `signalWorkflow`
-(ts, rust, python, swift — reactive + HTTP) plus admin variants, the
+(ts, rust, python, swift, go — reactive + HTTP) plus admin variants, the
 `rtdb workflows` CLI (incl. `rtdb workflows signal`), and the dashboard
 Workflows page (which shows waiting runs and can send the signal). Spec:
 [`docs/superpowers/specs/2026-08-15-workflows-design.md`](docs/superpowers/specs/2026-08-15-workflows-design.md)
@@ -1321,13 +1321,14 @@ Design and as-built notes:
 
 ## Clients
 
-par-rt-db ships four client SDKs that each mirror the server's wire contract,
+par-rt-db ships five client SDKs that each mirror the server's wire contract,
 plus an operator SPA and a CLI built on top of them:
 
 - [`ts-client/`](ts-client/README.md) — `@par-rt-db/client` (browser/Node/React Native): schema builder, reactive WebSocket client, React bindings, HTTP/admin clients, in-memory test harness.
 - [`rust-client/`](rust-client/README.md) — `par-rt-db-client` (Rust): http + reactive ws + admin, `.filter()`/`.search()`/`.vector_search()` builders.
 - [`python-client/`](python-client/README.md) — `par-rt-db` (Python): wire contract + schema/mutation/query DSL + sync HTTP/admin/storage + reactive WS.
 - [`swift-client/`](swift-client/README.md) — `ParRtDbClient`/`ParRtDbUI` (Swift 6, iOS 17+/macOS 14): wire + query/mutation/schema DSL + HTTP + reactive WS + SwiftUI `LiveQuery`, plus the admin client, presence, optimistic updates, and the in-memory engine (see its README's coverage table).
+- [`go-client/`](go-client/README.md) — `github.com/paulrobello/par-rt-db/go-client` (Go 1.23+): wire + schema DSL + typed HTTP queries + reactive WS + admin client + the in-memory engine, stdlib-only outside `coder/websocket`.
 - [`dashboard/`](dashboard/README.md) — the operator console SPA (admin/operator UI served same-origin at `RTDB_STATIC_DIR`; consumes `ts-client`).
 - [`cli/`](cli/README.md) — `rtdb` operator/CI binary (wraps `par-rt-db-client`).
 

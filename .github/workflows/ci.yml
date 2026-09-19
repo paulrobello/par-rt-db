@@ -106,10 +106,25 @@ jobs:
         with:
           enable-cache: true
 
+      # --- Go (go-client) ---------------------------------------------------
+      # `go vet` is the typecheck analog; the module's only dependency is
+      # coder/websocket, so `go mod download` is the only warmup needed.
+      # SEC-138: setup-go pinned to an immutable commit SHA
+      # (f111f3307d8850f501ac008e886eec1fd1932a34 = v5.3.0, verified to resolve).
+      - name: Set up Go
+        uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34
+        with:
+          go-version: "1.23"
+          cache-dependency-path: go-client/go.sum
+
       # --- First-time installs ---------------------------------------------
-      # A fresh CI checkout has no node_modules, no .venv, and no ts-client/dist.
-      # These three targets are NOT prerequisites of `make checkall` — the
-      # Makefile assumes they have already been run once (see CLAUDE.md).
+      # A fresh CI checkout has no node_modules, no .venv, no Go module cache,
+      # and no ts-client/dist. These targets are NOT prerequisites of
+      # `make checkall` — the Makefile assumes they have already been run once
+      # (see CLAUDE.md).
+      - name: Install go-client deps
+        run: make go-client-install
+
       - name: Install ts-client deps
         run: make ts-client-install
 

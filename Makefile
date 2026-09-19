@@ -24,6 +24,8 @@ SWIFT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(1),$(SW
 	python-client-typecheck python-client-checkall rust-client-check-features rtdb-cli deploy \
 	env-drift-check dockerfile-stub-check backup-persistence-check cli-docs cli-docs-check \
 	rust-client-doc ts-client-doc python-client-doc swift-client-doc docs-api \
+	go-client-install go-client-fmt go-client-fmt-check go-client-lint go-client-test \
+	go-client-typecheck go-client-checkall \
 	swift-client-build swift-client-test swift-client-lint swift-client-fmt \
 	swift-client-fmt-check swift-client-typecheck swift-client-checkall \
 	bench-micro bench bench-baseline
@@ -39,7 +41,7 @@ ts-client-build:
 clean:
 	cargo clean
 	rm -rf ts-client/dist dashboard/dist dashboard/node_modules/.cache swift-client/.build
-build: ts-client-build
+build: ts-client-build go-client-install
 	cd core && cargo build
 	cd server && cargo build
 	cd rust-client && cargo build --all-features
@@ -52,6 +54,7 @@ fmt:
 	cd ts-client && bun run fmt
 	cd dashboard && bun run fmt
 	cd python-client && uv run ruff format .
+	cd go-client && gofmt -w .
 	$(call SWIFT_IF_DARWIN,swiftformat .)
 
 fmt-check:
@@ -59,6 +62,7 @@ fmt-check:
 	cd ts-client && bun run fmt-check
 	cd dashboard && bun run fmt-check
 	cd python-client && uv run ruff format --check .
+	cd go-client && test -z "$$(gofmt -l .)" || { echo 'gofmt needed:'; gofmt -l .; exit 1; }
 	$(call SWIFT_IF_DARWIN,swiftformat --lint .)
 
 # ARC-014: one workspace-level clippy invocation instead of four per-crate
@@ -70,6 +74,8 @@ lint:
 	cd ts-client && bun run lint
 	cd dashboard && bun run lint
 	cd python-client && uv run ruff check .
+	cd go-client && go vet ./...
+	cd go-client && go vet -tags live ./...
 	$(call SWIFT_IF_DARWIN,swiftlint --strict)
 
 # ARC-014: workspace-level `cargo check`. This adds --all-features to core
@@ -82,6 +88,7 @@ typecheck: ts-client-build
 	cd ts-client && bun run typecheck
 	cd dashboard && bun run typecheck
 	cd python-client && uv run pyright
+	cd go-client && go vet ./...
 	$(call SWIFT_IF_DARWIN,swift build)
 
 dev-db-up:
@@ -110,7 +117,11 @@ test: dev-db-up
 	cd ts-client && bun run test
 	cd dashboard && bun run test
 	cd python-client && uv run pytest -q
+	cd go-client && go test ./...
 	$(call SWIFT_IF_DARWIN,swift test)
+
+go-client-install:
+	cd go-client && go mod download
 
 ts-client-install:
 	cd ts-client && bun install
@@ -141,6 +152,28 @@ python-client-typecheck:
 	cd python-client && uv run pyright
 
 python-client-checkall: python-client-fmt python-client-lint python-client-typecheck python-client-test
+
+# gofmt is Go's formatter; `go vet` doubles as the typecheck analog (it
+# type-checks every package). The dep guard re-asserts the stdlib-only rule:
+# coder/websocket may only appear in wsclient's dependency tree.
+go-client-fmt:
+	cd go-client && gofmt -w .
+
+go-client-fmt-check:
+	cd go-client && test -z "$$(gofmt -l .)" || { echo 'gofmt needed:'; gofmt -l .; exit 1; }
+
+go-client-lint:
+	cd go-client && go vet ./...
+	cd go-client && go vet -tags live ./...
+	cd go-client && go list -deps . ./wire ./dsl ./errors ./httpclient ./inmemory | grep -q coder/websocket && { echo 'stdlib-only package transitively imports coder/websocket'; exit 1; } || true
+
+go-client-typecheck: go-client-install
+	cd go-client && go vet ./...
+
+go-client-test:
+	cd go-client && go test ./...
+
+go-client-checkall: go-client-fmt-check go-client-lint go-client-typecheck go-client-test
 
 # Darwin-guarded (see SWIFT_IF_DARWIN at the top): `swift build` doubles as
 # typecheck — the Swift compiler has no separate check-only surface in SPM.
