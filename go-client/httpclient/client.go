@@ -54,6 +54,13 @@ func NewClient(baseURL, db, token string, opts ...Option) *Client {
 // DB returns the configured database name.
 func (c *Client) DB() string { return c.db }
 
+// Call exposes the authed request seam (Bearer + X-Rtdb-Protocol + error
+// envelope decode) for the admin client, whose routes carry the admin key
+// as the bearer. Body/out follow do()'s conventions.
+func (c *Client) Call(ctx context.Context, method, path string, body, out any) error {
+	return c.do(ctx, method, path, body, out)
+}
+
 // do performs one request through the auth seam and decodes the response.
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
 	var rdr io.Reader
