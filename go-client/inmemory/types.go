@@ -55,7 +55,7 @@ type Subscription struct {
 	Query    wire.Query
 	Table    string
 	alive    *syncFlag
-	Callback func(wire.Object)
+	Callback func(wire.JSONValue)
 	last     string
 	hasLast  bool
 }
@@ -77,6 +77,15 @@ func (f *syncFlag) set(v bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.v = v
+}
+
+// swap sets the flag and reports the PREVIOUS value (a close-once guard).
+func (f *syncFlag) swap(v bool) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	prev := f.v
+	f.v = v
+	return prev
 }
 
 // StoredBlob is the storage stub's per-id record.

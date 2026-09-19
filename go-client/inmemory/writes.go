@@ -164,8 +164,8 @@ func cloneSchedules(jobs []*ScheduledJob) []*ScheduledJob {
 // suppressed (a failing subscriber query must not abort the write).
 func notifySubs(s *Store, writeSet map[string]bool) {
 	type fire struct {
-		callback func(wire.Object)
-		value    wire.Object
+		callback func(wire.JSONValue)
+		value    wire.JSONValue
 	}
 	var fires []fire
 	var live []*Subscription
@@ -187,11 +187,7 @@ func notifySubs(s *Store, writeSet map[string]bool) {
 		}
 		sub.last = nextCanon
 		sub.hasLast = true
-		if obj, ok := next.(wire.Object); ok {
-			fires = append(fires, fire{callback: sub.Callback, value: obj})
-		} else {
-			fires = append(fires, fire{callback: sub.Callback, value: wire.Object{}})
-		}
+		fires = append(fires, fire{callback: sub.Callback, value: next})
 	}
 	s.subscribers = live
 	for _, f := range fires {
@@ -818,7 +814,11 @@ func deleteRowCascade(s *Store, tableName, id string, visited map[rowKey]bool, c
 			}
 		}
 	}
-	return doDeleteHard(s, tableName, id)
+	if err := doDeleteHard(s, tableName, id); err != nil {
+		return err
+	}
+	*touched = append(*touched, tableName)
+	return nil
 }
 
 func doDeleteHard(s *Store, tableName, id string) error {
