@@ -71,12 +71,14 @@ func executeQuery(s *Store, q *wire.Query, table *TableDef) (wire.JSONValue, err
 		return doc, nil
 	}
 
-	// search / vectorSearch / hybridSearch terminals land with the search
-	// task (T22); the combination table already rejects their illegal
-	// peers, so reaching here means the terminal is not yet wired.
-	if q.Search != nil || q.VectorSearch != nil || q.HybridSearch != nil {
-		return nil, rtdberrors.New(rtdberrors.CodeInternal,
-			"search terminals are not wired in this build")
+	if q.VectorSearch != nil {
+		return executeVectorSearchTerminal(s, q, q.VectorSearch, table)
+	}
+	if q.HybridSearch != nil {
+		return executeHybridSearchTerminal(s, q, q.HybridSearch)
+	}
+	if q.Search != nil {
+		return executeSearchTerminal(s, q, q.Search, table)
 	}
 
 	plan, err := prepareScan(q, table, hasRange)
