@@ -13,6 +13,7 @@ import (
 
 const http_POST = "POST"
 const http_GET = "GET"
+const http_DELETE = "DELETE"
 
 // Mutate runs a transaction; one StepResult per step. A non-empty
 // idempotencyKey engages the server's idempotency cache.

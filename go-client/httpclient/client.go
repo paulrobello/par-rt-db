@@ -83,18 +83,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		return fmt.Errorf("httpclient: read response: %w", err)
 	}
 	if resp.StatusCode >= 400 {
-		var env wire.ErrorEnvelope
-		if json.Unmarshal(data, &env) == nil && env.Code != "" {
-			return &rtdberrors.RtDbError{
-				Code:       rtdberrors.ErrorCode(env.Code),
-				Message:    env.Message,
-				RetryAfter: env.RetryAfter,
-			}
-		}
-		return &rtdberrors.RtDbError{
-			Code:    rtdberrors.CodeInternal,
-			Message: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncate(string(data), 200)),
-		}
+		return envelopeError(resp.StatusCode, data)
 	}
 	if out != nil {
 		if err := json.Unmarshal(data, out); err != nil {
@@ -102,6 +91,23 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		}
 	}
 	return nil
+}
+
+// envelopeError decodes a non-2xx body into *errors.RtDbError, falling
+// back to a truncated-INTERNAL envelope for non-JSON bodies.
+func envelopeError(status int, data []byte) error {
+	var env wire.ErrorEnvelope
+	if json.Unmarshal(data, &env) == nil && env.Code != "" {
+		return &rtdberrors.RtDbError{
+			Code:       rtdberrors.ErrorCode(env.Code),
+			Message:    env.Message,
+			RetryAfter: env.RetryAfter,
+		}
+	}
+	return &rtdberrors.RtDbError{
+		Code:    rtdberrors.CodeInternal,
+		Message: fmt.Sprintf("HTTP %d: %s", status, truncate(string(data), 200)),
+	}
 }
 
 func truncate(s string, n int) string {
