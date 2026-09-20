@@ -19,7 +19,11 @@ import (
 )
 
 // PROTOCOL_VERSION mirrors server/src/protocol.rs::PROTOCOL_VERSION.
-const PROTOCOL_VERSION uint32 = 1
+// ARC-013 (wire-v2 bundle): 1 -> 2 for multi-op aggregates, composite
+// groupBy, the mutate-batch endpoint, and cron timezone support — all
+// additive/optional wire changes, so a v1 server still parses this client's
+// existing traffic.
+const PROTOCOL_VERSION uint32 = 2
 
 // ---------------------------------------------------------------------------
 // ClientMessage — mirrors server/src/protocol.rs::ClientMessage.

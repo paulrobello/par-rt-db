@@ -1,0 +1,37 @@
+{
+  "name": "aggregate-groupby-fields",
+  "$comment": "Wire-v2 composite groupBy: a single-op spec with an explicit groupBy field list [status, priority] groups by that composite key and aggregates the remaining index field (order). Rows are {keys:[status,priority], values:{sum: <value>}} (single-op values keyed by lowercase op name), ordered by keys ascending. done/1 = {order 5} sum=5; todo/1 = {order 1, order 2} sum=3; todo/2 = {order 3} sum=3.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" },
+          "priority": { "type": "number" },
+          "order": { "type": "number" }
+        },
+        "indexes": [
+          { "name": "by_status_priority_order", "fields": ["status", "priority", "order"] }
+        ]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "status": "todo", "priority": 2, "order": 3 },
+    { "name": "b", "status": "todo", "priority": 1, "order": 1 },
+    { "name": "c", "status": "done", "priority": 1, "order": 5 },
+    { "name": "d", "status": "todo", "priority": 1, "order": 2 }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "index": "by_status_priority_order",
+      "aggregate": { "op": "sum", "groupBy": ["status", "priority"] }
+    }
+  },
+  "expect": [
+    { "keys": ["done", 1], "values": { "sum": 5 } },
+    { "keys": ["todo", 1], "values": { "sum": 3 } },
+    { "keys": ["todo", 2], "values": { "sum": 3 } }
+  ]
+}

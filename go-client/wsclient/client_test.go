@@ -90,7 +90,7 @@ func TestConnectHandshake(t *testing.T) {
 	if !strings.Contains(string(frame), `"type":"auth"`) {
 		t.Fatalf("first frame not auth: %s", frame)
 	}
-	if !strings.Contains(string(frame), `"db":"d1"`) || !strings.Contains(string(frame), `"protocolVersion":1`) {
+	if !strings.Contains(string(frame), `"db":"d1"`) || !strings.Contains(string(frame), `"protocolVersion":2`) {
 		t.Fatalf("auth frame missing db/protocolVersion: %s", frame)
 	}
 }

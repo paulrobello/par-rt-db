@@ -105,7 +105,28 @@ func (q TableQuery) Distinct() TableQuery {
 
 // Aggregate is the aggregate terminal; groupBy shifts to grouped rows.
 func (q TableQuery) Aggregate(op wire.AggregateOp, groupBy bool) TableQuery {
-	q.q.Aggregate = &wire.AggregateSpec{Op: op, GroupBy: groupBy}
+	q.q.Aggregate = &wire.AggregateSpec{Op: op, GroupBy: wire.GroupByBool(groupBy)}
+	return q
+}
+
+// AggregateGroupByFields is the aggregate terminal with wire-v2 composite
+// groupBy: groups by the listed declared index fields (each at or beyond the
+// eq prefix), returning AggregateMultiGroup rows keyed by the lowercase op
+// name.
+func (q TableQuery) AggregateGroupByFields(op wire.AggregateOp, fields ...string) TableQuery {
+	q.q.Aggregate = &wire.AggregateSpec{Op: op, GroupBy: wire.GroupByFields(fields)}
+	return q
+}
+
+// Aggregates is the wire-v2 multi-op aggregate terminal: several named ops
+// evaluated in one pass. groupBy is false (ungrouped -> AggregateMulti
+// object), true (legacy single-field grouping), or an explicit field list
+// (composite grouping) — both grouped forms return AggregateMultiGroup rows.
+func (q TableQuery) Aggregates(aggregates map[string]wire.AggregateOp, groupBy wire.GroupBy) TableQuery {
+	if groupBy == nil {
+		groupBy = wire.GroupByBool(false)
+	}
+	q.q.Aggregate = &wire.AggregateSpec{Aggregates: aggregates, GroupBy: groupBy}
 	return q
 }
 

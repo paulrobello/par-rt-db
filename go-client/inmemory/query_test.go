@@ -181,7 +181,7 @@ func TestQueryCountDistinctAggregate(t *testing.T) {
 	// groupBy count: group by status's successor field.
 	v = mustEval(t, s, wire.Query{Table: "items", Index: strPtr("by_status_and_order"),
 		Eq:        []wire.JSONValue{wire.String("todo")},
-		Aggregate: &wire.AggregateSpec{Op: wire.AggCount, GroupBy: true}})
+		Aggregate: &wire.AggregateSpec{Op: wire.AggCount, GroupBy: wire.GroupByBool(true)}})
 	arr = v.(wire.Array)
 	if len(arr) != 3 {
 		t.Fatalf("groupBy count: %v", arr)

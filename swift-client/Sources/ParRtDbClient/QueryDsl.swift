@@ -27,6 +27,11 @@ public enum QueryTerminal: Equatable, Sendable {
     case aggregate
     /// Grouped aggregate (`aggregate(groupBy: true)`) — `[{key, value}]` rows.
     case aggregateGroups
+    /// Wire-v2 `aggregates` map, ungrouped — object alias -> value, e.g.
+    /// `{"revenue": 1250.5, "orders": 42}`.
+    case aggregateMulti
+    /// Wire-v2 multi-op / composite-groupBy rows — `[{keys, values}]`.
+    case aggregateMultiGroups
     /// Cursor pagination — `{docs, nextCursor?}`. Also the payload shape of a
     /// ranked terminal composed with `paginate` (ENH-030): `search`/
     /// `vectorSearch`/`hybridSearch` return the same envelope once a
@@ -93,6 +98,23 @@ public struct AggregateGroup: Codable, Equatable, Sendable {
     public init(key: JSONValue, value: JSONValue) {
         self.key = key
         self.value = value
+    }
+}
+
+// MARK: - AggregateMultiGroup
+
+/// One `{keys, values}` row from a wire-v2 grouped aggregate. Mirrors
+/// server/src/dsl.rs::AggregateMultiGroup (camelCase). No unknown-key
+/// rejection: the server type carries no `deny_unknown_fields`.
+public struct AggregateMultiGroup: Codable, Equatable, Sendable {
+    /// The group's key values, in the requested field order.
+    public var keys: [JSONValue]
+    /// Alias (or, for a single-`op` spec, the lowercase op name) -> aggregate.
+    public var values: [String: JSONValue]
+
+    public init(keys: [JSONValue], values: [String: JSONValue]) {
+        self.keys = keys
+        self.values = values
     }
 }
 
@@ -211,6 +233,23 @@ public struct TableQuery: Sendable {
     /// `groupBy: true` shifts to a grouped aggregate returning `[{key, value}]`.
     public func aggregate(_ op: AggregateOp, groupBy: Bool = false) -> TableQuery {
         with { $0.aggregate = AggregateSpec(op: op, groupBy: groupBy) }
+    }
+
+    /// Aggregate terminal with wire-v2 composite groupBy: `op` grouped by the
+    /// listed declared index fields (each at or beyond the eq prefix),
+    /// returning `[AggregateMultiGroup]` rows keyed by the lowercase op name.
+    public func aggregate(_ op: AggregateOp, groupByFields fields: String...) -> TableQuery {
+        with { $0.aggregate = AggregateSpec(op: op, groupBy: .fields(fields)) }
+    }
+
+    /// Wire-v2 multi-op aggregate terminal: several named ops evaluated in
+    /// one pass. Without `groupBy`, returns one object alias -> value
+    /// (`[String: JSONValue]`); with `groupBy: true` or a field list, returns
+    /// `[AggregateMultiGroup]` rows.
+    public func aggregates(
+        _ aggregates: [String: AggregateOp], groupBy: AggregateGroupBy = .false
+    ) -> TableQuery {
+        with { $0.aggregate = AggregateSpec(aggregates: aggregates, groupBy: groupBy) }
     }
 
     /// Cursor-pagination terminal. Pass the previous page's `nextCursor` (nil
@@ -665,7 +704,8 @@ private func resultShapeError(_ value: JSONValue, terminal: QueryTerminal) -> Rt
     switch terminal {
     case .get, .unique, .first:
         return (value == .null || value.objectValue != nil) ? nil : invalid("an object or null")
-    case .collect, .take, .search, .vectorSearch, .hybridSearch, .distinct, .aggregateGroups:
+    case .collect, .take, .search, .vectorSearch, .hybridSearch, .distinct, .aggregateGroups,
+         .aggregateMultiGroups:
         if case .array = value {
             return nil
         }
@@ -677,6 +717,8 @@ private func resultShapeError(_ value: JSONValue, terminal: QueryTerminal) -> Rt
         case .int, .double, .string, .null: return nil
         default: return invalid("a scalar (number, string, or null)")
         }
+    case .aggregateMulti:
+        return value.objectValue != nil ? nil : invalid("an object")
     case .paginate:
         if case let .object(object) = value, case .array? = object["docs"] {
             return nil

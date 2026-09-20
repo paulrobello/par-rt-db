@@ -65,4 +65,44 @@ func TestTableQueryPaginateCursor(t *testing.T) {
 	}
 }
 
+func TestTableQueryAggregateGroupByFields(t *testing.T) {
+	// Wire-v2: composite groupBy widens the field to a declared-field list.
+	b, err := json.Marshal(NewTableQuery("items").
+		WithIndex("by_status_and_priority").
+		AggregateGroupByFields(wire.AggSum, "status", "priority").Build())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytesHas(b, `"aggregate":{"op":"sum","groupBy":["status","priority"]}`) {
+		t.Fatalf("composite groupBy shape: %s", b)
+	}
+}
+
+func TestTableQueryAggregatesMultiOp(t *testing.T) {
+	// Wire-v2: several named ops in one pass, ungrouped.
+	b, err := json.Marshal(NewTableQuery("items").
+		WithIndex("by_status", wire.String("todo")).
+		Aggregates(map[string]wire.AggregateOp{"total": wire.AggSum, "n": wire.AggCount}, nil).
+		Build())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytesHas(b, `"aggregate":{"aggregates":{"n":"count","total":"sum"},"groupBy":false}`) {
+		t.Fatalf("multi-op alias map shape: %s", b)
+	}
+}
+
+func TestTableQueryAggregatesGroupByTrue(t *testing.T) {
+	b, err := json.Marshal(NewTableQuery("items").
+		WithIndex("by_status").
+		Aggregates(map[string]wire.AggregateOp{"total": wire.AggSum, "n": wire.AggCount}, wire.GroupByBool(true)).
+		Build())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytesHas(b, `"aggregate":{"aggregates":{"n":"count","total":"sum"},"groupBy":true}`) {
+		t.Fatalf("multi-op grouped shape: %s", b)
+	}
+}
+
 func bytesHas(b []byte, s string) bool { return bytes.Contains(b, []byte(s)) }

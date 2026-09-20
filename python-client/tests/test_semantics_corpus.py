@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from par_rt_db import Mutation
 from par_rt_db.errors import ErrorCode, RtDbError
@@ -248,9 +248,19 @@ def _assert_result(
 
 
 def _run_query_json(client: InMemoryRtDbClient, q_json: dict[str, Any], case: str) -> Any:
-    """Validate and execute one wire-shaped query dict."""
+    """Validate and execute one wire-shaped query dict.
+
+    A shape a Query field validates eagerly (e.g. ``AggregateSpec``'s
+    op/aggregates exclusivity) raises pydantic's ``ValidationError`` at
+    ``model_validate`` rather than at execution — unlike ts/rust, which defer
+    that same check into their engine's aggregate executor. Both are BAD_REQUEST
+    on the wire, so an error-case fixture must see it as an ``RtDbError`` the
+    same way a later execution-time rejection is seen, not a bare parse failure.
+    """
     try:
         q = Query.model_validate(q_json)
+    except ValidationError as err:
+        raise RtDbError(ErrorCode.BAD_REQUEST, str(err)) from err
     except Exception as err:  # noqa: BLE001 — named loudly with the case
         raise AssertionError(f"{case}: query does not parse: {err}") from err
     return client.run_query(q)

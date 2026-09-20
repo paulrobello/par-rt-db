@@ -502,7 +502,7 @@ extension Query {
             return .distinct
         }
         if let aggregate {
-            return aggregate.groupBy ? .aggregateGroups : .aggregate
+            return aggregateTerminal(for: aggregate)
         }
         if paginate != nil {
             return .paginate
@@ -520,6 +520,23 @@ extension Query {
             return .take
         }
         return .collect
+    }
+}
+
+/// The `QueryResult` variant one `AggregateSpec` produces (server
+/// `compile_aggregate_terminal`'s routing comment, server/src/query/terminals.rs):
+/// legacy single-`op` + no groupBy -> scalar; legacy single-`op` +
+/// `groupBy: true` -> the legacy `[{key, value}]` rows; every other
+/// combination (an `aggregates` map, and/or an explicit `groupBy` field
+/// list) -> the wire-v2 shapes, ungrouped as one alias -> value object,
+/// grouped as `[{keys, values}]` rows.
+private func aggregateTerminal(for aggregate: AggregateSpec) -> QueryTerminal {
+    let legacy = aggregate.op != nil && aggregate.aggregates == nil
+    switch (legacy, aggregate.groupBy) {
+    case (true, .bool(false)): return .aggregate
+    case (true, .bool(true)): return .aggregateGroups
+    case (_, .bool(false)): return .aggregateMulti
+    default: return .aggregateMultiGroups
     }
 }
 

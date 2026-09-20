@@ -108,6 +108,47 @@ struct QueryTests {
         ])
     }
 
+    @Test func aggregateTerminalCompositeGroupByEmitsFieldList() throws {
+        // Wire-v2: groupByFields widens `groupBy` from a bool to a field list.
+        let obj = try TableQuery("items").withIndex("by_status_and_priority")
+            .aggregate(.sum, groupByFields: "status", "priority").build().wireObject()
+        #expect(obj == [
+            "table": .string("items"),
+            "index": .string("by_status_and_priority"),
+            "aggregate": .object([
+                "op": .string("sum"),
+                "groupBy": .array([.string("status"), .string("priority")])
+            ])
+        ])
+    }
+
+    @Test func aggregatesTerminalMultiOpEmitsAliasMap() throws {
+        // Wire-v2: several named ops in one pass, ungrouped.
+        let obj = try TableQuery("items").withIndex("by_status")
+            .eq(.string("todo")).aggregates(["total": .sum, "n": .count]).build().wireObject()
+        #expect(obj == [
+            "table": .string("items"),
+            "index": .string("by_status"),
+            "eq": .array([.string("todo")]),
+            "aggregate": .object([
+                "aggregates": .object(["total": .string("sum"), "n": .string("count")])
+            ])
+        ])
+    }
+
+    @Test func aggregatesTerminalComposesWithGroupByTrue() throws {
+        let obj = try TableQuery("items").withIndex("by_status")
+            .aggregates(["total": .sum, "n": .count], groupBy: .bool(true)).build().wireObject()
+        #expect(obj == [
+            "table": .string("items"),
+            "index": .string("by_status"),
+            "aggregate": .object([
+                "aggregates": .object(["total": .string("sum"), "n": .string("count")]),
+                "groupBy": .bool(true)
+            ])
+        ])
+    }
+
     @Test func paginateWithoutCursorOmitsIt() throws {
         // Corpus `queries` case: {"table":"workItems","paginate":{"numItems":10}}
         let obj = try TableQuery("workItems").paginate(numItems: 10).build().wireObject()

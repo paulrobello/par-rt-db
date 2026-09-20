@@ -538,128 +538,239 @@ func executeDistinctTerminal(table *TableDef, plan *scanPlan, filtered []*Stored
 	return values, nil
 }
 
+// aggregateOpAlias is one (alias, op) pair to evaluate — a single-`op` spec
+// aliases its one entry by the lowercase op name (matches the server/ts
+// `aliased_ops` convention; only load-bearing for the wire-v2 result shapes).
+type aggregateOpAlias struct {
+	alias string
+	op    wire.AggregateOp
+}
+
+// isAggAliasChar mirrors the server's/ts's `[A-Za-z0-9_]` alias charset.
+func isAggAliasChar(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// executeAggregateTerminal ports ts-client's unified `executeAggregateTerminal`
+// (in_memory/query.ts): one code path handles the legacy single-`op` scalar/
+// grouped shapes and the wire-v2 `aggregates` map / composite `groupBy`
+// shapes, dispatching only at the final result-shape choice.
 func executeAggregateTerminal(agg *wire.AggregateSpec, table *TableDef, plan *scanPlan, filtered []*StoredRow) (wire.JSONValue, error) {
-	if plan.indexDef == nil {
-		return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
-			"aggregate requires an index field beyond the eq prefix")
-	}
 	eqLen := len(plan.typedEq)
-	// count consumes no aggregate field (server AggregateOp::needs_field).
-	if agg.Op == wire.AggCount {
-		if agg.GroupBy {
-			if eqLen >= len(plan.indexDef.Fields) {
+	// A caller-constructed AggregateSpec (not decoded from JSON) may leave
+	// GroupBy nil; normalize to the legacy default the wire form always
+	// carries (mirrors AggregateSpec.MarshalJSON's nil -> GroupByBool(false)).
+	groupBy := agg.GroupBy
+	if groupBy == nil {
+		groupBy = wire.GroupByBool(false)
+	}
+
+	if agg.Op != "" && len(agg.Aggregates) > 0 {
+		return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+			"aggregate op and aggregates are mutually exclusive")
+	}
+	var ops []aggregateOpAlias
+	switch {
+	case len(agg.Aggregates) > 0:
+		aliases := make([]string, 0, len(agg.Aggregates))
+		for alias := range agg.Aggregates {
+			aliases = append(aliases, alias)
+		}
+		sort.Strings(aliases)
+		for _, alias := range aliases {
+			ops = append(ops, aggregateOpAlias{alias: alias, op: agg.Aggregates[alias]})
+		}
+	case agg.Op != "":
+		ops = []aggregateOpAlias{{alias: string(agg.Op), op: agg.Op}}
+	}
+	if len(ops) == 0 {
+		return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "aggregate requires op or aggregates")
+	}
+	for _, o := range ops {
+		if len(o.alias) == 0 || len(o.alias) > 64 {
+			return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+				"aggregates alias must be 1-64 characters")
+		}
+		for i := 0; i < len(o.alias); i++ {
+			if !isAggAliasChar(o.alias[i]) {
+				return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+					"aggregates alias may contain only [A-Za-z0-9_]")
+			}
+		}
+	}
+	needsField := false
+	for _, o := range ops {
+		if o.op != wire.AggCount {
+			needsField = true
+			break
+		}
+	}
+	_, legacyGroupBool := groupBy.(wire.GroupByBool)
+	legacy := agg.Op != "" && len(agg.Aggregates) == 0 && legacyGroupBool
+
+	var groupFields []string
+	switch gb := groupBy.(type) {
+	case wire.GroupByBool:
+		if bool(gb) {
+			if plan.indexDef == nil || eqLen >= len(plan.indexDef.Fields) {
 				return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
 					"aggregate groupBy requires an index field beyond the eq prefix")
 			}
-			groupField := plan.indexDef.Fields[eqLen]
-			groupPg := plan.fieldPg(table, groupField)
-			type groupEntry struct {
-				key   wire.JSONValue
-				count int64
-			}
-			var groups []groupEntry
-			groupIndex := map[string]int{}
-			for _, row := range filtered {
-				k, present := row.Doc[groupField]
-				if !present {
-					k = wire.Null{}
-				}
-				key := canonical(k)
-				i, seen := groupIndex[key]
-				if !seen {
-					i = len(groups)
-					groupIndex[key] = i
-					groups = append(groups, groupEntry{key: k})
-				}
-				groups[i].count++
-			}
-			out := make(wire.Array, 0, len(groups))
-			for _, g := range groups {
-				out = append(out, wire.Object{
-					"key":   g.key,
-					"value": wire.Number(formatI64(g.count)),
-				})
-			}
-			sort.SliceStable(out, func(a, b int) bool {
-				return compareIndexValues(out[a].(wire.Object)["key"], out[b].(wire.Object)["key"], groupPg) == cmpLess
-			})
-			if len(out) > maxTake {
-				out = out[:maxTake]
-			}
-			return out, nil
+			groupFields = []string{plan.indexDef.Fields[eqLen]}
 		}
-		return wire.Number(formatI64(int64(len(filtered)))), nil
-	}
-	var groupField, aggField string
-	if agg.GroupBy {
-		if eqLen+1 >= len(plan.indexDef.Fields) {
+	case wire.GroupByFields:
+		groupFields = []string(gb)
+		if len(groupFields) == 0 {
 			return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
-				"aggregate groupBy requires two index fields beyond the eq prefix")
+				"aggregate groupBy list must not be empty")
 		}
-		groupField = plan.indexDef.Fields[eqLen]
-		aggField = plan.indexDef.Fields[eqLen+1]
-	} else {
-		if eqLen >= len(plan.indexDef.Fields) {
+	}
+	if len(groupFields) > 0 {
+		if plan.indexDef == nil {
+			return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+				"aggregate groupBy requires an index field beyond the eq prefix")
+		}
+		for _, field := range groupFields {
+			found := false
+			for _, f := range plan.indexDef.Fields {
+				if f == field {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+					"aggregate groupBy field is not a declared index field")
+			}
+		}
+	}
+
+	var aggField string
+	if needsField {
+		if plan.indexDef == nil {
 			return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
 				"aggregate requires an index field beyond the eq prefix")
 		}
-		aggField = plan.indexDef.Fields[eqLen]
+		for _, f := range plan.indexDef.Fields[eqLen:] {
+			inGroup := false
+			for _, g := range groupFields {
+				if g == f {
+					inGroup = true
+					break
+				}
+			}
+			if !inGroup {
+				aggField = f
+				break
+			}
+		}
+		if aggField == "" {
+			return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+				"aggregate requires an index field beyond the eq prefix")
+		}
+		aggFieldPg := plan.fieldPg(table, aggField)
+		for _, o := range ops {
+			if (o.op == wire.AggSum || o.op == wire.AggAvg) && aggFieldPg != PgNumber && aggFieldPg != PgInt64 {
+				return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+					"aggregate op "+string(o.op)+" requires a numeric index field")
+			}
+		}
+		if gb, ok := groupBy.(wire.GroupByBool); ok && bool(gb) &&
+			eqLen+1 >= len(plan.indexDef.Fields) {
+			return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+				"aggregate groupBy requires two index fields beyond the eq prefix")
+		}
 	}
-	aggFieldPg := plan.fieldPg(table, aggField)
-	if (agg.Op == wire.AggSum || agg.Op == wire.AggAvg) && aggFieldPg != PgNumber && aggFieldPg != PgInt64 {
-		return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
-			"aggregate op "+string(agg.Op)+" requires a numeric index field")
+	aggFieldPg := PgText
+	if aggField != "" {
+		aggFieldPg = plan.fieldPg(table, aggField)
 	}
-	if groupField != "" {
-		groupPg := plan.fieldPg(table, groupField)
+
+	evaluate := func(rows []*StoredRow, op wire.AggregateOp) wire.JSONValue {
+		if op == wire.AggCount {
+			return wire.Number(formatI64(int64(len(rows))))
+		}
+		var values wire.Array
+		for _, row := range rows {
+			if v, present := row.Doc[aggField]; present && !isNullValue(v) {
+				values = append(values, v)
+			}
+		}
+		if len(values) == 0 {
+			return wire.Null{}
+		}
+		return applyAggregate(op, values, aggFieldPg)
+	}
+
+	if len(groupFields) > 0 {
+		groupPgs := make([]PgType, len(groupFields))
+		for i, f := range groupFields {
+			groupPgs[i] = plan.fieldPg(table, f)
+		}
 		type groupEntry struct {
-			key    wire.JSONValue
-			values wire.Array
+			keys []wire.JSONValue
+			rows []*StoredRow
 		}
 		var groups []groupEntry
 		groupIndex := map[string]int{}
 		for _, row := range filtered {
-			k, present := row.Doc[groupField]
-			if !present {
-				k = wire.Null{}
+			keys := make([]wire.JSONValue, len(groupFields))
+			var keyParts []byte
+			for i, f := range groupFields {
+				v, present := row.Doc[f]
+				if !present {
+					v = wire.Null{}
+				}
+				keys[i] = v
+				keyParts = append(keyParts, canonical(v)...)
+				keyParts = append(keyParts, 0x1f)
 			}
-			key := canonical(k)
+			key := string(keyParts)
 			i, seen := groupIndex[key]
 			if !seen {
 				i = len(groups)
 				groupIndex[key] = i
-				groups = append(groups, groupEntry{key: k})
+				groups = append(groups, groupEntry{keys: keys})
 			}
-			if v, present := row.Doc[aggField]; present && !isNullValue(v) {
-				groups[i].values = append(groups[i].values, v)
+			groups[i].rows = append(groups[i].rows, row)
+		}
+		sort.SliceStable(groups, func(a, b int) bool {
+			for i := range groupFields {
+				c := compareIndexValues(groups[a].keys[i], groups[b].keys[i], groupPgs[i])
+				if c != cmpEqual {
+					return c == cmpLess
+				}
 			}
+			return false
+		})
+		if len(groups) > maxTake {
+			groups = groups[:maxTake]
+		}
+		if legacy {
+			out := make(wire.Array, 0, len(groups))
+			for _, g := range groups {
+				out = append(out, wire.Object{"key": g.keys[0], "value": evaluate(g.rows, ops[0].op)})
+			}
+			return out, nil
 		}
 		out := make(wire.Array, 0, len(groups))
 		for _, g := range groups {
-			var value wire.JSONValue = wire.Null{}
-			if len(g.values) > 0 {
-				value = applyAggregate(agg.Op, g.values, aggFieldPg)
+			values := wire.Object{}
+			for _, o := range ops {
+				values[o.alias] = evaluate(g.rows, o.op)
 			}
-			out = append(out, wire.Object{"key": g.key, "value": value})
-		}
-		sort.SliceStable(out, func(a, b int) bool {
-			return compareIndexValues(out[a].(wire.Object)["key"], out[b].(wire.Object)["key"], groupPg) == cmpLess
-		})
-		if len(out) > maxTake {
-			out = out[:maxTake]
+			out = append(out, wire.Object{"keys": wire.Array(g.keys), "values": values})
 		}
 		return out, nil
 	}
-	var values wire.Array
-	for _, row := range filtered {
-		if v, present := row.Doc[aggField]; present && !isNullValue(v) {
-			values = append(values, v)
-		}
+	if legacy {
+		return evaluate(filtered, ops[0].op), nil
 	}
-	if len(values) == 0 {
-		return wire.Null{}, nil
+	out := wire.Object{}
+	for _, o := range ops {
+		out[o.alias] = evaluate(filtered, o.op)
 	}
-	return applyAggregate(agg.Op, values, aggFieldPg), nil
+	return out, nil
 }
 
 // applyAggregate applies one aggregate op over a non-empty value set:

@@ -1,0 +1,35 @@
+{
+  "name": "aggregate-multi-op-grouped",
+  "$comment": "Wire-v2: the aggregates map composed with legacy groupBy:true. Groups by fields[eq.len()]=priority, aggregates fields[eq.len()+1]=order. p1={b,d}: sum=3,n=2; p2={a,e}: sum=7,n=2; p3={c}: sum=5,n=1. Rows are {keys:[key], values:{alias:value,...}} ordered by key ascending.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "priority": { "type": "number" },
+          "order": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_priority", "fields": ["priority", "order"] }]
+      }
+    }
+  },
+  "seed": [
+    { "name": "a", "priority": 2, "order": 3 },
+    { "name": "b", "priority": 1, "order": 1 },
+    { "name": "c", "priority": 3, "order": 5 },
+    { "name": "d", "priority": 1, "order": 2 },
+    { "name": "e", "priority": 2, "order": 4 }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "index": "by_priority",
+      "aggregate": { "aggregates": { "total": "sum", "n": "count" }, "groupBy": true }
+    }
+  },
+  "expect": [
+    { "keys": [1], "values": { "total": 3, "n": 2 } },
+    { "keys": [2], "values": { "total": 7, "n": 2 } },
+    { "keys": [3], "values": { "total": 5, "n": 1 } }
+  ]
+}

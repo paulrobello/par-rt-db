@@ -530,7 +530,12 @@ Reciprocal Rank Fusion, `paginate` is opaque-cursor keyset pagination,
 (ascending; NULLs included, sorted last), and `aggregate` runs a scalar
 `sum`/`min`/`max`/`avg`/`count`, optionally grouped (`groupBy`) by the next
 index field (rows missing the group value form one `key: null` group,
-sorted last), and an optional `fields` array projects each result doc to the
+sorted last) — or, wire-v2, several named ops in one pass via an
+`aggregates: {alias: op, …}` map, and `groupBy` widened to an explicit list of
+declared index fields for composite grouping (`count per (status, priority)`);
+the map form returns `{alias: value, …}` ungrouped or `[{keys, values}]` rows
+grouped, and composes with the legacy single-`op` + field-list combination the
+same way, and an optional `fields` array projects each result doc to the
 listed user fields — the system fields (`_id`/`_creationTime`/`_version`) and
 synthetic fields (`_searchSnippet`) are always kept, `fields: []` is an
 ids-only view, names are validated against the schema (`BAD_REQUEST` on an

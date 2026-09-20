@@ -1,175 +1,1390 @@
 {
-  "$comment": "Canonical cross-client wire-parity corpus (ARC-008). Every entry is the raw JSON object as it appears on the wire. Each client's parity test parses -> serializes -> deep-compares to the input. Bytes are authoritative; tag/field names are load-bearing (see server/src/protocol.rs header). Sections: 'client_messages' (incl. ENH-015 presence join/state/leave frames, FM-29 startWorkflow/cancelWorkflow txn steps, FM-33 undelete txn step, awaitSignal spec steps + signalWorkflow frames — payload/timeoutMs present and omitted), 'server_messages' (incl. ENH-015 presenceSnapshot/presenceErr, FM-29 startWorkflowOk/startWorkflowErr/workflowAck/listWorkflowsOk — incl. a waiting-status WorkflowInfo with waitingFor/waitedSince and a CONFLICT workflowAck), 'authed_users', 'schedule_whens', 'schedule_infos', 'query_results', 'error_envelopes', 'queries' (embedded query shapes covering filter/search/vectorSearch/paginate), 'migrate_requests' / 'migrate_results' (admin migrate Directive list + response — op tag, camelCase, `where`/`from` aliases, cast literals), 'db_stats' (admin GET /admin/dbs/{db}/stats response, ENH-011 quota/usage fields — ARC-112), 'rejects_client_message_unknown_field' and 'rejects_workflow_spec_unknown_field' (must fail to parse where deny_unknown_fields / extra='forbid' applies — the workflow-spec section is a bare WorkflowSpec, the nested-shape pattern of 'rejects_schedule_when_unknown_field', because python's ClientMessage types txn as dict).",
+  "$comment": "Canonical cross-client wire-parity corpus (ARC-008). Every entry is the raw JSON object as it appears on the wire. Each client's parity test parses -> serializes -> deep-compares to the input. Bytes are authoritative; tag/field names are load-bearing (see server/src/protocol.rs header). Sections: 'client_messages' (incl. ENH-015 presence join/state/leave frames, FM-29 startWorkflow/cancelWorkflow txn steps, FM-33 undelete txn step, awaitSignal spec steps + signalWorkflow frames \u2014 payload/timeoutMs present and omitted), 'server_messages' (incl. ENH-015 presenceSnapshot/presenceErr, FM-29 startWorkflowOk/startWorkflowErr/workflowAck/listWorkflowsOk \u2014 incl. a waiting-status WorkflowInfo with waitingFor/waitedSince and a CONFLICT workflowAck), 'authed_users', 'schedule_whens', 'schedule_infos', 'query_results', 'error_envelopes', 'queries' (embedded query shapes covering filter/search/vectorSearch/paginate), 'migrate_requests' / 'migrate_results' (admin migrate Directive list + response \u2014 op tag, camelCase, `where`/`from` aliases, cast literals), 'db_stats' (admin GET /admin/dbs/{db}/stats response, ENH-011 quota/usage fields \u2014 ARC-112), 'rejects_client_message_unknown_field' and 'rejects_workflow_spec_unknown_field' (must fail to parse where deny_unknown_fields / extra='forbid' applies \u2014 the workflow-spec section is a bare WorkflowSpec, the nested-shape pattern of 'rejects_schedule_when_unknown_field', because python's ClientMessage types txn as dict).",
   "client_messages": [
-    { "type": "auth", "token": "t", "db": "d" },
-    { "type": "auth", "db": "d" },
-    { "type": "auth", "token": "t", "db": "d", "protocolVersion": 1 },
-    { "type": "subscribe", "queryId": "q1", "query": { "table": "workItems" } },
-    { "type": "subscribe", "queryId": "q-filter", "query": { "table": "workItems", "filter": { "op": "and", "exprs": [ { "op": "eq", "field": "status", "value": "done" }, { "op": "gt", "field": "order", "value": 0 } ] } } },
-    { "type": "subscribe", "queryId": "q-search", "query": { "table": "notes", "search": { "index": "search_body", "query": "hello world" } } },
-    { "type": "subscribe", "queryId": "q-vector", "query": { "table": "embeds", "vectorSearch": { "index": "by_embedding", "vector": [1.0, 0.5, -0.5], "limit": 5 } } },
-    { "type": "subscribe", "queryId": "q-vector-filter", "query": { "table": "embeds", "vectorSearch": { "index": "by_embedding", "vector": [1.0], "limit": 3, "filter": { "op": "eq", "field": "userId", "value": "u1" } } } },
-    { "type": "subscribe", "queryId": "q-paginate", "query": { "table": "workItems", "paginate": { "numItems": 10 } } },
-    { "type": "subscribe", "queryId": "q-paginate-cursor", "query": { "table": "workItems", "paginate": { "cursor": "abc", "numItems": 10 } } },
-    { "type": "unsubscribe", "queryId": "q1" },
-    { "type": "mutate", "mutId": "m1", "txn": { "steps": [] } },
-    { "type": "mutate", "mutId": "m1", "idempotencyKey": "key1", "txn": { "steps": [] } },
-    { "type": "mutate", "mutId": "m1", "txn": { "steps": [ { "op": "insert", "table": "workItems", "doc": { "title": "x" } } ] } },
-    { "type": "mutate", "mutId": "m4", "txn": { "steps": [ { "op": "schedule", "when": { "type": "afterMs", "ms": 60000 }, "txn": { "steps": [ { "op": "insert", "table": "workItems", "doc": { "title": "later" } } ] } } ] } },
-    { "type": "mutate", "mutId": "m5", "txn": { "steps": [ { "op": "cancelSchedule", "id": "0199ab_cd" } ] } },
-    { "type": "mutate", "mutId": "m6", "txn": { "steps": [ { "op": "startWorkflow", "spec": { "name": "drip", "steps": [ { "txn": { "steps": [ { "op": "insert", "table": "workItems", "doc": { "title": "welcome" } } ] }, "retry": { "maxAttempts": 3, "initialRetryMs": 1000, "maxRetryMs": 60000 }, "sleepBeforeMs": 60000 }, { "txn": { "steps": [] } } ] } } ] } },
-    { "type": "mutate", "mutId": "m7", "txn": { "steps": [ { "op": "cancelWorkflow", "id": "wf-9" } ] } },
-    { "type": "schedule", "scheduleId": "s1", "when": { "type": "afterMs", "ms": 100 }, "txn": { "steps": [] } },
-    { "type": "schedule", "scheduleId": "s1", "when": { "type": "runAt", "ms": 1700000000000 }, "txn": { "steps": [] } },
-    { "type": "schedule", "scheduleId": "s1", "when": { "type": "cron", "expr": "*/5 * * * *" }, "txn": { "steps": [] } },
-    { "type": "schedule", "scheduleId": "s1", "when": { "type": "interval", "everyMs": 300000 }, "txn": { "steps": [] } },
-    { "type": "schedule", "scheduleId": "s9", "when": { "type": "afterMs", "ms": 100 }, "txn": { "steps": [] }, "external": true },
-    { "type": "cancelSchedule", "scheduleId": "s1", "id": "job-9" },
-    { "type": "pauseSchedule", "scheduleId": "s1", "id": "job-9" },
-    { "type": "resumeSchedule", "scheduleId": "s1", "id": "job-9" },
-    { "type": "listSchedules", "scheduleId": "s1" },
-    { "type": "presence", "room": "doc:1" },
-    { "type": "presence", "room": "doc:1", "state": { "cursor": { "x": 1, "y": 2 } } },
-    { "type": "presenceState", "room": "doc:1", "state": { "typing": true } },
-    { "type": "leavePresence", "room": "doc:1" },
-    { "type": "ping" },
-    { "type": "mutate", "mutId": "m8", "txn": { "steps": [ { "op": "undelete", "table": "tasks", "id": "t-1" } ] } },
-    { "type": "mutate", "mutId": "m9", "txn": { "steps": [ { "op": "schedule", "when": { "type": "interval", "everyMs": 300000 }, "txn": { "steps": [] } } ] } },
-    { "type": "signalWorkflow", "workflowId": "w1", "id": "wf-1", "name": "approve", "payload": { "ok": true, "count": 2 } },
-    { "type": "signalWorkflow", "workflowId": "w2", "id": "wf-2", "name": "approve" },
-    { "type": "mutate", "mutId": "m10", "txn": { "steps": [ { "op": "startWorkflow", "spec": { "name": "gated", "steps": [ { "txn": { "steps": [ { "op": "insert", "table": "workItems", "doc": { "title": "pre" } } ] } }, { "awaitSignal": { "name": "approve", "timeoutMs": 3600000 } }, { "awaitSignal": { "name": "audit" } } ] } } ] } },
-    { "type": "mutate", "mutId": "m11", "txn": { "steps": [ { "op": "patchByQuery", "table": "workItems", "filter": { "op": "olderThan", "field": "completedAt", "ms": 604800000 }, "patch": { "status": "archived" } }, { "op": "deleteByQuery", "table": "sessions", "filter": { "op": "and", "exprs": [ { "op": "olderThan", "field": "claimExpiresAt", "ms": 0 }, { "op": "exists", "field": "claimExpiresAt" } ] }, "limit": 500 } ] } },
-    { "type": "mutate", "mutId": "m12", "txn": { "steps": [ { "op": "adjustCounter", "table": "storageUsage", "id": "usage-1", "field": "usedBytes", "delta": -8, "min": 0, "max": 100, "expected": { "key": "retained-data", "initialized": true, "metadata": { "limits": { "daily": 12, "hourly": 4 } } } } ] } }
+    {
+      "type": "auth",
+      "token": "t",
+      "db": "d"
+    },
+    {
+      "type": "auth",
+      "db": "d"
+    },
+    {
+      "type": "auth",
+      "token": "t",
+      "db": "d",
+      "protocolVersion": 1
+    },
+    {
+      "type": "subscribe",
+      "queryId": "q1",
+      "query": {
+        "table": "workItems"
+      }
+    },
+    {
+      "type": "subscribe",
+      "queryId": "q-filter",
+      "query": {
+        "table": "workItems",
+        "filter": {
+          "op": "and",
+          "exprs": [
+            {
+              "op": "eq",
+              "field": "status",
+              "value": "done"
+            },
+            {
+              "op": "gt",
+              "field": "order",
+              "value": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "subscribe",
+      "queryId": "q-search",
+      "query": {
+        "table": "notes",
+        "search": {
+          "index": "search_body",
+          "query": "hello world"
+        }
+      }
+    },
+    {
+      "type": "subscribe",
+      "queryId": "q-vector",
+      "query": {
+        "table": "embeds",
+        "vectorSearch": {
+          "index": "by_embedding",
+          "vector": [
+            1.0,
+            0.5,
+            -0.5
+          ],
+          "limit": 5
+        }
+      }
+    },
+    {
+      "type": "subscribe",
+      "queryId": "q-vector-filter",
+      "query": {
+        "table": "embeds",
+        "vectorSearch": {
+          "index": "by_embedding",
+          "vector": [
+            1.0
+          ],
+          "limit": 3,
+          "filter": {
+            "op": "eq",
+            "field": "userId",
+            "value": "u1"
+          }
+        }
+      }
+    },
+    {
+      "type": "subscribe",
+      "queryId": "q-paginate",
+      "query": {
+        "table": "workItems",
+        "paginate": {
+          "numItems": 10
+        }
+      }
+    },
+    {
+      "type": "subscribe",
+      "queryId": "q-paginate-cursor",
+      "query": {
+        "table": "workItems",
+        "paginate": {
+          "cursor": "abc",
+          "numItems": 10
+        }
+      }
+    },
+    {
+      "type": "unsubscribe",
+      "queryId": "q1"
+    },
+    {
+      "type": "mutate",
+      "mutId": "m1",
+      "txn": {
+        "steps": []
+      }
+    },
+    {
+      "type": "mutate",
+      "mutId": "m1",
+      "idempotencyKey": "key1",
+      "txn": {
+        "steps": []
+      }
+    },
+    {
+      "type": "mutate",
+      "mutId": "m1",
+      "txn": {
+        "steps": [
+          {
+            "op": "insert",
+            "table": "workItems",
+            "doc": {
+              "title": "x"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "mutate",
+      "mutId": "m4",
+      "txn": {
+        "steps": [
+          {
+            "op": "schedule",
+            "when": {
+              "type": "afterMs",
+              "ms": 60000
+            },
+            "txn": {
+              "steps": [
+                {
+                  "op": "insert",
+                  "table": "workItems",
+                  "doc": {
+                    "title": "later"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "mutate",
+      "mutId": "m5",
+      "txn": {
+        "steps": [
+          {
+            "op": "cancelSchedule",
+            "id": "0199ab_cd"
+          }
+        ]
+      }
+    },
+    {
+      "type": "mutate",
+      "mutId": "m6",
+      "txn": {
+        "steps": [
+          {
+            "op": "startWorkflow",
+            "spec": {
+              "name": "drip",
+              "steps": [
+                {
+                  "txn": {
+                    "steps": [
+                      {
+                        "op": "insert",
+                        "table": "workItems",
+                        "doc": {
+                          "title": "welcome"
+                        }
+                      }
+                    ]
+                  },
+                  "retry": {
+                    "maxAttempts": 3,
+                    "initialRetryMs": 1000,
+                    "maxRetryMs": 60000
+                  },
+                  "sleepBeforeMs": 60000
+                },
+                {
+                  "txn": {
+                    "steps": []
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "mutate",
+      "mutId": "m7",
+      "txn": {
+        "steps": [
+          {
+            "op": "cancelWorkflow",
+            "id": "wf-9"
+          }
+        ]
+      }
+    },
+    {
+      "type": "schedule",
+      "scheduleId": "s1",
+      "when": {
+        "type": "afterMs",
+        "ms": 100
+      },
+      "txn": {
+        "steps": []
+      }
+    },
+    {
+      "type": "schedule",
+      "scheduleId": "s1",
+      "when": {
+        "type": "runAt",
+        "ms": 1700000000000
+      },
+      "txn": {
+        "steps": []
+      }
+    },
+    {
+      "type": "schedule",
+      "scheduleId": "s1",
+      "when": {
+        "type": "cron",
+        "expr": "*/5 * * * *"
+      },
+      "txn": {
+        "steps": []
+      }
+    },
+    {
+      "type": "schedule",
+      "scheduleId": "s1",
+      "when": {
+        "type": "interval",
+        "everyMs": 300000
+      },
+      "txn": {
+        "steps": []
+      }
+    },
+    {
+      "type": "schedule",
+      "scheduleId": "s9",
+      "when": {
+        "type": "afterMs",
+        "ms": 100
+      },
+      "txn": {
+        "steps": []
+      },
+      "external": true
+    },
+    {
+      "type": "cancelSchedule",
+      "scheduleId": "s1",
+      "id": "job-9"
+    },
+    {
+      "type": "pauseSchedule",
+      "scheduleId": "s1",
+      "id": "job-9"
+    },
+    {
+      "type": "resumeSchedule",
+      "scheduleId": "s1",
+      "id": "job-9"
+    },
+    {
+      "type": "listSchedules",
+      "scheduleId": "s1"
+    },
+    {
+      "type": "presence",
+      "room": "doc:1"
+    },
+    {
+      "type": "presence",
+      "room": "doc:1",
+      "state": {
+        "cursor": {
+          "x": 1,
+          "y": 2
+        }
+      }
+    },
+    {
+      "type": "presenceState",
+      "room": "doc:1",
+      "state": {
+        "typing": true
+      }
+    },
+    {
+      "type": "leavePresence",
+      "room": "doc:1"
+    },
+    {
+      "type": "ping"
+    },
+    {
+      "type": "mutate",
+      "mutId": "m8",
+      "txn": {
+        "steps": [
+          {
+            "op": "undelete",
+            "table": "tasks",
+            "id": "t-1"
+          }
+        ]
+      }
+    },
+    {
+      "type": "mutate",
+      "mutId": "m9",
+      "txn": {
+        "steps": [
+          {
+            "op": "schedule",
+            "when": {
+              "type": "interval",
+              "everyMs": 300000
+            },
+            "txn": {
+              "steps": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "signalWorkflow",
+      "workflowId": "w1",
+      "id": "wf-1",
+      "name": "approve",
+      "payload": {
+        "ok": true,
+        "count": 2
+      }
+    },
+    {
+      "type": "signalWorkflow",
+      "workflowId": "w2",
+      "id": "wf-2",
+      "name": "approve"
+    },
+    {
+      "type": "mutate",
+      "mutId": "m10",
+      "txn": {
+        "steps": [
+          {
+            "op": "startWorkflow",
+            "spec": {
+              "name": "gated",
+              "steps": [
+                {
+                  "txn": {
+                    "steps": [
+                      {
+                        "op": "insert",
+                        "table": "workItems",
+                        "doc": {
+                          "title": "pre"
+                        }
+                      }
+                    ]
+                  }
+                },
+                {
+                  "awaitSignal": {
+                    "name": "approve",
+                    "timeoutMs": 3600000
+                  }
+                },
+                {
+                  "awaitSignal": {
+                    "name": "audit"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "mutate",
+      "mutId": "m11",
+      "txn": {
+        "steps": [
+          {
+            "op": "patchByQuery",
+            "table": "workItems",
+            "filter": {
+              "op": "olderThan",
+              "field": "completedAt",
+              "ms": 604800000
+            },
+            "patch": {
+              "status": "archived"
+            }
+          },
+          {
+            "op": "deleteByQuery",
+            "table": "sessions",
+            "filter": {
+              "op": "and",
+              "exprs": [
+                {
+                  "op": "olderThan",
+                  "field": "claimExpiresAt",
+                  "ms": 0
+                },
+                {
+                  "op": "exists",
+                  "field": "claimExpiresAt"
+                }
+              ]
+            },
+            "limit": 500
+          }
+        ]
+      }
+    },
+    {
+      "type": "mutate",
+      "mutId": "m12",
+      "txn": {
+        "steps": [
+          {
+            "op": "adjustCounter",
+            "table": "storageUsage",
+            "id": "usage-1",
+            "field": "usedBytes",
+            "delta": -8,
+            "min": 0,
+            "max": 100,
+            "expected": {
+              "key": "retained-data",
+              "initialized": true,
+              "metadata": {
+                "limits": {
+                  "daily": 12,
+                  "hourly": 4
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
   ],
   "server_messages": [
-    { "type": "authOk", "user": { "kind": "user", "email": "a@b.com", "name": null, "githubLogin": "alice", "githubId": 12345 } },
-    { "type": "authOk", "user": { "kind": "machine", "email": null, "name": null } },
-    { "type": "authOk", "user": { "kind": "machine", "email": null, "name": null }, "protocolVersion": 1 },
-    { "type": "authErr", "error": { "code": "UNAUTHORIZED", "message": "bad token" } },
-    { "type": "queryUpdate", "queryId": "q1", "result": null },
-    { "type": "queryUpdate", "queryId": "q1", "result": { "_id": "abc", "title": "first" } },
-    { "type": "queryUpdate", "queryId": "q1", "result": [] },
-    { "type": "queryUpdate", "queryId": "q1", "result": [ { "_id": "a" }, { "_id": "b" } ] },
-    { "type": "queryUpdate", "queryId": "q1", "result": 42 },
-    { "type": "queryUpdate", "queryId": "q1", "result": { "docs": [ { "_id": "a" } ], "nextCursor": "cur1" } },
-    { "type": "queryUpdate", "queryId": "q1", "result": { "docs": [ { "_id": "a" } ] } },
-    { "type": "mutateOk", "mutId": "m1", "results": [] },
-    { "type": "mutateOk", "mutId": "m1", "results": [ { "_id": "a", "title": "x" } ] },
-    { "type": "mutateErr", "mutId": "m1", "error": { "code": "NOT_FOUND", "message": "missing doc" } },
-    { "type": "subscribeErr", "queryId": "q1", "error": { "code": "BAD_REQUEST", "message": "bad index" } },
-    { "type": "scheduleOk", "scheduleId": "s1", "id": "job-9" },
-    { "type": "scheduleErr", "scheduleId": "s1", "error": { "code": "BAD_REQUEST", "message": "bad cron" } },
-    { "type": "scheduleAck", "scheduleId": "s1", "ok": true },
-    { "type": "scheduleAck", "scheduleId": "s1", "ok": false, "error": { "code": "NOT_FOUND", "message": "missing job" } },
-    { "type": "listSchedulesOk", "scheduleId": "s1", "schedules": [] },
-    { "type": "listSchedulesOk", "scheduleId": "s1", "schedules": [ { "id": "j1", "kind": "oneshot", "dueAt": 1000, "status": "pending", "createdAt": 500, "firedCount": 0 } ] },
-    { "type": "listSchedulesOk", "scheduleId": "s1", "schedules": [ { "id": "j2", "kind": "cron", "dueAt": 2000, "cron": "*/5 * * * *", "status": "error", "lastError": "boom", "createdAt": 500, "firedCount": 3 } ] },
-    { "type": "startWorkflowOk", "workflowId": "w1", "info": { "id": "wf1", "name": "drip", "status": "pending", "currentStep": 0, "stepCount": 2, "attempts": 0, "createdAt": 100, "updatedAt": 100 } },
-    { "type": "startWorkflowErr", "workflowId": "w1", "error": { "code": "BAD_REQUEST", "message": "workflow must have at least one step" } },
-    { "type": "workflowAck", "workflowId": "w1", "ok": true },
-    { "type": "workflowAck", "workflowId": "w1", "ok": false, "error": { "code": "NOT_FOUND", "message": "no run" } },
-    { "type": "listWorkflowsOk", "workflowId": "w1", "workflows": [] },
-    { "type": "listWorkflowsOk", "workflowId": "w1", "workflows": [ { "id": "wf2", "name": "drip", "status": "running", "currentStep": 1, "stepCount": 2, "attempts": 0, "sleepUntil": 9000, "createdAt": 100, "updatedAt": 150 }, { "id": "wf3", "name": "drip", "status": "failed", "currentStep": 0, "stepCount": 2, "attempts": 3, "lastError": "boom", "createdAt": 100, "updatedAt": 200, "startedAt": 110, "finishedAt": 200 } ] },
-    { "type": "workflowAck", "workflowId": "w3", "ok": false, "error": { "code": "CONFLICT", "message": "workflow waiting on 'approve', got 'ok'" } },
-    { "type": "listWorkflowsOk", "workflowId": "w4", "workflows": [ { "id": "wf4", "name": "gated", "status": "waiting", "currentStep": 1, "stepCount": 3, "attempts": 0, "waitingFor": "approve", "waitedSince": 1234, "sleepUntil": 3601234, "createdAt": 100, "updatedAt": 1234 } ] },
-    { "type": "presenceSnapshot", "room": "doc:1", "members": [ { "connectionId": "c1", "user": { "kind": "user", "email": "a@b.com", "name": null }, "state": { "cursor": { "x": 1, "y": 2 } } }, { "connectionId": "c2", "user": { "kind": "machine", "email": null, "name": null }, "state": {} } ] },
-    { "type": "presenceErr", "room": "doc:1", "error": { "code": "FORBIDDEN", "message": "presence not enabled" } },
-    { "type": "pong" }
+    {
+      "type": "authOk",
+      "user": {
+        "kind": "user",
+        "email": "a@b.com",
+        "name": null,
+        "githubLogin": "alice",
+        "githubId": 12345
+      }
+    },
+    {
+      "type": "authOk",
+      "user": {
+        "kind": "machine",
+        "email": null,
+        "name": null
+      }
+    },
+    {
+      "type": "authOk",
+      "user": {
+        "kind": "machine",
+        "email": null,
+        "name": null
+      },
+      "protocolVersion": 1
+    },
+    {
+      "type": "authErr",
+      "error": {
+        "code": "UNAUTHORIZED",
+        "message": "bad token"
+      }
+    },
+    {
+      "type": "queryUpdate",
+      "queryId": "q1",
+      "result": null
+    },
+    {
+      "type": "queryUpdate",
+      "queryId": "q1",
+      "result": {
+        "_id": "abc",
+        "title": "first"
+      }
+    },
+    {
+      "type": "queryUpdate",
+      "queryId": "q1",
+      "result": []
+    },
+    {
+      "type": "queryUpdate",
+      "queryId": "q1",
+      "result": [
+        {
+          "_id": "a"
+        },
+        {
+          "_id": "b"
+        }
+      ]
+    },
+    {
+      "type": "queryUpdate",
+      "queryId": "q1",
+      "result": 42
+    },
+    {
+      "type": "queryUpdate",
+      "queryId": "q1",
+      "result": {
+        "docs": [
+          {
+            "_id": "a"
+          }
+        ],
+        "nextCursor": "cur1"
+      }
+    },
+    {
+      "type": "queryUpdate",
+      "queryId": "q1",
+      "result": {
+        "docs": [
+          {
+            "_id": "a"
+          }
+        ]
+      }
+    },
+    {
+      "type": "mutateOk",
+      "mutId": "m1",
+      "results": []
+    },
+    {
+      "type": "mutateOk",
+      "mutId": "m1",
+      "results": [
+        {
+          "_id": "a",
+          "title": "x"
+        }
+      ]
+    },
+    {
+      "type": "mutateErr",
+      "mutId": "m1",
+      "error": {
+        "code": "NOT_FOUND",
+        "message": "missing doc"
+      }
+    },
+    {
+      "type": "subscribeErr",
+      "queryId": "q1",
+      "error": {
+        "code": "BAD_REQUEST",
+        "message": "bad index"
+      }
+    },
+    {
+      "type": "scheduleOk",
+      "scheduleId": "s1",
+      "id": "job-9"
+    },
+    {
+      "type": "scheduleErr",
+      "scheduleId": "s1",
+      "error": {
+        "code": "BAD_REQUEST",
+        "message": "bad cron"
+      }
+    },
+    {
+      "type": "scheduleAck",
+      "scheduleId": "s1",
+      "ok": true
+    },
+    {
+      "type": "scheduleAck",
+      "scheduleId": "s1",
+      "ok": false,
+      "error": {
+        "code": "NOT_FOUND",
+        "message": "missing job"
+      }
+    },
+    {
+      "type": "listSchedulesOk",
+      "scheduleId": "s1",
+      "schedules": []
+    },
+    {
+      "type": "listSchedulesOk",
+      "scheduleId": "s1",
+      "schedules": [
+        {
+          "id": "j1",
+          "kind": "oneshot",
+          "dueAt": 1000,
+          "status": "pending",
+          "createdAt": 500,
+          "firedCount": 0
+        }
+      ]
+    },
+    {
+      "type": "listSchedulesOk",
+      "scheduleId": "s1",
+      "schedules": [
+        {
+          "id": "j2",
+          "kind": "cron",
+          "dueAt": 2000,
+          "cron": "*/5 * * * *",
+          "status": "error",
+          "lastError": "boom",
+          "createdAt": 500,
+          "firedCount": 3
+        }
+      ]
+    },
+    {
+      "type": "startWorkflowOk",
+      "workflowId": "w1",
+      "info": {
+        "id": "wf1",
+        "name": "drip",
+        "status": "pending",
+        "currentStep": 0,
+        "stepCount": 2,
+        "attempts": 0,
+        "createdAt": 100,
+        "updatedAt": 100
+      }
+    },
+    {
+      "type": "startWorkflowErr",
+      "workflowId": "w1",
+      "error": {
+        "code": "BAD_REQUEST",
+        "message": "workflow must have at least one step"
+      }
+    },
+    {
+      "type": "workflowAck",
+      "workflowId": "w1",
+      "ok": true
+    },
+    {
+      "type": "workflowAck",
+      "workflowId": "w1",
+      "ok": false,
+      "error": {
+        "code": "NOT_FOUND",
+        "message": "no run"
+      }
+    },
+    {
+      "type": "listWorkflowsOk",
+      "workflowId": "w1",
+      "workflows": []
+    },
+    {
+      "type": "listWorkflowsOk",
+      "workflowId": "w1",
+      "workflows": [
+        {
+          "id": "wf2",
+          "name": "drip",
+          "status": "running",
+          "currentStep": 1,
+          "stepCount": 2,
+          "attempts": 0,
+          "sleepUntil": 9000,
+          "createdAt": 100,
+          "updatedAt": 150
+        },
+        {
+          "id": "wf3",
+          "name": "drip",
+          "status": "failed",
+          "currentStep": 0,
+          "stepCount": 2,
+          "attempts": 3,
+          "lastError": "boom",
+          "createdAt": 100,
+          "updatedAt": 200,
+          "startedAt": 110,
+          "finishedAt": 200
+        }
+      ]
+    },
+    {
+      "type": "workflowAck",
+      "workflowId": "w3",
+      "ok": false,
+      "error": {
+        "code": "CONFLICT",
+        "message": "workflow waiting on 'approve', got 'ok'"
+      }
+    },
+    {
+      "type": "listWorkflowsOk",
+      "workflowId": "w4",
+      "workflows": [
+        {
+          "id": "wf4",
+          "name": "gated",
+          "status": "waiting",
+          "currentStep": 1,
+          "stepCount": 3,
+          "attempts": 0,
+          "waitingFor": "approve",
+          "waitedSince": 1234,
+          "sleepUntil": 3601234,
+          "createdAt": 100,
+          "updatedAt": 1234
+        }
+      ]
+    },
+    {
+      "type": "presenceSnapshot",
+      "room": "doc:1",
+      "members": [
+        {
+          "connectionId": "c1",
+          "user": {
+            "kind": "user",
+            "email": "a@b.com",
+            "name": null
+          },
+          "state": {
+            "cursor": {
+              "x": 1,
+              "y": 2
+            }
+          }
+        },
+        {
+          "connectionId": "c2",
+          "user": {
+            "kind": "machine",
+            "email": null,
+            "name": null
+          },
+          "state": {}
+        }
+      ]
+    },
+    {
+      "type": "presenceErr",
+      "room": "doc:1",
+      "error": {
+        "code": "FORBIDDEN",
+        "message": "presence not enabled"
+      }
+    },
+    {
+      "type": "pong"
+    }
   ],
   "authed_users": [
-    { "kind": "user", "email": "a@b.com", "name": null, "githubLogin": "alice", "githubId": 12345 },
-    { "kind": "user", "email": "a@b.com", "name": "Alice" },
-    { "kind": "user", "email": "a@b.com", "name": "Alice Example", "githubLogin": "alice", "githubId": 12345 },
-    { "kind": "machine", "email": null, "name": null },
-    { "kind": "machine", "email": null, "name": null, "githubLogin": "ci-bot", "githubId": 999 }
+    {
+      "kind": "user",
+      "email": "a@b.com",
+      "name": null,
+      "githubLogin": "alice",
+      "githubId": 12345
+    },
+    {
+      "kind": "user",
+      "email": "a@b.com",
+      "name": "Alice"
+    },
+    {
+      "kind": "user",
+      "email": "a@b.com",
+      "name": "Alice Example",
+      "githubLogin": "alice",
+      "githubId": 12345
+    },
+    {
+      "kind": "machine",
+      "email": null,
+      "name": null
+    },
+    {
+      "kind": "machine",
+      "email": null,
+      "name": null,
+      "githubLogin": "ci-bot",
+      "githubId": 999
+    }
   ],
   "schedule_whens": [
-    { "type": "afterMs", "ms": 100 },
-    { "type": "runAt", "ms": 1700000000000 },
-    { "type": "cron", "expr": "*/5 * * * *" },
-    { "type": "interval", "everyMs": 300000 }
+    {
+      "type": "afterMs",
+      "ms": 100
+    },
+    {
+      "type": "runAt",
+      "ms": 1700000000000
+    },
+    {
+      "type": "cron",
+      "expr": "*/5 * * * *"
+    },
+    {
+      "type": "interval",
+      "everyMs": 300000
+    }
   ],
   "schedule_infos": [
-    { "id": "j1", "kind": "oneshot", "dueAt": 1000, "status": "pending", "createdAt": 500, "firedCount": 0 },
-    { "id": "j2", "kind": "oneshot", "dueAt": 1100, "status": "running", "createdAt": 500, "firedCount": 0 },
-    { "id": "j3", "kind": "oneshot", "dueAt": 1200, "status": "paused", "createdAt": 500, "firedCount": 0 },
-    { "id": "j4", "kind": "oneshot", "dueAt": 1300, "status": "error", "lastError": "boom", "createdAt": 500, "firedCount": 0 },
-    { "id": "j5", "kind": "cron", "dueAt": 2000, "cron": "*/5 * * * *", "status": "pending", "createdAt": 500, "firedCount": 0 },
-    { "id": "j6", "kind": "cron", "dueAt": 2100, "cron": "0 * * * *", "status": "running", "createdAt": 500, "firedCount": 4 },
-    { "id": "j7", "kind": "cron", "dueAt": 2200, "cron": "0 * * * *", "status": "paused", "createdAt": 500, "firedCount": 4 },
-    { "id": "j8", "kind": "cron", "dueAt": 2300, "cron": "0 * * * *", "status": "error", "lastError": "kaboom", "createdAt": 500, "firedCount": 7 },
-    { "id": "j9", "kind": "interval", "dueAt": 2400, "everyMs": 300000, "status": "pending", "createdAt": 500, "firedCount": 0 },
-    { "id": "j10", "kind": "interval", "dueAt": 2500, "everyMs": 60000, "status": "error", "lastError": "boom", "createdAt": 500, "firedCount": 2 },
-    { "id": "jx", "kind": "oneshot", "dueAt": 3000, "status": "running", "createdAt": 500, "firedCount": 0, "external": true }
+    {
+      "id": "j1",
+      "kind": "oneshot",
+      "dueAt": 1000,
+      "status": "pending",
+      "createdAt": 500,
+      "firedCount": 0
+    },
+    {
+      "id": "j2",
+      "kind": "oneshot",
+      "dueAt": 1100,
+      "status": "running",
+      "createdAt": 500,
+      "firedCount": 0
+    },
+    {
+      "id": "j3",
+      "kind": "oneshot",
+      "dueAt": 1200,
+      "status": "paused",
+      "createdAt": 500,
+      "firedCount": 0
+    },
+    {
+      "id": "j4",
+      "kind": "oneshot",
+      "dueAt": 1300,
+      "status": "error",
+      "lastError": "boom",
+      "createdAt": 500,
+      "firedCount": 0
+    },
+    {
+      "id": "j5",
+      "kind": "cron",
+      "dueAt": 2000,
+      "cron": "*/5 * * * *",
+      "status": "pending",
+      "createdAt": 500,
+      "firedCount": 0
+    },
+    {
+      "id": "j6",
+      "kind": "cron",
+      "dueAt": 2100,
+      "cron": "0 * * * *",
+      "status": "running",
+      "createdAt": 500,
+      "firedCount": 4
+    },
+    {
+      "id": "j7",
+      "kind": "cron",
+      "dueAt": 2200,
+      "cron": "0 * * * *",
+      "status": "paused",
+      "createdAt": 500,
+      "firedCount": 4
+    },
+    {
+      "id": "j8",
+      "kind": "cron",
+      "dueAt": 2300,
+      "cron": "0 * * * *",
+      "status": "error",
+      "lastError": "kaboom",
+      "createdAt": 500,
+      "firedCount": 7
+    },
+    {
+      "id": "j9",
+      "kind": "interval",
+      "dueAt": 2400,
+      "everyMs": 300000,
+      "status": "pending",
+      "createdAt": 500,
+      "firedCount": 0
+    },
+    {
+      "id": "j10",
+      "kind": "interval",
+      "dueAt": 2500,
+      "everyMs": 60000,
+      "status": "error",
+      "lastError": "boom",
+      "createdAt": 500,
+      "firedCount": 2
+    },
+    {
+      "id": "jx",
+      "kind": "oneshot",
+      "dueAt": 3000,
+      "status": "running",
+      "createdAt": 500,
+      "firedCount": 0,
+      "external": true
+    }
   ],
   "query_results": [
     null,
-    { "_id": "abc", "title": "first" },
+    {
+      "_id": "abc",
+      "title": "first"
+    },
     [],
-    [ { "_id": "a" }, { "_id": "b" } ],
+    [
+      {
+        "_id": "a"
+      },
+      {
+        "_id": "b"
+      }
+    ],
     42,
-    { "docs": [ { "_id": "a" } ], "nextCursor": "cur1" },
-    { "docs": [ { "_id": "a" } ] }
+    {
+      "docs": [
+        {
+          "_id": "a"
+        }
+      ],
+      "nextCursor": "cur1"
+    },
+    {
+      "docs": [
+        {
+          "_id": "a"
+        }
+      ]
+    },
+    [
+      {
+        "keys": [
+          "backlog"
+        ],
+        "values": {
+          "total": 5,
+          "n": 2
+        }
+      }
+    ],
+    [
+      {
+        "keys": [
+          "backlog",
+          1
+        ],
+        "values": {
+          "sum": 5
+        }
+      }
+    ]
   ],
   "error_envelopes": [
-    { "code": "BAD_REQUEST", "message": "bad index" },
-    { "code": "UNAUTHORIZED", "message": "bad token" },
-    { "code": "NOT_FOUND", "message": "missing doc" },
-    { "code": "PRECONDITION_FAILED", "message": "version conflict" },
-    { "code": "FORBIDDEN", "message": "not owner" },
-    { "code": "UNSUPPORTED_PROTOCOL", "message": "requested protocol version 999 is newer than this server's 1" },
-    { "code": "CURSOR_EXPIRED", "message": "cursor 41 predates the retention window (oldest retained seq 900) — resync from 0" }
+    {
+      "code": "BAD_REQUEST",
+      "message": "bad index"
+    },
+    {
+      "code": "UNAUTHORIZED",
+      "message": "bad token"
+    },
+    {
+      "code": "NOT_FOUND",
+      "message": "missing doc"
+    },
+    {
+      "code": "PRECONDITION_FAILED",
+      "message": "version conflict"
+    },
+    {
+      "code": "FORBIDDEN",
+      "message": "not owner"
+    },
+    {
+      "code": "UNSUPPORTED_PROTOCOL",
+      "message": "requested protocol version 999 is newer than this server's 1"
+    },
+    {
+      "code": "CURSOR_EXPIRED",
+      "message": "cursor 41 predates the retention window (oldest retained seq 900) \u2014 resync from 0"
+    }
   ],
   "queries": [
-    { "table": "workItems" },
-    { "table": "workItems", "filter": { "op": "eq", "field": "status", "value": "done" } },
-    { "table": "workItems", "filter": { "op": "olderThan", "field": "completedAt", "ms": 604800000 } },
-    { "table": "workItems", "filter": { "op": "or", "exprs": [ { "op": "in", "field": "status", "values": [ "a", "b" ] }, { "op": "lte", "field": "order", "value": 5 } ] } },
-    { "table": "notes", "search": { "index": "search_body", "query": "hello world" } },
-    { "table": "notes", "search": { "index": "search_body", "query": "conv", "mode": "trgm" } },
-    { "table": "notes", "search": { "index": "search_body", "query": "conv", "mode": "tsquery", "filter": { "op": "eq", "field": "status", "value": "open" } } },
-    { "table": "notes", "search": { "index": "search_body", "query": "\"exact phrase\" or -excluded" } },
-    { "table": "notes", "search": { "index": "search_body", "query": "hello world", "snippet": true } },
-    { "table": "embeds", "vectorSearch": { "index": "by_embedding", "vector": [ 1.0, 0.5, -0.5 ], "limit": 5 } },
-    { "table": "embeds", "vectorSearch": { "index": "by_embedding", "vector": [ 1.0 ], "limit": 3, "filter": { "op": "eq", "field": "userId", "value": "u1" } } },
-    { "table": "workItems", "paginate": { "numItems": 10 } },
-    { "table": "workItems", "paginate": { "cursor": "abc", "numItems": 10 } },
-    { "table": "workItems", "index": "by_project_and_status", "eq": [ "p1" ], "distinct": true },
-    { "table": "workItems", "index": "by_status", "eq": [ "backlog" ], "take": 10, "fields": [ "title", "status", "_id" ] }
+    {
+      "table": "workItems"
+    },
+    {
+      "table": "workItems",
+      "filter": {
+        "op": "eq",
+        "field": "status",
+        "value": "done"
+      }
+    },
+    {
+      "table": "workItems",
+      "filter": {
+        "op": "olderThan",
+        "field": "completedAt",
+        "ms": 604800000
+      }
+    },
+    {
+      "table": "workItems",
+      "filter": {
+        "op": "or",
+        "exprs": [
+          {
+            "op": "in",
+            "field": "status",
+            "values": [
+              "a",
+              "b"
+            ]
+          },
+          {
+            "op": "lte",
+            "field": "order",
+            "value": 5
+          }
+        ]
+      }
+    },
+    {
+      "table": "notes",
+      "search": {
+        "index": "search_body",
+        "query": "hello world"
+      }
+    },
+    {
+      "table": "notes",
+      "search": {
+        "index": "search_body",
+        "query": "conv",
+        "mode": "trgm"
+      }
+    },
+    {
+      "table": "notes",
+      "search": {
+        "index": "search_body",
+        "query": "conv",
+        "mode": "tsquery",
+        "filter": {
+          "op": "eq",
+          "field": "status",
+          "value": "open"
+        }
+      }
+    },
+    {
+      "table": "notes",
+      "search": {
+        "index": "search_body",
+        "query": "\"exact phrase\" or -excluded"
+      }
+    },
+    {
+      "table": "notes",
+      "search": {
+        "index": "search_body",
+        "query": "hello world",
+        "snippet": true
+      }
+    },
+    {
+      "table": "embeds",
+      "vectorSearch": {
+        "index": "by_embedding",
+        "vector": [
+          1.0,
+          0.5,
+          -0.5
+        ],
+        "limit": 5
+      }
+    },
+    {
+      "table": "embeds",
+      "vectorSearch": {
+        "index": "by_embedding",
+        "vector": [
+          1.0
+        ],
+        "limit": 3,
+        "filter": {
+          "op": "eq",
+          "field": "userId",
+          "value": "u1"
+        }
+      }
+    },
+    {
+      "table": "workItems",
+      "paginate": {
+        "numItems": 10
+      }
+    },
+    {
+      "table": "workItems",
+      "paginate": {
+        "cursor": "abc",
+        "numItems": 10
+      }
+    },
+    {
+      "table": "workItems",
+      "index": "by_project_and_status",
+      "eq": [
+        "p1"
+      ],
+      "distinct": true
+    },
+    {
+      "table": "workItems",
+      "index": "by_status",
+      "eq": [
+        "backlog"
+      ],
+      "take": 10,
+      "fields": [
+        "title",
+        "status",
+        "_id"
+      ]
+    },
+    {
+      "table": "workItems",
+      "index": "by_status",
+      "aggregate": {
+        "aggregates": {
+          "total": "sum",
+          "n": "count"
+        },
+        "groupBy": true
+      }
+    },
+    {
+      "table": "workItems",
+      "index": "by_status_and_priority",
+      "aggregate": {
+        "op": "sum",
+        "groupBy": [
+          "status",
+          "priority"
+        ]
+      }
+    }
   ],
   "migrate_requests": [
     {
       "directives": [
-        { "op": "renameField", "table": "users", "from": "name", "to": "fullName" },
-        { "op": "renameTable", "from": "old_users", "to": "users" },
-        { "op": "dropField", "table": "users", "field": "legacy" },
-        { "op": "dropTable", "name": "gone" },
-        { "op": "dropIndex", "table": "users", "name": "by_email" },
-        { "op": "setDefault", "table": "users", "field": "role", "value": "member" }
+        {
+          "op": "renameField",
+          "table": "users",
+          "from": "name",
+          "to": "fullName"
+        },
+        {
+          "op": "renameTable",
+          "from": "old_users",
+          "to": "users"
+        },
+        {
+          "op": "dropField",
+          "table": "users",
+          "field": "legacy"
+        },
+        {
+          "op": "dropTable",
+          "name": "gone"
+        },
+        {
+          "op": "dropIndex",
+          "table": "users",
+          "name": "by_email"
+        },
+        {
+          "op": "setDefault",
+          "table": "users",
+          "field": "role",
+          "value": "member"
+        }
       ],
       "dryRun": false
     },
     {
       "directives": [
-        { "op": "changeType", "table": "users", "field": "age", "to": { "type": "string" }, "cast": "toString", "default": "0" },
-        { "op": "changeType", "table": "users", "field": "active", "to": { "type": "boolean" }, "cast": "toBoolean", "default": false },
-        { "op": "changeType", "table": "events", "field": "ts", "to": { "type": "int64" }, "cast": "toInt64", "default": "0" },
-        { "op": "changeType", "table": "events", "field": "score", "to": { "type": "number" }, "cast": "toNumber", "default": 0 },
-        { "op": "evalExpr", "table": "users", "set": "upper", "expr": "upper(doc->>'fullName')", "where": "doc ? 'fullName'" }
+        {
+          "op": "changeType",
+          "table": "users",
+          "field": "age",
+          "to": {
+            "type": "string"
+          },
+          "cast": "toString",
+          "default": "0"
+        },
+        {
+          "op": "changeType",
+          "table": "users",
+          "field": "active",
+          "to": {
+            "type": "boolean"
+          },
+          "cast": "toBoolean",
+          "default": false
+        },
+        {
+          "op": "changeType",
+          "table": "events",
+          "field": "ts",
+          "to": {
+            "type": "int64"
+          },
+          "cast": "toInt64",
+          "default": "0"
+        },
+        {
+          "op": "changeType",
+          "table": "events",
+          "field": "score",
+          "to": {
+            "type": "number"
+          },
+          "cast": "toNumber",
+          "default": 0
+        },
+        {
+          "op": "evalExpr",
+          "table": "users",
+          "set": "upper",
+          "expr": "upper(doc->>'fullName')",
+          "where": "doc ? 'fullName'"
+        }
       ],
       "dryRun": true
     },
     {
       "directives": [
-        { "op": "evalExpr", "table": "users", "set": "upper",
-          "expr": { "op": "upper", "value": { "op": "field", "field": "fullName" } },
-          "where": { "op": "exists", "field": "fullName" } },
-        { "op": "evalExpr", "table": "events", "set": "label",
-          "expr": { "op": "concat", "parts": [ { "op": "literal", "value": "ev-" }, { "op": "cast", "value": { "op": "field", "field": "ts" }, "to": "toString" } ] } },
-        { "op": "evalExpr", "table": "events", "set": "band",
-          "expr": { "op": "case",
-            "whens": [ { "when": { "op": "lt", "field": "score", "value": 10 }, "then": { "op": "literal", "value": "low" } } ],
-            "otherwise": { "op": "coalesce", "parts": [ { "op": "field", "field": "score" }, { "op": "literal", "value": 0 } ] } } }
+        {
+          "op": "evalExpr",
+          "table": "users",
+          "set": "upper",
+          "expr": {
+            "op": "upper",
+            "value": {
+              "op": "field",
+              "field": "fullName"
+            }
+          },
+          "where": {
+            "op": "exists",
+            "field": "fullName"
+          }
+        },
+        {
+          "op": "evalExpr",
+          "table": "events",
+          "set": "label",
+          "expr": {
+            "op": "concat",
+            "parts": [
+              {
+                "op": "literal",
+                "value": "ev-"
+              },
+              {
+                "op": "cast",
+                "value": {
+                  "op": "field",
+                  "field": "ts"
+                },
+                "to": "toString"
+              }
+            ]
+          }
+        },
+        {
+          "op": "evalExpr",
+          "table": "events",
+          "set": "band",
+          "expr": {
+            "op": "case",
+            "whens": [
+              {
+                "when": {
+                  "op": "lt",
+                  "field": "score",
+                  "value": 10
+                },
+                "then": {
+                  "op": "literal",
+                  "value": "low"
+                }
+              }
+            ],
+            "otherwise": {
+              "op": "coalesce",
+              "parts": [
+                {
+                  "op": "field",
+                  "field": "score"
+                },
+                {
+                  "op": "literal",
+                  "value": 0
+                }
+              ]
+            }
+          }
+        }
       ],
       "dryRun": false
     }
@@ -177,50 +1392,242 @@
   "migrate_results": [
     {
       "applied": true,
-      "schema": { "tables": { "users": { "fields": { "fullName": { "type": "string" }, "age": { "type": "string" } }, "indexes": [] } } },
+      "schema": {
+        "tables": {
+          "users": {
+            "fields": {
+              "fullName": {
+                "type": "string"
+              },
+              "age": {
+                "type": "string"
+              }
+            },
+            "indexes": []
+          }
+        }
+      },
       "directives": [
-        { "op": "renameField", "affectedRows": 3, "castFailures": [ { "id": "u1", "value": null } ], "sampleChanges": [ { "id": "u1", "before": { "name": "x" }, "after": { "fullName": "x" } } ] },
-        { "op": "changeType", "affectedRows": 3, "castFailures": [ { "id": "u2", "value": "abc" } ], "sampleChanges": [ { "id": "u3", "before": { "age": 42 }, "after": { "age": "42" } } ] }
+        {
+          "op": "renameField",
+          "affectedRows": 3,
+          "castFailures": [
+            {
+              "id": "u1",
+              "value": null
+            }
+          ],
+          "sampleChanges": [
+            {
+              "id": "u1",
+              "before": {
+                "name": "x"
+              },
+              "after": {
+                "fullName": "x"
+              }
+            }
+          ]
+        },
+        {
+          "op": "changeType",
+          "affectedRows": 3,
+          "castFailures": [
+            {
+              "id": "u2",
+              "value": "abc"
+            }
+          ],
+          "sampleChanges": [
+            {
+              "id": "u3",
+              "before": {
+                "age": 42
+              },
+              "after": {
+                "age": "42"
+              }
+            }
+          ]
+        }
       ]
     },
     {
       "applied": false,
-      "schema": { "tables": { "items": { "fields": { "title": { "type": "string" }, "order": { "type": "string" } }, "indexes": [] } } },
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": {
+              "title": {
+                "type": "string"
+              },
+              "order": {
+                "type": "string"
+              }
+            },
+            "indexes": []
+          }
+        }
+      },
       "directives": [
-        { "op": "dropField", "affectedRows": 5, "castFailures": [ { "id": "i1", "value": null } ], "sampleChanges": [ { "id": "i1", "before": { "legacy": true }, "after": {} } ] }
+        {
+          "op": "dropField",
+          "affectedRows": 5,
+          "castFailures": [
+            {
+              "id": "i1",
+              "value": null
+            }
+          ],
+          "sampleChanges": [
+            {
+              "id": "i1",
+              "before": {
+                "legacy": true
+              },
+              "after": {}
+            }
+          ]
+        }
       ]
-    }
-  ,
+    },
     {
       "applied": true,
-      "schema": { "tables": { "users": { "fields": { "first": { "type": "string" }, "last": { "type": "string" }, "fullName": { "type": "string" }, "slug": { "type": "optional", "inner": { "type": "string" } } }, "computed": { "fullName": { "op": "concat", "parts": [ { "op": "field", "field": "first" }, { "op": "literal", "value": " " }, { "op": "field", "field": "last" } ] }, "slug": { "op": "lower", "value": { "op": "trim", "value": { "op": "field", "field": "fullName" } } } }, "indexes": [] } } },
-      "directives": [ { "op": "renameField", "affectedRows": 0 } ]
-    }],
+      "schema": {
+        "tables": {
+          "users": {
+            "fields": {
+              "first": {
+                "type": "string"
+              },
+              "last": {
+                "type": "string"
+              },
+              "fullName": {
+                "type": "string"
+              },
+              "slug": {
+                "type": "optional",
+                "inner": {
+                  "type": "string"
+                }
+              }
+            },
+            "computed": {
+              "fullName": {
+                "op": "concat",
+                "parts": [
+                  {
+                    "op": "field",
+                    "field": "first"
+                  },
+                  {
+                    "op": "literal",
+                    "value": " "
+                  },
+                  {
+                    "op": "field",
+                    "field": "last"
+                  }
+                ]
+              },
+              "slug": {
+                "op": "lower",
+                "value": {
+                  "op": "trim",
+                  "value": {
+                    "op": "field",
+                    "field": "fullName"
+                  }
+                }
+              }
+            },
+            "indexes": []
+          }
+        }
+      },
+      "directives": [
+        {
+          "op": "renameField",
+          "affectedRows": 0
+        }
+      ]
+    }
+  ],
   "rejects_client_message_unknown_field": [
-    { "type": "auth", "token": "t", "db": "d", "bogus": true },
-    { "type": "unsubscribe", "queryId": "q1", "extra": 1 }
+    {
+      "type": "auth",
+      "token": "t",
+      "db": "d",
+      "bogus": true
+    },
+    {
+      "type": "unsubscribe",
+      "queryId": "q1",
+      "extra": 1
+    }
   ],
   "rejects_schedule_when_unknown_field": [
-    { "type": "afterMs", "ms": 1, "x": 9 }
+    {
+      "type": "afterMs",
+      "ms": 1,
+      "x": 9
+    }
   ],
   "rejects_workflow_spec_unknown_field": [
-    { "name": "g", "steps": [ { "awaitSignal": { "name": "a", "bogus": 1 } } ] }
+    {
+      "name": "g",
+      "steps": [
+        {
+          "awaitSignal": {
+            "name": "a",
+            "bogus": 1
+          }
+        }
+      ]
+    }
   ],
   "rejects_authed_user_unknown_kind": [
-    { "kind": "robot", "email": null, "name": null }
+    {
+      "kind": "robot",
+      "email": null,
+      "name": null
+    }
   ],
   "rejects_schedule_info_unknown_kind": [
-    { "id": "j1", "kind": "recurring", "dueAt": 1000, "status": "pending", "createdAt": 500, "firedCount": 0 }
+    {
+      "id": "j1",
+      "kind": "recurring",
+      "dueAt": 1000,
+      "status": "pending",
+      "createdAt": 500,
+      "firedCount": 0
+    }
   ],
   "rejects_schedule_info_unknown_status": [
-    { "id": "j1", "kind": "oneshot", "dueAt": 1000, "status": "queued", "createdAt": 500, "firedCount": 0 }
+    {
+      "id": "j1",
+      "kind": "oneshot",
+      "dueAt": 1000,
+      "status": "queued",
+      "createdAt": 500,
+      "firedCount": 0
+    }
   ],
   "db_stats": [
     {
       "$comment": "ARC-112: GET /admin/dbs/{db}/stats response (DbStatsResponse, server/src/admin/dbs.rs). camelCase byte-for-byte; the six quota/usage fields are ENH-011, always emitted by the server. Consumer round-trips land with QA-103; the entry is the byte-authoritative shape clients must deserialize.",
       "tables": [
-        { "name": "items", "rowCount": 5, "sizeBytes": 4096 },
-        { "name": "users", "rowCount": 12, "sizeBytes": 32768 }
+        {
+          "name": "items",
+          "rowCount": 5,
+          "sizeBytes": 4096
+        },
+        {
+          "name": "users",
+          "rowCount": 12,
+          "sizeBytes": 32768
+        }
       ],
       "totalSizeBytes": 36864,
       "tablesQuota": 10,
@@ -249,7 +1656,10 @@
           "table": "workItems",
           "docId": "d41",
           "kind": "patch",
-          "doc": { "title": "rewritten", "points": 3 },
+          "doc": {
+            "title": "rewritten",
+            "points": 3
+          },
           "ts": 1758300000000
         },
         {
@@ -265,7 +1675,9 @@
           "table": "archive",
           "docId": "d43",
           "kind": "insert",
-          "doc": { "name": "seeded" },
+          "doc": {
+            "name": "seeded"
+          },
           "ts": 1758300000002
         }
       ],

@@ -630,6 +630,15 @@ impl InMemoryRtDbClient {
         })?;
         let eq_len = typed_eq.len();
 
+        // Server parity: exactly one of `op` (legacy scalar) or `aggregates`
+        // (wire-v2 alias map) must be set — both is BadRequest.
+        if agg.op.is_some() && agg.aggregates.is_some() {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "aggregate op and aggregates are mutually exclusive",
+            ));
+        }
+
         // Wire-v2 multi-operation and explicit composite groupBy support.
         if agg.aggregates.is_some() || matches!(agg.group_by, crate::wire::GroupBy::Fields(_)) {
             let ops: Vec<(String, AggregateOp)> = if let Some(map) = &agg.aggregates {

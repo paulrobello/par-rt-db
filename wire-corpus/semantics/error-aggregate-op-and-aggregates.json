@@ -1,0 +1,26 @@
+{
+  "name": "error-aggregate-op-and-aggregates",
+  "$comment": "AggregateSpec.aliased_ops: op and aggregates are mutually exclusive — both set is BAD_REQUEST across all six runners.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" },
+          "order": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_status_and_order", "fields": ["status", "order"] }]
+      }
+    }
+  },
+  "seed": [{ "name": "a", "status": "todo", "order": 1 }],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "index": "by_status_and_order",
+      "eq": ["todo"],
+      "aggregate": { "op": "sum", "aggregates": { "n": "count" } }
+    }
+  },
+  "expect": { "error": { "code": "BAD_REQUEST" } }
+}

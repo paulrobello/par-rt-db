@@ -1258,7 +1258,21 @@ class _QueryEngine(_Core):
         if explicit_groups or multi_ops:
             if index_def is None:
                 raise RtDbError(ErrorCode.BAD_REQUEST, "aggregate requires an index")
-            group_fields = list(agg.group_by) if isinstance(agg.group_by, list) else []
+            # `aggregates` composed with the legacy `groupBy: true` groups by
+            # the same single field the scalar path does (server
+            # `compile_aggregate_terminal`'s `GroupBy::Bool(true)` arm) — an
+            # explicit field list is the only other grouping form here.
+            if isinstance(agg.group_by, list):
+                group_fields = list(agg.group_by)
+            elif agg.group_by:
+                if eq_len >= len(index_def.fields):
+                    raise RtDbError(
+                        ErrorCode.BAD_REQUEST,
+                        "aggregate groupBy requires an index field beyond the eq prefix",
+                    )
+                group_fields = [index_def.fields[eq_len]]
+            else:
+                group_fields = []
             positions = index_def.fields[eq_len:]
             if explicit_groups and (
                 len(set(group_fields)) != len(group_fields)
@@ -1299,6 +1313,7 @@ class _QueryEngine(_Core):
                 return _apply_aggregate(op, vals, agg_pg) if vals else None
 
             if group_fields:
+                group_pgs = [_pg_for_field(table_def, f) for f in group_fields]
                 grouped: dict[str, tuple[list[Any], list[StoredRow]]] = {}
                 for row in filtered:
                     keys = [row.doc.get(f) for f in group_fields]
@@ -1313,9 +1328,15 @@ class _QueryEngine(_Core):
                     }
                     for keys, rows in grouped.values()
                 ]
-                out.sort(
-                    key=cmp_to_key(lambda a, b: _compare_index_values(a["keys"], b["keys"], _TEXT))
-                )
+
+                def _compare_keys(a: dict[str, Any], b: dict[str, Any]) -> int:
+                    for av, bv, pg in zip(a["keys"], b["keys"], group_pgs, strict=True):
+                        c = _compare_index_values(av, bv, pg)
+                        if c != 0:
+                            return c
+                    return 0
+
+                out.sort(key=cmp_to_key(_compare_keys))
                 return out[:MAX_TAKE]
             return {alias: values(filtered, op) for alias, op in operations.items()}
         # `count` aggregates rows and consumes no aggregate field.

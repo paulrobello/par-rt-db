@@ -1,0 +1,25 @@
+{
+  "name": "error-aggregate-groupby-unknown-field",
+  "$comment": "Wire-v2 composite groupBy: every listed field must be a declared index field at or beyond the eq prefix. 'bogus' is not a field of by_status_and_order -> BAD_REQUEST across all six runners.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "status": { "type": "string" },
+          "order": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_status_and_order", "fields": ["status", "order"] }]
+      }
+    }
+  },
+  "seed": [{ "name": "a", "status": "todo", "order": 1 }],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "index": "by_status_and_order",
+      "aggregate": { "op": "sum", "groupBy": ["bogus"] }
+    }
+  },
+  "expect": { "error": { "code": "BAD_REQUEST" } }
+}

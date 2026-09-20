@@ -17,7 +17,7 @@ func TestMutateSendsExactBodyAndHeaders(t *testing.T) {
 		if r.URL.Path != "/api/mutate" {
 			t.Errorf("path %s", r.URL.Path)
 		}
-		if got := r.Header.Get("X-Rtdb-Protocol"); got != "1" {
+		if got := r.Header.Get("X-Rtdb-Protocol"); got != "2" {
 			t.Errorf("proto header %q", got)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer tk" {

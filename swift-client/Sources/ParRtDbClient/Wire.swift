@@ -6,7 +6,11 @@ import Foundation
 /// than its own with `unsupportedProtocol`. Mirrors server
 /// `protocol::PROTOCOL_VERSION`.
 public enum WireProtocol {
-    public static let version: UInt32 = 1
+    /// ARC-013 (wire-v2 bundle): 1 -> 2 for multi-op aggregates, composite
+    /// groupBy, the mutate-batch endpoint, and cron timezone support — all
+    /// additive/optional wire changes, so a v1 server still parses this
+    /// client's existing traffic.
+    public static let version: UInt32 = 2
 }
 
 // MARK: - Internally tagged enum decode helpers (serde parity)
@@ -1681,35 +1685,91 @@ public enum AggregateOp: String, Codable, Sendable {
     case count
 }
 
-/// Mirrors server/src/dsl.rs::AggregateSpec — camelCase, unknown fields
-/// rejected; `groupBy` omitted when false (client convention; the server's
-/// `#[serde(default)]` accepts both forms).
-public struct AggregateSpec: Equatable, Codable, Sendable {
-    /// The reduction to apply: sum/avg/min/max/count.
-    public var op: AggregateOp
-    /// Whether to group results by the query's index prefix; defaults to `false`.
-    public var groupBy: Bool
+/// Wire v2 (ARC-013) widening of `AggregateSpec.groupBy`: `false`/`true` keep
+/// the legacy wire bytes byte-identical, while a field list groups by those
+/// declared index fields. Mirrors server `dsl::GroupBy` (untagged
+/// `Bool(bool) | Fields(Vec<String>)`).
+public enum AggregateGroupBy: Equatable, Sendable {
+    case bool(Bool)
+    case fields([String])
 
+    /// `false` — the default when `AggregateSpec` omits `groupBy`.
+    public static let `false` = AggregateGroupBy.bool(false)
+}
+
+extension AggregateGroupBy: Codable {
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let flag = try? container.decode(Bool.self) {
+            self = .bool(flag)
+            return
+        }
+        self = try .fields(container.decode([String].self))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case let .bool(flag): try container.encode(flag)
+        case let .fields(fields): try container.encode(fields)
+        }
+    }
+}
+
+/// Mirrors server/src/dsl.rs::AggregateSpec — camelCase, unknown fields
+/// rejected. Wire v2: exactly one of `op` (legacy single scalar op) or
+/// `aggregates` (alias -> op map, evaluated in one pass) must be set — both
+/// or neither is `BadRequest`, enforced server-side (not duplicated here).
+/// `groupBy` widens from a bool to bool|[String]; it is omitted when the
+/// legacy `false` (client convention predating v2; the server's
+/// `#[serde(default)]` accepts an absent field the same way).
+public struct AggregateSpec: Equatable, Codable, Sendable {
+    /// Legacy single aggregate operation. Exactly one of `op`/`aggregates`.
+    public var op: AggregateOp?
+    /// Wire-v2 alias -> op map, evaluated in one pass. Exactly one of
+    /// `op`/`aggregates`.
+    public var aggregates: [String: AggregateOp]?
+    /// Legacy bool or wire-v2 explicit field list; defaults to `.false`.
+    public var groupBy: AggregateGroupBy
+
+    /// Legacy single-op constructor.
     public init(op: AggregateOp, groupBy: Bool = false) {
         self.op = op
+        aggregates = nil
+        self.groupBy = .bool(groupBy)
+    }
+
+    /// Wire-v2 multi-op constructor: several named ops in one pass.
+    public init(aggregates: [String: AggregateOp], groupBy: AggregateGroupBy = .false) {
+        op = nil
+        self.aggregates = aggregates
+        self.groupBy = groupBy
+    }
+
+    /// Wire-v2 single-op with composite groupBy constructor.
+    public init(op: AggregateOp, groupBy: AggregateGroupBy) {
+        self.op = op
+        aggregates = nil
         self.groupBy = groupBy
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
-        case op, groupBy
+        case op, aggregates, groupBy
     }
 
     public init(from decoder: Decoder) throws {
         try decoder.rejectUnknownKeys("AggregateSpec", as: CodingKeys.self)
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        op = try container.decode(AggregateOp.self, forKey: .op)
-        groupBy = try container.decodeIfPresent(Bool.self, forKey: .groupBy) ?? false
+        op = try container.decodeIfPresent(AggregateOp.self, forKey: .op)
+        aggregates = try container.decodeIfPresent([String: AggregateOp].self, forKey: .aggregates)
+        groupBy = try container.decodeIfPresent(AggregateGroupBy.self, forKey: .groupBy) ?? .false
     }
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(op, forKey: .op)
-        if groupBy {
+        try container.encodeIfPresent(op, forKey: .op)
+        try container.encodeIfPresent(aggregates, forKey: .aggregates)
+        if groupBy != .false {
             try container.encode(groupBy, forKey: .groupBy)
         }
     }

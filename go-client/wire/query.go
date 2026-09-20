@@ -9,6 +9,7 @@ package wire
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -185,18 +186,102 @@ const (
 	AggCount AggregateOp = "count"
 )
 
-// Mirrors server/src/dsl.rs::AggregateSpec — groupBy is a bool that ALWAYS
-// serializes (the server has no skip_serializing_if on it).
+// Mirrors server/src/dsl.rs::AggregateSpec. Wire v2 (ARC-013): exactly one
+// of Op (legacy single scalar op) or Aggregates (alias->op map, evaluated in
+// one pass) must be set — both or neither is BadRequest, enforced server-side
+// (this mirror does not duplicate the check). GroupBy widens from a bool to
+// bool|[]string: GroupByBool(true) is the legacy `groupBy: true` shape;
+// GroupByFields groups by the listed declared index fields, returning the
+// wire-v2 AggregateMultiGroups rows. GroupBy ALWAYS serializes as a bare
+// `groupBy: false`/`true`/`[...]` (the server has no skip_serializing_if on
+// it, and this mirror's always-serialized convention predates v2, so a nil
+// GroupBy on construction defaults to GroupByBool(false)); Aggregates is
+// omitted when nil.
 type AggregateSpec struct {
-	Op      AggregateOp `json:"op"`
-	GroupBy bool        `json:"groupBy"`
+	Op         AggregateOp            `json:"op,omitempty"`
+	Aggregates map[string]AggregateOp `json:"aggregates,omitempty"`
+	GroupBy    GroupBy                `json:"groupBy"`
+}
+
+// MarshalJSON encodes AggregateSpec, defaulting a nil GroupBy to the legacy
+// `false` (mirrors the server's `#[serde(default)]` on an absent groupBy).
+func (a AggregateSpec) MarshalJSON() ([]byte, error) {
+	type alias AggregateSpec
+	out := alias(a)
+	if out.GroupBy == nil {
+		out.GroupBy = GroupByBool(false)
+	}
+	return json.Marshal(out)
+}
+
+// UnmarshalJSON decodes AggregateSpec, rejecting unknown fields and resolving
+// the untagged `groupBy` shape (bool or string array) into a GroupBy value.
+func (a *AggregateSpec) UnmarshalJSON(b []byte) error {
+	r, err := StrictUnmarshal[struct {
+		Op         AggregateOp            `json:"op,omitempty"`
+		Aggregates map[string]AggregateOp `json:"aggregates,omitempty"`
+		GroupBy    json.RawMessage        `json:"groupBy,omitempty"`
+	}](b)
+	if err != nil {
+		return err
+	}
+	groupBy, err := unmarshalGroupBy(r.GroupBy)
+	if err != nil {
+		return err
+	}
+	a.Op, a.Aggregates, a.GroupBy = r.Op, r.Aggregates, groupBy
+	return nil
+}
+
+// GroupBy is the wire-v2 widening of AggregateSpec.groupBy: either a legacy
+// bool (GroupByBool) or an explicit list of declared index fields
+// (GroupByFields), grouping by that composite key.
+type GroupBy interface {
+	isGroupBy()
+}
+
+// GroupByBool is the legacy `groupBy: false`/`true` form.
+type GroupByBool bool
+
+func (GroupByBool) isGroupBy() {}
+
+// GroupByFields is the wire-v2 `groupBy: [field, …]` composite-grouping form.
+type GroupByFields []string
+
+func (GroupByFields) isGroupBy() {}
+
+// unmarshalGroupBy decodes a raw `groupBy` value into GroupByBool or
+// GroupByFields depending on its JSON shape (untagged, mirroring the
+// server's `#[serde(untagged)]` GroupBy enum). An absent field defaults to
+// GroupByBool(false), matching the server's `#[serde(default)]`.
+func unmarshalGroupBy(raw json.RawMessage) (GroupBy, error) {
+	if len(raw) == 0 {
+		return GroupByBool(false), nil
+	}
+	var b bool
+	if err := json.Unmarshal(raw, &b); err == nil {
+		return GroupByBool(b), nil
+	}
+	var fields []string
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, fmt.Errorf("wire: groupBy must be a bool or a string array: %w", err)
+	}
+	return GroupByFields(fields), nil
 }
 
 // Mirrors server/src/dsl.rs::AggregateGroup — one {key, value} row from a
-// grouped aggregate.
+// legacy grouped aggregate (`groupBy: true`).
 type AggregateGroup struct {
 	Key   JSONValue `json:"key"`
 	Value JSONValue `json:"value"`
+}
+
+// Mirrors server/src/dsl.rs::AggregateMultiGroup — one {keys, values} row
+// from a wire-v2 grouped aggregate (`aggregates` map and/or an explicit
+// `groupBy` field list).
+type AggregateMultiGroup struct {
+	Keys   []JSONValue          `json:"keys"`
+	Values map[string]JSONValue `json:"values"`
 }
 
 // Mirrors server/src/dsl.rs::PaginatedResult — the paginate terminal's
@@ -287,17 +372,6 @@ func (p *Paginate) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	*p = Paginate(v)
-	return nil
-}
-
-// UnmarshalJSON rejects unknown fields.
-func (a *AggregateSpec) UnmarshalJSON(b []byte) error {
-	type alias AggregateSpec
-	v, err := StrictUnmarshal[alias](b)
-	if err != nil {
-		return err
-	}
-	*a = AggregateSpec(v)
 	return nil
 }
 

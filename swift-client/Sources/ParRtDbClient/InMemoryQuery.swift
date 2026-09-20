@@ -1008,9 +1008,22 @@ private func executeDistinctTerminal(
     return .array(Array(values.prefix(maxQueryTake)))
 }
 
+/// One (alias, op) pair to evaluate. A single-`op` spec aliases its one
+/// entry by the lowercase op name (matches the server/ts `aliased_ops`
+/// convention; only load-bearing for the wire-v2 result shapes).
+private struct AggOpAlias {
+    let alias: String
+    let op: AggregateOp
+}
+
+private let aggAliasCharset = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZ" +
+    "abcdefghijklmnopqrstuvwxyz0123456789_")
+
 // swiftlint:disable cyclomatic_complexity function_body_length
-/// `aggregate` terminal (query.ts `executeAggregateTerminal`): op over the
-/// index field after the eq prefix, with optional `groupBy`.
+/// `aggregate` terminal (ts-client `in_memory/query.ts` `executeAggregateTerminal`):
+/// one code path handles the legacy single-`op` scalar/grouped shapes and the
+/// wire-v2 `aggregates` map / composite `groupBy` shapes, dispatching only at
+/// the final result-shape choice.
 private func executeAggregateTerminal(
     _ aggregate: AggregateSpec,
     _ tableDef: TableDef,
@@ -1034,96 +1047,157 @@ private func executeAggregateTerminal(
         }
         return false
     }
-    let op = aggregate.op
-    // `count` aggregates rows, not a field (server `AggregateOp::needs_field`).
-    let needsField = op != .count
-    if aggregate.groupBy {
-        guard let indexDef, eqLen < indexDef.fields.count else {
-            throw RtDbError(
-                code: .badRequest,
-                message: "aggregate groupBy requires an index field beyond the eq prefix"
-            )
-        }
-        let groupField = indexDef.fields[eqLen]
-        let groupFieldPg = try indexColumnType(requireFieldType(tableDef, groupField)).pg
-        var aggField: String?
-        var aggFieldPg: PgType?
-        if needsField {
-            guard eqLen + 1 < indexDef.fields.count else {
-                throw RtDbError(
-                    code: .badRequest,
-                    message: "aggregate groupBy requires two index fields beyond the eq prefix"
-                )
-            }
-            let field = indexDef.fields[eqLen + 1]
-            aggField = field
-            aggFieldPg = try indexColumnType(requireFieldType(tableDef, field)).pg
-            if op == .sum || op == .avg, !isNumeric(field) {
-                throw RtDbError(
-                    code: .badRequest,
-                    message: "aggregate op \(op.rawValue) requires a numeric index field"
-                )
-            }
-        }
-        // Group rows by key, first-seen order, then sort by key ascending
-        // (the server's ORDER BY k); rows missing the group field form one
-        // null group, sorted last (Postgres NULLS LAST). SQL aggregates skip
-        // NULL — a group left with none aggregates to null.
-        struct Group {
-            var key: JSONValue
-            var values: [JSONValue] = []
-            var rowCount = 0
-        }
-        var groups: [Group] = []
-        var groupIndex: [JSONValue: Int] = [:]
-        for row in filtered {
-            let key = row.doc[groupField] ?? .null
-            let entry: JSONValue = aggField != nil ? (row.doc[aggField!] ?? .null) : .null
-            if let index = groupIndex[key] {
-                groups[index].values.append(entry)
-                groups[index].rowCount += 1
-            } else {
-                groupIndex[key] = groups.count
-                groups.append(Group(key: key, values: [entry], rowCount: 1))
-            }
-        }
-        groups.sort { compareIndexValues($0.key, $1.key, groupFieldPg) < 0 }
-        let entries: [JSONValue] = groups.prefix(maxQueryTake).map { group in
-            if op == .count {
-                return .object(["key": group.key, "value": .int(Int64(group.rowCount))])
-            }
-            let present = group.values.filter { $0 != .null }
-            let value = present.isEmpty ? .null : applyAggregate(op, present, aggFieldPg)
-            return .object(["key": group.key, "value": value])
-        }
-        return .array(entries)
+
+    if aggregate.op != nil, aggregate.aggregates != nil {
+        throw RtDbError(
+            code: .badRequest, message: "aggregate op and aggregates are mutually exclusive"
+        )
     }
-    // Scalar: `count` needs no index/field; sum/avg/min/max require an
-    // aggregate field beyond the eq prefix.
+    let ops: [AggOpAlias] = if let aggregates = aggregate.aggregates {
+        aggregates.sorted { $0.key < $1.key }.map { AggOpAlias(alias: $0.key, op: $0.value) }
+    } else if let op = aggregate.op {
+        [AggOpAlias(alias: op.rawValue, op: op)]
+    } else {
+        []
+    }
+    if ops.isEmpty {
+        throw RtDbError(code: .badRequest, message: "aggregate requires op or aggregates")
+    }
+    for entry in ops {
+        let invalidCharset = entry.alias.rangeOfCharacter(from: aggAliasCharset.inverted) != nil
+        if entry.alias.isEmpty || entry.alias.count > 64 || invalidCharset {
+            throw RtDbError(
+                code: .badRequest, message: "aggregates alias may contain only [A-Za-z0-9_]"
+            )
+        }
+    }
+    let needsField = ops.contains { $0.op != .count }
+    let groupByIsFields: Bool = {
+        if case .fields = aggregate.groupBy {
+            return true
+        }
+        return false
+    }()
+    let legacy = aggregate.op != nil && aggregate.aggregates == nil && !groupByIsFields
+
+    var groupFields: [String] = []
+    switch aggregate.groupBy {
+    case let .bool(flag):
+        if flag {
+            guard let indexDef, eqLen < indexDef.fields.count else {
+                throw RtDbError(
+                    code: .badRequest,
+                    message: "aggregate groupBy requires an index field beyond the eq prefix"
+                )
+            }
+            groupFields = [indexDef.fields[eqLen]]
+        }
+    case let .fields(fields):
+        groupFields = fields
+        if groupFields.isEmpty {
+            throw RtDbError(
+                code: .badRequest, message: "aggregate groupBy list must not be empty"
+            )
+        }
+    }
+    if !groupFields.isEmpty {
+        guard let indexDef, groupFields.allSatisfy({ indexDef.fields.contains($0) }) else {
+            throw RtDbError(
+                code: .badRequest, message: "aggregate groupBy field is not a declared index field"
+            )
+        }
+    }
+
+    var aggField: String?
     if needsField {
-        guard let indexDef, eqLen < indexDef.fields.count else {
+        guard let indexDef else {
             throw RtDbError(
-                code: .badRequest,
-                message: "aggregate requires an index field beyond the eq prefix"
+                code: .badRequest, message: "aggregate requires an index field beyond the eq prefix"
             )
         }
-        let aggField = indexDef.fields[eqLen]
-        let aggFieldPg = try indexColumnType(requireFieldType(tableDef, aggField)).pg
-        if op == .sum || op == .avg, !isNumeric(aggField) {
+        aggField = indexDef.fields[eqLen...].first { !groupFields.contains($0) }
+        guard let field = aggField else {
             throw RtDbError(
-                code: .badRequest,
-                message: "aggregate op \(op.rawValue) requires a numeric index field"
+                code: .badRequest, message: "aggregate requires an index field beyond the eq prefix"
             )
         }
-        let values = filtered.compactMap { row -> JSONValue? in
-            guard let value = row.doc[aggField], value != .null else { return nil }
+        for entry in ops where entry.op == .sum || entry.op == .avg {
+            if !isNumeric(field) {
+                throw RtDbError(
+                    code: .badRequest,
+                    message: "aggregate op \(entry.op.rawValue) requires a numeric index field"
+                )
+            }
+        }
+        if case .bool(true) = aggregate.groupBy, eqLen + 1 >= indexDef.fields.count {
+            throw RtDbError(
+                code: .badRequest,
+                message: "aggregate groupBy requires two index fields beyond the eq prefix"
+            )
+        }
+    }
+    let aggFieldPg: PgType? = try aggField.map { try indexColumnType(requireFieldType(tableDef, $0)).pg }
+
+    func evaluate(_ rows: [StoredRow], _ op: AggregateOp) -> JSONValue {
+        if op == .count {
+            return .int(Int64(rows.count))
+        }
+        let values = rows.compactMap { row -> JSONValue? in
+            guard let field = aggField, let value = row.doc[field], value != .null else { return nil }
             return value
         }
-        // Empty set -> null (server SUM/AVG/MIN/MAX over zero rows).
         return values.isEmpty ? .null : applyAggregate(op, values, aggFieldPg)
     }
-    // Scalar count: COUNT(*) over the matching set.
-    return .int(Int64(filtered.count))
+
+    if !groupFields.isEmpty {
+        let groupPgs = try groupFields.map { try indexColumnType(requireFieldType(tableDef, $0)).pg }
+        struct Group {
+            var keys: [JSONValue]
+            var rows: [StoredRow] = []
+        }
+        var groups: [Group] = []
+        var groupIndex: [String: Int] = [:]
+        for row in filtered {
+            let keys = groupFields.map { row.doc[$0] ?? .null }
+            let key = keys.map(String.init(describing:)).joined(separator: "\u{1f}")
+            if let index = groupIndex[key] {
+                groups[index].rows.append(row)
+            } else {
+                groupIndex[key] = groups.count
+                groups.append(Group(keys: keys, rows: [row]))
+            }
+        }
+        groups.sort { lhs, rhs in
+            for (index, pg) in groupPgs.enumerated() {
+                let cmp = compareIndexValues(lhs.keys[index], rhs.keys[index], pg)
+                if cmp != 0 {
+                    return cmp < 0
+                }
+            }
+            return false
+        }
+        let sorted = groups.prefix(maxQueryTake)
+        if legacy, case .bool(true) = aggregate.groupBy {
+            return .array(sorted.map { group in
+                .object(["key": group.keys[0], "value": evaluate(group.rows, ops[0].op)])
+            })
+        }
+        return .array(sorted.map { group in
+            var values: [String: JSONValue] = [:]
+            for entry in ops {
+                values[entry.alias] = evaluate(group.rows, entry.op)
+            }
+            return .object(["keys": .array(group.keys), "values": .object(values)])
+        })
+    }
+    if legacy {
+        return evaluate(filtered, ops[0].op)
+    }
+    var out: [String: JSONValue] = [:]
+    for entry in ops {
+        out[entry.alias] = evaluate(filtered, entry.op)
+    }
+    return .object(out)
 }
 
 // swiftlint:enable cyclomatic_complexity function_body_length
