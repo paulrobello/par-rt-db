@@ -302,6 +302,7 @@ final class ScheduledJob {
     let txn: Transaction
     var dueAt: Int64
     var cron: String?
+    var tz: String?
     var everyMs: Int64?
     var status: ScheduleStatus
     let createdAt: Int64
@@ -313,14 +314,15 @@ final class ScheduledJob {
 
     init(
         id: String, kind: ScheduleKind, txn: Transaction, dueAt: Int64, cron: String?,
-        everyMs: Int64?, status: ScheduleStatus, createdAt: Int64, firedCount: Int64,
-        lastError: String? = nil, external: Bool = false
+        tz: String? = nil, everyMs: Int64?, status: ScheduleStatus, createdAt: Int64,
+        firedCount: Int64, lastError: String? = nil, external: Bool = false
     ) {
         self.id = id
         self.kind = kind
         self.txn = txn
         self.dueAt = dueAt
         self.cron = cron
+        self.tz = tz
         self.everyMs = everyMs
         self.status = status
         self.createdAt = createdAt
@@ -1163,10 +1165,12 @@ public final class InMemoryRtDbClient: MigrationStore {
         let now = nowFn()
         var kind = ScheduleKind.oneshot
         var cron: String?
+        var tz: String?
         var everyMs: Int64?
-        if case let .cron(expr) = when {
+        if case let .cron(expr, cronTz) = when {
             kind = .cron
             cron = expr
+            tz = cronTz
         }
         if case let .interval(ms) = when {
             // Server `scheduler::resolve_when`: everyMs must be positive and
@@ -1189,6 +1193,7 @@ public final class InMemoryRtDbClient: MigrationStore {
             txn: txn,
             dueAt: dueAtFor(when, now),
             cron: cron,
+            tz: tz,
             everyMs: everyMs,
             status: .pending,
             createdAt: now,
@@ -1253,6 +1258,7 @@ public final class InMemoryRtDbClient: MigrationStore {
             kind: job.kind,
             dueAt: job.dueAt,
             cron: job.cron,
+            tz: job.tz,
             everyMs: job.everyMs,
             status: job.status,
             lastError: job.lastError,

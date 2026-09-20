@@ -519,6 +519,95 @@ async fn cron_fires_and_stays_pending() {
 }
 
 #[tokio::test]
+async fn cron_with_tz_recomputes_local_next_fire_on_rearm() {
+    let pool = test_pool().await;
+    let db = unique_db(&pool).await;
+    let schema = push_simple_schema(&pool, &db).await;
+    let committers = Committers::new(
+        pool.clone(),
+        SubscriptionManager::new(),
+        SchemaCache::new(),
+        OpFeed::new(64, 32),
+        Arc::new(ArcSwap::from_pointee(crate::common::test_hot())),
+        Metrics::new(),
+        CommitterConfig {
+            quotas: Arc::new(quota::UsageCache::new()),
+            audit_log_enabled: false,
+            webhooks_enabled: false,
+            ttl_sweep_interval_secs: 60,
+            ttl_batch: 5000,
+            quota_cache_ttl_secs: 60,
+            idle_reclaim_secs: 0,
+            instance_id: String::new(),
+            multi_instance: false,
+            forwarder: None,
+        },
+    );
+
+    // 09:00 daily in India Standard Time (+05:30, no DST transitions) — a
+    // fixed half-hour offset that a bug which only shifts whole hours, or
+    // silently drops `tz` and evaluates in UTC, would not reproduce.
+    let txn = Transaction {
+        steps: vec![Step::Insert {
+            table: "items".to_string(),
+            doc: serde_json::json!({ "n": 99 }).as_object().unwrap().clone(),
+        }],
+    };
+    let _id = scheduler::insert(
+        &pool,
+        &db,
+        "cron",
+        1, // due in the past: fires on the scheduler's first wake
+        &txn,
+        Some("0 9 * * *"),
+        None,
+        Some("Asia/Kolkata"),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let before_claim = rtdb_server::db::now_ms();
+    warm_up_committer(&committers, &db).await;
+
+    let appeared = poll_for_n(&pool, &db, &schema, 99, Duration::from_secs(15)).await;
+    assert!(appeared, "tz cron never wrote its doc");
+
+    // After firing, the row returns to pending with `tz` intact and `due_at`
+    // recomputed through the real claim -> execute -> finalize machinery
+    // (`committer::arms::scheduled::handle_scheduled` -> `next_fire`), not
+    // just the create-time validation.
+    let info = poll_list(&pool, &db, Duration::from_secs(8), |l| {
+        l.iter()
+            .find(|i| {
+                i.kind == ScheduleKind::Cron
+                    && i.status == ScheduleStatus::Pending
+                    && i.fired_count >= 1
+            })
+            .cloned()
+    })
+    .await
+    .expect("tz cron row should be pending with fired_count >= 1");
+
+    assert_eq!(info.tz.as_deref(), Some("Asia/Kolkata"));
+
+    // The recomputed due_at must be the zone-local 09:00 instant, not the
+    // UTC one — this is the assertion that actually distinguishes "tz was
+    // threaded through the fire path" from "tz was accepted and ignored".
+    let expected_tz =
+        scheduler::next_fire("0 9 * * *", before_claim, Some("Asia/Kolkata")).unwrap();
+    let expected_utc = scheduler::next_fire("0 9 * * *", before_claim, None).unwrap();
+    assert_ne!(
+        expected_tz, expected_utc,
+        "the chosen zone must differ from UTC for this assertion to be meaningful"
+    );
+    assert_eq!(
+        info.due_at, expected_tz,
+        "recomputed due_at should be the zone-local 09:00 instant, not the UTC one"
+    );
+}
+
+#[tokio::test]
 async fn failing_cron_reschedules_anyway() {
     let pool = test_pool().await;
     let db = unique_db(&pool).await;

@@ -38,6 +38,7 @@ type ScheduledJob struct {
 	Txn        wire.Transaction
 	DueAt      int64
 	Cron       *string
+	Tz         *string
 	EveryMs    *int64
 	Status     ScheduleStatus
 	CreatedAt  int64

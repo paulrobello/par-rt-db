@@ -1082,11 +1082,13 @@ func scheduleJob(s *Store, txn wire.Transaction, when wire.ScheduleWhen, externa
 	now := s.now()
 	kind := ScheduleKindOneShot
 	var cron *string
+	var tz *string
 	switch w := when.(type) {
 	case wire.WhenCron:
 		kind = ScheduleKindCron
 		expr := w.Expr
 		cron = &expr
+		tz = w.Tz
 	case wire.WhenInterval:
 		kind = ScheduleKindInterval
 	}
@@ -1097,6 +1099,7 @@ func scheduleJob(s *Store, txn wire.Transaction, when wire.ScheduleWhen, externa
 		Txn:       txn,
 		DueAt:     dueAt,
 		Cron:      cron,
+		Tz:        tz,
 		EveryMs:   everyMs,
 		Status:    ScheduleStatusPending,
 		CreatedAt: now,

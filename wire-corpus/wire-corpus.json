@@ -866,6 +866,11 @@
       "expr": "*/5 * * * *"
     },
     {
+      "type": "cron",
+      "expr": "0 9 * * *",
+      "tz": "America/New_York"
+    },
+    {
       "type": "interval",
       "everyMs": 300000
     }
@@ -968,6 +973,16 @@
       "createdAt": 500,
       "firedCount": 0,
       "external": true
+    },
+    {
+      "id": "jtz",
+      "kind": "cron",
+      "dueAt": 2600,
+      "cron": "0 9 * * *",
+      "tz": "America/New_York",
+      "status": "pending",
+      "createdAt": 500,
+      "firedCount": 0
     }
   ],
   "query_results": [

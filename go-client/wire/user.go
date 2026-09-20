@@ -176,13 +176,14 @@ func (w *WorkflowInfoFull) UnmarshalJSON(b []byte) error {
 }
 
 // Mirrors core/src/mutation.rs::ScheduleInfo — a scheduled job's public
-// view (listSchedules). cron/everyMs/lastError omitted when absent;
+// view (listSchedules). cron/tz/everyMs/lastError omitted when absent;
 // external omitted when false.
 type ScheduleInfo struct {
 	ID         string         `json:"id"`
 	Kind       ScheduleKind   `json:"kind"`
 	DueAt      int64          `json:"dueAt"`
 	Cron       *string        `json:"cron,omitempty"`
+	Tz         *string        `json:"tz,omitempty"`
 	EveryMs    *int64         `json:"everyMs,omitempty"`
 	Status     ScheduleStatus `json:"status"`
 	LastError  *string        `json:"lastError,omitempty"`

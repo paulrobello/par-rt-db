@@ -679,15 +679,17 @@ public enum ScheduleWhen: Equatable, Codable, Sendable {
     case afterMs(ms: Int64)
     /// Fire at this UTC epoch-ms instant (in the past = fire immediately).
     case runAt(ms: Int64)
-    /// Fire on this 5-field cron schedule (UTC, min-first).
-    case cron(expr: String)
+    /// Fire on this 5-field cron schedule (UTC, min-first). `tz` is an
+    /// optional IANA timezone used to evaluate the cron's local wall clock;
+    /// omitted on the wire when absent.
+    case cron(expr: String, tz: String? = nil)
     /// Fire every `everyMs` milliseconds, starting one interval from now.
     /// Missed windows (downtime, pause) are skipped, never backfilled —
     /// each fire re-arms from its actual fire time, like cron recompute.
     case interval(everyMs: Int64)
 
     enum CodingKeys: String, CodingKey, CaseIterable {
-        case type, ms, expr, everyMs
+        case type, ms, expr, tz, everyMs
     }
 
     public init(from decoder: Decoder) throws {
@@ -709,9 +711,12 @@ public enum ScheduleWhen: Equatable, Codable, Sendable {
         case "cron":
             try rejectUnknownVariantFields(
                 "ScheduleWhen", variant: payload.tag, keys: payload.keys,
-                allowed: ["type", "expr"]
+                allowed: ["type", "expr", "tz"]
             )
-            self = try .cron(expr: container.decode(String.self, forKey: .expr))
+            self = try .cron(
+                expr: container.decode(String.self, forKey: .expr),
+                tz: container.decodeIfPresent(String.self, forKey: .tz)
+            )
         case "interval":
             try rejectUnknownVariantFields(
                 "ScheduleWhen", variant: payload.tag, keys: payload.keys,
@@ -737,9 +742,10 @@ public enum ScheduleWhen: Equatable, Codable, Sendable {
         case let .runAt(ms):
             try container.encode("runAt", forKey: .type)
             try container.encode(ms, forKey: .ms)
-        case let .cron(expr):
+        case let .cron(expr, tz):
             try container.encode("cron", forKey: .type)
             try container.encode(expr, forKey: .expr)
+            try container.encodeIfPresent(tz, forKey: .tz)
         case let .interval(everyMs):
             try container.encode("interval", forKey: .type)
             try container.encode(everyMs, forKey: .everyMs)
@@ -764,7 +770,7 @@ public enum ScheduleStatus: String, Codable, Sendable {
     case error
 }
 
-/// Mirrors server/src/protocol.rs::ScheduleInfo — camelCase; `cron`,
+/// Mirrors server/src/protocol.rs::ScheduleInfo — camelCase; `cron`, `tz`,
 /// `everyMs`, and `lastError` are omitted on the wire when absent. No
 /// unknown-field rejection (the server type carries no
 /// `deny_unknown_fields`).
@@ -777,6 +783,8 @@ public struct ScheduleInfo: Equatable, Codable, Sendable {
     public var dueAt: Int64
     /// Cron expression, present only when `kind == .cron`.
     public var cron: String?
+    /// IANA timezone used for cron evaluation, present only when set.
+    public var tz: String?
     /// Interval jobs only: the fixed recurrence in ms (`kind: "interval"`).
     public var everyMs: Int64?
     /// Current lifecycle state.
@@ -794,14 +802,15 @@ public struct ScheduleInfo: Equatable, Codable, Sendable {
     public var external: Bool
 
     public init(
-        id: String, kind: ScheduleKind, dueAt: Int64, cron: String? = nil, everyMs: Int64? = nil,
-        status: ScheduleStatus, lastError: String? = nil, createdAt: Int64, firedCount: Int64,
-        external: Bool = false
+        id: String, kind: ScheduleKind, dueAt: Int64, cron: String? = nil, tz: String? = nil,
+        everyMs: Int64? = nil, status: ScheduleStatus, lastError: String? = nil, createdAt: Int64,
+        firedCount: Int64, external: Bool = false
     ) {
         self.id = id
         self.kind = kind
         self.dueAt = dueAt
         self.cron = cron
+        self.tz = tz
         self.everyMs = everyMs
         self.status = status
         self.lastError = lastError
@@ -811,7 +820,7 @@ public struct ScheduleInfo: Equatable, Codable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
-        case id, kind, dueAt, cron, everyMs, status, lastError, createdAt, firedCount, external
+        case id, kind, dueAt, cron, tz, everyMs, status, lastError, createdAt, firedCount, external
     }
 
     public init(from decoder: Decoder) throws {
@@ -820,6 +829,7 @@ public struct ScheduleInfo: Equatable, Codable, Sendable {
         kind = try container.decode(ScheduleKind.self, forKey: .kind)
         dueAt = try container.decode(Int64.self, forKey: .dueAt)
         cron = try container.decodeIfPresent(String.self, forKey: .cron)
+        tz = try container.decodeIfPresent(String.self, forKey: .tz)
         everyMs = try container.decodeIfPresent(Int64.self, forKey: .everyMs)
         status = try container.decode(ScheduleStatus.self, forKey: .status)
         lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
@@ -834,6 +844,7 @@ public struct ScheduleInfo: Equatable, Codable, Sendable {
         try container.encode(kind, forKey: .kind)
         try container.encode(dueAt, forKey: .dueAt)
         try container.encodeIfPresent(cron, forKey: .cron)
+        try container.encodeIfPresent(tz, forKey: .tz)
         try container.encodeIfPresent(everyMs, forKey: .everyMs)
         try container.encode(status, forKey: .status)
         try container.encodeIfPresent(lastError, forKey: .lastError)

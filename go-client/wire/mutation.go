@@ -602,9 +602,11 @@ func (v *WhenRunAt) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// Mirrors core/src/mutation.rs::ScheduleWhen::Cron
+// Mirrors core/src/mutation.rs::ScheduleWhen::Cron — Tz is the optional IANA
+// timezone used to evaluate the cron's local wall clock, omitted when absent.
 type WhenCron struct {
-	Expr string `json:"expr"`
+	Expr string  `json:"expr"`
+	Tz   *string `json:"tz,omitempty"`
 }
 
 func (WhenCron) isScheduleWhen() {}
@@ -616,12 +618,14 @@ func (v WhenCron) MarshalJSON() ([]byte, error) {
 
 func (v *WhenCron) UnmarshalJSON(b []byte) error {
 	r, err := StrictUnmarshal[struct {
-		Expr string `json:"expr"`
+		Expr string  `json:"expr"`
+		Tz   *string `json:"tz,omitempty"`
 	}](b)
 	if err != nil {
 		return err
 	}
 	v.Expr = r.Expr
+	v.Tz = r.Tz
 	return nil
 }
 
