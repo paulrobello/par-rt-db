@@ -20,12 +20,20 @@ import (
 // Every call sends the admin key as the bearer.
 type AdminClient struct {
 	api *httpclient.Client
+	// baseURL/adminKey back the /admin/stream websocket seam (stream.go);
+	// the HTTP seam carries the same values inside httpclient.Client.
+	baseURL  string
+	adminKey string
 }
 
 // NewAdminClient builds a client against baseURL authenticated with the
 // instance admin key. httpclient options (e.g. WithHTTPClient) flow through.
 func NewAdminClient(baseURL, adminKey string, opts ...httpclient.Option) *AdminClient {
-	return &AdminClient{api: httpclient.NewClient(baseURL, "", adminKey, opts...)}
+	return &AdminClient{
+		api:      httpclient.NewClient(baseURL, "", adminKey, opts...),
+		baseURL:  baseURL,
+		adminKey: adminKey,
+	}
 }
 
 // Method literals (httpclient's are unexported).

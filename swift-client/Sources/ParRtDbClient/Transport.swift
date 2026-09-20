@@ -43,11 +43,24 @@ public struct TransportCloseError: Error, Sendable {
 /// it would supersede.
 public struct URLSessionWebSocketTransport: WebSocketTransport {
     private let session: URLSession
+    /// Optional WebSocket subprotocol for the handshake
+    /// (Sec-WebSocket-Protocol). The admin op-feed stream carries the admin
+    /// key as `rtdb-admin.<token>` — URLSessionWebSocketTask cannot set
+    /// arbitrary headers, and the server accepts the subprotocol (the
+    /// browser path) as an alternative to the Bearer header.
+    private let subprotocol: String?
     private let state = State()
 
     /// Create a transport backed by `session` (defaults to `.shared`).
     public init(session: URLSession = .shared) {
         self.session = session
+        subprotocol = nil
+    }
+
+    /// Create a transport that offers `subprotocol` on the handshake.
+    public init(session: URLSession = .shared, subprotocol: String) {
+        self.session = session
+        self.subprotocol = subprotocol
     }
 
     public func connect(to url: URL) async throws {
@@ -57,7 +70,10 @@ public struct URLSessionWebSocketTransport: WebSocketTransport {
                 message: "WebSocket URL must be ws:// or wss://, got \(url.scheme ?? "no scheme")"
             )
         }
-        let task = session.webSocketTask(with: url)
+        let task = session.webSocketTask(
+            with: url,
+            protocols: subprotocol.map { [$0] } ?? []
+        )
         state.replaceTask(task)?.cancel(with: .normalClosure, reason: nil)
         task.resume()
         // No delegate is attached to the (possibly injected) session, so

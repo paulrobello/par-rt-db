@@ -25,7 +25,7 @@ object.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_serializer
 from pydantic_core.core_schema import SerializerFunctionWrapHandler
@@ -645,3 +645,38 @@ _STEP_RESULT_ADAPTER = TypeAdapter(StepResult)
 # ``create_webhook`` treats ``table=None`` as all-tables (matching the server's
 # create semantics), so it does not use the sentinel.
 _UNSET: Any = object()
+
+
+# --- /admin/stream op-feed frames --------------------------------------------
+# Mirrors ts-client's AdminStreamFrame union / rust wire::admin::AdminStreamFrame.
+
+
+class _AdminStreamFrameBase(BaseModel):
+    """Lenient base for stream frames: camelCase wire keys, unknown keys
+    IGNORED (unlike :class:`_Wire` — a newer server may add fields to a frame,
+    and a known kind skipped over an extra field would drop live traffic)."""
+
+    model_config = ConfigDict(
+        extra="ignore",
+        populate_by_name=True,
+        alias_generator=to_camel,
+    )
+
+
+class AdminOpFrame(_AdminStreamFrameBase):
+    """``{"kind": "op", "event": OpEvent}`` — one document op (replay or live)."""
+
+    kind: Literal["op"]
+    event: OpEvent
+
+
+class AdminGaugesFrame(_AdminStreamFrameBase):
+    """``{"kind": "gauges", "gauges": MetricsSnapshot}`` — the ~1s server
+    metrics snapshot."""
+
+    kind: Literal["gauges"]
+    gauges: MetricsSnapshot
+
+
+AdminStreamFrame = AdminOpFrame | AdminGaugesFrame
+"""The ``/admin/stream`` frame union: an op event or a metrics snapshot."""

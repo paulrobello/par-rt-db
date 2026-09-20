@@ -20,9 +20,15 @@ from par_rt_db.http_client import RtDbHttpClient
 # counterpart by design.
 _ASYNC_ONLY = {"aclose"}
 
+# ``astream_admin`` is the a-prefix async-generator twin of sync
+# ``stream_admin`` — the same intentional naming divergence, normalized
+# before comparing so it does not read as a missing mirror.
+_ASYNC_GEN_TWINS = {"astream_admin": "stream_admin"}
+
 
 def _public_names(cls: type) -> set[str]:
-    return {name for name in dir(cls) if not name.startswith("_")}
+    names = {name for name in dir(cls) if not name.startswith("_")}
+    return {_ASYNC_GEN_TWINS.get(name, name) for name in names}
 
 
 def test_admin_client_sync_async_parity() -> None:

@@ -74,16 +74,23 @@ the sync/async data-plane and admin clients.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+import json
+import random
+import time
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlencode
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from .admin_models import (
     _STEP_RESULT_ADAPTER,
     _UNSET,
+    AdminGaugesFrame,
     AdminMember,
+    AdminOpFrame,
+    AdminStreamFrame,
     AuditEntry,
     ConfigResponse,
     DbStats,
@@ -120,6 +127,7 @@ from .wire import (
     WorkflowSpec,
     WorkflowStatus,
 )
+from .ws_client import _backoff_delay
 
 if TYPE_CHECKING:
     import httpx
@@ -949,6 +957,177 @@ class _AsyncAdminExecutor:
 # ---------------------------------------------------------------------------
 
 
+# --- /admin/stream op-feed WebSocket -----------------------------------------
+#
+# Mirrors rust-client/src/admin/stream.rs and ts-client's streamAdmin(): the
+# realtime op feed (up to 200 ring events replayed per (re)connection, then
+# live ops interleaved with ~1s gauge snapshots). Machine client — the admin
+# key rides the Authorization: Bearer header (the server prefers it over the
+# browser-only ``rtdb-admin.<token>`` subprotocol). ``websockets`` (the
+# ``[ws]`` extra) is imported lazily so this module imports without it.
+
+_ADMIN_STREAM_AUTH_FAILED = 4401
+# Server close code when the admin credential stops validating mid-stream
+# (SEC-006). Terminal, not transient — never reconnected, like the rust client.
+
+_ADMIN_STREAM_BACKOFF_BASE = 0.5
+_ADMIN_STREAM_BACKOFF_MAX = 15.0
+# The realtime client's jittered exponential backoff schedule (ws_client).
+
+_ADMIN_FRAME_MODELS: dict[str, Any] = {"op": AdminOpFrame, "gauges": AdminGaugesFrame}
+
+
+def _admin_stream_url(base: str, db: str | None = None, table: str | None = None) -> str:
+    """Flip http(s)→ws(s) and build ``/admin/stream?db=&table=``; filters are
+    percent-encoded, never interpolated."""
+    u = base.rstrip("/")
+    if u.startswith("https://"):
+        u = "wss://" + u[len("https://") :]
+    elif u.startswith("http://"):
+        u = "ws://" + u[len("http://") :]
+    pairs: list[tuple[str, str]] = []
+    if db is not None:
+        pairs.append(("db", db))
+    if table is not None:
+        pairs.append(("table", table))
+    qs = urlencode(pairs)
+    return u + "/admin/stream" + (f"?{qs}" if qs else "")
+
+
+def _parse_admin_stream_frame(raw: Any) -> AdminStreamFrame | None:
+    """Parse one text frame into the typed union, or ``None`` for anything
+    this client does not know: unknown ``kind``, malformed JSON, a non-string
+    frame, or a known kind with an invalid payload (the stricter of
+    ts-client's ``parseAdminStreamFrame`` and the rust union decode). Skipping
+    — never fatal — is the forward-compat contract: an unknown ``kind`` from
+    a newer server must not kill an operator's tail."""
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", errors="replace")
+    if not isinstance(raw, str):
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    kind = data.get("kind")
+    if not isinstance(kind, str):
+        return None
+    model = _ADMIN_FRAME_MODELS.get(kind)
+    if model is None:
+        return None
+    try:
+        result: AdminStreamFrame = model.model_validate(data)
+        return result
+    except ValidationError:
+        return None
+
+
+def _admin_stream_upgrade_error(e: Any) -> RtDbError:
+    """401 → UNAUTHORIZED, 403 → FORBIDDEN, else INTERNAL (mirror rust
+    upgrade_error's status classification)."""
+    status = e.response.status_code
+    if status == 401:
+        code = ErrorCode.UNAUTHORIZED
+    elif status == 403:
+        code = ErrorCode.FORBIDDEN
+    else:
+        code = ErrorCode.INTERNAL
+    return RtDbError(code, f"admin stream upgrade rejected with status {status}")
+
+
+def _connect_admin_stream(url: str, admin_key: str) -> Any:
+    """Open the sync op-feed websocket. A rejected upgrade (the server gates
+    the admin bearer before WS negotiation, so a bad key is a plain 401/403,
+    not a socket that opens and dies) raises :class:`RtDbError`."""
+    try:
+        from websockets.exceptions import InvalidStatus
+        from websockets.sync.client import connect as ws_connect
+    except ImportError as e:  # pragma: no cover - exercised when [ws] absent
+        raise ImportError(
+            "websockets is required for stream_admin: install with `pip install par-rt-db[ws]`"
+        ) from e
+    try:
+        return ws_connect(url, additional_headers={"Authorization": f"Bearer {admin_key}"})
+    except InvalidStatus as e:
+        raise _admin_stream_upgrade_error(e) from e
+
+
+async def _aconnect_admin_stream(url: str, admin_key: str) -> Any:
+    """Async twin of :func:`_connect_admin_stream`."""
+    try:
+        from websockets.asyncio.client import connect as ws_connect
+        from websockets.exceptions import InvalidStatus
+    except ImportError as e:  # pragma: no cover - exercised when [ws] absent
+        raise ImportError(
+            "websockets is required for astream_admin: install with `pip install par-rt-db[ws]`"
+        ) from e
+    try:
+        return await ws_connect(url, additional_headers={"Authorization": f"Bearer {admin_key}"})
+    except InvalidStatus as e:
+        raise _admin_stream_upgrade_error(e) from e
+
+
+def _stream_frames(url: str, admin_key: str) -> Iterator[AdminStreamFrame]:
+    """The sync reconnecting frame pump: yields parsed frames; on transport
+    loss or an unexpected close, reconnects on the jittered exponential
+    backoff; a mid-stream ``4401`` close raises terminal UNAUTHORIZED; a
+    rejected upgrade raises out of :func:`_connect_admin_stream`. The
+    consumer breaking out closes the socket via the ``finally``
+    (GeneratorExit)."""
+    from websockets.exceptions import ConnectionClosed
+
+    attempt = 0
+    while True:
+        ws = _connect_admin_stream(url, admin_key)
+        try:
+            for raw in ws:
+                frame = _parse_admin_stream_frame(raw)
+                if frame is not None:
+                    yield frame
+        except ConnectionClosed as e:
+            if e.rcvd is not None and e.rcvd.code == _ADMIN_STREAM_AUTH_FAILED:
+                reason = e.rcvd.reason or "admin credential no longer valid"
+                raise RtDbError(ErrorCode.UNAUTHORIZED, reason) from None
+        finally:
+            ws.close()
+        attempt += 1
+        time.sleep(
+            _backoff_delay(
+                attempt, _ADMIN_STREAM_BACKOFF_BASE, _ADMIN_STREAM_BACKOFF_MAX, random.random()
+            )
+        )
+
+
+async def _astream_frames(url: str, admin_key: str) -> AsyncIterator[AdminStreamFrame]:
+    """Async twin of :func:`_stream_frames`."""
+    import asyncio
+
+    from websockets.exceptions import ConnectionClosed
+
+    attempt = 0
+    while True:
+        ws = await _aconnect_admin_stream(url, admin_key)
+        try:
+            async for raw in ws:
+                frame = _parse_admin_stream_frame(raw)
+                if frame is not None:
+                    yield frame
+        except ConnectionClosed as e:
+            if e.rcvd is not None and e.rcvd.code == _ADMIN_STREAM_AUTH_FAILED:
+                reason = e.rcvd.reason or "admin credential no longer valid"
+                raise RtDbError(ErrorCode.UNAUTHORIZED, reason) from None
+        finally:
+            await ws.close()
+        attempt += 1
+        await asyncio.sleep(
+            _backoff_delay(
+                attempt, _ADMIN_STREAM_BACKOFF_BASE, _ADMIN_STREAM_BACKOFF_MAX, random.random()
+            )
+        )
+
+
 class RtDbAdminClient:
     """Sync admin control-plane client (the ``[http]`` extra).
 
@@ -1189,6 +1368,38 @@ class RtDbAdminClient:
         the result count (server-side max 500).
         """
         return self._executor.run(_op_ops_recent(db=db, table=table, n=n))
+
+    def stream_admin(
+        self,
+        *,
+        db: str | None = None,
+        table: str | None = None,
+    ) -> Iterator[AdminStreamFrame]:
+        """``WS /admin/stream`` → the live op feed as a sync generator of
+        frames — op events (a ≤200-event replay, then live) interleaved with
+        ~1s gauge snapshots.
+
+        ``db``/``table`` filter both the replay and the live stream, exactly
+        as on :meth:`ops_recent`. Every (re)connection replays up to 200 ring
+        events, so duplicates after a blip are expected (``OpEvent`` carries
+        no sequence to dedup on). Transport drops reconnect automatically on
+        the realtime client's jittered exponential backoff. A rejected
+        upgrade (a bad admin key) raises :class:`RtDbError` and is never
+        retried; a mid-stream ``4401`` close (credential revoked, SEC-006)
+        also raises and ends the stream. Frames this client cannot parse are
+        skipped, not fatal. Break out of the loop (or ``close()`` the
+        generator) to shut the socket down. Requires the ``[ws]`` extra.
+
+        ::
+
+            for frame in client.stream_admin(db="mydb"):
+                match frame:
+                    case AdminOpFrame():
+                        print(frame.event.db, frame.event.kind, frame.event.doc_id)
+                    case AdminGaugesFrame():
+                        print(frame.gauges.queries_total)
+        """
+        return _stream_frames(_admin_stream_url(self._base, db, table), self._admin_key)
 
     # --- config ---
 
@@ -1926,6 +2137,33 @@ class AsyncRtDbAdminClient:
         See :meth:`RtDbAdminClient.ops_recent` for filter semantics.
         """
         return await self._executor.run(_op_ops_recent(db=db, table=table, n=n))
+
+    def astream_admin(
+        self,
+        *,
+        db: str | None = None,
+        table: str | None = None,
+    ) -> AsyncIterator[AdminStreamFrame]:
+        """``WS /admin/stream`` → the live op feed as an async generator of
+        frames (async twin of :meth:`RtDbAdminClient.stream_admin`).
+
+        Same semantics: optional ``db``/``table`` filters, a ≤200-event
+        replay per (re)connection, auto-reconnect on transport drops with
+        duplicate replay, skip-don't-fatal frame parsing, a rejected upgrade
+        and a mid-stream ``4401`` close (SEC-006) raise terminal
+        :class:`RtDbError`, and breaking out of the loop closes the socket.
+        Requires the ``[ws]`` extra.
+
+        ::
+
+            async for frame in client.astream_admin():
+                match frame:
+                    case AdminOpFrame():
+                        print(frame.event.table, frame.event.doc_id)
+                    case AdminGaugesFrame():
+                        print(frame.gauges.queries_total)
+        """
+        return _astream_frames(_admin_stream_url(self._base, db, table), self._admin_key)
 
     # --- config ---
 

@@ -15,9 +15,18 @@ import Foundation
 /// subscriptions on one database) use `RtDbHttpClient`/`RtDbClient`.
 public actor RtDbAdminClient {
     /// Base URL with any trailing `/` trimmed (rust `trim_end_matches('/')`).
-    private let baseUrl: String
-    private let adminKey: String
+    /// Internal so the AdminStream.swift extension can build the WS URL.
+    let baseUrl: String
+    let adminKey: String
     private let session: URLSession
+
+    // Admin op-feed stream (AdminStream.swift) injection points — internal so
+    // AdminStreamTests can script transports and shrink backoff; production
+    // callers use the defaults.
+    var streamTransportFactoryOverride: (@Sendable (URL) -> any WebSocketTransport)?
+    var streamSchedulerOverride: (any WScheduler)?
+    var streamBackoffBaseMs: UInt64 = adminStreamBackoffBaseMs
+    var streamBackoffMaxMs: UInt64 = adminStreamBackoffMaxMs
 
     /// Create a standalone admin client. `adminKey` is the instance admin
     /// key (the same value `RtDbHttpClient` would carry as its token for an
