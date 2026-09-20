@@ -112,6 +112,43 @@ pub(crate) async fn run_mutate(cli: &Cli, txn: &str) -> Result<()> {
     Ok(())
 }
 
+/// `mutate-batch`: N independent transactions in one HTTP round trip. Each
+/// entry is `{txn, idempotencyKey?}`; outcomes print as one aligned JSON
+/// array of per-slot `{ok, results|error}`. Deliberately NOT atomic — one
+/// failing entry never rolls back the others.
+pub(crate) async fn run_mutate_batch(cli: &Cli, txns: &str) -> Result<()> {
+    let db = require_db(cli)?;
+    let token = require_token(cli)?;
+    let json = read_json_arg(txns)?;
+    let parsed: Vec<serde_json::Value> =
+        serde_json::from_str(&json).context("parsing mutate-batch entries JSON array")?;
+    let mut txns = Vec::with_capacity(parsed.len());
+    let mut keys = Vec::with_capacity(parsed.len());
+    for (i, v) in parsed.iter().enumerate() {
+        let txn: Transaction = serde_json::from_value(
+            v.get("txn")
+                .cloned()
+                .with_context(|| format!("entry {i} missing `txn`"))?,
+        )
+        .with_context(|| format!("parsing entry {i} txn"))?;
+        txns.push(txn);
+        keys.push(
+            v.get("idempotencyKey")
+                .and_then(|k| k.as_str())
+                .map(str::to_string),
+        );
+    }
+    let c = data_client(cli, &db, &token);
+    let refs: Vec<(&Transaction, Option<&str>)> = txns
+        .iter()
+        .zip(&keys)
+        .map(|(t, k)| (t, k.as_deref()))
+        .collect();
+    let outcomes = c.batch_mutate(&refs).await.map_err(map_err)?;
+    println!("{}", serde_json::to_string_pretty(&outcomes)?);
+    Ok(())
+}
+
 pub(crate) async fn run_explain(cli: &Cli, query: &str) -> Result<()> {
     let db = require_db(cli)?;
     require_admin(cli)?;

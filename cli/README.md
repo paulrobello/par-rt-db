@@ -74,6 +74,7 @@ Commands:
   query         Run a Query JSON against `--db` and print the result. (machine token)
   watch         Tail a live Query against `--db`: print the initial result, then every subsequent update until Ctrl-C. (machine token)
   mutate        Run a Transaction JSON against `--db` and print step results. (machine token)
+  mutate-batch  Run N independent transactions against `--db` in one round trip (`/api/mutate-batch`); one failing entry does not roll back the others. (machine token)
   import        Bulk-load a JSONL file into one table of `--db`: one JSON object per line, sent as bounded insert/upsert transactions with per-batch progress on stderr. (machine token)
   migrate       Apply (or preview with `--dry-run`) a migration directives JSON file to `--db`. (admin)
   explain       Explain a Query's compiled SQL against `--db` without running it. (admin)
@@ -276,6 +277,20 @@ Usage: rtdb mutate <TXN>
 
 Arguments:
   <TXN>  Transaction JSON (`{"steps":[..]}`). Prefix with `@` to read from a file (`@seed.json`)
+
+Options:
+  -h, --help  Print help
+```
+
+### `rtdb mutate-batch`
+
+```text
+Run N independent transactions against `--db` in one round trip (`/api/mutate-batch`); one failing entry does not roll back the others. (machine token)
+
+Usage: rtdb mutate-batch <TXNS>
+
+Arguments:
+  <TXNS>  JSON array of `{txn: <Transaction>, idempotencyKey?: string}` entries. Prefix with `@` to read from a file (`@batch.json`)
 
 Options:
   -h, --help  Print help

@@ -64,6 +64,42 @@ public struct BatchQueryOutcome: Equatable, Codable, Sendable {
     }
 }
 
+// MARK: - BatchMutateOutcome
+
+/// One aligned slot of a `/api/mutate-batch` response. Mirrors rust-client
+/// wire::BatchMutateOutcome — camelCase, omit-when-nil. `results` carries the
+/// txn's step results when `ok`; `error` the standard `{code, message}`
+/// envelope otherwise (never both).
+public struct BatchMutateOutcome: Equatable, Codable, Sendable {
+    public var ok: Bool
+    public var results: [StepResult]?
+    public var error: RtDbError?
+
+    public init(ok: Bool, results: [StepResult]? = nil, error: RtDbError? = nil) {
+        self.ok = ok
+        self.results = results
+        self.error = error
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case ok, results, error
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        ok = try container.decode(Bool.self, forKey: .ok)
+        results = try container.decodeIfPresent([StepResult].self, forKey: .results)
+        error = try container.decodeIfPresent(RtDbError.self, forKey: .error)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(ok, forKey: .ok)
+        try container.encodeIfPresent(results, forKey: .results)
+        try container.encodeIfPresent(error, forKey: .error)
+    }
+}
+
 // MARK: - RtDbHttpClient
 
 /// One-shot HTTP client for one par-rt-db database: typed queries, atomic
@@ -147,6 +183,30 @@ public actor RtDbHttpClient {
         let response: MutateResponse = try await postJson(
             "mutate", "/api/mutate",
             MutateRequest(db: db, txn: txn, idempotencyKey: idempotencyKey)
+        )
+        return response.results
+    }
+
+    /// Run independent transactions in one round trip
+    /// (`POST /api/mutate-batch`). The response slots are aligned with `txns`
+    /// and each may fail without rolling back the others (the batch is
+    /// deliberately not atomic — an atomic multi-step write is what the txn
+    /// DSL is for). `idempotencyKeys`, when given, must match `txns` in
+    /// length; a non-nil key engages the server's per-entry idempotency cache.
+    public func mutateBatch(
+        _ txns: [Transaction], idempotencyKeys: [String?]? = nil
+    ) async throws -> [BatchMutateOutcome] {
+        if let keys = idempotencyKeys, keys.count != txns.count {
+            throw RtDbError(
+                code: .badRequest,
+                message: "idempotencyKeys count must match txns count"
+            )
+        }
+        let entries = txns.enumerated().map { offset, txn in
+            BatchMutateEntry(txn: txn, idempotencyKey: idempotencyKeys?[offset])
+        }
+        let response: BatchMutateResponse = try await postJson(
+            "batch mutate", "/api/mutate-batch", BatchMutateRequest(db: db, txns: entries)
         )
         return response.results
     }
@@ -669,6 +729,16 @@ private struct MutateRequest: Encodable {
     let idempotencyKey: String?
 }
 
+private struct BatchMutateEntry: Encodable {
+    let txn: Transaction
+    let idempotencyKey: String?
+}
+
+private struct BatchMutateRequest: Encodable {
+    let db: String
+    let txns: [BatchMutateEntry]
+}
+
 private struct ScheduleRequest: Encodable {
     let db: String
     let when: ScheduleWhen
@@ -719,6 +789,10 @@ private struct BatchResponse: Decodable {
 
 private struct MutateResponse: Decodable {
     let results: [StepResult]
+}
+
+private struct BatchMutateResponse: Decodable {
+    let results: [BatchMutateOutcome]
 }
 
 private struct IdResponse: Decodable {

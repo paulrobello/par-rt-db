@@ -108,3 +108,33 @@ func TestQueryBatchMixed(t *testing.T) {
 		t.Fatalf("slots %+v", slots)
 	}
 }
+
+func TestMutateBatchMixed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/mutate-batch" {
+			t.Errorf("path %s", r.URL.Path)
+		}
+		b, _ := io.ReadAll(r.Body)
+		if !bytes.Contains(b, []byte(`"idempotencyKey":"k1"`)) ||
+			bytes.Contains(b, []byte(`"idempotencyKey":""`)) {
+			t.Errorf("body %s", b)
+		}
+		w.Write([]byte(`{"results":[{"ok":true,"results":[{"id":"i1"}]},` +
+			`{"ok":false,"error":{"code":"NOT_FOUND","message":"no such table"}}]}`))
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "d1", "tk")
+	slots, err := c.MutateBatch(context.Background(),
+		[]wire.Transaction{
+			{Steps: []wire.Step{wire.StepInsert{Table: "items", Doc: wire.Object(nil)}}},
+			{Steps: []wire.Step{wire.StepInsert{Table: "noSuch", Doc: wire.Object(nil)}}},
+		},
+		[]string{"k1", ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(slots) != 2 || !slots[0].OK || len(slots[0].Results) != 1 ||
+		slots[1].OK || slots[1].Error == nil || slots[1].Error.Code != "NOT_FOUND" {
+		t.Fatalf("slots %+v", slots)
+	}
+}

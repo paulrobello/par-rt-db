@@ -896,6 +896,194 @@ async fn batch_query_rejects_oversized_batch() -> anyhow::Result<()> {
     Ok(())
 }
 
+// (m5) POST /api/mutate-batch fans out N independent transactions in one round
+// trip with per-entry isolation: an entry's execution error lands in its own
+// `{index, ok:false, error}` slot and the surrounding entries still commit.
+// Deliberately NOT atomic — an atomic multi-step write is what the txn DSL is
+// for. Auth/read-only/rate-limit gates are request-scoped; the batch returns
+// 200 with per-slot errors unless a gate itself fails.
+#[tokio::test]
+async fn batch_mutate_returns_aligned_results_and_isolates_per_entry_errors() -> anyhow::Result<()>
+{
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let (_, token) = mint_token(addr, &name).await;
+
+    let resp = api_post(
+        addr,
+        "/api/mutate-batch",
+        &token,
+        json!({"db": name, "txns": [
+            {"txn": {"steps": [{"op": "insert", "table": "workItems", "doc": {
+                "projectId": "0".repeat(32), "title": "batch-first", "status": "backlog",
+                "order": 1.0, "completedAt": null}}]}},
+            {"txn": {"steps": [{"op": "insert", "table": "noSuchTable", "doc": {"a": 1}}]}},
+            {"txn": {"steps": [{"op": "insert", "table": "projects", "doc": {
+                "name": "PB1", "status": "active", "tags": [], "updatedAt": 0}}]}}
+        ]}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let results = body["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 3);
+
+    assert_eq!(results[0]["ok"], json!(true));
+    assert_eq!(results[0]["results"][0]["id"].is_string(), json!(true));
+    // omit-when-None: `error` is absent on an ok slot.
+    assert!(results[0].as_object().unwrap().get("error").is_none());
+
+    assert_eq!(results[1]["ok"], json!(false));
+    let err = &results[1]["error"];
+    assert!(err["code"].is_string(), "error slot carries a code: {err}");
+    assert!(
+        err["message"].is_string(),
+        "error slot carries a message: {err}"
+    );
+    // omit-when-None: `results` is absent on an errored slot.
+    assert!(results[1].as_object().unwrap().get("results").is_none());
+
+    assert_eq!(results[2]["ok"], json!(true));
+    assert_eq!(results[2]["results"][0]["id"].is_string(), json!(true));
+
+    // The surviving entries committed — one failing entry did not roll back
+    // the others (per-entry isolation, not a wrapping atomic txn).
+    let resp = api_post(
+        addr,
+        "/api/query",
+        &token,
+        json!({"db": name, "query": {"table": "workItems"}}),
+    )
+    .await;
+    let body: serde_json::Value = resp.json().await?;
+    let docs = body["result"].as_array().expect("docs");
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0]["title"], json!("batch-first"));
+    let resp = api_post(
+        addr,
+        "/api/query",
+        &token,
+        json!({"db": name, "query": {"table": "projects", "count": true}}),
+    )
+    .await;
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["result"], json!(1));
+
+    Ok(())
+}
+
+// (m6) Empty `txns` is rejected with 400 before anything runs.
+#[tokio::test]
+async fn batch_mutate_rejects_empty_txns() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let (_, token) = mint_token(addr, &name).await;
+
+    let resp = api_post(
+        addr,
+        "/api/mutate-batch",
+        &token,
+        json!({"db": name, "txns": []}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], "BAD_REQUEST");
+
+    Ok(())
+}
+
+// (m7) SEC-119: a batch with more than MAX_BATCH_TXNS (64) entries is rejected
+// with 400 BEFORE the bearer/authorize gate — an unauthenticated abuser cannot
+// pin a worker with an N-txn fan-out. Exactly the cap is accepted.
+#[tokio::test]
+async fn batch_mutate_rejects_oversized_batch() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    let entry = serde_json::json!({"txn": {"steps": [
+        {"op": "insert", "table": "workItems", "doc": {
+            "projectId": "0".repeat(32), "title": "b", "status": "backlog",
+            "order": 1.0, "completedAt": null}}
+    ]}});
+    let txns: Vec<serde_json::Value> = (0..65).map(|_| entry.clone()).collect();
+    let resp = api_post(
+        addr,
+        "/api/mutate-batch",
+        "ignored-no-matter-what",
+        json!({"db": name, "txns": txns}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], "BAD_REQUEST");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("exceeds maximum"),
+        "response should mention the cap: {body}"
+    );
+
+    // 64 entries (exactly the cap) is accepted — proves the cap is `>`, not
+    // `>=`. All 64 land (the fixture schema has workItems).
+    let (_, token) = mint_token(addr, &name).await;
+    let txns: Vec<serde_json::Value> = (0..64).map(|_| entry.clone()).collect();
+    let resp = api_post(
+        addr,
+        "/api/mutate-batch",
+        &token,
+        json!({"db": name, "txns": txns}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let results = body["results"].as_array().expect("results");
+    assert_eq!(results.len(), 64);
+    assert!(results.iter().all(|r| r["ok"] == json!(true)));
+
+    Ok(())
+}
+
+// (m8) Each entry's idempotencyKey dedupes through the per-db dedup table: a
+// repeat batch replays the first outcomes instead of re-executing.
+#[tokio::test]
+async fn batch_mutate_per_entry_idempotency_key_dedupes() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let (_, token) = mint_token(addr, &name).await;
+
+    let body = json!({"db": name, "txns": [
+        {"txn": insert_work_item_txn(), "idempotencyKey": "batch-key"}
+    ]});
+
+    let resp = api_post(addr, "/api/mutate-batch", &token, body.clone()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let first: serde_json::Value = resp.json().await?;
+
+    let resp = api_post(addr, "/api/mutate-batch", &token, body).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let second: serde_json::Value = resp.json().await?;
+
+    assert_eq!(first, second);
+
+    let resp = api_post(
+        addr,
+        "/api/query",
+        &token,
+        json!({"db": name, "query": {"table": "workItems"}}),
+    )
+    .await;
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["result"].as_array().expect("results array").len(), 1);
+
+    Ok(())
+}
+
 // (n) A read-only machine token cannot mutate (403 Forbidden) but can still
 // query the same db. The token is minted directly with read_only=true via
 // auth::tokens::mint_token (the /admin/mint-token endpoint doesn't yet expose

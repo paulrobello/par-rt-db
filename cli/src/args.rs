@@ -116,6 +116,14 @@ pub(crate) enum Command {
         /// file (`@seed.json`).
         txn: String,
     },
+    /// Run N independent transactions against `--db` in one round trip
+    /// (`/api/mutate-batch`); one failing entry does not roll back the
+    /// others. (machine token)
+    MutateBatch {
+        /// JSON array of `{txn: <Transaction>, idempotencyKey?: string}`
+        /// entries. Prefix with `@` to read from a file (`@batch.json`).
+        txns: String,
+    },
     /// Bulk-load a JSONL file into one table of `--db`: one JSON object per
     /// line, sent as bounded insert/upsert transactions with per-batch
     /// progress on stderr. (machine token)

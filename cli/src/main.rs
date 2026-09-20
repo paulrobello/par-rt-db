@@ -64,6 +64,7 @@ async fn dispatch(cli: &Cli) -> Result<()> {
         Command::Query { query } => commands::data::run_query(cli, query).await,
         Command::Watch { query } => commands::data::run_watch(cli, query).await,
         Command::Mutate { txn } => commands::data::run_mutate(cli, txn).await,
+        Command::MutateBatch { txns } => commands::data::run_mutate_batch(cli, txns).await,
         Command::Import {
             table,
             file,

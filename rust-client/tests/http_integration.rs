@@ -75,6 +75,51 @@ async fn http_round_trip() {
     assert_eq!(err.code, ErrorCode::PreconditionFailed);
 }
 
+/// `POST /api/mutate-batch` against a live server: slots aligned with the
+/// input txns; a failing entry isolates into its own error slot without
+/// rolling back the others; a per-entry idempotency key dedupes on replay.
+#[tokio::test]
+#[ignore = "set RTDB_TEST_SERVER_URL + RTDB_TEST_ADMIN_KEY and run with --ignored"]
+async fn http_batch_mutate_isolates_and_dedupes() {
+    let ctx = setup().await;
+    let c = RtDbHttpClient::new(&ctx.url, &ctx.db, &ctx.token);
+
+    let ok_txn = Mutation::new()
+        .insert("items", json!({"name":"batch-a","n":1}))
+        .build();
+    let bad_txn = Mutation::new()
+        .insert("noSuchTable", json!({"name":"x","n":1}))
+        .build();
+
+    // Mixed batch: slot 0 commits, slot 1 fails in isolation.
+    let slots = c
+        .batch_mutate(&[(&ok_txn, None), (&bad_txn, Some("bm-key"))])
+        .await
+        .unwrap();
+    assert_eq!(slots.len(), 2);
+    assert!(slots[0].ok, "slot 0 should commit: {:?}", slots[0]);
+    assert!(slots[0].results.is_some());
+    assert!(!slots[1].ok);
+    assert!(slots[1].error.is_some());
+
+    // Surviving entries committed; the failed one did not write anything.
+    let n: i64 = c
+        .run(TableQuery::new("items").with_index("by_n", &[]).count())
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+
+    // Same key replays the first outcome instead of re-executing.
+    let replay = c.batch_mutate(&[(&ok_txn, Some("bm-key"))]).await.unwrap();
+    assert_eq!(replay.len(), 1);
+    assert!(replay[0].ok);
+    let n: i64 = c
+        .run(TableQuery::new("items").with_index("by_n", &[]).count())
+        .await
+        .unwrap();
+    assert_eq!(n, 1, "idempotent replay must not double-write");
+}
+
 /// Exercises the admin control-plane end-to-end against a live server. Creates a
 /// fresh `t<uuid>` database (never touches a db it didn't create), pushes a
 /// schema, mints a token, lists dbs/allowlist, exports, and revokes.

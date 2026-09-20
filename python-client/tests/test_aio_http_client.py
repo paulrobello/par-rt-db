@@ -189,6 +189,41 @@ async def test_mutate_sends_idempotency_key_when_given() -> None:
     assert captured["body"]["idempotencyKey"] == "k1"
 
 
+async def test_mutate_batch_parses_aligned_outcomes() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"ok": True, "results": [{"id": "new1"}]},
+                    {"ok": False, "error": {"code": "NOT_FOUND", "message": "no such table"}},
+                ]
+            },
+        )
+
+    async with _client(handler) as c:
+        txn = Mutation.builder().insert("items", {"name": "x"}).build()
+        out = await c.mutate_batch([txn, txn], idempotency_keys=["k1", None])
+
+    assert len(out) == 2
+    assert out[0].ok
+    assert out[0].results == [{"id": "new1"}]
+    assert out[0].error is None
+    assert not out[1].ok
+    assert out[1].results is None
+    assert out[1].error is not None
+    assert out[1].error.code == "NOT_FOUND"
+    assert captured["body"]["db"] == DB
+    entries = captured["body"]["txns"]
+    assert len(entries) == 2
+    assert entries[0]["idempotencyKey"] == "k1"
+    assert "idempotencyKey" not in entries[1]
+    assert entries[0]["txn"]["steps"][0]["op"] == "insert"
+
+
 async def test_upsert_by_index_inserts_when_no_match() -> None:
     captured: dict[str, Any] = {}
 

@@ -388,6 +388,116 @@ async fn mutate_handler(
     }))
 }
 
+/// SEC-119 mirror for the mutation transport: hard cap on the number of
+/// transactions a single `POST /api/mutate-batch` may carry, rejected BEFORE
+/// the bearer/authorize gate (fail-fast on abuse) — same reasoning as
+/// `MAX_BATCH_QUERIES` above. 64 mirrors a generous round-trip budget; split
+/// into multiple batched requests rather than one giant one.
+const MAX_BATCH_TXNS: usize = 64;
+
+/// One entry of a `/api/mutate-batch` request. `idempotencyKey`, when present,
+/// opts THIS entry into the per-db dedup table: a retry of the batch (or the
+/// whole request) replays that entry's first outcome instead of re-executing.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchMutateEntry {
+    txn: Transaction,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchMutateRequest {
+    db: String,
+    txns: Vec<BatchMutateEntry>,
+}
+
+/// One slot of a `/api/mutate-batch` response, aligned by position with the
+/// request's `txns` (same convention as `/api/query-batch` — no index field;
+/// the client mirrors are extra=forbid on this shape). `ok` is always
+/// present; on success `results` carries the txn's step results (the same
+/// shape `/api/mutate` returns); on failure `error` carries the standard
+/// `RtDbError` wire envelope. Exactly one of `results` / `error` accompanies
+/// `ok` (omit-when-None).
+#[derive(Serialize)]
+struct BatchMutateOutcome {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    results: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<RtDbError>,
+}
+
+#[derive(Serialize)]
+struct BatchMutateResponse {
+    results: Vec<BatchMutateOutcome>,
+}
+
+/// Fan out over N independent transactions against one db in a single round
+/// trip. Deliberately NOT atomic — an atomic multi-step write is what the txn
+/// DSL is for; this is transport efficiency only. Auth, the read-only gate,
+/// and rate limits run once for the whole request (same db, same principal —
+/// mirrors `batch_query_handler`); each entry executes through the same
+/// `Committers::mutate` path as `/api/mutate`, so subscriptions, op-feed
+/// taps, and per-entry idempotency replay all fire. A per-entry error becomes
+/// that slot's `{ok:false,error}` and never fails the batch — only the
+/// request-level gates return a non-200 for the whole request.
+async fn mutate_batch_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ApiJson(body): ApiJson<BatchMutateRequest>,
+) -> Result<Json<BatchMutateResponse>, RtDbError> {
+    if body.txns.is_empty() {
+        return Err(RtDbError::bad_request("txns must not be empty"));
+    }
+    // SEC-119: reject an oversized batch before the bearer/authorize gate so an
+    // unauthenticated abuser can't pin a worker on an N-txn serial fan-out.
+    if body.txns.len() > MAX_BATCH_TXNS {
+        return Err(RtDbError::bad_request(format!(
+            "txn batch size {} exceeds maximum of {MAX_BATCH_TXNS}",
+            body.txns.len()
+        )));
+    }
+    let principal = authed(&state, &headers, &body.db).await?;
+    if principal.is_read_only() {
+        return Err(RtDbError::forbidden("read-only token cannot mutate"));
+    }
+    check_http_rate_limits(&state, &principal, &body.db).await?;
+
+    let ctx = principal.row_ctx();
+    let mut results = Vec::with_capacity(body.txns.len());
+    for entry in body.txns.into_iter() {
+        let t = Instant::now();
+        let outcome = match state
+            .realtime
+            .committers
+            .mutate(&body.db, entry.idempotency_key, entry.txn, ctx.clone())
+            .await
+        {
+            Ok(committed) => BatchMutateOutcome {
+                ok: true,
+                results: Some(committed.results),
+                error: None,
+            },
+            Err(err) => BatchMutateOutcome {
+                ok: false,
+                results: None,
+                error: Some(err),
+            },
+        };
+        if outcome.ok {
+            state
+                .runtime
+                .metrics
+                .record_mutation_duration(t.elapsed().as_micros() as u64);
+            state.runtime.metrics.record_mutation();
+        }
+        results.push(outcome);
+    }
+    Ok(Json(BatchMutateResponse { results }))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ScheduleRequest {
@@ -853,6 +963,7 @@ pub fn http_api_routes() -> Router<Arc<AppState>> {
         .route("/api/query", post(query_handler))
         .route("/api/query-batch", post(batch_query_handler))
         .route("/api/mutate", post(mutate_handler))
+        .route("/api/mutate-batch", post(mutate_batch_handler))
         .route("/api/schedule", post(schedule_handler))
         .route("/api/schedule/claim", post(claim_schedules_handler))
         .route(

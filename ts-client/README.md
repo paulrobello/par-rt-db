@@ -246,6 +246,13 @@ const [top, recent] = await db.batchQuery([
   api.items.query().withIndex("by_project", ["p1"]).take(5).json,
   api.items.query().order("desc").take(5).json,
 ]);
+// N independent transactions in one round trip (`POST /api/mutate-batch`) — per-entry
+// isolation (deliberately not atomic); each slot is `{ok, results}` or `{ok: false, error}`,
+// and each entry may carry its own `idempotencyKey`:
+const batch = await db.mutateBatch([
+  { txn: mutation().insert("items", { projectId: "p1", title: "a", status: "backlog", order: 1 }).build(), idempotencyKey: "k1" },
+  { txn: mutation().delete("items", "i1").build() },
+]);
 // An insert step returns `{ id }` (not a bare string); patch/delete/expect* return null.
 const [{ id }] = (await db.mutate(
   mutation().insert("items", { projectId: "p1", title: "x", status: "backlog", order: 1 }).build(),

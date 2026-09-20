@@ -6,6 +6,7 @@ package httpclient
 
 import (
 	"context"
+	"fmt"
 
 	rtdberrors "github.com/paulrobello/par-rt-db/go-client/errors"
 	"github.com/paulrobello/par-rt-db/go-client/wire"
@@ -26,6 +27,43 @@ func (c *Client) Mutate(ctx context.Context, txn wire.Transaction, idempotencyKe
 		Results []wire.StepResult `json:"results"`
 	}
 	if err := c.do(ctx, http_POST, "/api/mutate", body, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Results, nil
+}
+
+// MutateBatchSlot is one aligned outcome of MutateBatch: step results on
+// success, or the standard error envelope on failure (never both). The
+// server's slots are positionally aligned with the request's txns.
+type MutateBatchSlot struct {
+	OK      bool                `json:"ok"`
+	Results []wire.StepResult   `json:"results,omitempty"`
+	Error   *wire.ErrorEnvelope `json:"error,omitempty"`
+}
+
+// MutateBatch runs independent transactions through `/api/mutate-batch` in
+// one round trip. Slots are aligned with txns; one failing entry does not
+// roll back the others (the batch is deliberately not atomic — an atomic
+// multi-step write is what the txn DSL is for). idempotencyKeys, when
+// non-nil, must match txns in length; a non-empty key engages the server's
+// per-entry idempotency cache.
+func (c *Client) MutateBatch(ctx context.Context, txns []wire.Transaction, idempotencyKeys []string) ([]MutateBatchSlot, error) {
+	if idempotencyKeys != nil && len(idempotencyKeys) != len(txns) {
+		return nil, fmt.Errorf("httpclient: idempotencyKeys length %d does not match txns length %d",
+			len(idempotencyKeys), len(txns))
+	}
+	entries := make([]map[string]any, len(txns))
+	for i, txn := range txns {
+		entry := map[string]any{"txn": txn}
+		if idempotencyKeys != nil && idempotencyKeys[i] != "" {
+			entry["idempotencyKey"] = idempotencyKeys[i]
+		}
+		entries[i] = entry
+	}
+	var resp struct {
+		Results []MutateBatchSlot `json:"results"`
+	}
+	if err := c.do(ctx, http_POST, "/api/mutate-batch", map[string]any{"db": c.db, "txns": entries}, &resp); err != nil {
 		return nil, err
 	}
 	return resp.Results, nil

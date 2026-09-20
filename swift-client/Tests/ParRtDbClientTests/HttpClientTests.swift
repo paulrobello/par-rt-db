@@ -244,6 +244,54 @@ struct HttpClientTests {
         #expect(outcomes[1].error?.message == "no such table")
     }
 
+    // MARK: mutateBatch
+
+    @Test func mutateBatchPostsEntriesAndParsesAlignedOutcomes() async throws {
+        StubProtocol.handler = { request in
+            try demand(request.httpMethod == "POST", "expected POST")
+            try demand(
+                request.url?.path == "/api/mutate-batch",
+                "expected /api/mutate-batch, got \(request.url?.path ?? "nil")"
+            )
+            try demand(
+                request.value(forHTTPHeaderField: "Authorization") == "Bearer tok",
+                "missing bearer authorization"
+            )
+            let body = try jsonObjectBody(request)
+            try demand(body["db"] as? String == "app", "db mismatch: \(body)")
+            let entries = body["txns"] as? [[String: Any]]
+            try demand(entries?.count == 2, "txns mismatch: \(body)")
+            try demand(
+                entries?.first?["idempotencyKey"] as? String == "k1",
+                "txns[0].idempotencyKey mismatch: \(body)"
+            )
+            try demand(
+                entries?.last?["idempotencyKey"] == nil,
+                "txns[1].idempotencyKey must be omitted when nil: \(body)"
+            )
+            let firstTxnSteps = (entries?.first?["txn"] as? [String: Any])?["steps"] as? [[String: Any]]
+            try demand(firstTxnSteps?.count == 1, "txns[0].txn.steps mismatch: \(body)")
+            let secondTxnSteps = (entries?.last?["txn"] as? [String: Any])?["steps"] as? [[String: Any]]
+            try demand(secondTxnSteps?.count == 1, "txns[1].txn.steps mismatch: \(body)")
+            // {results: [ok slot with step results, error slot]}
+            let responseBody = #"{"results":[{"ok":true,"results":[{"id":"new1"}]},"# +
+                #"{"ok":false,"error":{"code":"NOT_FOUND","message":"no such table"}}]}"#
+            return (200, Data(responseBody.utf8))
+        }
+        let txn = try MutationBuilder().insert("items", ["name": .string("x")]).build()
+        let outcomes = try await makeClient().mutateBatch(
+            [txn, txn], idempotencyKeys: ["k1", nil]
+        )
+        #expect(outcomes.count == 2)
+        #expect(outcomes[0].ok)
+        #expect(outcomes[0].results?.count == 1)
+        #expect(outcomes[0].error == nil)
+        #expect(!outcomes[1].ok)
+        #expect(outcomes[1].results == nil)
+        #expect(outcomes[1].error?.code == .notFound)
+        #expect(outcomes[1].error?.message == "no such table")
+    }
+
     // MARK: mutate / upsert / retry
 
     @Test func mutatePostsTxnAndParsesStepResults() async throws {
