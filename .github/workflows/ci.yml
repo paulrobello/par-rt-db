@@ -152,6 +152,16 @@ jobs:
       # `make typecheck` (inside checkall) depends on `ts-client-build`, so the
       # dashboard's `@par-rt-db/client` resolution from ts-client/dist is
       # satisfied automatically (gate-needs-ts-client-dist-built gotcha).
+      # nextest: `make test` prefers `cargo nextest run` (per-test processes +
+      # retry quotas, .config/nextest.toml) and falls back to `cargo test` when
+      # absent — this step is what makes the nextest branch the one CI takes.
+      # SEC-138: pinned to the v2.9.4 tag's commit, verified to resolve
+      # (899b013517f9e7774591216672bf75a46bb9a481). Bump deliberately.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@899b013517f9e7774591216672bf75a46bb9a481
+        with:
+          tool: cargo-nextest
+
       - name: Run make checkall
         run: make checkall
 

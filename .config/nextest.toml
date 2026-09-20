@@ -1,0 +1,8 @@
+# cargo-nextest profile for the root workspace (`make test`). Each test runs
+# in its own process; `retries` re-runs a failing test up to N times before
+# counting it as failed, and flags it `flaky` in the output when a retry
+# passes — the recorded escape hatch for the gate's rare timing-sensitive
+# tests (observed: oauth_test pool timeouts under load, the multi-instance
+# scheduled-write push test) without weakening their assertions.
+[profile.default]
+retries = 2

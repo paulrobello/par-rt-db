@@ -7,6 +7,13 @@ DEPLOY_PATH = /docker/par-rt-db
 # the build arg — and thus the deployed binary's git_commit label — always tracks
 # the commit being deployed, without touching docker-host's .env.
 DEPLOY_COMMIT := $(shell git rev-parse --short HEAD)
+# Gate cache key for checkall-cached. A clean tree keys on its committed
+# content hash (exact reuse); a DIRTY tree gets a unique-per-invocation key so
+# uncommitted working-tree content can never reuse — or poison — a cached
+# verdict (deploys normally ship committed trees; gating a dirty tree always
+# runs the full gate).
+GATE_KEY := $(shell key=$$(git rev-parse 'HEAD^{tree}' 2>/dev/null); test -z "$$(git status --porcelain 2>/dev/null)" || key="$$key-dirty-$$(date +%s)"; echo "$$key")
+GATE_STAMP = target/.gate-tree
 
 # swift-client needs the Swift 6 toolchain; this repo's gate only carries one
 # on Darwin (the ubuntu CI image has no Swift). Every swift line in the
@@ -17,7 +24,7 @@ SWIFT_OS := $(shell uname -s)
 SWIFT_SKIP := @echo "Skipping swift-client (non-Darwin host)"
 SWIFT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(1),$(SWIFT_SKIP))
 
-.PHONY: clean build test lint fmt fmt-check typecheck checkall dev-db-up dev-db-down dev-db-clean \
+.PHONY: clean build test lint fmt fmt-check typecheck checkall checkall-cached dev-db-up dev-db-down dev-db-clean \
 	pre-commit pre-commit-update ts-client-build ts-client-install dashboard-install \
 	dashboard-test \
 	python-client-install python-client-test python-client-lint python-client-fmt \
@@ -78,13 +85,12 @@ lint:
 	cd go-client && go vet -tags live ./...
 	$(call SWIFT_IF_DARWIN,swiftlint --strict)
 
-# ARC-014: workspace-level `cargo check`. This adds --all-features to core
-# (already had it) and rust-client/cli (already had it) and now also server
-# (previously typechecked with default features only) — aligned with `lint`,
-# which has clippy'd server under --all-features all along, so this is not a
-# new feature combination for the workspace.
+# ARC-014: workspace-level typecheck. The former `cargo check --workspace
+# --all-targets --all-features` here was pure duplication: `make lint` runs
+# clippy over the identical scope, and clippy is check + lints, so it already
+# fails on everything check would fail on. What remains is the non-Rust
+# typecheckers plus the Swift build, which clippy does not cover.
 typecheck: ts-client-build
-	cargo check --workspace --all-targets --all-features
 	cd ts-client && bun run typecheck
 	cd dashboard && bun run typecheck
 	cd python-client && uv run pyright
@@ -93,6 +99,12 @@ typecheck: ts-client-build
 
 dev-db-up:
 	$(COMPOSE_DEV) up -d --wait
+	@leaked=$$(psql "$(RTDB_TEST_DATABASE_URL)" -t -A -c \
+		"SELECT count(*) FROM rtdb_auth.databases WHERE name ~ '^t[0-9a-f]{32}$$'"); \
+	if [ "$$leaked" -gt 200 ]; then \
+		echo "dev-db: $$leaked leaked test databases (> 200) — registry walks stall merge_test; running scoped clean"; \
+		psql "$(RTDB_TEST_DATABASE_URL)" -f scripts/dev-db-clean.sql; \
+	fi
 
 dev-db-down:
 	$(COMPOSE_DEV) down
@@ -112,8 +124,19 @@ dev-db-clean:
 # depends on. The flag also enables the server's `otel` feature, which only
 # compiles the OTLP layer — RTDB_OTEL_ENABLED still gates it at runtime, so a
 # feature-compiled test binary makes zero OTLP calls.
+# nextest runs each test in its own process with per-test retry quotas, so a
+# known-flaky test doesn't force a full gate rerun (retries configured in
+# .config/nextest.toml). Falls back to `cargo test` when the binary is absent
+# (CI installs it; see ci.yml). Doctests are skipped by nextest, but the
+# workspace's doc tests are all `ignore`-marked (7 ignored, 0 run under
+# `cargo test --doc`), so nothing is lost.
+NEXTEST := $(shell command -v cargo-nextest >/dev/null 2>&1 && echo yes)
 test: dev-db-up
+ifeq ($(NEXTEST),yes)
+	cargo nextest run --workspace --all-features
+else
 	cargo test --workspace --all-features
+endif
 	cd ts-client && bun run test
 	cd dashboard && bun run test
 	cd python-client && uv run pytest -q
@@ -273,6 +296,20 @@ backup-persistence-check:
 	./scripts/backup-persistence-check.sh
 
 checkall: env-drift-check dockerfile-stub-check backup-persistence-check cli-docs-check docs-api fmt-check lint typecheck test rust-client-check-features
+	@mkdir -p target && echo "$(GATE_KEY)" > $(GATE_STAMP)
+
+# Content-addressed gate reuse for deploys: `checkall` stamps the gate key
+# (committed tree hash, clean trees only) into target/.gate-tree on every green
+# run, and `deploy` reuses that verdict when the key matches. A cached gate
+# cannot go stale-wrong: any edit to any tracked file changes the tree hash or
+# makes the tree dirty (unique key, never cached) and forces a full re-gate.
+# `make checkall` always runs the full gate and refreshes the stamp.
+checkall-cached:
+	@if [ -f "$(GATE_STAMP)" ] && [ "$$(cat "$(GATE_STAMP)")" = "$(GATE_KEY)" ]; then \
+		echo "gate: cached green for $(GATE_KEY) — run 'make checkall' to force"; \
+	else \
+		$(MAKE) checkall; \
+	fi
 
 # ENH-033: criterion micro-benchmarks over the pure hot paths (server) and the
 # in-memory engine (rust-client). No Postgres, no server process. Deliberately
@@ -344,7 +381,7 @@ pre-commit:
 pre-commit-update:
 	pre-commit autoupdate
 
-deploy: checkall
+deploy: checkall-cached
 	rsync -az --delete --filter=':- .gitignore' --exclude .git/ \
 		./ $(DEPLOY_HOST):$(DEPLOY_PATH)/
 	ssh $(DEPLOY_HOST) 'cd $(DEPLOY_PATH) && BUILDER=par-rt-db-builder && if ! docker buildx inspect "$$BUILDER" >/dev/null 2>&1; then docker buildx create --name "$$BUILDER" --driver docker-container --driver-opt default-load=true --driver-opt cpu-quota=400000 --driver-opt cpu-period=100000 --buildkitd-config "$(DEPLOY_PATH)/deploy/buildkitd.toml"; fi && docker buildx use "$$BUILDER" && RTDB_BUILD_COMMIT=$(DEPLOY_COMMIT) BUILDX_BUILDER="$$BUILDER" docker compose up -d --build && docker compose ps'

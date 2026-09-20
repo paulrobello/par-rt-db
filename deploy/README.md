@@ -36,10 +36,13 @@ VPS and no reverse proxy is needed — TLS is terminated at Cloudflare's edge.
 
 ## Deploy / update
 
-The preferred path is `make deploy` from the repo root: it runs `make checkall`
-first (the full gate), then rsyncs to the deploy host and runs
+The preferred path is `make deploy` from the repo root: it gates via
+`make checkall-cached` (reusing the green verdict stamped by a previous
+`make checkall` for the identical tree content — any edit to a tracked file
+changes the git tree hash and forces a full re-gate), then rsyncs to the
+deploy host and runs
 `BUILDX_BUILDER=par-rt-db-builder docker compose up -d --build` with
-`RTDB_BUILD_COMMIT` baked in (so `/healthz` reports the deployed commit). See
+`RTDB_BUILD_COMMIT` baked in. See
 the [`Makefile`](../Makefile) `deploy` target for the canonical commands.
 
 The deploy target bootstraps the named `par-rt-db-builder` BuildKit
