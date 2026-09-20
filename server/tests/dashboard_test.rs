@@ -1,10 +1,31 @@
+/// Cluster-wide advisory-lock key serializing every test process that touches
+/// the global single-row `rtdb_config` table (id = 1). Arbitrary but stable.
+const RTDB_CONFIG_ADVISORY_KEY: i64 = 0x5254_4442_0000_0001;
+
 /// Serializes tests that touch the global single-row `rtdb_config` table
 /// (id = 1). That row is shared across the whole dev Postgres, so without this
 /// guard two such tests running in parallel race — one test's `DELETE` can be
 /// undone by another's `PATCH`/`save_hot` in the window between the `DELETE`
 /// and the following `load_hot` assertion, making the suite flaky. Per-db test
 /// isolation doesn't help here because `rtdb_config` is global (not per test db).
-static RTDB_CONFIG_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+///
+/// The guard is a cluster-wide advisory lock held on a dedicated connection,
+/// not a process-local `tokio::sync::Mutex`: nextest runs each test in its own
+/// process, where a process-local mutex serializes nothing. Nor is the lock
+/// taken on the shared test pool — `test_pool` allows ONE connection
+/// (`TEST_POOL_MAX_CONNECTIONS`), so a transaction held for the whole body
+/// starves the test's own queries. Dropping the dedicated connection closes it,
+/// which releases the lock; a crashed test process releases it the same way.
+async fn rtdb_config_guard() -> anyhow::Result<sqlx::PgConnection> {
+    use sqlx::Connection as _;
+    let mut conn =
+        sqlx::postgres::PgConnection::connect(&crate::common::test_config().database_url).await?;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(RTDB_CONFIG_ADVISORY_KEY)
+        .execute(&mut conn)
+        .await?;
+    Ok(conn)
+}
 
 // Seeding lowercases emails, is idempotent, and stores them with a NULL github_id.
 #[tokio::test]
@@ -848,8 +869,8 @@ async fn admin_stream_rejects_bad_subprotocol() -> anyhow::Result<()> {
 // the dev Postgres, so this test cleans up its row to avoid polluting others.
 #[tokio::test]
 async fn hot_config_round_trips_through_rtdb_config() -> anyhow::Result<()> {
-    let _rtdb_config_guard = RTDB_CONFIG_GUARD.lock().await;
     let state = crate::common::test_state().await;
+    let _rtdb_config_guard = rtdb_config_guard().await?;
 
     sqlx::query("DELETE FROM rtdb_config WHERE id = 1")
         .execute(&state.pool)
@@ -898,8 +919,8 @@ async fn hot_config_round_trips_through_rtdb_config() -> anyhow::Result<()> {
 // operator's persisted PATCH away and reverted to env defaults.
 #[tokio::test]
 async fn hot_config_row_missing_a_newer_field_still_loads() -> anyhow::Result<()> {
-    let _rtdb_config_guard = RTDB_CONFIG_GUARD.lock().await;
     let state = crate::common::test_state().await;
+    let _rtdb_config_guard = rtdb_config_guard().await?;
 
     // Write the row shape as it actually existed in prod: no idempotencyTtlMs.
     sqlx::query("DELETE FROM rtdb_config WHERE id = 1")
@@ -941,8 +962,8 @@ async fn hot_config_row_missing_a_newer_field_still_loads() -> anyhow::Result<()
 // are unaffected.
 #[tokio::test]
 async fn config_get_and_patch_round_trip() -> anyhow::Result<()> {
-    let _rtdb_config_guard = RTDB_CONFIG_GUARD.lock().await;
     let state = crate::common::test_state().await;
+    let _rtdb_config_guard = rtdb_config_guard().await?;
     let addr = crate::common::spawn_app(state.clone()).await;
     let bearer = "Bearer test-admin-key";
 
@@ -1078,8 +1099,8 @@ async fn config_get_and_patch_round_trip() -> anyhow::Result<()> {
 // snapshot.
 #[tokio::test]
 async fn config_cors_hot_reloads_allowed_origins() -> anyhow::Result<()> {
-    let _rtdb_config_guard = RTDB_CONFIG_GUARD.lock().await;
     let state = crate::common::test_state().await;
+    let _rtdb_config_guard = rtdb_config_guard().await?;
     let addr = crate::common::spawn_app(state.clone()).await;
     let bearer = "Bearer test-admin-key";
 
