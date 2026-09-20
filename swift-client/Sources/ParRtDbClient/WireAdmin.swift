@@ -847,6 +847,8 @@ public struct HotConfig: Equatable, Codable, Sendable {
     public var maxStorageBytesPerDb: Int64
     /// Subscription cap per db; 0 = unlimited.
     public var maxSubsPerDb: Int64
+    /// Change-feed retention per db in rows (server default 100 000).
+    public var changeLogMaxRows: Int64
 
     public init(
         allowedOrigins: [String],
@@ -855,7 +857,8 @@ public struct HotConfig: Equatable, Codable, Sendable {
         idempotencyTtlMs: Int64,
         maxTablesPerDb: Int64,
         maxStorageBytesPerDb: Int64,
-        maxSubsPerDb: Int64
+        maxSubsPerDb: Int64,
+        changeLogMaxRows: Int64
     ) {
         self.allowedOrigins = allowedOrigins
         self.sessionTtlDays = sessionTtlDays
@@ -864,11 +867,12 @@ public struct HotConfig: Equatable, Codable, Sendable {
         self.maxTablesPerDb = maxTablesPerDb
         self.maxStorageBytesPerDb = maxStorageBytesPerDb
         self.maxSubsPerDb = maxSubsPerDb
+        self.changeLogMaxRows = changeLogMaxRows
     }
 
     enum CodingKeys: String, CodingKey {
         case allowedOrigins, sessionTtlDays, maxFileSize, idempotencyTtlMs
-        case maxTablesPerDb, maxStorageBytesPerDb, maxSubsPerDb
+        case maxTablesPerDb, maxStorageBytesPerDb, maxSubsPerDb, changeLogMaxRows
     }
 }
 
@@ -961,6 +965,8 @@ public struct HotConfigPatch: Equatable, Encodable, Sendable {
     public var maxStorageBytesPerDb: Int64?
     /// New value; nil leaves it unchanged.
     public var maxSubsPerDb: Int64?
+    /// New value; nil leaves it unchanged.
+    public var changeLogMaxRows: Int64?
 
     public init(
         allowedOrigins: [String]? = nil,
@@ -969,7 +975,8 @@ public struct HotConfigPatch: Equatable, Encodable, Sendable {
         idempotencyTtlMs: Int64? = nil,
         maxTablesPerDb: Int64? = nil,
         maxStorageBytesPerDb: Int64? = nil,
-        maxSubsPerDb: Int64? = nil
+        maxSubsPerDb: Int64? = nil,
+        changeLogMaxRows: Int64? = nil
     ) {
         self.allowedOrigins = allowedOrigins
         self.sessionTtlDays = sessionTtlDays
@@ -978,11 +985,12 @@ public struct HotConfigPatch: Equatable, Encodable, Sendable {
         self.maxTablesPerDb = maxTablesPerDb
         self.maxStorageBytesPerDb = maxStorageBytesPerDb
         self.maxSubsPerDb = maxSubsPerDb
+        self.changeLogMaxRows = changeLogMaxRows
     }
 
     enum CodingKeys: String, CodingKey {
         case allowedOrigins, sessionTtlDays, maxFileSize, idempotencyTtlMs
-        case maxTablesPerDb, maxStorageBytesPerDb, maxSubsPerDb
+        case maxTablesPerDb, maxStorageBytesPerDb, maxSubsPerDb, changeLogMaxRows
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -994,6 +1002,7 @@ public struct HotConfigPatch: Equatable, Encodable, Sendable {
         try container.encodeIfPresent(maxTablesPerDb, forKey: .maxTablesPerDb)
         try container.encodeIfPresent(maxStorageBytesPerDb, forKey: .maxStorageBytesPerDb)
         try container.encodeIfPresent(maxSubsPerDb, forKey: .maxSubsPerDb)
+        try container.encodeIfPresent(changeLogMaxRows, forKey: .changeLogMaxRows)
     }
 }
 

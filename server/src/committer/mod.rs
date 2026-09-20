@@ -786,6 +786,7 @@ impl Committers {
                 tokio::spawn(mutation_log::run_cleanup(
                     poller_pool.clone(),
                     db.to_string(),
+                    self.hot.clone(),
                     tx.clone(),
                 ));
             }
@@ -1100,6 +1101,13 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
     }
     if let Err(err) = crate::storage::ensure_table(&ctx.pool, &ctx.db).await {
         tracing::error!(db = %ctx.db, error = %err, "committer: storage::ensure_table failed");
+    }
+    if let Err(err) = crate::change_log::ensure_table(&ctx.pool, &ctx.db).await {
+        // The change-feed append inside execute_txn needs the counter row —
+        // an ensure failure here would fail every write on this db, so log
+        // loudly. New dbs seeded the row at create_database; this covers dbs
+        // created before the change feed existed.
+        tracing::error!(db = %ctx.db, error = %err, "committer: change_log::ensure_table failed");
     }
     while let Some(req) = rx.recv().await {
         // ENH-022 Stage 4: a SHADOW committer (non-owner replica) serves read

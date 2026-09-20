@@ -26,6 +26,9 @@ public enum ErrorCode: String, Codable, Sendable, CaseIterable {
     /// ARC-013: requested `protocolVersion` (WS `auth` frame or the
     /// `X-Rtdb-Protocol` HTTP header) is newer than the server's (HTTP 400).
     case unsupportedProtocol = "UNSUPPORTED_PROTOCOL"
+    /// Change-feed cursor predates retention or is ahead of the log — resync
+    /// from `since=0` (HTTP 410).
+    case cursorExpired = "CURSOR_EXPIRED"
 }
 
 /// Every failure is this envelope: `{code, message, retryAfter?}` on the wire

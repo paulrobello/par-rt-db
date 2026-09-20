@@ -24,6 +24,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from par_rt_db.wire import (
     AuthedUser,
+    ChangeFeedResponse,
     ClientMessage,
     ScheduleInfo,
     ScheduleWhen,
@@ -257,6 +258,24 @@ def test_corpus_migrate_results_round_trip(entry: dict[str, Any]) -> None:
     msg = MigrateResult.model_validate(entry)
     dumped = json.loads(msg.model_dump_json(by_alias=True))
     assert dumped == entry, f"MigrateResult wire drift: {dumped} != {entry}"
+
+
+# --- corpus: F7 change feed (GET /api/db/{db}/changes response) -------------
+#
+# ``doc`` is JSON ``null`` (never omitted) for delete/backfill ops, and
+# ``kind`` is ``OpKind``'s lowercase wire form; ``ChangeOp.kind`` is a
+# ``Literal`` so an out-of-domain kind fails at parse time.
+
+
+@pytest.mark.parametrize(
+    "entry",
+    _corpus_section("change_feed_responses"),
+    ids=lambda e: f"ops={len(e.get('ops', []))},nextSeq={e.get('nextSeq')}",
+)
+def test_corpus_change_feed_responses_round_trip(entry: dict[str, Any]) -> None:
+    msg = ChangeFeedResponse.model_validate(entry)
+    dumped = json.loads(msg.model_dump_json(by_alias=True))
+    assert dumped == entry, f"ChangeFeedResponse wire drift: {dumped} != {entry}"
 
 
 @pytest.mark.parametrize(

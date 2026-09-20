@@ -37,6 +37,7 @@ const baseConfig: ConfigResponse = {
     maxTablesPerDb: 0,
     maxStorageBytesPerDb: 0,
     maxSubsPerDb: 0,
+    changeLogMaxRows: 100_000,
   },
   version: "0.1.0",
   gitCommit: "abcdef0123456789",
@@ -102,6 +103,7 @@ describe("ConfigPage form validation", () => {
       maxTablesPerDb: 0,
       maxStorageBytesPerDb: 0,
       maxSubsPerDb: 0,
+      changeLogMaxRows: 100_000,
     });
   });
 });

@@ -16,6 +16,7 @@ import httpx
 import pytest
 
 from par_rt_db import (
+    ErrorCode,
     Mutation,
     RtDbError,
     TableQuery,
@@ -1465,6 +1466,71 @@ async def test_admin_restore_backup_posts_name_and_confirm() -> None:
     }
     assert res["target"] == "rtdb_restored_20260728T143045Z"
     assert "rtdb_restored_20260728T143045Z" in res["instructions"]
+
+
+# --- data plane: change feed (F7) -------------------------------------------
+
+
+async def test_changes_gets_page_and_passes_params() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["params"] = dict(request.url.params)
+        return httpx.Response(
+            200,
+            json={
+                "ops": [
+                    {
+                        "seq": 41,
+                        "table": "items",
+                        "docId": "d41",
+                        "kind": "insert",
+                        "doc": {"name": "x"},
+                        "ts": 1758300000000,
+                    }
+                ],
+                "nextSeq": 41,
+                "head": 57,
+                "logId": "0a1b2c3d4e5f6071",
+            },
+        )
+
+    from par_rt_db.wire import ChangeFeedResponse
+
+    async with _client(handler) as c:
+        page = await c.changes(40, table="items", limit=1)
+    assert seen["method"] == "GET"
+    assert seen["path"] == f"/api/db/{DB}/changes"
+    assert seen["params"] == {"since": "40", "table": "items", "limit": "1"}
+    assert isinstance(page, ChangeFeedResponse)
+    assert page.next_seq == 41
+    assert page.head == 57
+    assert page.ops[0].doc == {"name": "x"}
+
+
+async def test_changes_defaults_omit_table_and_limit() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["params"] = dict(request.url.params)
+        return httpx.Response(200, json={"ops": [], "nextSeq": 0, "head": 0, "logId": "l"})
+
+    async with _client(handler) as c:
+        await c.changes()
+    assert seen["params"] == {"since": "0"}
+
+
+async def test_changes_cursor_expired_surfaces_as_rtdb_error_410() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(410, json={"code": "CURSOR_EXPIRED", "message": "ahead of head"})
+
+    async with _client(handler) as c:
+        with pytest.raises(RtDbError) as exc:
+            await c.changes(999)
+    assert exc.value.code is ErrorCode.CURSOR_EXPIRED
+    assert exc.value.status_code == 410
 
 
 # --- data plane: workflows (FM-29) ------------------------------------------

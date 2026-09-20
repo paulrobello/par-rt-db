@@ -23,7 +23,8 @@ import Testing
 // Sections covered: client_messages (38), server_messages (33),
 // authed_users (5), schedule_whens (4), schedule_infos (11), queries (15),
 // the admin-plane migrate sections — migrate_requests (3) and
-// migrate_results (3), through MigrateRequest/MigrateResult — the six
+// migrate_results (3), through MigrateRequest/MigrateResult — the
+// change_feed_responses (2) pages through ChangeFeedResponse, the six
 // rejects_* sections (7 total), and protocol_constants.max_steps.
 // query_results / error_envelopes / db_stats belong to their owning tasks'
 // types.
@@ -204,6 +205,14 @@ struct WireCorpusTests {
     /// `castFailures`/`sampleChanges` are omit-when-empty on the wire).
     @Test func migrateResultsRoundTrip() throws {
         try corpusRoundTrip(MigrateResult.self, "migrate_results", WireCorpus())
+    }
+
+    /// `GET /api/db/{db}/changes` pages — `ChangeFeedResponse` with embedded
+    /// `ChangeOp`s, whose `doc` is a plain-null Option on the wire (a
+    /// `delete` op's `"doc": null` must survive the round-trip, never be
+    /// omitted).
+    @Test func changeFeedResponsesRoundTrip() throws {
+        try corpusRoundTrip(ChangeFeedResponse.self, "change_feed_responses", WireCorpus())
     }
 
     // MARK: - Reject sections

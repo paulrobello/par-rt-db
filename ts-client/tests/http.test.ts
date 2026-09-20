@@ -409,6 +409,80 @@ describe("RtDbHttpClient", () => {
     });
   });
 
+  it("listChanges GETs /api/db/{db}/changes with since/table/limit as query params", async () => {
+    const page = {
+      ops: [
+        {
+          seq: 41,
+          table: "items",
+          docId: "d41",
+          kind: "patch",
+          doc: { title: "rewritten" },
+          ts: 1758300000000,
+        },
+        { seq: 42, table: "items", docId: "d42", kind: "delete", doc: null, ts: 1758300000001 },
+      ],
+      nextSeq: 42,
+      head: 57,
+      logId: "0a1b2c3d4e5f6071",
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(page));
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kan ban",
+      token: "mach-tok",
+      fetch: fetchMock,
+    });
+
+    const result = await client.listChanges({ since: 40, table: "items", limit: 2 });
+
+    expect(result).toEqual(page);
+    expect(result.ops[1].doc).toBeNull();
+    const [calledUrl, init] = fetchMock.mock.calls[0];
+    // The db rides in the path (encoded); the cursor inputs are query params.
+    expect(calledUrl).toBe("http://h:8300/api/db/kan%20ban/changes?since=40&table=items&limit=2");
+    expect(init.method).toBe("GET");
+    expect(init.headers.Authorization).toBe("Bearer mach-tok");
+    expect(init.headers["X-Rtdb-Protocol"]).toBe(String(PROTOCOL_VERSION));
+  });
+
+  it("listChanges omits the query string entirely when no opts are given", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ ops: [], nextSeq: 0, head: 0, logId: "ab" }));
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "mach-tok",
+      fetch: fetchMock,
+    });
+
+    const result = await client.listChanges();
+
+    expect(result).toEqual({ ops: [], nextSeq: 0, head: 0, logId: "ab" });
+    expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/api/db/kanban/changes");
+  });
+
+  it("listChanges surfaces a 410 CURSOR_EXPIRED as an RtDbError envelope", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse({ code: "CURSOR_EXPIRED", message: "cursor predates retention" }, 410),
+      );
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "mach-tok",
+      fetch: fetchMock,
+    });
+
+    await expect(client.listChanges({ since: 3 })).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "CURSOR_EXPIRED",
+      message: "cursor predates retention",
+    });
+  });
+
   it("mints a signed URL via GET /api/storage/{db}/{id}/signed-url", async () => {
     const fetchMock = vi
       .fn()

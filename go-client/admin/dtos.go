@@ -83,6 +83,7 @@ type HotConfigPatch struct {
 	SessionTTLDays       *int64   `json:"sessionTtlDays,omitempty"`
 	MaxFileSize          *int64   `json:"maxFileSize,omitempty"`
 	IdempotencyTTLMs     *int64   `json:"idempotencyTtlMs,omitempty"`
+	ChangeLogMaxRows     *int64   `json:"changeLogMaxRows,omitempty"`
 	MaxTablesPerDB       *int64   `json:"maxTablesPerDb,omitempty"`
 	MaxStorageBytesPerDB *int64   `json:"maxStorageBytesPerDb,omitempty"`
 	MaxSubsPerDB         *int64   `json:"maxSubsPerDb,omitempty"`

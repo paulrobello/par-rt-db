@@ -12,17 +12,18 @@ use crate::committer::*;
 /// op-feed, audit, and webhooks all fire.
 ///
 /// Single-writer invariant: document writes happen only here, inside the
-/// serialized committer turn. Like `handle_reaper`, statements issue directly
-/// on the pool with NO explicit transaction, so a per-row 23505 aborts only
-/// that row; unlike it, each successful row is captured on the `WriteSet`
-/// with before/after values so `fan_out`'s window checks see the doc crossing
-/// an eq boundary (a re-stamp is exactly that).
+/// serialized committer turn. Each row's rewrite runs in its OWN transaction
+/// together with its change-log row (see `change_log::append`), so a per-row
+/// 23505 aborts only that row while every committed row is change-feed
+/// observable; each successful row is captured on the `WriteSet` with
+/// before/after values so `fan_out`'s window checks see the doc crossing an
+/// eq boundary (a re-stamp is exactly that).
 ///
-/// Abort semantics: because the per-row statements autocommit, rows restamped
-/// before a mid-merge failure (any non-conflict error) are already durable.
-/// The abort path therefore does NOT return early — it breaks out of the
-/// loops, publishes `publish_taps` + the metric for everything that committed,
-/// and only then returns the recorded error. Returning without publishing
+/// Abort semantics: per-row transactions make restamps before a mid-merge
+/// failure (any non-conflict error) durable individually. The abort path
+/// therefore does NOT return early — it breaks out of the loops, publishes
+/// `publish_taps` + the metric for everything that committed, and only then
+/// returns the recorded error. Returning without publishing
 /// would leave live subscriptions stale (no `fan_out` ran at all, so the
 /// verify-skip safety net cannot help) and silently skip the op-feed/audit/
 /// webhook taps — violating the "every durable write publishes here" contract.
@@ -98,16 +99,6 @@ pub(in crate::committer) async fn handle_merge_users(
             }
         };
 
-        let mut conn = match ctx.pool.acquire().await {
-            Ok(conn) => conn,
-            Err(err) => {
-                // Same abort contract as a row error: earlier tables' rows are
-                // already committed, so break to the publish-then-return-Err path
-                // below instead of early-returning past publish_taps.
-                abort = Some(err.into());
-                break;
-            }
-        };
         let mut table_count = 0usize;
         for (id, doc_value, created_at) in rows {
             let serde_json::Value::Object(mut doc) = doc_value else {
@@ -133,30 +124,62 @@ pub(in crate::committer) async fn handle_merge_users(
                     break;
                 }
             };
-            match crate::txn::apply_update(
-                &mut conn,
-                &pg_schema_name,
-                table_def,
-                table_name,
-                &id,
-                &doc,
-            )
-            .await
-            {
-                Ok(()) => {
-                    write_set.touch(table_name, &id, OpKind::Patch);
-                    write_set.capture_doc(
-                        table_name,
-                        &id,
-                        Some(Some(&pre_doc)),
-                        Some(Some(&doc)),
-                        Some(created_at),
-                    );
-                    table_count += 1;
+            // Change-feed contract: each row's rewrite commits in its OWN
+            // transaction together with its change-log row — a committed
+            // restamp is observable, a rolled-back one leaves nothing behind.
+            // The per-row scope preserves the abort contract below exactly
+            // (a 23505 Conflict skips only this row; earlier rows stay
+            // committed and publish).
+            let mut tx = match ctx.pool.begin().await {
+                Ok(tx) => tx,
+                Err(err) => {
+                    abort = Some(err.into());
+                    break;
                 }
+            };
+            let mut row_ws = WriteSet::default();
+            // Rewrite + change-log stamp as one fallible unit: a failure at
+            // either point rolls the row's transaction back wholesale.
+            let outcome = async {
+                crate::txn::apply_update(
+                    &mut tx,
+                    &pg_schema_name,
+                    table_def,
+                    table_name,
+                    &id,
+                    &doc,
+                )
+                .await?;
+                row_ws.touch(table_name, &id, OpKind::Patch);
+                row_ws.capture_doc(
+                    table_name,
+                    &id,
+                    Some(Some(&pre_doc)),
+                    Some(Some(&doc)),
+                    Some(created_at),
+                );
+                crate::change_log::append(&mut tx, &pg_schema_name, &row_ws).await
+            }
+            .await;
+            match outcome {
+                Ok(()) => match tx.commit().await {
+                    Ok(()) => {
+                        write_set.tables.extend(row_ws.tables);
+                        write_set.docs.extend(row_ws.docs);
+                        write_set.ops.append(&mut row_ws.ops);
+                        write_set.doc_values.extend(row_ws.doc_values);
+                        table_count += 1;
+                    }
+                    Err(err) => {
+                        abort = Some(err.into());
+                        break;
+                    }
+                },
+                // 23505: the restamped row would collide with a row the
+                // real user already owns. Skip, report, keep going. The
+                // dropped tx leaves this row's rewrite and change row
+                // uncommitted together.
                 Err(err) if err.code == crate::error::ErrorCode::Conflict => {
-                    // 23505: the restamped row would collide with a row the
-                    // real user already owns. Skip, report, keep going.
                     tracing::warn!(
                         db = %ctx.db, table = %table_name, id = %id,
                         "merge: unique conflict, row keeps anon owner"

@@ -641,6 +641,48 @@ struct HttpClientTests {
         #expect(url == "http://x/storage/f1?exp=9&sig=ab")
     }
 
+    // MARK: change feed
+
+    @Test func changesSendsCursorQueryAndDecodesPage() async throws {
+        StubProtocol.handler = { request in
+            try demand(request.httpMethod == "GET", "expected GET")
+            try demand(request.url?.path == "/api/db/app/changes", "expected /api/db/app/changes")
+            try demand(
+                request.url?.query == "since=41&table=items&limit=2",
+                "cursor query mismatch: \(request.url?.query ?? "nil")"
+            )
+            let body = #"{"ops":[{"seq":42,"table":"items","docId":"d42","kind":"delete","doc":null,"ts":5}],"#
+                + #""nextSeq":57,"head":57,"logId":"0a1b2c3d4e5f6071"}"#
+            return (200, Data(body.utf8))
+        }
+        let page = try await makeClient().changes(since: 41, table: "items", limit: 2)
+        #expect(page.ops == [ChangeOp(seq: 42, table: "items", docId: "d42", kind: "delete", doc: nil, ts: 5)])
+        #expect(page.nextSeq == 57)
+        #expect(page.head == 57)
+        #expect(page.logId == "0a1b2c3d4e5f6071")
+    }
+
+    @Test func changesDefaultsToSinceZeroOnly() async throws {
+        StubProtocol.handler = { request in
+            try demand(request.url?.query == "since=0", "expected only since=0: \(request.url?.query ?? "nil")")
+            return (200, Data(#"{"ops":[],"nextSeq":0,"head":0,"logId":"x"}"#.utf8))
+        }
+        let page = try await makeClient().changes()
+        #expect(page.ops.isEmpty)
+    }
+
+    @Test func changesSurfacesCursorExpired() async throws {
+        StubProtocol.handler = { _ in
+            (410, Data(#"{"code":"CURSOR_EXPIRED","message":"cursor predates retention"}"#.utf8))
+        }
+        do {
+            _ = try await makeClient().changes(since: 1)
+            Issue.record("expected CURSOR_EXPIRED")
+        } catch let error as RtDbError {
+            #expect(error.code == .cursorExpired)
+        }
+    }
+
     // MARK: pure URL builders
 
     @Test func getUrlIsALocalBuilderThatTrimsTrailingSlash() {

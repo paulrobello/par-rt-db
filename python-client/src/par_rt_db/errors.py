@@ -24,6 +24,9 @@ class ErrorCode(StrEnum):
     #: ARC-013: requested ``protocolVersion`` (WS ``auth`` frame or the
     #: ``X-Rtdb-Protocol`` HTTP header) is newer than the server's.
     UNSUPPORTED_PROTOCOL = "UNSUPPORTED_PROTOCOL"
+    #: F7 change feed: ``GET /api/db/{db}/changes`` ``since`` cursor predates
+    #: retention or is ahead of the log head (HTTP 410).
+    CURSOR_EXPIRED = "CURSOR_EXPIRED"
 
 
 _STATUS: dict[ErrorCode, int] = {
@@ -38,6 +41,7 @@ _STATUS: dict[ErrorCode, int] = {
     ErrorCode.RATE_LIMITED: 429,
     ErrorCode.QUOTA_EXCEEDED: 507,
     ErrorCode.UNSUPPORTED_PROTOCOL: 400,
+    ErrorCode.CURSOR_EXPIRED: 410,
 }
 
 

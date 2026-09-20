@@ -888,6 +888,28 @@ point — the `publish_taps` helper (`committer/taps.rs`) — called from
 | `handle_push_schema` | `"push"` | no | `docop_taps = false`: fan-out + cross-replica invalidation only — DDL/backfills emit no DocOps, so no op-feed/audit/webhook taps |
 | `handle_restore_schema` | `"restore"` | no | Same shape as push, for schema-history restore |
 
+
+### The change log is stamped in-transaction, not via a tap
+
+The durable per-db change feed (`GET /api/db/{db}/changes`, the seq-cursor
+primitive for HTTP-only clients — see
+`docs/superpowers/specs/2026-09-19-change-feed-design.md`) is deliberately
+**not** a `publish_taps` tap: `publish_taps` runs after the commit and is
+failure-tolerant by design, while the feed requires each change row to commit
+or roll back with its write — a post-commit append could lose rows in a crash,
+which the feed's "never silent data loss" contract forbids. Instead
+`change_log::append` runs on the OPEN transaction before its commit at every
+document-write seam: inside `execute_txn` (mutate/scheduled/workflow), inside
+new per-row/per-batch transactions in the reaper and merge arms (which
+otherwise run autocommit statements), inside the migrate arm's existing
+transaction, and inside the snapshot import's transaction (so an import into a
+live db is observable). The append advances the per-db `change_head` counter
+row — transactional, so retained seqs are gap-free and the `CURSOR_EXPIRED`
+contract is exact — and inserts one net row per written `(table, id)`.
+Retention (`changeLogMaxRows`, trimmed by the per-db cleanup loop) keeps the
+newest rows only, so an empty `changes` table still means "nothing was ever
+committed".
+
 Any future code path that commits a document txn must call `publish_taps` too,
 or the op-feed (and `/admin/stream`) will silently miss those writes. Add new
 tap sites to this table.

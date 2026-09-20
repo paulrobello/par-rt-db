@@ -3,6 +3,7 @@ import { parseStepResults, type StepResult } from "./mutation.js";
 import type {
   AuthedUser,
   BatchQueryOutcomeJson,
+  ChangeFeedResponse,
   ClaimedSchedule,
   QueryJson,
   ScheduleInfo,
@@ -302,6 +303,30 @@ export class RtDbHttpClient {
       ...(status === undefined ? {} : { status }),
     });
     return (body as { workflows: WorkflowInfo[] }).workflows;
+  }
+
+  /** Reads one page of the resumable per-db change feed
+   * (`GET /api/db/{db}/changes`): every committed document op with
+   * `seq > opts.since` (default 0), oldest first, with post-images. Machine
+   * tokens only — a session token is rejected `FORBIDDEN`. `opts.table`
+   * filters to one table (`nextSeq`/`head` stay global); `opts.limit` is the
+   * page size (server default 500, clamped to 1000). Resume by passing the
+   * returned `nextSeq` as the next `since`; loop `while (nextSeq < head)`. A
+   * cursor older than retention or ahead of the log rejects with
+   * `CURSOR_EXPIRED` (410) — resync from `since: 0`, never assume an empty
+   * page. */
+  async listChanges(opts?: {
+    since?: number;
+    table?: string;
+    limit?: number;
+  }): Promise<ChangeFeedResponse> {
+    const params = new URLSearchParams();
+    if (opts?.since !== undefined) params.set("since", String(opts.since));
+    if (opts?.table !== undefined) params.set("table", opts.table);
+    if (opts?.limit !== undefined) params.set("limit", String(opts.limit));
+    const query = params.toString();
+    const path = `/api/db/${encodeURIComponent(this.db)}/changes${query ? `?${query}` : ""}`;
+    return (await this.get(path, this.token)) as ChangeFeedResponse;
   }
 
   /**

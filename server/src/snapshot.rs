@@ -119,6 +119,14 @@ pub async fn import_database(pool: &PgPool, db: &str, jsonl: &str) -> Result<Sch
     let pg_schema_name = pg_schema(db);
     let mut tx = pool.begin().await?;
 
+    // Restored rows, for the change-feed stamp below: (table, id, post-image,
+    // created_at) in replay order.
+    let mut stamped: Vec<(
+        String,
+        String,
+        serde_json::Map<String, serde_json::Value>,
+        i64,
+    )> = Vec::new();
     for line in lines {
         let parsed: SnapshotLine = serde_json::from_str(line)
             .map_err(|err| RtDbError::bad_request(format!("invalid snapshot doc line: {err}")))?;
@@ -146,6 +154,7 @@ pub async fn import_database(pool: &PgPool, db: &str, jsonl: &str) -> Result<Sch
             version,
         )
         .await?;
+        stamped.push((table, id, doc, created_at));
     }
 
     // Imported docs replay their counter values verbatim; reposition each
@@ -157,6 +166,22 @@ pub async fn import_database(pool: &PgPool, db: &str, jsonl: &str) -> Result<Sch
         if let Some(field) = &table_def.auto_increment_field {
             reposition_sequence(&mut tx, &pg_schema_name, table_name, field).await?;
         }
+    }
+
+    // Change-feed stamp: imported documents are observable like any write, so
+    // an import into a LIVE database moves the cursor world forward instead of
+    // silently stranding consumers. One `Insert` op with the post-image per
+    // restored row, on this same transaction (the change_head row lock
+    // serializes the import against the committer's counter UPDATE, so seq
+    // order still equals commit order). Clone-db and backup restore ride this
+    // same path into fresh databases, where the stamps are pure bookkeeping.
+    if !stamped.is_empty() {
+        let mut write_set = crate::txn::WriteSet::default();
+        for (table, id, doc, created_at) in &stamped {
+            write_set.touch(table, id, crate::txn::OpKind::Insert);
+            write_set.capture_doc(table, id, Some(None), Some(Some(doc)), Some(*created_at));
+        }
+        crate::change_log::append(&mut tx, &pg_schema_name, &write_set).await?;
     }
 
     tx.commit().await?;

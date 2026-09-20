@@ -341,6 +341,29 @@ public actor RtDbHttpClient {
         return response.workflows
     }
 
+    // MARK: Change feed
+
+    /// Read a page of the durable change feed
+    /// (`GET /api/db/{db}/changes?since=N&table=T&limit=L`, machine token
+    /// only). `since` returns ops with `seq > since`, oldest first; `table`
+    /// filters to one table (the cursor stays global); `limit` is the page
+    /// size (server default 500, clamped to 1000). Advance with
+    /// `since = response.nextSeq` while `nextSeq < head`. A cursor that
+    /// predates retention or is ahead of the log throws `CURSOR_EXPIRED`
+    /// (410) — resync from `since: 0`.
+    public func changes(
+        since: Int64 = 0, table: String? = nil, limit: Int? = nil
+    ) async throws -> ChangeFeedResponse {
+        var query = [URLQueryItem(name: "since", value: String(since))]
+        if let table {
+            query.append(URLQueryItem(name: "table", value: table))
+        }
+        if let limit {
+            query.append(URLQueryItem(name: "limit", value: String(limit)))
+        }
+        return try await getJson("changes", "/api/db/\(db)/changes", query: query)
+    }
+
     // MARK: Auth + schema facade
 
     /// Validate the bearer (session) token via `GET /auth/me`; machine tokens

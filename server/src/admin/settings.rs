@@ -85,6 +85,7 @@ pub(super) struct HotConfigPatch {
     max_tables_per_db: Option<usize>,
     max_storage_bytes_per_db: Option<u64>,
     max_subs_per_db: Option<usize>,
+    change_log_max_rows: Option<usize>,
 }
 
 /// `PATCH /admin/config` — apply a subset patch to the hot config, validate,
@@ -137,6 +138,15 @@ pub(super) async fn patch_config(
     // upper ceiling — an operator can set whatever limit they want live.
     if let Some(cap) = patch.max_tables_per_db {
         next.max_tables_per_db = cap;
+    }
+    // Change-feed retention: 0 restores the default; anything else clamps to
+    // MIN_MAX_ROWS (a floor of a few dozen rows would expire every cursor).
+    if let Some(cap) = patch.change_log_max_rows {
+        next.change_log_max_rows = if cap == 0 {
+            crate::change_log::DEFAULT_MAX_ROWS
+        } else {
+            cap.max(crate::change_log::MIN_MAX_ROWS)
+        };
     }
     if let Some(cap) = patch.max_storage_bytes_per_db {
         next.max_storage_bytes_per_db = cap;

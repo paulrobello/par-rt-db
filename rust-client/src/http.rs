@@ -960,6 +960,38 @@ impl RtDbHttpClient {
         Ok(parsed.user)
     }
 
+    /// Poll the durable per-db change feed via
+    /// `GET /api/db/{db}/changes` — every committed document op strictly
+    /// after `since`, oldest first, with post-image payloads. Machine-token
+    /// scoped; a cursor older than the server's retention window (or ahead
+    /// of the log) errors with `ErrorCode::CursorExpired` — resync from 0.
+    /// Loop `while resp.next_seq < resp.head`; re-reading a cursor is
+    /// idempotent. `table` restricts the page to one table (`next_seq`/`head`
+    /// stay global); `limit` is the page size (server clamps to 1000).
+    pub async fn changes(
+        &self,
+        since: i64,
+        table: Option<&str>,
+        limit: Option<i64>,
+    ) -> Result<crate::wire::ChangeFeedResponse, RtDbError> {
+        let mut req = self
+            .client
+            .get(format!("{}/api/db/{}/changes", self.url, self.db))
+            .query(&[("since", since.to_string())])
+            .authed(&self.token);
+        if let Some(table) = table {
+            req = req.query(&[("table", table)]);
+        }
+        if let Some(limit) = limit {
+            req = req.query(&[("limit", limit.to_string())]);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("changes request failed: {e}")))?;
+        crate::http_common::deserialize::<crate::wire::ChangeFeedResponse>(resp).await
+    }
+
     /// Fetch the database's pushed `SchemaDef` via `GET /api/db/{db}/schema` —
     /// the machine-token twin of the admin client's
     /// [`get_schema`](crate::admin::RtDbAdminClient::get_schema). Serves

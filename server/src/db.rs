@@ -585,6 +585,46 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
     .execute(&mut *tx)
     .await?;
 
+    // The durable change feed (see `change_log`): counter row seeded at 0 so
+    // the first write's UPDATE always matches, `log_id` minted once. The
+    // ensure_table path covers dbs created before this existed.
+    sqlx::query(&format!(
+        "CREATE TABLE \"{schema_name}\".change_head (
+            ok     boolean PRIMARY KEY DEFAULT true,
+            seq    bigint NOT NULL DEFAULT 0,
+            log_id text   NOT NULL DEFAULT ''
+        )"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!(
+        "INSERT INTO \"{schema_name}\".change_head (ok, seq, log_id)
+         VALUES (true, 0, $1) ON CONFLICT (ok) DO NOTHING"
+    ))
+    .bind(&new_id()[..16])
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!(
+        "CREATE TABLE \"{schema_name}\".changes (
+            seq        bigint PRIMARY KEY,
+            table_name text NOT NULL,
+            doc_id     text NOT NULL,
+            kind       text NOT NULL,
+            doc        jsonb,
+            ts         bigint NOT NULL
+        )"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!(
+        // CREATE INDEX takes no schema qualifier — the index lands in the
+        // table's schema automatically.
+        "CREATE INDEX changes_table_seq
+         ON \"{schema_name}\".changes (table_name, seq)"
+    ))
+    .execute(&mut *tx)
+    .await?;
+
     sqlx::query(&format!(
         "CREATE TABLE \"{schema_name}\".scheduled_txns (
             id          text PRIMARY KEY,

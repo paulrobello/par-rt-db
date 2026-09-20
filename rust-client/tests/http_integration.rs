@@ -123,3 +123,54 @@ async fn admin_control_plane() {
     let _scoped = admin.list_subscriptions(Some(&new_db)).await.unwrap();
     let _global = admin.list_subscriptions(None).await.unwrap();
 }
+
+/// Change feed: writes land in the durable log with post-images, the cursor
+/// contract holds (idempotent re-read, short page → nextSeq = head), and a
+/// stale cursor returns the typed `CURSOR_EXPIRED` (F7). Extends the same
+/// provisioned db the round-trip test uses.
+#[tokio::test]
+#[ignore = "set RTDB_TEST_SERVER_URL + RTDB_TEST_ADMIN_KEY and run with --ignored"]
+async fn change_feed_round_trip() {
+    if env().is_none() {
+        return;
+    }
+    let ctx = setup().await;
+    let c = RtDbHttpClient::new(&ctx.url, &ctx.db, &ctx.token);
+
+    // Fresh view of the log (the provisioned db may carry earlier writes).
+    let head_page = c.changes(0, None, Some(1000)).await.unwrap();
+    let start = head_page.next_seq.min(head_page.head);
+
+    // Two inserts → two observable ops with post-images.
+    let txn = Mutation::new()
+        .insert("items", json!({"name":"cf-a","n":101}))
+        .insert("items", json!({"name":"cf-b","n":102}))
+        .build();
+    c.mutate(&txn, None).await.unwrap();
+
+    let page = c.changes(start, None, Some(1000)).await.unwrap();
+    let mine: Vec<_> = page
+        .ops
+        .iter()
+        .filter(|op| op.kind == "insert" && op.doc.is_some())
+        .collect();
+    assert!(
+        mine.iter()
+            .any(|op| op.doc.as_ref().unwrap()["name"] == json!("cf-a")),
+        "inserts land in the feed with post-images: {:?}",
+        page.ops
+    );
+    // Short page (or filtered tail) ⇒ nextSeq == head, never a livelock.
+    assert_eq!(page.next_seq, page.head);
+
+    // Re-reading the same cursor is idempotent.
+    let again = c.changes(start, None, Some(1000)).await.unwrap();
+    assert_eq!(again.ops.len(), page.ops.len());
+
+    // A cursor ahead of the log is a typed error, never an empty success.
+    let err = c.changes(page.head + 10_000, None, None).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::CursorExpired);
+
+    // Table filter narrows ops but keeps the global cursor world.
+    let _scoped = c.changes(start, Some("items"), Some(1)).await.unwrap();
+}

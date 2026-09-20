@@ -143,6 +143,7 @@ export interface HotConfig {
   maxTablesPerDb: number;
   maxStorageBytesPerDb: number;
   maxSubsPerDb: number;
+  changeLogMaxRows: number;
 }
 
 export interface ConfigResponse {
@@ -208,4 +209,5 @@ export interface HotConfigPatch {
   maxTablesPerDb?: number;
   maxStorageBytesPerDb?: number;
   maxSubsPerDb?: number;
+  changeLogMaxRows?: number;
 }

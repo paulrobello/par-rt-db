@@ -81,11 +81,11 @@ pub use schema::{
 };
 pub use value_expr::{CaseWhen, Cast, ValueExpr};
 pub use wire::{
-    AggregateGroup, AggregateOp, AggregateSpec, AuthedUser, AwaitSignalSpec, ClaimedSchedule,
-    ClientMessage, FilterExpr, OutcomeStatus, PresenceMember, ScheduleInfo, ScheduleKind,
-    ScheduleStatus, ScheduleWhen, SearchMode, SearchQuery, ServerMessage, StepOutcome, StepRetry,
-    UserKind, VectorSearchQuery, WorkflowInfo, WorkflowInfoFull, WorkflowSpec, WorkflowStatus,
-    WorkflowStepSpec,
+    AggregateGroup, AggregateOp, AggregateSpec, AuthedUser, AwaitSignalSpec, ChangeFeedResponse,
+    ChangeOp, ClaimedSchedule, ClientMessage, FilterExpr, OutcomeStatus, PresenceMember,
+    ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen, SearchMode, SearchQuery,
+    ServerMessage, StepOutcome, StepRetry, UserKind, VectorSearchQuery, WorkflowInfo,
+    WorkflowInfoFull, WorkflowSpec, WorkflowStatus, WorkflowStepSpec,
 };
 
 #[cfg(feature = "http")]

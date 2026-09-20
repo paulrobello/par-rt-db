@@ -1347,16 +1347,34 @@ describe("HotConfig quota fields (ENH-011)", () => {
       maxTablesPerDb: 25,
       maxStorageBytesPerDb: 104_857_600,
       maxSubsPerDb: 500,
+      changeLogMaxRows: 100_000,
     };
     expect(hot.maxTablesPerDb).toBe(25);
     expect(hot.maxStorageBytesPerDb).toBe(104_857_600);
     expect(hot.maxSubsPerDb).toBe(500);
   });
 
+  it("HotConfig carries changeLogMaxRows (change-feed retention)", () => {
+    const hot: HotConfig = {
+      allowedOrigins: [],
+      sessionTtlDays: 30,
+      maxFileSize: 5_242_880,
+      idempotencyTtlMs: 300_000,
+      maxTablesPerDb: 0,
+      maxStorageBytesPerDb: 0,
+      maxSubsPerDb: 0,
+      changeLogMaxRows: 100_000,
+    };
+    expect(hot.changeLogMaxRows).toBe(100_000);
+    const patchRetention: HotConfigPatch = { changeLogMaxRows: 5_000 };
+    expect(patchRetention.changeLogMaxRows).toBe(5_000);
+  });
+
   it("HotConfigPatch makes the quota fields optional (omittable)", () => {
     const patchOnlyOrigins: HotConfigPatch = { allowedOrigins: ["https://app.x"] };
     const patchOneQuota: HotConfigPatch = { maxSubsPerDb: 50 };
     expect(patchOnlyOrigins.maxTablesPerDb).toBeUndefined();
+    expect(patchOnlyOrigins.changeLogMaxRows).toBeUndefined();
     expect((patchOneQuota as HotConfigPatch).maxSubsPerDb).toBe(50);
   });
 

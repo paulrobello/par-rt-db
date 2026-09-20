@@ -878,6 +878,42 @@ class BatchQueryOutcome(_Camel):
     error: _ErrorEnvelope | None = None
 
 
+# --- F7 change feed (GET /api/db/{db}/changes) ---
+
+
+class ChangeOp(_Camel):
+    """One committed document op from the per-db change log.
+
+    ``doc`` is the post-image and is JSON ``null`` (never omitted) for
+    ``delete`` ops and migrate-backfill ops. ``kind`` is ``OpKind``'s
+    lowercase wire form. Mirrors ``server/src/protocol.rs::ChangeOp``.
+    """
+
+    seq: int
+    table: str
+    doc_id: str
+    kind: Literal["insert", "patch", "replace", "delete", "upsert"]
+    doc: Any | None = None
+    ts: int
+
+
+class ChangeFeedResponse(_Camel):
+    """``GET /api/db/{db}/changes`` response.
+
+    ``next_seq`` is the last returned op's ``seq`` only when the page is full;
+    otherwise the log is exhausted up to ``head`` and ``next_seq == head``, so
+    the consumer loop ``while next_seq < head`` stays live on filtered and
+    tail pages. ``log_id`` identifies the log instance — a change means the
+    db was restored/rewound and the cursor must restart from 0. Mirrors
+    ``server/src/protocol.rs::ChangeFeedResponse``.
+    """
+
+    ops: list[ChangeOp]
+    next_seq: int
+    head: int
+    log_id: str
+
+
 class _ServerAuthOk(_Camel):
     type: Literal["authOk"] = "authOk"
     user: AuthedUser

@@ -207,6 +207,12 @@ func TestWireCorpusQueries(t *testing.T) {
 	}
 }
 
+func TestWireCorpusChangeFeedResponses(t *testing.T) {
+	for idx, raw := range entries(t, loadCorpus(t), "change_feed_responses") {
+		roundTripTyped(t, "change_feed_responses", idx, raw, &wire.ChangeFeedResponse{})
+	}
+}
+
 func TestWireCorpusRawSectionsRoundTrip(t *testing.T) {
 	// query_results / error_envelopes are raw JSON values (QueryResult is
 	// untagged on the wire; the error envelope model lives in errors) —

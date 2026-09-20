@@ -278,6 +278,10 @@ class HotConfig(_Wire):
     max_tables_per_db: int = 0
     max_storage_bytes_per_db: int = 0
     max_subs_per_db: int = 0
+    # F7 change feed: newest rows retained per db's change log. Defaults so a
+    # client built against this model still parses an older server's response
+    # (``extra="forbid"`` would otherwise reject the live one).
+    change_log_max_rows: int = 100000
 
 
 class ConfigResponse(_Wire):
@@ -315,6 +319,7 @@ class HotConfigPatch(_Wire):
     max_tables_per_db: int | None = None
     max_storage_bytes_per_db: int | None = None
     max_subs_per_db: int | None = None
+    change_log_max_rows: int | None = None
 
 
 class OpEvent(_Wire):

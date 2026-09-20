@@ -117,7 +117,8 @@
     { "code": "NOT_FOUND", "message": "missing doc" },
     { "code": "PRECONDITION_FAILED", "message": "version conflict" },
     { "code": "FORBIDDEN", "message": "not owner" },
-    { "code": "UNSUPPORTED_PROTOCOL", "message": "requested protocol version 999 is newer than this server's 1" }
+    { "code": "UNSUPPORTED_PROTOCOL", "message": "requested protocol version 999 is newer than this server's 1" },
+    { "code": "CURSOR_EXPIRED", "message": "cursor 41 predates the retention window (oldest retained seq 900) — resync from 0" }
   ],
   "queries": [
     { "table": "workItems" },
@@ -238,6 +239,45 @@
       "storageUsedBytes": 0,
       "subsQuota": 0,
       "subsUsed": 0
+    }
+  ],
+  "change_feed_responses": [
+    {
+      "ops": [
+        {
+          "seq": 41,
+          "table": "workItems",
+          "docId": "d41",
+          "kind": "patch",
+          "doc": { "title": "rewritten", "points": 3 },
+          "ts": 1758300000000
+        },
+        {
+          "seq": 42,
+          "table": "workItems",
+          "docId": "d42",
+          "kind": "delete",
+          "doc": null,
+          "ts": 1758300000001
+        },
+        {
+          "seq": 43,
+          "table": "archive",
+          "docId": "d43",
+          "kind": "insert",
+          "doc": { "name": "seeded" },
+          "ts": 1758300000002
+        }
+      ],
+      "nextSeq": 43,
+      "head": 57,
+      "logId": "0a1b2c3d4e5f6071"
+    },
+    {
+      "ops": [],
+      "nextSeq": 57,
+      "head": 57,
+      "logId": "0a1b2c3d4e5f6071"
     }
   ],
   "protocol_constants": {

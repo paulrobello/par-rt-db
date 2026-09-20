@@ -618,6 +618,8 @@ pub struct HotConfig {
     pub max_storage_bytes_per_db: i64,
     /// Subscription cap per db; 0 = unlimited.
     pub max_subs_per_db: i64,
+    /// Durable change-feed retention (rows kept per db).
+    pub change_log_max_rows: i64,
 }
 
 /// `GET /admin/config` response — redacted boot config + hot config + build
@@ -683,6 +685,9 @@ pub struct HotConfigPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// New value; `None` leaves it unchanged.
     pub max_subs_per_db: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// New value; `None` leaves it unchanged.
+    pub change_log_max_rows: Option<i64>,
 }
 
 /// One row of `OpEvent` returned by `GET /admin/ops/recent`. `kind` is a

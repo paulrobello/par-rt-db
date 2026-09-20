@@ -26,6 +26,9 @@ import { QUERY_COMBO_CLAUSES, QUERY_COMBO_RULES } from "../src/in_memory/query-c
 import type {
   AuthedUser,
   AuthedUserKind,
+  ChangeFeedResponse,
+  ChangeOp,
+  ChangeOpKind,
   ClientMessage,
   FilterExpr,
   MigrateRequestJson,
@@ -68,6 +71,9 @@ interface Corpus {
   rejects_authed_user_unknown_kind: unknown[];
   rejects_schedule_info_unknown_kind: unknown[];
   rejects_schedule_info_unknown_status: unknown[];
+  // Change-feed pages (`GET /api/db/{db}/changes`) — type-checked against
+  // ChangeFeedResponse (camelCase, `doc: null` for no-post-image ops).
+  change_feed_responses: ChangeFeedResponse[];
   // ARC-104: canonical numeric limits shared across the server and all four
   // clients. An object (not an array) — each client asserts its internal const
   // equals the value recorded here, so a server change requires updating the
@@ -490,6 +496,55 @@ describe("wire-corpus: workflow entries (FM-29 steps + frames)", () => {
     expect(waiting?.waitingFor).toBe("approve");
     expect(waiting?.waitedSince).toBe(1234);
     expect(waiting?.sleepUntil).toBe(3601234);
+  });
+});
+
+/**
+ * Change-feed pins: the corpus gained a `change_feed_responses` section — one
+ * three-op page (patch / delete-with-`doc: null` / insert across two tables)
+ * whose full-page `nextSeq` is the last op's seq, and one empty tail page
+ * whose `nextSeq` equals `head`. The generic loop type-checks and round-trips
+ * every entry; the pinned block asserts the load-bearing fields so a corpus
+ * or protocol drift on the feed surface fails here, not just silently
+ * round-tripping. `doc: null` MUST survive the round-trip as `null` (never
+ * dropped as undefined) — it is the "re-fetch this id" signal.
+ */
+describe("wire-corpus: change_feed_responses (resumable change feed)", () => {
+  const corpus = loadCorpus();
+  for (const [idx, entry] of corpus.change_feed_responses.entries()) {
+    const _typeCheck: ChangeFeedResponse = entry; // compile-time shape check
+    void _typeCheck;
+    for (const op of entry.ops) {
+      const kind: ChangeOpKind = op.kind; // narrows to the OpKind literal set
+      void kind;
+      const _opCheck: ChangeOp = op;
+      void _opCheck;
+    }
+    it(`change_feed_responses #${idx} (${entry.ops.length} ops, head=${entry.head}) round-trips`, () => {
+      assertJsonRoundTrip(entry);
+    });
+  }
+
+  it("carries a full page with nextSeq = last seq and a doc:null delete", () => {
+    const full = corpus.change_feed_responses.find((p) => p.ops.length > 0);
+    expect(full).toBeDefined();
+    expect(full?.ops.map((o) => o.seq)).toEqual([41, 42, 43]);
+    expect(full?.ops.map((o) => o.kind)).toEqual(["patch", "delete", "insert"]);
+    expect(full?.nextSeq).toBe(43);
+    expect(full?.head).toBe(57);
+    expect(full?.logId).toBe("0a1b2c3d4e5f6071");
+    const del = full?.ops.find((o) => o.kind === "delete");
+    expect(del?.doc).toBeNull();
+    expect(del && "doc" in del).toBe(true);
+    expect(full?.ops[0].doc).toEqual({ title: "rewritten", points: 3 });
+    expect(full?.ops[0].ts).toBe(1758300000000);
+  });
+
+  it("carries an empty tail page with nextSeq = head", () => {
+    const tail = corpus.change_feed_responses.find((p) => p.ops.length === 0);
+    expect(tail).toBeDefined();
+    expect(tail?.nextSeq).toBe(tail?.head);
+    expect(tail?.logId).toBe("0a1b2c3d4e5f6071");
   });
 });
 

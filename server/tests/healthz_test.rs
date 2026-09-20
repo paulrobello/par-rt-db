@@ -92,6 +92,7 @@ fn test_hot() -> HotConfig {
         max_tables_per_db: 0,
         max_storage_bytes_per_db: 0,
         max_subs_per_db: 0,
+        change_log_max_rows: rtdb_server::change_log::DEFAULT_MAX_ROWS,
     }
 }
 

@@ -31,15 +31,18 @@ func TestHTTPStatusTable(t *testing.T) {
 	if got := errors.HTTPStatus(errors.CodeQuotaExceeded); got != 507 {
 		t.Fatalf("QUOTA_EXCEEDED status %d", got)
 	}
+	if got := errors.HTTPStatus(errors.CodeCursorExpired); got != 410 {
+		t.Fatalf("CURSOR_EXPIRED status %d", got)
+	}
 	codes := errors.AllCodes()
-	if len(codes) != 11 {
-		t.Fatalf("want 11 codes, got %d", len(codes))
+	if len(codes) != 12 {
+		t.Fatalf("want 12 codes, got %d", len(codes))
 	}
 	seen := map[errors.ErrorCode]int{}
 	for _, c := range codes {
 		seen[c] = errors.HTTPStatus(c)
 	}
-	if len(seen) != 11 {
+	if len(seen) != 12 {
 		t.Fatalf("duplicate constants in AllCodes: %v", codes)
 	}
 }

@@ -17,6 +17,7 @@ mod audit_test;
 mod auth_test;
 mod auto_increment_test;
 mod cascade_test;
+mod change_feed_test;
 mod computed_test;
 mod dashboard_test;
 mod db_cleanup_test;

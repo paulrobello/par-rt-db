@@ -20,6 +20,7 @@ export function ConfigPage() {
   const [maxTables, setMaxTables] = useState("");
   const [maxStorage, setMaxStorage] = useState("");
   const [maxSubs, setMaxSubs] = useState("");
+  const [changeLogRows, setChangeLogRows] = useState("");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState(false);
@@ -40,6 +41,7 @@ export function ConfigPage() {
         setMaxTables(String(c.hot.maxTablesPerDb));
         setMaxStorage(String(c.hot.maxStorageBytesPerDb));
         setMaxSubs(String(c.hot.maxSubsPerDb));
+        setChangeLogRows(String(c.hot.changeLogMaxRows));
       })
       .catch((e) => {
         if (!cancelled) setError(toErrorMessage(e));
@@ -62,6 +64,7 @@ export function ConfigPage() {
     const maxTablesPerDb = Number(maxTables);
     const maxStorageBytesPerDb = Number(maxStorage);
     const maxSubsPerDb = Number(maxSubs);
+    const changeLogMaxRows = Number(changeLogRows);
     if (!Number.isFinite(sessionTtlDays) || sessionTtlDays < 0) {
       setSaveError("session TTL must be a non-negative number of days");
       setSaving(false);
@@ -92,6 +95,11 @@ export function ConfigPage() {
       setSaving(false);
       return;
     }
+    if (!Number.isFinite(changeLogMaxRows) || changeLogMaxRows < 0) {
+      setSaveError("change-log retention must be a non-negative row count (0 = server default)");
+      setSaving(false);
+      return;
+    }
     try {
       const c = await client.patchConfig({
         allowedOrigins: origins
@@ -104,6 +112,7 @@ export function ConfigPage() {
         maxTablesPerDb,
         maxStorageBytesPerDb,
         maxSubsPerDb,
+        changeLogMaxRows,
       });
       setCfg(c);
       setOrigins(c.hot.allowedOrigins.join("\n"));
@@ -113,6 +122,7 @@ export function ConfigPage() {
       setMaxTables(String(c.hot.maxTablesPerDb));
       setMaxStorage(String(c.hot.maxStorageBytesPerDb));
       setMaxSubs(String(c.hot.maxSubsPerDb));
+      setChangeLogRows(String(c.hot.changeLogMaxRows));
       setSavedAt(true);
     } catch (e) {
       setSaveError(toErrorMessage(e));
@@ -207,6 +217,18 @@ export function ConfigPage() {
                 spellCheck={false}
               />
               <span className={s.hint}>0 = unlimited</span>
+            </label>
+            <label className={s.field}>
+              <span className={s.fieldLabel}>change log rows / db</span>
+              <input
+                className={s.input}
+                value={changeLogRows}
+                onChange={(e) => setChangeLogRows(e.target.value)}
+                spellCheck={false}
+              />
+              <span className={s.hint}>
+                newest-N retention for GET /changes · 0 = server default
+              </span>
             </label>
           </div>
           <div className={s.actions}>

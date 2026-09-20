@@ -1472,6 +1472,14 @@ pub async fn execute_txn(
         }
     }
 
+    // Durable change-feed stamp — INSIDE the transaction, so the documents
+    // and their change rows commit (or roll back) together. This is the
+    // mutate/scheduled/workflow choke point; the reaper/merge/migrate arms
+    // append on their own transactions (see the change-feed design spec).
+    // The tables are ensured at committer startup and db creation, so the
+    // append itself never needs DDL.
+    crate::change_log::append(&mut tx, pg_schema_name.as_str(), &write_set).await?;
+
     tx.commit().await?;
     Ok(TxnOutcome { results, write_set })
     }

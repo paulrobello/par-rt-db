@@ -908,6 +908,88 @@ public struct ClaimedSchedule: Equatable, Codable, Sendable {
     }
 }
 
+// MARK: - Change feed
+
+/// Mirrors server/src/change_log.rs::ChangeRow — one committed document
+/// change from `GET /api/db/{db}/changes`, camelCase. `doc` is the stored
+/// post-image and is ALWAYS present on the wire: JSON `null` (nil here) for
+/// `delete` and migrate-backfill ops, where the consumer re-fetches. No
+/// unknown-field rejection (the server type is serialize-only).
+public struct ChangeOp: Equatable, Codable, Sendable {
+    /// Log position; strictly increasing in commit order.
+    public var seq: Int64
+    /// Table the change landed in.
+    public var table: String
+    /// The changed document's id.
+    public var docId: String
+    /// One of `insert` / `patch` / `replace` / `delete` / `upsert`.
+    public var kind: String
+    /// Post-image, or nil when the row carries no end-state.
+    public var doc: JSONValue?
+    /// Commit time, epoch ms.
+    public var ts: Int64
+
+    public init(seq: Int64, table: String, docId: String, kind: String, doc: JSONValue?, ts: Int64) {
+        self.seq = seq
+        self.table = table
+        self.docId = docId
+        self.kind = kind
+        self.doc = doc
+        self.ts = ts
+    }
+
+    enum CodingKeys: String, CodingKey, CaseIterable {
+        case seq, table, docId, kind, doc, ts
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        seq = try container.decode(Int64.self, forKey: .seq)
+        table = try container.decode(String.self, forKey: .table)
+        docId = try container.decode(String.self, forKey: .docId)
+        kind = try container.decode(String.self, forKey: .kind)
+        doc = try container.decodeIfPresent(JSONValue.self, forKey: .doc)
+        ts = try container.decode(Int64.self, forKey: .ts)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(seq, forKey: .seq)
+        try container.encode(table, forKey: .table)
+        try container.encode(docId, forKey: .docId)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(doc, forKey: .doc) // plain Option: nil -> null
+        try container.encode(ts, forKey: .ts)
+    }
+}
+
+/// Mirrors server/src/protocol.rs::ChangeFeedResponse — one page of the
+/// durable change feed, camelCase. `nextSeq` is the last returned op's `seq`
+/// only on a full page; otherwise the log is exhausted and `nextSeq == head`.
+/// `logId` identifies the log instance so a consumer can detect a db dropped
+/// and recreated under the same name (seqs restart at 0, the id changes).
+public struct ChangeFeedResponse: Equatable, Codable, Sendable {
+    /// Ops strictly after the requested `since`, oldest first.
+    public var ops: [ChangeOp]
+    /// The cursor to pass as the next `since`.
+    public var nextSeq: Int64
+    /// The log's current end.
+    public var head: Int64
+    /// Per-log identity; a change means the cursor is meaningless — resync.
+    public var logId: String
+
+    public init(ops: [ChangeOp], nextSeq: Int64, head: Int64, logId: String) {
+        self.ops = ops
+        self.nextSeq = nextSeq
+        self.head = head
+        self.logId = logId
+    }
+
+    enum CodingKeys: String, CodingKey, CaseIterable {
+        case ops, nextSeq, head, logId
+    }
+}
+
 // MARK: - Workflows
 
 /// Mirrors server/src/protocol.rs::StepRetry — camelCase, unknown fields

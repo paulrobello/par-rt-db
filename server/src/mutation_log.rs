@@ -104,6 +104,7 @@ pub async fn cleanup_expired(pool: &PgPool, db: &str) -> Result<u64, RtDbError> 
 pub async fn run_cleanup(
     pool: PgPool,
     db: String,
+    hot: std::sync::Arc<arc_swap::ArcSwap<crate::config::HotConfig>>,
     committer_tx: tokio::sync::mpsc::Sender<crate::committer::CommitterRequest>,
 ) {
     // Re-use the table-ensure idempotently so a database created before this
@@ -115,11 +116,29 @@ pub async fn run_cleanup(
     loop {
         tokio::select! {
             _ = tokio::time::sleep(interval) => {
+                // The change-feed trim rides this loop (same lifecycle, same
+                // idle-backoff economics); the max-rows value is read live so
+                // a `PATCH /admin/config` takes effect on the next sweep.
+                let max_rows = hot.load().change_log_max_rows as i64;
+                let trimmed = match crate::change_log::trim_expired(&pool, &db, max_rows).await {
+                    Ok(n) => n,
+                    Err(err) => {
+                        if matches!(crate::db::database_exists(&pool, &db).await, Ok(false)) {
+                            tracing::info!(db = %db, "mutation_log cleanup: database removed, exiting");
+                            return;
+                        }
+                        tracing::warn!(db = %db, error = %err, "change_log trim failed");
+                        0
+                    }
+                };
                 match cleanup_expired(&pool, &db).await {
                     Ok(deleted) => {
                         // ARC-102: back off when nothing was deleted; reset when
-                        // rows were reclaimed (the db is actively deduping).
-                        interval = if deleted == 0 {
+                        // rows were reclaimed (the db is actively deduping or
+                        // trimming). Both sweeps feed the backoff — the old
+                        // shape ignored the trim, so a busy db without
+                        // idempotency keys would have trimmed only every 5 min.
+                        interval = if deleted == 0 && trimmed == 0 {
                             CLEANUP_INTERVAL_IDLE
                         } else {
                             CLEANUP_INTERVAL

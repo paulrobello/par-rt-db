@@ -23,6 +23,9 @@
  * - `UNSUPPORTED_PROTOCOL` (400) — ARC-013: the client requested a
  *   `protocolVersion` (WS `auth` frame or the `X-Rtdb-Protocol` HTTP header)
  *   newer than the server's.
+ * - `CURSOR_EXPIRED` (410) — a change-feed `since` cursor older than the
+ *   retained log or ahead of its head; the consumer must resync from
+ *   `since: 0` (`RtDbHttpClient.listChanges`).
  */
 
 export type RtDbErrorCode =
@@ -36,7 +39,8 @@ export type RtDbErrorCode =
   | "INTERNAL"
   | "RATE_LIMITED"
   | "QUOTA_EXCEEDED"
-  | "UNSUPPORTED_PROTOCOL";
+  | "UNSUPPORTED_PROTOCOL"
+  | "CURSOR_EXPIRED";
 
 /** Every {@link RtDbErrorCode}, in the order declared above. The single
  *  source of truth for "is this a known code" — {@link CODES} and the
@@ -57,6 +61,7 @@ export const ALL_ERROR_CODES: readonly RtDbErrorCode[] = [
   "RATE_LIMITED",
   "QUOTA_EXCEEDED",
   "UNSUPPORTED_PROTOCOL",
+  "CURSOR_EXPIRED",
 ];
 
 const CODES: ReadonlySet<string> = new Set<RtDbErrorCode>(ALL_ERROR_CODES);

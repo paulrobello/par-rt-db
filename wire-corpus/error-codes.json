@@ -11,6 +11,7 @@
     { "code": "RATE_LIMITED", "httpStatus": 429 },
     { "code": "CONFLICT", "httpStatus": 409 },
     { "code": "QUOTA_EXCEEDED", "httpStatus": 507 },
-    { "code": "UNSUPPORTED_PROTOCOL", "httpStatus": 400 }
+    { "code": "UNSUPPORTED_PROTOCOL", "httpStatus": 400 },
+    { "code": "CURSOR_EXPIRED", "httpStatus": 410 }
   ]
 }

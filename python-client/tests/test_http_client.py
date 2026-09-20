@@ -21,6 +21,7 @@ import httpx
 import pytest
 
 from par_rt_db import (
+    ErrorCode,
     Mutation,
     RtDbError,
     RtDbHttpClient,
@@ -1511,6 +1512,78 @@ def test_get_signed_url_passes_ttl_seconds():
     c = _client(handler)
     c.get_signed_url("f1", ttl_seconds=120)
     assert seen["ttl"] == "120"
+
+
+# --- data plane: change feed (F7) -------------------------------------------
+
+_CHANGE_FEED_PAGE: dict[str, Any] = {
+    "ops": [
+        {
+            "seq": 41,
+            "table": "items",
+            "docId": "d41",
+            "kind": "patch",
+            "doc": {"title": "rewritten"},
+            "ts": 1758300000000,
+        },
+        {"seq": 42, "table": "items", "docId": "d42", "kind": "delete", "doc": None, "ts": 1},
+    ],
+    "nextSeq": 57,
+    "head": 57,
+    "logId": "0a1b2c3d4e5f6071",
+}
+
+
+def test_changes_gets_page_with_since_only_by_default() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["params"] = dict(request.url.params)
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, json=_CHANGE_FEED_PAGE)
+
+    from par_rt_db.wire import ChangeFeedResponse
+
+    page = _client(handler).changes()
+    assert seen["method"] == "GET"
+    assert seen["path"] == f"/api/db/{DB}/changes"
+    assert seen["params"] == {"since": "0"}  # table/limit omitted when None
+    assert seen["auth"] == "Bearer machine-token"
+    assert isinstance(page, ChangeFeedResponse)
+    assert page.next_seq == 57
+    assert page.head == 57
+    assert page.log_id == "0a1b2c3d4e5f6071"
+    assert [op.seq for op in page.ops] == [41, 42]
+    assert page.ops[0].doc_id == "d41"
+    assert page.ops[0].kind == "patch"
+    assert page.ops[1].kind == "delete"
+    assert page.ops[1].doc is None
+
+
+def test_changes_passes_since_table_limit_params() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["params"] = dict(request.url.params)
+        return httpx.Response(200, json={"ops": [], "nextSeq": 9, "head": 9, "logId": "l"})
+
+    page = _client(handler).changes(40, table="items", limit=100)
+    assert seen["params"] == {"since": "40", "table": "items", "limit": "100"}
+    assert page.ops == []
+
+
+def test_changes_cursor_expired_surfaces_as_rtdb_error_410() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            410, json={"code": "CURSOR_EXPIRED", "message": "cursor predates retention"}
+        )
+
+    with pytest.raises(RtDbError) as exc:
+        _client(handler).changes(1)
+    assert exc.value.code is ErrorCode.CURSOR_EXPIRED
+    assert exc.value.status_code == 410
 
 
 # --- data plane: workflows (FM-29) ------------------------------------------

@@ -373,6 +373,47 @@ pub struct PresenceMember {
     pub state: serde_json::Value,
 }
 
+/// One committed change from the durable per-db change feed
+/// (`GET /api/db/{db}/changes`). Mirrors `server/src/change_log::ChangeRow`
+/// byte-for-byte (camelCase). `doc` is the written document's end-of-txn
+/// state; `None` means no visible end state (a delete, a txn-local
+/// insert+delete, or a payload-less backfill op) — the consumer re-fetches
+/// the id, which resolves soft and hard deletes identically.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeOp {
+    /// The change's position in the db's log (contiguous, gap-free).
+    pub seq: i64,
+    /// The written document's table.
+    pub table: String,
+    /// The written document's id.
+    pub doc_id: String,
+    /// What the transaction did last: `insert|patch|replace|delete|upsert`.
+    pub kind: String,
+    /// End-of-txn post-image; `None` = no visible end state.
+    pub doc: Option<serde_json::Value>,
+    /// Commit wall-clock (epoch ms).
+    pub ts: i64,
+}
+
+/// One page of the change feed. `next_seq` is the cursor to resume from —
+/// the last returned op's seq ONLY on a full page, otherwise the log's end
+/// (`head`), so a filtered/short page still advances the consumer. `log_id`
+/// is the log's identity: it changes when a db is dropped and recreated under
+/// the same name, which seqs alone cannot reveal (they restart at 0).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeFeedResponse {
+    /// Ops strictly after the requested `since`, oldest first.
+    pub ops: Vec<ChangeOp>,
+    /// Cursor for the next page.
+    pub next_seq: i64,
+    /// The log's current end.
+    pub head: i64,
+    /// The log's identity (change ⇒ the db was replaced; resync).
+    pub log_id: String,
+}
+
 /// `ScheduleWhen`/`ScheduleKind` are now `par_rt_db_core::mutation` types
 /// (ARC-004 follow-up), re-exported here at their historical path so every
 /// existing `crate::wire::{ScheduleWhen, ScheduleKind}` call site keeps

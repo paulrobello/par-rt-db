@@ -529,7 +529,8 @@ struct AdminClientTests {
             "adminKeyConfigured":true,"githubConfigured":false,"googleConfigured":false,
             "gitlabConfigured":false,"oidcConfigured":false,
             "hot":{"allowedOrigins":[],"sessionTtlDays":7,"maxFileSize":1000,
-            "idempotencyTtlMs":10,"maxTablesPerDb":10,"maxStorageBytesPerDb":0,"maxSubsPerDb":0},
+            "idempotencyTtlMs":10,"maxTablesPerDb":10,"maxStorageBytesPerDb":0,"maxSubsPerDb":0,
+            "changeLogMaxRows":100000},
             "version":"1.0.0","gitCommit":"abc","admins":[]}
             """
             return (200, Data(config.utf8))

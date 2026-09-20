@@ -89,6 +89,18 @@ pub(in crate::committer) async fn handle_migrate(
     .bind(schema_json)
     .execute(&mut *tx)
     .await?;
+    // Change-feed stamp, INSIDE the migration transaction: the docs this
+    // migration rewrote (where the directive recorded ids) are observable like
+    // any write. `doc_values` is empty — migrate carries no per-doc post-images
+    // — so these rows land with `doc = NULL` and the consumer re-fetches the
+    // id. Fine-grained ids are best-effort (some directives rewrite without
+    // recording them); operators resync consumers after a migrate.
+    let write_set = WriteSet {
+        tables: fx.touched.clone(),
+        ops: fx.ops.clone(),
+        ..Default::default()
+    };
+    crate::change_log::append(&mut tx, &schema_name, &write_set).await?;
     tx.commit().await?;
     ctx.schemas.put(&ctx.db, derived.clone()).await;
 
@@ -108,11 +120,6 @@ pub(in crate::committer) async fn handle_migrate(
     // for a migration (some ops may touch docs whose ids weren't recorded at
     // the fine-grained (table, id) level — re-running is always sound, never
     // under-approximates). `owner = None`, `source = "migrate"`.
-    let write_set = WriteSet {
-        tables: fx.touched,
-        ops: fx.ops.clone(),
-        ..Default::default()
-    };
     publish_taps(ctx, &derived, &write_set, None, "migrate", true, true).await;
 
     Ok(crate::migrate::MigrateResult {

@@ -12,8 +12,8 @@
 
 use par_rt_db_client::Query;
 use par_rt_db_client::wire::{
-    AuthedUser, ClientMessage, ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen,
-    ServerMessage, UserKind, WorkflowSpec,
+    AuthedUser, ChangeFeedResponse, ClientMessage, ScheduleInfo, ScheduleKind, ScheduleStatus,
+    ScheduleWhen, ServerMessage, UserKind, WorkflowSpec,
 };
 use serde_json::{Value, json};
 
@@ -93,6 +93,14 @@ fn schedule_infos_round_trip() {
     let corpus = load_corpus();
     for (i, entry) in section(&corpus, "schedule_infos").iter().enumerate() {
         round_trip::<ScheduleInfo>("schedule_infos", i, entry);
+    }
+}
+
+#[test]
+fn change_feed_responses_round_trip() {
+    let corpus = load_corpus();
+    for (i, entry) in section(&corpus, "change_feed_responses").iter().enumerate() {
+        round_trip::<ChangeFeedResponse>("change_feed_responses", i, entry);
     }
 }
 
@@ -494,7 +502,7 @@ fn protocol_constants_max_steps_matches_corpus() {
 fn error_codes_known_to_rust_client() {
     use par_rt_db_client::ErrorCode;
 
-    const ALL: [ErrorCode; 11] = [
+    const ALL: [ErrorCode; 12] = [
         ErrorCode::Unauthorized,
         ErrorCode::Forbidden,
         ErrorCode::NotFound,
@@ -506,6 +514,7 @@ fn error_codes_known_to_rust_client() {
         ErrorCode::RateLimited,
         ErrorCode::QuotaExceeded,
         ErrorCode::UnsupportedProtocol,
+        ErrorCode::CursorExpired,
     ];
 
     let corpus: Value = serde_json::from_str(include_str!("../../wire-corpus/error-codes.json"))

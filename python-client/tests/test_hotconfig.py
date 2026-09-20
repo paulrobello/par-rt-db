@@ -45,3 +45,42 @@ def test_hot_config_patch_omits_unset_quota_fields():
 def test_quota_exceeded_code_registered():
     assert ErrorCode.QUOTA_EXCEEDED.value == "QUOTA_EXCEEDED"
     assert _STATUS[ErrorCode.QUOTA_EXCEEDED] == 507
+
+
+# --- F7 change feed: changeLogMaxRows + CURSOR_EXPIRED ----------------------
+
+
+def test_hot_config_change_log_max_rows_round_trip():
+    hot = HotConfig.model_validate(
+        {
+            "allowedOrigins": [],
+            "sessionTtlDays": 30,
+            "maxFileSize": 100,
+            "idempotencyTtlMs": 300000,
+            "changeLogMaxRows": 5000,
+        }
+    )
+    assert hot.change_log_max_rows == 5000
+    assert hot.model_dump(by_alias=True)["changeLogMaxRows"] == 5000
+
+
+def test_hot_config_change_log_max_rows_defaults_when_absent():
+    hot = HotConfig.model_validate(
+        {
+            "allowedOrigins": [],
+            "sessionTtlDays": 30,
+            "maxFileSize": 100,
+            "idempotencyTtlMs": 300000,
+        }
+    )
+    assert hot.change_log_max_rows == 100000
+
+
+def test_hot_config_patch_change_log_max_rows_only():
+    patch = HotConfigPatch(change_log_max_rows=250)
+    assert patch.model_dump(exclude_none=True, by_alias=True) == {"changeLogMaxRows": 250}
+
+
+def test_cursor_expired_code_registered():
+    assert ErrorCode.CURSOR_EXPIRED.value == "CURSOR_EXPIRED"
+    assert _STATUS[ErrorCode.CURSOR_EXPIRED] == 410

@@ -127,6 +127,7 @@ type HotConfig struct {
 	SessionTTLDays       int64    `json:"sessionTtlDays"`
 	MaxFileSize          int64    `json:"maxFileSize"`
 	IdempotencyTTLMs     int64    `json:"idempotencyTtlMs"`
+	ChangeLogMaxRows     int64    `json:"changeLogMaxRows"`
 	MaxTablesPerDB       int64    `json:"maxTablesPerDb"`
 	MaxStorageBytesPerDB int64    `json:"maxStorageBytesPerDb"`
 	MaxSubsPerDB         int64    `json:"maxSubsPerDb"`

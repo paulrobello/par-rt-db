@@ -151,6 +151,7 @@ const (
 	CodeConflict            = errors.CodeConflict
 	CodeQuotaExceeded       = errors.CodeQuotaExceeded
 	CodeUnsupportedProtocol = errors.CodeUnsupportedProtocol
+	CodeCursorExpired       = errors.CodeCursorExpired
 )
 
 // HTTPStatus maps a code to its canonical status.

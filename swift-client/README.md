@@ -521,7 +521,7 @@ Published reference: https://paulrobello.github.io/par-rt-db/swift/
 | Query DSL — every terminal incl. `search`/`vectorSearch`/`hybridSearch`/`paginate`/`aggregate`/`distinct` | ✅ |
 | Mutation DSL — all 14 step ops, recursive step-cap enforcement | ✅ |
 | Schema DSL — 15 field types, btree/search/vector/unique/partial indexes, `ownerField`/`collaboratorsField`/`authorize`, `ttl`, `updatedAtField`, `autoIncrementField`, `defaults`, `computed`, `softDelete`, `onDelete` | ✅ |
-| HTTP client — query/query-batch/mutate (+ idempotency key, retry helper), schedule ops, workflow ops, full storage surface, `pushSchema`/`previewSchema`, `authMe` | ✅ |
+| HTTP client — query/query-batch/mutate (+ idempotency key, retry helper), schedule ops, workflow ops, change feed (`changes(since:table:limit:)`), full storage surface, `pushSchema`/`previewSchema`, `authMe` | ✅ |
 | WS client — auth/reconnect/heartbeat, shared subscriptions with replay, mutate-over-WS, schedule + workflow ops | ✅ |
 | Presence (ENH-015) — `presence(room:state:)` / `updatePresence(room:state:ttlMs:)` / `leavePresence(room:)`, `PresenceSnapshot` fan-out, reconnect replay of joined rooms | ✅ |
 | Optimistic updates — `RtDbClientConfig.optimisticUpdates` (default off), overlay on mutate, reconcile on `queryUpdate`, rollback on `mutateErr`/reject/close | ✅ |

@@ -38,6 +38,14 @@ describe("RtDbError", () => {
     expect(e.retryAfter).toBe(42);
   });
 
+  it("recognizes a CURSOR_EXPIRED envelope (change-feed resync signal)", () => {
+    const raw: unknown = { code: "CURSOR_EXPIRED", message: "cursor predates retention" };
+    expect(RtDbError.isEnvelope(raw)).toBe(true);
+    const e = RtDbError.fromEnvelope(raw as { code: "CURSOR_EXPIRED"; message: string }, 410);
+    expect(e.code).toBe("CURSOR_EXPIRED");
+    expect(e.status).toBe(410);
+  });
+
   it("retryAfter is optional on the envelope", () => {
     const raw: unknown = { code: "NOT_FOUND", message: "x" };
     const e = RtDbError.fromEnvelope(raw as { code: "NOT_FOUND"; message: string });

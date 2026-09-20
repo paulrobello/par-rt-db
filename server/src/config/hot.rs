@@ -39,6 +39,11 @@ pub struct HotConfig {
     pub max_tables_per_db: usize, // RTDB_MAX_TABLES_PER_DB,       default 0
     pub max_storage_bytes_per_db: u64, // RTDB_MAX_STORAGE_BYTES_PER_DB, default 0
     pub max_subs_per_db: usize,  // RTDB_MAX_SUBS_PER_DB,        default 0
+    /// Durable change-feed retention per db (rows kept), the newest first.
+    /// See `change_log` — 0 keeps the default; values > 0 clamp to
+    /// `change_log::MIN_MAX_ROWS` so a misconfigured floor can't expire every
+    /// cursor immediately.
+    pub change_log_max_rows: usize, // RTDB_CHANGE_LOG_MAX_ROWS,    default 100 000
 }
 
 impl HotConfig {
@@ -91,6 +96,17 @@ impl HotConfig {
             Ok(v) => v.parse::<usize>().unwrap_or(0),
             Err(_) => 0,
         };
+        let change_log_max_rows = match std::env::var("RTDB_CHANGE_LOG_MAX_ROWS") {
+            Ok(v) => v
+                .parse::<usize>()
+                .unwrap_or(crate::change_log::DEFAULT_MAX_ROWS),
+            Err(_) => crate::change_log::DEFAULT_MAX_ROWS,
+        };
+        let change_log_max_rows = if change_log_max_rows == 0 {
+            crate::change_log::DEFAULT_MAX_ROWS
+        } else {
+            change_log_max_rows.max(crate::change_log::MIN_MAX_ROWS)
+        };
         Self {
             allowed_origins,
             session_ttl_days,
@@ -99,6 +115,7 @@ impl HotConfig {
             max_tables_per_db,
             max_storage_bytes_per_db,
             max_subs_per_db,
+            change_log_max_rows,
         }
     }
 
@@ -196,6 +213,8 @@ struct PersistedHotConfig {
     max_storage_bytes_per_db: Option<u64>,
     #[serde(default)]
     max_subs_per_db: Option<usize>,
+    #[serde(default)]
+    change_log_max_rows: Option<usize>,
 }
 
 impl PersistedHotConfig {
@@ -215,6 +234,9 @@ impl PersistedHotConfig {
                 .max_storage_bytes_per_db
                 .unwrap_or(defaults.max_storage_bytes_per_db),
             max_subs_per_db: self.max_subs_per_db.unwrap_or(defaults.max_subs_per_db),
+            change_log_max_rows: self
+                .change_log_max_rows
+                .unwrap_or(defaults.change_log_max_rows),
         }
     }
 }
@@ -281,6 +303,7 @@ mod tests {
             max_tables_per_db: 0,
             max_storage_bytes_per_db: 0,
             max_subs_per_db: 0,
+            change_log_max_rows: crate::change_log::DEFAULT_MAX_ROWS,
         }
     }
 
@@ -427,6 +450,7 @@ mod tests {
             max_tables_per_db: 0,
             max_storage_bytes_per_db: 0,
             max_subs_per_db: 0,
+            change_log_max_rows: crate::change_log::DEFAULT_MAX_ROWS,
         };
         assert!(hot.origins_valid());
         hot.allowed_origins.push("https://c.com\"".into());

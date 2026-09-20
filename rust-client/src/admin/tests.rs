@@ -761,7 +761,8 @@ async fn get_config_returns_response() {
                 "idempotencyTtlMs": 300000,
                 "maxTablesPerDb": 0,
                 "maxStorageBytesPerDb": 0,
-                "maxSubsPerDb": 0
+                "maxSubsPerDb": 0,
+                "changeLogMaxRows": 100000
             },
             "version": "0.1.0",
             "gitCommit": "abc1234",
@@ -817,7 +818,8 @@ async fn patch_config_patches_and_returns_config() {
                 "idempotencyTtlMs": 300000,
                 "maxTablesPerDb": 0,
                 "maxStorageBytesPerDb": 0,
-                "maxSubsPerDb": 0
+                "maxSubsPerDb": 0,
+                "changeLogMaxRows": 100000
             },
             "version": "",
             "gitCommit": "",
@@ -833,6 +835,7 @@ async fn patch_config_patches_and_returns_config() {
         max_tables_per_db: None,
         max_storage_bytes_per_db: None,
         max_subs_per_db: None,
+        change_log_max_rows: None,
     };
     let cfg = client.patch_config(&patch).await.unwrap();
     assert_eq!(

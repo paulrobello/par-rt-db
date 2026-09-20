@@ -94,6 +94,7 @@ from .http_client import (
 from .wire import (
     PROTOCOL_VERSION,
     BatchQueryOutcome,
+    ChangeFeedResponse,
     ClaimedSchedule,
     ScheduleInfo,
     ScheduleWhen,
@@ -469,6 +470,29 @@ class RtDbAsyncHttpClient:
             "POST", "/api/query-batch", json={"db": self._db, "queries": wire_queries}
         )
         return _BATCH_ADAPTER.validate_python(resp.json()["results"])
+
+    # --- data plane: change feed (GET /api/db/{db}/changes) ---
+
+    async def changes(
+        self,
+        since: int = 0,
+        *,
+        table: str | None = None,
+        limit: int | None = None,
+    ) -> ChangeFeedResponse:
+        """``GET /api/db/{db}/changes?since=&table=&limit=`` → one page of
+        committed document ops with ``seq > since``, oldest first (async).
+
+        See :meth:`RtDbHttpClient.changes` for the cursor semantics
+        (``next_seq``/``head``, ``CURSOR_EXPIRED``).
+        """
+        params: dict[str, Any] = {"since": since}
+        if table is not None:
+            params["table"] = table
+        if limit is not None:
+            params["limit"] = limit
+        resp = await self._send("GET", f"/api/db/{self._db}/changes", params=params)
+        return ChangeFeedResponse.model_validate(resp.json())
 
     # --- storage (machine token; HTTP-only, bypasses the committer) ---
 

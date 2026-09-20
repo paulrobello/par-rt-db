@@ -25,6 +25,7 @@
 * [Pagination](#pagination)
 * [Scheduling](#scheduling)
 * [Durable workflows](#durable-workflows)
+* [Change feed](#change-feed)
 * [Computed fields](#computed-fields)
 * [Realtime presence](#realtime-presence)
 * [Make targets](#make-targets)
@@ -251,6 +252,8 @@ since browsers cannot set headers on a WS handshake.
 | `POST /api/workflows/list` | Bearer token | Lists workflow runs for a database (`WorkflowInfo[]`, newest first; optional `status` filter). |
 | `POST /api/workflows/{id}/cancel` | Bearer token | Cancels a non-terminal run (`{ok:false}` = unknown/terminal — a no-op, not an error). |
 | `POST /api/workflows/{id}/signal` | Bearer token | Delivers a named signal to a `waiting` run (`{db, name, payload?}` → `{"delivered": true}`; releases an `awaitSignal` step). 404 unknown id; 409 not waiting or name mismatch; payload capped at 64 KiB serialized. |
+| `GET /api/db/{db}/changes` | Bearer token | **Durable change feed** — machine tokens only. `?since=<seq>&table=<name>&limit=<n>` returns every committed document op strictly after the cursor (oldest first, post-images included, `doc:null` on deletes) plus `{nextSeq, head, logId}`. An impossible cursor is `410 CURSOR_EXPIRED` (resync from 0) — never silent data loss. See [Change feed](#change-feed). |
+| `GET /api/db/{db}/schema` | Bearer token | The database's pushed `SchemaDef` — the machine-token twin of the admin schema read-back (serves tooling holding only a data-plane credential, e.g. `rtdb import --dry-run`). |
 
 ### File storage (HTTP-only, bypasses the committer)
 
@@ -1005,6 +1008,60 @@ await client.signalWorkflow(id, "approve", { approvedBy: "u1" }); // releases th
 await client.cancelWorkflow(id); // false for a missing/terminal run
 const runs = await client.listWorkflows("running"); // newest first
 ```
+
+## Change feed
+
+HTTP-only clients (machines, agents, cron jobs) can stay current without a
+WebSocket by polling the durable per-db change feed. Every committed document
+write — interactive mutations, scheduled txns, workflow steps, TTL expiry,
+anon→real merge, and admin snapshot imports — stamps one row per written
+document inside the same Postgres transaction as the write, under a gap-free
+per-db sequence.
+
+```bash
+# First poll (or full resync): the oldest retained ops.
+curl -s "http://localhost:8300/api/db/myapp/changes?since=0" \
+  -H "Authorization: Bearer $TOKEN"
+
+# Subsequent polls resume from the last acknowledged cursor.
+curl -s "http://localhost:8300/api/db/myapp/changes?since=$NEXT_SEQ&limit=500" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{
+  "ops": [
+    { "seq": 41, "table": "tasks", "docId": "d41", "kind": "patch",
+      "doc": { "title": "Buy milk", "done": true }, "ts": 1758300000000 },
+    { "seq": 42, "table": "tasks", "docId": "d42", "kind": "delete", "doc": null,
+      "ts": 1758300000001 }
+  ],
+  "nextSeq": 42, "head": 57, "logId": "0a1b2c3d4e5f6071"
+}
+```
+
+The consumer contract:
+
+- **Exactly once per cursor position.** Re-reading a cursor returns the same
+  page (idempotent retries); every op has exactly one seq in commit order.
+  Loop `while nextSeq < head`, then poll again later.
+- **`nextSeq` is the last returned seq only on a full page**; a short page
+  means the log is exhausted up to `head` and `nextSeq = head` — a filtered
+  (`table=`) page therefore still advances the consumer.
+- **`doc: null`** means no visible end state (delete, txn-local
+  insert+delete, or a payload-less migrate backfill): re-fetch the id; a 404
+  (or an invisible soft-deleted row) resolves it as deleted.
+- **`logId`** changes if a database was dropped and recreated under the same
+  name — seqs restart at 0 and the old cursor is meaningless; resync.
+- **Expired cursors are typed**: a cursor older than the retention window
+  (newest `RTDB_CHANGE_LOG_MAX_ROWS` rows kept, default 100 000, PATCHable
+  via `/admin/config` `changeLogMaxRows`) or ahead of the log returns
+  `410 CURSOR_EXPIRED` — an empty success would be silent data loss.
+- **Auth**: machine tokens only, filtered by the token's table allowlist the
+  same way every other executor surface is. Read-only tokens are fine.
+
+All five client SDKs expose the feed (`listChanges` in TS, `changes()` in
+Rust/Python/Swift/Go).
 
 ## Computed fields
 

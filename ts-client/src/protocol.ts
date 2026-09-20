@@ -191,6 +191,43 @@ export interface ClaimedSchedule {
   leaseDeadlineMs: number;
 }
 
+// ---- Change feed wire types --------------------------------------------------
+//
+// Mirror server `change_log::ChangeRow` / `protocol::ChangeFeedResponse`
+// byte-for-byte (camelCase). See the change-feed design spec
+// (`docs/superpowers/specs/2026-09-19-change-feed-design.md`).
+
+/** The net kind of one `(table, docId)` touch within a committed transaction —
+ * the LAST op applied to that id (lowercase wire form, same set as `OpKind`). */
+export type ChangeOpKind = "insert" | "patch" | "replace" | "delete" | "upsert";
+
+/** One committed document op from `GET /api/db/{db}/changes`. `doc` is the
+ * id's end-of-transaction post-image, or `null` when the id has no visible
+ * end state (a delete — hard or soft —, a txn-local insert+delete, or a
+ * payload-less migrate backfill); the consumer re-fetches the id and treats a
+ * miss as a deletion. `ts` is the commit wall clock, epoch ms. */
+export interface ChangeOp {
+  seq: number;
+  table: string;
+  docId: string;
+  kind: ChangeOpKind;
+  doc: Record<string, unknown> | null;
+  ts: number;
+}
+
+/** One page of the resumable per-db change feed. `nextSeq` is the cursor to
+ * resume from: the last returned op's `seq` only when the page is full,
+ * otherwise `head` (the log's current end) — so `while (nextSeq < head)`
+ * stays live for filtered and tail pages alike. `logId` identifies the log
+ * itself; a change means the db was dropped and recreated under the same
+ * name (seqs restarted at 0) and the consumer must resync from `since: 0`. */
+export interface ChangeFeedResponse {
+  ops: ChangeOp[];
+  nextSeq: number;
+  head: number;
+  logId: string;
+}
+
 // ---- Workflow wire types (FM-29) --------------------------------------------
 //
 // Mirror server `protocol`'s workflow family byte-for-byte (camelCase,

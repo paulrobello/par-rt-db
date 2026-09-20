@@ -19,6 +19,7 @@ pub mod admin;
 pub mod audit;
 pub mod auth;
 pub mod backup;
+pub mod change_log;
 pub mod committer;
 pub mod config;
 pub mod db;

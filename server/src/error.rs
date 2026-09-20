@@ -25,6 +25,11 @@ pub enum ErrorCode {
     /// the HTTP one-shot API's `X-Rtdb-Protocol` header) greater than this
     /// build's `protocol::PROTOCOL_VERSION`. Wire code `UNSUPPORTED_PROTOCOL`.
     UnsupportedProtocol,
+    /// Change feed: the caller's cursor cannot be served — older than the
+    /// retention window, or ahead of the log (wrong/rewound database). Wire
+    /// code `CURSOR_EXPIRED`, HTTP 410: resync from `since = 0`; an empty
+    /// success would be silent data loss.
+    CursorExpired,
 }
 
 /// Optional `Retry-After` hint, in seconds, attached to a `RateLimited` error.
@@ -127,6 +132,7 @@ impl RtDbError {
             ErrorCode::Conflict => StatusCode::CONFLICT,
             ErrorCode::QuotaExceeded => StatusCode::INSUFFICIENT_STORAGE,
             ErrorCode::UnsupportedProtocol => StatusCode::BAD_REQUEST,
+            ErrorCode::CursorExpired => StatusCode::GONE,
         }
     }
 }
@@ -280,7 +286,7 @@ mod tests {
     /// variant present in the enum but missing from `ALL` or from
     /// `wire-corpus/error-codes.json`.
     fn generate_error_code_table() -> Vec<(&'static str, u16)> {
-        const ALL: [ErrorCode; 11] = [
+        const ALL: [ErrorCode; 12] = [
             ErrorCode::Unauthorized,
             ErrorCode::Forbidden,
             ErrorCode::NotFound,
@@ -292,6 +298,7 @@ mod tests {
             ErrorCode::Conflict,
             ErrorCode::QuotaExceeded,
             ErrorCode::UnsupportedProtocol,
+            ErrorCode::CursorExpired,
         ];
         fn wire_str(code: ErrorCode) -> &'static str {
             match code {
@@ -306,6 +313,7 @@ mod tests {
                 ErrorCode::Conflict => "CONFLICT",
                 ErrorCode::QuotaExceeded => "QUOTA_EXCEEDED",
                 ErrorCode::UnsupportedProtocol => "UNSUPPORTED_PROTOCOL",
+                ErrorCode::CursorExpired => "CURSOR_EXPIRED",
             }
         }
         ALL.iter()

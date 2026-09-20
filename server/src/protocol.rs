@@ -355,6 +355,23 @@ pub enum OutcomeStatus {
     Failed,
 }
 
+/// One page of the durable per-db change feed (`GET /api/db/{db}/changes`).
+/// `ops` carries rows strictly after the request's `since` cursor, oldest
+/// first; `nextSeq` is the cursor to resume from — the last returned op's seq
+/// ONLY on a full page, otherwise the log's end (a short page means the log
+/// is exhausted, and `nextSeq = since` would livock a filtered consumer).
+/// `head` is the log's current end and `logId` the log's identity, so a
+/// consumer can detect a db dropped and recreated under the same name (seqs
+/// restart at 0; the logId does not match). See the change-feed design spec.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeFeedResponse {
+    pub ops: Vec<crate::change_log::ChangeRow>,
+    pub next_seq: i64,
+    pub head: i64,
+    pub log_id: String,
+}
+
 /// List/get projection of one run (FM-29).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

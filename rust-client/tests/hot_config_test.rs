@@ -12,7 +12,8 @@ fn hot_config_round_trips_quota_fields() {
         "idempotencyTtlMs": 300000,
         "maxTablesPerDb": 10,
         "maxStorageBytesPerDb": 1048576,
-        "maxSubsPerDb": 50
+        "maxSubsPerDb": 50,
+        "changeLogMaxRows": 100_000
     }))
     .expect("HotConfig with quota fields decodes");
     assert_eq!(hot.max_tables_per_db, 10);
@@ -28,6 +29,7 @@ fn hot_config_patch_omits_unset_quota_fields() {
     };
     let v = serde_json::to_value(&patch).unwrap();
     assert_eq!(v["maxSubsPerDb"], 5);
+    assert!(v.get("changeLogMaxRows").is_none());
     assert!(v.get("maxTablesPerDb").is_none());
     assert!(v.get("maxStorageBytesPerDb").is_none());
 }

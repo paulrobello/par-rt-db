@@ -120,6 +120,7 @@ from .schema import SchemaDef
 from .wire import (
     PROTOCOL_VERSION,
     BatchQueryOutcome,
+    ChangeFeedResponse,
     ClaimedSchedule,
     ScheduleInfo,
     ScheduleWhen,
@@ -575,6 +576,35 @@ class RtDbHttpClient:
             "POST", "/api/query-batch", json={"db": self._db, "queries": wire_queries}
         )
         return _BATCH_ADAPTER.validate_python(resp.json()["results"])
+
+    # --- data plane: change feed (GET /api/db/{db}/changes) ---
+
+    def changes(
+        self,
+        since: int = 0,
+        *,
+        table: str | None = None,
+        limit: int | None = None,
+    ) -> ChangeFeedResponse:
+        """``GET /api/db/{db}/changes?since=&table=&limit=`` → one page of
+        committed document ops with ``seq > since``, oldest first.
+
+        Machine-token only (a user session gets ``FORBIDDEN``). Advance
+        ``since`` to ``next_seq`` after processing a page and loop while
+        ``next_seq < head``. ``table`` filters to one table (the cursor stays
+        global); ``limit`` defaults to 500 server-side, clamped to 1000.
+
+        Raises:
+            RtDbError: ``CURSOR_EXPIRED`` (410) when ``since`` predates the
+                retained log or is ahead of ``head``.
+        """
+        params: dict[str, Any] = {"since": since}
+        if table is not None:
+            params["table"] = table
+        if limit is not None:
+            params["limit"] = limit
+        resp = self._send("GET", f"/api/db/{self._db}/changes", params=params)
+        return ChangeFeedResponse.model_validate(resp.json())
 
     # --- storage (machine token; HTTP-only, bypasses the committer) ---
 

@@ -871,6 +871,7 @@ async fn hot_config_round_trips_through_rtdb_config() -> anyhow::Result<()> {
         max_tables_per_db: 0,
         max_storage_bytes_per_db: 0,
         max_subs_per_db: 0,
+        change_log_max_rows: rtdb_server::change_log::DEFAULT_MAX_ROWS,
     };
     rtdb_server::config::save_hot(&state.pool, &hot).await?;
     let loaded = rtdb_server::config::load_hot(&state.pool, &crate::common::test_hot())
@@ -1348,6 +1349,7 @@ async fn db_stats_reports_quota_and_usage() -> anyhow::Result<()> {
             max_tables_per_db: 9,
             max_storage_bytes_per_db: 1000,
             max_subs_per_db: 5,
+            change_log_max_rows: rtdb_server::change_log::DEFAULT_MAX_ROWS,
             ..crate::common::test_hot()
         }));
     let db = crate::common::fresh_db(&state).await;

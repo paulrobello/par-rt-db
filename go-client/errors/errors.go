@@ -2,11 +2,11 @@
 package errors
 
 // Mirrors server/src/error.rs::ErrorCode and the canonical {code,
-// httpStatus} table in wire-corpus/error-codes.json. Eleven codes, closed
+// httpStatus} table in wire-corpus/error-codes.json. Twelve codes, closed
 // domain; the fixture is regenerated from the server enum and this package
 // must match it exactly (pinned by TestErrorCodesCorpus in wire/).
 
-// ErrorCode is one of the eleven wire error codes.
+// ErrorCode is one of the twelve wire error codes.
 type ErrorCode string
 
 const (
@@ -21,6 +21,7 @@ const (
 	CodeConflict            ErrorCode = "CONFLICT"
 	CodeQuotaExceeded       ErrorCode = "QUOTA_EXCEEDED"
 	CodeUnsupportedProtocol ErrorCode = "UNSUPPORTED_PROTOCOL"
+	CodeCursorExpired       ErrorCode = "CURSOR_EXPIRED"
 )
 
 // httpStatus mirrors wire-corpus/error-codes.json's {code, httpStatus}
@@ -37,6 +38,7 @@ var httpStatus = map[ErrorCode]int{
 	CodeConflict:            409,
 	CodeQuotaExceeded:       507,
 	CodeUnsupportedProtocol: 400,
+	CodeCursorExpired:       410,
 }
 
 // HTTPStatus maps a code to its canonical HTTP status.
@@ -61,6 +63,7 @@ func AllCodes() []ErrorCode {
 		CodeConflict,
 		CodeQuotaExceeded,
 		CodeUnsupportedProtocol,
+		CodeCursorExpired,
 	}
 }
 

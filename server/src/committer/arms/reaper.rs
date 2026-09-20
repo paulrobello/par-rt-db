@@ -100,6 +100,12 @@ pub(in crate::committer) async fn handle_reaper(ctx: &CommitterCtx) -> Result<()
             }
             continue;
         }
+        // Change-feed contract: the batch delete and its change-log rows
+        // commit together — a committed expiry is observable, a rolled-back
+        // one leaves nothing behind.
+        let Ok(mut tx) = ctx.pool.begin().await else {
+            continue;
+        };
         let rows: Vec<(String,)> = match sqlx::query_as(&format!(
             "DELETE FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE id IN (
                  SELECT id FROM \"{pg_schema_name}\".\"{table_ident}\"
@@ -109,21 +115,21 @@ pub(in crate::committer) async fn handle_reaper(ctx: &CommitterCtx) -> Result<()
         ))
         .bind(now)
         .bind(ctx.ttl_batch)
-        .fetch_all(&ctx.pool)
+        .fetch_all(&mut *tx)
         .await
         {
             Ok(rows) => rows,
             Err(e) => {
                 // A dropped db removes the schema mid-sweep; treat as a no-op
-                // exit like the scheduler/cleanup tasks do.
+                // exit like the scheduler/cleanup tasks do. The dropped tx
+                // rolls the whole batch back atomically.
                 if matches!(
                     crate::db::database_exists(&ctx.pool, &ctx.db).await,
                     Ok(false)
                 ) {
                     return Ok(());
                 }
-                tracing::warn!(
-                    db = %ctx.db, table = %table_name, error = %e,
+                tracing::warn!(db = %ctx.db, table = %table_name, error = %e,
                     "ttl reaper delete failed"
                 );
                 continue;
@@ -132,9 +138,25 @@ pub(in crate::committer) async fn handle_reaper(ctx: &CommitterCtx) -> Result<()
         if rows.is_empty() {
             continue;
         }
-        for (id,) in rows {
-            write_set.touch(table_name, &id, OpKind::Delete);
+        let mut batch_ws = WriteSet::default();
+        for (id,) in &rows {
+            batch_ws.touch(table_name, id, OpKind::Delete);
         }
+        if let Err(e) = crate::change_log::append(&mut tx, &pg_schema_name, &batch_ws).await {
+            tracing::warn!(db = %ctx.db, table = %table_name, error = %e,
+                "ttl reaper change-log append failed; retrying next sweep"
+            );
+            continue;
+        }
+        if let Err(e) = tx.commit().await {
+            tracing::warn!(db = %ctx.db, table = %table_name, error = %e,
+                "ttl reaper batch commit failed; retrying next sweep"
+            );
+            continue;
+        }
+        write_set.tables.extend(batch_ws.tables);
+        write_set.docs.extend(batch_ws.docs);
+        write_set.ops.append(&mut batch_ws.ops);
     }
     if write_set.ops.is_empty() {
         return Ok(());

@@ -299,6 +299,10 @@ export interface HotConfig {
   maxTablesPerDb: number;
   maxStorageBytesPerDb: number;
   maxSubsPerDb: number;
+  /** Change-feed retention: the newest N `changes` rows kept per db (server
+   * default 100000; a patch value `> 0` clamps to `>= 1000`, `0` restores
+   * the default). */
+  changeLogMaxRows: number;
 }
 /**
  * The full configuration profile response returned by the server.
@@ -331,6 +335,9 @@ export interface HotConfigPatch {
   maxTablesPerDb?: number;
   maxStorageBytesPerDb?: number;
   maxSubsPerDb?: number;
+  /** Change-feed retention rows; `0` restores the server default, `> 0`
+   * clamps to `>= 1000`. Omit to leave unchanged. */
+  changeLogMaxRows?: number;
 }
 /**
  * Union of valid operation event kinds recorded by the mutation/change log.

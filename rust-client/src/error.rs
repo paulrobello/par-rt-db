@@ -36,6 +36,10 @@ pub enum ErrorCode {
     /// Mirrors server `error::ErrorCode::UnsupportedProtocol`. Serialized
     /// `"UNSUPPORTED_PROTOCOL"`.
     UnsupportedProtocol,
+    /// Change feed: the caller's cursor cannot be served — older than the
+    /// retention window, or ahead of the log (HTTP 410). Mirrors server
+    /// `error::ErrorCode::CursorExpired`. Serialized `"CURSOR_EXPIRED"`.
+    CursorExpired,
 }
 
 /// Raw `{code, message, retryAfter?}` as it appears on the wire (HTTP body /
