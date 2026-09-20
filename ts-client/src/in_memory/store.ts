@@ -222,6 +222,7 @@ interface ScheduledJob {
   txn: TransactionJson;
   dueAt: number;
   cron?: string;
+  tz?: string;
   everyMs?: number;
   status: ScheduleStatus;
   createdAt: number;
@@ -1379,6 +1380,7 @@ export class InMemoryRtDbClient {
     };
     if (when.type === "cron") {
       job.cron = when.expr;
+      if (when.tz !== undefined) job.tz = when.tz;
     }
     if (when.type === "interval") {
       job.everyMs = when.everyMs;
@@ -1921,6 +1923,9 @@ export class InMemoryRtDbClient {
     }
     if (job.cron !== undefined) {
       info.cron = job.cron;
+    }
+    if (job.tz !== undefined) {
+      info.tz = job.tz;
     }
     if (job.everyMs !== undefined) {
       info.everyMs = job.everyMs;

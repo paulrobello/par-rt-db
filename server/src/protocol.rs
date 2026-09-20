@@ -17,7 +17,14 @@ use crate::error::RtDbError;
 /// A requested version GREATER than this is rejected with
 /// `ErrorCode::UnsupportedProtocol` rather than a generic 400/`deny_unknown_fields`
 /// failure — mirrored by all four client SDKs.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// Version 2 (2026-09-19 wire-v2 bundle) adds: the aggregate terminal's
+/// `aggregates` alias→op map, the `groupBy` field-list form, the optional
+/// `tz` on cron `ScheduleWhen`, and `POST /api/mutate-batch`. There is no
+/// per-message enforcement — a v2 build parses the full vocabulary from any
+/// authenticated peer; the number exists so an OLD server fails a v2 client
+/// cleanly at auth instead of on the first unknown field.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Full WS client vocabulary. Consumed by the WS handler (Task 9) and mirrored
 /// by the TS client — wire tags and field names are load-bearing.
@@ -618,7 +625,8 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(ScheduleWhen::Cron {
-                expr: "*/5 * * * *".to_string()
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
             })
             .unwrap(),
             serde_json::json!({"type": "cron", "expr": "*/5 * * * *"})

@@ -15,6 +15,7 @@ pub(in crate::committer) async fn handle_scheduled(
     txn: Transaction,
     cron: Option<String>,
     every_ms: Option<i64>,
+    tz: Option<String>,
 ) -> Result<(), RtDbError> {
     let schema = match ctx.schemas.get(&ctx.pool, &ctx.db).await {
         Ok(schema) => schema,
@@ -58,7 +59,7 @@ pub(in crate::committer) async fn handle_scheduled(
             let finalize = match kind.as_str() {
                 "oneshot" => scheduler::finalize_one_shot_done(&ctx.pool, &ctx.db, &id).await,
                 "cron" => match cron.as_deref() {
-                    Some(expr) => match scheduler::next_fire(expr, now_ms()) {
+                    Some(expr) => match scheduler::next_fire(expr, now_ms(), tz.as_deref()) {
                         Ok(next) => {
                             scheduler::finalize_recurring_next(&ctx.pool, &ctx.db, &id, next).await
                         }
@@ -104,7 +105,7 @@ pub(in crate::committer) async fn handle_scheduled(
             let msg = err.message.clone();
             match kind.as_str() {
                 "cron" => match cron.as_deref() {
-                    Some(expr) => match scheduler::next_fire(expr, now_ms()) {
+                    Some(expr) => match scheduler::next_fire(expr, now_ms(), tz.as_deref()) {
                         Ok(next) => {
                             let _ = scheduler::reschedule_recurring_error(
                                 &ctx.pool, &ctx.db, &id, next, &msg,

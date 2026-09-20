@@ -107,9 +107,20 @@ export type AggregateOp = "sum" | "avg" | "min" | "max" | "count";
  * `#[serde(default)]`, not a skip predicate), but we omit it on the wire when
  * false to match the SDK's omit-when-default convention; the server accepts
  * either form (the field is `#[serde(default)]`). */
+export type AggregateGroupBy = boolean | string[];
+
+/** Mirrors server `query::AggregateSpec` byte-for-byte (camelCase, deny_unknown_fields).
+ * Wire v2: exactly one of `op` (legacy single scalar op) or `aggregates` (alias
+ * to op, evaluated in one pass) must be set; `groupBy` widens from a boolean to
+ * `boolean | string[]` — `true` keeps the legacy grouped `{key, value}` shape,
+ * a field list groups by those declared index fields and returns
+ * `aggregateMultiGroups` rows. */
 export interface AggregateSpec {
-  op: AggregateOp;
-  groupBy?: boolean;
+  /** Legacy single aggregate operation. Exactly one of `op`/`aggregates` is required. */
+  op?: AggregateOp;
+  /** Wire v2 alias-to-operation map. */
+  aggregates?: Record<string, AggregateOp>;
+  groupBy?: AggregateGroupBy;
 }
 
 /** Mirrors server `query::AggregateGroup` byte-for-byte (camelCase). One row
@@ -117,6 +128,12 @@ export interface AggregateSpec {
 export interface AggregateGroup {
   key: unknown;
   value: unknown;
+}
+
+/** Wire v2 multi-field/multi-operation grouped aggregate row. */
+export interface AggregateMultiGroup {
+  keys: unknown[];
+  values: Record<string, unknown>;
 }
 
 /** Mirrors server `query::VectorSearchQuery` byte-for-byte (camelCase, deny_unknown_fields).
@@ -150,7 +167,7 @@ export interface HybridSearchQuery {
 export type ScheduleWhen =
   | { type: "afterMs"; ms: number }
   | { type: "runAt"; ms: number }
-  | { type: "cron"; expr: string }
+  | { type: "cron"; expr: string; tz?: string }
   | { type: "interval"; everyMs: number };
 
 /** Mirrors server `protocol::ScheduleInfo` (camelCase; `cron`/`everyMs`/`lastError` omitted when absent; `external` omitted when false — server serde-`default`s it on decode, so old payloads without it still parse). */
@@ -159,6 +176,7 @@ export interface ScheduleInfo {
   kind: "oneshot" | "cron" | "interval";
   dueAt: number;
   cron?: string;
+  tz?: string;
   everyMs?: number;
   status: "pending" | "running" | "paused" | "error";
   lastError?: string;
@@ -183,6 +201,8 @@ export interface ClaimedSchedule {
   txn: TransactionJson;
   /** The cron expression, for cron jobs. */
   cron?: string;
+  /** The cron timezone, when supplied. */
+  tz?: string;
   /** The fixed recurrence in ms, for interval jobs. */
   everyMs?: number;
   /** Per-job monotonic fencing token assigned atomically by the claim. */
@@ -328,6 +348,8 @@ export type QueryResultJson =
   | { type: "distinct"; value: unknown[] }
   | { type: "aggregate"; value: unknown }
   | { type: "aggregateGroups"; value: AggregateGroup[] }
+  | { type: "aggregateMulti"; value: Record<string, unknown> }
+  | { type: "aggregateMultiGroups"; value: AggregateMultiGroup[] }
   | { type: "paginated"; value: PaginatedResultJson };
 
 /**
@@ -602,7 +624,7 @@ export interface PresenceMember {
  * than its own with `UNSUPPORTED_PROTOCOL`. Mirrors server
  * `protocol::PROTOCOL_VERSION`.
  */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 /** Client -> server WS vocabulary. Tags/fields match server `protocol::ClientMessage`. */
 export type ClientMessage =

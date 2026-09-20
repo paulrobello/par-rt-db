@@ -315,6 +315,7 @@ class _ScheduledJob:
     created_at: int
     fired_count: int
     last_error: str | None
+    tz: str | None = None
     external: bool = False
 
 
@@ -1269,6 +1270,7 @@ def _schedule_info(job: _ScheduledJob) -> ScheduleInfo:
             "dueAt": job.due_at,
             "cron": job.cron,
             "everyMs": job.every_ms,
+            "tz": job.tz,
             "status": job.status,
             "lastError": job.last_error,
             "createdAt": job.created_at,

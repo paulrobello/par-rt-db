@@ -140,6 +140,35 @@ export class RtDbHttpClient {
    * accepted for backwards compatibility; it is unrelated to the wire-only
    * `mutId` reply-correlation field used on the WS transport.
    */
+  async mutateBatch(
+    txns: Array<{ txn: TransactionJson; idempotencyKey?: string }>,
+  ): Promise<
+    Array<
+      { ok: true; results: StepResult[] } | { ok: false; error: { code: string; message: string } }
+    >
+  > {
+    const body = await this.post("/api/mutate-batch", {
+      db: this.db,
+      txns,
+    });
+    return (
+      body as {
+        results: Array<{
+          ok: boolean;
+          results?: unknown[];
+          error?: { code: string; message: string };
+        }>;
+      }
+    ).results.map((entry) =>
+      entry.ok
+        ? { ok: true, results: parseStepResults(entry.results ?? []) }
+        : { ok: false, error: entry.error ?? { code: "INTERNAL", message: "mutation failed" } },
+    );
+  }
+
+  /** Executes one transaction (`POST /api/mutate`). `opts.idempotencyKey`
+   * makes the call safely retryable: supplying the same key replays the first
+   * result instead of double-applying. */
   async mutate(
     txn: TransactionJson,
     opts?: {

@@ -41,9 +41,9 @@ use terminals::{
 // now; re-exported so every `crate::query::` path (and the integration
 // tests' `rtdb_server::query::` paths) keep resolving unchanged.
 pub use crate::dsl::{
-    AggregateGroup, AggregateOp, AggregateSpec, FilterExpr, HybridSearchQuery, Order, Paginate,
-    PaginatedResult, Query, QueryResult, SearchMode, SearchQuery, VectorSearchQuery,
-    filter_matches,
+    AggregateGroup, AggregateMultiGroup, AggregateOp, AggregateSpec, FilterExpr, GroupBy,
+    HybridSearchQuery, Order, Paginate, PaginatedResult, Query, QueryResult, SearchMode,
+    SearchQuery, VectorSearchQuery, filter_matches,
 };
 // ARC-203: the compile/execute surface that used to live in this single file.
 pub(crate) use filter::{compile_filter, compile_filter_literal, compile_scan_where};
@@ -389,7 +389,9 @@ pub async fn execute_query(
             },
             "count" => execute_count_terminal(cq, pool).await,
             "distinct" => execute_distinct_terminal(cq, pool).await,
-            "aggregate" => execute_aggregate_terminal(cq, pool).await,
+            "aggregate" | "aggregate_multi" | "aggregate_multi_groups" => {
+                execute_aggregate_terminal(cq, pool).await
+            }
             "paginate" => {
                 // Re-derive the PaginateExecCtx the compile step produced. The
                 // ctx is pure metadata (index_def + eq_len + num_items); we

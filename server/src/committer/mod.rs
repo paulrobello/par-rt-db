@@ -95,6 +95,7 @@ pub enum CommitterRequest {
         txn: Box<Transaction>,
         cron: Option<String>,
         every_ms: Option<i64>,
+        tz: Option<String>,
     },
     /// Apply a declarative schema migration on this database. Serialized through
     /// the per-db committer like `Mutate`, so the migration's DDL+DML and the
@@ -1167,6 +1168,7 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                 txn,
                 cron,
                 every_ms,
+                tz,
             } => {
                 let span = tracing::info_span!(
                     "committer.scheduled",
@@ -1174,7 +1176,7 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                     kind,
                     id,
                 );
-                let outcome = handle_scheduled(&ctx, id, kind, *txn, cron, every_ms)
+                let outcome = handle_scheduled(&ctx, id, kind, *txn, cron, every_ms, tz)
                     .instrument(span)
                     .await;
                 if let Err(err) = outcome {

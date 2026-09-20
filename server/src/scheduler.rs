@@ -11,22 +11,31 @@ use crate::error::RtDbError;
 use crate::protocol::{ScheduleKind, ScheduleStatus, ScheduleWhen};
 
 /// Computes the next fire time (UTC epoch ms) for a 5-field cron expression,
-/// strictly after `now_ms`. Also validates the expression: a parse failure or
-/// an expression with no future fire times is `BadRequest`.
-pub fn next_fire(expr: &str, now_ms: i64) -> Result<i64, RtDbError> {
+/// strictly after `now_ms`. With `tz`, cron fields are evaluated against that
+/// IANA zone's local wall clock and the result is converted back to UTC. A
+/// parse failure, unknown timezone, or expression with no future fire times is
+/// `BadRequest`.
+pub fn next_fire(expr: &str, now_ms: i64, tz: Option<&str>) -> Result<i64, RtDbError> {
     use chrono::{DateTime, Utc};
-    // `Cron::new` is infallible; `parse()` does the actual validation and
-    // rejects malformed expressions. `croner` reads a 5-field expression
-    // min-first (seconds default to 0), so `*/5 * * * *` means every 5
-    // minutes, not every 5 seconds.
+    use chrono_tz::Tz;
     let mut cron = croner::Cron::new(expr);
     cron.parse()
         .map_err(|_| RtDbError::bad_request("invalid cron expression"))?;
     let now = DateTime::<Utc>::from_timestamp_millis(now_ms)
         .ok_or_else(|| RtDbError::internal("invalid timestamp"))?;
-    let next = cron
-        .find_next_occurrence(&now, false)
-        .map_err(|_| RtDbError::bad_request("cron expression has no future fire times"))?;
+    let next = match tz {
+        Some(name) => {
+            let zone: Tz = name
+                .parse()
+                .map_err(|_| RtDbError::bad_request("unknown timezone"))?;
+            cron.find_next_occurrence(&now.with_timezone(&zone), false)
+                .map_err(|_| RtDbError::bad_request("cron expression has no future fire times"))?
+                .with_timezone(&Utc)
+        }
+        None => cron
+            .find_next_occurrence(&now, false)
+            .map_err(|_| RtDbError::bad_request("cron expression has no future fire times"))?,
+    };
     Ok(next.timestamp_millis())
 }
 
@@ -36,7 +45,13 @@ pub fn next_fire(expr: &str, now_ms: i64) -> Result<i64, RtDbError> {
 pub const MAX_EVERY_MS: i64 = 365 * 24 * 60 * 60 * 1000;
 
 /// Row fields `resolve_when` produces: `(kind, due_at, cron, every_ms)`.
-pub(crate) type ResolvedWhen = (&'static str, i64, Option<String>, Option<i64>);
+pub(crate) type ResolvedWhen = (
+    &'static str,
+    i64,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+);
 
 /// Resolves a `ScheduleWhen` to `(kind, due_at, cron, every_ms)` row fields.
 /// Validates the cron expression, rejects negative `afterMs`, and rejects a
@@ -49,12 +64,12 @@ pub(crate) fn resolve_when(when: ScheduleWhen, now: i64) -> Result<ResolvedWhen,
             if ms < 0 {
                 return Err(RtDbError::bad_request("afterMs must be non-negative"));
             }
-            Ok(("oneshot", now + ms, None, None))
+            Ok(("oneshot", now + ms, None, None, None))
         }
-        ScheduleWhen::RunAt { ms } => Ok(("oneshot", ms, None, None)),
-        ScheduleWhen::Cron { expr } => {
-            let due = next_fire(&expr, now)?;
-            Ok(("cron", due, Some(expr), None))
+        ScheduleWhen::RunAt { ms } => Ok(("oneshot", ms, None, None, None)),
+        ScheduleWhen::Cron { expr, tz } => {
+            let due = next_fire(&expr, now, tz.as_deref())?;
+            Ok(("cron", due, Some(expr), None, tz))
         }
         ScheduleWhen::Interval { every_ms } => {
             if every_ms <= 0 {
@@ -65,7 +80,7 @@ pub(crate) fn resolve_when(when: ScheduleWhen, now: i64) -> Result<ResolvedWhen,
                     "everyMs must be at most {MAX_EVERY_MS}"
                 )));
             }
-            Ok(("interval", now + every_ms, None, Some(every_ms)))
+            Ok(("interval", now + every_ms, None, Some(every_ms), None))
         }
     }
 }
@@ -74,6 +89,10 @@ use sqlx::{PgConnection, PgPool};
 
 use crate::ddl::pg_schema;
 use crate::txn::Transaction;
+
+/// `(kind, cron, tz, every_ms)` of a stored recurring job, as read back by the
+/// resume and external-finalize recompute paths.
+type RecurringRow = (String, Option<String>, Option<String>, Option<i64>);
 
 /// Cap on how many due jobs one claim sweep takes. Bounded so a flood of
 /// past-due one-shots can't pin the committer channel indefinitely.
@@ -88,6 +107,7 @@ pub struct ClaimedJob {
     pub kind: String, // "oneshot" | "cron" | "interval"
     pub txn: Transaction,
     pub cron: Option<String>,
+    pub tz: Option<String>,
     pub every_ms: Option<i64>,
 }
 
@@ -107,6 +127,7 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
             due_at      bigint NOT NULL,
             txn         jsonb NOT NULL,
             cron        text,
+            tz          text,
             every_ms    bigint,
             status      text NOT NULL,
             last_error  text,
@@ -121,6 +142,12 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
     .await?;
     // Databases created before interval jobs lack the column; additive-only,
     // same IF NOT EXISTS discipline as the schema DDL path.
+    sqlx::query(&format!(
+        "ALTER TABLE \"{schema}\".scheduled_txns
+         ADD COLUMN IF NOT EXISTS tz text"
+    ))
+    .execute(pool)
+    .await?;
     sqlx::query(&format!(
         "ALTER TABLE \"{schema}\".scheduled_txns
          ADD COLUMN IF NOT EXISTS every_ms bigint"
@@ -169,6 +196,7 @@ pub(crate) async fn insert_on(
     txn: &Transaction,
     cron: Option<&str>,
     every_ms: Option<i64>,
+    tz: Option<&str>,
     external: bool,
 ) -> Result<String, RtDbError> {
     validate_db_name(db)?;
@@ -180,14 +208,15 @@ pub(crate) async fn insert_on(
     })?;
     sqlx::query(&format!(
         "INSERT INTO \"{schema}\".scheduled_txns
-            (id, kind, due_at, txn, cron, every_ms, status, created_at, external)
-         VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8)"
+            (id, kind, due_at, txn, cron, tz, every_ms, status, created_at, external)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9)"
     ))
     .bind(&id)
     .bind(kind)
     .bind(due_at)
     .bind(txn_json)
     .bind(cron)
+    .bind(tz)
     .bind(every_ms)
     .bind(now_ms())
     .bind(external)
@@ -205,10 +234,14 @@ pub async fn insert(
     txn: &Transaction,
     cron: Option<&str>,
     every_ms: Option<i64>,
+    tz: Option<&str>,
     external: bool,
 ) -> Result<String, RtDbError> {
     let mut conn = pool.acquire().await?;
-    insert_on(&mut conn, db, kind, due_at, txn, cron, every_ms, external).await
+    insert_on(
+        &mut conn, db, kind, due_at, txn, cron, every_ms, tz, external,
+    )
+    .await
 }
 
 pub async fn list(pool: &PgPool, db: &str) -> Result<Vec<ScheduleInfo>, RtDbError> {
@@ -220,6 +253,7 @@ pub async fn list(pool: &PgPool, db: &str) -> Result<Vec<ScheduleInfo>, RtDbErro
         String,
         i64,
         Option<String>,
+        Option<String>,
         Option<i64>,
         String,
         Option<String>,
@@ -228,7 +262,7 @@ pub async fn list(pool: &PgPool, db: &str) -> Result<Vec<ScheduleInfo>, RtDbErro
         bool,
     );
     let rows: Vec<ScheduleRow> = sqlx::query_as(&format!(
-        "SELECT id, kind, due_at, cron, every_ms, status, last_error, created_at, fired_count, external
+        "SELECT id, kind, due_at, cron, tz, every_ms, status, last_error, created_at, fired_count, external
              FROM \"{schema}\".scheduled_txns ORDER BY due_at, created_at"
     ))
     .fetch_all(pool)
@@ -240,6 +274,7 @@ pub async fn list(pool: &PgPool, db: &str) -> Result<Vec<ScheduleInfo>, RtDbErro
                 kind,
                 due_at,
                 cron,
+                tz,
                 every_ms,
                 status,
                 last_error,
@@ -258,6 +293,7 @@ pub async fn list(pool: &PgPool, db: &str) -> Result<Vec<ScheduleInfo>, RtDbErro
                     kind,
                     due_at,
                     cron,
+                    tz,
                     every_ms,
                     status,
                     last_error,
@@ -324,16 +360,18 @@ pub async fn set_paused(
     } else {
         // Resume: recompute next fire for cron, shift from resume for
         // interval; one-shot keeps its due_at.
-        let row: Option<(String, Option<String>, Option<i64>)> = sqlx::query_as(&format!(
-            "SELECT kind, cron, every_ms FROM \"{schema}\".scheduled_txns
+        let row: Option<RecurringRow> = sqlx::query_as(&format!(
+            "SELECT kind, cron, tz, every_ms FROM \"{schema}\".scheduled_txns
              WHERE id = $1 AND status = 'paused'"
         ))
         .bind(id)
         .fetch_optional(pool)
         .await?;
         let next = match row {
-            Some((kind, Some(expr), _)) if kind == "cron" => Some(next_fire(&expr, now_ms())?),
-            Some((kind, _, Some(every_ms))) if kind == "interval" => Some(now_ms() + every_ms),
+            Some((kind, Some(expr), tz, _)) if kind == "cron" => {
+                Some(next_fire(&expr, now_ms(), tz.as_deref())?)
+            }
+            Some((kind, _, _, Some(every_ms))) if kind == "interval" => Some(now_ms() + every_ms),
             Some(_) => None,
             None => return Ok(false),
         };
@@ -413,6 +451,7 @@ pub async fn claim_due(
         String,
         serde_json::Value,
         Option<String>,
+        Option<String>,
         Option<i64>,
     );
     let rows: Vec<ClaimRow> = sqlx::query_as(&format!(
@@ -427,14 +466,14 @@ pub async fn claim_due(
          SET status = 'running'
          FROM candidates
          WHERE target.id = candidates.id
-         RETURNING target.id, target.kind, target.txn, target.cron, target.every_ms"
+         RETURNING target.id, target.kind, target.txn, target.cron, target.tz, target.every_ms"
     ))
     .bind(now)
     .bind(batch)
     .fetch_all(pool)
     .await?;
     rows.into_iter()
-        .map(|(id, kind, txn_json, cron, every_ms)| {
+        .map(|(id, kind, txn_json, cron, tz, every_ms)| {
             let txn: Transaction = serde_json::from_value(txn_json).map_err(|err| {
                 tracing::error!(error = %err, db, %id, "failed to deserialize scheduled txn");
                 RtDbError::internal("failed to read scheduled txn")
@@ -444,6 +483,7 @@ pub async fn claim_due(
                 kind,
                 txn,
                 cron,
+                tz,
                 every_ms,
             })
         })
@@ -457,6 +497,7 @@ pub struct ClaimedExternalJob {
     pub due_at: i64,
     pub txn: Transaction,
     pub cron: Option<String>,
+    pub tz: Option<String>,
     pub every_ms: Option<i64>,
     /// Per-job monotonic fencing token, assigned atomically by the claim.
     pub lease_generation: i64,
@@ -503,6 +544,7 @@ pub async fn claim_external(
         i64,
         serde_json::Value,
         Option<String>,
+        Option<String>,
         Option<i64>,
         i64,
         i64,
@@ -526,7 +568,7 @@ pub async fn claim_external(
          FROM candidates
          WHERE target.id = candidates.id
          RETURNING target.id, target.kind, target.due_at, target.txn, target.cron,
-                   target.every_ms, target.claim_generation, target.lease_deadline_ms"
+                   target.tz, target.every_ms, target.claim_generation, target.lease_deadline_ms"
     ))
     .bind(now)
     .bind(limit)
@@ -535,7 +577,17 @@ pub async fn claim_external(
     .await?;
     rows.into_iter()
         .map(
-            |(id, kind, due_at, txn_json, cron, every_ms, lease_generation, lease_deadline_ms)| {
+            |(
+                id,
+                kind,
+                due_at,
+                txn_json,
+                cron,
+                tz,
+                every_ms,
+                lease_generation,
+                lease_deadline_ms,
+            )| {
                 let txn: Transaction = serde_json::from_value(txn_json).map_err(|err| {
                     tracing::error!(error = %err, db, %id, "failed to deserialize scheduled txn");
                     RtDbError::internal("failed to read scheduled txn")
@@ -546,6 +598,7 @@ pub async fn claim_external(
                     due_at,
                     txn,
                     cron,
+                    tz,
                     every_ms,
                     lease_generation,
                     lease_deadline_ms,
@@ -592,8 +645,8 @@ pub async fn finalize_external(
         ExternalOutcome::Complete => {
             // Recurring jobs need their next due instant first (cron recompute
             // / interval shift), exactly like the internal finalize path.
-            let row: Option<(String, Option<String>, Option<i64>)> = sqlx::query_as(&format!(
-                "SELECT kind, cron, every_ms FROM \"{schema}\".scheduled_txns
+            let row: Option<RecurringRow> = sqlx::query_as(&format!(
+                "SELECT kind, cron, tz, every_ms FROM \"{schema}\".scheduled_txns
                  WHERE id = $1 AND external
                    AND status = 'running' AND claim_generation = $2"
             ))
@@ -602,10 +655,10 @@ pub async fn finalize_external(
             .fetch_optional(pool)
             .await?;
             match row {
-                Some((ref kind, cron, every_ms)) if kind != "oneshot" => {
-                    let next = match (kind.as_str(), cron.as_deref(), every_ms) {
-                        ("cron", Some(expr), _) => next_fire(expr, now_ms())?,
-                        ("interval", _, Some(every_ms)) => now_ms() + every_ms,
+                Some((ref kind, cron, tz, every_ms)) if kind != "oneshot" => {
+                    let next = match (kind.as_str(), cron.as_deref(), tz.as_deref(), every_ms) {
+                        ("cron", Some(expr), tz, _) => next_fire(expr, now_ms(), tz)?,
+                        ("interval", _, _, Some(every_ms)) => now_ms() + every_ms,
                         _ => {
                             return Err(RtDbError::internal(format!(
                                 "invalid scheduled_txns row kind: {kind}"
@@ -893,6 +946,7 @@ pub async fn run_scheduler(pool: PgPool, db: String, committer_tx: Sender<Commit
                     txn: Box::new(job.txn),
                     cron: job.cron,
                     every_ms: job.every_ms,
+                    tz: job.tz,
                 };
                 if committer_tx.send(req).await.is_err() {
                     // Committer task is gone; this scheduler is now useless.
@@ -937,26 +991,37 @@ mod tests {
     fn every_5_minutes_not_seconds() {
         // `*/5 * * * *` must mean every 5 MINUTES (min-first), not every 5
         // seconds. The next fire after 12:00:00Z is 12:05:00Z = +300000 ms.
-        let next = next_fire("*/5 * * * *", ANCHOR_MS).unwrap();
+        let next = next_fire("*/5 * * * *", ANCHOR_MS, None).unwrap();
         assert_eq!(next - ANCHOR_MS, 300_000);
     }
 
     #[test]
     fn weekdays_at_9am_from_thursday() {
         // 2026-07-23 is a Thursday. `0 9 * * 1-5` next fires 2026-07-24 09:00Z.
-        let next = next_fire("0 9 * * 1-5", ANCHOR_MS).unwrap();
+        let next = next_fire("0 9 * * 1-5", ANCHOR_MS, None).unwrap();
         assert_eq!(next - ANCHOR_MS, 21 * 3600 * 1000); // +21h → Fri 09:00
     }
 
     #[test]
     fn rejects_garbage() {
-        assert!(next_fire("not a cron", ANCHOR_MS).is_err());
+        assert!(next_fire("not a cron", ANCHOR_MS, None).is_err());
     }
 
     #[test]
     fn next_is_strictly_after_now() {
-        let next = next_fire("* * * * *", ANCHOR_MS).unwrap();
+        let next = next_fire("* * * * *", ANCHOR_MS, None).unwrap();
         assert!(next > ANCHOR_MS);
+    }
+
+    #[test]
+    fn timezone_evaluates_local_wall_clock_and_rejects_unknown_zone() {
+        // 2026-07-23 12:00Z is 08:00 in New York during daylight time.
+        // The next 09:00 local fire is 13:00Z, one hour later.
+        let next = next_fire("0 9 * * *", ANCHOR_MS, Some("America/New_York")).unwrap();
+        assert_eq!(next - ANCHOR_MS, 3_600_000);
+        let err = next_fire("0 9 * * *", ANCHOR_MS, Some("Mars/Phobos"))
+            .expect_err("unknown IANA timezone must be rejected");
+        assert_eq!(err.code, crate::error::ErrorCode::BadRequest);
     }
 
     #[test]
@@ -967,12 +1032,13 @@ mod tests {
 
     #[test]
     fn resolve_when_interval_first_due_is_one_interval_out() {
-        let (kind, due, cron, every_ms) =
+        let (kind, due, cron, every_ms, tz) =
             resolve_when(ScheduleWhen::Interval { every_ms: 5_000 }, ANCHOR_MS).unwrap();
         assert_eq!(kind, "interval");
         assert_eq!(due, ANCHOR_MS + 5_000);
         assert!(cron.is_none());
         assert_eq!(every_ms, Some(5_000));
+        assert!(tz.is_none());
     }
 
     #[test]

@@ -685,7 +685,7 @@ async fn handle_schedule(
             let prepared = authorize_txn_tables(&principal.row_ctx(), &txn)
                 .and_then(|()| scheduler::resolve_when(when, now_ms()));
             match prepared {
-                Ok((kind, due_at, cron, every_ms)) => {
+                Ok((kind, due_at, cron, every_ms, _tz)) => {
                     // Fire time runs on the per-db scheduler, which only
                     // exists once the per-db tasks spawn — ensure that (and
                     // the table inline: the spawned scheduler's startup
@@ -705,6 +705,7 @@ async fn handle_schedule(
                                 &txn,
                                 cron.as_deref(),
                                 every_ms,
+                                None,
                                 external.is_some_and(|e| e),
                             )
                             .await

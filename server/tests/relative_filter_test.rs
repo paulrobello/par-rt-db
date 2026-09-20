@@ -437,7 +437,7 @@ async fn scheduled_sweep_fires_with_the_server_clock() -> anyhow::Result<()> {
             limit: None,
         }],
     };
-    scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, false)
+    scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, None, false)
         .await
         .unwrap();
 

@@ -74,6 +74,7 @@ base64.workspace = true
 # tree via rustls) as its sole crypto backend — no new native build.
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
 croner = "2"
 # Used by the managed-backup task to parse `postgres://` connection strings
 # into PG* env vars (so credentials never appear in the child argv).

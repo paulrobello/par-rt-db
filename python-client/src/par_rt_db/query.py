@@ -36,6 +36,7 @@ from pydantic_core.core_schema import SerializerFunctionWrapHandler
 
 from .wire import (
     AggregateGroup,
+    AggregateMultiGroup,
     AggregateSpec,
     FilterExpr,
     HybridSearchQuery,
@@ -331,7 +332,11 @@ class TableQuery:
         return self
 
     def aggregate(
-        self, op: Literal["sum", "avg", "min", "max", "count"], *, group_by: bool = False
+        self,
+        op: Literal["sum", "avg", "min", "max", "count"] | None = None,
+        *,
+        aggregates: dict[str, Literal["sum", "avg", "min", "max", "count"]] | None = None,
+        group_by: bool | list[str] = False,
     ) -> TableQuery:
         """Aggregate terminal: runs ``<op>`` (SUM/AVG/MIN/MAX/COUNT) over the
         index field after the eq prefix. With ``group_by=True``, groups by that
@@ -343,7 +348,12 @@ class TableQuery:
         field-bearing ops. Mutually exclusive with every other terminal except
         ``eq``/range bounds/``filter``; ``take`` is also rejected — group count
         is capped internally by MAX_TAKE."""
-        self._aggregate = AggregateSpec.model_validate({"op": op, "groupBy": bool(group_by)})
+        payload: dict[str, Any] = {"groupBy": group_by}
+        if op is not None:
+            payload["op"] = op
+        if aggregates is not None:
+            payload["aggregates"] = aggregates
+        self._aggregate = AggregateSpec.model_validate(payload)
         return self
 
     def paginate(self, *, cursor: str | None = None, num_items: int) -> TableQuery:
@@ -441,11 +451,15 @@ class TableQuery:
         return self.build()
 
     def build_for_aggregate(
-        self, op: Literal["sum", "avg", "min", "max", "count"], *, group_by: bool = False
+        self,
+        op: Literal["sum", "avg", "min", "max", "count"] | None = None,
+        *,
+        aggregates: dict[str, Literal["sum", "avg", "min", "max", "count"]] | None = None,
+        group_by: bool | list[str] = False,
     ) -> Query:
         """Set the ``aggregate`` terminal then build. See :meth:`aggregate` for
         op/grouping semantics."""
-        self.aggregate(op, group_by=group_by)
+        self.aggregate(op, aggregates=aggregates, group_by=group_by)
         return self.build()
 
 
@@ -468,6 +482,10 @@ def _terminal_of(q: Query) -> str:
     if q.distinct:
         return "distinct"
     if q.aggregate is not None:
+        if isinstance(q.aggregate.group_by, list):
+            return "aggregateMultiGroups"
+        if q.aggregate.aggregates is not None:
+            return "aggregateMultiGroups" if q.aggregate.group_by else "aggregateMulti"
         return "aggregateGroups" if q.aggregate.group_by else "aggregate"
     if q.paginate is not None:
         return "paginate"
@@ -520,6 +538,10 @@ def parse_result(model: type[Any], terminal: str, value: Any) -> Any:
         return None if value is None else _coerce(model, value)
     if terminal == "aggregateGroups":
         return [AggregateGroup.model_validate(v) for v in value]
+    if terminal == "aggregateMulti":
+        return dict(value)
+    if terminal == "aggregateMultiGroups":
+        return [AggregateMultiGroup.model_validate(v) for v in value]
     if terminal == "paginate":
         docs = [_coerce(model, v) for v in value.get("docs", [])]
         nxt = value.get("nextCursor")

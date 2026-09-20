@@ -1,5 +1,6 @@
 import type {
   AggregateGroup,
+  AggregateMultiGroup,
   AggregateOp,
   AggregateSpec,
   FilterExpr,
@@ -201,9 +202,19 @@ export class TableQuery<DocT, Indexes extends string> {
    * internally by MAX_TAKE. */
   aggregate(
     op: AggregateOp,
-    groupBy: boolean = false,
-  ): RtQuery<unknown> | RtQuery<AggregateGroup[]> {
-    const spec: AggregateSpec = groupBy ? { op, groupBy: true } : { op };
+    groupBy: boolean | string[] = false,
+  ): RtQuery<unknown> | RtQuery<AggregateGroup[] | AggregateMultiGroup[]> {
+    const spec: AggregateSpec = { op, ...(groupBy === false ? {} : { groupBy }) };
+    return { json: { ...this.json, aggregate: spec } };
+  }
+
+  /** Runs several aggregate operations in one query. The aliases become keys
+   * in the scalar result, or in each grouped row's `values` object. */
+  aggregates(
+    aggregates: Record<string, AggregateOp>,
+    groupBy: boolean | string[] = false,
+  ): RtQuery<Record<string, unknown> | AggregateMultiGroup[]> {
+    const spec: AggregateSpec = { aggregates, ...(groupBy === false ? {} : { groupBy }) };
     return { json: { ...this.json, aggregate: spec } };
   }
 

@@ -310,6 +310,7 @@ async fn bad_when_rolls_back_writes() -> anyhow::Result<()> {
         ScheduleWhen::AfterMs { ms: -1 },
         ScheduleWhen::Cron {
             expr: "not a cron".to_string(),
+            tz: None,
         },
     ] {
         let err = execute_txn(

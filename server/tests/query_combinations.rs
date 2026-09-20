@@ -18,8 +18,8 @@ use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::ddl::push_schema;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::query::{
-    AggregateOp, AggregateSpec, FilterExpr, HybridSearchQuery, Order, Paginate, Query, SearchQuery,
-    VectorSearchQuery, execute_query,
+    AggregateOp, AggregateSpec, FilterExpr, GroupBy, HybridSearchQuery, Order, Paginate, Query,
+    SearchQuery, VectorSearchQuery, execute_query,
 };
 use rtdb_server::schema::SchemaDef;
 use serde_json::json;
@@ -862,8 +862,9 @@ fn solo_hybrid(q: &mut Query) {
 fn solo_aggregate(q: &mut Query) {
     // MIN over the post-prefix field of `by_title` (string field, orderable).
     q.aggregate = Some(AggregateSpec {
-        op: AggregateOp::Min,
-        group_by: false,
+        op: Some(AggregateOp::Min),
+        group_by: GroupBy::Bool(false),
+        aggregates: None,
     });
     q.index = Some("by_title".to_string());
 }
@@ -1029,8 +1030,9 @@ fn distinct_hybrid(q: &mut Query) {
 // index/eq/range/filter — exercised under composition accepts below).
 fn aggregate_min(q: &mut Query) {
     q.aggregate = Some(AggregateSpec {
-        op: AggregateOp::Min,
-        group_by: false,
+        op: Some(AggregateOp::Min),
+        group_by: GroupBy::Bool(false),
+        aggregates: None,
     });
     q.index = Some("by_title".to_string());
 }
@@ -1083,16 +1085,18 @@ fn aggregate_eq(q: &mut Query) {
     // by_title_count has [title, count]; consuming `title` in the eq prefix
     // leaves `count` as the aggregate field — numeric, so SUM is valid.
     q.aggregate = Some(AggregateSpec {
-        op: AggregateOp::Sum,
-        group_by: false,
+        op: Some(AggregateOp::Sum),
+        group_by: GroupBy::Bool(false),
+        aggregates: None,
     });
     q.index = Some("by_title_count".to_string());
     q.eq.push(json!("x"));
 }
 fn aggregate_filter(q: &mut Query) {
     q.aggregate = Some(AggregateSpec {
-        op: AggregateOp::Min,
-        group_by: false,
+        op: Some(AggregateOp::Min),
+        group_by: GroupBy::Bool(false),
+        aggregates: None,
     });
     q.index = Some("by_title".to_string());
     q.filter = Some(filter_eq_title_x());
@@ -1295,8 +1299,9 @@ fn hs_distinct(q: &mut Query) {
 fn hs_aggregate(q: &mut Query) {
     q.hybrid_search = Some(hybrid_query_database_x());
     q.aggregate = Some(AggregateSpec {
-        op: AggregateOp::Min,
-        group_by: false,
+        op: Some(AggregateOp::Min),
+        group_by: GroupBy::Bool(false),
+        aggregates: None,
     });
 }
 fn hs_paginate(q: &mut Query) {

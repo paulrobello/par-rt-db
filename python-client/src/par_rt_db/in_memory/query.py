@@ -1240,8 +1240,88 @@ class _QueryEngine(_Core):
         agg = q.aggregate
         assert agg is not None  # caller dispatches only when set
         eq_len = len(typed_eq)
+
+        # Server parity: exactly one of ``op`` (legacy scalar) or ``aggregates``
+        # (wire v2 alias map) must be set - both or neither is BadRequest.
+        if agg.op is None and agg.aggregates is None:
+            raise RtDbError(ErrorCode.BAD_REQUEST, "aggregate requires op or aggregates")
+        if agg.op is not None and agg.aggregates is not None:
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST, "aggregate op and aggregates are mutually exclusive"
+            )
+
+        # V2 explicit group fields and/or multiple aliased operations. These
+        # shapes are additive; the legacy bool groupBy path below remains
+        # unchanged for byte/result compatibility.
+        explicit_groups = isinstance(agg.group_by, list)
+        multi_ops = agg.aggregates is not None
+        if explicit_groups or multi_ops:
+            if index_def is None:
+                raise RtDbError(ErrorCode.BAD_REQUEST, "aggregate requires an index")
+            group_fields = list(agg.group_by) if isinstance(agg.group_by, list) else []
+            positions = index_def.fields[eq_len:]
+            if explicit_groups and (
+                len(set(group_fields)) != len(group_fields)
+                or any(f not in positions for f in group_fields)
+            ):
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    "aggregate groupBy contains an unknown or duplicate field",
+                )
+            if agg.aggregates is not None:
+                operations: dict[str, Any] = dict(agg.aggregates)
+            else:
+                legacy_op = agg.op
+                assert legacy_op is not None  # guarded above: aggregates unset means op set
+                operations = {legacy_op: legacy_op}
+            needs_field = any(op != AggregateOp.COUNT for op in operations.values())
+            agg_field = (
+                next((f for f in positions if f not in group_fields), None) if needs_field else None
+            )
+            if needs_field and agg_field is None:
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    "aggregate requires an index field beyond the groupBy fields",
+                )
+            agg_pg = _pg_for_field(table_def, agg_field) if agg_field is not None else _TEXT
+            for op in operations.values():
+                if op in (AggregateOp.SUM, AggregateOp.AVG) and agg_pg not in (_NUMBER, _INT64):
+                    raise RtDbError(
+                        ErrorCode.BAD_REQUEST,
+                        f"aggregate op {op} requires a numeric index field",
+                    )
+
+            def values(rows: list[StoredRow], op: str) -> Any:
+                if op == AggregateOp.COUNT:
+                    return len(rows)
+                assert agg_field is not None  # validated above for field-bearing ops
+                vals = [r.doc.get(agg_field) for r in rows if r.doc.get(agg_field) is not None]
+                return _apply_aggregate(op, vals, agg_pg) if vals else None
+
+            if group_fields:
+                grouped: dict[str, tuple[list[Any], list[StoredRow]]] = {}
+                for row in filtered:
+                    keys = [row.doc.get(f) for f in group_fields]
+                    key = _dedupe_key(keys)
+                    if key not in grouped:
+                        grouped[key] = (keys, [])
+                    grouped[key][1].append(row)
+                out = [
+                    {
+                        "keys": keys,
+                        "values": {alias: values(rows, op) for alias, op in operations.items()},
+                    }
+                    for keys, rows in grouped.values()
+                ]
+                out.sort(
+                    key=cmp_to_key(lambda a, b: _compare_index_values(a["keys"], b["keys"], _TEXT))
+                )
+                return out[:MAX_TAKE]
+            return {alias: values(filtered, op) for alias, op in operations.items()}
         # `count` aggregates rows and consumes no aggregate field.
-        needs_field = agg.op != AggregateOp.COUNT
+        op = agg.op
+        assert op is not None  # exactly-one-of validated above (aggregates unset here)
+        needs_field = op != AggregateOp.COUNT
 
         # Resolve the group field: groupBy always needs one index field
         # beyond the eq prefix.
@@ -1278,10 +1358,10 @@ class _QueryEngine(_Core):
                     )
                 agg_field = index_def.fields[eq_len]
             agg_pg = _pg_for_field(table_def, agg_field)
-            if agg.op in (AggregateOp.SUM, AggregateOp.AVG) and agg_pg not in (_NUMBER, _INT64):
+            if op in (AggregateOp.SUM, AggregateOp.AVG) and agg_pg not in (_NUMBER, _INT64):
                 raise RtDbError(
                     ErrorCode.BAD_REQUEST,
-                    f"aggregate op {agg.op} requires a numeric index field",
+                    f"aggregate op {op} requires a numeric index field",
                 )
         else:
             agg_field = None
@@ -1309,11 +1389,11 @@ class _QueryEngine(_Core):
                 else:
                     # count: every row in the group counts (COUNT(*)).
                     groups[i][1].append(1)
-            if agg.op == AggregateOp.COUNT:
+            if op == AggregateOp.COUNT:
                 out: list[dict[str, Any]] = [{"key": k, "value": len(vs)} for k, vs in groups]
             else:
                 out = [
-                    {"key": k, "value": _apply_aggregate(agg.op, vs, agg_pg) if vs else None}
+                    {"key": k, "value": _apply_aggregate(op, vs, agg_pg) if vs else None}
                     for k, vs in groups
                 ]
             out.sort(
@@ -1322,14 +1402,14 @@ class _QueryEngine(_Core):
             return out[:MAX_TAKE]
         # Scalar path: count returns the matching-row count (0 if none);
         # the field-bearing ops reduce their non-null agg values (None if empty).
-        if agg.op == AggregateOp.COUNT:
+        if op == AggregateOp.COUNT:
             return len(filtered)
         assert agg_field is not None  # needs_field is True for every non-count op
         agg_values = [row.doc.get(agg_field) for row in filtered]
         agg_values = [v for v in agg_values if v is not None]
         if not agg_values:
             return None
-        return _apply_aggregate(agg.op, agg_values, agg_pg)
+        return _apply_aggregate(op, agg_values, agg_pg)
 
     def _execute_collect_terminal(self, q: Query, filtered: list[StoredRow]) -> Any:
         """``unique`` / ``first`` / plain ``collect`` terminal over the sorted

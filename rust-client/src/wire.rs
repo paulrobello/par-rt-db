@@ -14,7 +14,7 @@ pub type QueryRef = Query;
 /// header; a server whose `PROTOCOL_VERSION` is older rejects a value greater
 /// than its own with `UNSUPPORTED_PROTOCOL`. Mirrors server
 /// `protocol::PROTOCOL_VERSION`.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
@@ -450,6 +450,9 @@ pub struct ClaimedSchedule {
     /// The cron expression, for cron jobs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cron: Option<String>,
+    /// IANA timezone used for cron evaluation, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tz: Option<String>,
     /// The fixed recurrence in ms, for interval jobs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub every_ms: Option<i64>,
@@ -685,34 +688,45 @@ pub enum AggregateOp {
     Count,
 }
 
-/// `aggregate` terminal spec. `op` selects the SQL aggregate run over the index
-/// field after the eq prefix; `group_by` shifts the terminal to a grouped
-/// aggregate (groups by the index field after the eq prefix, aggregates the one
-/// after that). Mirrors `server/src/query.rs::AggregateSpec` byte-for-byte
-/// (camelCase, deny_unknown_fields). The server uses `#[serde(default)]` on
-/// `group_by` (always emits it); this client mirrors the rest of the SDK's
-/// bool convention and omits it on the wire when false, which the server
-/// accepts (the field is `#[serde(default)]`).
+/// Wire-v2 widening of aggregate grouping. `Bool(false)` and `Bool(true)`
+/// preserve the legacy wire forms, while `Fields` enables composite grouping.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GroupBy {
+    /// Legacy scalar grouping flag.
+    Bool(bool),
+    /// Explicit declared index fields, in result-key order.
+    Fields(Vec<String>),
+}
+
+impl Default for GroupBy {
+    fn default() -> Self {
+        Self::Bool(false)
+    }
+}
+
+fn group_by_false(group_by: &GroupBy) -> bool {
+    matches!(group_by, GroupBy::Bool(false))
+}
+
+/// `aggregate` terminal specification. Exactly one of `op` and `aggregates`
+/// is required by the server. The map is sorted on the wire for deterministic
+/// requests and results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AggregateSpec {
-    /// Which aggregate.
-    pub op: AggregateOp,
-    #[serde(default, skip_serializing_if = "is_false")]
-    /// Group by the index field after the eq prefix.
-    pub group_by: bool,
+    /// Legacy single aggregate operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<AggregateOp>,
+    /// Wire-v2 alias to aggregate operation map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregates: Option<std::collections::BTreeMap<String, AggregateOp>>,
+    /// Legacy boolean or wire-v2 explicit field list.
+    #[serde(default, skip_serializing_if = "group_by_false")]
+    pub group_by: GroupBy,
 }
 
-/// Serde skip predicate for `bool` fields whose default is `false`. Lets the
-/// rust-client omit `groupBy` on the wire when false, matching the TS client.
-fn is_false(b: &bool) -> bool {
-    !*b
-}
-
-/// One `{key, value}` row from a grouped `aggregate` (`groupBy: true`) terminal.
-/// Mirrors `server/src/query.rs::AggregateGroup` byte-for-byte (camelCase).
-/// ARC-130: response-shaped — `#[non_exhaustive]` lets the wire shape gain
-/// fields later without breaking exhaustive destructures.
+/// One `{key, value}` row from a legacy grouped aggregate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
@@ -721,6 +735,42 @@ pub struct AggregateGroup {
     pub key: serde_json::Value,
     /// The group's aggregate.
     pub value: serde_json::Value,
+}
+
+/// One `{keys, values}` row from a wire-v2 composite grouped aggregate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct AggregateMultiGroup {
+    /// Group keys in the requested field order.
+    pub keys: Vec<serde_json::Value>,
+    /// Alias-to-result values.
+    pub values: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// One slot of a mutate-batch response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchMutateOutcome {
+    /// Whether this transaction succeeded.
+    pub ok: bool,
+    /// Positional step results when successful.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub results: Option<Vec<serde_json::Value>>,
+    /// Standard error envelope when unsuccessful.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorEnvelope>,
+}
+
+/// A single transaction entry in a mutate-batch request.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchMutateRequest<'a> {
+    /// Transaction to execute.
+    pub txn: &'a Transaction,
+    /// Optional idempotency key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<&'a str>,
 }
 
 /// A db-side predicate appended to a query's WHERE clause. Defined once in
@@ -1609,7 +1659,8 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(ScheduleWhen::Cron {
-                expr: "*/5 * * * *".into()
+                expr: "*/5 * * * *".into(),
+                tz: None,
             })
             .unwrap(),
             json!({"type": "cron", "expr": "*/5 * * * *"})
@@ -1773,6 +1824,7 @@ mod tests {
             kind: ScheduleKind::Oneshot,
             due_at: 1000,
             cron: None,
+            tz: None,
             every_ms: None,
             status: ScheduleStatus::Pending,
             last_error: None,
@@ -1797,6 +1849,7 @@ mod tests {
             kind: ScheduleKind::Cron,
             due_at: 2000,
             cron: Some("*/5 * * * *".into()),
+            tz: None,
             every_ms: None,
             status: ScheduleStatus::Error,
             last_error: Some("boom".into()),
@@ -1823,6 +1876,7 @@ mod tests {
             kind: ScheduleKind::Interval,
             due_at: 2400,
             cron: None,
+            tz: None,
             every_ms: Some(300_000),
             status: ScheduleStatus::Pending,
             last_error: None,
@@ -1861,6 +1915,7 @@ mod tests {
             due_at: 2000,
             txn: empty_txn(),
             cron: Some("*/5 * * * *".into()),
+            tz: Some("America/New_York".into()),
             every_ms: None,
             lease_generation: 3,
             lease_deadline_ms: 86_400_000,
@@ -1874,12 +1929,14 @@ mod tests {
                 "dueAt": 2000,
                 "txn": {"steps": []},
                 "cron": "*/5 * * * *",
+                "tz": "America/New_York",
                 "leaseGeneration": 3,
                 "leaseDeadlineMs": 86400000
             })
         );
         let back: ClaimedSchedule = serde_json::from_value(v).unwrap();
         assert_eq!(back.cron.as_deref(), Some("*/5 * * * *"));
+        assert_eq!(back.tz.as_deref(), Some("America/New_York"));
         assert_eq!(back.every_ms, None);
         assert_eq!(back.lease_generation, 3);
 
@@ -1891,6 +1948,7 @@ mod tests {
             due_at: 2400,
             txn: empty_txn(),
             cron: None,
+            tz: None,
             every_ms: Some(300_000),
             lease_generation: 1,
             lease_deadline_ms: 300_000,

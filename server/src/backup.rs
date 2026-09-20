@@ -36,7 +36,7 @@ pub async fn run_backup_task(database_url: String, dir: String, cron: String, re
     );
     loop {
         let now = now_ms();
-        let next = match scheduler::next_fire(&cron, now) {
+        let next = match scheduler::next_fire(&cron, now, None) {
             Ok(t) => t,
             Err(err) => {
                 // An invalid cron expression was accepted at boot because
@@ -638,7 +638,7 @@ mod tests {
         // The default backup cron is `0 3 * * *` (daily 03:00 UTC). The next
         // fire must be strictly after `now` and at most ~1 day away.
         let now = now_ms();
-        let next = scheduler::next_fire("0 3 * * *", now).unwrap();
+        let next = scheduler::next_fire("0 3 * * *", now, None).unwrap();
         assert!(next > now);
         assert!(next - now <= 24 * 60 * 60 * 1000 + 60 * 1000);
     }

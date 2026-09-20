@@ -194,6 +194,8 @@ pub struct ScheduledJob {
     pub due_at: i64,
     /// The cron expression for cron jobs.
     pub cron: Option<String>,
+    /// The IANA timezone for cron jobs, when set.
+    pub tz: Option<String>,
     /// The fixed recurrence for interval jobs.
     pub every_ms: Option<i64>,
     /// Pending / paused / running / done / cancelled.
@@ -1956,9 +1958,9 @@ impl InMemoryRtDbClient {
             ScheduleWhen::Interval { .. } => ScheduleKind::Interval,
             _ => ScheduleKind::Oneshot,
         };
-        let cron = match &when {
-            ScheduleWhen::Cron { expr } => Some(expr.clone()),
-            _ => None,
+        let (cron, tz) = match &when {
+            ScheduleWhen::Cron { expr, tz } => (Some(expr.clone()), tz.clone()),
+            _ => (None, None),
         };
         let job = ScheduledJob {
             id: id.clone(),
@@ -1966,6 +1968,7 @@ impl InMemoryRtDbClient {
             txn,
             due_at: self.due_at_for(&when, now),
             cron,
+            tz,
             every_ms,
             status: ScheduleStatus::Pending,
             created_at: now,
@@ -2324,6 +2327,7 @@ fn schedule_info(job: &ScheduledJob) -> ScheduleInfo {
         kind: job.kind,
         due_at: job.due_at,
         cron: job.cron.clone(),
+        tz: job.tz.clone(),
         every_ms: job.every_ms,
         status: job.status,
         last_error: job.last_error.clone(),

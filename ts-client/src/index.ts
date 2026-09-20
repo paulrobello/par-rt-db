@@ -110,6 +110,8 @@ export { projectOptimisticUpdate } from "./optimistic.js";
 export { decodeCursor, encodeCursor } from "./pagination.js";
 export type {
   AggregateGroup,
+  AggregateGroupBy,
+  AggregateMultiGroup,
   AggregateOp,
   AggregateSpec,
   AuthedUser,

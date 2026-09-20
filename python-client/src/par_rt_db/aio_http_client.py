@@ -93,6 +93,7 @@ from .http_client import (
 )
 from .wire import (
     PROTOCOL_VERSION,
+    BatchMutateOutcome,
     BatchQueryOutcome,
     ChangeFeedResponse,
     ClaimedSchedule,
@@ -470,6 +471,21 @@ class RtDbAsyncHttpClient:
             "POST", "/api/query-batch", json={"db": self._db, "queries": wire_queries}
         )
         return _BATCH_ADAPTER.validate_python(resp.json()["results"])
+
+    async def mutate_batch(
+        self, txns: list[Transaction], *, idempotency_keys: list[str | None] | None = None
+    ) -> list[BatchMutateOutcome]:
+        """``POST /api/mutate-batch`` with one aligned outcome per transaction."""
+        if idempotency_keys is not None and len(idempotency_keys) != len(txns):
+            raise ValueError("idempotency_keys must match txns length")
+        entries = []
+        for i, txn in enumerate(txns):
+            entry: dict[str, Any] = {"txn": txn.model_dump(by_alias=True, mode="json")}
+            if idempotency_keys is not None and idempotency_keys[i] is not None:
+                entry["idempotencyKey"] = idempotency_keys[i]
+            entries.append(entry)
+        resp = await self._send("POST", "/api/mutate-batch", json={"db": self._db, "txns": entries})
+        return [BatchMutateOutcome.model_validate(v) for v in resp.json()["results"]]
 
     # --- data plane: change feed (GET /api/db/{db}/changes) ---
 

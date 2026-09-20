@@ -16,12 +16,15 @@ use super::search::{
     CompileSearchCtx, SearchCtx, compile_hybrid_search, compile_search, compile_vector_search,
 };
 use super::{MAX_TAKE, check_query_combinations, validate_projection};
+use std::collections::BTreeMap;
+
 use crate::auth::{PrincipalCtx, authorize_table};
 use crate::db::validate_db_name;
 use crate::ddl::{pg_col, pg_schema, pg_table};
 use crate::dsl::{
-    AggregateGroup, AggregateOp, AggregateSpec, EqBind, Order, Paginate, PaginatedResult, Query,
-    QueryResult, eq_bind_for, eq_binds, filter_matches, row_visible_to,
+    AggregateGroup, AggregateMultiGroup, AggregateOp, AggregateSpec, EqBind, GroupBy, Order,
+    Paginate, PaginatedResult, Query, QueryResult, eq_bind_for, eq_binds, filter_matches,
+    row_visible_to,
 };
 use crate::error::RtDbError;
 use crate::pagination::{decode_cursor, encode_cursor};
@@ -536,17 +539,17 @@ pub(crate) async fn execute_distinct_terminal(
     Ok(QueryResult::Distinct(values))
 }
 
-/// Aggregate terminal SQL compilation: runs `<OP>("<col>")` (SUM/AVG/MIN/MAX)
-/// over the same eq/range WHERE clause every other terminal builds, returning
-/// one scalar (`Aggregate(value)`). With `group_by: true`, it groups by the
-/// index field after the eq prefix and aggregates the one after that, returning
-/// `AggregateGroups([{key,value},…])`. The combination cascade already rejected
-/// every other terminal; `aggregate` composes only with `index`/`eq`/range
-/// bounds/`filter`. The preconditions below reject the no-index,
-/// no-remaining-field, and (for sum/avg) non-numeric-field cases. Group count
-/// is capped by `MAX_TAKE` for parity with `collect`. Compile half of the
-/// former inline `if let Some(agg) = &q.aggregate { … }` block — SQL and
-/// bind-order byte-for-byte identical to the pre-refactor cascade.
+/// Aggregate terminal SQL compilation. Routes by spec shape:
+/// - single `op`, `groupBy: false` → scalar (`Aggregate`), legacy path;
+/// - single `op`, `groupBy: true` → legacy grouped (`{key, value}` rows);
+/// - `aggregates` map (and/or the wire-v2 `groupBy` field list) → the wire-v2
+///   shapes (`AggregateMulti` object, `AggregateMultiGroups` `{keys, values}`
+///   rows), all evaluated as ONE SQL query with N aggregate expressions in one
+///   GROUP BY pass.
+///
+/// The combination cascade already rejected every other terminal; `aggregate`
+/// composes only with `index`/`eq`/range bounds/`filter`. Group count is
+/// capped by `MAX_TAKE` for parity with `collect`.
 fn compile_aggregate_terminal(
     w: QueryWindow<'_>,
     table_def: &TableDef,
@@ -563,90 +566,262 @@ fn compile_aggregate_terminal(
         filter_binds,
         limit_placeholder,
     } = w;
-    // Resolve the group column (groupBy) and the aggregate field. `count`
-    // aggregates rows, not a field — it consumes no aggregate index field (a
-    // scalar `count` needs no index at all; a grouped `count` needs one index
-    // field beyond the eq prefix to group by). Every other op needs an aggregate
-    // field: the one after the eq prefix (plain), or the one after the group
-    // field (groupBy). The groupcol for groupBy is the same field `distinct` uses.
-    let group_col: Option<String> = if agg.group_by {
-        let idx = index_def.ok_or_else(|| {
-            RtDbError::bad_request("aggregate groupBy requires an index field beyond the eq prefix")
-        })?;
-        let group_field = idx.fields.get(eq_len).ok_or_else(|| {
-            RtDbError::bad_request("aggregate groupBy requires an index field beyond the eq prefix")
-        })?;
-        Some(pg_col(group_field))
-    } else {
-        None
+    let ops = agg.aliased_ops()?;
+    // Resolve the group fields. `count` aggregates rows, not a field — it
+    // consumes no aggregate index field. Every other op needs an aggregate
+    // field: the one after the eq prefix (plain), the one after the group
+    // field (legacy groupBy), or — with an explicit groupBy list — the first
+    // index field at or beyond the eq prefix NOT in the list.
+    let group_fields: Vec<String> = match &agg.group_by {
+        GroupBy::Bool(false) => Vec::new(),
+        GroupBy::Bool(true) => {
+            let idx = index_def.ok_or_else(|| {
+                RtDbError::bad_request(
+                    "aggregate groupBy requires an index field beyond the eq prefix",
+                )
+            })?;
+            let group_field = idx.fields.get(eq_len).ok_or_else(|| {
+                RtDbError::bad_request(
+                    "aggregate groupBy requires an index field beyond the eq prefix",
+                )
+            })?;
+            vec![group_field.clone()]
+        }
+        GroupBy::Fields(list) => {
+            if list.is_empty() {
+                return Err(RtDbError::bad_request(
+                    "aggregate groupBy list must not be empty",
+                ));
+            }
+            let idx = index_def.ok_or_else(|| {
+                RtDbError::bad_request(
+                    "aggregate groupBy requires an index field beyond the eq prefix",
+                )
+            })?;
+            let mut seen = std::collections::BTreeSet::new();
+            for field in list {
+                let pos = idx.fields.iter().position(|f| f == field).ok_or_else(|| {
+                    RtDbError::bad_request(format!(
+                        "aggregate groupBy field '{field}' is not a declared index field"
+                    ))
+                })?;
+                if pos < eq_len {
+                    return Err(RtDbError::bad_request(format!(
+                        "aggregate groupBy field '{field}' is inside the eq prefix"
+                    )));
+                }
+                if !seen.insert(field.as_str()) {
+                    return Err(RtDbError::bad_request(format!(
+                        "aggregate groupBy field '{field}' is listed more than once"
+                    )));
+                }
+            }
+            list.clone()
+        }
     };
-    let agg_field_name: Option<&str> = if !agg.op.needs_field() {
+    let needs_field = ops.iter().any(|(_, op)| op.needs_field());
+    let agg_field_name: Option<String> = if !needs_field {
         None
     } else {
         let idx = index_def.ok_or_else(|| {
             RtDbError::bad_request("aggregate requires an index field beyond the eq prefix")
         })?;
-        let agg_field = if agg.group_by {
+        let agg_field = if agg.group_by == GroupBy::Bool(true) {
             idx.fields.get(eq_len + 1).ok_or_else(|| {
                 RtDbError::bad_request(
                     "aggregate groupBy requires two index fields beyond the eq prefix",
                 )
             })?
         } else {
-            idx.fields.get(eq_len).ok_or_else(|| {
-                RtDbError::bad_request("aggregate requires an index field beyond the eq prefix")
-            })?
+            idx.fields
+                .iter()
+                .skip(eq_len)
+                .find(|f| !group_fields.contains(f))
+                .ok_or_else(|| {
+                    RtDbError::bad_request(
+                        "aggregate requires an index field beyond the eq prefix outside the groupBy list",
+                    )
+                })?
         };
-        Some(agg_field.as_str())
+        Some(agg_field.clone())
     };
     // Validate the aggregate field's schema type and sum/avg's numeric
-    // requirement. count/min/max skip the numeric check; count has no field.
-    if let Some(name) = agg_field_name {
+    // requirement per op. count/min/max skip the numeric check.
+    if let Some(name) = &agg_field_name {
         let agg_field_type = table_def.fields.get(name).ok_or_else(|| {
             RtDbError::internal(format!("index references unknown field '{name}'"))
         })?;
-        if matches!(agg.op, AggregateOp::Sum | AggregateOp::Avg)
-            && !is_numeric_index_field(agg_field_type)
-        {
-            return Err(RtDbError::bad_request(format!(
-                "aggregate op {} requires a numeric index field",
-                agg.op.sql_fn().to_lowercase()
-            )));
+        for (alias, op) in &ops {
+            if matches!(op, AggregateOp::Sum | AggregateOp::Avg)
+                && !is_numeric_index_field(agg_field_type)
+            {
+                return Err(RtDbError::bad_request(format!(
+                    "aggregate op {} requires a numeric index field",
+                    if agg.op.is_some() {
+                        op.sql_fn().to_lowercase()
+                    } else {
+                        alias.clone()
+                    }
+                )));
+            }
         }
     }
     let pg_schema_name = pg_schema(db);
     let table_ident = pg_table(table);
-    let op_sql = agg.op.sql_fn();
-    // The aggregate expression: COUNT(*) for `count` (no column), else
+    // The aggregate expression per op: COUNT(*) for `count` (no column), else
     // OP("agg_col") over the resolved aggregate field.
-    let agg_expr = match agg_field_name {
-        Some(name) => {
-            let agg_col = pg_col(name);
-            format!("{op_sql}(\"{agg_col}\")")
+    let expr_for = |op: AggregateOp| -> String {
+        match (&agg_field_name, op) {
+            (Some(name), _) if op.needs_field() => {
+                format!("{}(\"{}\")", op.sql_fn(), pg_col(name))
+            }
+            _ => "COUNT(*)".to_string(),
         }
-        None => "COUNT(*)".to_string(),
     };
-    // Project via `to_jsonb` so a single `serde_json::Value` decoder handles
-    // text/number/boolean columns uniformly, exactly like `distinct`. A
-    // scalar SUM/AVG/MIN/MAX over zero matching rows yields one row with
-    // SQL NULL → `serde_json::Value::Null`; COUNT(*) over zero rows yields 0.
     let filter = FilterBinds {
         binds,
         range_binds,
         where_conditions,
         filter_binds,
     };
-    if let Some(group_col) = group_col {
-        return compile_aggregate_grouped(
-            group_col,
-            agg_expr,
-            filter,
-            limit_placeholder,
-            &pg_schema_name,
-            &table_ident,
-        );
+    // Legacy routing: a single-`op` spec keeps the pre-v2 shapes byte-for-byte.
+    if agg.op.is_some()
+        && let GroupBy::Bool(grouped) = agg.group_by
+    {
+        if grouped {
+            let Some(group_field) = group_fields.first() else {
+                return Err(RtDbError::internal(
+                    "aggregate groupBy resolved without a group field",
+                ));
+            };
+            let group_col = pg_col(group_field);
+            return compile_aggregate_grouped(
+                group_col,
+                expr_for(ops[0].1),
+                filter,
+                limit_placeholder,
+                &pg_schema_name,
+                &table_ident,
+            );
+        }
+        return compile_aggregate_scalar(expr_for(ops[0].1), filter, &pg_schema_name, &table_ident);
     }
-    compile_aggregate_scalar(agg_expr, filter, &pg_schema_name, &table_ident)
+    // Wire-v2 routing: the `aggregates` map (with any groupBy form) and the
+    // single-op + explicit-list combination.
+    let values_json = {
+        let mut parts = Vec::with_capacity(ops.len());
+        for (alias, op) in &ops {
+            parts.push(format!(
+                "'{}', COALESCE(to_jsonb({}), 'null'::jsonb)",
+                alias,
+                expr_for(*op)
+            ));
+        }
+        format!("jsonb_build_object({})", parts.join(", "))
+    };
+    if group_fields.is_empty() {
+        return compile_aggregate_multi(values_json, filter, &pg_schema_name, &table_ident);
+    }
+    compile_aggregate_multi_groups(
+        group_fields.iter().map(|f| pg_col(f)).collect::<Vec<_>>(),
+        values_json,
+        filter,
+        limit_placeholder,
+        &pg_schema_name,
+        &table_ident,
+    )
+}
+
+/// Wire-v2 ungrouped multi-op SQL compilation: one row, one jsonb object
+/// `{"alias": value, …}` decoded into `AggregateMulti`. SQL aggregates without
+/// GROUP BY always yield exactly one row.
+fn compile_aggregate_multi(
+    values_json: String,
+    filter: FilterBinds,
+    pg_schema_name: &str,
+    table_ident: &str,
+) -> Result<CompiledQuery, RtDbError> {
+    let FilterBinds {
+        binds,
+        range_binds,
+        where_conditions,
+        filter_binds,
+    } = filter;
+    let mut sql =
+        format!("SELECT to_jsonb({values_json}) AS v FROM \"{pg_schema_name}\".\"{table_ident}\"");
+    if !where_conditions.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_conditions.join(" AND "));
+    }
+    let mut all = Vec::with_capacity(binds.len() + range_binds.len() + filter_binds.len());
+    all.extend(binds);
+    all.extend(range_binds);
+    all.extend(filter_binds);
+    Ok(CompiledQuery {
+        sql,
+        binds: all,
+        terminal: "aggregate_multi",
+    })
+}
+
+/// Wire-v2 grouped SQL compilation: each row is one jsonb array
+/// `[k1, …, kn, {alias: value, …}]` — the flat-array wrapper lets a single
+/// `(serde_json::Value,)` decoder serve any group arity (sqlx cannot decode a
+/// variably-arity row into a static tuple). Group keys pass through
+/// `to_jsonb` so a NULL group surfaces as JSON null inside the array; the
+/// values object COALESCEs each aggregate to `'null'::jsonb` like the scalar
+/// path. `ORDER BY` restates the key projections (jsonb ordering matches the
+/// legacy grouped path's `ORDER BY k`, NULLS LAST default).
+fn compile_aggregate_multi_groups(
+    group_cols: Vec<String>,
+    values_json: String,
+    filter: FilterBinds,
+    limit_placeholder: usize,
+    pg_schema_name: &str,
+    table_ident: &str,
+) -> Result<CompiledQuery, RtDbError> {
+    let FilterBinds {
+        binds,
+        range_binds,
+        where_conditions,
+        filter_binds,
+    } = filter;
+    let mut row_parts: Vec<String> = group_cols
+        .iter()
+        .map(|c| format!("to_jsonb(\"{c}\")"))
+        .collect();
+    row_parts.push(format!("to_jsonb({values_json})"));
+    let mut sql = format!(
+        "SELECT to_jsonb(jsonb_build_array({})) AS row FROM \"{pg_schema_name}\".\"{table_ident}\"",
+        row_parts.join(", ")
+    );
+    if !where_conditions.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_conditions.join(" AND "));
+    }
+    let order = group_cols
+        .iter()
+        .map(|c| format!("to_jsonb(\"{c}\")"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    sql.push_str(&format!(
+        " GROUP BY {group_list} ORDER BY {order} LIMIT ${limit_placeholder}",
+        group_list = group_cols
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    let mut all = Vec::with_capacity(binds.len() + range_binds.len() + filter_binds.len() + 1);
+    all.extend(binds);
+    all.extend(range_binds);
+    all.extend(filter_binds);
+    all.push(EqBind::I64(i64::from(MAX_TAKE)));
+    Ok(CompiledQuery {
+        sql,
+        binds: all,
+        terminal: "aggregate_multi_groups",
+    })
 }
 
 /// The eq/range/filter binds and their WHERE clause, carved out of
@@ -738,8 +913,10 @@ fn compile_aggregate_scalar(
 }
 
 /// Aggregate terminal execute tail: branch on the `terminal` tag, bind, and
-/// fetch. The group vs scalar shape difference is encoded by which `query_as`
-/// decoder is used; `terminal` disambiguates which to call.
+/// fetch. The legacy `aggregate` tag covers both the scalar and the grouped
+/// `{key, value}` shape — the compiled SQL itself encodes which (its SELECT
+/// list), so that path dispatches on the SQL's projection. The wire-v2 tags
+/// (`aggregate_multi` / `aggregate_multi_groups`) each have their own shape.
 pub(crate) async fn execute_aggregate_terminal(
     cq: CompiledQuery,
     pool: &PgPool,
@@ -749,48 +926,104 @@ pub(crate) async fn execute_aggregate_terminal(
         binds,
         terminal,
     } = cq;
-    // The grouped path is tagged `aggregate` and emits a 2-column row shape
-    // (k, v); the scalar path is also tagged `aggregate` but emits 1 column.
-    // The compiled SQL itself encodes the shape (its SELECT list), so dispatch
-    // on the SQL's projection rather than the tag. Both paths carry the same
-    // tag because the wire terminal is the same; the executor reads the SQL.
-    if sql.contains("GROUP BY") {
+    match terminal {
         // Rows missing the group field form one SQL NULL group, which sorts
         // last under `ORDER BY k`'s NULLS LAST default — but sqlx cannot
         // decode a NULL cell into `serde_json::Value`, so decode the key as
         // `Option` and surface that group's key as JSON null (the value is
         // COALESCEd in the SQL; see compile_aggregate_grouped).
-        let mut query = sqlx::query_as::<_, (Option<serde_json::Value>, serde_json::Value)>(&sql);
-        for bind in binds {
-            query = match bind {
-                EqBind::Text(v) => query.bind(v),
-                EqBind::Num(v) => query.bind(v),
-                EqBind::Bool(v) => query.bind(v),
-                EqBind::I64(v) => query.bind(v),
-            };
+        "aggregate" if sql.contains("GROUP BY") => {
+            let mut query =
+                sqlx::query_as::<_, (Option<serde_json::Value>, serde_json::Value)>(&sql);
+            for bind in binds {
+                query = match bind {
+                    EqBind::Text(v) => query.bind(v),
+                    EqBind::Num(v) => query.bind(v),
+                    EqBind::Bool(v) => query.bind(v),
+                    EqBind::I64(v) => query.bind(v),
+                };
+            }
+            let rows = query.fetch_all(pool).await?;
+            let groups: Vec<AggregateGroup> = rows
+                .into_iter()
+                .map(|(k, v)| AggregateGroup {
+                    key: k.unwrap_or(serde_json::Value::Null),
+                    value: v,
+                })
+                .collect();
+            Ok(QueryResult::AggregateGroups(groups))
         }
-        let rows = query.fetch_all(pool).await?;
-        let groups: Vec<AggregateGroup> = rows
-            .into_iter()
-            .map(|(k, v)| AggregateGroup {
-                key: k.unwrap_or(serde_json::Value::Null),
-                value: v,
-            })
-            .collect();
-        Ok(QueryResult::AggregateGroups(groups))
-    } else {
-        let _ = terminal; // shape encoded by SQL; tag unused on this path
-        let mut query = sqlx::query_as::<_, (serde_json::Value,)>(&sql);
-        for bind in binds {
-            query = match bind {
-                EqBind::Text(v) => query.bind(v),
-                EqBind::Num(v) => query.bind(v),
-                EqBind::Bool(v) => query.bind(v),
-                EqBind::I64(v) => query.bind(v),
-            };
+        "aggregate" => {
+            let _ = terminal; // shape encoded by SQL; tag unused on this path
+            let mut query = sqlx::query_as::<_, (serde_json::Value,)>(&sql);
+            for bind in binds {
+                query = match bind {
+                    EqBind::Text(v) => query.bind(v),
+                    EqBind::Num(v) => query.bind(v),
+                    EqBind::Bool(v) => query.bind(v),
+                    EqBind::I64(v) => query.bind(v),
+                };
+            }
+            let (v,) = query.fetch_one(pool).await?;
+            Ok(QueryResult::Aggregate(v))
         }
-        let (v,) = query.fetch_one(pool).await?;
-        Ok(QueryResult::Aggregate(v))
+        "aggregate_multi" => {
+            let mut query = sqlx::query_as::<_, (serde_json::Value,)>(&sql);
+            for bind in binds {
+                query = match bind {
+                    EqBind::Text(v) => query.bind(v),
+                    EqBind::Num(v) => query.bind(v),
+                    EqBind::Bool(v) => query.bind(v),
+                    EqBind::I64(v) => query.bind(v),
+                };
+            }
+            let (v,) = query.fetch_one(pool).await?;
+            Ok(QueryResult::AggregateMulti(v))
+        }
+        // Each row is one jsonb array `[k1, …, kn, {alias: value, …}]` (see
+        // compile_aggregate_multi_groups); split off the trailing values
+        // object. A NULL group decodes as JSON null inside the array, so no
+        // Option decoding is needed.
+        "aggregate_multi_groups" => {
+            let mut query = sqlx::query_as::<_, (serde_json::Value,)>(&sql);
+            for bind in binds {
+                query = match bind {
+                    EqBind::Text(v) => query.bind(v),
+                    EqBind::Num(v) => query.bind(v),
+                    EqBind::Bool(v) => query.bind(v),
+                    EqBind::I64(v) => query.bind(v),
+                };
+            }
+            let rows = query.fetch_all(pool).await?;
+            let mut groups = Vec::with_capacity(rows.len());
+            for (row,) in rows {
+                let mut parts = match row {
+                    serde_json::Value::Array(parts) => parts,
+                    other => {
+                        return Err(RtDbError::internal(format!(
+                            "aggregate_multi_groups row is not an array: {other:?}"
+                        )));
+                    }
+                };
+                let values = parts
+                    .pop()
+                    .ok_or_else(|| RtDbError::internal("aggregate_multi_groups row is empty"))?;
+                let values: BTreeMap<String, serde_json::Value> = serde_json::from_value(values)
+                    .map_err(|e| {
+                        RtDbError::internal(format!(
+                            "aggregate_multi_groups values are not an object: {e}"
+                        ))
+                    })?;
+                groups.push(AggregateMultiGroup {
+                    keys: parts,
+                    values,
+                });
+            }
+            Ok(QueryResult::AggregateMultiGroups(groups))
+        }
+        other => Err(RtDbError::internal(format!(
+            "unknown aggregate terminal tag '{other}'"
+        ))),
     }
 }
 

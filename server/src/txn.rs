@@ -2397,7 +2397,7 @@ async fn step_schedule(
     external: bool,
 ) -> Result<(), RtDbError> {
     authorize_txn_tables(sctx.ctx, txn)?;
-    let (kind, due_at, cron, every_ms) = scheduler::resolve_when(when.clone(), now_ms())?;
+    let (kind, due_at, cron, every_ms, tz) = scheduler::resolve_when(when.clone(), now_ms())?;
     let id = scheduler::insert_on(
         sctx.tx,
         sctx.db,
@@ -2406,6 +2406,7 @@ async fn step_schedule(
         txn,
         cron.as_deref(),
         every_ms,
+        tz.as_deref(),
         external,
     )
     .await?;

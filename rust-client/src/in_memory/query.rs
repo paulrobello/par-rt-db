@@ -629,12 +629,183 @@ impl InMemoryRtDbClient {
             )
         })?;
         let eq_len = typed_eq.len();
+
+        // Wire-v2 multi-operation and explicit composite groupBy support.
+        if agg.aggregates.is_some() || matches!(agg.group_by, crate::wire::GroupBy::Fields(_)) {
+            let ops: Vec<(String, AggregateOp)> = if let Some(map) = &agg.aggregates {
+                map.iter().map(|(alias, op)| (alias.clone(), *op)).collect()
+            } else {
+                let op = agg.op.ok_or_else(|| {
+                    RtDbError::new(ErrorCode::BadRequest, "aggregate requires op or aggregates")
+                })?;
+                let alias = match op {
+                    AggregateOp::Sum => "sum",
+                    AggregateOp::Avg => "avg",
+                    AggregateOp::Min => "min",
+                    AggregateOp::Max => "max",
+                    AggregateOp::Count => "count",
+                };
+                vec![(alias.to_string(), op)]
+            };
+            let group_fields: Vec<String> = match &agg.group_by {
+                crate::wire::GroupBy::Bool(false) => Vec::new(),
+                crate::wire::GroupBy::Bool(true) => {
+                    idx.fields.get(eq_len).cloned().into_iter().collect()
+                }
+                crate::wire::GroupBy::Fields(fields) => fields.clone(),
+            };
+            if matches!(agg.group_by, crate::wire::GroupBy::Fields(_)) && group_fields.is_empty() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "aggregate groupBy list must not be empty",
+                ));
+            }
+            for field in &group_fields {
+                let position = idx.fields.iter().position(|candidate| candidate == field);
+                if position.is_none_or(|position| position < eq_len) {
+                    return Err(RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!(
+                            "aggregate groupBy field '{field}' is not available after the eq prefix"
+                        ),
+                    ));
+                }
+            }
+            let agg_field = ops
+                .iter()
+                .any(|(_, op)| !matches!(op, AggregateOp::Count))
+                .then(|| {
+                    idx.fields
+                        .iter()
+                        .skip(eq_len)
+                        .find(|field| !group_fields.contains(field))
+                        .cloned()
+                })
+                .flatten();
+            if ops.iter().any(|(_, op)| !matches!(op, AggregateOp::Count)) && agg_field.is_none() {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "aggregate requires an index field outside the groupBy list",
+                ));
+            }
+            let agg_pg = agg_field
+                .as_deref()
+                .and_then(|field| table_def.fields.get(field))
+                .and_then(|ty| index_column_type(ty).ok())
+                .map(|it| it.pg)
+                .unwrap_or(PgType::Text);
+            let eval = |op: AggregateOp, values: &[Value]| {
+                if matches!(op, AggregateOp::Count) {
+                    Value::Number(serde_json::Number::from(values.len() as i64))
+                } else if values.is_empty() {
+                    Value::Null
+                } else {
+                    apply_aggregate(op, values, agg_pg)
+                }
+            };
+            if group_fields.is_empty() {
+                let values = agg_field
+                    .as_deref()
+                    .map(|field| {
+                        filtered
+                            .iter()
+                            .filter_map(|row| row.doc.get(field))
+                            .filter(|value| !value.is_null())
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let mut object = Map::new();
+                for (alias, op) in ops {
+                    object.insert(alias, eval(op, &values));
+                }
+                return Ok(Value::Object(object));
+            }
+            let mut groups: HashMap<String, (Vec<Value>, Vec<StoredRow>)> = HashMap::new();
+            for row in filtered {
+                let keys = group_fields
+                    .iter()
+                    .map(|field| row.doc.get(field).cloned().unwrap_or(Value::Null))
+                    .collect::<Vec<_>>();
+                groups
+                    .entry(
+                        keys.iter()
+                            .map(Value::to_string)
+                            .collect::<Vec<_>>()
+                            .join("\\u{1f}"),
+                    )
+                    .or_insert_with(|| (keys, Vec::new()))
+                    .1
+                    .push(row.clone());
+            }
+            let mut output = groups.into_values().collect::<Vec<_>>();
+            output.sort_by(|a, b| {
+                a.0.iter()
+                    .zip(&b.0)
+                    .map(|(left, right)| compare_index_values(left, right, PgType::Text))
+                    .find(|ordering| *ordering != std::cmp::Ordering::Equal)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let rows = output
+                .into_iter()
+                .take(MAX_TAKE)
+                .map(|(keys, rows)| {
+                    let mut values = std::collections::BTreeMap::new();
+                    for (alias, op) in &ops {
+                        let items = if matches!(op, AggregateOp::Count) {
+                            Vec::new()
+                        } else {
+                            agg_field
+                                .as_deref()
+                                .map(|field| {
+                                    rows.iter()
+                                        .filter_map(|row| row.doc.get(field))
+                                        .filter(|value| !value.is_null())
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default()
+                        };
+                        let value = if matches!(op, AggregateOp::Count) {
+                            Value::Number(serde_json::Number::from(rows.len() as i64))
+                        } else {
+                            eval(*op, &items)
+                        };
+                        values.insert(alias.clone(), value);
+                    }
+                    let mut object = Map::new();
+                    object.insert("keys".to_string(), Value::Array(keys));
+                    object.insert(
+                        "values".to_string(),
+                        serde_json::to_value(values).unwrap_or(Value::Null),
+                    );
+                    Value::Object(object)
+                })
+                .collect();
+            return Ok(Value::Array(rows));
+        }
+
+        let op = agg.op.ok_or_else(|| {
+            RtDbError::new(
+                ErrorCode::BadRequest,
+                "in-memory aggregate map execution is not yet supported",
+            )
+        })?;
+        let group_by = match &agg.group_by {
+            crate::wire::GroupBy::Bool(value) => *value,
+            crate::wire::GroupBy::Fields(_) => {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "in-memory composite groupBy execution is not yet supported",
+                ));
+            }
+        };
         // `count` aggregates matching rows and consumes no aggregate field
         // (mirrors `server/src/query.rs::AggregateOp::needs_field`). Scalar
         // count = number of matching rows (0 if none, never null); grouped
         // count = the size of each group.
-        if matches!(agg.op, AggregateOp::Count) {
-            if agg.group_by {
+        if matches!(op, AggregateOp::Count) {
+            if group_by {
                 let group_field = idx.fields.get(eq_len).ok_or_else(|| {
                     RtDbError::new(
                         ErrorCode::BadRequest,
@@ -691,7 +862,7 @@ impl InMemoryRtDbClient {
                 filtered.len() as i64
             )));
         }
-        let (group_field, agg_field) = if agg.group_by {
+        let (group_field, agg_field) = if group_by {
             if eq_len + 1 >= idx.fields.len() {
                 return Err(RtDbError::new(
                     ErrorCode::BadRequest,
@@ -717,7 +888,7 @@ impl InMemoryRtDbClient {
             .and_then(|ty| index_column_type(ty).ok())
             .map(|it| it.pg)
             .unwrap_or(PgType::Text);
-        let op_name = match agg.op {
+        let op_name = match op {
             AggregateOp::Sum => "sum",
             AggregateOp::Avg => "avg",
             AggregateOp::Min => "min",
@@ -726,7 +897,7 @@ impl InMemoryRtDbClient {
             // the match exhaustive as the enum grows.
             AggregateOp::Count => "count",
         };
-        if matches!(agg.op, AggregateOp::Sum | AggregateOp::Avg)
+        if matches!(op, AggregateOp::Sum | AggregateOp::Avg)
             && !matches!(agg_field_pg, PgType::Number | PgType::Int64)
         {
             return Err(RtDbError::new(
@@ -772,7 +943,7 @@ impl InMemoryRtDbClient {
                     let value = if vs.is_empty() {
                         Value::Null
                     } else {
-                        apply_aggregate(agg.op, &vs, agg_field_pg)
+                        apply_aggregate(op, &vs, agg_field_pg)
                     };
                     let mut obj = Map::new();
                     obj.insert("key".to_string(), k);
@@ -794,7 +965,7 @@ impl InMemoryRtDbClient {
         if values.is_empty() {
             return Ok(Value::Null);
         }
-        Ok(apply_aggregate(agg.op, &values, agg_field_pg))
+        Ok(apply_aggregate(op, &values, agg_field_pg))
     }
 
     /// `collect` tail of `run_query` — the fallthrough after every standalone

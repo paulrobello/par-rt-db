@@ -173,8 +173,9 @@ async fn distinct_rejects_conflicting_terminals() {
             Query {
                 distinct: true,
                 aggregate: Some(AggregateSpec {
-                    op: AggregateOp::Sum,
-                    group_by: false,
+                    op: Some(AggregateOp::Sum),
+                    aggregates: None,
+                    group_by: crate::wire::GroupBy::Bool(false),
                 }),
                 ..base()
             },
@@ -459,8 +460,9 @@ async fn aggregate_rejects_conflicting_terminals() {
         ..Default::default()
     };
     let sum = || AggregateSpec {
-        op: AggregateOp::Sum,
-        group_by: false,
+        op: Some(AggregateOp::Sum),
+        aggregates: None,
+        group_by: crate::wire::GroupBy::Bool(false),
     };
     // ENH-028: the table-driven evaluator's `terminal-exclusive` rule covers
     // every pair among {aggregate,count,distinct,first,get,paginate,take,

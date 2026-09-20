@@ -56,7 +56,7 @@ async fn insert_list_cancel_roundtrip() {
     scheduler::ensure_table(&pool, &db).await.unwrap();
 
     let txn = empty_txn();
-    let id = scheduler::insert(&pool, &db, "oneshot", 123, &txn, None, None, false)
+    let id = scheduler::insert(&pool, &db, "oneshot", 123, &txn, None, None, None, false)
         .await
         .unwrap();
     let listed = scheduler::list(&pool, &db).await.unwrap();
@@ -85,6 +85,7 @@ async fn pause_resume_cron_recomputes_due() {
         &txn,
         Some("*/5 * * * *"),
         None,
+        None,
         false,
     )
     .await
@@ -111,7 +112,7 @@ async fn claim_due_and_finalize() {
     let db = unique_db(&pool).await;
     scheduler::ensure_table(&pool, &db).await.unwrap();
     let txn = empty_txn();
-    let one = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, false)
+    let one = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, None, false)
         .await
         .unwrap();
     let cron = scheduler::insert(
@@ -121,6 +122,7 @@ async fn claim_due_and_finalize() {
         1,
         &txn,
         Some("*/5 * * * *"),
+        None,
         None,
         false,
     )
@@ -135,7 +137,7 @@ async fn claim_due_and_finalize() {
     scheduler::finalize_one_shot_done(&pool, &db, &one)
         .await
         .unwrap();
-    let next = scheduler::next_fire("*/5 * * * *", rtdb_server::db::now_ms()).unwrap();
+    let next = scheduler::next_fire("*/5 * * * *", rtdb_server::db::now_ms(), None).unwrap();
     scheduler::finalize_recurring_next(&pool, &db, &cron, next)
         .await
         .unwrap();
@@ -154,7 +156,7 @@ async fn concurrent_internal_claims_never_exceed_the_batch() {
     scheduler::ensure_table(&pool, &db).await.unwrap();
     let txn = empty_txn();
     for _ in 0..5 {
-        scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, false)
+        scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, None, false)
             .await
             .unwrap();
     }
@@ -208,7 +210,7 @@ async fn reset_running_recovers_orphans() {
     let db = unique_db(&pool).await;
     scheduler::ensure_table(&pool, &db).await.unwrap();
     let txn = empty_txn();
-    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, false)
+    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, None, false)
         .await
         .unwrap();
     // Simulate a crash mid-fire: the committer claimed but never finalized.
@@ -233,13 +235,13 @@ async fn next_due_and_mark_error() {
     // Empty table → nothing due.
     assert!(scheduler::next_due(&pool, &db).await.unwrap().is_none());
 
-    let _a = scheduler::insert(&pool, &db, "oneshot", 50, &txn, None, None, false)
+    let _a = scheduler::insert(&pool, &db, "oneshot", 50, &txn, None, None, None, false)
         .await
         .unwrap();
-    let b = scheduler::insert(&pool, &db, "oneshot", 10, &txn, None, None, false)
+    let b = scheduler::insert(&pool, &db, "oneshot", 10, &txn, None, None, None, false)
         .await
         .unwrap();
-    let _c = scheduler::insert(&pool, &db, "oneshot", 90, &txn, None, None, false)
+    let _c = scheduler::insert(&pool, &db, "oneshot", 90, &txn, None, None, None, false)
         .await
         .unwrap();
 
@@ -265,7 +267,7 @@ async fn pause_resume_one_shot_keeps_due_at() {
     let db = unique_db(&pool).await;
     scheduler::ensure_table(&pool, &db).await.unwrap();
     let txn = empty_txn();
-    let id = scheduler::insert(&pool, &db, "oneshot", 42, &txn, None, None, false)
+    let id = scheduler::insert(&pool, &db, "oneshot", 42, &txn, None, None, None, false)
         .await
         .unwrap();
 
@@ -419,7 +421,7 @@ async fn one_shot_fires_and_writes() {
             doc: serde_json::json!({ "n": 42 }).as_object().unwrap().clone(),
         }],
     };
-    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, false)
+    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, None, false)
         .await
         .unwrap();
 
@@ -478,9 +480,19 @@ async fn cron_fires_and_stays_pending() {
             doc: serde_json::json!({ "n": 7 }).as_object().unwrap().clone(),
         }],
     };
-    let _id = scheduler::insert(&pool, &db, "cron", 1, &txn, Some("* * * * *"), None, false)
-        .await
-        .unwrap();
+    let _id = scheduler::insert(
+        &pool,
+        &db,
+        "cron",
+        1,
+        &txn,
+        Some("* * * * *"),
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
 
     warm_up_committer(&committers, &db).await;
 
@@ -544,9 +556,19 @@ async fn failing_cron_reschedules_anyway() {
             version: 999,
         }],
     };
-    let _id = scheduler::insert(&pool, &db, "cron", 1, &txn, Some("* * * * *"), None, false)
-        .await
-        .unwrap();
+    let _id = scheduler::insert(
+        &pool,
+        &db,
+        "cron",
+        1,
+        &txn,
+        Some("* * * * *"),
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
 
     let before = rtdb_server::db::now_ms();
     warm_up_committer(&committers, &db).await;
@@ -631,9 +653,19 @@ async fn one_shot_catches_up_after_being_past_due() {
         }],
     };
     let one_hour_ago = rtdb_server::db::now_ms() - 3_600_000;
-    let _id = scheduler::insert(&pool, &db, "oneshot", one_hour_ago, &txn, None, None, false)
-        .await
-        .unwrap();
+    let _id = scheduler::insert(
+        &pool,
+        &db,
+        "oneshot",
+        one_hour_ago,
+        &txn,
+        None,
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
 
     let appeared = poll_for_n(&pool, &db, &schema, 5, Duration::from_secs(15)).await;
     assert!(
@@ -687,6 +719,7 @@ async fn cron_skips_missed_windows() {
         one_hour_ago,
         &txn,
         Some("* * * * *"),
+        None,
         None,
         false,
     )
@@ -782,7 +815,7 @@ async fn failing_txn_marks_error_one_shot() {
             },
         ],
     };
-    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, false)
+    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, None, false)
         .await
         .unwrap();
 
@@ -832,9 +865,19 @@ async fn pause_resume_interval_shifts_due_from_resume() {
     let db = unique_db(&pool).await;
     scheduler::ensure_table(&pool, &db).await.unwrap();
     let txn = empty_txn();
-    let id = scheduler::insert(&pool, &db, "interval", 1, &txn, None, Some(60_000), false)
-        .await
-        .unwrap();
+    let id = scheduler::insert(
+        &pool,
+        &db,
+        "interval",
+        1,
+        &txn,
+        None,
+        Some(60_000),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
 
     let info = &scheduler::list(&pool, &db).await.unwrap()[0];
     assert_eq!(info.kind, ScheduleKind::Interval);
@@ -889,9 +932,19 @@ async fn interval_fires_repeatedly_and_skips_paused_windows() {
     // Due in the past so the first fire is immediate (catch-up path); every
     // later fire re-arms one interval out from its fire time.
     let txn = empty_txn();
-    let id = scheduler::insert(&pool, &db, "interval", 1, &txn, None, Some(EVERY_MS), false)
-        .await
-        .unwrap();
+    let id = scheduler::insert(
+        &pool,
+        &db,
+        "interval",
+        1,
+        &txn,
+        None,
+        Some(EVERY_MS),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
 
     warm_up_committer(&committers, &db).await;
 
@@ -1003,7 +1056,7 @@ async fn external_jobs_are_never_internally_claimed() {
     let db = unique_db(&pool).await;
     scheduler::ensure_table(&pool, &db).await.unwrap();
     let txn = empty_txn();
-    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, true)
+    let _id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, None, true)
         .await
         .unwrap();
 
@@ -1032,7 +1085,7 @@ async fn external_claim_assigns_monotonic_generation() {
     let db = unique_db(&pool).await;
     scheduler::ensure_table(&pool, &db).await.unwrap();
     let txn = empty_txn();
-    let id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, true)
+    let id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, None, true)
         .await
         .unwrap();
 
@@ -1083,7 +1136,7 @@ async fn concurrent_external_claims_never_exceed_the_limit() {
     scheduler::ensure_table(&pool, &db).await.unwrap();
     let txn = empty_txn();
     for _ in 0..5 {
-        scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, true)
+        scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, None, true)
             .await
             .unwrap();
     }
@@ -1153,7 +1206,7 @@ async fn external_finalize_rejects_stale_and_unknown() {
     .expect_err("unknown id must be NotFound");
     assert_eq!(err.code, ErrorCode::NotFound);
 
-    let id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, true)
+    let id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, None, true)
         .await
         .unwrap();
     let claimed = scheduler::claim_external(&pool, &db, rtdb_server::db::now_ms(), 8, 60_000)
@@ -1199,9 +1252,19 @@ async fn external_finalize_complete_advance_retry_fail() {
     let txn = empty_txn();
 
     // --- Complete on an external cron advances it to its next due instant.
-    let cron_id = scheduler::insert(&pool, &db, "cron", 1, &txn, Some("*/5 * * * *"), None, true)
-        .await
-        .unwrap();
+    let cron_id = scheduler::insert(
+        &pool,
+        &db,
+        "cron",
+        1,
+        &txn,
+        Some("*/5 * * * *"),
+        None,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
     let claimed = scheduler::claim_external(&pool, &db, rtdb_server::db::now_ms(), 8, 60_000)
         .await
         .unwrap();
@@ -1242,7 +1305,7 @@ async fn external_finalize_complete_advance_retry_fail() {
     assert!(scheduler::cancel(&pool, &db, &cron_id).await.unwrap());
 
     // --- Retry re-arms a one-shot at now + delayMs, keeping the generation.
-    let one_id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, true)
+    let one_id = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, None, true)
         .await
         .unwrap();
     let claimed = scheduler::claim_external(&pool, &db, rtdb_server::db::now_ms(), 8, 60_000)
@@ -1326,10 +1389,10 @@ async fn reset_running_preserves_external_leases() {
     let db = unique_db(&pool).await;
     scheduler::ensure_table(&pool, &db).await.unwrap();
     let txn = empty_txn();
-    let internal = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, false)
+    let internal = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, None, false)
         .await
         .unwrap();
-    let external = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, true)
+    let external = scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, None, true)
         .await
         .unwrap();
 

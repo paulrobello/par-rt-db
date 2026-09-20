@@ -237,6 +237,9 @@ pub enum ScheduleWhen {
     Cron {
         /// 5-field cron expression (UTC, min-first).
         expr: String,
+        /// Optional IANA timezone used to evaluate the cron's local wall clock.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tz: Option<String>,
     },
     /// Fire every `every_ms` milliseconds, starting one interval from now.
     /// Missed windows (downtime, pause) are skipped, never backfilled —
@@ -481,6 +484,9 @@ pub struct ScheduleInfo {
     /// The cron expression, for cron jobs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cron: Option<String>,
+    /// IANA timezone used for cron evaluation, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tz: Option<String>,
     /// Interval jobs only: the fixed recurrence in ms (`kind: "interval"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub every_ms: Option<i64>,

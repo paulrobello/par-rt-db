@@ -2116,6 +2116,7 @@ mod tests {
             schedule_id: "sch-1".into(),
             when: ScheduleWhen::Cron {
                 expr: "*/5 * * * *".into(),
+                tz: None,
             },
             txn: Transaction { steps: vec![] },
             external: None,
@@ -2751,6 +2752,7 @@ mod tests {
                     kind: ScheduleKind::Cron,
                     due_at: 9000,
                     cron: Some("*/5 * * * *".into()),
+                    tz: None,
                     every_ms: None,
                     status: ScheduleStatus::Pending,
                     last_error: None,

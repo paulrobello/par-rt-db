@@ -16,6 +16,7 @@
 //! non-uniform — do not normalize them.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 use crate::auth::PrincipalCtx;
 use crate::error::RtDbError;
@@ -256,17 +257,80 @@ impl AggregateOp {
     }
 }
 
-/// `aggregate` terminal spec. `op` selects the SQL aggregate run over the index
-/// field after the eq prefix (`index.fields[eq.len()]`); `group_by` shifts the
-/// terminal to a grouped aggregate — groups by `index.fields[eq.len()]` and
-/// aggregates `index.fields[eq.len()+1]`, returning `{key, value}` rows. Wire
-/// shape is camelCase (`groupBy`) to match the rest of the protocol.
+/// `aggregate` terminal spec. Exactly one of `op` (single scalar op) or
+/// `aggregates` (wire v2: alias → op map, evaluated in one pass) must be set —
+/// both or neither is a compile-time `BadRequest`. `group_by` shifts the
+/// terminal to a grouped aggregate: `Bool(true)` groups by
+/// `index.fields[eq.len()]` and aggregates `index.fields[eq.len()+1]`,
+/// returning `{key, value}` rows (legacy shape, byte-identical); `Fields`
+/// (wire v2) groups by the listed declared index fields, each at position
+/// ≥ eq prefix, returning `aggregateMultiGroups` rows. Wire shape is camelCase
+/// (`groupBy`, `aggregates`) to match the rest of the protocol.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AggregateSpec {
-    pub op: AggregateOp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<AggregateOp>,
     #[serde(default)]
-    pub group_by: bool,
+    pub group_by: GroupBy,
+    /// Wire v2: alias → op. All field-needing ops share the ONE index-derived
+    /// aggregate field; aliases become the keys of the `aggregateMulti`
+    /// object / `values` map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregates: Option<BTreeMap<String, AggregateOp>>,
+}
+
+impl AggregateSpec {
+    /// The ops to evaluate as `(alias, op)` pairs in deterministic order. A
+    /// single-`op` spec aliases its result by the lowercase op name (used only
+    /// by the wire-v2 result shapes). Enforces exactly-one-of and the alias
+    /// charset — aliases become `jsonb_build_object` labels, so anything
+    /// outside `[A-Za-z0-9_]` (≤ 64 chars) is rejected rather than escaped.
+    pub(crate) fn aliased_ops(&self) -> Result<Vec<(String, AggregateOp)>, RtDbError> {
+        match (&self.op, &self.aggregates) {
+            (Some(op), None) => Ok(vec![(op.sql_fn().to_lowercase(), *op)]),
+            (None, Some(map)) => {
+                if map.is_empty() {
+                    return Err(RtDbError::bad_request("aggregates must not be empty"));
+                }
+                for alias in map.keys() {
+                    if alias.is_empty() || alias.len() > 64 {
+                        return Err(RtDbError::bad_request(
+                            "aggregates alias must be 1-64 characters",
+                        ));
+                    }
+                    if !alias.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                        return Err(RtDbError::bad_request(
+                            "aggregates alias may contain only [A-Za-z0-9_]",
+                        ));
+                    }
+                }
+                Ok(map.iter().map(|(a, o)| (a.clone(), *o)).collect())
+            }
+            (Some(_), Some(_)) => Err(RtDbError::bad_request(
+                "aggregate op and aggregates are mutually exclusive",
+            )),
+            (None, None) => Err(RtDbError::bad_request(
+                "aggregate requires op or aggregates",
+            )),
+        }
+    }
+}
+
+/// Wire v2 widening of the aggregate `groupBy` clause: `false`/`true` keep the
+/// legacy wire bytes byte-identical (including the always-serialized
+/// `groupBy: false`), while a field list groups by those declared index fields.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum GroupBy {
+    Bool(bool),
+    Fields(Vec<String>),
+}
+
+impl Default for GroupBy {
+    fn default() -> Self {
+        Self::Bool(false)
+    }
 }
 
 /// One `{key, value}` row from a grouped `aggregate` (`groupBy: true`) terminal.
@@ -295,6 +359,24 @@ pub enum QueryResult {
     Distinct(Vec<serde_json::Value>), // distinct: unique values of index.fields[eq.len()] over the matching set
     Aggregate(serde_json::Value), // aggregate: bare scalar (null if no rows match), e.g. `42`, `"x"`, `null`
     AggregateGroups(Vec<AggregateGroup>), // aggregate groupBy: array of `{key, value}` rows
+    /// Wire v2 `aggregates` map, ungrouped: one object alias → value, e.g.
+    /// `{"revenue": 1250.5, "orders": 42}`. A NULL aggregate surfaces as JSON
+    /// null per alias.
+    AggregateMulti(serde_json::Value),
+    /// Wire v2 multi-op / multi-field groupBy rows: `keys` are the group's
+    /// values of the groupBy fields in declared order; `values` maps each
+    /// alias (or, for a single-`op` spec, the lowercase op name) to its
+    /// aggregate. Ordered by group keys ascending, capped by `MAX_TAKE`.
+    AggregateMultiGroups(Vec<AggregateMultiGroup>),
+}
+
+/// One `{keys, values}` row from a wire-v2 grouped aggregate. See
+/// [`QueryResult::AggregateMultiGroups`].
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AggregateMultiGroup {
+    pub keys: Vec<serde_json::Value>,
+    pub values: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

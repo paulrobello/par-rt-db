@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_serializer
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 from pydantic_core.core_schema import SerializerFunctionWrapHandler
 
 
@@ -46,7 +46,7 @@ class _Camel(BaseModel):
 #: HTTP header; a server whose ``PROTOCOL_VERSION`` is older rejects a value
 #: greater than its own with ``UNSUPPORTED_PROTOCOL``. Mirrors server
 #: ``protocol::PROTOCOL_VERSION``.
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 
 class AuthedUser(_Camel):
@@ -103,14 +103,22 @@ class RunAt(_Camel):
 
 
 class Cron(_Camel):
-    """Fire repeatedly on a 5-field cron schedule (UTC, minute-first).
+    """Fire repeatedly on a 5-field cron schedule.
 
-    Attributes:
-        expr: The cron expression.
+    ``tz`` is an optional IANA timezone name. It is omitted when absent so
+    existing cron payloads retain their legacy wire shape.
     """
 
     type: Literal["cron"] = "cron"
     expr: str
+    tz: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_none_tz(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("tz") is None:
+            out.pop("tz", None)
+        return out
 
 
 class Interval(_Camel):
@@ -157,6 +165,7 @@ class ScheduleInfo(_Camel):
     due_at: int
     cron: str | None = None
     every_ms: int | None = None
+    tz: str | None = None
     status: Literal["pending", "running", "paused", "error"]
     last_error: str | None = None
     created_at: int
@@ -166,7 +175,7 @@ class ScheduleInfo(_Camel):
     @model_serializer(mode="wrap")
     def _drop_none_optional(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
-        for alias in ("cron", "everyMs", "lastError"):
+        for alias in ("cron", "everyMs", "tz", "lastError"):
             if out.get(alias) is None:
                 out.pop(alias, None)
         if not out.get("external"):
@@ -192,13 +201,14 @@ class ClaimedSchedule(_Camel):
     txn: dict[str, Any]
     cron: str | None = None
     every_ms: int | None = None
+    tz: str | None = None
     lease_generation: int
     lease_deadline_ms: int
 
     @model_serializer(mode="wrap")
     def _drop_none_optional(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
-        for alias in ("cron", "everyMs"):
+        for alias in ("cron", "everyMs", "tz"):
             if out.get(alias) is None:
                 out.pop(alias, None)
         return out
@@ -506,24 +516,38 @@ class AggregateOp:
 
 
 class AggregateSpec(_Camel):
-    """``aggregate`` terminal spec: ``{op, groupBy?}``.
+    """Aggregate terminal spec supporting legacy and v2 forms.
 
-    ``op`` selects the SQL aggregate run over the index field after the eq
-    prefix; ``groupBy`` (camelCase on the wire) shifts the terminal to a grouped
-    aggregate. ``count`` aggregates rows and consumes no aggregate field (a
-    scalar ``count`` needs no index at all; a grouped ``count`` needs one index
-    field beyond the eq prefix to group by). Mirrors
-    ``server/src/query.rs::AggregateSpec`` byte-for-byte. ``groupBy`` is omitted
-    on the wire when ``False`` (mirrors the TS/Rust clients' skip-when-false
-    convention; the server accepts either form).
+    Legacy ``op`` plus boolean ``groupBy`` remains byte-compatible. V2 may
+    instead provide an alias-to-operation ``aggregates`` map and a list of
+    group fields, but never both ``op`` and ``aggregates``.
     """
 
-    op: Literal["sum", "avg", "min", "max", "count"]
-    group_by: bool = False
+    op: Literal["sum", "avg", "min", "max", "count"] | None = None
+    aggregates: dict[str, Literal["sum", "avg", "min", "max", "count"]] | None = None
+    group_by: bool | list[str] = False
+
+    @model_validator(mode="after")
+    def _validate_variant(self) -> AggregateSpec:
+        if (self.op is None) == (self.aggregates is None):
+            raise ValueError("aggregate requires exactly one of op or aggregates")
+        if self.aggregates is not None:
+            if not self.aggregates:
+                raise ValueError("aggregates must not be empty")
+            for alias in self.aggregates:
+                if not alias or len(alias) > 64 or not alias.replace("_", "").isalnum():
+                    raise ValueError("aggregate aliases must match [A-Za-z0-9_]{1,64}")
+        if isinstance(self.group_by, list) and not self.group_by:
+            raise ValueError("groupBy field list must not be empty")
+        return self
 
     @model_serializer(mode="wrap")
-    def _drop_false_group_by(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+    def _drop_legacy_false_group_by(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
+        if out.get("op") is None:
+            out.pop("op", None)
+        if out.get("aggregates") is None:
+            out.pop("aggregates", None)
         if out.get("groupBy") is False:
             out.pop("groupBy", None)
         return out
@@ -537,6 +561,13 @@ class AggregateGroup(_Camel):
 
     key: Any
     value: Any
+
+
+class AggregateMultiGroup(_Camel):
+    """One v2 explicit-group aggregate row: ``{keys, values}``."""
+
+    keys: list[Any]
+    values: dict[str, Any]
 
 
 class VectorSearchQuery(_Camel):
@@ -860,6 +891,23 @@ class _ErrorEnvelope(_Camel):
 
     code: str
     message: str
+
+
+class BatchMutateOutcome(_Camel):
+    """One slot of a ``POST /api/mutate-batch`` response."""
+
+    ok: bool
+    results: list[Any] | None = None
+    error: _ErrorEnvelope | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_optional(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("results") is None:
+            out.pop("results", None)
+        if out.get("error") is None:
+            out.pop("error", None)
+        return out
 
 
 class BatchQueryOutcome(_Camel):

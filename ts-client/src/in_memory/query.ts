@@ -966,8 +966,8 @@ function executeDistinctTerminal(
   return values.slice(0, MAX_TAKE);
 }
 
-/** `aggregate` terminal: OP over the index field after the eq prefix, with
- *  optional `groupBy`. */
+/** `aggregate` terminal: supports legacy single-op results and wire-v2
+ * multi-op/composite-group results. */
 function executeAggregateTerminal(
   q: QueryJson,
   tableDef: TableJson,
@@ -989,89 +989,110 @@ function executeAggregateTerminal(
     return false;
   };
   // biome-ignore lint/style/noNonNullAssertion: dispatcher only calls this under q.aggregate !== undefined
-  const { op, groupBy = false } = q.aggregate!;
-  // `count` aggregates rows, not a field — it consumes no aggregate index
-  // field (mirrors server `AggregateOp::needs_field`).
-  const needsField = op !== "count";
-  if (groupBy) {
-    if (!indexDef || eqLen >= indexDef.fields.length) {
-      throw new RtDbError(
-        "BAD_REQUEST",
-        "aggregate groupBy requires an index field beyond the eq prefix",
-      );
+  const { op, aggregates, groupBy = false } = q.aggregate!;
+  if (op !== undefined && aggregates !== undefined) {
+    throw new RtDbError("BAD_REQUEST", "aggregate op and aggregates are mutually exclusive");
+  }
+  const aggregateOps: Array<[string, AggregateOp]> = aggregates
+    ? Object.entries(aggregates)
+    : op
+      ? [[op, op]]
+      : [];
+  if (aggregateOps.length === 0) {
+    throw new RtDbError("BAD_REQUEST", "aggregate requires op or aggregates");
+  }
+  for (const [alias] of aggregateOps) {
+    if (!/^[A-Za-z0-9_]{1,64}$/.test(alias)) {
+      throw new RtDbError("BAD_REQUEST", "aggregates alias may contain only [A-Za-z0-9_]");
     }
-    const groupField = indexDef.fields[eqLen];
-    const groupFieldPg = indexColumnType(tableDef.fields[groupField]).pg;
-    let aggField: string | undefined;
-    let aggFieldPg: PgType | undefined;
-    if (needsField) {
-      if (eqLen + 1 >= indexDef.fields.length) {
+  }
+  const needsField = aggregateOps.some(([, aggregateOp]) => aggregateOp !== "count");
+  // `count` aggregates rows, not a field — it consumes no aggregate index
+  const legacy = op !== undefined && aggregates === undefined && !Array.isArray(groupBy);
+  const groupFields =
+    groupBy === true ? [indexDef?.fields[eqLen]] : Array.isArray(groupBy) ? groupBy : [];
+  if (groupFields.some((field) => field === undefined)) {
+    throw new RtDbError(
+      "BAD_REQUEST",
+      "aggregate groupBy requires an index field beyond the eq prefix",
+    );
+  }
+  if (
+    groupFields.length > 0 &&
+    (!indexDef || groupFields.some((field) => !indexDef.fields.includes(field!)))
+  ) {
+    throw new RtDbError("BAD_REQUEST", "aggregate groupBy field is not a declared index field");
+  }
+  let aggregateField: string | undefined;
+  if (needsField) {
+    if (!indexDef)
+      throw new RtDbError("BAD_REQUEST", "aggregate requires an index field beyond the eq prefix");
+    aggregateField = indexDef.fields.slice(eqLen).find((field) => !groupFields.includes(field));
+    if (!aggregateField)
+      throw new RtDbError("BAD_REQUEST", "aggregate requires an index field beyond the eq prefix");
+    const aggregatePg = indexColumnType(tableDef.fields[aggregateField]).pg;
+    for (const [, aggregateOp] of aggregateOps) {
+      if ((aggregateOp === "sum" || aggregateOp === "avg") && !isNumeric(aggregateField)) {
         throw new RtDbError(
           "BAD_REQUEST",
-          "aggregate groupBy requires two index fields beyond the eq prefix",
+          `aggregate op ${aggregateOp} requires a numeric index field`,
         );
       }
-      aggField = indexDef.fields[eqLen + 1];
-      aggFieldPg = indexColumnType(tableDef.fields[aggField]).pg;
-      if ((op === "sum" || op === "avg") && !isNumeric(aggField)) {
-        throw new RtDbError("BAD_REQUEST", `aggregate op ${op} requires a numeric index field`);
-      }
     }
-    // Group rows by `groupField` value, preserving first-seen order and then
-    // sorting by key ascending for parity with the server's ORDER BY k — rows
-    // missing the group field form one null group (the server's GROUP BY
-    // includes the SQL NULL group; compareIndexValues sorts it last, matching
-    // Postgres NULLS LAST). `count` counts rows (one entry per row); else
-    // aggregate the field's non-null values (SQL aggregates skip NULL — a
-    // group left with none aggregates to null).
-    const groups = new Map<unknown, unknown[]>();
+    if (groupBy === true && eqLen + 1 >= indexDef.fields.length) {
+      throw new RtDbError(
+        "BAD_REQUEST",
+        "aggregate groupBy requires two index fields beyond the eq prefix",
+      );
+    }
+    void aggregatePg;
+  }
+  const valueFor = (row: StoredRow, aggregateOp: AggregateOp): unknown[] => {
+    if (aggregateOp === "count") return [row];
+    return [row.doc[aggregateField!]];
+  };
+  const evaluate = (rows: StoredRow[], aggregateOp: AggregateOp): unknown => {
+    const values = rows
+      .flatMap((row) => valueFor(row, aggregateOp))
+      .filter((value) => value !== null && value !== undefined);
+    return aggregateOp === "count"
+      ? rows.length
+      : values.length === 0
+        ? null
+        : applyAggregate(aggregateOp, values, indexColumnType(tableDef.fields[aggregateField!]).pg);
+  };
+  if (groupFields.length > 0) {
+    const groups = new Map<string, { keys: unknown[]; rows: StoredRow[] }>();
     for (const row of filtered) {
-      const k = row.doc[groupField] ?? null;
-      const entry = aggField !== undefined ? row.doc[aggField] : row;
-      const existing = groups.get(k);
-      if (existing) {
-        existing.push(entry);
-      } else {
-        groups.set(k, [entry]);
-      }
+      const keys = groupFields.map((field) => row.doc[field!] ?? null);
+      const key = JSON.stringify(keys);
+      const existing = groups.get(key);
+      if (existing) existing.rows.push(row);
+      else groups.set(key, { keys, rows: [row] });
     }
-    const out = Array.from(groups.entries())
-      .map(([k, values]) => {
-        if (op === "count") {
-          return { key: k, value: applyAggregate(op, values, aggFieldPg) };
+    const sorted = [...groups.values()]
+      .sort((a, b) => {
+        for (let i = 0; i < groupFields.length; i++) {
+          const pg = indexColumnType(tableDef.fields[groupFields[i]!]).pg;
+          const cmp = compareIndexValues(a.keys[i], b.keys[i], pg);
+          if (cmp !== 0) return cmp;
         }
-        const present = values.filter((v) => v !== null && v !== undefined);
-        return {
-          key: k,
-          value: present.length > 0 ? applyAggregate(op, present, aggFieldPg) : null,
-        };
+        return 0;
       })
-      .sort((a, b) => compareIndexValues(a.key, b.key, groupFieldPg))
       .slice(0, MAX_TAKE);
-    return out;
+    if (legacy && groupBy === true)
+      return sorted.map(({ keys, rows }) => ({ key: keys[0], value: evaluate(rows, op!) }));
+    return sorted.map(({ keys, rows }) => ({
+      keys,
+      values: Object.fromEntries(
+        aggregateOps.map(([alias, aggregateOp]) => [alias, evaluate(rows, aggregateOp)]),
+      ),
+    }));
   }
-  // Scalar: `count` needs no index/field (COUNT(*) over the matching set);
-  // sum/avg/min/max require an aggregate field beyond the eq prefix.
-  if (needsField) {
-    if (!indexDef) {
-      throw new RtDbError("BAD_REQUEST", "aggregate requires an index field beyond the eq prefix");
-    }
-    if (eqLen >= indexDef.fields.length) {
-      throw new RtDbError("BAD_REQUEST", "aggregate requires an index field beyond the eq prefix");
-    }
-    const aggField = indexDef.fields[eqLen];
-    const aggFieldPg = indexColumnType(tableDef.fields[aggField]).pg;
-    if ((op === "sum" || op === "avg") && !isNumeric(aggField)) {
-      throw new RtDbError("BAD_REQUEST", `aggregate op ${op} requires a numeric index field`);
-    }
-    const values = filtered
-      .map((row) => row.doc[aggField])
-      .filter((v) => v !== null && v !== undefined);
-    // Empty set → null (matches server SUM/AVG/MIN/MAX over zero rows).
-    return values.length === 0 ? null : applyAggregate(op, values, aggFieldPg);
-  }
-  // Scalar count: COUNT(*) over the matching set (0 when empty).
-  return filtered.length;
+  if (legacy) return evaluate(filtered, op!);
+  return Object.fromEntries(
+    aggregateOps.map(([alias, aggregateOp]) => [alias, evaluate(filtered, aggregateOp)]),
+  );
 }
 
 /** `paginate` terminal: keyset-cursor paging over the already-filtered,

@@ -111,7 +111,9 @@ async fn auth_with_protocol_version_echoes_server_version() -> anyhow::Result<()
     let msg = recv_json(&mut ws).await;
 
     assert_eq!(msg["type"], json!("authOk"));
-    assert_eq!(msg["protocolVersion"], json!(1));
+    // The echo is the SERVER's version, not the client's request: the client
+    // sent 1, the v2 server answers 2 (wire-v2 bundle).
+    assert_eq!(msg["protocolVersion"], json!(2));
     Ok(())
 }
 

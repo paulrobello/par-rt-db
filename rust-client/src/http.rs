@@ -267,6 +267,46 @@ impl RtDbHttpClient {
         Ok(parsed.results)
     }
 
+    /// Run independent transactions sequentially through `/api/mutate-batch`.
+    /// Each response slot is aligned with the input transaction and may fail
+    /// without rolling back other slots.
+    pub async fn batch_mutate(
+        &self,
+        txns: &[(&Transaction, Option<&str>)],
+    ) -> Result<Vec<crate::wire::BatchMutateOutcome>, RtDbError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            db: &'a str,
+            txns: Vec<crate::wire::BatchMutateRequest<'a>>,
+        }
+        let body = Body {
+            db: &self.db,
+            txns: txns
+                .iter()
+                .map(|(txn, key)| crate::wire::BatchMutateRequest {
+                    txn,
+                    idempotency_key: *key,
+                })
+                .collect(),
+        };
+        let resp = self
+            .client
+            .post(format!("{}/api/mutate-batch", self.url))
+            .authed(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("batch mutate request failed: {e}")))?;
+        #[derive(serde::Deserialize)]
+        struct BatchResponse {
+            results: Vec<crate::wire::BatchMutateOutcome>,
+        }
+        Ok(crate::http_common::deserialize::<BatchResponse>(resp)
+            .await?
+            .results)
+    }
+
     /// Run a transaction; returns one `StepResult` per step.
     pub async fn mutate(
         &self,

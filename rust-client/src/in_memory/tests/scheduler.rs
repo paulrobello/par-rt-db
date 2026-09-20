@@ -159,6 +159,7 @@ async fn list_schedules_returns_server_aligned_info() {
             insert_todo_txn(),
             ScheduleWhen::Cron {
                 expr: "* * * * *".to_string(),
+                tz: None,
             },
             false,
         )
@@ -203,6 +204,7 @@ async fn tick_cron_re_arms_and_fires_again_on_a_later_tick() {
         insert_todo_txn(),
         ScheduleWhen::Cron {
             expr: "* * * * *".to_string(),
+            tz: None,
         },
         false,
     )
@@ -253,6 +255,7 @@ async fn tick_cron_skips_missed_windows_does_not_backfill() {
         insert_todo_txn(),
         ScheduleWhen::Cron {
             expr: "* * * * *".to_string(),
+            tz: None,
         },
         false,
     )

@@ -441,7 +441,38 @@ impl TableQuery {
     /// non-numeric, no-index, or no-field-beyond-prefix cases. Mutually exclusive
     /// with every other terminal except `eq`/range bounds/`filter`.
     pub fn aggregate(mut self, op: AggregateOp, group_by: bool) -> Query {
-        self.q.aggregate = Some(AggregateSpec { op, group_by });
+        self.q.aggregate = Some(AggregateSpec {
+            op: Some(op),
+            aggregates: None,
+            group_by: crate::wire::GroupBy::Bool(group_by),
+        });
+        self.q
+    }
+
+    /// Queue a wire-v2 multi-operation aggregate. Aliases are validated by the
+    /// server and are serialized in deterministic `BTreeMap` order.
+    pub fn aggregate_many(
+        mut self,
+        aggregates: std::collections::BTreeMap<String, AggregateOp>,
+        group_by: crate::wire::GroupBy,
+    ) -> Query {
+        self.q.aggregate = Some(AggregateSpec {
+            op: None,
+            aggregates: Some(aggregates),
+            group_by,
+        });
+        self.q
+    }
+
+    /// Queue a single operation with an explicit composite group-by field list.
+    pub fn aggregate_group_by_fields(mut self, op: AggregateOp, fields: &[&str]) -> Query {
+        self.q.aggregate = Some(AggregateSpec {
+            op: Some(op),
+            aggregates: None,
+            group_by: crate::wire::GroupBy::Fields(
+                fields.iter().map(|field| (*field).to_string()).collect(),
+            ),
+        });
         self.q
     }
     /// Finish with the cursor-pagination terminal. Pass the previous page's

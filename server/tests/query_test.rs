@@ -10,8 +10,8 @@ use rtdb_server::dsl::EqBind;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::pagination::encode_cursor;
 use rtdb_server::query::{
-    AggregateGroup, AggregateOp, AggregateSpec, Order, Paginate, Query, QueryResult, canonical,
-    execute_query,
+    AggregateGroup, AggregateOp, AggregateSpec, GroupBy, Order, Paginate, Query, QueryResult,
+    canonical, execute_query,
 };
 use rtdb_server::schema::SchemaDef;
 use rtdb_server::txn::{Step, Transaction, execute_txn};
@@ -2633,8 +2633,9 @@ async fn distinct_combined_with_take_is_bad_request() -> anyhow::Result<()> {
 /// Aggregate spec without groupBy (most common shape in the tests below).
 fn agg(op: AggregateOp) -> AggregateSpec {
     AggregateSpec {
-        op,
-        group_by: false,
+        op: Some(op),
+        group_by: GroupBy::Bool(false),
+        aggregates: None,
     }
 }
 
@@ -3028,8 +3029,9 @@ async fn aggregate_group_by_returns_one_row_per_group() -> anyhow::Result<()> {
             Some("by_project_status_order"),
             vec![serde_json::json!(project_id)],
             AggregateSpec {
-                op: AggregateOp::Sum,
-                group_by: true,
+                op: Some(AggregateOp::Sum),
+                group_by: GroupBy::Bool(true),
+                aggregates: None,
             },
             |_| {},
         ),
@@ -3080,8 +3082,9 @@ async fn aggregate_group_by_with_one_field_beyond_prefix_is_bad_request() -> any
             Some("by_project_and_status"),
             vec![serde_json::json!(project_id)],
             AggregateSpec {
-                op: AggregateOp::Sum,
-                group_by: true,
+                op: Some(AggregateOp::Sum),
+                group_by: GroupBy::Bool(true),
+                aggregates: None,
             },
             |_| {},
         ),
@@ -3187,8 +3190,9 @@ async fn aggregate_count_grouped_by_status() -> anyhow::Result<()> {
             Some("by_project_status_order"),
             vec![serde_json::json!(project_id)],
             AggregateSpec {
-                op: AggregateOp::Count,
-                group_by: true,
+                op: Some(AggregateOp::Count),
+                group_by: GroupBy::Bool(true),
+                aggregates: None,
             },
             |_| {},
         ),
@@ -4443,8 +4447,9 @@ async fn int64_index_count_and_aggregate() -> anyhow::Result<()> {
             hybrid_search: None,
             fields: None,
             aggregate: Some(AggregateSpec {
-                op: AggregateOp::Sum,
-                group_by: false,
+                op: Some(AggregateOp::Sum),
+                group_by: GroupBy::Bool(false),
+                aggregates: None,
             }),
         },
         &PrincipalCtx::bypass(),

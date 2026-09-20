@@ -137,7 +137,7 @@ async def test_connect_sends_auth_then_marks_connected():
             "type": "auth",
             "token": "tok",
             "db": "db",
-            "protocolVersion": 1,
+            "protocolVersion": 2,
         }
         assert client.status().state is ConnectionState.CONNECTING
         await conn.deliver('{"type":"authOk","user":{"kind":"machine"}}')
