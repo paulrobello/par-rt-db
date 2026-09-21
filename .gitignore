@@ -36,6 +36,11 @@ claude_scratch/
 docs/playgrounds/
 .impeccable/
 
+# Grind loop (make grind-*, ~/Repos/par-grind); .grind.local.json is covered
+# by the *.local.* rule above
+.grind-logs/
+.exit-grind
+
 # Language/build artifacts
 build/
 dist/
