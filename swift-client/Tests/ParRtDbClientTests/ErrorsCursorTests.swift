@@ -16,7 +16,8 @@ struct ErrorsCursorTests {
         let expected: Set = [
             "UNAUTHORIZED", "FORBIDDEN", "NOT_FOUND", "SCHEMA_VIOLATION",
             "PRECONDITION_FAILED", "BAD_REQUEST", "INTERNAL", "RATE_LIMITED",
-            "CONFLICT", "QUOTA_EXCEEDED", "UNSUPPORTED_PROTOCOL", "CURSOR_EXPIRED"
+            "CONFLICT", "QUOTA_EXCEEDED", "UNSUPPORTED_PROTOCOL", "CURSOR_EXPIRED",
+            "READ_ONLY"
         ]
         #expect(ErrorCode.allCases.count == expected.count)
         for code in ErrorCode.allCases {

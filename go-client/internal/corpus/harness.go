@@ -147,6 +147,16 @@ func RunSemanticsCase(tb caseTB, c *SemanticsCase) {
 		tb.Fatalf("%s: %v", name, err)
 	}
 
+	// A frozen-db case arms the engine's freeze AFTER seeding (the seeds are
+	// pre-freeze writes; the op runs against the frozen engine). Mirrors the
+	// server runner's dbReadOnly handling.
+	if roRaw, ok := c.Raw["dbReadOnly"]; ok {
+		var ro bool
+		if err := json.Unmarshal(roRaw, &ro); err == nil && ro {
+			client.SetReadOnly(true)
+		}
+	}
+
 	expectRaw, hasExpect := c.Raw["expect"]
 	if !hasExpect {
 		tb.Fatalf("%s: missing expect", name)

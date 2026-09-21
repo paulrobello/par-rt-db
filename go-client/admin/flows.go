@@ -203,3 +203,22 @@ func (c *AdminClient) SetAnonymousAccess(ctx context.Context, db string, enabled
 	return c.ok(ctx, methodPatch, fmt.Sprintf("/admin/db/%s/anonymous-access", db),
 		map[string]any{"enabled": enabled})
 }
+
+// GetReadOnly: GET /admin/db/{db}/readonly → whether the database is frozen
+// read-only (client-plane writes rejected with READ_ONLY while frozen).
+func (c *AdminClient) GetReadOnly(ctx context.Context, db string) (bool, error) {
+	var resp struct {
+		ReadOnly bool `json:"readOnly"`
+	}
+	if err := c.get(ctx, fmt.Sprintf("/admin/db/%s/readonly", db), nil, &resp); err != nil {
+		return false, err
+	}
+	return resp.ReadOnly, nil
+}
+
+// SetReadOnly: PATCH /admin/db/{db}/readonly {readOnly} → {ok:true}. Freezes
+// (or unfreezes) the database.
+func (c *AdminClient) SetReadOnly(ctx context.Context, db string, readOnly bool) error {
+	return c.ok(ctx, methodPatch, fmt.Sprintf("/admin/db/%s/readonly", db),
+		map[string]any{"readOnly": readOnly})
+}

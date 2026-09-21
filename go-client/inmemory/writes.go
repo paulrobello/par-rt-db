@@ -42,6 +42,14 @@ func ApplyTxn(s *Store, txn wire.Transaction, mutID string) ([]wire.StepResult, 
 			return cached, nil
 		}
 	}
+	// Per-database read-only freeze (corpus dbReadOnly cases): mirrors the
+	// server committer's Mutate arm — the gate sits after the
+	// idempotency-replay lookup.
+	if s.readOnly {
+		s.mu.Unlock()
+		return nil, rtdberrors.New(rtdberrors.CodeReadOnly,
+			"database is frozen read-only; an operator can unfreeze it via PATCH /admin/db/{db}/readonly")
+	}
 	results, err := executeTransaction(s, txn)
 	if err == nil && mutID != "" {
 		s.idempotency[mutID] = results

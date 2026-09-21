@@ -22,6 +22,10 @@ const (
 	CodeQuotaExceeded       ErrorCode = "QUOTA_EXCEEDED"
 	CodeUnsupportedProtocol ErrorCode = "UNSUPPORTED_PROTOCOL"
 	CodeCursorExpired       ErrorCode = "CURSOR_EXPIRED"
+	// CodeReadOnly is the per-database read-only freeze
+	// (PATCH /admin/db/{db}/readonly): client-plane document writes are
+	// rejected while frozen.
+	CodeReadOnly ErrorCode = "READ_ONLY"
 )
 
 // httpStatus mirrors wire-corpus/error-codes.json's {code, httpStatus}
@@ -39,6 +43,7 @@ var httpStatus = map[ErrorCode]int{
 	CodeQuotaExceeded:       507,
 	CodeUnsupportedProtocol: 400,
 	CodeCursorExpired:       410,
+	CodeReadOnly:            409,
 }
 
 // HTTPStatus maps a code to its canonical HTTP status.
@@ -64,6 +69,7 @@ func AllCodes() []ErrorCode {
 		CodeQuotaExceeded,
 		CodeUnsupportedProtocol,
 		CodeCursorExpired,
+		CodeReadOnly,
 	}
 }
 

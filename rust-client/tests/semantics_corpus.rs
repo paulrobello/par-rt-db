@@ -336,6 +336,14 @@ async fn run_case(case_name: &str, case: &Value) {
     let single_table =
         (schema.tables.len() == 1).then(|| schema.tables.keys().next().cloned().unwrap());
 
+    // Reserve the arming point: a frozen-db case arms the engine's freeze
+    // AFTER seeding (the seeds are pre-freeze writes; the op runs against the
+    // frozen engine). Mirrors the server runner's `dbReadOnly` handling.
+    let frozen = case
+        .get("dbReadOnly")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
     // Seed in array order through the normal insert path (`mutate` with a
     // single Insert step), recording `label -> minted id` for `$id`-labeled
     // entries.
@@ -369,6 +377,12 @@ async fn run_case(case_name: &str, case: &Value) {
         .unwrap_or_else(|| panic!("{case_name}: missing expect"));
     let expects_error = expect.pointer("/error/code").is_some();
     let case_keys = normalize_keys(case, &DEFAULT_NORMALIZE.map(|s| s.to_string()), case_name);
+
+    // A frozen-db case arms the engine's freeze here — after seeding (the
+    // seeds are pre-freeze writes), before the op.
+    if frozen {
+        client.set_read_only(true);
+    }
 
     // Execute the op. Error cases assert the code and stop (no `then`).
     let op_result: Value = if let Some(txn_json) = case.pointer("/op/txn") {

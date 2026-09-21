@@ -1266,6 +1266,40 @@ impl RtDbAdminClient {
         self.expect_ok(resp).await
     }
 
+    //
+    // Per-database read-only freeze — mirror of the anonymous-access pair
+    // above (same paths/shapes; the wire body/response key is `readOnly`).
+
+    /// `GET /admin/db/{db}/readonly` → `{readOnly: bool}`. Whether the
+    /// database's operator froze it read-only.
+    pub async fn get_read_only(&self, db: &str) -> Result<bool, RtDbError> {
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            #[serde(rename = "readOnly")]
+            read_only: bool,
+        }
+        Ok(self
+            .get_json::<Resp>(&format!("/admin/db/{db}/readonly"), &[])
+            .await?
+            .read_only)
+    }
+
+    /// `PATCH /admin/db/{db}/readonly` `{readOnly}` → `{ok:true}`. Freezes
+    /// (or unfreezes) the database: while frozen, client-plane document
+    /// writes fail with `READ_ONLY`. A `not_found` error means the database
+    /// is not registered.
+    pub async fn set_read_only(&self, db: &str, read_only: bool) -> Result<(), RtDbError> {
+        #[derive(Serialize)]
+        struct Body {
+            #[serde(rename = "readOnly")]
+            read_only: bool,
+        }
+        let resp = self
+            .patch_json(&format!("/admin/db/{db}/readonly"), &Body { read_only })
+            .await?;
+        self.expect_ok(resp).await
+    }
+
     async fn post_json<Req: Serialize>(
         &self,
         path: &str,

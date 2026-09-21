@@ -26,6 +26,9 @@
  * - `CURSOR_EXPIRED` (410) — a change-feed `since` cursor older than the
  *   retained log or ahead of its head; the consumer must resync from
  *   `since: 0` (`RtDbHttpClient.listChanges`).
+ * - `READ_ONLY` (409) — the database's operator froze it read-only via
+ *   `PATCH /admin/db/{db}/readonly`; client-plane writes are rejected until
+ *   it is unfrozen.
  */
 
 export type RtDbErrorCode =
@@ -40,7 +43,8 @@ export type RtDbErrorCode =
   | "RATE_LIMITED"
   | "QUOTA_EXCEEDED"
   | "UNSUPPORTED_PROTOCOL"
-  | "CURSOR_EXPIRED";
+  | "CURSOR_EXPIRED"
+  | "READ_ONLY";
 
 /** Every {@link RtDbErrorCode}, in the order declared above. The single
  *  source of truth for "is this a known code" — {@link CODES} and the
@@ -62,6 +66,7 @@ export const ALL_ERROR_CODES: readonly RtDbErrorCode[] = [
   "QUOTA_EXCEEDED",
   "UNSUPPORTED_PROTOCOL",
   "CURSOR_EXPIRED",
+  "READ_ONLY",
 ];
 
 const CODES: ReadonlySet<string> = new Set<RtDbErrorCode>(ALL_ERROR_CODES);

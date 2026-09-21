@@ -1,0 +1,28 @@
+{
+  "name": "readonly-freeze-rejects-txn",
+  "$comment": "Per-database read-only freeze (PATCH /admin/db/{db}/readonly): with dbReadOnly set, the engine models a frozen database after seeding — every txn fails with READ_ONLY while reads still execute. Only the error code is asserted (determinism ruling 4). The server's transport-level gating (committer Mutate arm; schedule/workflow/signal client surfaces) is pinned by server/tests/read_only_test.rs, not here — the corpus pins the code and the cross-engine freeze semantics.",
+  "dbReadOnly": true,
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "title": { "type": "string" }
+        },
+        "indexes": [
+          { "name": "by_title", "fields": ["title"] }
+        ]
+      }
+    }
+  },
+  "seed": [
+    { "title": "seeded" }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        { "op": "insert", "table": "tasks", "doc": { "title": "blocked" } }
+      ]
+    }
+  },
+  "expect": { "error": { "code": "READ_ONLY" } }
+}

@@ -682,42 +682,56 @@ async fn handle_schedule(
             error: RtDbError::forbidden("read-only token cannot mutate"),
         },
         Ok(()) => {
-            let prepared = authorize_txn_tables(&principal.row_ctx(), &txn)
-                .and_then(|()| scheduler::resolve_when(when, now_ms()));
-            match prepared {
-                Ok((kind, due_at, cron, every_ms, _tz)) => {
-                    // Fire time runs on the per-db scheduler, which only
-                    // exists once the per-db tasks spawn — ensure that (and
-                    // the table inline: the spawned scheduler's startup
-                    // ensure is not ordered against this insert) or a job
-                    // scheduled on a cold db sits pending forever.
-                    let spawned = match state.realtime.committers.ensure_spawned(db).await {
-                        Ok(()) => scheduler::ensure_table(&state.pool, db).await,
-                        Err(error) => Err(error),
-                    };
-                    match spawned {
-                        Ok(()) => {
-                            match scheduler::insert(
-                                &state.pool,
-                                db,
-                                kind,
-                                due_at,
-                                &txn,
-                                cron.as_deref(),
-                                every_ms,
-                                None,
-                                external.is_some_and(|e| e),
-                            )
-                            .await
-                            {
-                                Ok(id) => ServerMessage::ScheduleOk { schedule_id, id },
+            // A schedule is a future document write: reject new starts under
+            // the per-db read-only freeze (already-created jobs keep firing —
+            // the fire path is the exempt system arm).
+            match crate::db::is_read_only(&state.pool, db).await {
+                Ok(true) => ServerMessage::ScheduleErr {
+                    schedule_id,
+                    error: RtDbError::read_only(),
+                },
+                Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
+                Ok(false) => {
+                    let prepared = authorize_txn_tables(&principal.row_ctx(), &txn)
+                        .and_then(|()| scheduler::resolve_when(when, now_ms()));
+                    match prepared {
+                        Ok((kind, due_at, cron, every_ms, _tz)) => {
+                            // Fire time runs on the per-db scheduler, which only
+                            // exists once the per-db tasks spawn — ensure that (and
+                            // the table inline: the spawned scheduler's startup
+                            // ensure is not ordered against this insert) or a job
+                            // scheduled on a cold db sits pending forever.
+                            let spawned = match state.realtime.committers.ensure_spawned(db).await {
+                                Ok(()) => scheduler::ensure_table(&state.pool, db).await,
+                                Err(error) => Err(error),
+                            };
+                            match spawned {
+                                Ok(()) => {
+                                    match scheduler::insert(
+                                        &state.pool,
+                                        db,
+                                        kind,
+                                        due_at,
+                                        &txn,
+                                        cron.as_deref(),
+                                        every_ms,
+                                        None,
+                                        external.is_some_and(|e| e),
+                                    )
+                                    .await
+                                    {
+                                        Ok(id) => ServerMessage::ScheduleOk { schedule_id, id },
+                                        Err(error) => {
+                                            ServerMessage::ScheduleErr { schedule_id, error }
+                                        }
+                                    }
+                                }
                                 Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
                             }
                         }
                         Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
                     }
                 }
-                Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
             }
         }
         Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
@@ -778,35 +792,53 @@ async fn handle_start_workflow(
             error: RtDbError::forbidden("read-only token cannot mutate"),
         },
         Ok(()) => {
-            let prepared = workflows::validate_spec(&spec)
-                .and_then(|()| authorize_spec_tables(&principal.row_ctx(), &spec));
-            match prepared {
-                // Steps fire from the per-db scheduler, which only exists once
-                // the per-db tasks spawn — ensure that before insert or the
-                // run sits `pending` forever on a cold db. The spawned
-                // scheduler's own startup ensure is NOT ordered against this
-                // insert, so ensure the table inline too or a cold-db insert
-                // can lose the race and error.
-                Ok(()) => match state.realtime.committers.ensure_spawned(db).await {
-                    Ok(()) => match workflows::ensure_table(&state.pool, db).await {
-                        Ok(()) => match workflows::insert(&state.pool, db, &spec).await {
-                            Ok(id) => match workflows::get(&state.pool, db, &id).await {
-                                Ok(Some(full)) => ServerMessage::StartWorkflowOk {
-                                    workflow_id,
-                                    info: full.info,
+            // A workflow start is a future document write: reject new starts
+            // under the per-db read-only freeze (in-flight runs keep advancing
+            // via the exempt system arm).
+            match crate::db::is_read_only(&state.pool, db).await {
+                Ok(true) => ServerMessage::StartWorkflowErr {
+                    workflow_id,
+                    error: RtDbError::read_only(),
+                },
+                Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
+                Ok(false) => {
+                    let prepared = workflows::validate_spec(&spec)
+                        .and_then(|()| authorize_spec_tables(&principal.row_ctx(), &spec));
+                    match prepared {
+                        // Steps fire from the per-db scheduler, which only exists once
+                        // the per-db tasks spawn — ensure that before insert or the
+                        // run sits `pending` forever on a cold db. The spawned
+                        // scheduler's own startup ensure is NOT ordered against this
+                        // insert, so ensure the table inline too or a cold-db insert
+                        // can lose the race and error.
+                        Ok(()) => match state.realtime.committers.ensure_spawned(db).await {
+                            Ok(()) => match workflows::ensure_table(&state.pool, db).await {
+                                Ok(()) => match workflows::insert(&state.pool, db, &spec).await {
+                                    Ok(id) => match workflows::get(&state.pool, db, &id).await {
+                                        Ok(Some(full)) => ServerMessage::StartWorkflowOk {
+                                            workflow_id,
+                                            info: full.info,
+                                        },
+                                        _ => ServerMessage::StartWorkflowErr {
+                                            workflow_id,
+                                            error: RtDbError::internal(
+                                                "workflow started but unreadable",
+                                            ),
+                                        },
+                                    },
+                                    Err(error) => {
+                                        ServerMessage::StartWorkflowErr { workflow_id, error }
+                                    }
                                 },
-                                _ => ServerMessage::StartWorkflowErr {
-                                    workflow_id,
-                                    error: RtDbError::internal("workflow started but unreadable"),
-                                },
+                                Err(error) => {
+                                    ServerMessage::StartWorkflowErr { workflow_id, error }
+                                }
                             },
                             Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
                         },
                         Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
-                    },
-                    Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
-                },
-                Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
+                    }
+                }
             }
         }
         Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
@@ -867,28 +899,39 @@ async fn handle_signal_workflow(
             false,
             Some(RtDbError::forbidden("read-only token cannot mutate")),
         ),
-        // Cold-db guard (the table is ensured only at scheduler startup):
-        // ensure inline so signal on a db with no spawned tasks is a clean
-        // typed error, not a 500.
-        Ok(()) => match workflows::ensure_table(&state.pool, db).await {
-            Ok(()) => match workflows::deliver_signal(&state.pool, db, &id, &name, payload).await {
-                Ok(workflows::SignalDelivery::Delivered) => (true, None),
-                Ok(workflows::SignalDelivery::NotFound) => {
-                    (false, Some(RtDbError::not_found("unknown workflow")))
+        // A signal injects the trigger for the frozen database's next
+        // document write: reject delivery under the per-db read-only freeze
+        // so a waiting run stays parked at the signal boundary until
+        // unfreeze (retry then). Runs not waiting on anything keep advancing
+        // via the exempt system arm.
+        Ok(()) => match crate::db::is_read_only(&state.pool, db).await {
+            Ok(true) => (false, Some(RtDbError::read_only())),
+            Err(error) => (false, Some(error)),
+            // Cold-db guard (the table is ensured only at scheduler startup):
+            // ensure inline so signal on a db with no spawned tasks is a clean
+            // typed error, not a 500.
+            Ok(false) => match workflows::ensure_table(&state.pool, db).await {
+                Ok(()) => {
+                    match workflows::deliver_signal(&state.pool, db, &id, &name, payload).await {
+                        Ok(workflows::SignalDelivery::Delivered) => (true, None),
+                        Ok(workflows::SignalDelivery::NotFound) => {
+                            (false, Some(RtDbError::not_found("unknown workflow")))
+                        }
+                        Ok(workflows::SignalDelivery::NotWaiting) => (
+                            false,
+                            Some(RtDbError::conflict("workflow is not waiting for a signal")),
+                        ),
+                        Ok(workflows::SignalDelivery::NameMismatch { waiting_on }) => (
+                            false,
+                            Some(RtDbError::conflict(format!(
+                                "workflow waiting on '{waiting_on}', got '{name}'"
+                            ))),
+                        ),
+                        Err(error) => (false, Some(error)),
+                    }
                 }
-                Ok(workflows::SignalDelivery::NotWaiting) => (
-                    false,
-                    Some(RtDbError::conflict("workflow is not waiting for a signal")),
-                ),
-                Ok(workflows::SignalDelivery::NameMismatch { waiting_on }) => (
-                    false,
-                    Some(RtDbError::conflict(format!(
-                        "workflow waiting on '{waiting_on}', got '{name}'"
-                    ))),
-                ),
                 Err(error) => (false, Some(error)),
             },
-            Err(error) => (false, Some(error)),
         },
         Err(error) => (false, Some(error)),
     };

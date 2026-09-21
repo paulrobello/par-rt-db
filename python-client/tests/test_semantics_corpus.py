@@ -324,6 +324,12 @@ def _run_case(case: dict[str, Any]) -> None:
             )
             ids[label] = first["id"]
 
+    # A frozen-db case arms the engine's freeze AFTER seeding (the seeds are
+    # pre-freeze writes; the op runs against the frozen engine). Mirrors the
+    # server runner's `dbReadOnly` handling.
+    if case.get("dbReadOnly") is True:
+        client.set_read_only(True)
+
     # Key presence, not value truthiness: `get`-miss cases carry an explicit
     # JSON-null `expect` (the serialized miss result) — present-null is legal.
     assert "expect" in case, f"{name}: missing expect"

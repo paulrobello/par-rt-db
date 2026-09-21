@@ -1033,6 +1033,11 @@ export class InMemoryRtDbClient {
   readonly connectionId: string;
   private idCounter = 0;
   private _admin?: InMemoryAdminClient;
+  /** Per-database read-only freeze (server `PATCH /admin/db/{db}/readonly`):
+   * while set, `mutate` rejects transactions with `READ_ONLY` after the
+   * idempotency-replay lookup, mirroring the server committer's Mutate arm.
+   * Queries and subscriptions are unaffected. */
+  private readOnly = false;
 
   constructor(options: InMemoryRtDbClientOptions = {}) {
     this.now = options.now ?? (() => Date.now());
@@ -1051,6 +1056,13 @@ export class InMemoryRtDbClient {
       this._admin = new InMemoryAdminClient({ now: this.now, subs: this.subs });
     }
     return this._admin;
+  }
+
+  /** Toggles the per-database read-only freeze (corpus `dbReadOnly` cases).
+   * Mirrors the server's admin toggle; writes fail with `READ_ONLY` while
+   * set, after the idempotency-replay lookup. */
+  setReadOnly(readOnly: boolean): void {
+    this.readOnly = readOnly;
   }
 
   /** Installs `schema` as this client's sole in-memory database schema. The
@@ -1160,6 +1172,12 @@ export class InMemoryRtDbClient {
       if (cached) {
         return parseStepResults(clone(cached));
       }
+    }
+    if (this.readOnly) {
+      throw new RtDbError(
+        "READ_ONLY",
+        "database is frozen read-only; an operator can unfreeze it via PATCH /admin/db/{db}/readonly",
+      );
     }
     const results = this.executeTransaction(txn);
     if (idempotencyKey) {

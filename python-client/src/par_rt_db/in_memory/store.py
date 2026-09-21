@@ -1347,6 +1347,10 @@ class _InMemoryStoreCore:
         self._auto_counters: dict[str, int] = {}
         # mut_id -> cached results (idempotency short-circuit).
         self._idempotency: dict[str, list[StepResult]] = {}
+        # Per-database read-only freeze (server ``PATCH /admin/db/{db}/readonly``).
+        # While set, ``mutate`` fails with ``READ_ONLY`` after the
+        # idempotency-replay lookup; queries are unaffected.
+        self._read_only: bool = False
         # Scheduled jobs (one-shot + cron).
         self._schedules: list[_ScheduledJob] = []
         # Workflow runs (FM-29), insertion-ordered.
@@ -1372,6 +1376,13 @@ class _InMemoryStoreCore:
         (mirrors the TS harness's ``c{N}`` counter)."""
         self._conn_counter += 1
         return f"c{self._conn_counter}"
+
+    def set_read_only(self, read_only: bool) -> None:
+        """Toggle the per-database read-only freeze (server
+        ``PATCH /admin/db/{db}/readonly``). While set, ``mutate`` fails with
+        ``READ_ONLY`` after the idempotency-replay lookup; queries are
+        unaffected."""
+        self._read_only = read_only
 
     def push_schema(self, schema: SchemaDef) -> None:
         """Install ``schema`` as this client's sole in-memory database schema,
@@ -1469,6 +1480,15 @@ class _InMemoryStoreCore:
             cached = self._idempotency.get(mut_id)
             if cached is not None:
                 return cached
+        # Per-database read-only freeze (corpus ``dbReadOnly`` cases): mirrors
+        # the server committer's Mutate arm — the gate sits after the
+        # idempotency-replay lookup.
+        if self._read_only:
+            raise RtDbError(
+                ErrorCode.READ_ONLY,
+                "database is frozen read-only; an operator can unfreeze it via "
+                "PATCH /admin/db/{db}/readonly",
+            )
         results = self._execute_transaction(txn)
         if mut_id is not None:
             self._idempotency[mut_id] = list(results)

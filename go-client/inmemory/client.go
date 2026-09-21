@@ -69,6 +69,11 @@ func New(opts Options) *Client {
 // Store exposes the underlying engine state (test/inspection seam).
 func (c *Client) Store() *Store { return c.store }
 
+// SetReadOnly toggles the per-database read-only freeze (corpus dbReadOnly
+// cases; server PATCH /admin/db/{db}/readonly). While set, Mutate fails with
+// READ_ONLY after the idempotency-replay lookup.
+func (c *Client) SetReadOnly(readOnly bool) { c.store.SetReadOnly(readOnly) }
+
 // PushSchema installs the schema (additive merges; destructive changes
 // rejected). See Store.PushSchema.
 func (c *Client) PushSchema(s wire.JSONValue) error { return c.store.PushSchema(s) }

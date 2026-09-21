@@ -361,6 +361,10 @@ pub fn admin_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             get(get_anonymous_access).patch(patch_anonymous_access),
         )
         .route(
+            "/admin/db/{db}/readonly",
+            get(get_readonly).patch(patch_readonly),
+        )
+        .route(
             "/admin/db/{db}/storage",
             get(admin_storage_list)
                 .post(admin_storage_upload)

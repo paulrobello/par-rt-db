@@ -347,3 +347,52 @@ pub(super) async fn patch_anonymous_access(
     tracing::info!(db = %db, enabled = body.enabled, "anonymous-access toggled");
     Ok(Json(OkResponse { ok: true }))
 }
+
+// ============================================================================
+// Per-database read-only freeze.
+// ============================================================================
+
+/// `GET /admin/db/{db}/readonly` — whether the database is frozen read-only.
+/// Mirrors `get_anonymous_access`: an unregistered database reads as FALSE
+/// rather than 404ing on the read.
+#[derive(Serialize)]
+pub(super) struct ReadOnlyResponse {
+    #[serde(rename = "readOnly")]
+    read_only: bool,
+}
+
+pub(super) async fn get_readonly(
+    State(state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    Path(db): Path<String>,
+) -> Result<Json<ReadOnlyResponse>, RtDbError> {
+    let read_only = crate::db::is_read_only(&state.pool, &db).await?;
+    Ok(Json(ReadOnlyResponse { read_only }))
+}
+
+/// `PATCH /admin/db/{db}/readonly` — freeze (or unfreeze) the database. While
+/// frozen, the committer's Mutate arm rejects every client-plane document
+/// write with `READ_ONLY`; reads, subscriptions, admin surfaces, and system
+/// writes (scheduled fires, workflow advances, TTL reaping) are unaffected.
+/// Returns 404 for an unregistered database.
+#[derive(Deserialize)]
+pub(super) struct PatchReadOnlyRequest {
+    #[serde(rename = "readOnly")]
+    read_only: bool,
+}
+
+pub(super) async fn patch_readonly(
+    State(state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    Path(db): Path<String>,
+    ApiJson(body): ApiJson<PatchReadOnlyRequest>,
+) -> Result<Json<OkResponse>, RtDbError> {
+    let registered = crate::db::set_read_only(&state.pool, &db, body.read_only).await?;
+    if !registered {
+        return Err(RtDbError::not_found(format!(
+            "database '{db}' is not registered (create it before toggling the read-only freeze)"
+        )));
+    }
+    tracing::info!(db = %db, readOnly = body.read_only, "readonly freeze toggled");
+    Ok(Json(OkResponse { ok: true }))
+}

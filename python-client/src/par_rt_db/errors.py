@@ -27,6 +27,9 @@ class ErrorCode(StrEnum):
     #: F7 change feed: ``GET /api/db/{db}/changes`` ``since`` cursor predates
     #: retention or is ahead of the log head (HTTP 410).
     CURSOR_EXPIRED = "CURSOR_EXPIRED"
+    #: Per-database read-only freeze (``PATCH /admin/db/{db}/readonly``);
+    #: client-plane document writes are rejected while frozen (HTTP 409).
+    READ_ONLY = "READ_ONLY"
 
 
 _STATUS: dict[ErrorCode, int] = {
@@ -42,6 +45,7 @@ _STATUS: dict[ErrorCode, int] = {
     ErrorCode.QUOTA_EXCEEDED: 507,
     ErrorCode.UNSUPPORTED_PROTOCOL: 400,
     ErrorCode.CURSOR_EXPIRED: 410,
+    ErrorCode.READ_ONLY: 409,
 }
 
 

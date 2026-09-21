@@ -29,6 +29,9 @@ public enum ErrorCode: String, Codable, Sendable, CaseIterable {
     /// Change-feed cursor predates retention or is ahead of the log — resync
     /// from `since=0` (HTTP 410).
     case cursorExpired = "CURSOR_EXPIRED"
+    /// Per-database read-only freeze (`PATCH /admin/db/{db}/readonly`);
+    /// client-plane document writes are rejected while frozen (HTTP 409).
+    case readOnly = "READ_ONLY"
 }
 
 /// Every failure is this envelope: `{code, message, retryAfter?}` on the wire

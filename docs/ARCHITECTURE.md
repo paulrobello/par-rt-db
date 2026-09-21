@@ -71,6 +71,41 @@ Taps and fan-out both happen *before* the next message is dequeued. That
 ordering is why a subscriber can never observe a write out of order with
 respect to a later one.
 
+### The read-only freeze gates the Mutate arm, and only the Mutate arm
+
+The per-database read-only freeze (`GET|PATCH /admin/db/{db}/readonly`, a
+persisted `read_only` column on `rtdb_auth.databases`) is checked **fresh per
+write** at the top of the `Mutate` arm (`committer/arms/mutate.rs`), after the
+idempotency-replay lookup. One gate covers every client-plane document write:
+WS, HTTP one-shot, mutate-batch, admin direct mutate, and forwarded-owner
+writes all enter through that arm, and the check is principal-agnostic —
+machine tokens, OAuth users, and admins are all rejected while frozen.
+
+What stays open is decided by which arm a request rides, not by who sent it:
+
+- **Exempt by construction — system arms**: scheduled fires
+  (`RunScheduled`), workflow advances (`RunWorkflowAdvance`), and TTL reaping
+  (`RunReaper`) never enter the Mutate arm. Freezing these would strand
+  in-flight workflows and stop TTL expiry, and the schema-surgery use case
+  needs the freeze to pause the *app*, not strand the *database*. Idempotent
+  replays also sit before the gate: a retry of an already-committed write
+  returns its cached result rather than an error.
+- **Gated at the transport — future-write triggers**: new scheduled jobs
+  (`POST /api/schedule`, WS `Schedule`), workflow starts (`POST /api/workflows`,
+  WS `StartWorkflow`), and signal delivery (`POST /api/workflows/{id}/signal`,
+  WS `SignalWorkflow`) never touch the Mutate arm, so each carries the same
+  `db::is_read_only` check directly. They create *future* writes, so a frozen
+  database refuses them; in-flight runs that are not waiting keep advancing.
+- **Admin plane**: schema push/migrate/restore, backups, import/export/clone,
+  and the toggle itself stay usable while frozen — "pause writes during schema
+  surgery" is a stated use case, and unfreezing is always the operator's
+  repair path.
+
+The flag is read fresh per write (one indexed lookup in the serialized turn —
+no cache, no invalidation), which is what makes PATCH-then-write ordering
+tight without any coherence machinery. Pinned by `server/tests/read_only_test.rs`
+and the `dbReadOnly` semantics-corpus cases (all six runners).
+
 ```mermaid
 graph TD
     subgraph transports["Two transports, one vocabulary"]

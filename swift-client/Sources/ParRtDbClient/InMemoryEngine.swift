@@ -779,6 +779,8 @@ public final class InMemoryRtDbClient: MigrationStore {
     private var presenceSubSeq = 0
     private var idCounter: Int64 = 0
     private var _admin: InMemoryAdminClient?
+    // Per-database read-only freeze (server PATCH /admin/db/{db}/readonly).
+    var readOnly = false
 
     /// This client's stable identity in presence rooms (counter-prefixed,
     /// distinct in shape from document ids).
@@ -936,6 +938,13 @@ public final class InMemoryRtDbClient: MigrationStore {
             if let cached = idempotency[idempotencyKey] {
                 return try cached.map(parseStepResult)
             }
+        }
+        if readOnly {
+            throw RtDbError(
+                code: .readOnly,
+                message: "database is frozen read-only; an operator can unfreeze it via "
+                    + "PATCH /admin/db/{db}/readonly"
+            )
         }
         let results = try executeTransaction(txn)
         if let idempotencyKey {

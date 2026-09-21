@@ -526,6 +526,12 @@ async fn schedule_handler(
         return Err(RtDbError::forbidden("read-only token cannot mutate"));
     }
     check_http_rate_limits(&state, &principal, &body.db).await?;
+    // A schedule is a future document write: reject new starts under the
+    // per-db read-only freeze (already-created jobs keep firing — the fire
+    // path is the exempt system arm).
+    if crate::db::is_read_only(&state.pool, &body.db).await? {
+        return Err(RtDbError::read_only());
+    }
 
     // FM-28 tightening: a scoped machine token cannot smuggle a future write
     // into a table outside its allowlist via a scheduled job (matches the
@@ -844,6 +850,12 @@ async fn start_workflow_handler(
         return Err(RtDbError::forbidden("read-only token cannot mutate"));
     }
     check_http_rate_limits(&state, &principal, &body.db).await?;
+    // A workflow start is a future document write: reject new starts under the
+    // per-db read-only freeze (in-flight runs keep advancing — the advance
+    // path is the exempt system arm).
+    if crate::db::is_read_only(&state.pool, &body.db).await? {
+        return Err(RtDbError::read_only());
+    }
     workflows::validate_spec(&body.spec)?;
     crate::txn::authorize_spec_tables(&principal.row_ctx(), &body.spec)?;
     // Steps fire from the per-db scheduler, which only exists once the per-db
@@ -939,6 +951,14 @@ async fn signal_workflow_handler(
         return Err(RtDbError::forbidden("read-only token cannot mutate"));
     }
     check_http_rate_limits(&state, &principal, &body.db).await?;
+    // A signal injects the trigger for a frozen database's next document
+    // write: reject delivery under the per-db read-only freeze so a waiting
+    // run stays parked at the signal boundary until unfreeze (retry then).
+    // In-flight runs that are NOT waiting keep advancing via the exempt
+    // system arm.
+    if crate::db::is_read_only(&state.pool, &body.db).await? {
+        return Err(RtDbError::read_only());
+    }
     // Cold-db guard (the table is ensured only at scheduler startup): ensure
     // inline so signal on a db with no spawned tasks is a typed 404, not a 500.
     workflows::ensure_table(&state.pool, &body.db).await?;

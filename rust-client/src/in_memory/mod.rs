@@ -364,6 +364,10 @@ pub struct InMemoryRtDbClient {
     now: Arc<dyn Fn() -> i64 + Send + Sync>,
     random: Arc<dyn Fn() -> f64 + Send + Sync>,
     schema: Option<SchemaDef>,
+    /// Per-database read-only freeze (server `PATCH /admin/db/{db}/readonly`).
+    /// While set, `mutate` fails with `READ_ONLY` after the idempotency-replay
+    /// lookup, mirroring the server committer's Mutate arm.
+    read_only: bool,
     /// Per-table schema defs, keyed by table name. Separate from `schema` so
     /// Task 2+'s hot paths (validate-on-write, table lookups) don't re-walk the
     /// whole schema.
@@ -429,6 +433,7 @@ impl InMemoryRtDbClient {
             }),
             random: options.random.unwrap_or_else(|| Arc::new(|| 0.5)),
             schema: None,
+            read_only: false,
             tables: HashMap::new(),
             docs: HashMap::new(),
             auto_increment_counters: HashMap::new(),
@@ -451,6 +456,13 @@ impl InMemoryRtDbClient {
             joined_rooms: BTreeSet::new(),
             presence_unsubs: HashMap::new(),
         }
+    }
+
+    /// Toggles the per-database read-only freeze (server
+    /// `PATCH /admin/db/{db}/readonly`). While set, `mutate` fails with
+    /// `READ_ONLY` after the idempotency-replay lookup; queries are unaffected.
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
     }
 
     /// Installs `schema` as this client's sole in-memory database schema,
@@ -625,6 +637,16 @@ impl InMemoryRtDbClient {
             && let Some(cached) = self.idempotency.get(mid)
         {
             return Ok(cached.clone());
+        }
+        // Per-database read-only freeze (corpus `dbReadOnly` cases): mirrors
+        // the server committer's Mutate arm — the gate sits after the
+        // idempotency-replay lookup.
+        if self.read_only {
+            return Err(RtDbError::new(
+                ErrorCode::ReadOnly,
+                "database is frozen read-only; an operator can unfreeze it via \
+                 PATCH /admin/db/{db}/readonly",
+            ));
         }
         let results = self.execute_transaction(txn)?;
         if let Some(mid) = mut_id {

@@ -178,6 +178,10 @@ struct SemanticsCase: Sendable, CustomStringConvertible {
     let expectNextCursor: Bool?
     let thenBlock: ThenBlock?
     let skipReason: String?
+    /// True on a frozen-db case: the engine's freeze is armed AFTER seeding
+    /// (the seeds are pre-freeze writes) and the op runs against the frozen
+    /// engine (server PATCH /admin/db/{db}/readonly mirror).
+    let dbReadOnly: Bool
 
     var description: String {
         if let skipReason {
@@ -254,7 +258,8 @@ private func loadCase(stem: String) throws -> SemanticsCase {
             stem: stem, schema: schema, seed: [], pushErrorCode: code,
             opQuery: nil, opTxn: nil, opMigrate: nil, expect: nil,
             unordered: false, normalize: nil, expectNextCursor: nil,
-            thenBlock: nil, skipReason: skipReason(object, stem)
+            thenBlock: nil, skipReason: skipReason(object, stem),
+            dbReadOnly: object["dbReadOnly"]?.boolValue ?? false
         )
     }
     let seed: [JSONValue]
@@ -279,7 +284,8 @@ private func loadCase(stem: String) throws -> SemanticsCase {
         normalize: stringList(object["normalize"], "\(stem): normalize"),
         expectNextCursor: object["expect_next_cursor"]?.boolValue,
         thenBlock: parseThen(object, stem),
-        skipReason: skipReason(object, stem)
+        skipReason: skipReason(object, stem),
+        dbReadOnly: object["dbReadOnly"]?.boolValue ?? false
     )
 }
 
@@ -660,6 +666,13 @@ private func seedClient(
 // swiftlint:disable function_body_length
 /// Execute one corpus case end to end against a fresh in-memory instance.
 /// Every failure names the case.
+/// A frozen-db case arms the engine's freeze after seeding, before the op
+/// (mirrors the server runner's dbReadOnly handling).
+private func armFreezeIfCase(_ client: InMemoryRtDbClient, _ corpusCase: SemanticsCase) {
+    guard corpusCase.dbReadOnly else { return }
+    client.readOnly = true
+}
+
 private func runCase(_ corpusCase: SemanticsCase) throws {
     let caseName = corpusCase.stem
     let client = makeClient()
@@ -689,6 +702,7 @@ private func runCase(_ corpusCase: SemanticsCase) throws {
     let tableNames = corpusCase.schema.tables.keys.sorted()
     let singleTable = tableNames.count == 1 ? tableNames[0] : nil
     let ids = try seedClient(client, corpusCase, singleTable)
+    armFreezeIfCase(client, corpusCase)
 
     let expect = try {
         guard let value = corpusCase.expect else {

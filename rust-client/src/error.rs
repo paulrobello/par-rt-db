@@ -40,6 +40,10 @@ pub enum ErrorCode {
     /// retention window, or ahead of the log (HTTP 410). Mirrors server
     /// `error::ErrorCode::CursorExpired`. Serialized `"CURSOR_EXPIRED"`.
     CursorExpired,
+    /// Per-database read-only freeze (`PATCH /admin/db/{db}/readonly`);
+    /// client-plane document writes are rejected while frozen (HTTP 409).
+    /// Mirrors server `error::ErrorCode::ReadOnly`. Serialized `"READ_ONLY"`.
+    ReadOnly,
 }
 
 /// Raw `{code, message, retryAfter?}` as it appears on the wire (HTTP body /

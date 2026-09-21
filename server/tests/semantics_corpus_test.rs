@@ -410,6 +410,21 @@ pub async fn run_case(pool: &sqlx::PgPool, case_name: &str, case: &Value) {
     let expects_error = expect.pointer("/error/code").is_some();
     let case_keys = normalize_keys(case, &DEFAULT_NORMALIZE.map(|s| s.to_string()), case_name);
 
+    // A frozen-db case arms the real flag column after seeding (the seeds are
+    // pre-freeze writes) and the txn path mirrors the committer's Mutate arm:
+    // consult the same `db::is_read_only` gate helper the arm consults and
+    // refuse with the same `RtDbError::read_only()`. Queries bypass the gate
+    // here exactly as they do on the server.
+    let frozen = case
+        .get("dbReadOnly")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if frozen {
+        db::set_read_only(pool, &db_name, true)
+            .await
+            .unwrap_or_else(|e| panic!("{case_name}: set_read_only: {e:?}"));
+    }
+
     // Execute the op. A query op first resolves the `"$prev"` paginate-cursor
     // sentinel (README step 4): run the cursor-less query, take its
     // nextCursor, then run the real query with it. `expect` describes the
@@ -417,6 +432,11 @@ pub async fn run_case(pool: &sqlx::PgPool, case_name: &str, case: &Value) {
     let op_result: Value = if let Some(txn_json) = case.pointer("/op/txn") {
         let txn: Transaction = serde_json::from_value(substitute(txn_json, &ids, case_name))
             .unwrap_or_else(|e| panic!("{case_name}: op.txn does not parse: {e}"));
+        if frozen && db::is_read_only(pool, &db_name).await.unwrap_or(false) {
+            let e = RtDbError::read_only();
+            assert_error_code(&e, expect, case_name);
+            return; // a frozen op has no `then` follow-up
+        }
         match execute_txn(pool, &db_name, &schema, &txn, &PrincipalCtx::bypass()).await {
             Ok(outcome) => Value::Array(outcome.results),
             Err(e) => {

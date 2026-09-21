@@ -53,6 +53,10 @@ type Store struct {
 	idCounter             uint64
 	// mutID -> cached results; the idempotency short-circuit.
 	idempotency map[string][]wire.StepResult
+	// readOnly is the per-database read-only freeze (server
+	// PATCH /admin/db/{db}/readonly). While set, ApplyTxn fails with
+	// READ_ONLY after the idempotency-replay lookup; queries are unaffected.
+	readOnly bool
 	// scheduledJobs are the in-memory scheduled txns; tick drains due
 	// non-paused entries.
 	scheduledJobs []*ScheduledJob
@@ -190,6 +194,15 @@ func timeNowMillis() int64 {
 // removed/changed table, field, or index — are rejected with the server's
 // messages. Validation runs first, so an invalid TTL or non-indexable index
 // field fails SCHEMA_VIOLATION exactly as the live server 422s.
+// SetReadOnly toggles the per-database read-only freeze (server
+// PATCH /admin/db/{db}/readonly). While set, ApplyTxn fails with READ_ONLY
+// after the idempotency-replay lookup; queries are unaffected.
+func (s *Store) SetReadOnly(readOnly bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.readOnly = readOnly
+}
+
 func (s *Store) PushSchema(schema wire.JSONValue) error {
 	parsed, err := parseSchema(schema)
 	if err != nil {

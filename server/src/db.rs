@@ -149,6 +149,19 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     .execute(&mut *conn)
     .await?;
 
+    // Per-database read-only freeze: when TRUE, the committer's Mutate arm
+    // rejects every client-plane document write with READ_ONLY while reads,
+    // subscriptions, admin surfaces, and system writes (scheduled fires,
+    // workflow advances, TTL reaping) continue. Toggled via
+    // `GET|PATCH /admin/db/{db}/readonly`. Defaults FALSE; idempotent ALTER so
+    // an existing deployment adds the column on boot.
+    sqlx::query(
+        "ALTER TABLE rtdb_auth.databases \
+         ADD COLUMN IF NOT EXISTS read_only boolean NOT NULL DEFAULT FALSE",
+    )
+    .execute(&mut *conn)
+    .await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS rtdb_auth.users (
             id text PRIMARY KEY,
@@ -782,6 +795,34 @@ pub async fn database_exists(pool: &PgPool, name: &str) -> Result<bool, RtDbErro
             .fetch_optional(pool)
             .await?;
     Ok(row.is_some())
+}
+
+/// Whether the database's operator froze it read-only. Unknown/missing
+/// databases read as FALSE — mirroring `get_anonymous_access`, the gate
+/// treats an unregistered name as not frozen, and the write that would create
+/// it is rejected at registration time instead.
+pub async fn is_read_only(pool: &PgPool, name: &str) -> Result<bool, RtDbError> {
+    let (ro,): (bool,) = sqlx::query_as(
+        "SELECT COALESCE((
+            SELECT read_only FROM rtdb_auth.databases WHERE name = $1
+        ), FALSE)",
+    )
+    .bind(name)
+    .fetch_one(pool)
+    .await?;
+    Ok(ro)
+}
+
+/// Sets the per-database read-only freeze flag; returns FALSE when the
+/// database is not registered so the admin handler can 404. The flag is read
+/// fresh per write by the committer's Mutate arm — no cache, no invalidation.
+pub async fn set_read_only(pool: &PgPool, name: &str, read_only: bool) -> Result<bool, RtDbError> {
+    let result = sqlx::query("UPDATE rtdb_auth.databases SET read_only = $1 WHERE name = $2")
+        .bind(read_only)
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Names of every registered database, in a stable order.

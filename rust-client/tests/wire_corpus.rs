@@ -502,7 +502,7 @@ fn protocol_constants_max_steps_matches_corpus() {
 fn error_codes_known_to_rust_client() {
     use par_rt_db_client::ErrorCode;
 
-    const ALL: [ErrorCode; 12] = [
+    const ALL: [ErrorCode; 13] = [
         ErrorCode::Unauthorized,
         ErrorCode::Forbidden,
         ErrorCode::NotFound,
@@ -515,6 +515,7 @@ fn error_codes_known_to_rust_client() {
         ErrorCode::QuotaExceeded,
         ErrorCode::UnsupportedProtocol,
         ErrorCode::CursorExpired,
+        ErrorCode::ReadOnly,
     ];
 
     let corpus: Value = serde_json::from_str(include_str!("../../wire-corpus/error-codes.json"))

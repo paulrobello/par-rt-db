@@ -24,6 +24,17 @@ pub(in crate::committer) async fn handle_mutate(
         });
     }
 
+    // Per-database read-only freeze: after the idempotency replay (a retry of
+    // an already-committed write returns its cached result, not an error) and
+    // before any work. One indexed lookup per write; principal-agnostic — the
+    // freeze covers machine tokens, OAuth users, admin direct mutate, and the
+    // forwarded-owner path alike, on every transport. System arms (scheduled
+    // fires, workflow advances, TTL reaping) and admin schema ops bypass this
+    // gate by construction: they never enter the Mutate arm.
+    if crate::db::is_read_only(&ctx.pool, &ctx.db).await? {
+        return Err(RtDbError::read_only());
+    }
+
     let schema = ctx.schemas.get(&ctx.pool, &ctx.db).await?;
     // ENH-011 / ARC-004: enforce per-db storage cap before the first write.
     // Uniform — no admin bypass — `enforce(cap=0)` is a no-op, so an unset cap

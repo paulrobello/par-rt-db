@@ -35,14 +35,14 @@ func TestHTTPStatusTable(t *testing.T) {
 		t.Fatalf("CURSOR_EXPIRED status %d", got)
 	}
 	codes := errors.AllCodes()
-	if len(codes) != 12 {
-		t.Fatalf("want 12 codes, got %d", len(codes))
+	if len(codes) != 13 {
+		t.Fatalf("want 13 codes, got %d", len(codes))
 	}
 	seen := map[errors.ErrorCode]int{}
 	for _, c := range codes {
 		seen[c] = errors.HTTPStatus(c)
 	}
-	if len(seen) != 12 {
+	if len(seen) != 13 {
 		t.Fatalf("duplicate constants in AllCodes: %v", codes)
 	}
 }

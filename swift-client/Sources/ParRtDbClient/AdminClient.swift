@@ -821,6 +821,30 @@ public actor RtDbAdminClient {
             contentType: "application/json"
         )
     }
+
+    // MARK: Read-only freeze
+
+    /// `GET /admin/db/{db}/readonly` → `{readOnly}` — whether the database is
+    /// frozen read-only (client-plane writes rejected with `READ_ONLY` while
+    /// frozen).
+    public func getReadOnly(_ db: String) async throws -> Bool {
+        let response: ReadOnlyResponse = try await getJson(
+            "get read-only", "/admin/db/\(encodePath(db))/readonly"
+        )
+        return response.readOnly
+    }
+
+    /// `PATCH /admin/db/{db}/readonly` `{readOnly}` → `{ok:true}`. Freezes
+    /// (or unfreezes) the database; a not-found error means the database is
+    /// not registered.
+    public func setReadOnly(_ db: String, readOnly: Bool) async throws {
+        try await expectOk(
+            "set read-only", method: "PATCH",
+            path: "/admin/db/\(encodePath(db))/readonly",
+            body: jsonBody("set read-only", SetReadOnlyRequest(readOnly: readOnly)),
+            contentType: "application/json"
+        )
+    }
 }
 
 // MARK: - Transport
@@ -1135,6 +1159,10 @@ private struct SetAnonymousAccessRequest: Encodable {
     let enabled: Bool
 }
 
+private struct SetReadOnlyRequest: Encodable {
+    let readOnly: Bool
+}
+
 /// Encodes as `{}` — `backupNow`'s empty JSON body.
 private struct EmptyRequest: Encodable {}
 
@@ -1227,4 +1255,8 @@ private struct IdResponse: Decodable {
 
 private struct AnonymousAccessResponse: Decodable {
     let enabled: Bool
+}
+
+private struct ReadOnlyResponse: Decodable {
+    let readOnly: Bool
 }

@@ -338,6 +338,7 @@ loss is `DROP TABLE` for tables absent from the target snapshot, and migrate dat
 | `POST /admin/db/{db}/workflows/{id}/cancel` | Bearer admin key | Cancels a non-terminal run (admin-scoped; `{ok:false}` = unknown/terminal). |
 | `POST /admin/db/{db}/workflows/{id}/signal` | Bearer admin key | Delivers a named signal to a `waiting` run (admin-scoped; `{name, payload?}` → `{ok}`) — the route the dashboard's send-signal form and `rtdb workflows signal` ride. |
 | `GET|PATCH /admin/db/{db}/anonymous-access` | Bearer admin key | Per-database anonymous-auth toggle (SEC-103), on top of the instance-wide `RTDB_AUTH_ANONYMOUS_ENABLED` boot gate. |
+| `GET|PATCH /admin/db/{db}/readonly` | Bearer admin key | Per-database read-only freeze. While frozen, every client-plane document write — WS, HTTP, mutate-batch, admin direct mutate, any principal — is rejected with `409 READ_ONLY`; reads, subscriptions, admin surfaces, and system writes (scheduled fires, workflow advances, TTL reaping) are unaffected. New scheduled jobs, workflow starts, and signal delivery are also rejected (they are future writes); in-flight work drains. An idempotent retry of an already-committed write still replays its cached result. |
 | `GET /admin/db/{db}/storage` | Bearer admin key | Lists blobs stored in a database (id, sha256, size, contentType, createdAt). |
 | `POST /admin/db/{db}/storage` | Bearer admin key | Uploads a blob (admin-scoped; same shape as `POST /api/storage/{db}`). |
 | `DELETE /admin/db/{db}/storage/{id}` | Bearer admin key | Deletes a blob (admin-scoped). |
@@ -497,6 +498,7 @@ mirrored as the HTTP `Retry-After` header); every other code omits it:
 | `RATE_LIMITED`        | 429         | Per-token or per-db rate limit hit (HTTP and WS frames). Carries `retryAfter`. The WS connection stays open for this error; the separate per-connection frame-rate limit below closes it instead. |
 | `INTERNAL`            | 500         | Unexpected server error (generic message; detail logged via `tracing`). |
 | `QUOTA_EXCEEDED`      | 507         | Per-database resource cap hit (tables / storage bytes / concurrent subscriptions — ENH-011). |
+| `READ_ONLY`           | 409         | The database is frozen read-only (`PATCH /admin/db/{db}/readonly`); client-plane document writes are rejected until it is unfrozen. |
 
 ## Wire protocol
 

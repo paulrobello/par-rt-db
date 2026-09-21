@@ -64,6 +64,11 @@ interface SemanticsCase {
   /** Asserts the schema PUSH fails with this error code (code only, never the
    * message). A `pushError` case carries no seed/op/then/expect. */
   pushError?: { code: string };
+  /** When true, the engine models a FROZEN database (per-database read-only
+   * freeze): the op is executed against a db where every txn fails with
+   * `READ_ONLY` while queries still execute. Set on the engine AFTER seeding
+   * (the freeze pauses new writes, not the db itself). */
+  dbReadOnly?: boolean;
   unordered?: boolean;
   normalize?: string[];
   expect_next_cursor?: boolean;
@@ -332,6 +337,12 @@ async function runCase(caseName: string, caseData: SemanticsCase): Promise<void>
       }
       ids.set(label, first.id as string);
     }
+  }
+
+  // A frozen-db case arms the engine's freeze AFTER seeding (the seeds are
+  // pre-freeze writes; the op runs against the frozen engine).
+  if (caseData.dbReadOnly === true) {
+    client.setReadOnly(true);
   }
 
   const expectErr = errorCodeOf(caseData.expect);

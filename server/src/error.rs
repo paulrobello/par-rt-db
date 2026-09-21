@@ -30,6 +30,12 @@ pub enum ErrorCode {
     /// code `CURSOR_EXPIRED`, HTTP 410: resync from `since = 0`; an empty
     /// success would be silent data loss.
     CursorExpired,
+    /// Per-database read-only freeze: the database's operator has frozen it
+    /// via `PATCH /admin/db/{db}/readonly`, so client-plane document writes
+    /// are rejected. HTTP 409: the request is well-formed and permitted in
+    /// principle — the database's current state refuses it. Wire code
+    /// `READ_ONLY`.
+    ReadOnly,
 }
 
 /// Optional `Retry-After` hint, in seconds, attached to a `RateLimited` error.
@@ -119,6 +125,17 @@ impl RtDbError {
         Self::new(ErrorCode::UnsupportedProtocol, msg)
     }
 
+    /// The database's operator froze it read-only via
+    /// `PATCH /admin/db/{db}/readonly`; client-plane document writes are
+    /// rejected until it is unfrozen (HTTP 409). Wire code `READ_ONLY`.
+    pub fn read_only() -> Self {
+        Self::new(
+            ErrorCode::ReadOnly,
+            "database is frozen read-only; an operator can unfreeze it via \
+             PATCH /admin/db/{db}/readonly",
+        )
+    }
+
     pub fn status(&self) -> StatusCode {
         match self.code {
             ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
@@ -133,6 +150,7 @@ impl RtDbError {
             ErrorCode::QuotaExceeded => StatusCode::INSUFFICIENT_STORAGE,
             ErrorCode::UnsupportedProtocol => StatusCode::BAD_REQUEST,
             ErrorCode::CursorExpired => StatusCode::GONE,
+            ErrorCode::ReadOnly => StatusCode::CONFLICT,
         }
     }
 }
@@ -218,6 +236,7 @@ mod tests {
             RtDbError::internal("x").status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+        assert_eq!(RtDbError::read_only().status(), StatusCode::CONFLICT);
         assert_eq!(
             RtDbError::rate_limited(30).status(),
             StatusCode::TOO_MANY_REQUESTS
@@ -286,7 +305,7 @@ mod tests {
     /// variant present in the enum but missing from `ALL` or from
     /// `wire-corpus/error-codes.json`.
     fn generate_error_code_table() -> Vec<(&'static str, u16)> {
-        const ALL: [ErrorCode; 12] = [
+        const ALL: [ErrorCode; 13] = [
             ErrorCode::Unauthorized,
             ErrorCode::Forbidden,
             ErrorCode::NotFound,
@@ -299,6 +318,7 @@ mod tests {
             ErrorCode::QuotaExceeded,
             ErrorCode::UnsupportedProtocol,
             ErrorCode::CursorExpired,
+            ErrorCode::ReadOnly,
         ];
         fn wire_str(code: ErrorCode) -> &'static str {
             match code {
@@ -314,6 +334,7 @@ mod tests {
                 ErrorCode::QuotaExceeded => "QUOTA_EXCEEDED",
                 ErrorCode::UnsupportedProtocol => "UNSUPPORTED_PROTOCOL",
                 ErrorCode::CursorExpired => "CURSOR_EXPIRED",
+                ErrorCode::ReadOnly => "READ_ONLY",
             }
         }
         ALL.iter()

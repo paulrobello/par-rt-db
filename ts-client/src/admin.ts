@@ -764,6 +764,26 @@ export class RtDbAdminClient {
     });
   }
 
+  /** Whether `db` is frozen read-only
+   *  (GET /admin/db/{db}/readonly). While frozen, client-plane document
+   *  writes fail with `READ_ONLY`; reads, subscriptions, and admin surfaces
+   *  are unaffected. */
+  async getReadOnly(db: string): Promise<{ readOnly: boolean }> {
+    return (await this.request("GET", `/admin/db/${encodeURIComponent(db)}/readonly`)) as {
+      readOnly: boolean;
+    };
+  }
+
+  /** Freeze (or unfreeze) `db` read-only
+   *  (PATCH /admin/db/{db}/readonly). While frozen, every client-plane
+   *  document write — any transport, any principal — fails with `READ_ONLY`;
+   *  system writes (scheduled fires, workflow advances, TTL reaping) continue. */
+  async setReadOnly(db: string, readOnly: boolean): Promise<void> {
+    await this.request("PATCH", `/admin/db/${encodeURIComponent(db)}/readonly`, {
+      readOnly,
+    });
+  }
+
   /** Cookie-session login (POST /admin/login). Sets the server's HttpOnly `rtdb_session`
    *  cookie on 204. A browser auto-attaches the cookie thereafter; a Node caller must wire
    *  its own cookie jar onto the injected `fetch` to reuse the session. */

@@ -669,6 +669,27 @@ def _op_set_anonymous_access(db: str, enabled: bool) -> _AdminRequest:
     )
 
 
+# --- per-db read-only freeze ---
+
+
+def _op_get_read_only(db: str) -> _AdminRequest:
+    return _AdminRequest(
+        "GET",
+        f"/admin/db/{db}/readonly",
+        {},
+        lambda resp: bool(resp.json()["readOnly"]),
+    )
+
+
+def _op_set_read_only(db: str, read_only: bool) -> _AdminRequest:
+    return _AdminRequest(
+        "PATCH",
+        f"/admin/db/{db}/readonly",
+        {"json": {"readOnly": read_only}},
+        _parse_expect_ok,
+    )
+
+
 def _op_mint_token(
     db: str,
     name: str,
@@ -1647,6 +1668,24 @@ class RtDbAdminClient:
         """
         self._executor.run(_op_set_anonymous_access(db, enabled))
 
+    # --- per-db read-only freeze ---
+
+    def get_read_only(self, db: str) -> bool:
+        """``GET /admin/db/{db}/readonly`` → whether the database is frozen.
+
+        While frozen, client-plane document writes fail with ``READ_ONLY``;
+        reads, subscriptions, and admin surfaces are unaffected.
+        """
+        return self._executor.run(_op_get_read_only(db))
+
+    def set_read_only(self, db: str, read_only: bool) -> None:
+        """``PATCH /admin/db/{db}/readonly`` ``{readOnly}`` → ``{ok:true}``.
+
+        Freezes (or unfreezes) the database. A ``not_found`` error means the
+        database is not registered.
+        """
+        self._executor.run(_op_set_read_only(db, read_only))
+
     # --- token surface (ENH-005) ---
 
     def mint_token(
@@ -2362,6 +2401,16 @@ class AsyncRtDbAdminClient:
         See :meth:`RtDbAdminClient.get_anonymous_access` for the two-gate rule.
         """
         return await self._executor.run(_op_get_anonymous_access(db))
+
+    # --- per-db read-only freeze ---
+
+    async def get_read_only(self, db: str) -> bool:
+        """``GET /admin/db/{db}/readonly`` → whether the database is frozen."""
+        return await self._executor.run(_op_get_read_only(db))
+
+    async def set_read_only(self, db: str, read_only: bool) -> None:
+        """``PATCH /admin/db/{db}/readonly`` ``{readOnly}`` → ``{ok:true}``."""
+        await self._executor.run(_op_set_read_only(db, read_only))
 
     async def set_anonymous_access(self, db: str, enabled: bool) -> None:
         """``PATCH /admin/db/{db}/anonymous-access`` ``{enabled}`` (async).
