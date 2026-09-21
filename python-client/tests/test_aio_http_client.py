@@ -1225,6 +1225,8 @@ async def test_admin_ops_recent_returns_events_and_sends_filters() -> None:
                         "kind": "insert",
                         "ts": 1000,
                         "owner": "user@example.com",
+                        "seq": 1,
+                        "feedEpoch": "epoch-1",
                     },
                     {
                         "db": "kanban",
@@ -1233,6 +1235,8 @@ async def test_admin_ops_recent_returns_events_and_sends_filters() -> None:
                         "kind": "delete",
                         "ts": 2000,
                         "owner": None,
+                        "seq": 2,
+                        "feedEpoch": "epoch-1",
                     },
                 ]
             },

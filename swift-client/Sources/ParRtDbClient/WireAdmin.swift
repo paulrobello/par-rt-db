@@ -1023,9 +1023,24 @@ public struct OpEvent: Equatable, Codable, Sendable {
     public var ts: Int64
     /// Per-row owner principal, when one applies (nil for `string | null`).
     public var owner: String?
+    /// 1-based monotonic sequence within the feed instance. The ring replays
+    /// on every (re)connect — dedup replays by tracking the max `seq` seen per
+    /// `feedEpoch`; a gap means evicted/dropped events, never a reordering.
+    public var seq: UInt64
+    /// The feed instance's boot-time UUID identity. An epoch change means the
+    /// counter reset (server restart), not dropped events. Dedup key:
+    /// `(feedEpoch, seq)`.
+    public var feedEpoch: String
 
     public init(
-        db: String, table: String, docId: String, kind: String, ts: Int64, owner: String? = nil
+        db: String,
+        table: String,
+        docId: String,
+        kind: String,
+        ts: Int64,
+        owner: String? = nil,
+        seq: UInt64 = 0,
+        feedEpoch: String = ""
     ) {
         self.db = db
         self.table = table
@@ -1033,10 +1048,12 @@ public struct OpEvent: Equatable, Codable, Sendable {
         self.kind = kind
         self.ts = ts
         self.owner = owner
+        self.seq = seq
+        self.feedEpoch = feedEpoch
     }
 
     enum CodingKeys: String, CodingKey {
-        case db, table, docId, kind, ts, owner
+        case db, table, docId, kind, ts, owner, seq, feedEpoch
     }
 }
 

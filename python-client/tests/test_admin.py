@@ -1029,6 +1029,8 @@ def test_ops_recent_parses_events() -> None:
                                 "kind": "insert",
                                 "ts": 1700000000000,
                                 "owner": "u@e.com",
+                                "seq": 1,
+                                "feedEpoch": "epoch-1",
                             }
                         ]
                     },

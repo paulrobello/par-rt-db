@@ -37,6 +37,8 @@ fn op_frame(db: &str, doc_id: &str) -> String {
             "kind": "insert",
             "ts": 1_700_000_000_000i64,
             "owner": null,
+            "seq": 7,
+            "feedEpoch": "epoch-1",
         }
     })
     .to_string()

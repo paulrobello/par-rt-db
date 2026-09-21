@@ -500,6 +500,9 @@ pub async fn run_listener(pool: PgPool, op_feed: std::sync::Arc<OpFeed>, own_ins
                     kind: payload.kind,
                     ts: payload.ts,
                     owner: payload.owner,
+                    // Re-stamped with this feed's (seq, epoch) on inject.
+                    seq: 0,
+                    feed_epoch: String::new(),
                 };
                 op_feed.publish_injected(event).await;
             }

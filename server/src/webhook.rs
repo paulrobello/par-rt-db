@@ -64,7 +64,7 @@ fn op_kind_name(kind: OpKind) -> &'static str {
 }
 
 /// The JSON body POSTed to each registered webhook URL. Shape matches
-/// `op_feed::OpEvent` (`{db, table, docId, kind, ts, owner}`, camelCase) with a
+/// `op_feed::OpEvent` (`{db, table, docId, kind, ts, owner, seq, feedEpoch}`, camelCase) with a
 /// `source` tag indicating which committer tap produced it (`"mutate"` or
 /// `"scheduled"`).
 #[derive(Debug, Clone, Serialize)]

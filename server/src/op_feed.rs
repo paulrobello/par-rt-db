@@ -3,6 +3,7 @@
 //! (re)connect; a `broadcast` channel fans live events to `/admin/stream`. Non-durable.
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
 use tokio::sync::{Mutex, broadcast};
@@ -19,12 +20,25 @@ pub struct OpEvent {
     pub kind: OpKind,
     pub ts: i64,
     pub owner: Option<String>,
+    /// Monotonic per-feed sequence, assigned as the event enters this feed's
+    /// ring (1-based). The ring replays on every (re)connect; a consumer that
+    /// tracks the max `seq` seen per `feedEpoch` observes each event exactly
+    /// once across replay + live windows, and a gap in `seq` means events the
+    /// ring evicted or the broadcast dropped — never a reordering.
+    pub seq: u64,
+    /// The feed instance's identity (a boot-time UUID, minted once per
+    /// [`OpFeed::new`]). An epoch change means the counter reset (server
+    /// restart or feed recreation) — not dropped events. Dedup key:
+    /// `(feedEpoch, seq)`.
+    pub feed_epoch: String,
 }
 
 pub struct OpFeed {
     tx: broadcast::Sender<OpEvent>,
     ring: Mutex<VecDeque<OpEvent>>,
     ring_cap: usize,
+    seq: AtomicU64,
+    feed_epoch: String,
 }
 
 impl OpFeed {
@@ -34,6 +48,8 @@ impl OpFeed {
             tx,
             ring: Mutex::new(VecDeque::with_capacity(ring_cap)),
             ring_cap,
+            seq: AtomicU64::new(0),
+            feed_epoch: uuid::Uuid::now_v7().simple().to_string(),
         })
     }
 
@@ -53,8 +69,18 @@ impl OpFeed {
                 kind: op.kind,
                 ts,
                 owner: owner.clone(),
+                // Stamped with this feed's (seq, epoch) by `push_event`.
+                seq: 0,
+                feed_epoch: String::new(),
             };
-            push_event(&mut ring, self.ring_cap, &self.tx, event);
+            push_event(
+                &mut ring,
+                self.ring_cap,
+                &self.tx,
+                &self.seq,
+                &self.feed_epoch,
+                event,
+            );
         }
     }
 
@@ -65,9 +91,20 @@ impl OpFeed {
     /// wall-clock time. Same ring/broadcast semantics as `publish` — this is the
     /// listener's single entry into the local feed; it performs no write and no
     /// committer interaction, so the single-writer invariant is intact.
+    /// The event is re-stamped into THIS feed's `(feedEpoch, seq)` series (the
+    /// origin `ts` above is what survives from the peer), so every consumer of
+    /// this feed sees one monotonic sequence regardless of which replica
+    /// committed the write.
     pub async fn publish_injected(&self, event: OpEvent) {
         let mut ring = self.ring.lock().await;
-        push_event(&mut ring, self.ring_cap, &self.tx, event);
+        push_event(
+            &mut ring,
+            self.ring_cap,
+            &self.tx,
+            &self.seq,
+            &self.feed_epoch,
+            event,
+        );
     }
 
     /// Recent events (oldest-first), filtered by optional db/table, capped at `n`.
@@ -90,16 +127,22 @@ impl OpFeed {
     }
 }
 
-/// Shared ring-push + broadcast for `publish` and `publish_injected`. Evicts the
-/// oldest entry when the ring is at `ring_cap`, then broadcasts to live
-/// subscribers. A lagged receiver (slower than the broadcast capacity) drops the
-/// event — that subscriber catches up via the ring on its next replay.
+/// Shared ring-push + broadcast for `publish` and `publish_injected`. Stamps the
+/// feed-local `(seq, feedEpoch)` onto the event — including re-stamping an
+/// injected peer event — then evicts the oldest entry when the ring is at
+/// `ring_cap` and broadcasts to live subscribers. A lagged receiver (slower than
+/// the broadcast capacity) drops the event — that subscriber catches up via the
+/// ring on its next replay (the drop reads as a `seq` gap).
 fn push_event(
     ring: &mut VecDeque<OpEvent>,
     ring_cap: usize,
     tx: &broadcast::Sender<OpEvent>,
-    event: OpEvent,
+    seq: &AtomicU64,
+    feed_epoch: &str,
+    mut event: OpEvent,
 ) {
+    event.seq = seq.fetch_add(1, Ordering::Relaxed) + 1;
+    event.feed_epoch = feed_epoch.to_string();
     if ring.len() >= ring_cap {
         ring.pop_front();
     }

@@ -354,6 +354,14 @@ export interface OpEvent {
   kind: OpEventKind;
   ts: number;
   owner?: string | null;
+  /** 1-based monotonic sequence within the feed instance. The ring replays on
+   *  every (re)connect — dedup replays by tracking the max `seq` seen per
+   *  `feedEpoch`; a gap means evicted/dropped events, never a reordering. */
+  seq: number;
+  /** The feed instance's boot-time UUID identity. An epoch change means the
+   *  counter reset (server restart), not dropped events. Dedup key:
+   *  `(feedEpoch, seq)`. */
+  feedEpoch: string;
 }
 /** A frame on the `/admin/stream` op-feed: a document op event (replay then live),
  *  or a ~1s server metrics snapshot. */

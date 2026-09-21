@@ -562,7 +562,8 @@ struct AdminClientTests {
             )
             let ops = """
             {"ops":[{"db":"app","table":"users","docId":"u1","kind":"insert","ts":9,
-            "owner":"u1"},{"db":"app","table":"users","docId":"u2","kind":"ttl","ts":10}]}
+            "owner":"u1","seq":1,"feedEpoch":"epoch-1"},{"db":"app","table":"users",
+            "docId":"u2","kind":"ttl","ts":10,"seq":2,"feedEpoch":"epoch-1"}]}
             """
             return (200, Data(ops.utf8))
         }

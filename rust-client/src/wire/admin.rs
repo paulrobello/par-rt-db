@@ -713,6 +713,14 @@ pub struct OpEvent {
     pub ts: i64,
     /// Per-row owner principal, when one applies.
     pub owner: Option<String>,
+    /// 1-based monotonic sequence within the feed instance. The ring replays
+    /// on every (re)connect; dedup replays by tracking the max `seq` seen per
+    /// `feed_epoch`. A gap means evicted/dropped events, never a reordering.
+    pub seq: u64,
+    /// The feed instance's boot-time UUID identity. An epoch change means the
+    /// counter reset (server restart), not dropped events. Dedup key:
+    /// `(feed_epoch, seq)`.
+    pub feed_epoch: String,
 }
 
 /// One frame on the `/admin/stream` op-feed WebSocket: a document op event

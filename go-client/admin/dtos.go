@@ -229,6 +229,13 @@ type OpEvent struct {
 	Kind  string  `json:"kind"`
 	Ts    int64   `json:"ts"`
 	Owner *string `json:"owner"`
+	// Seq is the 1-based monotonic sequence within the feed instance: the
+	// ring replays on every (re)connect, so dedup replays by tracking the
+	// max Seq seen per FeedEpoch; a gap means evicted/dropped events.
+	Seq uint64 `json:"seq"`
+	// FeedEpoch is the feed's boot-time UUID identity — an epoch change
+	// means the counter reset (server restart), not dropped events.
+	FeedEpoch string `json:"feedEpoch"`
 }
 
 // AuditEntry is one durable-audit row from GetAudit.

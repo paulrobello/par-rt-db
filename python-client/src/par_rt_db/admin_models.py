@@ -325,7 +325,13 @@ class HotConfigPatch(_Wire):
 class OpEvent(_Wire):
     """``GET /admin/ops/recent`` row — one document-op event from the in-memory
     ring. ``kind`` is a lowercase string (``insert``/``patch``/``replace``/
-    ``delete``/``upsert``); ``owner`` is ``null`` for admin/machine writes."""
+    ``delete``/``upsert``); ``owner`` is ``null`` for admin/machine writes.
+    ``seq`` is the 1-based monotonic sequence within the feed instance (dedup
+    ring replays by tracking the max ``seq`` seen per ``feed_epoch``; a gap
+    means evicted/dropped events, never a reordering), and ``feed_epoch`` is
+    the feed's boot-time UUID identity — an epoch change means the counter
+    reset (server restart), not dropped events. Dedup key:
+    ``(feed_epoch, seq)``."""
 
     db: str
     table: str
@@ -333,6 +339,8 @@ class OpEvent(_Wire):
     kind: str
     ts: int
     owner: str | None = None
+    seq: int
+    feed_epoch: str
 
 
 class CastFailure(_Wire):

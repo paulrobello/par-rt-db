@@ -1384,3 +1384,207 @@ async fn db_stats_reports_quota_and_usage() -> anyhow::Result<()> {
     assert_eq!(body["subsQuota"], 5);
     Ok(())
 }
+
+// Every event entering the feed is stamped with a 1-based monotonic `seq` and
+// the feed's `feedEpoch`: reconnect dedup keys on (feedEpoch, seq), a new feed
+// instance (process restart) resets the counter under a NEW epoch, and an
+// injected peer event joins the LOCAL sequence (its origin `ts` survives).
+#[tokio::test]
+async fn op_feed_seq_monotonic_and_epoch_scoped() -> anyhow::Result<()> {
+    use rtdb_server::txn::{DocOp, OpKind};
+    let feed = rtdb_server::op_feed::OpFeed::new(64, 32);
+    let ops: Vec<DocOp> = (1..=3)
+        .map(|i| DocOp {
+            table: "t".into(),
+            id: format!("id{i}"),
+            kind: OpKind::Insert,
+        })
+        .collect();
+    feed.publish("dbA", None, &ops).await;
+    let recent = feed.recent(None, None, 10).await;
+    let seqs: Vec<u64> = recent.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, vec![1, 2, 3], "seq must be 1-based and monotonic");
+    let epoch = recent[0].feed_epoch.clone();
+    assert!(!epoch.is_empty());
+    assert!(recent.iter().all(|e| e.feed_epoch == epoch));
+
+    // Injected peer event: re-stamped into this feed's series; origin ts kept.
+    let mut injected = recent[0].clone();
+    injected.seq = 999;
+    injected.feed_epoch = "peer-epoch".into();
+    injected.ts = 42;
+    feed.publish_injected(injected).await;
+    let recent = feed.recent(None, None, 10).await;
+    let last = recent.last().expect("injected event in ring");
+    assert_eq!(last.seq, 4, "injected events join the local sequence");
+    assert_eq!(last.feed_epoch, epoch);
+    assert_eq!(last.ts, 42, "injected origin ts is preserved");
+
+    // A new feed (the process-restart shape) mints a fresh epoch, so a
+    // consumer distinguishes "counter reset" from "gap = dropped events".
+    let feed2 = rtdb_server::op_feed::OpFeed::new(64, 32);
+    feed2.publish("dbA", None, &ops).await;
+    let recent2 = feed2.recent(None, None, 10).await;
+    assert_eq!(recent2[0].seq, 1, "the counter resets with the new feed");
+    assert_ne!(
+        recent2[0].feed_epoch, epoch,
+        "a new feed instance mints a new epoch"
+    );
+    Ok(())
+}
+
+// Reconnect-with-replay on /admin/stream: the ring replays up to its cap on
+// every (re)connect, so a consumer sees duplicate deliveries after a blip.
+// Every frame carries (feedEpoch, seq); a consumer that dedups on that pair
+// observes each event exactly once across replay + live windows.
+#[tokio::test]
+async fn admin_stream_reconnect_dedup_by_seq_and_epoch() -> anyhow::Result<()> {
+    use futures_util::StreamExt;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let state = crate::common::test_state().await;
+    let addr = crate::common::spawn_app(state.clone()).await;
+    let db = crate::common::fresh_db(&state).await;
+
+    let mint: serde_json::Value = crate::common::admin_post(
+        addr,
+        "/admin/mint-token",
+        serde_json::json!({"db": db, "name": "t"}),
+    )
+    .await
+    .json()
+    .await?;
+    let token = mint["token"].as_str().unwrap().to_string();
+    let insert = |name: &'static str| {
+        serde_json::json!({"db": db, "txn": {"steps":[{"op":"insert","table":"projects",
+            "doc":{"name": name, "status":"active","tags":[],"updatedAt":0}}]}})
+    };
+
+    async fn connect_stream(
+        addr: &str,
+    ) -> anyhow::Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    > {
+        let mut req = format!("ws://{addr}/admin/stream").into_client_request()?;
+        req.headers_mut().insert(
+            "sec-websocket-protocol",
+            reqwest::header::HeaderValue::from_str("rtdb-admin.test-admin-key")?,
+        );
+        let (ws, resp) = tokio_tungstenite::connect_async(req).await?;
+        assert_eq!(resp.status(), reqwest::StatusCode::SWITCHING_PROTOCOLS);
+        Ok(ws)
+    }
+
+    // Collect `op` frames (gauges skipped) until `want` distinct docIds have
+    // arrived or the timeout fires.
+    async fn collect_op_frames(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        want: usize,
+    ) -> Vec<serde_json::Value> {
+        let mut ops = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while ops.len() < want {
+            let frame = tokio::time::timeout_at(deadline, ws.next()).await;
+            let Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) = frame else {
+                break;
+            };
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t)
+                && v["kind"] == "op"
+            {
+                ops.push(v["event"].clone());
+            }
+        }
+        ops
+    }
+
+    // 1. Write A before any connection (lands in the ring only).
+    reqwest::Client::new()
+        .post(format!("http://{addr}/api/mutate"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&insert("a"))
+        .send()
+        .await?;
+    // 2. Connect; replay delivers A. Write B and C live on the same socket.
+    let mut ws1 = connect_stream(&addr.to_string()).await?;
+    let replay_a = collect_op_frames(&mut ws1, 1).await;
+    assert_eq!(
+        replay_a.len(),
+        1,
+        "ring replay must deliver the pre-connect write"
+    );
+    reqwest::Client::new()
+        .post(format!("http://{addr}/api/mutate"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&insert("b"))
+        .send()
+        .await?;
+    reqwest::Client::new()
+        .post(format!("http://{addr}/api/mutate"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&insert("c"))
+        .send()
+        .await?;
+    let live_bc = collect_op_frames(&mut ws1, 2).await;
+    assert_eq!(
+        live_bc.len(),
+        2,
+        "live frames for the two mid-stream writes"
+    );
+    drop(ws1);
+    // 3. Reconnect: the ring replays A, B, C again.
+    let mut ws2 = connect_stream(&addr.to_string()).await?;
+    let replay_abc = collect_op_frames(&mut ws2, 3).await;
+    assert_eq!(replay_abc.len(), 3, "reconnect replay redelivers all three");
+
+    // 4. Dedup by (feedEpoch, seq): 6 deliveries collapse to 3 events, each
+    //    seen exactly once, one epoch throughout, seqs strictly increasing.
+    let deliveries: Vec<(String, u64)> = replay_a
+        .iter()
+        .chain(live_bc.iter())
+        .chain(replay_abc.iter())
+        .map(|e| {
+            (
+                e["feedEpoch"].as_str().expect("feedEpoch").to_string(),
+                e["seq"].as_u64().expect("seq"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        deliveries.len(),
+        6,
+        "raw deliveries: replay + live + re-replay"
+    );
+    let unique: std::collections::BTreeSet<(String, u64)> = deliveries.iter().cloned().collect();
+    assert_eq!(
+        unique.len(),
+        3,
+        "dedup by (feedEpoch, seq) collapses replays"
+    );
+    let epochs: std::collections::BTreeSet<String> =
+        deliveries.iter().map(|(e, _)| e.clone()).collect();
+    assert_eq!(epochs.len(), 1, "one epoch across both connections");
+    let seqs: Vec<u64> = unique.iter().map(|(_, s)| *s).collect();
+    // BTreeSet ordering is by (epoch, seq): strictly increasing seqs.
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "seq strictly increasing after dedup: {seqs:?}"
+    );
+    // GET /admin/ops/recent carries the same stamps.
+    let body: serde_json::Value =
+        crate::common::admin_get(addr, &format!("/admin/ops/recent?db={db}&n=10"))
+            .await
+            .json()
+            .await?;
+    let rows = body["ops"].as_array().expect("ops array");
+    assert!(
+        rows.iter()
+            .all(|r| r["seq"].is_u64() && r["feedEpoch"].is_string()),
+        "ops/recent rows carry seq + feedEpoch: {rows:?}"
+    );
+    Ok(())
+}

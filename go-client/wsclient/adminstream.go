@@ -8,8 +8,9 @@ package wsclient
 // one browsers must use). A frame whose kind is unknown is skipped, not
 // fatal, matching ts-client's parseAdminStreamFrame and the rust
 // AdminStream::next loop. Every reconnect replays up to 200 ring events, so
-// duplicates after a blip are expected — OpEvent carries no sequence to
-// dedup on.
+// duplicates after a blip are expected — dedup them on (FeedEpoch, Seq):
+// track the max Seq seen per FeedEpoch, treat an epoch change as a counter
+// reset (server restart), and read a Seq gap as evicted/dropped events.
 
 import (
 	"context"

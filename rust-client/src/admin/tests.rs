@@ -873,8 +873,8 @@ async fn ops_recent_returns_events_and_query_params() {
         .and(header("authorization", BEARER))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "ops": [
-                {"db":"kanban","table":"notes","docId":"n1","kind":"insert","ts":1000,"owner":null},
-                {"db":"kanban","table":"notes","docId":"n2","kind":"patch","ts":2000,"owner":"u1"}
+                {"db":"kanban","table":"notes","docId":"n1","kind":"insert","ts":1000,"owner":null,"seq":1,"feedEpoch":"epoch-1"},
+                {"db":"kanban","table":"notes","docId":"n2","kind":"patch","ts":2000,"owner":"u1","seq":2,"feedEpoch":"epoch-1"}
             ]
         })))
         .mount(&server)

@@ -38,7 +38,7 @@ func opFrame(docID string) string {
 	b, _ := json.Marshal(map[string]any{
 		"kind": "op",
 		"event": map[string]any{
-			"db": "d", "table": "items", "docId": docID, "kind": "insert", "ts": 1,
+			"db": "d", "table": "items", "docId": docID, "kind": "insert", "ts": 1, "seq": 7, "feedEpoch": "epoch-1",
 		},
 	})
 	return string(b)
