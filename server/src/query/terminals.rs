@@ -669,12 +669,26 @@ fn compile_aggregate_terminal(
     }
     let pg_schema_name = pg_schema(db);
     let table_ident = pg_table(table);
+    // int64 aggregate fields project sum/min/max through the field's own
+    // decimal-string wire convention (`OP("col")::text`) — see
+    // `is_int64_index_field` for why the bare JSON number was a defect.
+    let agg_field_is_int64 = agg_field_name
+        .as_deref()
+        .and_then(|name| table_def.fields.get(name))
+        .is_some_and(is_int64_index_field);
     // The aggregate expression per op: COUNT(*) for `count` (no column), else
     // OP("agg_col") over the resolved aggregate field.
     let expr_for = |op: AggregateOp| -> String {
         match (&agg_field_name, op) {
             (Some(name), _) if op.needs_field() => {
-                format!("{}(\"{}\")", op.sql_fn(), pg_col(name))
+                let int64_text = if agg_field_is_int64
+                    && matches!(op, AggregateOp::Sum | AggregateOp::Min | AggregateOp::Max)
+                {
+                    "::text"
+                } else {
+                    ""
+                };
+                format!("{}(\"{}\"){int64_text}", op.sql_fn(), pg_col(name))
             }
             _ => "COUNT(*)".to_string(),
         }
@@ -1564,13 +1578,28 @@ pub(crate) async fn point_read(
 }
 
 /// Whether an indexed field's declared type is numeric enough for `sum`/`avg`.
-/// `Number` and `Int64` both qualify (`Optional<…>` unwraps one layer). Note:
-/// `SUM(bigint)`/`AVG(bigint)` return Postgres `numeric`, which serializes as a
-/// JSON number (f64) — precision is lost past 2^53; accepted trade-off.
+/// `Number` and `Int64` both qualify (`Optional<…>` unwraps one layer).
 fn is_numeric_index_field(ty: &FieldType) -> bool {
     match ty {
         FieldType::Number | FieldType::Int64 => true,
         FieldType::Optional { inner } => is_numeric_index_field(inner),
+        _ => false,
+    }
+}
+
+/// Whether `sum`/`min`/`max` over this field project through the int64
+/// decimal-string wire convention. Postgres returns exact `numeric`/`bigint`
+/// for these; casting the aggregate expression to `text` keeps those exact
+/// digits in the JSON — the same convention the field's own reads and writes
+/// already follow (a JSON number is IEEE-754 to every JS consumer, so the
+/// bare `to_jsonb` projection was silently wrong past 2^53). `avg` is
+/// excluded on purpose: a fractional mean has no int64 representation and
+/// stays a JSON number (documented in FEATURE_MATRIX row 13). `count` never
+/// takes a field.
+fn is_int64_index_field(ty: &FieldType) -> bool {
+    match ty {
+        FieldType::Int64 => true,
+        FieldType::Optional { inner } => is_int64_index_field(inner),
         _ => false,
     }
 }

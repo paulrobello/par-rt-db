@@ -2155,7 +2155,7 @@ describe("InMemoryRtDbClient — int64 index", () => {
     expect((asc as Array<{ kind: string }>).map((d) => d.kind)).toEqual(["zero", "prev", "max"]);
   });
 
-  it("aggregate sum/avg/min/max over an int64 index field are numeric", async () => {
+  it("aggregate sum/min/max over an int64 index field are exact decimal strings; avg is a number", async () => {
     const c = newClient();
     // ts values: 3, 20, 100 — chosen so lexicographic order (100, 20, 3) differs
     // from numeric order, and string concat ("3"+"20"+"100" = "320100") differs
@@ -2163,7 +2163,7 @@ describe("InMemoryRtDbClient — int64 index", () => {
     await seed(c);
 
     const sum = await c.query(int64Api.events.query().withIndex("by_ts").aggregate("sum"));
-    expect(sum).toBe(123);
+    expect(sum).toBe("123");
 
     const avg = await c.query(int64Api.events.query().withIndex("by_ts").aggregate("avg"));
     expect(avg).toBe(41);
@@ -2173,6 +2173,24 @@ describe("InMemoryRtDbClient — int64 index", () => {
 
     const max = await c.query(int64Api.events.query().withIndex("by_ts").aggregate("max"));
     expect(max).toBe("100");
+  });
+
+  it("int64 aggregate sum is exact past 2^53 where a Number reduce rounds", async () => {
+    const c = newClient();
+    // 2^53+1 and 2: sum = 9007199254740995 — odd and past
+    // Number.MAX_SAFE_INTEGER, so not representable as a JS number (Number()
+    // of the first operand alone already rounds 9007199254740993 → …992).
+    await c.mutate(mutation().insert("events", { ts: "9007199254740993", kind: "big" }).build());
+    await c.mutate(mutation().insert("events", { ts: "2", kind: "small" }).build());
+
+    const sum = await c.query(int64Api.events.query().withIndex("by_ts").aggregate("sum"));
+    expect(sum).toBe("9007199254740995");
+
+    const min = await c.query(int64Api.events.query().withIndex("by_ts").aggregate("min"));
+    expect(min).toBe("2");
+
+    const max = await c.query(int64Api.events.query().withIndex("by_ts").aggregate("max"));
+    expect(max).toBe("9007199254740993");
   });
 
   it("paginates an int64 index in numeric order with no gaps or duplicates", async () => {

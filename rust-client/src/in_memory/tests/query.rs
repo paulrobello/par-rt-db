@@ -330,7 +330,7 @@ async fn query_range_filters_by_index_field() {
 
 /// Schema for int64-indexable coverage: a single `by_ts` index over an
 /// `Int64` field, plus a string payload to identify rows in assertions.
-fn int64_test_schema() -> SchemaDef {
+pub(super) fn int64_test_schema() -> SchemaDef {
     Schema::builder()
         .table(
             "events",
@@ -346,7 +346,7 @@ fn int64_test_schema() -> SchemaDef {
 /// clock so each insert gets a distinct `_id` (the default constant-RNG id
 /// collides within a single millisecond, which would make successive inserts
 /// overwrite each other).
-fn int64_client() -> InMemoryRtDbClient {
+pub(super) fn int64_client() -> InMemoryRtDbClient {
     let counter = Arc::new(Mutex::new(1_700_000_000_000_i64));
     let mut client = InMemoryRtDbClient::new(
         InMemoryRtDbClientOptions::default()

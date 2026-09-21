@@ -1865,17 +1865,28 @@ pub fn compare_index_values(a: &Value, b: &Value, pg: PgType) -> std::cmp::Order
 /// non-empty input — the caller maps an empty set to JSON null.
 pub fn apply_aggregate(op: AggregateOp, values: &[Value], pg: PgType) -> Value {
     match op {
-        AggregateOp::Sum | AggregateOp::Avg => {
-            let sum: f64 = values.iter().filter_map(|v| numeric_value(v, pg)).sum();
-            let result = if matches!(op, AggregateOp::Avg) {
-                sum / values.len() as f64
-            } else {
-                sum
-            };
-            serde_json::Number::from_f64(result)
-                .map(Value::Number)
-                .unwrap_or(Value::Null)
+        // Exact decimal-string sum over an int64 field — the int64 wire
+        // convention the server projects (`OP("col")::text`, exact
+        // numeric/bigint digits), where the f64 JSON number silently rounded
+        // past 2^53. Values are i64 decimal strings; i128 accumulates any sum
+        // the corpus pins, and a sum past ~1.7e38 (beyond the harness's
+        // widest integer; the server's `numeric` is unbounded) falls back to
+        // the f64 form rather than truncating.
+        AggregateOp::Sum if matches!(pg, PgType::Int64) => {
+            let mut total: i128 = 0;
+            for v in values {
+                let addend = v
+                    .as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .map(i128::from);
+                match addend.and_then(|n| total.checked_add(n)) {
+                    Some(t) => total = t,
+                    None => return f64_aggregate(op, values, pg),
+                }
+            }
+            Value::String(total.to_string())
         }
+        AggregateOp::Sum | AggregateOp::Avg => f64_aggregate(op, values, pg),
         AggregateOp::Min | AggregateOp::Max => {
             let want_less = matches!(op, AggregateOp::Min);
             let mut best = &values[0];
@@ -1894,6 +1905,21 @@ pub fn apply_aggregate(op: AggregateOp, values: &[Value], pg: PgType) -> Value {
         // helper is called directly — it returns the count of provided values.
         AggregateOp::Count => Value::Number(serde_json::Number::from(values.len() as i64)),
     }
+}
+
+/// The f64 reduction shared by number-field sum/avg, int64 avg (a fractional
+/// mean has no int64 representation — documented f64 form), and the
+/// beyond-i128 int64-sum fallback.
+fn f64_aggregate(op: AggregateOp, values: &[Value], pg: PgType) -> Value {
+    let sum: f64 = values.iter().filter_map(|v| numeric_value(v, pg)).sum();
+    let result = if matches!(op, AggregateOp::Avg) {
+        sum / values.len() as f64
+    } else {
+        sum
+    };
+    serde_json::Number::from_f64(result)
+        .map(Value::Number)
+        .unwrap_or(Value::Null)
 }
 
 /// Parses an index value to `f64` for SUM/AVG. `Number` columns are JSON

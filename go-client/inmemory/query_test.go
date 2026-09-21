@@ -312,3 +312,77 @@ func TestQueryUnknownTableAndEqErrors(t *testing.T) {
 
 func strPtr(s string) *string                  { return &s }
 func jsonPtr(v wire.JSONValue) *wire.JSONValue { return &v }
+
+// int64 aggregates project the exact decimal string (the int64 wire
+// convention), past 2^53 — and past u64 — where the old JSON-number path
+// was f64-rounded.
+func TestQueryInt64AggregateExactStrings(t *testing.T) {
+	s := buildSchema(func(b *dsl.SchemaBuilder) {
+		b.Table("nums", func(tb *dsl.TableBuilder) {
+			tb.Field("bucket", dsl.Str()).Field("n", dsl.Int64()).Index("by_bucket_n", "bucket", "n")
+		})
+	})
+	st := NewStore()
+	if err := st.PushSchema(s); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	agg := func(op wire.AggregateOp) wire.JSONValue {
+		return mustEval(t, st, wire.Query{Table: "nums", Index: strPtr("by_bucket_n"),
+			Eq:        []wire.JSONValue{wire.String("b")},
+			Aggregate: &wire.AggregateSpec{Op: op}})
+	}
+
+	seedRow(t, st, "nums", 10, docObj("bucket", "b", "n", "3"))
+	seedRow(t, st, "nums", 20, docObj("bucket", "b", "n", "20"))
+	seedRow(t, st, "nums", 30, docObj("bucket", "b", "n", "100"))
+
+	if got := agg(wire.AggSum); got != wire.String("123") {
+		t.Fatalf("int64 sum: %v", got)
+	}
+	if got := agg(wire.AggMin); got != wire.String("3") {
+		t.Fatalf("int64 min: %v", got)
+	}
+	if got := agg(wire.AggMax); got != wire.String("100") {
+		t.Fatalf("int64 max: %v", got)
+	}
+}
+
+func TestQueryInt64AggregateSumPast2p53AndU64(t *testing.T) {
+	s := buildSchema(func(b *dsl.SchemaBuilder) {
+		b.Table("nums", func(tb *dsl.TableBuilder) {
+			tb.Field("bucket", dsl.Str()).Field("n", dsl.Int64()).Index("by_bucket_n", "bucket", "n")
+		})
+	})
+	st := NewStore()
+	if err := st.PushSchema(s); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	sum := func() wire.JSONValue {
+		return mustEval(t, st, wire.Query{Table: "nums", Index: strPtr("by_bucket_n"),
+			Eq:        []wire.JSONValue{wire.String("b")},
+			Aggregate: &wire.AggregateSpec{Op: wire.AggSum}})
+	}
+
+	// 2^53+1 and 2: sum = 9007199254740995 — odd and past 2^53, not
+	// representable as a float64 integer.
+	seedRow(t, st, "nums", 10, docObj("bucket", "b", "n", "9007199254740993"))
+	seedRow(t, st, "nums", 20, docObj("bucket", "b", "n", "2"))
+	if got := sum(); got != wire.String("9007199254740995") {
+		t.Fatalf("int64 sum past 2^53: %v", got)
+	}
+
+	// Three i64-max rows: sum = 27670116110564327421 — past u64, where the
+	// server's old JSON-number path returned an f64.
+	st2 := NewStore()
+	if err := st2.PushSchema(s); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	seedRow(t, st2, "nums", 10, docObj("bucket", "b", "n", "9223372036854775807"))
+	seedRow(t, st2, "nums", 20, docObj("bucket", "b", "n", "9223372036854775807"))
+	seedRow(t, st2, "nums", 30, docObj("bucket", "b", "n", "9223372036854775807"))
+	if got := mustEval(t, st2, wire.Query{Table: "nums", Index: strPtr("by_bucket_n"),
+		Eq:        []wire.JSONValue{wire.String("b")},
+		Aggregate: &wire.AggregateSpec{Op: wire.AggSum}}); got != wire.String("27670116110564327421") {
+		t.Fatalf("int64 sum past u64: %v", got)
+	}
+}

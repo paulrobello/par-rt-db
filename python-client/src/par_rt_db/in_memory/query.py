@@ -345,11 +345,20 @@ def _is_number(value: Any) -> bool:
 
 def _apply_aggregate(op: str, values: list[Any], pg: _PgType) -> Any:
     """Apply one aggregate op over a non-empty list of non-null values, mirroring
-    the server's SQL semantics and the TS/Rust harnesses. SUM/AVG reduce
-    numerically (int64 values are decimal strings -> parsed); MIN/MAX pick the
-    smallest/largest per :func:`_compare_index_values`, so a string field's
-    extremes match Postgres lexicographic ordering. Only called on non-empty
-    input — the caller maps an empty set to ``None``."""
+    the server's SQL semantics and the TS/Rust harnesses. SUM over an int64
+    field and MIN/MAX over any int64 field project the exact decimal string —
+    the int64 wire convention the server casts to (``OP("col")::text``), exact
+    past 2^53 where a JSON number is an IEEE-754 double. AVG reduces
+    numerically (a fractional mean has no int64 representation — documented
+    f64 form); MIN/MAX pick the smallest/largest per
+    :func:`_compare_index_values`, so a string field's extremes match Postgres
+    lexicographic ordering. Only called on non-empty input — the caller maps an
+    empty set to ``None``."""
+    if op == AggregateOp.SUM and pg == _INT64:
+        # Python ints are arbitrary precision, so the exact sum needs no
+        # widened accumulator — str() emits the same decimal digits the
+        # server's numeric produces.
+        return str(sum(_parse_i64(v) for v in values))
     if op in (AggregateOp.SUM, AggregateOp.AVG):
         nums = [_to_numeric(v, pg) for v in values]
         total = sum(nums)

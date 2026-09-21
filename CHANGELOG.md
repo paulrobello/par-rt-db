@@ -21,6 +21,27 @@ alter observable behavior on upgrade.
 
 ### Breaking
 
+- **`sum`/`min`/`max` over an `int64` index field now return the exact decimal
+  string instead of a JSON number** (FEATURE_MATRIX #13). The old projection
+  put Postgres's exact `numeric`/`bigint` result through a JSON number — exact
+  on the server only while the value fit `u64`, and silently rounded to f64 by
+  every JS consumer past 2^53, which is precisely the loss the `int64` field
+  type (and its decimal-string wire convention) exists to prevent. The
+  aggregate expression now casts to `::text`, so the digits Postgres computed
+  are the digits on the wire: `"27670116110564327421"`, not
+  `2.7670116110564327e19`. `avg` over any numeric field is unchanged (JSON
+  number — now documented as the f64 form, since a fractional mean has no
+  int64 representation), `count` is unchanged, and a `number` field's
+  aggregates are byte-identical to before. **Migration:** a consumer reading
+  an int64-field aggregate must treat it as the decimal string the int64 field
+  values already are — the same `toInt64()`/`fromInt64()` helpers (ts) or
+  language int parse every other int64 read uses; a consumer that fed the old
+  number into float arithmetic was already getting silently wrong totals.
+  All five client in-memory engines mirror the exact-string forms
+  (swift's engine also had int64 `avg` reducing decimal strings to 0 via a nil
+  `doubleValue` — now parsed), and three wire-corpus semantics cases pin the
+  output (`aggregate-int64-sum-scalar`, `aggregate-int64-multi-op-exact`,
+  `aggregate-int64-avg-number`).
 - **Google, GitLab, and generic-OIDC identity now keys on a stable
   provider-side subject instead of the email** (FEATURE_MATRIX #14). These
   three resolved logins through `INSERT … ON CONFLICT (email) DO UPDATE`, so a

@@ -261,18 +261,36 @@ func jsonNumber(_ double: Double) -> JSONValue {
 
 /// Applies one aggregate op over a non-empty value array (query.ts
 /// `applyAggregate`). SUM/AVG require numeric entries; MIN/MAX order per
-/// `compareIndexValues`; `pg == "int64"` parses decimal strings for both
-/// ordering and reduction (accepted precision loss past 2^53, matching the
-/// server's numeric -> JSON number projection).
+/// `compareIndexValues`. Over an int64 field, SUM/MIN/MAX project the exact
+/// decimal string — the int64 wire convention the server casts to
+/// (`OP("col")::text`), exact past 2^53 where a JSON number is an IEEE-754
+/// double. AVG stays a number (a fractional mean has no int64 form —
+/// documented f64).
 func applyAggregate(_ op: AggregateOp, _ values: [JSONValue], _ pg: PgType?) -> JSONValue {
     switch op {
     case .count:
         return .int(Int64(values.count))
     case .sum:
+        if pg == .int64 {
+            // Exact decimal-string sum. Decimal is exact to 38 significant
+            // digits — the same practical boundary as the other engines'
+            // i128/BigInt/int accumulators (the server's numeric is
+            // unbounded).
+            let total = values.reduce(Decimal(0)) { acc, value in
+                acc + (value.stringValue.flatMap { Decimal(string: $0) } ?? Decimal(0))
+            }
+            return .string(total.description)
+        }
         let total = values.reduce(0.0) { $0 + ($1.doubleValue ?? 0) }
         return jsonNumber(total)
     case .avg:
-        let total = values.reduce(0.0) { $0 + ($1.doubleValue ?? 0) }
+        // An int64 field's values are decimal strings — `doubleValue` is nil
+        // for those, so parse them explicitly instead of reducing to 0.
+        let total = values.reduce(0.0) { acc, value in
+            acc + (pg == .int64
+                ? (value.stringValue.flatMap { Double($0) } ?? 0)
+                : (value.doubleValue ?? 0))
+        }
         return jsonNumber(total / Double(values.count))
     case .min:
         return values.dropFirst().reduce(values[0]) { best, next in

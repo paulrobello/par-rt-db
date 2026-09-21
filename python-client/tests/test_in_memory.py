@@ -3780,3 +3780,77 @@ def test_await_signal_spec_validation_rejects_invalid_steps() -> None:
     wid = c.start_workflow(_wf("ok", [_wf_wait_step("a")]))
     c.tick()
     assert _wf_status(c, wid).status == "waiting"
+
+
+# ---------------------------------------------------------------------------
+# aggregate: int64 exact decimal-string projection
+# ---------------------------------------------------------------------------
+
+
+def _int64_events_client() -> InMemoryRtDbClient:
+    """Client with the int64 ``events`` schema (``ts`` int64 + ``by_ts``),
+    mirroring the Rust/TS int64 fixtures."""
+    counter = [1_700_000_000_000]
+
+    def now() -> int:
+        v = counter[0]
+        counter[0] += 1
+        return v
+
+    schema = (
+        Schema.builder()
+        .table(
+            "events",
+            lambda tb: tb.field("ts", t.int64()).field("kind", t.string()).index("by_ts", ["ts"]),
+        )
+        .build()
+    )
+    c = InMemoryRtDbClient(InMemoryRtDbClientOptions(now=now, random=lambda: 0.0))
+    c.push_schema(schema)
+    return c
+
+
+def _seed_int64_events(c: InMemoryRtDbClient, rows: list[tuple[str, str]]) -> None:
+    for ts, kind in rows:
+        c.mutate(Mutation.builder().insert("events", {"ts": ts, "kind": kind}).build())
+
+
+def test_int64_aggregate_sum_min_max_are_decimal_strings_avg_is_number() -> None:
+    # ts values 3, 20, 100: sum/min/max are exact decimal strings (the int64
+    # wire convention), avg stays a number.
+    c = _int64_events_client()
+    _seed_int64_events(c, [("3", "c"), ("20", "b"), ("100", "a")])
+
+    def agg(op: Literal["sum", "avg", "min", "max"]) -> Any:
+        return c.run_query(TableQuery("events").with_index("by_ts").aggregate(op).build())
+
+    assert agg("sum") == "123"
+    assert agg("avg") == 41
+    assert agg("min") == "3"
+    assert agg("max") == "100"
+
+
+def test_int64_aggregate_sum_is_exact_past_2p53() -> None:
+    # 2^53+1 and 2: sum = 9007199254740995 — odd and past 2^53, not
+    # representable as a float64 integer.
+    c = _int64_events_client()
+    _seed_int64_events(c, [("9007199254740993", "big"), ("2", "small")])
+
+    def agg(op: Literal["sum", "min", "max"]) -> Any:
+        return c.run_query(TableQuery("events").with_index("by_ts").aggregate(op).build())
+
+    assert agg("sum") == "9007199254740995"
+    assert agg("min") == "2"
+    assert agg("max") == "9007199254740993"
+
+
+def test_int64_aggregate_sum_past_u64_stays_exact() -> None:
+    # Three i64-max rows: sum = 27670116110564327421 — past u64, where the
+    # server's old JSON-number path returned an f64.
+    c = _int64_events_client()
+    _seed_int64_events(
+        c,
+        [("9223372036854775807", "a")] * 3,
+    )
+    v = c.run_query(TableQuery("events").with_index("by_ts").aggregate("sum").build())
+    assert v == "27670116110564327421"

@@ -4456,8 +4456,159 @@ async fn int64_index_count_and_aggregate() -> anyhow::Result<()> {
         false,
     )
     .await?;
-    // SUM(bigint) projects via to_jsonb -> JSON number.
-    assert!(matches!(r, QueryResult::Aggregate(ref v) if v.as_f64() == Some(60.0)));
+    // SUM over an int64 field projects via ::text -> decimal string (exact).
+    assert!(matches!(r, QueryResult::Aggregate(ref v) if v.as_str() == Some("60")));
+    Ok(())
+}
+
+/// Query builder for the int64 aggregate tests: aggregate over the full
+/// `by_ts` index (empty eq prefix), mirroring `aggregate_query` but on the
+/// int64-schema `events` table.
+fn int64_aggregate_query(spec: AggregateSpec) -> Query {
+    Query {
+        table: "events".to_string(),
+        get: None,
+        index: Some("by_ts".to_string()),
+        eq: vec![],
+        gt: None,
+        gte: None,
+        lt: None,
+        lte: None,
+        order: None,
+        take: None,
+        unique: false,
+        first: false,
+        count: false,
+        distinct: false,
+        paginate: None,
+        filter: None,
+        search: None,
+        vector_search: None,
+        hybrid_search: None,
+        fields: None,
+        aggregate: Some(spec),
+    }
+}
+
+// int64 sum/min/max project through the field's decimal-string convention, so
+// aggregates past 2^53 — or past u64 entirely — are exact, where the old bare
+// to_jsonb projection was an f64 JSON number (silently wrong for every JS
+// consumer past 2^53, and wrong on the server itself past u64::MAX, where
+// serde_json's integer paths give out). The wire-v2 multi-op map keeps the
+// same exactness per alias.
+#[tokio::test]
+async fn int64_aggregate_sum_min_max_exact_past_2p53() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_int64_db(&state).await;
+    let schema = int64_schema();
+    // Three i64::MAX rows: sum = 27670116110564327421 — past u64::MAX
+    // (18446744073709551615), so the old JSON-number path returned an f64
+    // (2.7670116110564327e19) for it.
+    insert_event(&pool, &db, &schema, "9223372036854775807", "a").await?;
+    insert_event(&pool, &db, &schema, "9223372036854775807", "b").await?;
+    insert_event(&pool, &db, &schema, "9223372036854775807", "c").await?;
+
+    let sum = aggregate_scalar(
+        &execute_query(
+            &pool,
+            &db,
+            &schema,
+            &int64_aggregate_query(agg(AggregateOp::Sum)),
+            &PrincipalCtx::bypass(),
+            false,
+        )
+        .await?,
+    );
+    assert_eq!(sum, serde_json::json!("27670116110564327421"));
+
+    let min = aggregate_scalar(
+        &execute_query(
+            &pool,
+            &db,
+            &schema,
+            &int64_aggregate_query(agg(AggregateOp::Min)),
+            &PrincipalCtx::bypass(),
+            false,
+        )
+        .await?,
+    );
+    assert_eq!(min, serde_json::json!("9223372036854775807"));
+
+    let max = aggregate_scalar(
+        &execute_query(
+            &pool,
+            &db,
+            &schema,
+            &int64_aggregate_query(agg(AggregateOp::Max)),
+            &PrincipalCtx::bypass(),
+            false,
+        )
+        .await?,
+    );
+    assert_eq!(max, serde_json::json!("9223372036854775807"));
+
+    // Wire-v2 multi-op: one query, aliased ops, every field op exact-string;
+    // count keeps its integer form.
+    let multi_spec = AggregateSpec {
+        op: None,
+        group_by: GroupBy::Bool(false),
+        aggregates: Some(std::collections::BTreeMap::from([
+            ("total".to_string(), AggregateOp::Sum),
+            ("lo".to_string(), AggregateOp::Min),
+            ("hi".to_string(), AggregateOp::Max),
+            ("n".to_string(), AggregateOp::Count),
+        ])),
+    };
+    let r = execute_query(
+        &pool,
+        &db,
+        &schema,
+        &int64_aggregate_query(multi_spec),
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await?;
+    let multi = match r {
+        QueryResult::AggregateMulti(v) => v,
+        other => panic!("expected AggregateMulti variant, got {other:?}"),
+    };
+    assert_eq!(
+        multi,
+        serde_json::json!({
+            "total": "27670116110564327421",
+            "lo": "9223372036854775807",
+            "hi": "9223372036854775807",
+            "n": 3
+        })
+    );
+    Ok(())
+}
+
+// avg over an int64 field stays a JSON number — the documented f64 form. A
+// fractional mean has no int64 representation, so the decimal-string
+// convention cannot apply without inventing a numeric-string type for it.
+#[tokio::test]
+async fn int64_aggregate_avg_stays_number() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_int64_db(&state).await;
+    let schema = int64_schema();
+    insert_event(&pool, &db, &schema, "3", "a").await?;
+    insert_event(&pool, &db, &schema, "4", "b").await?;
+
+    let avg = aggregate_scalar(
+        &execute_query(
+            &pool,
+            &db,
+            &schema,
+            &int64_aggregate_query(agg(AggregateOp::Avg)),
+            &PrincipalCtx::bypass(),
+            false,
+        )
+        .await?,
+    );
+    assert_eq!(avg, serde_json::json!(3.5));
     Ok(())
 }
 

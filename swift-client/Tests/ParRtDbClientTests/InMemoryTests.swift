@@ -790,6 +790,74 @@ struct InMemoryTests {
         ]))
     }
 
+    /// Client with the int64 `events` schema (ts int64 + by_ts), seeded with
+    /// one row per decimal-string ts value.
+    private func int64EventsEngine(_ tsValues: [String]) throws -> InMemoryRtDbClient {
+        let client = deterministicClient()
+        try client.pushSchema(SchemaBuilder()
+            .table("events") {
+                $0.field("ts", .int64)
+                    .field("kind", .string)
+                    .index("by_ts", on: ["ts"])
+            }
+            .build())
+        _ = try client.mutate(Transaction(steps: tsValues.enumerated().map { index, ts in
+            .insert(table: "events", doc: ["ts": .string(ts), "kind": .string("k\(index)")])
+        }))
+        return client
+    }
+
+    @Test func int64AggregateSumMinMaxAreExactDecimalStrings() throws {
+        // ts values 3, 20, 100: sum/min/max are exact decimal strings (the
+        // int64 wire convention), not numbers.
+        let client = try int64EventsEngine(["3", "20", "100"])
+        #expect(
+            try client.query(Query(table: "events", index: "by_ts", aggregate: AggregateSpec(op: .sum)))
+                == .string("123")
+        )
+        #expect(
+            try client.query(Query(table: "events", index: "by_ts", aggregate: AggregateSpec(op: .min)))
+                == .string("3")
+        )
+        #expect(
+            try client.query(Query(table: "events", index: "by_ts", aggregate: AggregateSpec(op: .max)))
+                == .string("100")
+        )
+    }
+
+    @Test func int64AggregateSumExactPast2p53() throws {
+        // 2^53+1 and 2: sum = 9007199254740995 — odd and past 2^53, not
+        // representable as a Double integer.
+        let client = try int64EventsEngine(["9007199254740993", "2"])
+        #expect(
+            try client.query(Query(table: "events", index: "by_ts", aggregate: AggregateSpec(op: .sum)))
+                == .string("9007199254740995")
+        )
+    }
+
+    @Test func int64AggregateSumPastU64StaysExact() throws {
+        // Three i64-max rows: sum = 27670116110564327421 — past u64, where
+        // the server's old JSON-number path returned an f64.
+        let client = try int64EventsEngine([
+            "9223372036854775807", "9223372036854775807", "9223372036854775807"
+        ])
+        #expect(
+            try client.query(Query(table: "events", index: "by_ts", aggregate: AggregateSpec(op: .sum)))
+                == .string("27670116110564327421")
+        )
+    }
+
+    @Test func int64AggregateAvgStaysNumber() throws {
+        // avg is the documented f64 form — 3 and 4 average to 3.5. (Regression
+        // guard: the engine's avg reduce used `doubleValue`, which is nil for
+        // decimal strings and reduced int64 rows to 0.)
+        let client = try int64EventsEngine(["3", "4"])
+        let avg = try client.query(
+            Query(table: "events", index: "by_ts", aggregate: AggregateSpec(op: .avg))
+        )
+        #expect(avg.doubleValue == 3.5)
+    }
+
     @Test func paginateCursorRoundTrips() throws {
         let client = deterministicClient()
         try client.pushSchema(itemsSchema())

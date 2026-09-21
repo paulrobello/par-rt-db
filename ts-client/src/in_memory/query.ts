@@ -202,10 +202,12 @@ function compareIndexValues(a: unknown, b: unknown, pg?: PgType): number {
  *  semantics: SUM/AVG require all entries numeric; MIN/MAX pick the smallest/
  *  largest per `compareIndexValues` so a string field's MIN/MAX matches Postgres
  *  lexicographic ordering, unless `pg === "int64"` in which case both ordering
- *  and numeric reduction parse the decimal strings (server `SUM(bigint)`/
- *  `AVG(bigint)` return Postgres `numeric` → JSON number, so `Number()` is the
- *  correct projection — accepted precision loss past 2^53). AVG returns the
- *  arithmetic mean (no rounding). */
+ *  and numeric reduction parse the decimal strings. SUM/MIN/MAX over an int64
+ *  field project through the int64 decimal-string wire convention (the server
+ *  casts the aggregate to `::text` — see `is_int64_index_field` in
+ *  `server/src/query/terminals.rs`), exact past 2^53 where a JSON number is an
+ *  IEEE-754 double. AVG stays a number: a fractional mean has no int64
+ *  representation (documented f64 form). */
 function applyAggregate(op: AggregateOp, values: unknown[], pg?: PgType): unknown {
   switch (op) {
     case "count":
@@ -214,7 +216,9 @@ function applyAggregate(op: AggregateOp, values: unknown[], pg?: PgType): unknow
       return values.length;
     case "sum":
       if (pg === "int64") {
-        return values.reduce<number>((acc, v) => acc + Number(v), 0);
+        // Exact decimal-string sum — a `Number` reduce silently rounds past
+        // 2^53.
+        return values.reduce<bigint>((acc, v) => acc + BigInt(v as string), 0n).toString();
       }
       return values.reduce<number>((acc, v) => acc + (v as number), 0);
     case "avg":

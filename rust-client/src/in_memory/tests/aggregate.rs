@@ -1,3 +1,4 @@
+use super::query::int64_client;
 use super::*;
 
 // ---- query: distinct + aggregate terminals ---------------------
@@ -539,4 +540,127 @@ async fn aggregate_rejects_conflicting_terminals() {
             err.message
         );
     }
+}
+
+// ---- aggregate: int64 exact decimal-string projection ----------------
+//
+// sum/min/max over an int64 field project through the int64 wire convention
+// (decimal strings), mirroring the server's `OP("col")::text` — exact past
+// 2^53 (and past u64, where even serde_json's exact integer paths give out)
+// where the old f64 JSON number silently rounded. avg stays a number.
+
+/// Seeds the int64 `events` table with (ts, kind) rows.
+async fn seed_int64_events(c: &mut InMemoryRtDbClient, rows: &[(&str, &str)]) {
+    for (ts, kind) in rows {
+        c.mutate(
+            &Mutation::new()
+                .insert("events", json!({"ts": ts, "kind": kind}))
+                .build(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn int64_aggregate_sum_min_max_are_decimal_strings_avg_is_number() {
+    let mut c = int64_client();
+    seed_int64_events(&mut c, &[("3", "c"), ("20", "b"), ("100", "a")]).await;
+
+    let sum = c
+        .run_query(
+            &TableQuery::new("events")
+                .with_index("by_ts", &[])
+                .aggregate(AggregateOp::Sum, false),
+        )
+        .expect("sum");
+    assert_eq!(sum, json!("123"));
+
+    let avg = c
+        .run_query(
+            &TableQuery::new("events")
+                .with_index("by_ts", &[])
+                .aggregate(AggregateOp::Avg, false),
+        )
+        .expect("avg");
+    assert_eq!(avg, json!(41.0));
+
+    let min = c
+        .run_query(
+            &TableQuery::new("events")
+                .with_index("by_ts", &[])
+                .aggregate(AggregateOp::Min, false),
+        )
+        .expect("min");
+    assert_eq!(min, json!("3"));
+
+    let max = c
+        .run_query(
+            &TableQuery::new("events")
+                .with_index("by_ts", &[])
+                .aggregate(AggregateOp::Max, false),
+        )
+        .expect("max");
+    assert_eq!(max, json!("100"));
+}
+
+#[tokio::test]
+async fn int64_aggregate_sum_is_exact_past_2p53() {
+    let mut c = int64_client();
+    // 2^53+1 and 2: sum = 9007199254740995 — odd and past 2^53, not
+    // representable as an f64 integer.
+    seed_int64_events(&mut c, &[("9007199254740993", "big"), ("2", "small")]).await;
+
+    let sum = c
+        .run_query(
+            &TableQuery::new("events")
+                .with_index("by_ts", &[])
+                .aggregate(AggregateOp::Sum, false),
+        )
+        .expect("sum");
+    assert_eq!(sum, json!("9007199254740995"));
+
+    let min = c
+        .run_query(
+            &TableQuery::new("events")
+                .with_index("by_ts", &[])
+                .aggregate(AggregateOp::Min, false),
+        )
+        .expect("min");
+    assert_eq!(min, json!("2"));
+
+    let max = c
+        .run_query(
+            &TableQuery::new("events")
+                .with_index("by_ts", &[])
+                .aggregate(AggregateOp::Max, false),
+        )
+        .expect("max");
+    assert_eq!(max, json!("9007199254740993"));
+}
+
+#[tokio::test]
+async fn int64_aggregate_sum_past_u64_stays_exact() {
+    let mut c = int64_client();
+    // Three i64::MAX rows: sum = 27670116110564327421 — past u64::MAX, where
+    // the server's old JSON-number path returned an f64.
+    seed_int64_events(
+        &mut c,
+        &[
+            ("9223372036854775807", "a"),
+            ("9223372036854775807", "b"),
+            ("9223372036854775807", "c"),
+        ],
+    )
+    .await;
+
+    let sum = c
+        .run_query(
+            &TableQuery::new("events")
+                .with_index("by_ts", &[])
+                .aggregate(AggregateOp::Sum, false),
+        )
+        .expect("sum");
+    assert_eq!(sum, json!("27670116110564327421"));
 }

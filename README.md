@@ -538,7 +538,13 @@ sorted last) — or, wire-v2, several named ops in one pass via an
 declared index fields for composite grouping (`count per (status, priority)`);
 the map form returns `{alias: value, …}` ungrouped or `[{keys, values}]` rows
 grouped, and composes with the legacy single-`op` + field-list combination the
-same way, and an optional `fields` array projects each result doc to the
+same way. Aggregate result forms: `sum`/`min`/`max` over an `int64` index
+field return the exact decimal string — the int64 wire convention, exact past
+2^53 where a JSON number is an IEEE-754 double (a `sum` of satoshis or byte
+counts is not silently rounded); `avg` over any numeric field stays a JSON
+number (documented f64 form — a fractional mean has no int64 representation);
+`count` is an integer; a `number` field's aggregates are JSON numbers. An
+optional `fields` array projects each result doc to the
 listed user fields — the system fields (`_id`/`_creationTime`/`_version`) and
 synthetic fields (`_searchSnippet`) are always kept, `fields: []` is an
 ids-only view, names are validated against the schema (`BAD_REQUEST` on an

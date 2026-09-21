@@ -1,0 +1,35 @@
+{
+  "name": "aggregate-int64-multi-op-exact",
+  "$comment": "Wire-v2 aggregates over an int64 field: sum/min/max are exact decimal strings per op — the i64-max triple sums to 27670116110564327421, past u64 where even serde_json's exact integer paths give out and the old JSON-number projection returned an f64 — while count keeps its integer form.",
+  "schema": {
+    "tables": {
+      "balances": {
+        "fields": {
+          "acct": { "type": "string" },
+          "sats": { "type": "int64" }
+        },
+        "indexes": [{ "name": "by_acct_sats", "fields": ["acct", "sats"] }]
+      }
+    }
+  },
+  "seed": [
+    { "acct": "a", "sats": "9223372036854775807" },
+    { "acct": "a", "sats": "9223372036854775807" },
+    { "acct": "a", "sats": "9223372036854775807" },
+    { "acct": "b", "sats": "5" }
+  ],
+  "op": {
+    "query": {
+      "table": "balances",
+      "index": "by_acct_sats",
+      "eq": ["a"],
+      "aggregate": { "aggregates": { "total": "sum", "lo": "min", "hi": "max", "n": "count" } }
+    }
+  },
+  "expect": {
+    "total": "27670116110564327421",
+    "lo": "9223372036854775807",
+    "hi": "9223372036854775807",
+    "n": 3
+  }
+}

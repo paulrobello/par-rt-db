@@ -4,6 +4,7 @@
 package inmemory
 
 import (
+	"math/big"
 	"sort"
 	"strconv"
 
@@ -774,23 +775,33 @@ func executeAggregateTerminal(agg *wire.AggregateSpec, table *TableDef, plan *sc
 }
 
 // applyAggregate applies one aggregate op over a non-empty value set:
-// SUM/AVG reduce numerically (int64 values parsed from decimal strings);
-// MIN/MAX pick the extreme per compareIndexValues.
+// SUM over an int64 field reduces exactly over the decimal strings and
+// projects the exact decimal string (the int64 wire convention — the server
+// casts OP("col")::text; a JSON number is an IEEE-754 double past 2^53);
+// other SUM/AVG reduce numerically (int64 values parsed from decimal
+// strings); MIN/MAX pick the extreme per compareIndexValues.
 func applyAggregate(op wire.AggregateOp, values wire.Array, pg PgType) wire.JSONValue {
 	switch op {
-	case wire.AggSum, wire.AggAvg:
-		var sum float64
-		for _, v := range values {
-			sum += numericValue(v, pg)
+	case wire.AggSum:
+		if pg == PgInt64 {
+			// math/big is unbounded, matching the server's numeric exactly.
+			total := new(big.Int)
+			for _, v := range values {
+				s, ok := v.(wire.String)
+				if !ok {
+					return f64Aggregate(op, values, pg)
+				}
+				n, ok := new(big.Int).SetString(string(s), 10)
+				if !ok {
+					return f64Aggregate(op, values, pg)
+				}
+				total.Add(total, n)
+			}
+			return wire.String(total.String())
 		}
-		result := sum
-		if op == wire.AggAvg {
-			result = sum / float64(len(values))
-		}
-		if isInfOrNaN(result) {
-			return wire.Null{}
-		}
-		return jsonNumberFromF64(result)
+		return f64Aggregate(op, values, pg)
+	case wire.AggAvg:
+		return f64Aggregate(op, values, pg)
 	case wire.AggMin, wire.AggMax:
 		best := values[0]
 		for _, v := range values[1:] {
@@ -803,6 +814,24 @@ func applyAggregate(op wire.AggregateOp, values wire.Array, pg PgType) wire.JSON
 	default: // count over provided values
 		return wire.Number(formatI64(int64(len(values))))
 	}
+}
+
+// f64Aggregate is the numeric reduction shared by number-field SUM/AVG and
+// int64 AVG (a fractional mean has no int64 representation — documented f64
+// form).
+func f64Aggregate(op wire.AggregateOp, values wire.Array, pg PgType) wire.JSONValue {
+	var sum float64
+	for _, v := range values {
+		sum += numericValue(v, pg)
+	}
+	result := sum
+	if op == wire.AggAvg {
+		result = sum / float64(len(values))
+	}
+	if isInfOrNaN(result) {
+		return wire.Null{}
+	}
+	return jsonNumberFromF64(result)
 }
 
 func numericValue(v wire.JSONValue, pg PgType) float64 {
