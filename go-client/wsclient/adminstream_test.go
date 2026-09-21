@@ -1,5 +1,5 @@
 // go-client/admin/stream_test.go
-package admin
+package wsclient
 
 // Tests for the /admin/stream mirror (stream.go), against a mock stream:
 // an httptest server that upgrades with coder/websocket and pushes frames.
@@ -20,6 +20,9 @@ import (
 	"github.com/coder/websocket"
 	rtdberrors "github.com/paulrobello/par-rt-db/go-client/errors"
 )
+
+// testStreamKey mirrors the admin package's test key literal.
+const testStreamKey = "test-admin-key"
 
 // shortBackoff shrinks the reconnect backoff for the test's duration.
 func shortBackoff(t *testing.T) {
@@ -43,7 +46,7 @@ func opFrame(docID string) string {
 
 // streamStub upgrades every request and hands each connection to onConn
 // with its 1-based hit count; hits counts upgrades (auth failures included).
-func streamStub(t *testing.T, onConn func(conn *websocket.Conn, hits int32)) (*AdminClient, *atomic.Int32) {
+func streamStub(t *testing.T, onConn func(conn *websocket.Conn, hits int32)) (*AdminStreamClient, *atomic.Int32) {
 	t.Helper()
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -56,7 +59,7 @@ func streamStub(t *testing.T, onConn func(conn *websocket.Conn, hits int32)) (*A
 		onConn(conn, n)
 	}))
 	t.Cleanup(srv.Close)
-	return NewAdminClient(srv.URL, testAdminKey), &hits
+	return NewAdminStreamClient(srv.URL, testStreamKey), &hits
 }
 
 // writeText pushes one text frame with a 1s budget.
@@ -145,7 +148,7 @@ func TestStreamAdminRejectedHandshake(t *testing.T) {
 		http.Error(w, "denied", http.StatusUnauthorized)
 	}))
 	t.Cleanup(srv.Close)
-	client := NewAdminClient(srv.URL, testAdminKey)
+	client := NewAdminStreamClient(srv.URL, testStreamKey)
 
 	ch, err := client.StreamAdmin(context.Background(), nil, nil)
 	if err == nil {

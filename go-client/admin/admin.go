@@ -17,22 +17,19 @@ import (
 )
 
 // AdminClient drives one par-rt-db instance's /admin/* control plane.
-// Every call sends the admin key as the bearer.
+// Every call sends the admin key as the bearer. The /admin/stream WebSocket
+// seam lives in the wsclient package (AdminStreamClient) so this package —
+// which inmemory imports — never transitively pulls coder/websocket
+// (guard_test.go's stdlib-only rule).
 type AdminClient struct {
 	api *httpclient.Client
-	// baseURL/adminKey back the /admin/stream websocket seam (stream.go);
-	// the HTTP seam carries the same values inside httpclient.Client.
-	baseURL  string
-	adminKey string
 }
 
 // NewAdminClient builds a client against baseURL authenticated with the
 // instance admin key. httpclient options (e.g. WithHTTPClient) flow through.
 func NewAdminClient(baseURL, adminKey string, opts ...httpclient.Option) *AdminClient {
 	return &AdminClient{
-		api:      httpclient.NewClient(baseURL, "", adminKey, opts...),
-		baseURL:  baseURL,
-		adminKey: adminKey,
+		api: httpclient.NewClient(baseURL, "", adminKey, opts...),
 	}
 }
 

@@ -1,5 +1,5 @@
 // go-client/admin/stream.go
-package admin
+package wsclient
 
 // Mirrors rust-client/src/admin/stream.rs and ts-client's streamAdmin():
 // the realtime op-feed WebSocket /admin/stream. Machine client — the admin
@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/paulrobello/par-rt-db/go-client/admin"
 	rtdberrors "github.com/paulrobello/par-rt-db/go-client/errors"
 )
 
@@ -31,9 +32,9 @@ import (
 // op event (replay then live), or a ~1s server metrics snapshot. Payloads
 // decode through the existing OpEvent / MetricsSnapshot types.
 type AdminStreamFrame struct {
-	Kind   string           `json:"kind"`
-	Event  *OpEvent         `json:"event,omitempty"`
-	Gauges *MetricsSnapshot `json:"gauges,omitempty"`
+	Kind   string                 `json:"kind"`
+	Event  *admin.OpEvent         `json:"event,omitempty"`
+	Gauges *admin.MetricsSnapshot `json:"gauges,omitempty"`
 }
 
 // AdminStreamEvent is one channel delivery from StreamAdmin: exactly one of
@@ -57,6 +58,22 @@ var (
 // only seam; revisit on a dependency bump.
 var dialStatusRe = regexp.MustCompile(`but got (\d+)`)
 
+// AdminStreamClient drives the /admin/stream op-feed WebSocket for a caller
+// holding the instance admin key. It lives in wsclient rather than admin so
+// importing the admin package never transitively pulls the websocket
+// dependency — the stdlib-only rule guard_test.go enforces for the root,
+// wire, dsl, errors, httpclient, and inmemory packages.
+type AdminStreamClient struct {
+	baseURL  string
+	adminKey string
+}
+
+// NewAdminStreamClient builds a stream client against baseURL, carrying the
+// instance admin key as the bearer on every (re)connect.
+func NewAdminStreamClient(baseURL, adminKey string) *AdminStreamClient {
+	return &AdminStreamClient{baseURL: baseURL, adminKey: adminKey}
+}
+
 // StreamAdmin opens /admin/stream?db=&table= and streams the op feed on a
 // channel. db/table are optional (nil = all dbs / all tables) and filter
 // both the replay and the live broadcast, exactly as on
@@ -72,7 +89,7 @@ var dialStatusRe = regexp.MustCompile(`but got (\d+)`)
 // another non-101 status) is returned from this call itself as the client
 // error type, classified by status like rust upgrade_error: 401 →
 // UNAUTHORIZED, 403 → FORBIDDEN, else INTERNAL.
-func (c *AdminClient) StreamAdmin(ctx context.Context, db, table *string) (<-chan AdminStreamEvent, error) {
+func (c *AdminStreamClient) StreamAdmin(ctx context.Context, db, table *string) (<-chan AdminStreamEvent, error) {
 	wsURL, err := c.streamURL(db, table)
 	if err != nil {
 		return nil, err
@@ -166,7 +183,7 @@ func adminDial(ctx context.Context, wsURL, token string) (*websocket.Conn, error
 
 // streamURL builds ws(s)://host/admin/stream?db=&table= from the base URL,
 // percent-encoding the filters (url.Values.Encode), never interpolating.
-func (c *AdminClient) streamURL(db, table *string) (string, error) {
+func (c *AdminStreamClient) streamURL(db, table *string) (string, error) {
 	u, err := url.Parse(strings.TrimRight(c.baseURL, "/") + "/admin/stream")
 	if err != nil {
 		return "", fmt.Errorf("invalid server url: %w", err)
