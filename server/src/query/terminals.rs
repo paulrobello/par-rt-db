@@ -59,7 +59,8 @@ use crate::schema::{FieldType, IndexDef, SchemaDef, SchemaDefExt, TableDef, Tabl
 /// bare scalar (null if no rows match). With `groupBy: true`, it groups by `index.fields[eq.len()]`
 /// and aggregates `index.fields[eq.len()+1]`, returning `AggregateGroups([{key,value},…])`
 /// ordered by group key and capped by `MAX_TAKE`. `sum`/`avg` require a numeric aggregate field
-/// (only `number` is numeric among indexable types) → BadRequest otherwise. Requires an index AND
+/// (`number` and `int64` both qualify — see `is_numeric_index_field`) → BadRequest otherwise.
+/// `count` consumes no aggregate field at all. Requires an index AND
 /// a field beyond the eq prefix (TWO fields beyond for `groupBy`) → BadRequest otherwise. Mutually
 /// exclusive with every other terminal except `eq`/range bounds/`filter` (which narrow the
 /// matching set); `take` is also rejected — group count is capped internally by `MAX_TAKE`.
@@ -1562,7 +1563,6 @@ pub(crate) async fn point_read(
     }
 }
 
-/// Whether an indexed field's declared type is numeric (the only numeric
 /// Whether an indexed field's declared type is numeric enough for `sum`/`avg`.
 /// `Number` and `Int64` both qualify (`Optional<…>` unwraps one layer). Note:
 /// `SUM(bigint)`/`AVG(bigint)` return Postgres `numeric`, which serializes as a
