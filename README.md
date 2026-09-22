@@ -605,13 +605,18 @@ single send for 30 s, is also dropped.
 `auth` and the HTTP API (`X-Rtdb-Protocol` request header, honored on both the
 per-db `/api/*` routes and the `/admin/*` control plane) both accept an
 optional `protocolVersion` (ARC-013) so a client can declare the wire version it
-speaks. Omitting it is backward-compatible (treated as version `1`, the current
-`PROTOCOL_VERSION`); a client requesting a version *newer* than the server's is
+speaks. Omitting it is backward-compatible (treated as version `1`); a client
+requesting a version *newer* than the server's is
 rejected with `UNSUPPORTED_PROTOCOL` (400) instead of a generic `deny_unknown_fields`
-400, so a version skew is diagnosable. All four SDKs send the header on every
+400, so a version skew is diagnosable. All five SDKs send the header on every
 HTTP call — data plane and admin alike. When the `auth` frame carries
 `protocolVersion`, `authOk` echoes the server's `PROTOCOL_VERSION` back (also
-omitted otherwise, so an older client's `authOk` bytes never change):
+omitted otherwise, so an older client's `authOk` bytes never change). Version
+3 also gates the presence `presenceDelta` frame server-side: the presence
+flush emits incremental deltas only to connections that negotiated at least
+version 3 (`PRESENCE_DELTA_MIN_VERSION`); every other connection keeps
+receiving full `presenceSnapshot` frames, so a pre-v3 SDK is never sent a
+frame type it cannot parse:
 
 ```jsonc
 // -> client: authenticate with a machine token scoped to db "myapp"
@@ -1191,6 +1196,16 @@ Those SDK method names are not the wire tags. On the wire the client sends:
 The server answers with `presenceSnapshot` (`room`, `members`) or
 `presenceErr`. There is no `presenceOk` frame. When presence is disabled, the
 server replies with a `FORBIDDEN` `presenceErr` ("presence not enabled").
+
+A connection that negotiated `protocolVersion` ≥ 3 on its `auth` frame also
+receives `presenceDelta` frames (`room`, `seq`, `joined`, `left`,
+`stateChanged`) instead of a full snapshot once the server knows it has seen
+the room — its first broadcast is always a full snapshot, every later one a
+delta. `seq` is a per-room counter: a client that observes a gap knows it
+missed a delta and should re-join the room to force a fresh snapshot. Empty
+delta arrays are omitted from the wire. Connections that omitted
+`protocolVersion` or negotiated below 3 keep receiving full `presenceSnapshot`
+frames, so the delta rollout never breaks an older SDK.
 
 ## Make targets
 

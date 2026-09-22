@@ -84,17 +84,27 @@ async fn cross_replica_presence_union_includes_namespaced_peer_member() -> anyho
 
     // 1. A LOCAL subscriber on replica B conn 1 in "room-x". This is the
     //    client whose receipt of the union broadcast we assert against. The
-    //    `rx` is what receives `PresenceSnapshot` when B flushes.
+    //    `rx` receives `PresenceSnapshot` for B's own join, then
+    //    `PresenceDelta` for every later broadcast (B's connection is
+    //    `caught_up` from that point on — see `presence.rs::flush_once`).
     let (tx_b, rx_b) = mpsc::unbounded_channel::<ServerMessage>();
     let rx_b = std::cell::RefCell::new(rx_b);
     state_b
         .realtime
         .presence
-        .join(&db, 1, "room-x", None, user("local@b.example"), tx_b)
+        .join(
+            &db,
+            1,
+            "room-x",
+            None,
+            user("local@b.example"),
+            tx_b,
+            Some(3),
+        )
         .await
         .expect("B local join");
     // Drain the initial local-only snapshot from B's join so the next recv
-    // is unambiguously the union after A's gossip arrives.
+    // is unambiguously the broadcast after A's gossip arrives.
     let _ = rx_b.borrow_mut().try_recv();
 
     // 2. Join on replica A conn 1 in the SAME room. A's join calls
@@ -112,20 +122,25 @@ async fn cross_replica_presence_union_includes_namespaced_peer_member() -> anyho
             Some(json!({"role": "caller"})),
             user("peer@a.example"),
             tx_a,
+            Some(3),
         )
         .await
         .expect("A join");
 
-    // 3. Poll: drive B's flush_once until the union broadcast arrives AND
-    //    contains the namespaced peer member. NOTIFY delivery is async; bound
-    //    the wait at ~5s with 50ms sleeps (matching the broadcast interval).
-    let found: std::cell::RefCell<Option<Vec<PresenceMember>>> = std::cell::RefCell::new(None);
+    // 3. Poll: drive B's flush_once until the peer's arrival is observed.
+    //    B's local subscriber already received its own join snapshot above
+    //    (step 1's drain), so it's `caught_up`: the union's arrival on this
+    //    subscriber is delivered as a `PresenceDelta` whose `joined` carries
+    //    the namespaced peer member, not a fresh `PresenceSnapshot`. NOTIFY
+    //    delivery is async; bound the wait at ~5s with 50ms sleeps (matching
+    //    the broadcast interval).
+    let found: std::cell::RefCell<Option<PresenceMember>> = std::cell::RefCell::new(None);
     let got_peer = wait_until(std::time::Duration::from_secs(5), || async {
         state_b.realtime.presence.flush_once().await;
-        if let Ok(ServerMessage::PresenceSnapshot { members, .. }) = rx_b.borrow_mut().try_recv()
-            && members.iter().any(|m| m.connection_id == peer_conn_id)
+        if let Ok(ServerMessage::PresenceDelta { joined, .. }) = rx_b.borrow_mut().try_recv()
+            && let Some(peer) = joined.into_iter().find(|m| m.connection_id == peer_conn_id)
         {
-            *found.borrow_mut() = Some(members);
+            *found.borrow_mut() = Some(peer);
             true
         } else {
             false
@@ -137,16 +152,17 @@ async fn cross_replica_presence_union_includes_namespaced_peer_member() -> anyho
         "replica B never observed A's join in its union broadcast within the \
          deadline — the rtdb_presence LISTEN path or gossip_publish is broken"
     );
-    let members = found.borrow_mut().take().expect("checked above");
-    // Assert the union shape: local member "1" (B's own, plain conn id) AND
-    // the namespaced peer member `peer_conn_id` (A's instance id + ":1").
-    let local = members.iter().find(|m| m.connection_id == "1");
-    let peer = members.iter().find(|m| m.connection_id == peer_conn_id);
+    let peer = found.borrow_mut().take().expect("checked above");
+    // B's own local member is unchanged by A's join, so it's correctly
+    // absent from the delta's `joined`/`stateChanged`/`left` — the union
+    // shape (B's local member still present) is proven by
+    // `PresenceManager::snapshot`, the room's authoritative membership view,
+    // rather than by re-deriving it from delta bookkeeping.
+    let room_members = state_b.realtime.presence.snapshot(&db, "room-x").await;
     assert!(
-        local.is_some(),
+        room_members.iter().any(|m| m.connection_id == "1"),
         "union must contain B's own local member with plain conn id"
     );
-    let peer = peer.expect("checked above");
     assert_eq!(
         peer.user.email.as_deref(),
         Some("peer@a.example"),
@@ -195,9 +211,17 @@ async fn expire_peers_evicts_dead_replica_members_from_union() -> anyhow::Result
     //    whose received snapshot we assert against.
     let (tx, rx) = mpsc::unbounded_channel::<ServerMessage>();
     let rx = std::cell::RefCell::new(rx);
-    mgr.join("db-y", 1, "room-y", None, user("me@self.example"), tx)
-        .await
-        .expect("local join");
+    mgr.join(
+        "db-y",
+        1,
+        "room-y",
+        None,
+        user("me@self.example"),
+        tx,
+        Some(3),
+    )
+    .await
+    .expect("local join");
     // Drain the initial local-only snapshot.
     let _ = rx.borrow_mut().try_recv();
 
@@ -255,9 +279,17 @@ async fn expire_peers_evicts_dead_replica_members_from_union() -> anyhow::Result
     // to force a fresh dirty+flush cycle.
     let (tx2, rx2) = mpsc::unbounded_channel::<ServerMessage>();
     let rx2 = std::cell::RefCell::new(rx2);
-    mgr.join("db-y", 2, "room-y", None, user("other@self.example"), tx2)
-        .await
-        .expect("second local join triggers fresh flush");
+    mgr.join(
+        "db-y",
+        2,
+        "room-y",
+        None,
+        user("other@self.example"),
+        tx2,
+        Some(3),
+    )
+    .await
+    .expect("second local join triggers fresh flush");
     // Drain potentially several snapshots until we see one without the peer.
     let confirmed_peer_gone = wait_until(std::time::Duration::from_secs(2), || async {
         mgr.flush_once().await;
@@ -323,6 +355,7 @@ async fn admin_presence_inspector_merges_gossiped_peer_room() -> anyhow::Result<
             Some(json!({"role": "caller"})),
             user("peer@a.example"),
             tx_a,
+            Some(3),
         )
         .await
         .expect("A join");
@@ -402,9 +435,17 @@ async fn single_instance_does_not_gossip() -> anyhow::Result<()> {
     // the WIRE shape instead: the local snapshot contains exactly one member
     // with a plain conn id, no namespacing, no peer contributions.
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
-    mgr.join("db-solo", 1, "room-solo", None, user("a@b.example"), tx)
-        .await
-        .expect("local join");
+    mgr.join(
+        "db-solo",
+        1,
+        "room-solo",
+        None,
+        user("a@b.example"),
+        tx,
+        Some(3),
+    )
+    .await
+    .expect("local join");
     mgr.flush_once().await;
     let snap = rx.try_recv().expect("snapshot");
     let ServerMessage::PresenceSnapshot { members, .. } = snap else {

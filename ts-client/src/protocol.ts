@@ -632,8 +632,12 @@ export interface PresenceMember {
  * header; a server whose `PROTOCOL_VERSION` is older rejects a value greater
  * than its own with `UNSUPPORTED_PROTOCOL`. Mirrors server
  * `protocol::PROTOCOL_VERSION`.
+ *
+ * v3 (2026-09-22) adds the `presenceDelta` server frame: a v3+ server emits
+ * it only to connections that negotiated this version; every other
+ * connection keeps receiving full `presenceSnapshot` frames.
  */
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 /** Client -> server WS vocabulary. Tags/fields match server `protocol::ClientMessage`. */
 export type ClientMessage =
@@ -678,6 +682,18 @@ export type ServerMessage =
   | { type: "workflowAck"; workflowId: string; ok: boolean; error?: RtDbErrorEnvelope }
   | { type: "listWorkflowsOk"; workflowId: string; workflows: WorkflowInfo[] }
   | { type: "presenceSnapshot"; room: string; members: PresenceMember[] }
+  | {
+      type: "presenceDelta";
+      room: string;
+      /** Per-room monotonic counter; proves delta-to-delta contiguity only. */
+      seq: number;
+      /** Omitted on the wire when empty (`skip_serializing_if`). */
+      joined?: PresenceMember[];
+      /** Omitted on the wire when empty. */
+      left?: string[];
+      /** Omitted on the wire when empty. */
+      stateChanged?: PresenceMember[];
+    }
   | { type: "presenceErr"; room: string; error: RtDbErrorEnvelope }
   | { type: "pong" };
 

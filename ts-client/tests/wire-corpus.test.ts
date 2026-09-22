@@ -21,6 +21,7 @@ import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { ALL_ERROR_CODES } from "../src/errors.js";
+import { PROTOCOL_VERSION } from "../src/protocol.js";
 import { MAX_STEPS } from "../src/in_memory/index.js";
 import { QUERY_COMBO_CLAUSES, QUERY_COMBO_RULES } from "../src/in_memory/query-combinations.js";
 import type { OpEvent } from "../src/admin.js";
@@ -80,7 +81,7 @@ interface Corpus {
   // clients. An object (not an array) — each client asserts its internal const
   // equals the value recorded here, so a server change requires updating the
   // corpus AND every client or a test fails.
-  protocol_constants: { max_steps: number };
+  protocol_constants: { max_steps: number; protocol_version: number };
 }
 
 const CORPUS_PATH = resolve(__dirname, "../../wire-corpus/wire-corpus.json");
@@ -611,6 +612,9 @@ describe("wire-corpus: protocol_constants match the implementation (ARC-104)", (
   const corpus = loadCorpus();
   it("MAX_STEPS matches the canonical corpus value", () => {
     expect(corpus.protocol_constants.max_steps).toBe(MAX_STEPS);
+  });
+  it("PROTOCOL_VERSION matches the canonical corpus value", () => {
+    expect(corpus.protocol_constants.protocol_version).toBe(PROTOCOL_VERSION);
   });
 });
 

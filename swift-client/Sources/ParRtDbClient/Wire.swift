@@ -7,10 +7,12 @@ import Foundation
 /// `protocol::PROTOCOL_VERSION`.
 public enum WireProtocol {
     /// ARC-013 (wire-v2 bundle): 1 -> 2 for multi-op aggregates, composite
-    /// groupBy, the mutate-batch endpoint, and cron timezone support — all
-    /// additive/optional wire changes, so a v1 server still parses this
-    /// client's existing traffic.
-    public static let version: UInt32 = 2
+    /// groupBy, the mutate-batch endpoint, and cron timezone support.
+    /// ARC-013 (2026-09-22 presence deltas): 2 -> 3 adds the `presenceDelta`
+    /// server frame, which the server emits only to connections that
+    /// negotiated at least version 3 — an older SDK keeps receiving full
+    /// `presenceSnapshot` frames instead.
+    public static let version: UInt32 = 3
 }
 
 // MARK: - Internally tagged enum decode helpers (serde parity)
@@ -488,6 +490,20 @@ public enum ServerMessage: Equatable, Codable, Sendable {
     case listWorkflowsOk(workflowId: String, workflows: [WorkflowInfo])
     /// Full room membership (on join and on every change).
     case presenceSnapshot(room: String, members: [PresenceMember])
+    /// Incremental alternative to `presenceSnapshot` (protocol v3): the
+    /// room's membership change since the server's last broadcast, diffed
+    /// against a shared per-room baseline. `seq` is a per-room monotonic
+    /// counter proving delta-to-delta contiguity (`presenceSnapshot` carries
+    /// no `seq`, so the snapshot → first-delta transition is not itself
+    /// verifiable). The three arrays are omitted from the wire when empty
+    /// (serde `skip_serializing_if = "Vec::is_empty"`), so decode defaults
+    /// them to `[]`. The server sends this frame only to connections that
+    /// negotiated protocol version ≥ 3; a caught-up client that sees a `seq`
+    /// gap must re-join the room to force a fresh full snapshot.
+    case presenceDelta(
+        room: String, seq: UInt64, joined: [PresenceMember], left: [String],
+        stateChanged: [PresenceMember]
+    )
     /// Presence operation failed.
     case presenceErr(room: String, error: RtDbError)
     /// Reply to `ping`.
@@ -496,7 +512,7 @@ public enum ServerMessage: Equatable, Codable, Sendable {
     enum CodingKeys: String, CodingKey, CaseIterable {
         case type, user, error, queryId, result, mutId, results, schedules
         case scheduleId, id, ok, workflowId, info, workflows, room, members
-        case protocolVersion
+        case protocolVersion, seq, joined, left, stateChanged
     }
 
     // swiftlint:disable:next cyclomatic_complexity function_body_length
@@ -577,6 +593,14 @@ public enum ServerMessage: Equatable, Codable, Sendable {
             self = try .presenceSnapshot(
                 room: container.decode(String.self, forKey: .room),
                 members: container.decode([PresenceMember].self, forKey: .members)
+            )
+        case "presenceDelta":
+            self = try .presenceDelta(
+                room: container.decode(String.self, forKey: .room),
+                seq: container.decode(UInt64.self, forKey: .seq),
+                joined: container.decodeIfPresent([PresenceMember].self, forKey: .joined) ?? [],
+                left: container.decodeIfPresent([String].self, forKey: .left) ?? [],
+                stateChanged: container.decodeIfPresent([PresenceMember].self, forKey: .stateChanged) ?? []
             )
         case "presenceErr":
             self = try .presenceErr(
@@ -660,6 +684,21 @@ public enum ServerMessage: Equatable, Codable, Sendable {
             try container.encode("presenceSnapshot", forKey: .type)
             try container.encode(room, forKey: .room)
             try container.encode(members, forKey: .members)
+        case let .presenceDelta(room, seq, joined, left, stateChanged):
+            try container.encode("presenceDelta", forKey: .type)
+            try container.encode(room, forKey: .room)
+            try container.encode(seq, forKey: .seq)
+            // Byte parity with serde `skip_serializing_if = "Vec::is_empty"`:
+            // empty buckets are omitted from the wire entirely.
+            if !joined.isEmpty {
+                try container.encode(joined, forKey: .joined)
+            }
+            if !left.isEmpty {
+                try container.encode(left, forKey: .left)
+            }
+            if !stateChanged.isEmpty {
+                try container.encode(stateChanged, forKey: .stateChanged)
+            }
         case let .presenceErr(room, error):
             try container.encode("presenceErr", forKey: .type)
             try container.encode(room, forKey: .room)

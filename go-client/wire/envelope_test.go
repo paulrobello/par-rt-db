@@ -92,3 +92,58 @@ func TestScheduleAckErrorOmittedWhenOK(t *testing.T) {
 		t.Fatalf("wrong variant %T", msg)
 	}
 }
+
+func TestPresenceDeltaOmitEmptyAndDecode(t *testing.T) {
+	// All-empty buckets must be omitted (server skip_serializing_if parity):
+	// the corpus pins the all-empty shape as room+seq+type only.
+	b, err := json.Marshal(ServerPresenceDelta{Room: "doc:1", Seq: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytesHas(b, `"type":"presenceDelta"`) || !bytesHas(b, `"room":"doc:1"`) || !bytesHas(b, `"seq":1`) {
+		t.Fatalf("all-empty delta: %s", b)
+	}
+	if bytesHas(b, "joined") || bytesHas(b, "left") || bytesHas(b, "stateChanged") {
+		t.Fatalf("empty buckets must be omitted: %s", b)
+	}
+	msg, err := UnmarshalServerMessage(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta, ok := msg.(ServerPresenceDelta)
+	if !ok {
+		t.Fatalf("wrong variant %T", msg)
+	}
+	if delta.Room != "doc:1" || delta.Seq != 1 || delta.Joined != nil || delta.Left != nil || delta.StateChanged != nil {
+		t.Fatalf("decode mismatch: %+v", delta)
+	}
+
+	// Full shape: buckets present, camelCase stateChanged preserved.
+	full := ServerPresenceDelta{
+		Room: "doc:1",
+		Seq:  2,
+		Joined: []PresenceMember{{
+			ConnectionID: "c3",
+			User:         AuthedUser{Kind: UserKindUser},
+			State:        Null{},
+		}},
+		Left:         []string{"c2"},
+		StateChanged: []PresenceMember{{ConnectionID: "c1", User: AuthedUser{Kind: UserKindMachine}, State: Null{}}},
+	}
+	b, err = json.Marshal(full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"joined":[`, `"left":["c2"]`, `"stateChanged":[`} {
+		if !bytesHas(b, key) {
+			t.Fatalf("missing %s in %s", key, b)
+		}
+	}
+	msg, err = UnmarshalServerMessage(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := msg.(ServerPresenceDelta); !ok {
+		t.Fatalf("wrong variant %T", msg)
+	}
+}

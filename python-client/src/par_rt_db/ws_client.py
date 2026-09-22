@@ -203,6 +203,11 @@ class _PresenceRoom:
     version: int = 0
     closed: bool = False
     handle_count: int = 0
+    #: Last ``presenceDelta`` ``seq`` folded into ``members`` (``None`` = no
+    #: delta applied since the latest snapshot). A gap signals a missed delta:
+    #: the folded list is dropped and the room re-joined to force a fresh
+    #: snapshot, mirroring the server's per-room seq contract.
+    last_seq: int | None = None
     cond: asyncio.Condition = field(default_factory=asyncio.Condition)
 
 
@@ -500,6 +505,8 @@ class RtDbClient:
             self._on_workflow(msg)
         elif tag == "presenceSnapshot":
             self._on_presence_snapshot(msg)
+        elif tag == "presenceDelta":
+            self._on_presence_delta(msg)
         elif tag == "presenceErr":
             self._on_presence_err(msg)
         # authOk/authErr are handled in _await_auth; unknown tags ignored.
@@ -892,6 +899,41 @@ class RtDbClient:
         if rm is None:
             return
         rm.members = list(msg.members)
+        rm.last_seq = None
+        rm.version += 1
+        self._notify_presence(rm)
+
+    def _on_presence_delta(self, msg: Any) -> None:
+        """Fold a ``presenceDelta`` into the room's member list (public API
+        stays "full member list"). ``seq``-gap detection is the defensive
+        contract for a missed delta: rather than apply it to a stale baseline,
+        the folded list is dropped and the room re-joined — a join resets the
+        server's per-room ``caught_up`` bookkeeping, so the next flush is a
+        full ``presenceSnapshot``."""
+        rm = self._presence_by_room.get(msg.room)
+        if rm is None or rm.members is None:
+            return
+        if rm.last_seq is not None:
+            if msg.seq <= rm.last_seq:
+                # Stale duplicate/replay: already reflected, ignore.
+                return
+            if msg.seq > rm.last_seq + 1:
+                rm.members = None
+                rm.last_seq = None
+                if self._state is ConnectionState.CONNECTED:
+                    asyncio.get_running_loop().create_task(
+                        self._send(_presence_join_frame(msg.room, rm.join_state))
+                    )
+                return
+        members = {m.connection_id: m for m in rm.members}
+        for member in msg.joined:
+            members[member.connection_id] = member
+        for connection_id in msg.left:
+            members.pop(connection_id, None)
+        for member in msg.state_changed:
+            members[member.connection_id] = member
+        rm.members = list(members.values())
+        rm.last_seq = msg.seq
         rm.version += 1
         self._notify_presence(rm)
 

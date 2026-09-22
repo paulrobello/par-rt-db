@@ -497,6 +497,16 @@ fn protocol_constants_max_steps_matches_corpus() {
         par_rt_db_client::in_memory::MAX_STEPS,
         "MAX_STEPS drifted from wire-corpus protocol_constants.max_steps"
     );
+    let protocol_version = corpus
+        .get("protocol_constants")
+        .and_then(|v| v.get("protocol_version"))
+        .and_then(Value::as_u64)
+        .expect("corpus missing protocol_constants.protocol_version");
+    assert_eq!(
+        protocol_version,
+        par_rt_db_client::wire::PROTOCOL_VERSION as u64,
+        "PROTOCOL_VERSION drifted from wire-corpus protocol_constants.protocol_version"
+    );
 }
 
 /// ARC-017: `wire-corpus/error-codes.json` is the canonical

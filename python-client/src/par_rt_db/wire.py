@@ -44,9 +44,11 @@ class _Camel(BaseModel):
 #: The wire protocol version this client speaks (ARC-013). Sent as
 #: ``protocolVersion`` on the WS ``auth`` frame and as the ``X-Rtdb-Protocol``
 #: HTTP header; a server whose ``PROTOCOL_VERSION`` is older rejects a value
-#: greater than its own with ``UNSUPPORTED_PROTOCOL``. Mirrors server
+#: greater than its own with ``UNSUPPORTED_PROTOCOL``. Version 3 adds the
+#: ``presenceDelta`` server frame, which the server emits only to connections
+#: that negotiated at least this version. Mirrors server
 #: ``protocol::PROTOCOL_VERSION``.
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 
 class AuthedUser(_Camel):
@@ -1102,6 +1104,32 @@ class _ServerPresenceSnapshot(_Camel):
     members: list[PresenceMember]
 
 
+class _ServerPresenceDelta(_Camel):
+    """Incremental alternative to ``presenceSnapshot`` (server→client), sent
+    only to a connection that negotiated ``protocolVersion >= 3`` after that
+    connection's first full snapshot for the room. ``seq`` is a per-room
+    monotonic counter proving delta-to-delta contiguity (a snapshot carries no
+    ``seq``, so the snapshot→first-delta transition is not itself verifiable).
+    Empty buckets are omitted from the wire — the all-empty delta serializes
+    byte-exactly as ``{"type":"presenceDelta","room":...,"seq":...}``,
+    mirroring the server's ``skip_serializing_if = "Vec::is_empty"``."""
+
+    type: Literal["presenceDelta"] = "presenceDelta"
+    room: str
+    seq: int
+    joined: list[PresenceMember] = []
+    left: list[str] = []
+    state_changed: list[PresenceMember] = []
+
+    @model_serializer(mode="wrap")
+    def _drop_empty_buckets(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        for alias in ("joined", "left", "stateChanged"):
+            if out.get(alias) == []:
+                out.pop(alias, None)
+        return out
+
+
 class _ServerPresenceErr(_Camel):
     """ENH-015 the server rejected a presence op for ``room``."""
 
@@ -1131,6 +1159,7 @@ ServerMessage = Annotated[
         | _ServerWorkflowAck
         | _ServerListWorkflowsOk
         | _ServerPresenceSnapshot
+        | _ServerPresenceDelta
         | _ServerPresenceErr
         | _ServerPong
     ),

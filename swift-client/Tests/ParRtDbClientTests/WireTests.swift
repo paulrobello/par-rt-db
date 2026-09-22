@@ -433,6 +433,62 @@ struct WireServerMessageTests {
         )
     }
 
+    @Test func presenceDeltaServerFrames() throws {
+        // protocol.rs ServerMessage::PresenceDelta — buckets omit from the
+        // wire when empty (serde skip_serializing_if = "Vec::is_empty").
+        let member = PresenceMember(
+            connectionId: "42",
+            user: AuthedUser(kind: .user, email: "a@b.com", name: nil),
+            state: .object(["x": .int(1)])
+        )
+        try expectEncodes(
+            ServerMessage.presenceDelta(
+                room: "doc:1", seq: 2, joined: [member], left: ["c2"], stateChanged: [member]
+            ),
+            as: """
+            {"type":"presenceDelta","room":"doc:1","seq":2,"joined":[{"connectionId":"42",
+            "user":{"kind":"user","email":"a@b.com","name":null},"state":{"x":1}}],
+            "left":["c2"],"stateChanged":[{"connectionId":"42",
+            "user":{"kind":"user","email":"a@b.com","name":null},"state":{"x":1}}]}
+            """
+        )
+        // All-empty buckets: omitted entirely — the exact shape the wire
+        // corpus pins for a delta that only advances `seq`.
+        try expectEncodes(
+            ServerMessage.presenceDelta(room: "doc:1", seq: 1, joined: [], left: [], stateChanged: []),
+            as: #"{"type":"presenceDelta","room":"doc:1","seq":1}"#
+        )
+        // Decode: missing buckets default to empty arrays.
+        let empty = try decode(
+            ServerMessage.self, #"{"type":"presenceDelta","room":"doc:1","seq":1}"#
+        )
+        #expect(
+            empty == ServerMessage.presenceDelta(room: "doc:1", seq: 1, joined: [], left: [], stateChanged: [])
+        )
+        let populated = try decode(
+            ServerMessage.self,
+            """
+            {"type":"presenceDelta","room":"doc:1","seq":3,
+            "joined":[{"connectionId":"c1","user":{"kind":"machine"},"state":{}}],
+            "left":["c2"],
+            "stateChanged":[{"connectionId":"c9","user":{"kind":"machine"},"state":{"k":1}}]}
+            """
+        )
+        #expect(
+            populated == ServerMessage.presenceDelta(
+                room: "doc:1",
+                seq: 3,
+                joined: [PresenceMember(connectionId: "c1", user: AuthedUser(kind: .machine), state: .object([:]))],
+                left: ["c2"],
+                stateChanged: [
+                    PresenceMember(
+                        connectionId: "c9", user: AuthedUser(kind: .machine), state: .object(["k": .int(1)])
+                    )
+                ]
+            )
+        )
+    }
+
     @Test func serverMessageToleratesUnknownFields() throws {
         // rust-client parity: ServerMessage deliberately does NOT carry
         // deny_unknown_fields (client-side forward compatibility — a newer

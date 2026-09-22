@@ -326,16 +326,21 @@ func TestWireCorpusRejectsUnknownFields(t *testing.T) {
 }
 
 func TestWireCorpusProtocolConstants(t *testing.T) {
-	// ARC-104: MAX_STEPS is part of the cross-client contract; the corpus
-	// records the canonical value every client asserts against.
+	// ARC-104: MAX_STEPS and PROTOCOL_VERSION are part of the cross-client
+	// contract; the corpus records the canonical values every client asserts
+	// against.
 	var constants struct {
-		MaxSteps int64 `json:"max_steps"`
+		MaxSteps        int64  `json:"max_steps"`
+		ProtocolVersion uint32 `json:"protocol_version"`
 	}
 	if err := json.Unmarshal(loadCorpus(t)["protocol_constants"], &constants); err != nil {
 		t.Fatalf("protocol_constants: %v", err)
 	}
 	if int64(inmemory.MaxSteps) != constants.MaxSteps {
 		t.Fatalf("max_steps: engine %d, corpus %d", inmemory.MaxSteps, constants.MaxSteps)
+	}
+	if wire.PROTOCOL_VERSION != constants.ProtocolVersion {
+		t.Fatalf("protocol_version: client %d, corpus %d", wire.PROTOCOL_VERSION, constants.ProtocolVersion)
 	}
 }
 

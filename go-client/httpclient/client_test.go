@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/paulrobello/par-rt-db/go-client/wire"
@@ -17,7 +18,7 @@ func TestMutateSendsExactBodyAndHeaders(t *testing.T) {
 		if r.URL.Path != "/api/mutate" {
 			t.Errorf("path %s", r.URL.Path)
 		}
-		if got := r.Header.Get("X-Rtdb-Protocol"); got != "2" {
+		if got := r.Header.Get("X-Rtdb-Protocol"); got != strconv.FormatUint(uint64(wire.PROTOCOL_VERSION), 10) {
 			t.Errorf("proto header %q", got)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer tk" {

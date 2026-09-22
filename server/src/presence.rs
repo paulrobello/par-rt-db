@@ -81,6 +81,25 @@ struct Session {
     /// `expire_once`. `None` = permanent (no ttl armed). Joins never arm it
     /// (ttl rides on `presenceState` only); only `update_state` sets/clears it.
     expires_at: Option<i64>,
+    /// False until this connection has received at least one broadcast
+    /// (`PresenceSnapshot` or `PresenceDelta`) for the room it's in. A
+    /// `false` connection always receives a full `PresenceSnapshot` on the
+    /// next flush (never a delta — there is nothing to diff against yet); it
+    /// flips to `true` the moment that snapshot is sent, so every following
+    /// flush for this connection is a delta against the room's shared
+    /// baseline — for a v3 connection. A pre-v3 connection keeps receiving
+    /// snapshots regardless of `caught_up` (see `protocol_version`).
+    /// Reset to `false` on join/re-join, matching the semantics
+    /// `flush_once` already relies on (a fresh join always sees the full
+    /// list, never a partial delta).
+    caught_up: bool,
+    /// The `protocolVersion` this connection declared on its `Auth` frame
+    /// (`None` = omitted, v1 semantics). `flush_once` emits `PresenceDelta`
+    /// only to connections that negotiated at least
+    /// `protocol::PRESENCE_DELTA_MIN_VERSION`; every other connection keeps
+    /// receiving full `PresenceSnapshot` frames, so the delta frame's
+    /// rollout never breaks an older SDK (ARC-013 gate).
+    protocol_version: Option<u32>,
 }
 
 /// Per-db shard.
@@ -91,6 +110,17 @@ struct DbPresence {
     conn_rooms: HashMap<ConnId, Vec<String>>,
     /// Per-conn `presenceState` rate window: (window_start_ms, count).
     update_window: HashMap<ConnId, (i64, u32)>,
+    /// room -> the last (`seq`, `members`) broadcast to every caught-up
+    /// connection in that room. One shared baseline per room, not one per
+    /// connection — an O(members) cost, not O(members²) — since every
+    /// caught-up connection in a room is diffed against the same prior
+    /// state by construction (a delta always fully replaces what every
+    /// caught-up recipient already has). Absent for a room that has never
+    /// completed a flush (the first flush for a room always seeds this
+    /// entry and every recipient that tick gets the full snapshot instead
+    /// of a diff, since a fresh `dirty` room has no members with
+    /// `caught_up == true` yet).
+    room_baselines: HashMap<String, (u64, Vec<PresenceMember>)>,
 }
 
 impl DbPresence {
@@ -98,6 +128,7 @@ impl DbPresence {
         Self {
             rooms: HashMap::new(),
             conn_rooms: HashMap::new(),
+            room_baselines: HashMap::new(),
             update_window: HashMap::new(),
         }
     }
@@ -175,6 +206,62 @@ pub struct PresenceManager {
     pool: Option<sqlx::PgPool>,
 }
 
+/// True when a connection's negotiated `protocolVersion` allows the server
+/// to send it `PresenceDelta` frames: a declared version at or above
+/// `protocol::PRESENCE_DELTA_MIN_VERSION`. `None` (the client omitted
+/// `protocolVersion`) is legacy v1 semantics and never receives deltas —
+/// nor does any declared version below the gate — so an SDK that predates
+/// the v3 frame keeps working off full `PresenceSnapshot` broadcasts
+/// (ARC-013).
+fn supports_presence_delta(negotiated: Option<u32>) -> bool {
+    negotiated.is_some_and(|v| v >= crate::protocol::PRESENCE_DELTA_MIN_VERSION)
+}
+
+/// The three buckets `diff_members` sorts a member-list transition into.
+struct MemberDiff {
+    joined: Vec<PresenceMember>,
+    left: Vec<String>,
+    state_changed: Vec<PresenceMember>,
+}
+
+/// Compute the `PresenceDelta` buckets between two full member lists for the
+/// same room: members present in `after` but not `before` are `joined`,
+/// members present in `before` but not `after` are `left` (by
+/// `connection_id`), and members present in both whose `state` differs are
+/// `state_changed` (this also covers a TTL expiry — `expire_once` nulls
+/// `state` without touching membership, so that transition lands here, never
+/// in `left`). `user` is not compared: a member's `user` never changes after
+/// join (there is no rename op), so a same-id member is fully identified by
+/// its state alone.
+fn diff_members(before: &[PresenceMember], after: &[PresenceMember]) -> MemberDiff {
+    let before_by_id: HashMap<&str, &PresenceMember> = before
+        .iter()
+        .map(|m| (m.connection_id.as_str(), m))
+        .collect();
+    let after_by_id: HashSet<&str> = after.iter().map(|m| m.connection_id.as_str()).collect();
+
+    let mut joined = Vec::new();
+    let mut state_changed = Vec::new();
+    for m in after {
+        match before_by_id.get(m.connection_id.as_str()) {
+            None => joined.push(m.clone()),
+            Some(prev) if prev.state != m.state => state_changed.push(m.clone()),
+            Some(_) => {}
+        }
+    }
+    let left: Vec<String> = before
+        .iter()
+        .filter(|m| !after_by_id.contains(m.connection_id.as_str()))
+        .map(|m| m.connection_id.clone())
+        .collect();
+
+    MemberDiff {
+        joined,
+        left,
+        state_changed,
+    }
+}
+
 impl PresenceManager {
     /// Construct a presence manager. The last three args wire ENH-022 Stage 3
     /// cross-instance gossip: `multi_instance` gates the whole layer (false ⇒
@@ -242,6 +329,10 @@ impl PresenceManager {
 
     /// Join `room` as `conn`: register present + subscribe. Idempotent
     /// (re-join updates `state`). `tx` is the connection's outbound channel.
+    /// `protocol_version` is the connection's negotiated `protocolVersion`
+    /// (`None` = omitted on the `Auth` frame, v1 semantics) — see
+    /// `Session::protocol_version` for how `flush_once` uses it.
+    #[allow(clippy::too_many_arguments)]
     pub async fn join(
         &self,
         db: &str,
@@ -250,6 +341,7 @@ impl PresenceManager {
         state: Option<serde_json::Value>,
         user: AuthedUser,
         tx: UnboundedSender<ServerMessage>,
+        protocol_version: Option<u32>,
     ) -> Result<(), RtDbError> {
         if !self.config.enabled {
             return Err(RtDbError::forbidden("presence not enabled"));
@@ -285,6 +377,8 @@ impl PresenceManager {
                 updated_at: now,
                 joined_at: now,
                 expires_at: None,
+                caught_up: false,
+                protocol_version,
             },
         );
         // index (only on a genuine new join — re-join must not append a
@@ -843,26 +937,78 @@ impl PresenceManager {
                 local_members
             };
             if members.is_empty() {
-                continue; // room emptied between mark_dirty and flush
+                // Room emptied between mark_dirty and flush. Drop its
+                // baseline too — otherwise a room that goes empty leaves a
+                // (seq, members) entry in `room_baselines` forever (nothing
+                // else ever removes it), a per-room leak bounded only by how
+                // many distinct rooms this db has ever had a member in.
+                let mut p = shard.lock().await;
+                p.room_baselines.remove(&room);
+                continue;
             }
             did_work = true;
-            // Capture the recipient tx list under the lock (the room may still
-            // be the source of truth), then send outside the lock.
-            let recipients: Vec<UnboundedSender<ServerMessage>> = {
-                let p = shard.lock().await;
+            // Capture each recipient's tx, caught_up flag, AND negotiated
+            // protocol version under the lock (the room may still be the
+            // source of truth), flip every not-yet-caught-up recipient to
+            // caught_up = true so the NEXT flush sends it a delta, then send
+            // outside the lock. Recipients that are already caught_up AND
+            // negotiated at least PRESENCE_DELTA_MIN_VERSION get a delta
+            // this tick; the rest (a fresh join, a room's very first flush,
+            // or a pre-v3 connection) get the full snapshot instead — a
+            // fresh join has nothing to diff against, and an older SDK must
+            // never see a frame type it can't parse.
+            let recipients: Vec<(UnboundedSender<ServerMessage>, bool, Option<u32>)> = {
+                let mut p = shard.lock().await;
                 p.rooms
-                    .get(&room)
-                    .map(|m| m.values().map(|s| s.tx.clone()).collect())
+                    .get_mut(&room)
+                    .map(|m| {
+                        m.values_mut()
+                            .map(|s| {
+                                let was_caught_up = s.caught_up;
+                                s.caught_up = true;
+                                (s.tx.clone(), was_caught_up, s.protocol_version)
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default()
             };
             if let Some(metrics) = &self.metrics {
                 metrics.record_presence_broadcast();
             }
-            for tx in recipients {
-                let _ = tx.send(ServerMessage::PresenceSnapshot {
-                    room: room.clone(),
-                    members: members.clone(),
-                });
+            // Diff against the room's previous broadcast (if any) and bump
+            // seq. A room with no prior baseline (first flush ever, or the
+            // baseline was dropped when the room last emptied) has no
+            // meaningful diff — every recipient this tick is necessarily
+            // !was_caught_up anyway (a room can't have caught-up members
+            // without a prior successful flush), so `delta` is computed but
+            // never actually sent.
+            let (seq, delta) = {
+                let mut p = shard.lock().await;
+                let prev = p.room_baselines.get(&room);
+                let prev_seq = prev.map(|(s, _)| *s).unwrap_or(0);
+                let prev_members = prev.map(|(_, m)| m.as_slice()).unwrap_or(&[]);
+                let seq = prev_seq + 1;
+                let delta = diff_members(prev_members, &members);
+                p.room_baselines
+                    .insert(room.clone(), (seq, members.clone()));
+                (seq, delta)
+            };
+            for (tx, was_caught_up, negotiated) in recipients {
+                let msg = if was_caught_up && supports_presence_delta(negotiated) {
+                    ServerMessage::PresenceDelta {
+                        room: room.clone(),
+                        seq,
+                        joined: delta.joined.clone(),
+                        left: delta.left.clone(),
+                        state_changed: delta.state_changed.clone(),
+                    }
+                } else {
+                    ServerMessage::PresenceSnapshot {
+                        room: room.clone(),
+                        members: members.clone(),
+                    }
+                };
+                let _ = tx.send(msg);
             }
         }
         did_work
@@ -1061,7 +1207,7 @@ mod tests {
     async fn join_then_snapshot_lists_the_member() {
         let m = mgr();
         let (t, _r) = tx();
-        m.join("db", 1, "room", None, user("a@b.com"), t)
+        m.join("db", 1, "room", None, user("a@b.com"), t, Some(3))
             .await
             .unwrap();
         let members = m.snapshot("db", "room").await;
@@ -1074,7 +1220,7 @@ mod tests {
     async fn update_state_changes_the_blob() {
         let m = mgr();
         let (t, _r) = tx();
-        m.join("db", 1, "room", None, user("a@b.com"), t)
+        m.join("db", 1, "room", None, user("a@b.com"), t, Some(3))
             .await
             .unwrap();
         m.update_state("db", 1, "room", serde_json::json!({"x": 5}), None)
@@ -1084,11 +1230,64 @@ mod tests {
         assert_eq!(members[0].state, serde_json::json!({"x": 5}));
     }
 
+    /// The ARC-013 gate: a connection that negotiated a version below
+    /// `PRESENCE_DELTA_MIN_VERSION` keeps receiving full `PresenceSnapshot`
+    /// broadcasts on every flush, while a v3 connection in the same room
+    /// receives the delta. Neither ever receives a frame type it can't
+    /// parse.
+    #[tokio::test]
+    async fn flush_sends_deltas_to_v3_and_snapshots_to_prev3_connections() {
+        let m = mgr();
+        let (t_v3, mut r_v3) = tx();
+        let (t_old, mut r_old) = tx();
+        m.join("db", 1, "room", None, user("a@b.com"), t_v3, Some(3))
+            .await
+            .unwrap();
+        m.join("db", 2, "room", None, user("b@b.com"), t_old, Some(2))
+            .await
+            .unwrap();
+        // First flush: both are fresh joins (nothing to diff against) →
+        // both get the full snapshot regardless of version.
+        m.flush_once().await;
+        match r_v3.try_recv().expect("v3 first broadcast") {
+            ServerMessage::PresenceSnapshot { members, .. } => assert_eq!(members.len(), 2),
+            other => panic!("expected PresenceSnapshot, got {other:?}"),
+        }
+        match r_old.try_recv().expect("legacy first broadcast") {
+            ServerMessage::PresenceSnapshot { members, .. } => assert_eq!(members.len(), 2),
+            other => panic!("expected PresenceSnapshot, got {other:?}"),
+        }
+        // A state change on the next flush: the v3 connection gets the
+        // delta; the v2 connection gets a full snapshot again — never a
+        // `presenceDelta` frame its parser would reject.
+        m.update_state("db", 1, "room", serde_json::json!({"n": 1}), None)
+            .await
+            .unwrap();
+        m.flush_once().await;
+        match r_v3.try_recv().expect("v3 delta") {
+            ServerMessage::PresenceDelta {
+                seq, state_changed, ..
+            } => {
+                assert_eq!(seq, 2);
+                assert_eq!(state_changed.len(), 1);
+                assert_eq!(state_changed[0].connection_id, "1");
+            }
+            other => panic!("expected PresenceDelta, got {other:?}"),
+        }
+        match r_old.try_recv().expect("legacy snapshot") {
+            ServerMessage::PresenceSnapshot { members, .. } => {
+                let m1 = members.iter().find(|m| m.connection_id == "1").unwrap();
+                assert_eq!(m1.state, serde_json::json!({"n": 1}));
+            }
+            other => panic!("expected PresenceSnapshot, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn inspect_lists_rooms_with_counts_bytes_and_oldest_age() {
         let m = mgr();
         let (t, _r) = tx();
-        m.join("db", 1, "lobby", None, user("a@b.com"), t)
+        m.join("db", 1, "lobby", None, user("a@b.com"), t, Some(3))
             .await
             .unwrap();
         let (t2, _r2) = tx();
@@ -1099,6 +1298,7 @@ mod tests {
             Some(serde_json::json!({"k": "v"})),
             user("c@d.com"),
             t2,
+            Some(3),
         )
         .await
         .unwrap();
@@ -1129,7 +1329,7 @@ mod tests {
         // in presence_xreplica_test.rs uses for a bare `PresenceManager`).
         let m = PresenceManager::new(None, cfg(), true, "self".to_string(), None);
         let (t, _r) = tx();
-        m.join("db", 1, "lobby", None, user("a@b.com"), t)
+        m.join("db", 1, "lobby", None, user("a@b.com"), t, Some(3))
             .await
             .unwrap();
         // Before any peer snapshot arrives: merged == local, not merged.
@@ -1207,7 +1407,7 @@ mod tests {
     async fn leave_removes_the_member() {
         let m = mgr();
         let (t, _r) = tx();
-        m.join("db", 1, "room", None, user("a@b.com"), t)
+        m.join("db", 1, "room", None, user("a@b.com"), t, Some(3))
             .await
             .unwrap();
         m.leave("db", 1, "room").await;
@@ -1219,7 +1419,7 @@ mod tests {
         let m = mgr();
         let (t1, _r1) = tx();
         let (t2, _r2) = tx();
-        m.join("db", 1, "a", None, user("a@b.com"), t1)
+        m.join("db", 1, "a", None, user("a@b.com"), t1, Some(3))
             .await
             .unwrap();
         m.join(
@@ -1229,10 +1429,11 @@ mod tests {
             None,
             user("a@b.com"),
             mpsc::unbounded_channel().0,
+            Some(3),
         )
         .await
         .unwrap();
-        m.join("db", 2, "a", None, user("b@b.com"), t2)
+        m.join("db", 2, "a", None, user("b@b.com"), t2, Some(3))
             .await
             .unwrap();
         m.remove_conn("db", 1).await;
@@ -1252,27 +1453,27 @@ mod tests {
         let m = PresenceManager::new(None, c, false, "test".to_string(), None);
         let (t, _r) = tx();
         // Join "a" once, then re-join "a" 5 more times.
-        m.join("db", 1, "a", None, user("a@b.com"), t.clone())
+        m.join("db", 1, "a", None, user("a@b.com"), t.clone(), Some(3))
             .await
             .unwrap();
         for _ in 0..5 {
-            m.join("db", 1, "a", None, user("a@b.com"), t.clone())
+            m.join("db", 1, "a", None, user("a@b.com"), t.clone(), Some(3))
                 .await
                 .unwrap();
         }
         // The conn is still in exactly one room — a new room must be accepted.
-        m.join("db", 1, "b", None, user("a@b.com"), t.clone())
+        m.join("db", 1, "b", None, user("a@b.com"), t.clone(), Some(3))
             .await
             .unwrap();
-        m.join("db", 1, "c", None, user("a@b.com"), t.clone())
+        m.join("db", 1, "c", None, user("a@b.com"), t.clone(), Some(3))
             .await
             .unwrap();
-        m.join("db", 1, "d", None, user("a@b.com"), t.clone())
+        m.join("db", 1, "d", None, user("a@b.com"), t.clone(), Some(3))
             .await
             .unwrap();
         // Now at the cap (4 rooms: a, b, c, d). The next NEW room must reject.
         let err = m
-            .join("db", 1, "e", None, user("a@b.com"), t)
+            .join("db", 1, "e", None, user("a@b.com"), t, Some(3))
             .await
             .unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::Forbidden);
@@ -1292,10 +1493,11 @@ mod tests {
             Some(serde_json::json!({"x":1})),
             user("a@b.com"),
             t1,
+            Some(3),
         )
         .await
         .unwrap();
-        m.join("db", 2, "room", None, user("b@b.com"), t2)
+        m.join("db", 2, "room", None, user("b@b.com"), t2, Some(3))
             .await
             .unwrap();
         m.flush_once().await;
@@ -1317,10 +1519,10 @@ mod tests {
         let m = mgr();
         let (t1, mut r1) = tx();
         let (t2, _r2) = tx();
-        m.join("db", 1, "room", None, user("a@b.com"), t1)
+        m.join("db", 1, "room", None, user("a@b.com"), t1, Some(3))
             .await
             .unwrap();
-        m.join("db", 2, "room", None, user("b@b.com"), t2)
+        m.join("db", 2, "room", None, user("b@b.com"), t2, Some(3))
             .await
             .unwrap();
         // three rapid state updates by conn 1 -> conn 2 should see ONE snapshot after flush
@@ -1354,14 +1556,14 @@ mod tests {
     async fn flush_once_clears_the_dirty_set() {
         let m = mgr();
         let (t, _r) = tx();
-        m.join("db", 1, "room", None, user("a@b.com"), t)
+        m.join("db", 1, "room", None, user("a@b.com"), t, Some(3))
             .await
             .unwrap();
         m.flush_once().await;
         // a second flush with no new changes sends nothing
         // (assert by joining a 2nd conn that drains its own join snapshot separately)
         let (t2, mut r2) = tx();
-        m.join("db", 2, "room", None, user("b@b.com"), t2)
+        m.join("db", 2, "room", None, user("b@b.com"), t2, Some(3))
             .await
             .unwrap();
         m.flush_once().await;
@@ -1381,7 +1583,7 @@ mod tests {
         let (t, _r) = tx();
         let big = serde_json::json!({"big":"0123456789"});
         let err = m
-            .join("db", 1, "room", Some(big), user("a@b.com"), t)
+            .join("db", 1, "room", Some(big), user("a@b.com"), t, Some(3))
             .await
             .unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::BadRequest);
@@ -1392,7 +1594,7 @@ mod tests {
         let m = mgr();
         let (t, _r) = tx();
         let err = m
-            .join("db", 1, "", None, user("a@b.com"), t)
+            .join("db", 1, "", None, user("a@b.com"), t, Some(3))
             .await
             .unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::BadRequest);
@@ -1405,11 +1607,11 @@ mod tests {
         let m = PresenceManager::new(None, c, false, "test".to_string(), None);
         let (t1, _r1) = tx();
         let (t2, _r2) = tx();
-        m.join("db", 1, "room", None, user("a@b.com"), t1)
+        m.join("db", 1, "room", None, user("a@b.com"), t1, Some(3))
             .await
             .unwrap();
         let err = m
-            .join("db", 2, "room", None, user("b@b.com"), t2)
+            .join("db", 2, "room", None, user("b@b.com"), t2, Some(3))
             .await
             .unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::Forbidden);
@@ -1428,11 +1630,12 @@ mod tests {
             None,
             user("a@b.com"),
             mpsc::unbounded_channel().0,
+            Some(3),
         )
         .await
         .unwrap();
         let err = m
-            .join("db", 1, "b", None, user("a@b.com"), t)
+            .join("db", 1, "b", None, user("a@b.com"), t, Some(3))
             .await
             .unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::Forbidden);
@@ -1444,7 +1647,7 @@ mod tests {
         c.update_limit_per_sec = 2;
         let m = PresenceManager::new(None, c, false, "test".to_string(), None);
         let (t, _r) = tx();
-        m.join("db", 1, "room", None, user("a@b.com"), t)
+        m.join("db", 1, "room", None, user("a@b.com"), t, Some(3))
             .await
             .unwrap();
         assert!(
@@ -1471,7 +1674,7 @@ mod tests {
         let m = PresenceManager::new(None, c, false, "test".to_string(), None);
         let (t, _r) = tx();
         let err = m
-            .join("db", 1, "room", None, user("a@b.com"), t)
+            .join("db", 1, "room", None, user("a@b.com"), t, Some(3))
             .await
             .unwrap_err();
         assert_eq!(err.code, crate::error::ErrorCode::Forbidden);
@@ -1482,10 +1685,10 @@ mod tests {
         let m = mgr();
         let (t1, _r1) = tx();
         let (t2, mut r2) = tx();
-        m.join("db", 1, "room", None, user("a@b.com"), t1)
+        m.join("db", 1, "room", None, user("a@b.com"), t1, Some(3))
             .await
             .unwrap();
-        m.join("db", 2, "room", None, user("b@b.com"), t2)
+        m.join("db", 2, "room", None, user("b@b.com"), t2, Some(3))
             .await
             .unwrap();
         // conn 1 arms a 60ms ttl on its typing state.
@@ -1532,7 +1735,7 @@ mod tests {
     async fn omitted_ttl_is_permanent_and_does_not_expire() {
         let m = mgr();
         let (t, _r) = tx();
-        m.join("db", 1, "room", None, user("a@b.com"), t)
+        m.join("db", 1, "room", None, user("a@b.com"), t, Some(3))
             .await
             .unwrap();
         // update with NO ttl -> permanent.
@@ -1550,7 +1753,7 @@ mod tests {
     async fn ttl_refresh_re_arms_and_a_non_ttl_update_clears_it() {
         let m = mgr();
         let (t, _r) = tx();
-        m.join("db", 1, "room", None, user("a@b.com"), t)
+        m.join("db", 1, "room", None, user("a@b.com"), t, Some(3))
             .await
             .unwrap();
         m.update_state("db", 1, "room", serde_json::json!({"t": true}), Some(200))
@@ -1573,7 +1776,7 @@ mod tests {
     async fn ttl_validation_rejects_zero_and_over_cap() {
         let m = mgr();
         let (t, _r) = tx();
-        m.join("db", 1, "room", None, user("a@b.com"), t)
+        m.join("db", 1, "room", None, user("a@b.com"), t, Some(3))
             .await
             .unwrap();
         let err = m
@@ -1592,7 +1795,7 @@ mod tests {
     async fn expire_once_with_nothing_expired_is_idle() {
         let m = mgr();
         let (t, _r) = tx();
-        m.join("db", 1, "room", None, user("a@b.com"), t)
+        m.join("db", 1, "room", None, user("a@b.com"), t, Some(3))
             .await
             .unwrap();
         assert!(!m.expire_once().await);

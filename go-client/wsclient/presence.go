@@ -325,9 +325,37 @@ func (c *Client) routeReply(msg wire.ServerMessage) {
 
 // --- presence ---
 
+// presenceFold tracks one room's folded member list and delta sequence so
+// presenceDelta frames (protocol v3+) apply incrementally instead of
+// replacing. hasSeq is false until the first delta after a snapshot —
+// snapshots carry no seq, so the snapshot→first-delta transition accepts
+// whatever seq the room's counter has reached.
+type presenceFold struct {
+	members []wire.PresenceMember
+	lastSeq uint64
+	hasSeq  bool
+}
+
+// recordJoin remembers the room's last join state (re-sent on a seq-gap
+// resync: re-join is idempotent on the server and resets its caught-up
+// state, so the next broadcast is a full snapshot) and resets the fold
+// baseline.
+func (c *Client) recordJoin(room string, state wire.JSONValue) {
+	c.presenceMu.Lock()
+	defer c.presenceMu.Unlock()
+	if c.presenceJoins == nil {
+		c.presenceJoins = map[string]wire.JSONValue{}
+		c.presenceFolds = map[string]*presenceFold{}
+	}
+	c.presenceJoins[room] = state
+	c.presenceFolds[room] = &presenceFold{}
+}
+
 // JoinPresence joins a room with a state blob; presenceSnapshot frames
-// arrive for every member change.
+// arrive for every member change, presenceDelta frames (protocol v3+) for
+// later increments.
 func (c *Client) JoinPresence(ctx context.Context, room string, state wire.JSONValue) error {
+	c.recordJoin(room, state)
 	frame, err := json.Marshal(wire.ClientPresence{Room: room, State: state})
 	if err != nil {
 		return err
@@ -335,8 +363,12 @@ func (c *Client) JoinPresence(ctx context.Context, room string, state wire.JSONV
 	return c.sendFrame(ctx, frame)
 }
 
-// LeavePresence leaves a room.
+// LeavePresence leaves a room and drops its join/fold state.
 func (c *Client) LeavePresence(ctx context.Context, room string) error {
+	c.presenceMu.Lock()
+	delete(c.presenceJoins, room)
+	delete(c.presenceFolds, room)
+	c.presenceMu.Unlock()
 	frame, err := json.Marshal(wire.ClientLeavePresence{Room: room})
 	if err != nil {
 		return err
@@ -344,13 +376,108 @@ func (c *Client) LeavePresence(ctx context.Context, room string) error {
 	return c.sendFrame(ctx, frame)
 }
 
-// OnPresence registers a callback for presenceSnapshot frames.
+// OnPresence registers a callback for presence updates. The callback always
+// receives the room's full member list: a presenceSnapshot replaces it, and
+// a presenceDelta is folded in (joined upserted, left removed, stateChanged
+// replaced, each by connection id). A delta whose seq skips ahead means a
+// missed frame — applying it would poison the baseline — so the client
+// drops its fold state and re-sends the room's join frame; the server
+// answers with a fresh full snapshot.
 func (c *Client) OnPresence(fn func(room string, members []wire.PresenceMember)) {
 	c.setServerObserver(func(msg wire.ServerMessage) {
-		if m, ok := msg.(wire.ServerPresenceSnapshot); ok {
+		switch m := msg.(type) {
+		case wire.ServerPresenceSnapshot:
+			c.presenceMu.Lock()
+			fold := c.presenceFolds[m.Room]
+			if fold == nil {
+				fold = &presenceFold{}
+				if c.presenceFolds == nil {
+					c.presenceFolds = map[string]*presenceFold{}
+				}
+				c.presenceFolds[m.Room] = fold
+			}
+			fold.members = append([]wire.PresenceMember(nil), m.Members...)
+			fold.lastSeq, fold.hasSeq = 0, false
+			c.presenceMu.Unlock()
 			fn(m.Room, m.Members)
+		case wire.ServerPresenceDelta:
+			room, members := c.foldPresenceDelta(m)
+			if members != nil {
+				fn(room, members)
+			}
 		}
 	})
+}
+
+// foldPresenceDelta applies one presenceDelta to the room's folded list.
+// Returns the room and a copy of the full folded list to deliver, or a nil
+// list when the delta was dropped: unknown room (no snapshot baseline yet),
+// stale duplicate (seq <= lastSeq), or a seq gap — a gap re-sends the
+// room's stored join frame instead of applying.
+func (c *Client) foldPresenceDelta(m wire.ServerPresenceDelta) (string, []wire.PresenceMember) {
+	c.presenceMu.Lock()
+	fold, ok := c.presenceFolds[m.Room]
+	if !ok {
+		c.presenceMu.Unlock()
+		return m.Room, nil
+	}
+	if fold.hasSeq {
+		if m.Seq <= fold.lastSeq {
+			c.presenceMu.Unlock()
+			return m.Room, nil
+		}
+		if m.Seq > fold.lastSeq+1 {
+			delete(c.presenceFolds, m.Room)
+			state := c.presenceJoins[m.Room]
+			c.presenceMu.Unlock()
+			if frame, err := json.Marshal(wire.ClientPresence{Room: m.Room, State: state}); err == nil {
+				_ = c.sendFrame(context.Background(), frame)
+			}
+			return m.Room, nil
+		}
+	}
+	for _, j := range m.Joined {
+		replaced := false
+		for i := range fold.members {
+			if fold.members[i].ConnectionID == j.ConnectionID {
+				fold.members[i] = j
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			fold.members = append(fold.members, j)
+		}
+	}
+	if len(m.Left) > 0 {
+		kept := fold.members[:0]
+		for _, mem := range fold.members {
+			dropped := false
+			for _, id := range m.Left {
+				if mem.ConnectionID == id {
+					dropped = true
+					break
+				}
+			}
+			if !dropped {
+				kept = append(kept, mem)
+			}
+		}
+		fold.members = kept
+	}
+	for _, s := range m.StateChanged {
+		for i := range fold.members {
+			if fold.members[i].ConnectionID == s.ConnectionID {
+				fold.members[i] = s
+				break
+			}
+		}
+	}
+	fold.lastSeq, fold.hasSeq = m.Seq, true
+	members := make([]wire.PresenceMember, len(fold.members))
+	copy(members, fold.members)
+	c.presenceMu.Unlock()
+	return m.Room, members
 }
 
 // optStr returns nil for empty strings (omitted fields).

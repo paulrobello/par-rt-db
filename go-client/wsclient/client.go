@@ -50,6 +50,13 @@ type Client struct {
 	handlerMu sync.Mutex
 	onServer  func(wire.ServerMessage) // test/observer hook
 
+	// presence fold state: per-room last join payload (re-sent on a delta
+	// seq-gap resync) and the folded member list + seq baseline that
+	// presenceDelta frames apply against. Guarded by presenceMu.
+	presenceMu    sync.Mutex
+	presenceJoins map[string]wire.JSONValue
+	presenceFolds map[string]*presenceFold
+
 	wg sync.WaitGroup
 }
 

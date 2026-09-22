@@ -34,7 +34,9 @@ class FakeSocket implements WebSocketLike {
   send(data: string): void {
     this.sent.push(data);
   }
-  close(): void {}
+  close(code = 1000, reason = ""): void {
+    this.onclose?.({ code, reason });
+  }
   open(): void {
     this.onopen?.();
   }
@@ -48,6 +50,7 @@ class FakeSocket implements WebSocketLike {
 
 function setupClient() {
   const sockets: FakeSocket[] = [];
+  const timers: Array<() => void> = [];
   const client = new RtDbClient({
     url: "ws://h:8300",
     db: "kanban",
@@ -58,10 +61,18 @@ function setupClient() {
       return s;
     },
     heartbeatMs: 0,
-    setTimeoutImpl: () => 0 as unknown as ReturnType<typeof setTimeout>,
+    setTimeoutImpl: (fn) => {
+      timers.push(fn);
+      return timers.length as unknown as ReturnType<typeof setTimeout>;
+    },
     clearTimeoutImpl: () => {},
   });
-  return { client, sockets };
+  const runTimers = () => {
+    for (const fn of timers.splice(0)) {
+      fn();
+    }
+  };
+  return { client, sockets, runTimers };
 }
 
 describe("presence wire types", () => {
@@ -406,5 +417,206 @@ describe("RtDbClient presence", () => {
     // A third call on a fully-left room is a no-op (no duplicate wire frame).
     client.leavePresence("doc:1");
     expect(leaveFrames()).toHaveLength(1);
+  });
+});
+
+describe("RtDbClient presenceDelta (v3 fold)", () => {
+  const c1 = { connectionId: "1", user: { kind: "user" as const }, state: null };
+  const c2 = { connectionId: "2", user: { kind: "user" as const }, state: null };
+  const c3 = { connectionId: "3", user: { kind: "user" as const }, state: null };
+
+  it("presenceDelta carries camelCase fields and tolerates all-empty wire shape", () => {
+    const m = {
+      type: "presenceDelta",
+      room: "doc:1",
+      seq: 2,
+      joined: [c1],
+      left: ["2"],
+      stateChanged: [c3],
+    } satisfies ServerMessage;
+    const round = JSON.parse(JSON.stringify(m)) as { type: string; seq: number };
+    expect(round.type).toBe("presenceDelta");
+    expect(round.seq).toBe(2);
+    // The server omits empty arrays; the all-empty shape is a valid frame.
+    const bare = { type: "presenceDelta", room: "r", seq: 1 } satisfies ServerMessage;
+    expect(JSON.parse(JSON.stringify(bare))).toEqual({ type: "presenceDelta", room: "r", seq: 1 });
+  });
+
+  it("folds a delta into the snapshot: joined upserted, left removed, stateChanged replaced", () => {
+    const { client, sockets } = setupClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+
+    const seen: PresenceMember[][] = [];
+    client.presence("doc:1", undefined, (m) => seen.push(m));
+
+    sockets[0].deliver({
+      type: "presenceSnapshot",
+      room: "doc:1",
+      members: [c1, c2],
+    });
+    sockets[0].deliver({
+      type: "presenceDelta",
+      room: "doc:1",
+      seq: 2,
+      joined: [c3],
+      left: ["2"],
+      stateChanged: [{ ...c1, state: { cursor: { x: 9 } } }],
+    });
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).toEqual([{ ...c1, state: { cursor: { x: 9 } } }, c3]);
+  });
+
+  it("all-empty delta is a no-op fold and does NOT re-notify (push-on-change parity)", () => {
+    // Choice: an empty delta changes nothing observable, so listeners keep
+    // their previous data — mirroring the server's push-only-on-change
+    // contract rather than causing a redundant re-render.
+    const { client, sockets } = setupClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+
+    const seen: PresenceMember[][] = [];
+    client.presence("doc:1", undefined, (m) => seen.push(m));
+    sockets[0].deliver({ type: "presenceSnapshot", room: "doc:1", members: [c1] });
+    sockets[0].deliver({ type: "presenceDelta", room: "doc:1", seq: 5 });
+    expect(seen).toHaveLength(1);
+
+    // The empty delta DID advance the seq baseline: a later contiguous
+    // delta still folds (it is not treated as a gap).
+    sockets[0].deliver({
+      type: "presenceDelta",
+      room: "doc:1",
+      seq: 6,
+      joined: [c2],
+    });
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).toEqual([c1, c2]);
+  });
+
+  it("delta for a room with no snapshot baseline yet is ignored (no crash, no fold)", () => {
+    const { client, sockets } = setupClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+
+    const seen: PresenceMember[][] = [];
+    client.presence("doc:1", undefined, (m) => seen.push(m));
+    sockets[0].deliver({ type: "presenceDelta", room: "doc:1", seq: 3, joined: [c1] });
+    expect(seen).toHaveLength(0);
+  });
+
+  it("delta for an unknown room is ignored", () => {
+    const { client, sockets } = setupClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+
+    const seen: PresenceMember[][] = [];
+    client.presence("doc:1", undefined, (m) => seen.push(m));
+    sockets[0].deliver({ type: "presenceSnapshot", room: "doc:1", members: [c1] });
+    sockets[0].deliver({ type: "presenceDelta", room: "other", seq: 4, joined: [c2] });
+    expect(seen).toHaveLength(1);
+  });
+
+  it("seq gap discards the fold, re-sends the room join, and a later snapshot resyncs", () => {
+    const { client, sockets } = setupClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+
+    const seen: PresenceMember[][] = [];
+    client.presence("doc:1", { cursor: { x: 0 } }, (m) => seen.push(m));
+    sockets[0].deliver({ type: "presenceSnapshot", room: "doc:1", members: [c1] });
+
+    // First delta after the snapshot: accepted from any seq (the room's
+    // counter ran while this connection caught up).
+    sockets[0].deliver({ type: "presenceDelta", room: "doc:1", seq: 5, joined: [c2] });
+    expect(seen).toHaveLength(2);
+
+    // Gap (6 missing): seq 7 must NOT be applied; a fresh join frame goes out.
+    sockets[0].deliver({ type: "presenceDelta", room: "doc:1", seq: 7, joined: [c3] });
+    expect(seen).toHaveLength(2); // no fold, no notify
+    const joins = sockets[0].parsed().filter((m) => (m as { type: string }).type === "presence");
+    expect(joins).toEqual([
+      { type: "presence", room: "doc:1", state: { cursor: { x: 0 } } }, // initial
+      { type: "presence", room: "doc:1", state: { cursor: { x: 0 } } }, // gap re-join
+    ]);
+
+    // The re-join forces a full snapshot server-side; it restores a sane list.
+    sockets[0].deliver({ type: "presenceSnapshot", room: "doc:1", members: [c1, c3] });
+    sockets[0].deliver({ type: "presenceDelta", room: "doc:1", seq: 9, left: ["1"] });
+    expect(seen).toHaveLength(4);
+    expect(seen[3]).toEqual([c3]);
+  });
+
+  it("stale duplicate delta (seq <= lastSeq) is ignored", () => {
+    const { client, sockets } = setupClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+
+    const seen: PresenceMember[][] = [];
+    client.presence("doc:1", undefined, (m) => seen.push(m));
+    sockets[0].deliver({ type: "presenceSnapshot", room: "doc:1", members: [c1] });
+    sockets[0].deliver({ type: "presenceDelta", room: "doc:1", seq: 6, joined: [c2] });
+    sockets[0].deliver({ type: "presenceDelta", room: "doc:1", seq: 6, joined: [c2] });
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).toEqual([c1, c2]);
+  });
+
+  it("reconnect clears fold state: the replayed re-join is followed by a fresh snapshot", () => {
+    const setup = setupClient();
+    const { client, sockets } = setup;
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+
+    client.presence("doc:1", { cursor: { x: 0 } }, () => {});
+    sockets[0].deliver({ type: "presenceSnapshot", room: "doc:1", members: [c1] });
+    sockets[0].deliver({ type: "presenceDelta", room: "doc:1", seq: 4, joined: [c2] });
+
+    // Drop + reconnect (non-4401: reconnectable). close fires onclose; the
+    // client schedules the reconnect on the queued timer.
+    sockets[0].close(1006, "gone");
+    const { runTimers } = setup;
+    runTimers();
+    sockets[1].open();
+    sockets[1].deliver({ type: "authOk", user: { kind: "user" } });
+    // flushOnAuth replayed the join on the new socket.
+    const joins = sockets[1].parsed().filter((m) => (m as { type: string }).type === "presence");
+    expect(joins).toEqual([{ type: "presence", room: "doc:1", state: { cursor: { x: 0 } } }]);
+
+    // A delta on the new socket BEFORE its snapshot has no baseline → ignored;
+    // the fresh snapshot re-seeds, and a delta folding from ANY seq works.
+    const seen: PresenceMember[][] = [];
+    // (listener re-registered post-reconnect, mirroring usePresence remount)
+    client.presence("doc:1", undefined, (m) => seen.push(m));
+    sockets[1].deliver({ type: "presenceDelta", room: "doc:1", seq: 99, joined: [c3] });
+    expect(seen).toHaveLength(0);
+    sockets[1].deliver({ type: "presenceSnapshot", room: "doc:1", members: [c1] });
+    expect(seen).toEqual([[c1]]);
+    sockets[1].deliver({ type: "presenceDelta", room: "doc:1", seq: 2, left: ["1"] });
+    expect(seen).toEqual([[c1], []]);
+  });
+
+  it("leavePresence drops the fold state with the room", () => {
+    const { client, sockets } = setupClient();
+    client.connect();
+    sockets[0].open();
+    sockets[0].deliver({ type: "authOk", user: { kind: "user" } });
+
+    const seen: PresenceMember[][] = [];
+    client.presence("doc:1", undefined, (m) => seen.push(m));
+    sockets[0].deliver({ type: "presenceSnapshot", room: "doc:1", members: [c1] });
+    client.leavePresence("doc:1");
+    // A late delta after leaving is ignored (no re-fold, no re-join frame).
+    sockets[0].deliver({ type: "presenceDelta", room: "doc:1", seq: 7, joined: [c2] });
+    const joinsAfterLeave = sockets[0]
+      .parsed()
+      .filter((m) => (m as { type: string }).type === "presence");
+    expect(joinsAfterLeave).toHaveLength(1); // only the original join
+    expect(seen).toHaveLength(1);
   });
 });

@@ -86,6 +86,11 @@ fn protocol_constants_match_server() {
         rtdb_server::txn::MAX_STEPS as u64,
         "wire-corpus protocol_constants.max_steps must match server txn::MAX_STEPS"
     );
+    assert_eq!(
+        consts["protocol_version"].as_u64().unwrap(),
+        rtdb_server::protocol::PROTOCOL_VERSION as u64,
+        "wire-corpus protocol_constants.protocol_version must match server protocol::PROTOCOL_VERSION"
+    );
 }
 
 #[test]

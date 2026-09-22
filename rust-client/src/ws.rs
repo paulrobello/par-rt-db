@@ -192,6 +192,14 @@ struct SubMaps {
 struct PresenceRoomState {
     room: String,
     state: Mutex<Option<serde_json::Value>>,
+    /// Last applied `presenceDelta` `seq` for this room: `None` until the
+    /// first delta after the latest `PresenceSnapshot` (snapshots carry no
+    /// `seq`, so any delta value may follow one). Drives the gap detector in
+    /// `on_presence`: `seq <= last` is a stale duplicate, `seq > last + 1` is
+    /// a missed delta (discard the baseline and re-join for a fresh
+    /// snapshot). Reset to `None` on every snapshot and on each (re)connect's
+    /// join replay.
+    last_seq: Mutex<Option<u64>>,
     tx: watch::Sender<PresenceSnapshot>,
 }
 
@@ -379,6 +387,14 @@ enum Cmd {
     },
     /// Leave a presence room (bookkeeping already cleared by the caller).
     PresenceLeave { room: String },
+    /// Seq-gap resync: re-send a joined room's `presence` frame (with its
+    /// cached state) even though the session already sent it — the delta
+    /// stream's `seq` skipped, so the receiver's baseline is stale and a
+    /// re-join is the only way to force a full `presenceSnapshot` (the
+    /// server resets the room's caught-up flag on every join). Distinct from
+    /// [`Cmd::PresenceJoin`] precisely so the session's `sent_rooms` dedup
+    /// cannot swallow it.
+    PresenceResync { room: String },
     /// Tear the driver down.
     Shutdown,
 }
@@ -747,6 +763,7 @@ impl RtDbClient {
                 let st = Arc::new(PresenceRoomState {
                     room: room.to_string(),
                     state: Mutex::new(state.clone()),
+                    last_seq: Mutex::new(None),
                     tx,
                 });
                 maps.by_room.insert(room.to_string(), st);
@@ -1303,6 +1320,19 @@ async fn run_session(
     };
     for (room, state) in &rooms_snapshot {
         sent_rooms.insert(room.clone());
+        // A fresh session re-joins every room, so the server will open with
+        // a full snapshot; any delta sequence from the previous session is
+        // void — reset the gap-detector cursor with it.
+        {
+            let maps = driver
+                .inner
+                .presence
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(st) = maps.by_room.get(room) {
+                *st.last_seq.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            }
+        }
         let frame = ClientMessage::Presence {
             room: room.clone(),
             state: state.clone(),
@@ -1434,6 +1464,33 @@ async fn run_session(
                         if send_text(&mut sink, &frame).await.is_err() {
                             return SessionOutcome::Reconnect;
                         }
+                    }
+                }
+                Some(Cmd::PresenceResync { room }) => {
+                    // Delta seq gap: unconditionally re-send the join so the
+                    // server flips the room's caught-up flag and the next
+                    // flush delivers a full snapshot. Deliberately NOT gated
+                    // on `sent_rooms` — the room IS in the set; replacing the
+                    // join is the resync.
+                    let cached = {
+                        let maps = driver
+                            .inner
+                            .presence
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
+                        maps.by_room.get(&room).and_then(|s| {
+                            s.state
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .clone()
+                        })
+                    };
+                    let frame = ClientMessage::Presence {
+                        room,
+                        state: cached,
+                    };
+                    if send_text(&mut sink, &frame).await.is_err() {
+                        return SessionOutcome::Reconnect;
                     }
                 }
             },
@@ -1634,7 +1691,9 @@ fn apply_server_message(inner: &Arc<ClientInner>, msg: ServerMessage, queues: &m
         | ServerMessage::ListWorkflowsOk { .. } => {
             on_workflow_reply(&mut queues.workflow.by_id, msg);
         }
-        ServerMessage::PresenceSnapshot { .. } | ServerMessage::PresenceErr { .. } => {
+        ServerMessage::PresenceSnapshot { .. }
+        | ServerMessage::PresenceErr { .. }
+        | ServerMessage::PresenceDelta { .. } => {
             on_presence(inner, msg);
         }
         // Pong is handled by the session loop; AuthOk/AuthErr arrive only at the
@@ -1794,7 +1853,12 @@ fn on_workflow_reply(pending: &mut HashMap<String, WfReply>, msg: ServerMessage)
     }
 }
 
-/// Route a `presenceSnapshot`/`presenceErr` frame to its room's watch channel.
+/// Route a `presenceSnapshot`/`presenceDelta`/`presenceErr` frame to its
+/// room's watch channel. Deltas are folded into the room's current member
+/// list (the watch channel's own value is the baseline) under per-room
+/// `seq`-gap discipline: a stale duplicate is dropped, a gap discards the
+/// baseline and queues a `Cmd::PresenceResync` so the session re-joins and
+/// the server answers with a fresh full snapshot.
 fn on_presence(inner: &Arc<ClientInner>, msg: ServerMessage) {
     match msg {
         ServerMessage::PresenceSnapshot { room, members } => {
@@ -1803,8 +1867,73 @@ fn on_presence(inner: &Arc<ClientInner>, msg: ServerMessage) {
             // this room observes the new member list via its watch receiver.
             let maps = inner.presence.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(state) = maps.by_room.get(&room) {
+                // Snapshots carry no `seq`, so the delta cursor restarts
+                // blank: the first delta after this may carry any `seq`.
+                *state.last_seq.lock().unwrap_or_else(|p| p.into_inner()) = None;
                 let _ = state.tx.send(PresenceSnapshot::Members(members));
             }
+        }
+        ServerMessage::PresenceDelta {
+            room,
+            seq,
+            joined,
+            left,
+            state_changed,
+        } => {
+            let maps = inner.presence.lock().unwrap_or_else(|p| p.into_inner());
+            // A delta for a room this client never joined has no baseline to
+            // fold into — ignore it (the same rule as a snapshot's routing).
+            let Some(state) = maps.by_room.get(&room) else {
+                return;
+            };
+            let baseline = match state.tx.borrow().clone() {
+                PresenceSnapshot::Members(members) => members,
+                // Pending (no snapshot yet) or Error (dead join): nothing to
+                // diff against; the server's next full snapshot will resync.
+                _ => return,
+            };
+            let mut last = state.last_seq.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(prev) = *last {
+                if seq <= prev {
+                    // Stale duplicate or already-applied delta: idempotent
+                    // no-op, never re-applied onto the baseline.
+                    return;
+                }
+                if seq > prev + 1 {
+                    // GAP: a delta was missed, so the baseline can no longer
+                    // be trusted. Discard the cursor (and, with the next
+                    // snapshot, the stale list) and re-join: the server
+                    // resets the room's caught-up flag on every join, so the
+                    // next flush delivers a fresh full snapshot. Never apply
+                    // a delta onto a stale baseline.
+                    *last = None;
+                    drop(last);
+                    drop(maps);
+                    let _ = inner
+                        .cmd_tx
+                        .send(Cmd::PresenceResync { room: room.clone() });
+                    return;
+                }
+            }
+            // Contiguous delta: fold joined/left/stateChanged into the
+            // baseline, then publish the folded FULL list — the public
+            // `Presence` surface stays "the room's member list" regardless
+            // of which frame shape the server used.
+            let mut members = baseline;
+            for id in &left {
+                members.retain(|m| &m.connection_id != id);
+            }
+            for member in joined.into_iter().chain(state_changed) {
+                match members
+                    .iter_mut()
+                    .find(|m| m.connection_id == member.connection_id)
+                {
+                    Some(existing) => *existing = member,
+                    None => members.push(member),
+                }
+            }
+            *last = Some(seq);
+            let _ = state.tx.send(PresenceSnapshot::Members(members));
         }
         ServerMessage::PresenceErr { room, error } => {
             // The server rejected the join (e.g. presence not enabled). Surface
@@ -2398,6 +2527,7 @@ mod tests {
         let state = Arc::new(PresenceRoomState {
             room: room.to_string(),
             state: Mutex::new(None),
+            last_seq: Mutex::new(None),
             tx,
         });
         inner
@@ -2407,6 +2537,65 @@ mod tests {
             .by_room
             .insert(room.to_string(), state);
         (inner, rx)
+    }
+
+    /// Same as [`rig_with_presence`] but keeps the command receiver, so a test
+    /// can observe the `Cmd::PresenceResync` the gap detector queues.
+    fn rig_with_presence_and_cmds(
+        room: &str,
+    ) -> (
+        Arc<ClientInner>,
+        watch::Receiver<PresenceSnapshot>,
+        mpsc::UnboundedReceiver<Cmd>,
+    ) {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
+        let (status_tx, _status_rx) = watch::channel(ClientStatus::default());
+        let inner = Arc::new(ClientInner {
+            url: "ws://h".into(),
+            db: "d".into(),
+            config: Config::default(),
+            get_token: Box::new(|| Box::pin(async { None })),
+            cmd_tx,
+            status_tx,
+            subs: Mutex::new(SubMaps::default()),
+            presence: Mutex::new(PresenceMaps::default()),
+            generation: Arc::new(AtomicU64::new(0)),
+            closed: Arc::new(AtomicBool::new(false)),
+            sub_counter: AtomicU64::new(1),
+            mut_counter: AtomicU64::new(1),
+            sched_counter: AtomicU64::new(1),
+            wf_counter: AtomicU64::new(1),
+        });
+        let (tx, rx) = watch::channel(PresenceSnapshot::Pending);
+        let state = Arc::new(PresenceRoomState {
+            room: room.to_string(),
+            state: Mutex::new(None),
+            last_seq: Mutex::new(None),
+            tx,
+        });
+        inner
+            .presence
+            .lock()
+            .unwrap()
+            .by_room
+            .insert(room.to_string(), state);
+        (inner, rx, cmd_rx)
+    }
+
+    fn presence_delta(
+        room: &str,
+        seq: u64,
+        joined: Vec<crate::wire::PresenceMember>,
+        left: Vec<String>,
+        state_changed: Vec<crate::wire::PresenceMember>,
+    ) -> ServerMessage {
+        ServerMessage::PresenceDelta {
+            room: room.to_string(),
+            seq,
+            joined,
+            left,
+            state_changed,
+        }
     }
 
     fn presence_member(cid: &str) -> crate::wire::PresenceMember {
@@ -2479,6 +2668,177 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn presence_delta_folds_into_the_member_list() {
+        let (inner, rx) = rig_with_presence("doc:1");
+        let mut queues = PendingQueues::default();
+        // Baseline snapshot (any seq may follow it — snapshots carry none).
+        apply_server_message(
+            &inner,
+            ServerMessage::PresenceSnapshot {
+                room: "doc:1".into(),
+                members: vec![presence_member("c1"), presence_member("c2")],
+            },
+            &mut queues,
+        );
+        // c1's state changes, c2 leaves, c3 joins — one contiguous delta.
+        let mut c1 = presence_member("c1");
+        c1.state = json!({"cursor": 7});
+        apply_server_message(
+            &inner,
+            presence_delta(
+                "doc:1",
+                4,
+                vec![presence_member("c3")],
+                vec!["c2".into()],
+                vec![c1],
+            ),
+            &mut queues,
+        );
+        match rx.borrow().clone() {
+            PresenceSnapshot::Members(m) => {
+                let ids: Vec<&str> = m.iter().map(|m| m.connection_id.as_str()).collect();
+                assert_eq!(ids, vec!["c1", "c3"], "fold applied left/joined in order");
+                assert_eq!(m[0].state, json!({"cursor": 7}), "stateChanged replaced");
+            }
+            other => panic!("expected folded Members, got {other:?}"),
+        }
+        // A following contiguous delta applies on the new cursor.
+        apply_server_message(
+            &inner,
+            presence_delta("doc:1", 5, vec![presence_member("c4")], vec![], vec![]),
+            &mut queues,
+        );
+        match rx.borrow().clone() {
+            PresenceSnapshot::Members(m) => assert_eq!(m.len(), 3),
+            other => panic!("expected Members, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn presence_delta_gap_discards_baseline_and_requests_resync() {
+        let (inner, rx, mut cmd_rx) = rig_with_presence_and_cmds("doc:1");
+        let mut queues = PendingQueues::default();
+        apply_server_message(
+            &inner,
+            ServerMessage::PresenceSnapshot {
+                room: "doc:1".into(),
+                members: vec![presence_member("c1")],
+            },
+            &mut queues,
+        );
+        apply_server_message(
+            &inner,
+            presence_delta("doc:1", 2, vec![presence_member("c2")], vec![], vec![]),
+            &mut queues,
+        );
+        // seq jumps 2 → 9: a delta was missed. The stale delta must NOT be
+        // applied, and the client must queue a resync (re-join).
+        apply_server_message(
+            &inner,
+            presence_delta("doc:1", 9, vec![presence_member("c9")], vec![], vec![]),
+            &mut queues,
+        );
+        match rx.borrow().clone() {
+            PresenceSnapshot::Members(m) => {
+                let ids: Vec<&str> = m.iter().map(|m| m.connection_id.as_str()).collect();
+                assert_eq!(
+                    ids,
+                    vec!["c1", "c2"],
+                    "stale-baseline delta must not be applied"
+                );
+            }
+            other => panic!("expected untouched Members, got {other:?}"),
+        }
+        match cmd_rx.try_recv().expect("resync cmd queued") {
+            Cmd::PresenceResync { room } => assert_eq!(room, "doc:1"),
+            _ => panic!("expected PresenceResync"),
+        }
+        // The re-join forces a fresh snapshot; the cursor restarts blank so
+        // the next delta (any seq) applies on the recovered baseline.
+        apply_server_message(
+            &inner,
+            ServerMessage::PresenceSnapshot {
+                room: "doc:1".into(),
+                members: vec![presence_member("c1"), presence_member("c2")],
+            },
+            &mut queues,
+        );
+        apply_server_message(
+            &inner,
+            presence_delta("doc:1", 12, vec![], vec!["c2".into()], vec![]),
+            &mut queues,
+        );
+        match rx.borrow().clone() {
+            PresenceSnapshot::Members(m) => {
+                let ids: Vec<&str> = m.iter().map(|m| m.connection_id.as_str()).collect();
+                assert_eq!(ids, vec!["c1"], "post-resync delta applied");
+            }
+            other => panic!("expected recovered Members, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn presence_delta_stale_duplicate_is_ignored() {
+        let (inner, rx, mut cmd_rx) = rig_with_presence_and_cmds("doc:1");
+        let mut queues = PendingQueues::default();
+        apply_server_message(
+            &inner,
+            ServerMessage::PresenceSnapshot {
+                room: "doc:1".into(),
+                members: vec![presence_member("c1")],
+            },
+            &mut queues,
+        );
+        apply_server_message(
+            &inner,
+            presence_delta("doc:1", 3, vec![presence_member("c2")], vec![], vec![]),
+            &mut queues,
+        );
+        // A redelivered seq 3 (and an older 2) must change nothing.
+        apply_server_message(
+            &inner,
+            presence_delta("doc:1", 3, vec![presence_member("c2")], vec![], vec![]),
+            &mut queues,
+        );
+        apply_server_message(
+            &inner,
+            presence_delta("doc:1", 2, vec![presence_member("c0")], vec![], vec![]),
+            &mut queues,
+        );
+        match rx.borrow().clone() {
+            PresenceSnapshot::Members(m) => {
+                let ids: Vec<&str> = m.iter().map(|m| m.connection_id.as_str()).collect();
+                assert_eq!(ids, vec!["c1", "c2"], "duplicates never re-applied");
+            }
+            other => panic!("expected Members, got {other:?}"),
+        }
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "no resync should be queued for stale deltas"
+        );
+    }
+
+    #[test]
+    fn presence_delta_without_a_baseline_is_ignored() {
+        let (inner, rx) = rig_with_presence("doc:1");
+        let mut queues = PendingQueues::default();
+        // Pending room: nothing to diff against — no apply, no resync, no panic.
+        apply_server_message(
+            &inner,
+            presence_delta("doc:1", 1, vec![presence_member("c1")], vec![], vec![]),
+            &mut queues,
+        );
+        assert!(matches!(rx.borrow().clone(), PresenceSnapshot::Pending));
+        // Unknown room: same — silently dropped.
+        apply_server_message(
+            &inner,
+            presence_delta("doc:other", 1, vec![presence_member("c1")], vec![], vec![]),
+            &mut queues,
+        );
+        assert!(matches!(rx.borrow().clone(), PresenceSnapshot::Pending));
     }
 
     // ── optimistic-update wiring ───────────────────────────────────────────

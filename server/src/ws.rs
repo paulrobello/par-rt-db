@@ -130,7 +130,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, headers: Hea
     let conn_id = next_conn_id();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-    let Some((principal, db)) = authenticate(&mut socket, &state, &headers).await else {
+    let Some((principal, db, protocol_version)) = authenticate(&mut socket, &state, &headers).await
+    else {
         return;
     };
     state.runtime.metrics.ws_connect();
@@ -163,6 +164,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, headers: Hea
                             principal: &principal,
                             db: &db,
                             conn_id,
+                            protocol_version,
                             out_tx: &out_tx,
                         };
                         let should_close =
@@ -204,7 +206,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, headers: Hea
 /// frames — a client that opens with a keepalive isn't penalized) for the
 /// first data frame and requires it to be a valid `Auth` message; any other
 /// outcome (timeout, wrong message, bad frame) sends `AuthErr` and closes.
-/// Returns the resolved principal and authorized database name. Whether the
+/// Returns the resolved principal, the authorized database name, and the
+/// client's negotiated `protocolVersion` (`None` when the `Auth` frame
+/// omitted it — v1 semantics). Whether the
 /// principal is a server-wide dashboard admin is computed here ONLY to decide
 /// whether the initial per-db `authorize` runs at the handshake; it is NOT
 /// returned — `handle_text_frame` re-runs `is_admin` on each Subscribe/Mutate
@@ -214,7 +218,7 @@ async fn authenticate(
     socket: &mut WebSocket,
     state: &Arc<AppState>,
     headers: &HeaderMap,
-) -> Option<(Principal, String)> {
+) -> Option<(Principal, String, Option<u32>)> {
     let deadline = Instant::now() + AUTH_TIMEOUT;
     let text = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -325,7 +329,7 @@ async fn authenticate(
         return None;
     }
 
-    Some((principal, db))
+    Some((principal, db, protocol_version))
 }
 
 /// Shared, borrow-only context for the per-frame `handle_*` handlers that
@@ -344,6 +348,12 @@ struct FrameCtx<'a> {
     principal: &'a Principal,
     db: &'a str,
     conn_id: ConnId,
+    /// The `protocolVersion` the client declared on its `Auth` frame
+    /// (`None` = omitted, v1 semantics). Currently consumed only by the
+    /// presence layer, which emits `PresenceDelta` to connections that
+    /// negotiated at least `PRESENCE_DELTA_MIN_VERSION` and full snapshots
+    /// to everything else (ARC-013 gate, protocol.rs).
+    protocol_version: Option<u32>,
     out_tx: &'a UnboundedSender<ServerMessage>,
 }
 
@@ -1002,7 +1012,15 @@ async fn handle_presence(
     match state
         .realtime
         .presence
-        .join(db, conn_id, &room, presence_state, user, out_tx.clone())
+        .join(
+            db,
+            conn_id,
+            &room,
+            presence_state,
+            user,
+            out_tx.clone(),
+            fctx.protocol_version,
+        )
         .await
     {
         Ok(()) => state.runtime.metrics.record_presence_update(),

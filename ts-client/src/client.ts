@@ -251,6 +251,18 @@ export class RtDbClient {
    *  don't kill it for each other on the first unmount. The wire JOIN itself is
    *  already idempotent server-side (one membership per conn+room). */
   private readonly presenceRefcounts = new Map<string, number>();
+  /** Per-room fold state for v3 `presenceDelta` frames: the last-known full
+   * member list plus the room's last-applied `seq` (`null` until the first
+   * delta after a snapshot — a snapshot carries no seq, so the
+   * snapshot→first-delta transition can land on any seq). A delta is folded
+   * into `members` here and the folded LIST is what listeners receive; the
+   * delta frame itself never leaves this class. Reset on snapshot, on
+   * leave/error, on disconnect, and on a detected `seq` gap (which re-joins
+   * to force a fresh snapshot). */
+  private readonly presenceFold = new Map<
+    string,
+    { members: PresenceMember[]; lastSeq: number | null }
+  >();
   /** mutId → subscriptions whose last result this mutation optimistically overlaid. */
   private readonly optimisticOverlays = new Map<string, Set<Subscription>>();
   private readonly optimistic: boolean;
@@ -720,6 +732,7 @@ export class RtDbClient {
     this.presenceRefcounts.delete(room);
     this.joinedRooms.delete(room);
     this.presenceListeners.delete(room);
+    this.presenceFold.delete(room);
     if (this.authState === "authenticated") {
       this.send({ type: "leavePresence", room });
     }
@@ -1019,6 +1032,7 @@ export class RtDbClient {
         this.onWorkflowReply(msg);
         break;
       case "presenceSnapshot":
+      case "presenceDelta":
       case "presenceErr":
         this.onPresence(msg);
         break;
@@ -1138,25 +1152,100 @@ export class RtDbClient {
     }
   }
 
-  /** Route a `presenceSnapshot`/`presenceErr` frame to its room's listeners. */
+  /** Route a `presenceSnapshot`/`presenceDelta`/`presenceErr` frame to its
+   * room's listeners. Snapshots replace the room's fold state wholesale;
+   * deltas (v3) are folded into it and the folded full LIST is what
+   * listeners see. */
   private onPresence(
-    msg: Extract<ServerMessage, { type: "presenceSnapshot" | "presenceErr" }>,
+    msg: Extract<ServerMessage, { type: "presenceSnapshot" | "presenceDelta" | "presenceErr" }>,
   ): void {
     if (msg.type === "presenceSnapshot") {
-      // Per-room fan-out, mirroring how `queryUpdate` routes to per-`queryId`
-      // handlers via `subsById`.
-      const set = this.presenceListeners.get(msg.room);
-      if (set) {
-        for (const fn of set) {
-          fn(msg.members);
-        }
+      // A snapshot is self-contained: replace the fold state and reset
+      // `lastSeq` (a snapshot carries no seq, so the snapshot→first-delta
+      // transition can land on any seq). Seeded only for rooms this client
+      // has joined — a non-member has no baseline to keep.
+      if (this.joinedRooms.has(msg.room)) {
+        this.presenceFold.set(msg.room, { members: msg.members, lastSeq: null });
       }
+      this.notifyPresence(msg.room, msg.members);
+      return;
+    }
+    if (msg.type === "presenceDelta") {
+      this.onPresenceDelta(msg.room, msg.seq, msg.joined, msg.left, msg.stateChanged);
       return;
     }
     // The server rejected the join (e.g. presence not enabled). Drop local
     // listeners so a stale room doesn't keep accumulating snapshots the
     // caller can no longer act on.
     this.presenceListeners.delete(msg.room);
+    this.presenceFold.delete(msg.room);
+  }
+
+  /** Fold one `presenceDelta` into the room's fold state and fan out the
+   * resulting full member list. A room the client has not joined has no
+   * baseline to fold against and is ignored — same as snapshots for unknown
+   * rooms. Sequence handling: a stale duplicate (`seq <= lastSeq`) is
+   * dropped; a gap (`seq > lastSeq + 1`) means a missed delta, so the fold
+   * state is discarded and the room re-joined (an idempotent server-side
+   * re-join resets the connection to caught-up=false and the next flush is
+   * a full snapshot). An all-empty delta changes nothing, so listeners are
+   * not re-notified (mirrors the server's push-on-change contract). */
+  private onPresenceDelta(
+    room: string,
+    seq: number,
+    joined?: PresenceMember[],
+    left?: string[],
+    stateChanged?: PresenceMember[],
+  ): void {
+    if (!this.joinedRooms.has(room)) {
+      return;
+    }
+    const state = this.presenceFold.get(room);
+    if (!state) {
+      // Joined but no snapshot baseline yet (cannot happen from a correct
+      // server — the first broadcast is always a snapshot — but folding
+      // into nothing would silently drop members).
+      return;
+    }
+    if (state.lastSeq !== null && seq <= state.lastSeq) {
+      return; // stale duplicate
+    }
+    if (state.lastSeq !== null && seq > state.lastSeq + 1) {
+      // Gap: a delta was missed. Applying it would corrupt the member list.
+      this.presenceFold.delete(room);
+      this.send({ type: "presence", room, state: this.joinedRooms.get(room) });
+      return;
+    }
+    let members = state.members;
+    if (joined?.length) {
+      const byId = new Map(members.map((m) => [m.connectionId, m]));
+      for (const m of joined) {
+        byId.set(m.connectionId, m);
+      }
+      members = [...byId.values()];
+    }
+    if (left?.length) {
+      const dropped = new Set(left);
+      members = members.filter((m) => !dropped.has(m.connectionId));
+    }
+    if (stateChanged?.length) {
+      const changed = new Map(stateChanged.map((m) => [m.connectionId, m]));
+      members = members.map((m) => changed.get(m.connectionId) ?? m);
+    }
+    state.members = members;
+    state.lastSeq = seq;
+    if (joined?.length || left?.length || stateChanged?.length) {
+      this.notifyPresence(room, members);
+    }
+  }
+
+  private notifyPresence(room: string, members: PresenceMember[]): void {
+    const set = this.presenceListeners.get(room);
+    if (set) {
+      for (const fn of set) {
+        fn(members);
+      }
+    }
   }
 
   private flushOnAuth(): void {
@@ -1184,6 +1273,9 @@ export class RtDbClient {
   private handleClose(code: number): void {
     this.socket = null;
     this.clearHeartbeat();
+    // Delta fold state is per-connection: a reconnect re-joins every room
+    // (flushOnAuth) and the server restarts each with a full snapshot.
+    this.presenceFold.clear();
     // In-flight (already-sent) mutations are never auto-resent — reject them.
     this.rejectPendingMutates("connection closed before the mutation was acknowledged");
     // Same for in-flight schedule and workflow requests: they are never auto-resent.

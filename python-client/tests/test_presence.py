@@ -903,3 +903,196 @@ def _member(conn_id: str, state: object):
         user=AuthedUser(kind="user"),
         state=state,
     )
+
+
+# --- presenceDelta (v3 wire frame + client-side fold) -------------------------
+
+
+def _raw_member(connection_id: str, state: object) -> dict:
+    return {
+        "connectionId": connection_id,
+        "user": {"kind": "machine", "email": None, "name": None},
+        "state": state,
+    }
+
+
+def test_presence_delta_all_empty_omits_bucket_arrays() -> None:
+    """The all-empty delta serializes as type/room/seq only — the corpus pins
+    this shape (mirrors the server's ``skip_serializing_if = "Vec::is_empty"``)."""
+    adapter = TypeAdapter(ServerMessage)
+    msg = adapter.validate_python({"type": "presenceDelta", "room": "doc:1", "seq": 1})
+    assert json.loads(msg.model_dump_json(by_alias=True)) == {
+        "type": "presenceDelta",
+        "room": "doc:1",
+        "seq": 1,
+    }
+
+
+def test_presence_delta_round_trips_buckets() -> None:
+    adapter = TypeAdapter(ServerMessage)
+    raw = {
+        "type": "presenceDelta",
+        "room": "doc:1",
+        "seq": 2,
+        "joined": [_raw_member("c3", None)],
+        "left": ["c2"],
+        "stateChanged": [_raw_member("c1", {"cursor": {"x": 3, "y": 4}})],
+    }
+    msg = adapter.validate_python(raw)
+    assert len(msg.state_changed) == 1  # snake_case alias maps back
+    assert json.loads(msg.model_dump_json(by_alias=True)) == raw
+
+
+async def test_presence_delta_folds_into_room_members() -> None:
+    conn = _FakeConn()
+    client = await _connected(conn)
+    try:
+        handle = client.presence("doc:1")
+        await _drain()
+
+        await conn.deliver(
+            json.dumps(
+                {
+                    "type": "presenceSnapshot",
+                    "room": "doc:1",
+                    "members": [_raw_member("c1", {"v": 1})],
+                }
+            )
+        )
+        await _drain()
+        members = handle.current()
+        assert members is not None and len(members) == 1
+
+        await conn.deliver(
+            json.dumps(
+                {
+                    "type": "presenceDelta",
+                    "room": "doc:1",
+                    "seq": 2,
+                    "joined": [_raw_member("c2", {"v": 2})],
+                }
+            )
+        )
+        await _drain()
+        members = handle.current()
+        assert members is not None and [m.connection_id for m in members] == ["c1", "c2"]
+
+        await conn.deliver(
+            json.dumps(
+                {
+                    "type": "presenceDelta",
+                    "room": "doc:1",
+                    "seq": 3,
+                    "left": ["c1"],
+                    "stateChanged": [_raw_member("c2", {"v": 22})],
+                }
+            )
+        )
+        await _drain()
+        members = handle.current()
+        assert members is not None and len(members) == 1
+        assert members[0].connection_id == "c2"
+        assert members[0].state == {"v": 22}
+    finally:
+        await client.close()
+
+
+async def test_presence_delta_gap_clears_members_and_rejoins() -> None:
+    conn = _FakeConn()
+    client = await _connected(conn)
+    try:
+        handle = client.presence("doc:1", state={"cursor": 1})
+        await _drain()
+
+        await conn.deliver(
+            json.dumps(
+                {
+                    "type": "presenceSnapshot",
+                    "room": "doc:1",
+                    "members": [_raw_member("c1", None)],
+                }
+            )
+        )
+        await _drain()
+        await conn.deliver(
+            json.dumps(
+                {
+                    "type": "presenceDelta",
+                    "room": "doc:1",
+                    "seq": 2,
+                    "joined": [_raw_member("c2", None)],
+                }
+            )
+        )
+        await _drain()
+        assert len(handle.current() or []) == 2
+        joins_before = sum(1 for f in conn.sent if json.loads(f).get("type") == "presence")
+
+        # seq jumps 2 -> 5: a missed delta. The client must NOT apply it to
+        # the stale baseline; it clears the list and re-joins to force a
+        # fresh snapshot.
+        await conn.deliver(
+            json.dumps(
+                {
+                    "type": "presenceDelta",
+                    "room": "doc:1",
+                    "seq": 5,
+                    "left": ["c1"],
+                }
+            )
+        )
+        await _drain()
+        assert handle.current() is None, "gap must drop the stale folded list"
+        joins_after = sum(1 for f in conn.sent if json.loads(f).get("type") == "presence")
+        assert joins_after == joins_before + 1, "gap must re-send the join frame"
+
+        # Recovery: the server answers the re-join with a full snapshot.
+        await conn.deliver(
+            json.dumps(
+                {
+                    "type": "presenceSnapshot",
+                    "room": "doc:1",
+                    "members": [_raw_member("c1", None), _raw_member("c2", None)],
+                }
+            )
+        )
+        await _drain()
+        assert len(handle.current() or []) == 2
+    finally:
+        await client.close()
+
+
+async def test_presence_delta_stale_duplicate_is_ignored() -> None:
+    conn = _FakeConn()
+    client = await _connected(conn)
+    try:
+        handle = client.presence("doc:1")
+        await _drain()
+        await conn.deliver(
+            json.dumps(
+                {
+                    "type": "presenceSnapshot",
+                    "room": "doc:1",
+                    "members": [_raw_member("c1", None)],
+                }
+            )
+        )
+        await _drain()
+        delta = {
+            "type": "presenceDelta",
+            "room": "doc:1",
+            "seq": 2,
+            "joined": [_raw_member("c2", None)],
+        }
+        await conn.deliver(json.dumps(delta))
+        await _drain()
+        members = handle.current()
+        assert members is not None and len(members) == 2
+
+        # Replaying seq 2 must not join c2 twice.
+        await conn.deliver(json.dumps(delta))
+        await _drain()
+        members = handle.current()
+        assert members is not None and [m.connection_id for m in members] == ["c1", "c2"]
+    finally:
+        await client.close()

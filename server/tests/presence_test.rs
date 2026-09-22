@@ -33,7 +33,23 @@ async fn recv_json(ws: &mut WsStream) -> Value {
     }
 }
 
+/// Authenticate as a v3 client: the explicit `protocolVersion: 3` is what
+/// lets these tests receive `presenceDelta` frames — a connection that
+/// omits the field (or negotiates below `PRESENCE_DELTA_MIN_VERSION`) keeps
+/// getting full snapshots (see `legacy_connection_keeps_receiving_snapshots`).
 async fn auth(ws: &mut WsStream, token: &str, db: &str) -> Value {
+    send_json(
+        ws,
+        json!({"type": "auth", "token": token, "db": db, "protocolVersion": 3}),
+    )
+    .await;
+    recv_json(ws).await
+}
+
+/// Authenticate WITHOUT a `protocolVersion` (legacy v1 semantics) — the
+/// pre-delta SDK shape. Used by the gate test to prove such a connection
+/// never sees a `presenceDelta`.
+async fn auth_legacy(ws: &mut WsStream, token: &str, db: &str) -> Value {
     send_json(ws, json!({"type": "auth", "token": token, "db": db})).await;
     recv_json(ws).await
 }
@@ -81,6 +97,29 @@ where
     .expect("timed out waiting for presenceSnapshot")
 }
 
+/// Read frames from `ws` until a `presenceDelta` for `room` matching `pred`
+/// (invoked with the frame itself, so a caller can inspect `joined`/`left`/
+/// `stateChanged`), discarding stray frames. A connection only ever receives
+/// a delta once it has been sent at least one `presenceSnapshot` for the room
+/// (`flush_once`'s `caught_up` gate — see `presence.rs`), so every test that
+/// uses this must have already drained that connection's initial snapshot.
+/// Bounded by a 2s timeout, same rationale as `drain_until_snapshot`.
+async fn drain_until_delta<F>(ws: &mut WsStream, room: &str, pred: F) -> Value
+where
+    F: Fn(&Value) -> bool,
+{
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let msg = recv_json(ws).await;
+            if msg["type"] == "presenceDelta" && msg["room"] == room && pred(&msg) {
+                return msg;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for presenceDelta")
+}
+
 /// Mint a user session with an identity derived from `db` so concurrent tests
 /// in the same binary never collide on `rtdb_auth.users.id` / `.email` /
 /// `.github_id` (all UNIQUE). Mirrors `per_row_auth_test.rs::alice_uid`'s
@@ -113,21 +152,93 @@ async fn two_conns_see_each_other_in_a_room() {
     assert_eq!(ok_a["type"], json!("authOk"));
     assert_eq!(ok_b["type"], json!("authOk"));
 
-    // wa joins first → 1-member snapshot to wa.
+    // wa joins first → 1-member snapshot to wa. That snapshot marks wa
+    // caught_up, so every LATER broadcast to wa is a delta, not a snapshot.
     send_json(&mut wa, json!({"type": "presence", "room": "doc:1"})).await;
     state.realtime.presence.flush_once().await;
     let snap = drain_until_snapshot(&mut wa, "doc:1", |n| n == 1).await;
     assert_eq!(snap["members"].as_array().map(|a| a.len()), Some(1));
 
-    // wb joins → 2-member snapshot to BOTH members (join marks the room dirty;
-    // flush broadcasts to every member, including the just-joined wb and the
-    // already-present wa).
+    // wb joins → the ALREADY-caught-up wa gets a delta (wb joined); the
+    // FRESHLY-joining wb still gets its own full snapshot (nothing to diff
+    // against yet).
     send_json(&mut wb, json!({"type": "presence", "room": "doc:1"})).await;
     state.realtime.presence.flush_once().await;
-    let snap_a = drain_until_snapshot(&mut wa, "doc:1", |n| n == 2).await;
+    let delta_a = drain_until_delta(&mut wa, "doc:1", |_| true).await;
     let snap_b = drain_until_snapshot(&mut wb, "doc:1", |n| n == 2).await;
-    assert_eq!(snap_a["members"].as_array().map(|a| a.len()), Some(2));
+    assert_eq!(
+        delta_a["joined"].as_array().map(|a| a.len()),
+        Some(1),
+        "wa's delta should report wb joining"
+    );
+    assert!(
+        delta_a["left"].as_array().is_none_or(|a| a.is_empty()),
+        "no one left"
+    );
     assert_eq!(snap_b["members"].as_array().map(|a| a.len()), Some(2));
+}
+
+/// The ARC-013 gate, end to end: a connection that negotiated v3 receives a
+/// `presenceDelta` on the next flush, while a legacy connection (no
+/// `protocolVersion` on its auth frame) in the SAME room receives a full
+/// `presenceSnapshot` instead — an SDK that predates the delta frame never
+/// sees a message type its parser rejects, so the rollout is not lockstep.
+#[tokio::test]
+async fn legacy_connection_keeps_receiving_snapshots() {
+    let state = test_state_with_presence().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let (token_a, email_a) = mint_user_for_db(&state, &db, "a").await;
+    let (token_b, email_b) = mint_user_for_db(&state, &db, "b").await;
+    allowlist(addr, &db, &[&email_a, &email_b]).await;
+
+    let mut wa = ws_connect(addr).await;
+    let mut wb = ws_connect(addr).await;
+    let ok_a = auth(&mut wa, &token_a, &db).await; // v3: deltas enabled
+    let ok_b = auth_legacy(&mut wb, &token_b, &db).await; // legacy: never
+    assert_eq!(ok_a["type"], json!("authOk"));
+    assert_eq!(ok_b["type"], json!("authOk"));
+
+    send_json(&mut wa, json!({"type": "presence", "room": "doc:1"})).await;
+    state.realtime.presence.flush_once().await;
+    let snap_a = drain_until_snapshot(&mut wa, "doc:1", |n| n == 1).await;
+    assert_eq!(snap_a["type"], json!("presenceSnapshot"));
+
+    send_json(&mut wb, json!({"type": "presence", "room": "doc:1"})).await;
+    state.realtime.presence.flush_once().await;
+    // wb's first broadcast is a full snapshot (fresh join); whichever flush
+    // (background or explicit) delivers it carries both members.
+    let snap_b = drain_until_snapshot(&mut wb, "doc:1", |n| n == 2).await;
+    assert_eq!(snap_b["type"], json!("presenceSnapshot"));
+
+    // A state change on the next flush: the v3 connection gets a delta;
+    // the legacy connection gets a full snapshot whose members carry the
+    // new state — never a `presenceDelta` frame.
+    send_json(
+        &mut wa,
+        json!({"type": "presenceState", "room": "doc:1", "state": {"cursor": 7}}),
+    )
+    .await;
+    state.realtime.presence.flush_once().await;
+    let delta_a = drain_until_delta(&mut wa, "doc:1", |d| {
+        d["stateChanged"].as_array().is_some_and(|a| !a.is_empty())
+    })
+    .await;
+    assert_eq!(delta_a["type"], json!("presenceDelta"));
+    assert_eq!(delta_a["stateChanged"][0]["state"], json!({"cursor": 7}));
+
+    let frame_b = recv_json(&mut wb).await;
+    assert_eq!(
+        frame_b["type"],
+        json!("presenceSnapshot"),
+        "a legacy connection must receive a snapshot, not a delta"
+    );
+    let members_b = frame_b["members"].as_array().unwrap();
+    assert_eq!(members_b.len(), 2);
+    assert!(
+        members_b.iter().any(|m| m["state"] == json!({"cursor": 7})),
+        "legacy snapshot carries the updated state"
+    );
 }
 
 /// A `presenceState` update from one member is observed, via the next
@@ -149,29 +260,43 @@ async fn state_update_is_observed_by_peer() {
 
     send_json(&mut wa, json!({"type": "presence", "room": "doc:1"})).await;
     state.realtime.presence.flush_once().await;
+    // wa's first snapshot marks it caught_up, so its own next broadcast (wb's
+    // join, below) is a delta.
     drain_until_snapshot(&mut wa, "doc:1", |n| n == 1).await;
 
     send_json(&mut wb, json!({"type": "presence", "room": "doc:1"})).await;
     state.realtime.presence.flush_once().await;
-    drain_until_snapshot(&mut wa, "doc:1", |n| n == 2).await;
+    drain_until_delta(&mut wa, "doc:1", |_| true).await;
     drain_until_snapshot(&mut wb, "doc:1", |n| n == 2).await;
 
-    // wa publishes a state update; wb's next snapshot carries it on wa's entry.
+    // wa publishes a state update; both wa and wb are now caught up (each got
+    // their own snapshot above), so wb's next broadcast is a delta whose
+    // `stateChanged` carries wa's updated state.
     send_json(
         &mut wa,
         json!({"type": "presenceState", "room": "doc:1", "state": {"typing": true}}),
     )
     .await;
     state.realtime.presence.flush_once().await;
-    let snap = drain_until_snapshot(&mut wb, "doc:1", |n| n == 2).await;
-    let members = snap["members"].as_array().expect("members array");
-    assert_eq!(members.len(), 2, "room still has both members");
-    let has_typing = members
+    let delta = drain_until_delta(&mut wb, "doc:1", |d| {
+        d["stateChanged"].as_array().is_some_and(|a| !a.is_empty())
+    })
+    .await;
+    assert!(
+        delta["joined"].as_array().is_none_or(|a| a.is_empty()),
+        "no one joined"
+    );
+    assert!(
+        delta["left"].as_array().is_none_or(|a| a.is_empty()),
+        "no one left"
+    );
+    let state_changed = delta["stateChanged"].as_array().expect("stateChanged");
+    let has_typing = state_changed
         .iter()
         .any(|m| m["state"] == json!({"typing": true}));
     assert!(
         has_typing,
-        "peer's snapshot should carry wa's updated state; got {snap}"
+        "peer's delta should carry wa's updated state; got {delta}"
     );
 }
 
@@ -190,7 +315,9 @@ async fn ttl_expires_state_to_null_member_remains() {
     assert_eq!(auth(&mut wa, &token_a, &db).await["type"], json!("authOk"));
     assert_eq!(auth(&mut wb, &token_b, &db).await["type"], json!("authOk"));
 
-    // both join -> 2 members
+    // both join in the same flush tick -> 2-member snapshot to both (the
+    // room's first-ever flush, so nobody is caught_up yet). Every LATER
+    // broadcast to wb is a delta.
     send_json(&mut wa, json!({"type": "presence", "room": "doc:1"})).await;
     send_json(&mut wb, json!({"type": "presence", "room": "doc:1"})).await;
     state.realtime.presence.flush_once().await;
@@ -203,30 +330,45 @@ async fn ttl_expires_state_to_null_member_remains() {
     )
     .await;
     state.realtime.presence.flush_once().await;
-    // peer observes typing:true
-    let snap = drain_until_snapshot(&mut wb, "doc:1", |n| n == 2).await;
-    // both members are present and indistinguishable by identity here, so assert
-    // on the aggregate: at least one member is typing before the ttl fires.
-    let typing = snap["members"]
+    // peer observes typing:true via a delta's stateChanged entry.
+    let delta = drain_until_delta(&mut wb, "doc:1", |d| {
+        d["stateChanged"].as_array().is_some_and(|a| !a.is_empty())
+    })
+    .await;
+    let typing = delta["stateChanged"]
         .as_array()
         .unwrap()
         .iter()
         .any(|m| m["state"]["typing"] == json!(true));
     assert!(typing, "peer saw typing:true before ttl");
+    assert!(
+        delta["joined"].as_array().is_none_or(|a| a.is_empty())
+            && delta["left"].as_array().is_none_or(|a| a.is_empty()),
+        "only a state change happened"
+    );
 
     // wait out the ttl, then drive expiry + flush explicitly.
     tokio::time::sleep(std::time::Duration::from_millis(140)).await;
     state.realtime.presence.expire_once().await;
     state.realtime.presence.flush_once().await;
 
-    // peer now sees conn A's state as null, but A is still a member (2 members).
-    let snap = drain_until_snapshot(&mut wb, "doc:1", |n| n == 2).await;
-    let members = snap["members"].as_array().unwrap();
-    assert_eq!(members.len(), 2, "expiry clears state, not membership");
-    // at least one member's state is null (both are: A's typing expired to null,
-    // B joined with no state); the typing flag is gone from every member.
-    assert!(members.iter().any(|m| m["state"].is_null()));
-    assert!(members.iter().all(|m| m["state"]["typing"] != json!(true)));
+    // peer sees conn A's state clear to null via another delta's
+    // stateChanged (never `left` — expiry clears state, not membership).
+    let delta = drain_until_delta(&mut wb, "doc:1", |d| {
+        d["stateChanged"].as_array().is_some_and(|a| !a.is_empty())
+    })
+    .await;
+    assert!(
+        delta["left"].as_array().is_none_or(|a| a.is_empty()),
+        "expiry clears state, not membership — must never appear as left"
+    );
+    let state_changed = delta["stateChanged"].as_array().unwrap();
+    assert!(state_changed.iter().any(|m| m["state"].is_null()));
+    assert!(
+        state_changed
+            .iter()
+            .all(|m| m["state"]["typing"] != json!(true))
+    );
 }
 
 /// `leavePresence` removes the member; the survivor's next snapshot shrinks
@@ -248,18 +390,27 @@ async fn leave_shrinks_the_room() {
 
     send_json(&mut wa, json!({"type": "presence", "room": "doc:1"})).await;
     state.realtime.presence.flush_once().await;
+    // wa's first snapshot marks it caught_up, so its next broadcast (wb's
+    // join) is a delta, not a snapshot.
     drain_until_snapshot(&mut wa, "doc:1", |n| n == 1).await;
 
     send_json(&mut wb, json!({"type": "presence", "room": "doc:1"})).await;
     state.realtime.presence.flush_once().await;
-    drain_until_snapshot(&mut wa, "doc:1", |n| n == 2).await;
+    drain_until_delta(&mut wa, "doc:1", |_| true).await;
     drain_until_snapshot(&mut wb, "doc:1", |n| n == 2).await;
 
-    // wb leaves; wa's snapshot shrinks to 1.
+    // wb leaves; wa (already caught_up) sees it via a delta's `left` list.
     send_json(&mut wb, json!({"type": "leavePresence", "room": "doc:1"})).await;
     state.realtime.presence.flush_once().await;
-    let snap = drain_until_snapshot(&mut wa, "doc:1", |n| n == 1).await;
-    assert_eq!(snap["members"].as_array().map(|a| a.len()), Some(1));
+    let delta = drain_until_delta(&mut wa, "doc:1", |d| {
+        d["left"].as_array().is_some_and(|a| !a.is_empty())
+    })
+    .await;
+    assert!(
+        delta["joined"].as_array().is_none_or(|a| a.is_empty()),
+        "no one joined"
+    );
+    assert_eq!(delta["left"].as_array().map(|a| a.len()), Some(1));
 }
 
 /// An abrupt TCP disconnect fires the `remove_conn` hook (ws.rs cleanup),
@@ -283,24 +434,30 @@ async fn disconnect_evicts_the_member() {
 
     send_json(&mut wa, json!({"type": "presence", "room": "doc:1"})).await;
     state.realtime.presence.flush_once().await;
+    // wa's first snapshot marks it caught_up, so its next broadcast (wb's
+    // join) is a delta, not a snapshot.
     drain_until_snapshot(&mut wa, "doc:1", |n| n == 1).await;
 
     send_json(&mut wb, json!({"type": "presence", "room": "doc:1"})).await;
     state.realtime.presence.flush_once().await;
-    drain_until_snapshot(&mut wa, "doc:1", |n| n == 2).await;
+    drain_until_delta(&mut wa, "doc:1", |_| true).await;
     drain_until_snapshot(&mut wb, "doc:1", |n| n == 2).await;
 
     // Drop wb's socket → server reads EOF → remove_conn → room dirty → the
-    // interval=0 background flush task broadcasts the 1-member snapshot to wa.
+    // interval=0 background flush task broadcasts a delta (wa is already
+    // caught_up) reporting wb's departure.
     // An explicit `flush_once` here would race the background task (both drain
     // the same dirty set under one mutex), so we rely on the background task.
     drop(wb);
-    // `drain_until_snapshot`'s own 2s timeout is the single bound on the
+    // `drain_until_delta`'s own 2s timeout is the single bound on the
     // eviction wait — the prior outer 3s wrapper was unreachable dead code (the
     // inner helper times out first). The interval=0 flush task enqueues the
-    // eviction snapshot within milliseconds of the TCP close, so 2s is ample.
-    let snap = drain_until_snapshot(&mut wa, "doc:1", |n| n == 1).await;
-    assert_eq!(snap["members"].as_array().map(|a| a.len()), Some(1));
+    // eviction delta within milliseconds of the TCP close, so 2s is ample.
+    let delta = drain_until_delta(&mut wa, "doc:1", |d| {
+        d["left"].as_array().is_some_and(|a| !a.is_empty())
+    })
+    .await;
+    assert_eq!(delta["left"].as_array().map(|a| a.len()), Some(1));
 }
 
 /// A connection authed to db1 joining room "X" and a connection authed to db2
@@ -383,6 +540,7 @@ async fn presence_manager_is_wired_and_disabled_by_default() {
                 github_id: None,
             },
             t,
+            Some(3),
         )
         .await
         .unwrap_err();

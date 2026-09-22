@@ -20,11 +20,28 @@ use crate::error::RtDbError;
 ///
 /// Version 2 (2026-09-19 wire-v2 bundle) adds: the aggregate terminal's
 /// `aggregates` alias→op map, the `groupBy` field-list form, the optional
-/// `tz` on cron `ScheduleWhen`, and `POST /api/mutate-batch`. There is no
-/// per-message enforcement — a v2 build parses the full vocabulary from any
-/// authenticated peer; the number exists so an OLD server fails a v2 client
-/// cleanly at auth instead of on the first unknown field.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// `tz` on cron `ScheduleWhen`, and `POST /api/mutate-batch`.
+///
+/// Version 3 (2026-09-22 presence deltas) adds: the `presenceDelta` server
+/// frame, emitted by the presence flush loop ONLY to connections whose
+/// negotiated `protocolVersion` is at least
+/// [`PRESENCE_DELTA_MIN_VERSION`]; every other connection keeps receiving
+/// full `presenceSnapshot` frames, so the frame's rollout is not lockstep
+/// with SDK upgrades.
+///
+/// There is no per-message enforcement — a v3 build parses the full
+/// vocabulary from any authenticated peer; the number exists so an OLD
+/// server fails a newer client cleanly at auth instead of on the first
+/// unknown field.
+pub const PROTOCOL_VERSION: u32 = 3;
+
+/// The protocol version at which the server may emit `PresenceDelta`
+/// (ARC-013 gate for the v3 frame). A connection that negotiated a version
+/// below this — or omitted `protocolVersion` entirely (v1 semantics) — keeps
+/// receiving full `PresenceSnapshot` frames instead. Pinned as its own
+/// constant (not read off `PROTOCOL_VERSION`) because the gate must stay at
+/// 3 even after `PROTOCOL_VERSION` moves to 4+.
+pub const PRESENCE_DELTA_MIN_VERSION: u32 = 3;
 
 /// Full WS client vocabulary. Consumed by the WS handler (Task 9) and mirrored
 /// by the TS client — wire tags and field names are load-bearing.
@@ -208,6 +225,40 @@ pub enum ServerMessage {
     PresenceSnapshot {
         room: String,
         members: Vec<PresenceMember>,
+    },
+    /// Incremental alternative to `PresenceSnapshot`, sent instead of a full
+    /// snapshot to a recipient with a known prior broadcast to diff against
+    /// (see `presence.rs::flush_once`). `seq` is a per-ROOM monotonic
+    /// counter, shared by every caught-up recipient of that room (NOT
+    /// per-connection) — it increments once per flush tick that has a prior
+    /// baseline to diff against, so a connection's first `PresenceDelta` can
+    /// arrive at any `seq` (whatever the room's counter had reached when
+    /// that connection caught up), not necessarily 1 or 2. `PresenceSnapshot`
+    /// carries no `seq`, so the snapshot→first-delta transition is not
+    /// itself verifiable; `seq` only proves CONTIGUITY delta-to-delta. The
+    /// server's outbound path (`ws.rs::handle_socket`'s `out_rx` drain)
+    /// either delivers a message or tears the whole connection down — there
+    /// is no path that silently drops one queued frame while leaving the
+    /// connection open — so a gap in `seq` cannot reach a live, connected
+    /// client; a fresh connection always starts from `PresenceSnapshot`,
+    /// never mid-delta-stream. `seq` gap-detection is therefore a defensive
+    /// invariant against a future regression in that guarantee, not
+    /// protection against an observed failure mode today. `left` carries
+    /// departed connection ids (a TTL expiry that nulls `state` is
+    /// `stateChanged`, not `left` — membership is untouched). Additive: a
+    /// client that only knows `PresenceSnapshot`/`PresenceErr` silently
+    /// ignores this frame's `type` and keeps working off snapshots (the
+    /// server always sends at least one full snapshot per join, so an
+    /// unaware client never observes a gap).
+    PresenceDelta {
+        room: String,
+        seq: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        joined: Vec<PresenceMember>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        left: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        state_changed: Vec<PresenceMember>,
     },
     PresenceErr {
         room: String,

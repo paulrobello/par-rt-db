@@ -113,7 +113,7 @@ async fn auth_with_protocol_version_echoes_server_version() -> anyhow::Result<()
     assert_eq!(msg["type"], json!("authOk"));
     // The echo is the SERVER's version, not the client's request: the client
     // sent 1, the v2 server answers 2 (wire-v2 bundle).
-    assert_eq!(msg["protocolVersion"], json!(2));
+    assert_eq!(msg["protocolVersion"], json!(3));
     Ok(())
 }
 

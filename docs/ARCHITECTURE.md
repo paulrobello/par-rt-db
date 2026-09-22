@@ -862,12 +862,23 @@ membership for a room on `rtdb_presence` at a configured cadence. A full
 snapshot rather than a delta, because a snapshot is idempotent and needs no
 reconciliation, and rooms are capped small enough for it to stay cheap.
 
+Client-facing broadcasts are incremental for connections that negotiated
+protocol version 3 or newer: after a connection's first full `PresenceSnapshot`
+for a room, each flush diffs the room against a shared per-room baseline and
+sends a `PresenceDelta` (`joined`/`left`/`stateChanged`, plus a per-room
+`seq` that only proves delta-to-delta contiguity). The ARC-013 version gate
+(`protocol::PRESENCE_DELTA_MIN_VERSION`) is what makes the frame safe to
+deploy: a connection that omitted `protocolVersion` or negotiated below 3
+keeps receiving full snapshots, so the delta can never reach an SDK that
+predates it. A client that sees a `seq` gap re-joins the room to force a
+fresh snapshot.
+
 ## Wire contract and clients
 
 `server/src/protocol.rs`, `ts-client/src/protocol.ts`,
-`rust-client/src/wire.rs`, `python-client/src/par_rt_db/wire.py`, and
+`rust-client/src/wire.rs`, `python-client/src/par_rt_db/wire.py`,
 `swift-client/Sources/ParRtDbClient/Wire.swift` (query/txn wire structs in
-`Query.swift`/`Mutation.swift` alongside it) are five
+`Query.swift`/`Mutation.swift` alongside it), and `go-client/wire/` are six
 implementations of the same protocol and must stay byte-identical (serde tags
 and field names). The casing is deliberately non-uniform and load-bearing —
 match the protocol files exactly (see the spec). Since ARC-004 the Rust-side

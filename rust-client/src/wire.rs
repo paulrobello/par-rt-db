@@ -14,7 +14,13 @@ pub type QueryRef = Query;
 /// header; a server whose `PROTOCOL_VERSION` is older rejects a value greater
 /// than its own with `UNSUPPORTED_PROTOCOL`. Mirrors server
 /// `protocol::PROTOCOL_VERSION`.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// Version 3 (2026-09-22 presence deltas) adds the server's `presenceDelta`
+/// frame: the server emits it only to connections that authenticated with a
+/// version at or above its `PRESENCE_DELTA_MIN_VERSION` (3), so declaring 3
+/// here opts this client into deltas; every older client keeps receiving
+/// full `presenceSnapshot` frames.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
@@ -287,6 +293,33 @@ pub enum ServerMessage {
         room: String,
         /// Everyone currently in the room.
         members: Vec<PresenceMember>,
+    },
+    /// Incremental room membership change, sent instead of a full
+    /// `PresenceSnapshot` to a connection the server knows is caught up
+    /// (its first broadcast for a room is always a full snapshot). `seq`
+    /// is a per-ROOM monotonic counter shared by every caught-up recipient:
+    /// it increments once per flush tick that had a prior baseline, so a
+    /// connection's first delta can arrive at any `seq`. It proves only
+    /// delta-to-delta contiguity — `PresenceSnapshot` carries no `seq` — so
+    /// a receiver detects a gap (`seq > last + 1`), discards its baseline,
+    /// and re-joins the room to force a fresh snapshot. Empty buckets are
+    /// omitted on the wire; the server emits this frame only to connections
+    /// that negotiated protocol version 3+ (ARC-013 gate). Mirrors server
+    /// `protocol.rs::ServerMessage::PresenceDelta`.
+    PresenceDelta {
+        /// Which room.
+        room: String,
+        /// Per-room broadcast counter (see above).
+        seq: u64,
+        /// Members that joined since the previous broadcast.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        joined: Vec<PresenceMember>,
+        /// Connection ids that left since the previous broadcast.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        left: Vec<String>,
+        /// Members whose `state` changed since the previous broadcast.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        state_changed: Vec<PresenceMember>,
     },
     /// Presence operation failed.
     PresenceErr {

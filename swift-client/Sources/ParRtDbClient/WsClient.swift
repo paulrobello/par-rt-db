@@ -246,10 +246,11 @@ final class LatestPresenceBox: @unchecked Sendable {
 
 /// A presence-room handle returned by `RtDbClient.presence(room:state:)`.
 /// `current` is the room's latest snapshot; `stream` yields each subsequent
-/// snapshot (never `.pending`) and finishes when the room is left or the
-/// client becomes terminal. Stopping iteration stops LISTENING only — the
-/// room membership survives until `leavePresence(room:)` (rust: `Presence`
-/// is a watch receiver; dropping it does not leave the room).
+/// snapshot (a detected `presenceDelta` seq gap briefly re-publishes
+/// `.pending` while the client re-joins to resync) and finishes when the room
+/// is left or the client becomes terminal. Stopping iteration stops LISTENING
+/// only — the room membership survives until `leavePresence(room:)` (rust:
+/// `Presence` is a watch receiver; dropping it does not leave the room).
 public struct PresenceHandle: Sendable {
     private let box: LatestPresenceBox
     private let storedStream: AsyncStream<PresenceSnapshot>
@@ -430,6 +431,13 @@ public actor RtDbClient {
         var state: JSONValue?
         var latest: PresenceSnapshot
         var sinks: [PresenceSink]
+        /// The last applied `presenceDelta`'s per-room `seq` (nil until the
+        /// first delta after a snapshot — snapshots carry no `seq`). A delta
+        /// whose `seq` is not `lastSeq + 1` means a frame was missed: the
+        /// fold resets the room's member view and re-sends the join frame to
+        /// force a fresh full snapshot rather than applying a delta to a
+        /// stale baseline.
+        var lastSeq: UInt64?
     }
 
     /// Joined presence rooms (rust `PresenceMaps::by_room`), plus the join
@@ -1106,7 +1114,7 @@ public actor RtDbClient {
             presenceRooms[room] = entry
         } else {
             presenceRooms[room] = PresenceRoom(
-                room: room, state: state, latest: .pending, sinks: [sink]
+                room: room, state: state, latest: .pending, sinks: [sink], lastSeq: nil
             )
             presenceOrder.append(room)
         }
@@ -1180,6 +1188,19 @@ public actor RtDbClient {
         guard var entry = presenceRooms[room] else { return }
         entry.sinks.removeAll { $0.id == sinkId }
         presenceRooms[room] = entry
+    }
+
+    /// Re-send a room's stored join frame after a detected `presenceDelta`
+    /// seq gap: the server treats `presence` as an idempotent re-join that
+    /// resets the connection's caught-up flag, so the next broadcast is a
+    /// full `presenceSnapshot` the fold can resync from. Best-effort,
+    /// mirroring the join path — a failed send means the session is dying
+    /// and the next session's replay covers it.
+    private func resendPresenceJoin(room: String) async {
+        guard let transport = currentTransport, state == .connected else { return }
+        try? await transport.send(
+            try Self.frame(.presence(room: room, state: presenceRooms[room]?.state))
+        )
     }
 
     // MARK: Task 14 — mutations
@@ -1441,7 +1462,7 @@ public actor RtDbClient {
             onWorkflowReply(message)
         case .authOk, .authErr, .pong:
             break // lifecycle-owned — the receive loop never dispatches these
-        case .presenceSnapshot, .presenceErr:
+        case .presenceSnapshot, .presenceDelta, .presenceErr:
             onPresence(message)
         }
     }
@@ -1550,20 +1571,28 @@ public actor RtDbClient {
         }
     }
 
-    /// Route a `presenceSnapshot`/`presenceErr` frame to its room's sinks.
+    /// Route a `presenceSnapshot`/`presenceDelta`/`presenceErr` frame to its
+    /// room's sinks.
     private func onPresence(_ message: ServerMessage) {
         switch message {
         case let .presenceSnapshot(room, members):
             // Per-room fan-out (rust PresenceSnapshot arm): anyone holding a
             // handle for this room observes the new member list. A snapshot
             // for a room this client has not joined is dropped, exactly like
-            // the by_id guard on queryUpdate.
+            // the by_id guard on queryUpdate. A snapshot carries no `seq`, so
+            // it also re-arms the delta stream: the next delta may arrive at
+            // any seq.
             guard var presenceRoom = presenceRooms[room] else { return }
             presenceRoom.latest = .members(members)
+            presenceRoom.lastSeq = nil
             presenceRooms[room] = presenceRoom
             for sink in presenceRoom.sinks {
                 sink.deliver(.members(members))
             }
+        case let .presenceDelta(room, seq, joined, left, stateChanged):
+            applyPresenceDelta(
+                room: room, seq: seq, joined: joined, left: left, stateChanged: stateChanged
+            )
         case let .presenceErr(room, error):
             // The server rejected the join (e.g. presence not enabled).
             // Surface the error on the room's handles; the room stays
@@ -1577,6 +1606,56 @@ public actor RtDbClient {
             }
         default:
             preconditionFailure("onPresence called with a non-presence message")
+        }
+    }
+
+    /// Fold one `presenceDelta` into its room's last known member list and
+    /// re-publish the full list — the handle API stays "you get the member
+    /// list"; deltas are a transport detail. No baseline yet (a pre-snapshot
+    /// delta) or an unjoined room: ignored. A `seq` gap resets the view to
+    /// `.pending` (a state every consumer already handles from join) and
+    /// re-sends the join frame — the server's idempotent join resets the
+    /// connection's caught-up flag, so the next broadcast is a full snapshot
+    /// to resync from; applying a delta to a stale baseline would corrupt
+    /// the member list. Stale duplicates (`seq` ≤ last) are already
+    /// reflected and dropped.
+    private func applyPresenceDelta(
+        room: String, seq: UInt64, joined: [PresenceMember], left: [String],
+        stateChanged: [PresenceMember]
+    ) {
+        guard var presenceRoom = presenceRooms[room] else { return }
+        guard case var .members(members) = presenceRoom.latest else { return }
+        if let last = presenceRoom.lastSeq {
+            if seq <= last {
+                return
+            }
+            if seq > last + 1 {
+                presenceRoom.latest = .pending
+                presenceRoom.lastSeq = nil
+                presenceRooms[room] = presenceRoom
+                for sink in presenceRoom.sinks {
+                    sink.deliver(.pending)
+                }
+                Task { await self.resendPresenceJoin(room: room) }
+                return
+            }
+        }
+        for member in joined {
+            members.removeAll { $0.connectionId == member.connectionId }
+            members.append(member)
+        }
+        for id in left {
+            members.removeAll { $0.connectionId == id }
+        }
+        for member in stateChanged {
+            members.removeAll { $0.connectionId == member.connectionId }
+            members.append(member)
+        }
+        presenceRoom.latest = .members(members)
+        presenceRoom.lastSeq = seq
+        presenceRooms[room] = presenceRoom
+        for sink in presenceRoom.sinks {
+            sink.deliver(.members(members))
         }
     }
 

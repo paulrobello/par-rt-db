@@ -267,6 +267,23 @@ struct WireCorpusTests {
         )
     }
 
+    /// ARC-104: the wire protocol version is part of the six-client wire
+    /// contract. The corpus records the canonical value; assert the swift
+    /// client's `WireProtocol.version` matches, so a server bump fails here
+    /// unless the corpus (and every client) is updated too.
+    @Test func protocolConstantsProtocolVersion() throws {
+        let constants = try WireCorpus().object("protocol_constants")
+        guard let protocolVersion = constants["protocol_version"] as? Int else {
+            throw CorpusFailure(
+                "protocol_constants.protocol_version missing or not an integer: \(constants)"
+            )
+        }
+        #expect(
+            UInt32(protocolVersion) == WireProtocol.version,
+            "WireProtocol.version (\(WireProtocol.version)) != corpus protocol_version (\(protocolVersion))"
+        )
+    }
+
     // MARK: - Comparison pin
 
     /// Pins the deep-compare semantics this runner relies on: it must catch

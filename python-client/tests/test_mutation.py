@@ -28,7 +28,14 @@ from pydantic import TypeAdapter, ValidationError
 
 from par_rt_db.errors import ErrorCode, RtDbError
 from par_rt_db.mutation import MAX_STEPS, Mutation, StepResult, Transaction, await_signal
-from par_rt_db.wire import AfterMs, FilterExpr, StepRetry, WorkflowSpec, WorkflowStepSpec
+from par_rt_db.wire import (
+    PROTOCOL_VERSION,
+    AfterMs,
+    FilterExpr,
+    StepRetry,
+    WorkflowSpec,
+    WorkflowStepSpec,
+)
 
 
 def test_insert_patch_replace_delete_upsert_wire():
@@ -168,6 +175,17 @@ def test_transaction_max_steps_matches_wire_corpus():
         (Path(__file__).resolve().parents[2] / "wire-corpus" / "wire-corpus.json").read_text()
     )
     assert corpus["protocol_constants"]["max_steps"] == MAX_STEPS
+
+
+def test_protocol_version_matches_wire_corpus():
+    # ARC-104: same drift guard for the negotiated protocol version (v3 adds
+    # the presenceDelta frame). Mirrors the server's protocol::PROTOCOL_VERSION.
+    from pathlib import Path
+
+    corpus = json.loads(
+        (Path(__file__).resolve().parents[2] / "wire-corpus" / "wire-corpus.json").read_text()
+    )
+    assert corpus["protocol_constants"]["protocol_version"] == PROTOCOL_VERSION
 
 
 def test_mutation_builder_returns_self():

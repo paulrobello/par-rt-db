@@ -22,8 +22,11 @@ import (
 // ARC-013 (wire-v2 bundle): 1 -> 2 for multi-op aggregates, composite
 // groupBy, the mutate-batch endpoint, and cron timezone support — all
 // additive/optional wire changes, so a v1 server still parses this client's
-// existing traffic.
-const PROTOCOL_VERSION uint32 = 2
+// existing traffic. 2 -> 3 (2026-09-22) for the presenceDelta frame: the
+// server emits deltas only to connections that authenticated with
+// protocolVersion >= 3 and full presenceSnapshot frames to everything else,
+// so the gate — not lockstep SDK upgrades — keeps older clients working.
+const PROTOCOL_VERSION uint32 = 3
 
 // ---------------------------------------------------------------------------
 // ClientMessage — mirrors server/src/protocol.rs::ClientMessage.
@@ -655,6 +658,29 @@ func (v ServerPresenceSnapshot) MarshalJSON() ([]byte, error) {
 	return MarshalTagged("type", "presenceSnapshot", alias(v))
 }
 
+// Mirrors server/src/protocol.rs::ServerMessage::PresenceDelta — the
+// incremental broadcast sent INSTEAD of a snapshot to a connection that
+// authenticated with protocolVersion >= 3 once the server knows it has seen
+// the room. Seq is a per-room monotonic counter (snapshots carry none), so
+// a receiver detects a missed delta by a seq gap and resyncs by re-joining.
+// The three buckets are omitted when empty, matching the server's
+// skip_serializing_if — the all-empty shape is
+// {"room":R,"seq":N,"type":"presenceDelta"}.
+type ServerPresenceDelta struct {
+	Room         string           `json:"room"`
+	Seq          uint64           `json:"seq"`
+	Joined       []PresenceMember `json:"joined,omitempty"`
+	Left         []string         `json:"left,omitempty"`
+	StateChanged []PresenceMember `json:"stateChanged,omitempty"`
+}
+
+func (ServerPresenceDelta) isServerMessage() {}
+
+func (v ServerPresenceDelta) MarshalJSON() ([]byte, error) {
+	type alias ServerPresenceDelta
+	return MarshalTagged("type", "presenceDelta", alias(v))
+}
+
 // Mirrors server/src/protocol.rs::ServerMessage::PresenceErr
 type ServerPresenceErr struct {
 	Room  string        `json:"room"`
@@ -719,6 +745,8 @@ func UnmarshalServerMessage(data []byte) (ServerMessage, error) {
 		return DecodeTagged[ServerListWorkflowsOk](data, "type")
 	case "presenceSnapshot":
 		return DecodeTagged[ServerPresenceSnapshot](data, "type")
+	case "presenceDelta":
+		return DecodeTagged[ServerPresenceDelta](data, "type")
 	case "presenceErr":
 		return DecodeTagged[ServerPresenceErr](data, "type")
 	case "pong":
