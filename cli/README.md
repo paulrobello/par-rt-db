@@ -314,6 +314,8 @@ Options:
           The single-field index backing `--on-conflict` lookups; every line must carry this field. A unique index is recommended
       --batch <BATCH>
           Lines per transaction (default 500, capped at 1000 — the server rejects transactions over 1024 steps)
+      --start-line <START_LINE>
+          Resume an import: skip every line before this 1-based line number (matching the numbers reported in progress and error messages). Pass the failing batch's first line to retry it in full — earlier committed batches are untouched either way
       --dry-run
           Validate every line against the pushed schema without writing
   -h, --help

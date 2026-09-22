@@ -71,16 +71,20 @@ async fn dispatch(cli: &Cli) -> Result<()> {
             on_conflict,
             key,
             batch,
+            start_line,
             dry_run,
         } => {
             commands::import::run_import(
                 cli,
-                table,
-                file,
-                on_conflict.as_deref(),
-                key.as_deref(),
-                batch.unwrap_or(commands::import::DEFAULT_BATCH),
-                *dry_run,
+                commands::import::ImportArgs {
+                    table,
+                    file,
+                    on_conflict: on_conflict.as_deref(),
+                    key: key.as_deref(),
+                    batch: batch.unwrap_or(commands::import::DEFAULT_BATCH),
+                    start_line: *start_line,
+                    dry_run: *dry_run,
+                },
             )
             .await
         }

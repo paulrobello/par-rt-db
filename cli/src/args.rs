@@ -146,6 +146,12 @@ pub(crate) enum Command {
         /// rejects transactions over 1024 steps).
         #[arg(long)]
         batch: Option<usize>,
+        /// Resume an import: skip every line before this 1-based line number
+        /// (matching the numbers reported in progress and error messages).
+        /// Pass the failing batch's first line to retry it in full — earlier
+        /// committed batches are untouched either way.
+        #[arg(long)]
+        start_line: Option<usize>,
         /// Validate every line against the pushed schema without writing.
         #[arg(long)]
         dry_run: bool,
@@ -556,6 +562,8 @@ mod tests {
             "slug",
             "--batch",
             "250",
+            "--start-line",
+            "501",
             "--dry-run",
         ])
         .unwrap();
@@ -565,6 +573,7 @@ mod tests {
             on_conflict,
             key,
             batch,
+            start_line,
             dry_run,
         } = cli.command
         else {
@@ -575,6 +584,7 @@ mod tests {
         assert_eq!(on_conflict.as_deref(), Some("update"));
         assert_eq!(key.as_deref(), Some("slug"));
         assert_eq!(batch, Some(250));
+        assert_eq!(start_line, Some(501));
         assert!(dry_run);
 
         // Bare form: positional table + file only.
@@ -586,6 +596,7 @@ mod tests {
             on_conflict,
             key,
             batch,
+            start_line,
             dry_run,
             ..
         } = cli.command
@@ -595,6 +606,7 @@ mod tests {
         assert_eq!(on_conflict, None);
         assert_eq!(key, None);
         assert_eq!(batch, None);
+        assert_eq!(start_line, None);
         assert!(!dry_run);
     }
 

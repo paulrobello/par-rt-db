@@ -3,10 +3,13 @@
 //! insert/upsert transactions that respect the server's per-txn step caps
 //! (`MAX_STEPS` = 1024 on the server), progress on stderr, non-zero exit on
 //! the first failed batch with the offending line range — earlier committed
-//! batches stay committed (documented, not rolled back). `--dry-run` fetches
-//! the pushed schema (`GET /api/db/{db}/schema`) and validates every line
-//! with the rust client's corpus-verified `validate_doc` — the same check the
-//! server runs at insert time — without writing anything.
+//! batches stay committed (documented, not rolled back). The failure message
+//! prints the exact `--start-line` invocation that resumes from the failed
+//! batch's first line, skipping every already-committed line before it.
+//! `--dry-run` fetches the pushed schema (`GET /api/db/{db}/schema`) and
+//! validates every line with the rust client's corpus-verified
+//! `validate_doc` — the same check the server runs at insert time — without
+//! writing anything.
 
 use std::path::Path;
 
@@ -45,22 +48,39 @@ enum Mode {
 /// skipped but keep counting) plus the JSON object it holds.
 type Line = (usize, Value);
 
-pub(crate) async fn run_import(
-    cli: &Cli,
-    table: &str,
-    file: &Path,
-    on_conflict: Option<&str>,
-    key: Option<&str>,
-    batch: usize,
-    dry_run: bool,
-) -> Result<()> {
+/// `run_import`'s arguments, straight from the parsed CLI flags. Grouped into
+/// a struct (rather than seven positional parameters) so `resume_command`
+/// can echo them back verbatim on a batch failure.
+pub(crate) struct ImportArgs<'a> {
+    pub(crate) table: &'a str,
+    pub(crate) file: &'a Path,
+    pub(crate) on_conflict: Option<&'a str>,
+    pub(crate) key: Option<&'a str>,
+    pub(crate) batch: usize,
+    pub(crate) start_line: Option<usize>,
+    pub(crate) dry_run: bool,
+}
+
+pub(crate) async fn run_import(cli: &Cli, args: ImportArgs<'_>) -> Result<()> {
+    let ImportArgs {
+        table,
+        file,
+        on_conflict,
+        key,
+        batch,
+        start_line,
+        dry_run,
+    } = args;
     let db = require_db(cli)?;
     let token = require_token(cli)?;
     let mode = resolve_mode(on_conflict, key)?;
     let batch = batch.clamp(1, MAX_BATCH);
     let content =
         std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-    let lines = parse_jsonl(&content)?;
+    let mut lines = parse_jsonl(&content)?;
+    if let Some(start_line) = start_line {
+        lines.retain(|(n, _)| *n >= start_line);
+    }
     let client = data_client(cli, &db, &token);
 
     // `--dry-run` needs the schema; `Skip`/`Update` need it to resolve the
@@ -120,8 +140,9 @@ pub(crate) async fn run_import(
             .mutate(&txn, None)
             .await
             .map_err(|e| {
+                let resume = resume_command(table, file, on_conflict, key, batch, first);
                 anyhow!(
-                    "batch {}/{total_batches} (lines {first}-{last}) failed: {}\nBatches before this one remain committed; fix the file (or re-run with --dry-run to find the first bad line) and import the remainder.",
+                    "batch {}/{total_batches} (lines {first}-{last}) failed: {}\nBatches before this one remain committed; fix the file (or re-run with --dry-run to find the first bad line), then resume with:\n  {resume}",
                     i + 1,
                     map_err(e)
                 )
@@ -135,6 +156,34 @@ pub(crate) async fn run_import(
     }
     eprintln!("import: done — {total} rows into {db}.{table}");
     Ok(())
+}
+
+/// The exact `rtdb import` invocation that resumes from a failed batch's
+/// first line — reusing whatever `--on-conflict`/`--key`/`--batch` flags this
+/// run was given, so the operator can copy the line verbatim rather than
+/// reconstruct it from prose. `--url`/`--db`/`--token` are omitted: they are
+/// normally supplied via env (`RTDB_URL`/`RTDB_DB`/`RTDB_TOKEN`), and this run
+/// already proves whatever combination the operator is using works.
+fn resume_command(
+    table: &str,
+    file: &Path,
+    on_conflict: Option<&str>,
+    key: Option<&str>,
+    batch: usize,
+    start_line: usize,
+) -> String {
+    let mut cmd = format!(
+        "rtdb import {table} {} --start-line {start_line}",
+        file.display()
+    );
+    if let Some(on_conflict) = on_conflict {
+        cmd.push_str(&format!(" --on-conflict {on_conflict}"));
+    }
+    if let Some(key) = key {
+        cmd.push_str(&format!(" --key {key}"));
+    }
+    cmd.push_str(&format!(" --batch {batch}"));
+    cmd
 }
 
 /// Resolve `--on-conflict` / `--key` into a [`Mode`], rejecting the invalid
@@ -295,6 +344,19 @@ mod tests {
         let err = parse_jsonl("[1,2]\n").unwrap_err().to_string();
         assert!(err.contains("line 1"), "got: {err}");
         assert!(err.contains("JSON object"), "got: {err}");
+    }
+
+    #[test]
+    fn resume_command_reproduces_the_run_it_names() {
+        let path = std::path::Path::new("seed.jsonl");
+        assert_eq!(
+            resume_command("items", path, None, None, 500, 501),
+            "rtdb import items seed.jsonl --start-line 501 --batch 500"
+        );
+        assert_eq!(
+            resume_command("items", path, Some("update"), Some("slug"), 250, 751),
+            "rtdb import items seed.jsonl --start-line 751 --on-conflict update --key slug --batch 250"
+        );
     }
 
     #[test]

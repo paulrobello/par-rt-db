@@ -629,7 +629,10 @@ fn cli_import_round_trip() {
     assert_eq!(count_items(&url, &db, &token), 1205);
 
     // A schema-invalid line mid-file fails its batch naming the line range;
-    // the first batch (lines 1-500) stays committed.
+    // the first batch (lines 1-500) stays committed. The failure names the
+    // exact --start-line resume invocation; fixing the bad line and running
+    // that invocation completes the import with no duplicated or skipped
+    // rows.
     let (db2, token2) = provision(&url, &admin_key);
     let mut body = String::new();
     for i in 0..900 {
@@ -641,7 +644,7 @@ fn cli_import_round_trip() {
     }
     let mid_bad =
         std::env::temp_dir().join(format!("rtdb-cli-live-midbad-{}.jsonl", unique_suffix()));
-    std::fs::write(&mid_bad, body).unwrap();
+    std::fs::write(&mid_bad, &body).unwrap();
     rtdb(&url)
         .arg("--db")
         .arg(&db2)
@@ -655,8 +658,37 @@ fn cli_import_round_trip() {
         .assert()
         .failure()
         .stderr(contains("batch 2/2 (lines 501-900) failed"))
-        .stderr(contains("remain committed"));
+        .stderr(contains("remain committed"))
+        .stderr(contains(format!(
+            "rtdb import items {} --start-line 501 --batch 500",
+            mid_bad.display()
+        )));
     assert_eq!(count_items(&url, &db2, &token2), 500);
+
+    // Fix the bad line (line 601, 1-based) in place, then resume with the
+    // printed invocation.
+    let fixed_body = body.replace(
+        "{\"name\":\"bad\",\"unknown_field\":1}\n",
+        "{\"name\":\"row 600\",\"n\":600}\n",
+    );
+    std::fs::write(&mid_bad, fixed_body).unwrap();
+    rtdb(&url)
+        .arg("--db")
+        .arg(&db2)
+        .arg("--token")
+        .arg(&token2)
+        .arg("import")
+        .arg("items")
+        .arg(&mid_bad)
+        .arg("--batch")
+        .arg("500")
+        .arg("--start-line")
+        .arg("501")
+        .assert()
+        .success()
+        .stderr(contains("batch 1/1 committed (400/400 rows)"))
+        .stderr(contains("done — 400 rows"));
+    assert_eq!(count_items(&url, &db2, &token2), 900);
 
     for path in [&seed, &updated, &dry_bad, &mid_bad] {
         std::fs::remove_file(path).ok();
