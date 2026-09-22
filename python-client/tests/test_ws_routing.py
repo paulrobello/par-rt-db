@@ -265,6 +265,32 @@ async def test_pong_resets_liveness():
         await client.close()
 
 
+async def test_unrecognized_frame_type_does_not_trigger_reconnect():
+    """An unrecognized ServerMessage `type` is tolerated, matching the other
+    four clients (ts/rust/swift/go all silently skip an unmatched frame).
+
+    Regression guard: python-client's `_read_loop` previously let the
+    pydantic `ValidationError` from an unknown discriminator propagate up
+    through the broad outer `except Exception`, which scheduled a
+    reconnect — so every additive, forward-compatible server frame this
+    project ships puts an already-deployed python client into a reconnect
+    loop on the next unrecognized frame.
+    """
+    conn = FakeConn()
+    client = await _connected(conn)
+    try:
+        await conn.deliver('{"type":"somethingFuture","payload":{"x":1}}')
+        await _drain()
+        assert client.status().state is ConnectionState.CONNECTED
+
+        # The read loop keeps processing later valid frames.
+        await conn.deliver('{"type":"pong"}')
+        await _drain()
+        assert client.status().state is ConnectionState.CONNECTED
+    finally:
+        await client.close()
+
+
 # --- Subscription tests (Task 3) ----------------------------------------
 #
 # Drive a connected client with ``await conn.deliver(frame)`` then ``_drain()``

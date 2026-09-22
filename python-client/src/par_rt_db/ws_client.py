@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Literal, Protocol, overload
 
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from .errors import ErrorCode, RtDbError
 from .mutation import StepResult, Transaction
@@ -402,7 +402,15 @@ class RtDbClient:
         try:
             while gen == self._generation and not self._closed:
                 raw = await ws.recv()
-                self._dispatch(_SERVER.validate_json(raw))
+                try:
+                    msg = _SERVER.validate_json(raw)
+                except ValidationError:
+                    # An unrecognized `type` (e.g. a newer server sending a
+                    # frame this client predates) is tolerated, matching the
+                    # other four clients — skip the frame, keep the session.
+                    _logger.debug("ignoring unrecognized server frame: %s", raw)
+                    continue
+                self._dispatch(msg)
         except _PeerClosed as e:
             return e.code
         return 1000

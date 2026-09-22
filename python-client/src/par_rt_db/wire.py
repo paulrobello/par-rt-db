@@ -889,7 +889,10 @@ class PresenceMember(_Camel):
 # enum does not set ``deny_unknown_fields`` at the top level, but each leaf
 # struct derives it, so inheriting ``extra="forbid"`` from ``_Camel`` keeps the
 # leaf shapes tight; validation routes through ``TypeAdapter(ServerMessage)``
-# because the alias itself has no ``model_validate``.
+# because the alias itself has no ``model_validate``. An unrecognized ``type``
+# still raises ``pydantic.ValidationError`` from ``TypeAdapter`` — tolerance of
+# a forward-compatible/unknown frame is implemented by the caller
+# (``ws_client._read_loop``), not by this type, matching the other four clients.
 # Embedded errors are the ``{code, message}`` envelope (a small
 # ``_ErrorEnvelope`` model), not ``RtDbError`` (which is an Exception).
 # ``queryUpdate.result`` and ``mutateOk.results[]`` are opaque JSON (``object`` /
