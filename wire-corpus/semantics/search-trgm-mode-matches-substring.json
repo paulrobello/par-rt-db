@@ -1,0 +1,27 @@
+{
+  "name": "search-trgm-mode-matches-substring",
+  "$comment": "FM-30 (trigram search, phase 2): a search index that declares trgm: true accepts mode: \"trgm\" and matches a case-insensitive SUBSTRING of an indexed field -- 'ATAB' inside 'database' -- which tsquery's lexeme-based default mode cannot match at all. Pins the opt-in wire field and the substring-matching behavior together so a client mirror that forgets to gate on the flag (or forgets the substring semantics) fails this case.",
+  "schema": {
+    "tables": {
+      "notes": {
+        "fields": {
+          "body": { "type": "string" }
+        },
+        "indexes": [
+          { "name": "search_body", "fields": ["body"], "search": true, "trgm": true }
+        ]
+      }
+    }
+  },
+  "seed": [
+    { "body": "a database intro" },
+    { "body": "unrelated notes" }
+  ],
+  "op": {
+    "query": {
+      "table": "notes",
+      "search": { "index": "search_body", "query": "ATAB", "mode": "trgm" }
+    }
+  },
+  "expect": [{ "body": "a database intro" }]
+}

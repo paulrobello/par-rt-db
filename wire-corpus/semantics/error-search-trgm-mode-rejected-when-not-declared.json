@@ -1,0 +1,30 @@
+{
+  "name": "error-search-trgm-mode-rejected-when-not-declared",
+  "$comment": "FM-30 (trigram search, phase 2): mode: \"trgm\" against a search index that never declared trgm: true is rejected as BAD_REQUEST naming the missing declaration, not a silent fallback to a sequential ILIKE scan. Mirrors server search_test::trgm_mode_rejected_when_not_declared and each client's in-memory port of the same gate.",
+  "schema": {
+    "tables": {
+      "notes": {
+        "fields": {
+          "body": { "type": "string" }
+        },
+        "indexes": [
+          { "name": "search_body", "fields": ["body"], "search": true }
+        ]
+      }
+    }
+  },
+  "seed": [
+    { "body": "a database intro" }
+  ],
+  "op": {
+    "query": {
+      "table": "notes",
+      "search": { "index": "search_body", "query": "atab", "mode": "trgm" }
+    }
+  },
+  "expect": {
+    "error": {
+      "code": "BAD_REQUEST"
+    }
+  }
+}
