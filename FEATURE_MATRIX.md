@@ -1,6 +1,6 @@
 # Feature Matrix — Convex vs par-rt-db
 
-**Date:** 2026-07-21 (gap matrix last updated 2026-08-23; dimensional + divergence comparison added 2026-07-29)
+**Date:** 2026-07-21 (gap matrix last updated 2026-09-22; dimensional + divergence comparison added 2026-07-29)
 **Purpose:** Inventory Convex's feature surface against par-rt-db's, and rank every gap
 by utility and level of effort so parity work can be picked off in value order.
 **Perspective:** "Utility" is judged for the apps this instance actually serves (kanban
@@ -319,10 +319,14 @@ operating points, not better-or-worse — a team should pick them deliberately.
 As of 2026-08-09, **all ranked gaps are shipped** — every row in §2 is ✅ (the original
 21 plus #22 unique/partial indexes, a par-rt-db advantage Convex lacks), including the
 #18 dashboard (backend + frontend). §2 has kept growing since; as of this document's
-last update it holds 40 rows (1–39 plus 3b), all ✅. Since the 2026-08-01 cut, the matrix has grown two
-more rows of par-rt-db-native capability: #25 realtime presence (ENH-015, connection-bound
-and free of Convex's table-backed heartbeat/reaper machinery) and #26 per-database resource
-quotas (ENH-011, exposes to the operator what Convex hides at the platform layer); the #14
+last update it holds 42 rows (1–41 plus 3b), all ✅ — the two newest, #40 the durable
+per-db change feed (seq-cursor polling over `GET /api/db/{db}/changes`, a synchronous
+alternative to the WS-only reactive sync) and #41 table-scoped JSONL import
+(`rtdb import`, a normal machine token instead of Convex's admin-key whole-DB import).
+Since the 2026-08-01 cut, the matrix has also grown two rows of par-rt-db-native
+capability: #25 realtime presence (ENH-015, connection-bound and free of Convex's
+table-backed heartbeat/reaper machinery) and #26 per-database resource quotas
+(ENH-011, exposes to the operator what Convex hides at the platform layer); the #14
 provider list expanded to six (Microsoft Entra ID + Apple shipped alongside GitHub/Google/
 GitLab/OIDC); the #16 storage surface gained on-the-fly image transforms (ENH-014); the
 #20 per-row auth gained the general-purpose `authorize` predicate DSL; and the #11
