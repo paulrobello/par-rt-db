@@ -572,28 +572,60 @@ public struct MetricsSnapshot: Equatable, Codable, Sendable {
 }
 
 /// One room's live footprint — the rows of `GET /admin/presence` and
-/// `presenceDetail` on `/admin/metrics`. Presence is in-memory per replica,
-/// so multi-instance replicas report their own rooms.
+/// `presenceDetail` on `/admin/metrics`. In multi-instance mode
+/// `memberCount`/`stateBytes` are merged with gossiped peer membership;
+/// `localMemberCount` is always this replica's own count and
+/// `mergedWithPeers` says whether the merge happened (eventually-consistent,
+/// best-effort — never an authoritative total).
 public struct PresenceRoomInspect: Equatable, Codable, Sendable {
     /// Room name.
     public var room: String
-    /// Live members in the room.
+    /// Merged member count: local plus deduped gossiped peers in
+    /// multi-instance mode, else identical to `localMemberCount`.
     public var memberCount: Int64
-    /// Sum of serialized `presenceState` blob sizes across the room's members.
+    /// This replica's own local member count, always (never merged;
+    /// defaults 0 for an older server).
+    public var localMemberCount: Int64
+    /// Sum of serialized `presenceState` blob sizes across the room's
+    /// members, merged the same way as `memberCount`.
     public var stateBytes: Int64
     /// Age of the oldest member's join, in ms (a re-join refreshes it).
+    /// Local only — 0 for a room this replica has no local members in.
     public var oldestMemberAgeMs: Int64
+    /// True when `memberCount`/`stateBytes` include gossiped peer membership
+    /// (defaults false for an older server).
+    public var mergedWithPeers: Bool
 
     public init(
         room: String,
         memberCount: Int64,
+        localMemberCount: Int64 = 0,
         stateBytes: Int64,
-        oldestMemberAgeMs: Int64
+        oldestMemberAgeMs: Int64,
+        mergedWithPeers: Bool = false
     ) {
         self.room = room
         self.memberCount = memberCount
+        self.localMemberCount = localMemberCount
         self.stateBytes = stateBytes
         self.oldestMemberAgeMs = oldestMemberAgeMs
+        self.mergedWithPeers = mergedWithPeers
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case room, memberCount, localMemberCount, stateBytes, oldestMemberAgeMs, mergedWithPeers
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        room = try container.decode(String.self, forKey: .room)
+        memberCount = try container.decode(Int64.self, forKey: .memberCount)
+        localMemberCount =
+            try container.decodeIfPresent(Int64.self, forKey: .localMemberCount) ?? 0
+        stateBytes = try container.decode(Int64.self, forKey: .stateBytes)
+        oldestMemberAgeMs = try container.decode(Int64.self, forKey: .oldestMemberAgeMs)
+        mergedWithPeers =
+            try container.decodeIfPresent(Bool.self, forKey: .mergedWithPeers) ?? false
     }
 }
 

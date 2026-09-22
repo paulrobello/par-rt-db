@@ -51,9 +51,10 @@ pub(super) struct PresenceRoomsResponse {
 }
 
 /// `GET /admin/presence` — per-replica live room inspector: one row per room
-/// with member count, state bytes, and oldest member age. Presence is
-/// in-memory per replica; in multi-instance mode each replica reports its
-/// own rooms, no coordination (per the card's design note).
+/// with member count, state bytes, and oldest member age. In multi-instance
+/// mode `PresenceManager::inspect` merges gossiped peer membership into the
+/// counts (see `RoomInspect`'s doc comment); the row discloses this via
+/// `merged_with_peers` rather than presenting a merged number as exact.
 pub(super) async fn presence_handler(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,

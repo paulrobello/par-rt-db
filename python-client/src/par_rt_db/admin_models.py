@@ -205,13 +205,18 @@ class DbWorkflowStatusCounts(_Wire):
 
 class PresenceRoomInspect(_Wire):
     """One room's live footprint — the rows of ``GET /admin/presence`` and
-    ``presenceDetail`` on ``GET /admin/metrics``. Presence is in-memory per
-    replica, so multi-instance replicas report their own rooms."""
+    ``presenceDetail`` on ``GET /admin/metrics``. In multi-instance mode
+    ``member_count``/``state_bytes`` are merged with gossiped peer
+    membership; ``local_member_count`` is always this replica's own count
+    and ``merged_with_peers`` says whether the merge happened
+    (eventually-consistent, best-effort — never an authoritative total)."""
 
     room: str
     member_count: int
+    local_member_count: int = 0
     state_bytes: int
     oldest_member_age_ms: int
+    merged_with_peers: bool = False
 
 
 class PresenceRoomsResponse(_Wire):

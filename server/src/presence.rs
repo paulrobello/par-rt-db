@@ -117,18 +117,36 @@ struct PeerSnapshot {
 }
 
 /// One room's live footprint as surfaced by `GET /admin/presence` and the
-/// `presenceDetail` field on `/admin/metrics`. Presence is in-memory per
-/// replica, so in multi-instance mode each replica reports its own rooms
-/// with no coordination.
+/// `presenceDetail` field on `/admin/metrics`. In multi-instance mode
+/// `member_count`/`state_bytes` are merged with gossiped peer membership
+/// (ENH-022 Stage 3's `peers` shadow map, the same union `flush_once` already
+/// broadcasts to clients) so an operator sees the room's whole footprint, not
+/// just this replica's slice; `local_member_count` is always this replica's
+/// own count so the split stays visible. In single-instance mode
+/// `local_member_count == member_count` and the merge is a no-op (there are
+/// no peers to merge).
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoomInspect {
     pub room: String,
+    /// Merged member count: local members plus deduped gossiped peer members
+    /// in multi-instance mode, else identical to `local_member_count`.
     pub member_count: u64,
-    /// Sum of serialized `presenceState` blob sizes across the room's members.
+    /// This replica's own local member count, always (never merged).
+    pub local_member_count: u64,
+    /// Sum of serialized `presenceState` blob sizes across the room's
+    /// members, merged the same way as `member_count`.
     pub state_bytes: u64,
     /// Age of the oldest member's join, in ms (a re-join refreshes it).
+    /// Local only — `PresenceMember` carries no join timestamp for peer
+    /// members, so this can never reflect a remote member's join age.
     pub oldest_member_age_ms: u64,
+    /// True when `member_count`/`state_bytes` include gossiped peer
+    /// membership — an eventually-consistent, best-effort merge (gossip
+    /// publish is fire-and-forget; see `gossip_publish`), never an
+    /// authoritative total. False in single-instance mode or when this room
+    /// currently has no live peer contributions.
+    pub merged_with_peers: bool,
 }
 
 pub struct PresenceManager {
@@ -599,34 +617,114 @@ impl PresenceManager {
 
     /// Per-room inspector rows across all shards: name, member count, state
     /// bytes, oldest member age. Consumed by `GET /admin/presence` and the
-    /// `presenceDetail` field on `/admin/metrics`. Presence is in-memory per
-    /// replica, so in multi-instance mode each replica reports its own rooms
-    /// with no coordination. Same lock discipline as `counts()`: clone each
+    /// `presenceDetail` field on `/admin/metrics`. In multi-instance mode
+    /// `member_count`/`state_bytes` merge in gossiped peer membership (see
+    /// `RoomInspect`) so a partial per-replica view is never mistaken for the
+    /// room's whole footprint. Same lock discipline as `counts()`: clone each
     /// shard `Arc` under the brief outer lock, release it, then lock each
     /// shard individually (never hold the outer lock across a shard lock).
     pub async fn inspect(&self) -> Vec<RoomInspect> {
-        let shards: Vec<Arc<Mutex<DbPresence>>> = {
-            let dbs = self.dbs.lock().await;
-            dbs.values().cloned().collect()
-        };
         let now = crate::db::now_ms();
+        // Snapshot the peer shadow map ONCE up front (multi-instance only) so
+        // both passes below read one consistent view instead of re-locking
+        // `peers` per room. Cheap: the map is small (capped at
+        // `max_room_size` members per room) and this is an admin-rate call,
+        // not a hot path.
+        let peers_snapshot: HashMap<(String, String), HashMap<String, PeerSnapshot>> =
+            if self.multi_instance {
+                self.peers.lock().await.clone()
+            } else {
+                HashMap::new()
+            };
+
+        // Pass 1: rooms this replica has LOCAL members in, merged against the
+        // peer snapshot for the same (db, room) key.
+        let shards: Vec<(String, Arc<Mutex<DbPresence>>)> = {
+            let dbs = self.dbs.lock().await;
+            dbs.iter().map(|(db, s)| (db.clone(), s.clone())).collect()
+        };
         let mut rooms = Vec::new();
-        for shard in shards {
+        let mut covered: HashSet<(String, String)> = HashSet::new();
+        for (db, shard) in shards {
             let p = shard.lock().await;
             for (room, members) in &p.rooms {
-                let mut state_bytes = 0u64;
+                let key = (db.clone(), room.clone());
+                covered.insert(key.clone());
+                let local_member_count = members.len() as u64;
+                let mut local_state_bytes = 0u64;
                 let mut oldest = i64::MAX;
-                for s in members.values() {
-                    state_bytes += serde_json::to_vec(&s.state).map_or(0, |b| b.len() as u64);
+                // Same union-by-namespaced-conn-id dedup as `flush_once`'s
+                // `build_union`, but summing rather than materializing the
+                // member list — this is an admin-only aggregate, not a
+                // broadcast, so it isn't capped by `max_room_size`.
+                let mut seen: HashSet<String> = HashSet::with_capacity(members.len());
+                for (conn, s) in members {
+                    local_state_bytes += serde_json::to_vec(&s.state).map_or(0, |b| b.len() as u64);
                     oldest = oldest.min(s.joined_at);
+                    seen.insert(conn.to_string());
                 }
+                let (member_count, state_bytes, merged_with_peers) = match peers_snapshot.get(&key)
+                {
+                    Some(by_instance) if !by_instance.is_empty() => {
+                        let mut merged_count = local_member_count;
+                        let mut merged_bytes = local_state_bytes;
+                        for (instance_id, snap) in by_instance {
+                            for m in &snap.members {
+                                let namespaced = format!("{instance_id}:{}", m.connection_id);
+                                if seen.insert(namespaced) {
+                                    merged_count += 1;
+                                    merged_bytes +=
+                                        serde_json::to_vec(&m.state).map_or(0, |b| b.len() as u64);
+                                }
+                            }
+                        }
+                        (merged_count, merged_bytes, true)
+                    }
+                    _ => (local_member_count, local_state_bytes, false),
+                };
                 rooms.push(RoomInspect {
                     room: room.clone(),
-                    member_count: members.len() as u64,
+                    member_count,
+                    local_member_count,
                     state_bytes,
                     oldest_member_age_ms: now.saturating_sub(oldest) as u64,
+                    merged_with_peers,
                 });
             }
+        }
+
+        // Pass 2: rooms this replica has NEVER locally joined but a peer
+        // gossiped into — invisible to pass 1 (no shard entry to iterate
+        // from). Membership is entirely remote: `local_member_count` is 0
+        // and `oldest_member_age_ms` is 0 (no local join timestamp exists to
+        // report; `PresenceMember` carries none for peer members).
+        for (key, by_instance) in &peers_snapshot {
+            if covered.contains(key) || by_instance.is_empty() {
+                continue;
+            }
+            let mut member_count = 0u64;
+            let mut state_bytes = 0u64;
+            let mut seen: HashSet<String> = HashSet::new();
+            for (instance_id, snap) in by_instance {
+                for m in &snap.members {
+                    let namespaced = format!("{instance_id}:{}", m.connection_id);
+                    if seen.insert(namespaced) {
+                        member_count += 1;
+                        state_bytes += serde_json::to_vec(&m.state).map_or(0, |b| b.len() as u64);
+                    }
+                }
+            }
+            if member_count == 0 {
+                continue;
+            }
+            rooms.push(RoomInspect {
+                room: key.1.clone(),
+                member_count,
+                local_member_count: 0,
+                state_bytes,
+                oldest_member_age_ms: 0,
+                merged_with_peers: true,
+            });
         }
         rooms
     }
@@ -1009,14 +1107,90 @@ mod tests {
         let r = &rooms[0];
         assert_eq!(r.room, "lobby");
         assert_eq!(r.member_count, 2);
+        assert_eq!(r.local_member_count, 2, "single-instance: local == merged");
         // Sum of serialized member state sizes: `null` (4 bytes) + `{"k":"v"}`
         // (9 bytes).
         assert_eq!(r.state_bytes, 13);
+        assert!(
+            !r.merged_with_peers,
+            "single-instance mode never merges peers"
+        );
         assert!(
             r.oldest_member_age_ms <= 1_000,
             "oldest join is this test's own age: {}",
             r.oldest_member_age_ms
         );
+    }
+
+    #[tokio::test]
+    async fn inspect_merges_gossiped_peer_membership_in_multi_instance_mode() {
+        // multi_instance=true, no pool (this test never publishes — only
+        // ingests, the same seam `expire_peers_evicts_dead_replica_members`
+        // in presence_xreplica_test.rs uses for a bare `PresenceManager`).
+        let m = PresenceManager::new(None, cfg(), true, "self".to_string(), None);
+        let (t, _r) = tx();
+        m.join("db", 1, "lobby", None, user("a@b.com"), t)
+            .await
+            .unwrap();
+        // Before any peer snapshot arrives: merged == local, not merged.
+        let rooms = m.inspect().await;
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0].member_count, 1);
+        assert_eq!(rooms[0].local_member_count, 1);
+        assert!(!rooms[0].merged_with_peers, "no peer contribution yet");
+
+        // Ingest a peer snapshot for the SAME room from a different instance.
+        let peer_member = PresenceMember {
+            connection_id: "9".to_string(),
+            user: user("peer@remote.example"),
+            state: serde_json::json!({"k": "v"}), // 9 bytes serialized
+        };
+        m.ingest_peer_snapshot("replica-b", "db", "lobby", vec![peer_member])
+            .await;
+
+        let rooms = m.inspect().await;
+        assert_eq!(rooms.len(), 1);
+        let r = &rooms[0];
+        assert_eq!(
+            r.member_count, 2,
+            "merged count includes the gossiped peer member"
+        );
+        assert_eq!(
+            r.local_member_count, 1,
+            "local count is unaffected by the merge"
+        );
+        // local `null` (4 bytes) + peer `{"k":"v"}` (9 bytes).
+        assert_eq!(r.state_bytes, 13);
+        assert!(r.merged_with_peers);
+
+        // A DIFFERENT room this replica never joined LOCALLY, with only a
+        // peer contribution, must still surface — this is the card's core
+        // bug: a room with zero local members previously had no shard entry
+        // to report from at all, so it vanished from the inspector entirely
+        // rather than merely under-reporting its count.
+        m.ingest_peer_snapshot(
+            "replica-b",
+            "db",
+            "peer-only-room",
+            vec![PresenceMember {
+                connection_id: "1".to_string(),
+                user: user("solo@remote.example"),
+                state: serde_json::Value::Null,
+            }],
+        )
+        .await;
+        let rooms = m.inspect().await;
+        assert_eq!(rooms.len(), 2, "the peer-only room now surfaces too");
+        let peer_only = rooms
+            .iter()
+            .find(|r| r.room == "peer-only-room")
+            .expect("peer-only-room present");
+        assert_eq!(peer_only.member_count, 1);
+        assert_eq!(
+            peer_only.local_member_count, 0,
+            "this replica never joined it"
+        );
+        assert!(peer_only.merged_with_peers);
     }
 
     #[tokio::test]

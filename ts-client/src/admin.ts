@@ -255,14 +255,23 @@ export interface MetricsSnapshot {
 }
 /**
  * One room's live footprint — the rows of `GET /admin/presence` and
- * `presenceDetail` on `/admin/metrics`. Presence is in-memory per replica,
- * so multi-instance replicas report their own rooms.
+ * `presenceDetail` on `/admin/metrics`. In multi-instance mode
+ * `memberCount`/`stateBytes` are merged with gossiped peer membership;
+ * `localMemberCount` is always this replica's own count and
+ * `mergedWithPeers` says whether the merge happened (eventually-consistent,
+ * best-effort — never an authoritative total).
  */
 export interface PresenceRoomInspect {
   room: string;
+  /** Merged count: local plus deduped gossiped peers in multi-instance mode. */
   memberCount: number;
+  /** This replica's own local member count, always (never merged). */
+  localMemberCount: number;
   stateBytes: number;
+  /** Local only — 0 for a room this replica has no local members in. */
   oldestMemberAgeMs: number;
+  /** True when `memberCount`/`stateBytes` include gossiped peer membership. */
+  mergedWithPeers: boolean;
 }
 /** One db's quota-rejection counters (`perDbQuota[]` on `GET /admin/metrics`). */
 export interface DbQuotaCounters {

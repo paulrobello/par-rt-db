@@ -449,20 +449,33 @@ pub struct MetricsSnapshot {
 }
 
 /// One room's live footprint — the rows of `GET /admin/presence` and
-/// `presenceDetail` on `/admin/metrics`. Presence is in-memory per replica,
-/// so multi-instance replicas report their own rooms.
+/// `presenceDetail` on `/admin/metrics`. In multi-instance mode
+/// `member_count`/`state_bytes` are merged with gossiped peer membership;
+/// `local_member_count` is always this replica's own count and
+/// `merged_with_peers` says whether the merge happened.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct PresenceRoomInspect {
     /// Room name.
     pub room: String,
-    /// Live members in the room.
+    /// Merged member count: local plus deduped gossiped peer members in
+    /// multi-instance mode, else identical to `local_member_count`.
     pub member_count: i64,
-    /// Sum of serialized `presenceState` blob sizes across the room's members.
+    /// This replica's own local member count, always (never merged).
+    #[serde(default)]
+    pub local_member_count: i64,
+    /// Sum of serialized `presenceState` blob sizes across the room's
+    /// members, merged the same way as `member_count`.
     pub state_bytes: i64,
     /// Age of the oldest member's join, in ms (a re-join refreshes it).
+    /// Local only — 0 for a room this replica has no local members in.
     pub oldest_member_age_ms: i64,
+    /// True when `member_count`/`state_bytes` include gossiped peer
+    /// membership — an eventually-consistent, best-effort merge, never an
+    /// authoritative total.
+    #[serde(default)]
+    pub merged_with_peers: bool,
 }
 
 /// `GET /admin/presence` response — per-replica live room inspector.

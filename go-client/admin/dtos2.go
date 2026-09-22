@@ -49,12 +49,18 @@ type MetricsSnapshot struct {
 	PerDBWorkflows              []DbWorkflowStatusCounts `json:"perDbWorkflows"`
 }
 
-// PresenceRoomInspect is one room's live footprint.
+// PresenceRoomInspect is one room's live footprint. In multi-instance mode
+// MemberCount/StateBytes are merged with gossiped peer membership;
+// LocalMemberCount is always this replica's own count and MergedWithPeers
+// says whether the merge happened (eventually-consistent, best-effort —
+// never an authoritative total).
 type PresenceRoomInspect struct {
 	Room              string `json:"room"`
 	MemberCount       int64  `json:"memberCount"`
+	LocalMemberCount  int64  `json:"localMemberCount"`
 	StateBytes        int64  `json:"stateBytes"`
 	OldestMemberAgeMs int64  `json:"oldestMemberAgeMs"`
+	MergedWithPeers   bool   `json:"mergedWithPeers"`
 }
 
 // PresenceRoomsResponse is GET /admin/presence.

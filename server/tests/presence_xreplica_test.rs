@@ -17,7 +17,7 @@
 //! bare `PresenceManager` (no Postgres) and so does not use the harness.
 
 use crate::common::cluster::{Cluster, ReplicaId, ReplicaOpts};
-use crate::common::wait_until;
+use crate::common::{admin_get, wait_until};
 use rtdb_server::presence::{PresenceConfig, PresenceManager};
 use rtdb_server::protocol::{AuthedUser, PresenceMember, ServerMessage, UserKind};
 use serde_json::json;
@@ -287,6 +287,89 @@ async fn expire_peers_evicts_dead_replica_members_from_union() -> anyhow::Result
         confirmed_peer_gone,
         "peer member was not evicted from the union within the deadline — \
          expire_peers did not drop the stale PeerSnapshot"
+    );
+
+    Ok(())
+}
+
+/// A room joined on replica A is visible in replica B's admin presence
+/// inspector (`GET /admin/presence`) via the SAME gossip path the wire
+/// broadcast test above exercises — the inspector merges gossiped peer
+/// membership instead of reporting only its own local slice (the bug this
+/// card fixes: an operator hitting whichever replica previously under-
+/// reported multi-instance room membership with no indication the count was
+/// partial).
+#[tokio::test]
+async fn admin_presence_inspector_merges_gossiped_peer_room() -> anyhow::Result<()> {
+    let cluster = Cluster::two_with(
+        presence_schema(),
+        presence_opts("replica-a"),
+        presence_opts("replica-b"),
+    )
+    .await;
+    let state_a = cluster.replica(ReplicaId::A).state.clone();
+    let addr_b = cluster.replica(ReplicaId::B).addr;
+    let db = cluster.db.as_str().to_string();
+
+    // Join ONLY on replica A — replica B has zero local members in this room.
+    let (tx_a, _rx_a) = mpsc::unbounded_channel::<ServerMessage>();
+    state_a
+        .realtime
+        .presence
+        .join(
+            &db,
+            1,
+            "room-inspect",
+            Some(json!({"role": "caller"})),
+            user("peer@a.example"),
+            tx_a,
+        )
+        .await
+        .expect("A join");
+
+    // Poll GET /admin/presence on replica B until it reports the room with
+    // a merged count of 1 (A's member, gossiped in) and local_member_count
+    // 0 (B never joined it), distinguishing the merge from a local view.
+    let found = wait_until(std::time::Duration::from_secs(5), || async {
+        let resp = admin_get(addr_b, "/admin/presence").await;
+        if resp.status() != reqwest::StatusCode::OK {
+            return false;
+        }
+        let body: serde_json::Value = resp.json().await.expect("parse json");
+        let rooms = body["rooms"].as_array().expect("rooms array");
+        rooms
+            .iter()
+            .any(|r| r["room"] == "room-inspect" && r["memberCount"] == 1)
+    })
+    .await;
+    assert!(
+        found,
+        "replica B's admin presence inspector never reported A's gossiped \
+         room-inspect member within the deadline"
+    );
+
+    let body: serde_json::Value = admin_get(addr_b, "/admin/presence")
+        .await
+        .json()
+        .await
+        .expect("parse json");
+    let room = body["rooms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["room"] == "room-inspect")
+        .expect("room-inspect present");
+    assert_eq!(
+        room["memberCount"], 1,
+        "merged count includes A's peer member"
+    );
+    assert_eq!(
+        room["localMemberCount"], 0,
+        "B never joined this room locally"
+    );
+    assert_eq!(
+        room["mergedWithPeers"], true,
+        "the row must disclose the count is merged, not purely local"
     );
 
     Ok(())
