@@ -83,10 +83,35 @@ async fn cross_replica_presence_union_includes_namespaced_peer_member() -> anyho
     let db = cluster.db.as_str().to_string();
 
     // 1. A LOCAL subscriber on replica B conn 1 in "room-x". This is the
-    //    client whose receipt of the union broadcast we assert against. The
-    //    `rx` receives `PresenceSnapshot` for B's own join, then
-    //    `PresenceDelta` for every later broadcast (B's connection is
-    //    `caught_up` from that point on — see `presence.rs::flush_once`).
+    //    client whose receipt of the union broadcast we assert against.
+    //    Delivery is driven by BOTH this test's explicit `flush_once` calls
+    //    below AND B's own background flush task (spawned by
+    //    `presence_opts`'s 50ms broadcast interval) racing it — so exactly
+    //    which flush ships which message is not deterministic. In
+    //    particular, if A's `join` (step 2) marks the room dirty again
+    //    before ANY flush for B's own join has fired yet, the two dirty
+    //    marks coalesce: B's connection is still `caught_up == false`, so
+    //    that first flush ships a `PresenceSnapshot` containing BOTH
+    //    members — not the "local-only" snapshot a blind single `try_recv`
+    //    drain would assume. Once `caught_up` flips to `true` with nothing
+    //    left to diff against, no further message is ever sent, so a test
+    //    that unconditionally discards its first-drained message loses the
+    //    real answer and spins to the deadline. The check below inspects
+    //    EVERY delivered message — snapshot or delta — for the peer, so a
+    //    coalesced snapshot is caught instead of discarded.
+    fn peer_in(msg: &ServerMessage, peer_conn_id: &str) -> Option<PresenceMember> {
+        match msg {
+            ServerMessage::PresenceSnapshot { members, .. } => members
+                .iter()
+                .find(|m| m.connection_id == peer_conn_id)
+                .cloned(),
+            ServerMessage::PresenceDelta { joined, .. } => joined
+                .iter()
+                .find(|m| m.connection_id == peer_conn_id)
+                .cloned(),
+            _ => None,
+        }
+    }
     let (tx_b, rx_b) = mpsc::unbounded_channel::<ServerMessage>();
     let rx_b = std::cell::RefCell::new(rx_b);
     state_b
@@ -103,9 +128,16 @@ async fn cross_replica_presence_union_includes_namespaced_peer_member() -> anyho
         )
         .await
         .expect("B local join");
-    // Drain the initial local-only snapshot from B's join so the next recv
-    // is unambiguously the broadcast after A's gossip arrives.
-    let _ = rx_b.borrow_mut().try_recv();
+    // Drain whatever the background flush task has already shipped for B's
+    // own join (typically nothing yet, but the race above means it can also
+    // already be the full union) — capture the peer if this drain happens to
+    // contain it, rather than assuming it never can.
+    let found: std::cell::RefCell<Option<PresenceMember>> = std::cell::RefCell::new(None);
+    while let Ok(msg) = rx_b.borrow_mut().try_recv() {
+        if let Some(peer) = peer_in(&msg, &peer_conn_id) {
+            *found.borrow_mut() = Some(peer);
+        }
+    }
 
     // 2. Join on replica A conn 1 in the SAME room. A's join calls
     //    gossip_publish -> pg_notify('rtdb_presence', …). B's presence LISTEN
@@ -127,26 +159,27 @@ async fn cross_replica_presence_union_includes_namespaced_peer_member() -> anyho
         .await
         .expect("A join");
 
-    // 3. Poll: drive B's flush_once until the peer's arrival is observed.
-    //    B's local subscriber already received its own join snapshot above
-    //    (step 1's drain), so it's `caught_up`: the union's arrival on this
-    //    subscriber is delivered as a `PresenceDelta` whose `joined` carries
-    //    the namespaced peer member, not a fresh `PresenceSnapshot`. NOTIFY
-    //    delivery is async; bound the wait at ~5s with 50ms sleeps (matching
-    //    the broadcast interval).
-    let found: std::cell::RefCell<Option<PresenceMember>> = std::cell::RefCell::new(None);
-    let got_peer = wait_until(std::time::Duration::from_secs(5), || async {
-        state_b.realtime.presence.flush_once().await;
-        if let Ok(ServerMessage::PresenceDelta { joined, .. }) = rx_b.borrow_mut().try_recv()
-            && let Some(peer) = joined.into_iter().find(|m| m.connection_id == peer_conn_id)
-        {
-            *found.borrow_mut() = Some(peer);
-            true
-        } else {
-            false
-        }
-    })
-    .await;
+    // 3. Poll: drive B's flush_once until the peer's arrival is observed,
+    //    draining and checking every queued message each tick (not just
+    //    one) since the background flush task can enqueue more than one
+    //    between polls. NOTIFY delivery is async; bound the wait at 15s
+    //    (well above the ~5.9s observed under full-suite parallel load
+    //    against the shared dev Postgres) with 50ms sleeps matching the
+    //    broadcast interval.
+    let got_peer = found.borrow().is_some() || {
+        wait_until(std::time::Duration::from_secs(15), || async {
+            state_b.realtime.presence.flush_once().await;
+            let mut got = false;
+            while let Ok(msg) = rx_b.borrow_mut().try_recv() {
+                if let Some(peer) = peer_in(&msg, &peer_conn_id) {
+                    *found.borrow_mut() = Some(peer);
+                    got = true;
+                }
+            }
+            got
+        })
+        .await
+    };
     assert!(
         got_peer,
         "replica B never observed A's join in its union broadcast within the \
@@ -363,7 +396,9 @@ async fn admin_presence_inspector_merges_gossiped_peer_room() -> anyhow::Result<
     // Poll GET /admin/presence on replica B until it reports the room with
     // a merged count of 1 (A's member, gossiped in) and local_member_count
     // 0 (B never joined it), distinguishing the merge from a local view.
-    let found = wait_until(std::time::Duration::from_secs(5), || async {
+    // Same rtdb_presence gossip round-trip as the union test above; bound at
+    // 15s so full-suite contention doesn't trip this deadline either.
+    let found = wait_until(std::time::Duration::from_secs(15), || async {
         let resp = admin_get(addr_b, "/admin/presence").await;
         if resp.status() != reqwest::StatusCode::OK {
             return false;
