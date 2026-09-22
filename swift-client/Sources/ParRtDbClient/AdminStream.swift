@@ -153,12 +153,15 @@ extension RtDbAdminClient {
     /// `db`/`table` filter both the replay and the live stream, exactly as on
     /// `opsRecent` (both optional here; nil spans every database/table).
     /// Every (re)connection replays up to 200 ring events, so duplicates
-    /// after a blip are expected — `OpEvent` carries no sequence to dedup
-    /// on. Transport drops and unexpected closes reconnect automatically on
-    /// the exponential backoff; a mid-stream close 4401 (credential revoked,
-    /// SEC-006) finishes the stream with `ErrorCode.unauthorized` and is
-    /// never retried; an initial-connect failure (a rejected upgrade, a bad
-    /// URL) finishes the stream with an `RtDbError` instead of retrying.
+    /// after a blip are expected — dedup on the `(feedEpoch, seq)` pair every
+    /// `OpEvent` carries: track the max `seq` seen per `feedEpoch`, and read
+    /// an epoch change as a counter reset (server restart) rather than
+    /// dropped events. Transport drops and unexpected closes reconnect
+    /// automatically on the exponential backoff; a mid-stream close 4401
+    /// (credential revoked, SEC-006) finishes the stream with
+    /// `ErrorCode.unauthorized` and is never retried; an initial-connect
+    /// failure (a rejected upgrade, a bad URL) finishes the stream with an
+    /// `RtDbError` instead of retrying.
     /// Break out of the loop or cancel the consuming task to close the
     /// socket. The admin key rides the `rtdb-admin.<token>` WebSocket
     /// subprotocol — URLSessionWebSocketTask cannot set arbitrary headers,

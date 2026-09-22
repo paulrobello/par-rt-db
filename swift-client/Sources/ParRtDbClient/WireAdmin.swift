@@ -1055,6 +1055,21 @@ public struct OpEvent: Equatable, Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case db, table, docId, kind, ts, owner, seq, feedEpoch
     }
+
+    /// Custom encode: `owner` is a plain Option on the wire (nil -> `null`,
+    /// never omitted — matches server `op_feed::OpEvent`, which always writes
+    /// the key; ChangeOp encodes `doc` the same way).
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(db, forKey: .db)
+        try container.encode(table, forKey: .table)
+        try container.encode(docId, forKey: .docId)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(ts, forKey: .ts)
+        try container.encode(owner, forKey: .owner) // plain Option: nil -> null
+        try container.encode(seq, forKey: .seq)
+        try container.encode(feedEpoch, forKey: .feedEpoch)
+    }
 }
 
 // MARK: - Schema history / preview

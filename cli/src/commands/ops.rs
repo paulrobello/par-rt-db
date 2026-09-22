@@ -101,8 +101,10 @@ where
                 attempt = 0;
                 // Every connection replays up to 200 ring events before going
                 // live, so a reconnect re-emits the tail of the last session.
-                // `OpEvent` carries no sequence to dedup on, so the duplicates
-                // are surfaced rather than guessed at.
+                // Each `OpEvent` carries `(feedEpoch, seq)`, so a consumer
+                // piping this NDJSON into its own dedup can drop replays by
+                // tracking the max `seq` seen per `feedEpoch`; this tail
+                // itself does no deduping and surfaces every line as-is.
                 match drain(stream, pretty, out, &mut shutdown).await? {
                     // Returning here is load-bearing: `shutdown` has completed,
                     // and the backoff arm below would poll it a second time.
@@ -197,6 +199,7 @@ mod tests {
             "event": {
                 "db": db, "table": "items", "docId": doc_id,
                 "kind": "insert", "ts": 1_700_000_000_000i64, "owner": null,
+                "seq": 1, "feedEpoch": "test-epoch",
             }
         })
         .to_string()

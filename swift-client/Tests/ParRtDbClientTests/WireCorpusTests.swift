@@ -215,6 +215,12 @@ struct WireCorpusTests {
         try corpusRoundTrip(ChangeFeedResponse.self, "change_feed_responses", WireCorpus())
     }
 
+    /// Admin op-feed `OpEvent` rows — the reconnect-dedup stamps: 1-based
+    /// monotonic per-feed `seq` + the boot-time UUID `feedEpoch`.
+    @Test func adminOpEventsRoundTrip() throws {
+        try corpusRoundTrip(OpEvent.self, "admin_op_events", WireCorpus())
+    }
+
     // MARK: - Reject sections
 
     @Test func rejectsUnknownClientMessageField() throws {

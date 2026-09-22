@@ -18,7 +18,7 @@ from par_rt_db.admin_models import AdminGaugesFrame, AdminOpFrame
 from par_rt_db.errors import ErrorCode, RtDbError
 
 
-def _op_frame(doc_id: str) -> str:
+def _op_frame(doc_id: str, seq: int = 1) -> str:
     """A wire-shaped op frame."""
     return json.dumps(
         {
@@ -30,6 +30,8 @@ def _op_frame(doc_id: str) -> str:
                 "kind": "insert",
                 "ts": 1,
                 "owner": None,
+                "seq": seq,
+                "feedEpoch": "test-epoch",
             },
         }
     )

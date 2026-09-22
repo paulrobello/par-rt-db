@@ -1402,12 +1402,15 @@ class RtDbAdminClient:
 
         ``db``/``table`` filter both the replay and the live stream, exactly
         as on :meth:`ops_recent`. Every (re)connection replays up to 200 ring
-        events, so duplicates after a blip are expected (``OpEvent`` carries
-        no sequence to dedup on). Transport drops reconnect automatically on
-        the realtime client's jittered exponential backoff. A rejected
-        upgrade (a bad admin key) raises :class:`RtDbError` and is never
-        retried; a mid-stream ``4401`` close (credential revoked, SEC-006)
-        also raises and ends the stream. Frames this client cannot parse are
+        events, so duplicates after a blip are expected — dedup on the
+        ``(feed_epoch, seq)`` pair every ``OpEvent`` carries: track the max
+        ``seq`` seen per ``feed_epoch``, and read an epoch change as a
+        counter reset (server restart) rather than dropped events. Transport
+        drops reconnect automatically on the realtime client's jittered
+        exponential backoff. A rejected upgrade (a bad admin key) raises
+        :class:`RtDbError` and is never retried; a mid-stream ``4401`` close
+        (credential revoked, SEC-006) also raises and ends the stream.
+        Frames this client cannot parse are
         skipped, not fatal. Break out of the loop (or ``close()`` the
         generator) to shut the socket down. Requires the ``[ws]`` extra.
 

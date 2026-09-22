@@ -213,6 +213,12 @@ func TestWireCorpusChangeFeedResponses(t *testing.T) {
 	}
 }
 
+func TestWireCorpusAdminOpEvents(t *testing.T) {
+	for idx, raw := range entries(t, loadCorpus(t), "admin_op_events") {
+		roundTripTyped(t, "admin_op_events", idx, raw, &admin.OpEvent{})
+	}
+}
+
 func TestWireCorpusRawSectionsRoundTrip(t *testing.T) {
 	// query_results / error_envelopes are raw JSON values (QueryResult is
 	// untagged on the wire; the error envelope model lives in errors) —

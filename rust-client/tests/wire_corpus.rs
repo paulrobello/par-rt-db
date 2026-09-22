@@ -104,6 +104,17 @@ fn change_feed_responses_round_trip() {
     }
 }
 
+/// Admin op-feed `OpEvent` rows — the reconnect-dedup stamps (`seq` +
+/// `feedEpoch`), mirroring the server runner's section.
+#[cfg(feature = "admin")]
+#[test]
+fn admin_op_events_round_trip() {
+    let corpus = load_corpus();
+    for (i, entry) in section(&corpus, "admin_op_events").iter().enumerate() {
+        round_trip::<par_rt_db_client::wire::admin::OpEvent>("admin_op_events", i, entry);
+    }
+}
+
 /// The corpus `queries` section — embedded `Query` wire shapes covering
 /// filter/search/vectorSearch/paginate, including FM-31's operator-syntax
 /// search text and `snippet: true` (the operator syntax is plain `query`

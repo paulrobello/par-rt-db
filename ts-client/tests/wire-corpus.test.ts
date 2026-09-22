@@ -23,6 +23,7 @@ import { describe, expect, it } from "vitest";
 import { ALL_ERROR_CODES } from "../src/errors.js";
 import { MAX_STEPS } from "../src/in_memory/index.js";
 import { QUERY_COMBO_CLAUSES, QUERY_COMBO_RULES } from "../src/in_memory/query-combinations.js";
+import type { OpEvent } from "../src/admin.js";
 import type {
   AuthedUser,
   AuthedUserKind,
@@ -74,6 +75,7 @@ interface Corpus {
   // Change-feed pages (`GET /api/db/{db}/changes`) — type-checked against
   // ChangeFeedResponse (camelCase, `doc: null` for no-post-image ops).
   change_feed_responses: ChangeFeedResponse[];
+  admin_op_events: OpEvent[];
   // ARC-104: canonical numeric limits shared across the server and all four
   // clients. An object (not an array) — each client asserts its internal const
   // equals the value recorded here, so a server change requires updating the
@@ -509,6 +511,33 @@ describe("wire-corpus: workflow entries (FM-29 steps + frames)", () => {
  * round-tripping. `doc: null` MUST survive the round-trip as `null` (never
  * dropped as undefined) — it is the "re-fetch this id" signal.
  */
+
+/**
+ * Admin op-feed pins: the corpus gained an `admin_op_events` section — one
+ * `OpEvent` per row carrying the reconnect-dedup stamps: 1-based monotonic
+ * per-feed `seq` + the feed's boot-time UUID `feedEpoch` (an epoch change is
+ * a counter reset / server restart; a seq gap is evicted or dropped events).
+ * Round-trips and type-checks every row; the pinned block asserts the stamps
+ * so a corpus or protocol drift on the op-feed surface fails here.
+ */
+describe("wire-corpus: admin_op_events (op-feed dedup stamps)", () => {
+  const corpus = loadCorpus();
+  for (const [idx, entry] of corpus.admin_op_events.entries()) {
+    const _typeCheck: OpEvent = entry; // compile-time shape check
+    void _typeCheck;
+    it(`admin_op_events #${idx} (${entry.table}/${entry.kind}/seq=${entry.seq}) round-trips`, () => {
+      assertJsonRoundTrip(entry);
+    });
+  }
+
+  it("carries 1-based monotonic seq and a stable feedEpoch", () => {
+    const epoch = corpus.admin_op_events[0].feedEpoch;
+    expect(corpus.admin_op_events.map((e) => e.seq)).toEqual([1, 2, 9007199254740]);
+    expect(corpus.admin_op_events.every((e) => e.feedEpoch.length > 0)).toBe(true);
+    expect(epoch).toBe("0f1e2d3c4b5a69788796a5b4c3d2e1f0");
+  });
+});
+
 describe("wire-corpus: change_feed_responses (resumable change feed)", () => {
   const corpus = loadCorpus();
   for (const [idx, entry] of corpus.change_feed_responses.entries()) {

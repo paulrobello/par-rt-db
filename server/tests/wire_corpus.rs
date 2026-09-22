@@ -49,6 +49,17 @@ where
     );
 }
 
+/// Admin op-feed `OpEvent` rows — the reconnect-dedup stamps: 1-based
+/// monotonic per-feed `seq` + the boot-time UUID `feedEpoch` (an epoch change
+/// is a counter reset, a seq gap is evicted/dropped events).
+#[test]
+fn admin_op_events_round_trip() {
+    let corpus = load_corpus();
+    for (i, entry) in section(&corpus, "admin_op_events").iter().enumerate() {
+        round_trip::<rtdb_server::op_feed::OpEvent>("admin_op_events", i, entry);
+    }
+}
+
 /// Asserts `input` does NOT parse as `T` (used for the `rejects_*` sections).
 fn must_reject<T>(name: &str, idx: usize, input: &Value)
 where

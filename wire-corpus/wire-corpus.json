@@ -1707,6 +1707,38 @@
       "logId": "0a1b2c3d4e5f6071"
     }
   ],
+  "admin_op_events": [
+    {
+      "db": "kanban",
+      "table": "items",
+      "docId": "i1",
+      "kind": "insert",
+      "ts": 1759000000000,
+      "owner": null,
+      "seq": 1,
+      "feedEpoch": "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+    },
+    {
+      "db": "kanban",
+      "table": "items",
+      "docId": "i2",
+      "kind": "patch",
+      "ts": 1759000000001,
+      "owner": "user@example.com",
+      "seq": 2,
+      "feedEpoch": "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+    },
+    {
+      "db": "app",
+      "table": "users",
+      "docId": "u9",
+      "kind": "delete",
+      "ts": 1759000000002,
+      "owner": null,
+      "seq": 9007199254740,
+      "feedEpoch": "1a2b3c4d5e6f708192a3b4c5d6e7f809"
+    }
+  ],
   "protocol_constants": {
     "$comment": "ARC-104: canonical numeric limits shared across the server and all four clients. Each client's wire-parity test asserts its internal const equals the value recorded here, so a server change (e.g. server/src/txn.rs::MAX_STEPS) requires updating this fixture AND every client, or a test fails. Server source of truth: server/src/txn.rs:22 (MAX_STEPS).",
     "max_steps": 1024

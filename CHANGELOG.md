@@ -87,6 +87,20 @@ alter observable behavior on upgrade.
   migration.
 
 ### Added
+
+- **Op-feed events carry a monotonic `seq` and a `feedEpoch` for reconnect
+  dedup** (FEATURE_MATRIX §1). Every `OpEvent` — on `/admin/stream` frames,
+  `GET /admin/ops/recent` rows, and webhook payloads, which embed the
+  serialized event — now carries a 1-based per-feed monotonic `seq` and the
+  feed's boot-time UUID `feedEpoch`. The ring replays up to its cap on every
+  (re)connect; a consumer that tracks the max `seq` seen per `feedEpoch`
+  observes each event exactly once across replay + live windows: an epoch
+  change means the counter reset (server restart), a `seq` gap means evicted
+  or dropped events. Under `RTDB_MULTI_INSTANCE`, peer-replica events
+  injected by the NOTIFY listener are re-stamped into the local feed's
+  sequence (their origin `ts` is preserved). Mirrored in all five clients'
+  `OpEvent` types and pinned by the wire-corpus `admin_op_events` section
+  (which also fixed the Swift `OpEvent` re-encode dropping `owner: null`).
 - **ENH-032 extends ENH-027 property testing to mutations and migrations.**
   `server/tests/proptest_parity.rs` is the implementation authority: every
   property runs 64 cases by default (the weekly CI job sets

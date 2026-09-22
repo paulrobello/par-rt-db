@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
+from par_rt_db.admin_models import OpEvent
 from par_rt_db.wire import (
     AuthedUser,
     ChangeFeedResponse,
@@ -276,6 +277,20 @@ def test_corpus_change_feed_responses_round_trip(entry: dict[str, Any]) -> None:
     msg = ChangeFeedResponse.model_validate(entry)
     dumped = json.loads(msg.model_dump_json(by_alias=True))
     assert dumped == entry, f"ChangeFeedResponse wire drift: {dumped} != {entry}"
+
+
+# --- corpus: admin op-feed events (seq + feedEpoch reconnect-dedup stamps) ---
+
+
+@pytest.mark.parametrize(
+    "entry",
+    _corpus_section("admin_op_events"),
+    ids=lambda e: f"{e.get('table')}/{e.get('kind')}/seq={e.get('seq')}",
+)
+def test_corpus_admin_op_events_round_trip(entry: dict[str, Any]) -> None:
+    msg = OpEvent.model_validate(entry)
+    dumped = json.loads(msg.model_dump_json(by_alias=True))
+    assert dumped == entry, f"OpEvent wire drift: {dumped} != {entry}"
 
 
 @pytest.mark.parametrize(
