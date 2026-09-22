@@ -159,6 +159,19 @@ pub struct IndexDef {
     /// deserialize unchanged.
     #[serde(default, skip_serializing_if = "is_false")]
     pub search: bool,
+    /// FM-30: `true` on a search index additionally builds a trigram GIN
+    /// (`tg_<table>_<index>`) over its text `fields`, enabling `search`'s
+    /// `mode: "trgm"` (substring/`ILIKE` matching ranked by `similarity()`)
+    /// on this index. Legal only alongside `search: true`; meaningless
+    /// otherwise. Create-time-only — deliberately NOT compared in
+    /// `detect_destructive_changes` (like `softDelete`), because the
+    /// server grandfathers it at push time for a search index that already
+    /// carries a physical trigram index from before this flag existed (see
+    /// `ddl.rs::push_schema`), so old and new always agree by the time the
+    /// comparison would run. Omitted on the wire when `false`, so existing
+    /// schemas deserialize unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub trgm: bool,
     /// When present, marks this as a vector index: `fields[0]` must name a
     /// `Vector { dimensions }` field whose dimensions match `vector.dimensions`,
     /// and `filter_fields` (if any) must be scalar-indexable columns used to

@@ -379,3 +379,39 @@ fn push_schema_rejects_narrowing_a_literal_union() {
         other => panic!("expected Union, got {other:?}"),
     }
 }
+
+#[test]
+fn push_schema_grandfathers_trgm_for_preexisting_search_index_on_repush() {
+    // FM-30 grandfather: mirrors the server's
+    // `trgm_grandfathered_for_preexisting_search_index_on_repush`. A search
+    // index that predates the `trgm` flag (declared with no `trgm` key at
+    // all — exactly what a pre-flag schema JSON looks like) gets `trgm`
+    // silently flipped to `true` on the next push if that push still omits
+    // it too.
+    let no_trgm_schema = Schema::builder()
+        .table(
+            "items",
+            Table::new().field("name", FieldType::String).search_index(
+                "by_content",
+                &["name"],
+                None,
+            ),
+        )
+        .build();
+    let mut c = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+    c.push_schema(&no_trgm_schema).unwrap();
+
+    let stored = c.to_schema_json().expect("schema installed");
+    assert!(
+        !stored.tables["items"].indexes[0].trgm,
+        "fixture must start trgm:false"
+    );
+
+    // Routine re-push, same schema: grandfather flips it.
+    c.push_schema(&no_trgm_schema).unwrap();
+    let stored = c.to_schema_json().expect("schema installed");
+    assert!(
+        stored.tables["items"].indexes[0].trgm,
+        "existing search index should be grandfathered to trgm:true"
+    );
+}

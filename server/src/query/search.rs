@@ -219,6 +219,18 @@ pub(crate) fn compile_search(
     let pg_schema_name = pg_schema(db);
     let table_ident = pg_table(table_name);
     let mode = search.mode.unwrap_or_default();
+    // FM-30: `trgm` mode requires the index to have declared (or been
+    // grandfathered) `trgm: true` at push time — the trigram GIN backing
+    // this mode only exists on such an index (`ddl.rs::create_indexes`).
+    // Named separately from the "not found" lookup above so a real
+    // configuration gap reads as an actionable BAD_REQUEST rather than a
+    // misleading "index not found".
+    if mode == SearchMode::Trgm && !index_def.trgm {
+        return Err(RtDbError::bad_request(format!(
+            "search index '{}' does not declare trgm: true — trgm mode requires it",
+            search.index
+        )));
+    }
     // `snippet` needs a tsquery tree to highlight; trgm mode matches raw
     // substrings, so the combination is rejected rather than silently
     // ignored.

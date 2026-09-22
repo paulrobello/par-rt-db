@@ -258,6 +258,14 @@ impl TableDefExt for TableDef {
                     )));
                 }
             }
+            // FM-30: `trgm` gates the trigram GIN built alongside a search
+            // index's tsvector GIN; meaningless on a btree or vector index.
+            if index.trgm && !index.search {
+                return Err(RtDbError::schema(format!(
+                    "index '{}' declares trgm but is not a search index",
+                    index.name
+                )));
+            }
             // `language` selects a search index's tsvector `regconfig`; it is
             // meaningless on a btree or vector index, and the literal is later
             // interpolated into DDL, so both its placement and format are gated

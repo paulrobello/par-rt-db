@@ -27,6 +27,7 @@ fn priority_schema(variants: &[&str]) -> SchemaDef {
         unique: false,
         r#where: None,
         language: None,
+        trgm: false,
     }];
     let mut tables = BTreeMap::new();
     tables.insert(
@@ -120,6 +121,7 @@ fn email_index_schema(unique: bool, where_clause: Option<FilterExpr>) -> SchemaD
         unique,
         r#where: where_clause,
         language: None,
+        trgm: false,
     }];
     let mut tables = BTreeMap::new();
     tables.insert(

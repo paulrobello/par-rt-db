@@ -262,6 +262,7 @@ mod tests {
             unique: false,
             r#where: None,
             language: None,
+            trgm: false,
         }
     }
 

@@ -48,7 +48,8 @@ fn test_schema() -> SchemaDef {
                 .index("by_name", &["name"])
                 .index("by_status", &["status"])
                 .index("by_status_and_order", &["status", "order"])
-                .search_index("by_content", &["name"], None),
+                .search_index("by_content", &["name"], None)
+                .trgm(),
         )
         .build()
 }

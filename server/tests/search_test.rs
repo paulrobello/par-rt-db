@@ -18,7 +18,7 @@ fn search_schema_json() -> serde_json::Value {
         "fields":{"title":{"type":"string"},"body":{"type":"string"}},
         "indexes":[
             {"name":"by_title","fields":["title"]},
-            {"name":"search_content","fields":["title","body"],"search":true}
+            {"name":"search_content","fields":["title","body"],"search":true,"trgm":true}
         ]
     }}})
 }
@@ -500,7 +500,7 @@ fn filter_schema() -> SchemaDef {
         },
         "indexes":[
             {"name":"by_category","fields":["category"]},
-            {"name":"search_title","fields":["title"],"search":true}
+            {"name":"search_title","fields":["title"],"search":true,"trgm":true}
         ]
     }}}))
     .expect("parse filter schema")
@@ -1052,6 +1052,131 @@ async fn trgm_gin_index_dropped_by_reconcile() {
             .is_none(),
         "tsvector GIN survived reconcile"
     );
+}
+
+// --- trgm opt-in (the FM-30 `trgm` flag) ---
+
+/// A search index WITHOUT `trgm: true` — no trigram GIN is created, and
+/// `mode: "trgm"` against it is rejected rather than falling back to a
+/// sequential ILIKE scan.
+fn search_schema_no_trgm_json() -> serde_json::Value {
+    serde_json::json!({"tables":{"notes":{
+        "fields":{"title":{"type":"string"},"body":{"type":"string"}},
+        "indexes":[
+            {"name":"search_content","fields":["title","body"],"search":true}
+        ]
+    }}})
+}
+
+// A search index that never declared `trgm: true` gets no trigram GIN.
+#[tokio::test]
+async fn trgm_not_declared_creates_no_gin_index() {
+    let state = test_state().await;
+    let pool = &state.pool;
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(pool, &name).await.expect("create db");
+    let schema: SchemaDef =
+        serde_json::from_value(search_schema_no_trgm_json()).expect("parse schema");
+    ddl::push_schema(pool, &name, schema.clone())
+        .await
+        .expect("push schema");
+    let schema_name = ddl::pg_schema(&name);
+    assert!(
+        index_def(pool, &schema_name, "tg_notes_search_content")
+            .await
+            .is_none(),
+        "trigram GIN created despite trgm: false"
+    );
+}
+
+// `mode: "trgm"` against an index that never declared `trgm: true` is
+// rejected as BAD_REQUEST naming the missing declaration, not a silent
+// sequential scan.
+#[tokio::test]
+async fn trgm_mode_rejected_when_not_declared() {
+    let state = test_state().await;
+    let pool = &state.pool;
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(pool, &name).await.expect("create db");
+    let schema: SchemaDef =
+        serde_json::from_value(search_schema_no_trgm_json()).expect("parse schema");
+    ddl::push_schema(pool, &name, schema.clone())
+        .await
+        .expect("push schema");
+
+    let q = trgm_query("search_content", "conv");
+    let err = execute_query(pool, &name, &schema, &q, &PrincipalCtx::bypass(), false)
+        .await
+        .expect_err("trgm mode without trgm: true must fail");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(
+        err.message.contains("trgm"),
+        "error should name the missing declaration: {}",
+        err.message
+    );
+}
+
+// FM-30 grandfather: a search index that predates the `trgm` flag (created
+// via a schema that never mentioned it, so it deserializes as `trgm: false`
+// against `old`) gets `trgm` silently flipped to `true` on the next push if
+// the NEW push still omits it too — matching the physical trigram GIN
+// `create_indexes` already built for every search index before this flag
+// existed. A genuinely brand-new search index gets no such grandfather: it
+// stays opt-in.
+#[tokio::test]
+async fn trgm_grandfathered_for_preexisting_search_index_on_repush() {
+    let state = test_state().await;
+    let pool = &state.pool;
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(pool, &name).await.expect("create db");
+
+    // First push: a search index declared with no `trgm` key at all —
+    // exactly what a pre-flag schema JSON looks like on the wire.
+    let schema: SchemaDef =
+        serde_json::from_value(search_schema_no_trgm_json()).expect("parse schema");
+    ddl::push_schema(pool, &name, schema.clone())
+        .await
+        .expect("first push");
+
+    // Confirm the persisted schema really is trgm:false before the
+    // grandfather push, so the assertion below is not vacuous.
+    let stored = db::load_schema(pool, &name)
+        .await
+        .expect("load schema")
+        .expect("schema exists");
+    assert!(
+        !stored.tables["notes"].indexes[0].trgm,
+        "fixture must start trgm:false"
+    );
+
+    // Second push (routine re-push, same schema): grandfather flips it.
+    ddl::push_schema(pool, &name, schema)
+        .await
+        .expect("grandfather push");
+    let stored = db::load_schema(pool, &name)
+        .await
+        .expect("load schema")
+        .expect("schema exists");
+    assert!(
+        stored.tables["notes"].indexes[0].trgm,
+        "existing search index should be grandfathered to trgm:true"
+    );
+
+    // The physical trigram GIN now exists (create_indexes backfills it once
+    // the persisted flag reads true), and trgm-mode search now succeeds.
+    let schema_name = ddl::pg_schema(&name);
+    assert!(
+        index_def(pool, &schema_name, "tg_notes_search_content")
+            .await
+            .is_some(),
+        "grandfathered trgm did not backfill the trigram GIN"
+    );
+    insert_note(pool, &name, &stored, "database intro", "notes about db").await;
+    let q = trgm_query("search_content", "atab");
+    let res = execute_query(pool, &name, &stored, &q, &PrincipalCtx::bypass(), false)
+        .await
+        .expect("trgm search after grandfather");
+    assert_eq!(titles(&res), vec!["database intro".to_string()]);
 }
 
 // --- phrase/operator search (FM-31) ---

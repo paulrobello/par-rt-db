@@ -490,6 +490,7 @@ mod tests {
                 unique: false,
                 r#where: None,
                 language: None,
+                trgm: false,
             }],
             owner_field: None,
             collaborators_field: None,

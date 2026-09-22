@@ -1979,6 +1979,7 @@ mod tests {
                     unique: false,
                     r#where: None,
                     language: None,
+                    trgm: false,
                 }],
                 owner_field: Some("ownerId".into()),
                 collaborators_field: Some("collabs".into()),

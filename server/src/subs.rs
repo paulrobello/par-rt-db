@@ -1367,6 +1367,7 @@ mod tests {
                     unique: false,
                     r#where: None,
                     language: None,
+                    trgm: false,
                 },
                 IndexDef {
                     name: "by_status_order".to_string(),
@@ -1376,6 +1377,7 @@ mod tests {
                     unique: false,
                     r#where: None,
                     language: None,
+                    trgm: false,
                 },
                 IndexDef {
                     name: "by_flag".to_string(),
@@ -1385,6 +1387,7 @@ mod tests {
                     unique: false,
                     r#where: None,
                     language: None,
+                    trgm: false,
                 },
             ],
             owner_field: None,

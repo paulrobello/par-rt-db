@@ -73,6 +73,7 @@ impl TableBuilder {
             unique: false,
             r#where: None,
             language: None,
+            trgm: false,
         });
         self.last_index = Some(self.indexes.len() - 1);
         self
@@ -92,6 +93,7 @@ impl TableBuilder {
             unique: false,
             r#where: None,
             language: language.map(|s| s.into()),
+            trgm: false,
         });
         self.last_index = Some(self.indexes.len() - 1);
         self
@@ -121,6 +123,7 @@ impl TableBuilder {
             unique: false,
             r#where: None,
             language: None,
+            trgm: false,
         });
         self.last_index = Some(self.indexes.len() - 1);
         self
@@ -135,6 +138,18 @@ impl TableBuilder {
     pub fn unique(mut self) -> Self {
         if let Some(i) = self.last_index {
             self.indexes[i].unique = true;
+        }
+        self
+    }
+
+    /// Opt the most recently declared search index into a trigram GIN
+    /// (`.search_index(...).trgm()`), enabling `search`'s `mode: "trgm"`
+    /// (substring/`ILIKE` matching) on it (FM-30). Legal only on a search
+    /// index; the server rejects `trgm` on a btree/vector index at
+    /// push-schema time. No-ops if no index has been declared yet.
+    pub fn trgm(mut self) -> Self {
+        if let Some(i) = self.last_index {
+            self.indexes[i].trgm = true;
         }
         self
     }

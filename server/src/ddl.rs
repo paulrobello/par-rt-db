@@ -212,7 +212,7 @@ async fn validate_search_languages(pool: &PgPool, schema: &SchemaDef) -> Result<
 pub async fn push_schema(
     pool: &PgPool,
     db: &str,
-    schema: SchemaDef,
+    mut schema: SchemaDef,
 ) -> Result<(SchemaDef, std::collections::BTreeSet<String>), RtDbError> {
     schema.validate()?;
     validate_db_name(db)?;
@@ -223,6 +223,13 @@ pub async fn push_schema(
     }
 
     let previous = load_schema(pool, db).await?;
+    // FM-30: grandfather `trgm` on a search index that already existed
+    // before this push declared it, so a deployment never silently loses
+    // substring search on a routine additive push. Runs before
+    // `detect_destructive_changes` (which deliberately does not compare
+    // `trgm`, a create-time-only flag) so old and new agree on it, and
+    // before persisting `schema` below, so the grandfather is durable.
+    par_rt_db_core::engine::grandfather_trgm(previous.as_ref(), &mut schema);
     if let Some(old_schema) = &previous {
         detect_destructive_changes(old_schema, &schema)?;
     }
@@ -459,13 +466,16 @@ async fn create_indexes(
         .map(|t| t.indexes.iter().map(|index| index.name.as_str()).collect())
         .unwrap_or_default();
     for index in &new.indexes {
-        // Trigram GIN over a search index's text `f_` columns (FM-30):
-        // created for NEW and EXISTING search indexes alike — `IF NOT
-        // EXISTS` makes re-pushes a no-op and backfills search indexes that
-        // predate trgm mode (the backing `f_` columns exist by this point
-        // either way). Accelerates `search` mode `trgm` ILIKE; the query
-        // still works without it, just seq-scanned.
-        if index.search {
+        // Trigram GIN over a search index's text `f_` columns (FM-30),
+        // gated by the index's `trgm` flag: created for NEW and EXISTING
+        // trgm-opted-in search indexes alike — `IF NOT EXISTS` makes
+        // re-pushes a no-op and backfills an index whose `trgm` flag was
+        // just grandfathered `true` by `push_schema` (the backing `f_`
+        // columns exist by this point either way). Accelerates `search`
+        // mode `trgm` ILIKE; the query is rejected at the `search`
+        // terminal (not seq-scanned) when `trgm` is false — see
+        // `query/search.rs::compile_search`.
+        if index.search && index.trgm {
             let trgm_ident = format!(
                 "tg_{}_{}",
                 table_name.to_lowercase(),

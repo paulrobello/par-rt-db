@@ -31,6 +31,7 @@ fn owner_schema() -> SchemaDef {
                 unique: false,
                 r#where: None,
                 language: None,
+                trgm: false,
             }],
             owner_field: Some("userId".into()),
             collaborators_field: None,

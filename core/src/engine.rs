@@ -108,6 +108,39 @@ pub fn detect_destructive_changes(old: &SchemaDef, new: &SchemaDef) -> Result<()
     Ok(())
 }
 
+/// FM-30: grandfathers `trgm` on `new` for any search index that was already
+/// a search index in `old` (i.e. predates the `trgm` flag) and did not
+/// explicitly declare `trgm` on this push. Mutates `new` in place; a no-op
+/// when `old` is `None` (first-ever push — nothing to grandfather) or for a
+/// table/index absent from `old` (a genuinely new search index is opt-in, as
+/// designed). Idempotent: re-running it once already grandfathered changes
+/// nothing.
+///
+/// Called before [`detect_destructive_changes`] (which deliberately does
+/// NOT compare `trgm` — a create-time-only flag, like `softDelete`) so old
+/// and new always agree on it by the time that comparison runs, and before
+/// persisting `new` as the stored schema, so the grandfather is durable
+/// rather than recomputed at every query/DDL site.
+pub fn grandfather_trgm(old: Option<&SchemaDef>, new: &mut SchemaDef) {
+    let Some(old) = old else { return };
+    for (table_name, new_table) in new.tables.iter_mut() {
+        let Some(old_table) = old.tables.get(table_name) else {
+            continue;
+        };
+        for new_index in new_table.indexes.iter_mut() {
+            if new_index.search && !new_index.trgm {
+                let was_search = old_table
+                    .indexes
+                    .iter()
+                    .any(|old_index| old_index.name == new_index.name && old_index.search);
+                if was_search {
+                    new_index.trgm = true;
+                }
+            }
+        }
+    }
+}
+
 /// Rewrite every `field` reference in `expr` that equals `from` to `to`, in
 /// place. Used by the `RenameField` migration directive to carry an
 /// `authorize` predicate (or any other `FilterExpr` the schema carries)

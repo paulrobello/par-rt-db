@@ -490,8 +490,13 @@ impl InMemoryRtDbClient {
     /// conversion needed since the builder already produces the wire shape).
     pub fn push_schema(&mut self, schema: &SchemaDef) -> Result<(), RtDbError> {
         schema.validate()?;
+        let mut schema = schema.clone();
+        // FM-30: mirrors server `ddl::push_schema` — grandfather `trgm` on a
+        // search index that already existed before this push declared it,
+        // before the (deliberately trgm-blind) destructive-change check.
+        par_rt_db_core::engine::grandfather_trgm(self.schema.as_ref(), &mut schema);
         if let Some(prev) = &self.schema {
-            detect_destructive_changes(prev, schema)?;
+            detect_destructive_changes(prev, &schema)?;
         }
         self.schema = Some(schema.clone());
         for (name, def) in &schema.tables {

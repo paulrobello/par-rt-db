@@ -431,6 +431,18 @@ impl InMemoryRtDbClient {
             .find(|i| i.name == search.index && i.search)
             .ok_or_else(search_not_found)?;
         let index_fields: Vec<String> = index_def.fields.clone();
+        // FM-30: mirrors server `compile_search` — `trgm` mode requires the
+        // index to have declared (or been grandfathered) `trgm: true`.
+        // Named separately from the "not found" lookup above.
+        if search.mode == Some(crate::wire::SearchMode::Trgm) && !index_def.trgm {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!(
+                    "search index '{}' does not declare trgm: true — trgm mode requires it",
+                    search.index
+                ),
+            ));
+        }
         // `snippet` needs a tsquery tree to highlight; trgm mode matches raw
         // substrings, so the combination is rejected rather than silently
         // ignored. Mirrors server `compile_search`, which runs this check

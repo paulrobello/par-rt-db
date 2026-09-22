@@ -96,6 +96,7 @@ fn table_with_ttl(ttl: Option<TtlDef>) -> TableDef {
             vector: None,
             r#where: None,
             language: None,
+            trgm: false,
         }],
         owner_field: None,
         collaborators_field: None,
@@ -162,6 +163,7 @@ fn ttl_rejects_unique_or_partial_or_multifield_index() {
             vector: None,
             r#where: None,
             language: None,
+            trgm: false,
         },
         IndexDef {
             name: "x".to_string(),
@@ -174,6 +176,7 @@ fn ttl_rejects_unique_or_partial_or_multifield_index() {
                 value: serde_json::json!(0),
             }),
             language: None,
+            trgm: false,
         },
         IndexDef {
             name: "x".to_string(),
@@ -183,6 +186,7 @@ fn ttl_rejects_unique_or_partial_or_multifield_index() {
             vector: None,
             r#where: None,
             language: None,
+            trgm: false,
         },
     ] {
         let mut table = table_with_ttl(Some(TtlDef {

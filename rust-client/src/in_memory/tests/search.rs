@@ -615,6 +615,42 @@ async fn query_search_snippet_rejected_with_trgm_mode() {
 }
 
 #[tokio::test]
+async fn query_search_trgm_mode_rejected_when_not_declared() {
+    // FM-30: an index without `trgm: true` rejects `mode: "trgm"` as
+    // BAD_REQUEST naming the missing declaration (mirrors the server's
+    // `trgm_mode_rejected_when_not_declared`).
+    let no_trgm_schema = Schema::builder()
+        .table(
+            "items",
+            Table::new().field("name", FieldType::String).search_index(
+                "by_content",
+                &["name"],
+                None,
+            ),
+        )
+        .build();
+    let mut client = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+    client.push_schema(&no_trgm_schema).unwrap();
+    let err = client
+        .run::<Vec<Value>>(
+            &TableQuery::new("items")
+                .search(
+                    "by_content",
+                    "conv",
+                    SearchOpts {
+                        filter: None,
+                        mode: Some(SearchMode::Trgm),
+                        snippet: None,
+                    },
+                )
+                .take(5),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(err.message.contains("trgm"), "got: {err}");
+}
+
+#[tokio::test]
 async fn query_vector_search_returns_empty_array_stub() {
     // The TS harness rejects `vectorSearch` combined with any other
     // terminal (including `take`) — unlike `search`, vectorSearch carries

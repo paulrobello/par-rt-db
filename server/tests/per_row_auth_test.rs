@@ -36,6 +36,7 @@ fn owner_schema() -> SchemaDef {
         unique: false,
         r#where: None,
         language: None,
+        trgm: false,
     }];
     let mut tables = BTreeMap::new();
     tables.insert(
@@ -542,6 +543,7 @@ async fn search_filters_to_own_rows() -> anyhow::Result<()> {
         unique: false,
         r#where: None,
         language: None,
+        trgm: false,
     }];
     let mut tables = BTreeMap::new();
     tables.insert(
@@ -665,6 +667,7 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
         unique: false,
         r#where: None,
         language: None,
+        trgm: false,
     }];
     let mut tables = BTreeMap::new();
     tables.insert(
@@ -801,6 +804,7 @@ async fn vector_search_composes_filter_fields_with_owner() -> anyhow::Result<()>
         unique: false,
         r#where: None,
         language: None,
+        trgm: false,
     }];
     let mut tables = BTreeMap::new();
     tables.insert(
@@ -1761,6 +1765,7 @@ fn collab_schema() -> SchemaDef {
         unique: false,
         r#where: None,
         language: None,
+        trgm: false,
     }];
     let mut tables = BTreeMap::new();
     tables.insert(
@@ -2405,6 +2410,7 @@ fn authorize_schema() -> SchemaDef {
         unique: false,
         r#where: None,
         language: None,
+        trgm: false,
     }];
     let authorize = Some(FilterExpr::Or {
         exprs: vec![
@@ -3142,6 +3148,7 @@ fn insert_stamp_schema() -> SchemaDef {
         unique: false,
         r#where: None,
         language: None,
+        trgm: false,
     });
     tables.insert("owned".to_string(), owned);
     // (b) Or[Eq{owner,$user}, Eq{visibility,"public"}]
