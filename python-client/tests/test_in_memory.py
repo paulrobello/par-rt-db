@@ -29,7 +29,7 @@ from par_rt_db.in_memory import (
     worst_case_affected,
 )
 from par_rt_db.query import Query
-from par_rt_db.schema import Schema, t
+from par_rt_db.schema import Schema, SchemaDef, t
 from par_rt_db.wire import AggregateSpec, ScheduleWhen, StepRetry, WorkflowSpec, WorkflowStepSpec
 
 _when = TypeAdapter(ScheduleWhen)
@@ -1006,7 +1006,11 @@ def _new_search_client() -> InMemoryRtDbClient:
                 tb.field("title", t.string())
                 .field("body", t.string())
                 .field("status", t.string())
+                # FM-30: opt in to the trigram GIN so mode="trgm" is legal
+                # (the shared prologue rejects trgm mode on an index that
+                # never declared it — see test_search_trgm_mode_rejected...).
                 .search_index("search_all", ["title", "body"])
+                .trgm()
                 .index("by_status", ["status"])
             ),
         )
@@ -1113,6 +1117,59 @@ def test_search_trgm_requires_a_search_index() -> None:
         c.run_query(TableQuery("notes").search("by_status", "conv", mode="trgm").build())
     assert ei.value.code is ErrorCode.BAD_REQUEST
     assert "search index 'by_status' not found" in ei.value.message
+
+
+def _no_trgm_schema() -> SchemaDef:
+    # A search index declared with no `trgm` key at all — exactly what a
+    # pre-FM-30-flag schema looks like on the wire.
+    return (
+        Schema.builder()
+        .table(
+            "items",
+            lambda tb: tb.field("name", t.string()).search_index("by_content", ["name"]),
+        )
+        .build()
+    )
+
+
+def test_search_trgm_mode_rejected_when_not_declared() -> None:
+    # FM-30: an index without `trgm: true` rejects mode="trgm" as BAD_REQUEST
+    # naming the missing declaration (mirrors the server's
+    # `trgm_mode_rejected_when_not_declared` and the Rust in-memory test).
+    c = InMemoryRtDbClient()
+    c.push_schema(_no_trgm_schema())
+    with pytest.raises(RtDbError) as ei:
+        c.run_query(TableQuery("items").search("by_content", "conv", mode="trgm").take(5).build())
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "trgm" in ei.value.message
+    assert (
+        ei.value.message
+        == "search index 'by_content' does not declare trgm: true — trgm mode requires it"
+    )
+
+
+def test_push_schema_grandfathers_trgm_for_preexisting_search_index_on_repush() -> None:
+    # FM-30 grandfather: mirrors the server's
+    # `trgm_grandfathered_for_preexisting_search_index_on_repush`. A search
+    # index that predates the `trgm` flag gets `trgm` silently flipped to True
+    # on the next push if that push still omits it; a first push does not.
+    c = InMemoryRtDbClient()
+    c.push_schema(_no_trgm_schema())
+    stored = c.to_schema_json()
+    assert stored is not None
+    assert not stored.tables["items"].indexes[0].trgm, "fixture must start trgm falsy"
+
+    # Routine re-push, same schema: grandfather flips it.
+    c.push_schema(_no_trgm_schema())
+    stored = c.to_schema_json()
+    assert stored is not None
+    assert stored.tables["items"].indexes[0].trgm is True, (
+        "existing search index should be grandfathered to trgm=True"
+    )
+    # And the grandfathered index now accepts trgm mode.
+    c.mutate(Mutation.builder().insert("items", {"name": "convex"}).build())
+    docs = c.run_query(TableQuery("items").search("by_content", "conv", mode="trgm").build())
+    assert [d["name"] for d in docs] == ["convex"]
 
 
 def test_search_tsquery_requires_a_search_index() -> None:

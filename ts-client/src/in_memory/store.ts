@@ -62,6 +62,7 @@ import type { SchemaDefinition } from "../schema.js";
 import {
   applyMigrationDirective,
   detectDestructiveChanges,
+  grandfatherTrgm,
   onDeleteRef,
   validateOnDelete,
   validateSchema,
@@ -1080,10 +1081,17 @@ export class InMemoryRtDbClient {
    * index-field rules (`validateSchema`) and `onDelete` declarations (FM-33),
    * both SCHEMA_VIOLATION, like the server does. */
   pushSchema(schema: SchemaDefinition<any> | SchemaJson): void {
-    const next = toSchemaJson(schema);
+    // Cloned because `grandfatherTrgm` mutates in place and `toJSON()` hands
+    // back the builder's own index objects — a shared `defineSchema(...)`
+    // fixture must not pick up one client's grandfathered flag.
+    const next = clone(toSchemaJson(schema));
     validateSchema(next);
     validateOnDelete(next);
     validateComputed(next);
+    // FM-30: mirrors server `ddl::push_schema` — grandfather `trgm` on a
+    // search index that already existed before this push declared it,
+    // before the (deliberately trgm-blind) destructive-change check.
+    grandfatherTrgm(this.schema ?? undefined, next);
     if (this.schema) {
       detectDestructiveChanges(this.schema, next);
       // Additive: keep existing tables' rows and the idempotency cache; only

@@ -91,6 +91,41 @@ func stripOnDelete(ty FieldType) FieldType {
 
 func ptrField(f FieldType) *FieldType { return &f }
 
+// grandfatherTrgm (FM-30) flips Trgm to true on any search index in next that
+// was already a search index in old (i.e. predates the trgm flag) and did not
+// explicitly declare trgm on this push. Mutates next in place; a no-op when
+// old is nil (first-ever push) or for a table/index absent from old (a
+// genuinely new search index stays opt-in). Idempotent. Ports
+// core::engine::grandfather_trgm.
+//
+// Must run BEFORE detectDestructiveChanges (which deliberately does NOT
+// compare Trgm — a create-time-only flag, like SoftDelete) so old and next
+// agree on it by the time that comparison runs, and before next is stored,
+// so the flip is persisted rather than recomputed at every query site.
+func grandfatherTrgm(old, next *SchemaDef) {
+	if old == nil {
+		return
+	}
+	for tableName, newTable := range next.Tables {
+		oldTable, ok := old.Tables[tableName]
+		if !ok {
+			continue
+		}
+		for i := range newTable.Indexes {
+			newIndex := &newTable.Indexes[i]
+			if !newIndex.Search || newIndex.Trgm {
+				continue
+			}
+			for _, oldIndex := range oldTable.Indexes {
+				if oldIndex.Name == newIndex.Name && oldIndex.Search {
+					newIndex.Trgm = true
+					break
+				}
+			}
+		}
+	}
+}
+
 // detectDestructiveChanges rejects a second push that removes or retypes any
 // existing table/field/index (server ddl.rs::detect_destructive_changes).
 // Field types compare after stripping onDelete; a change is accepted only as

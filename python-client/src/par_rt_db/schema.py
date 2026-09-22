@@ -192,11 +192,21 @@ class IndexDef(_S):
     non-English corpora get correct stemming and stop-words. Valid only on a
     search index; the server default (field absent) behaves as ``english``.
     Mirrors ``server/src/schema.rs::IndexDef.language``
-    (``skip_serializing_if = "Option::is_none"``). See ENH-006."""
+    (``skip_serializing_if = "Option::is_none"``). See ENH-006.
+
+    ``trgm`` (FM-30) opts a search index into an additional trigram GIN
+    alongside its tsvector GIN, enabling ``search``'s ``mode="trgm"``
+    (substring matching) on it. Legal only with ``search=True``. Omitted on
+    the wire when falsy (server ``skip_serializing_if = "is_false"``).
+    Create-time-only: deliberately NOT compared by the destructive-change
+    check (like ``softDelete``), because the server grandfathers it on push
+    for a search index that predates the flag — see
+    ``core::engine::grandfather_trgm`` and ``in_memory.migrate._grandfather_trgm``."""
 
     name: str
     fields: list[str]
     search: bool | None = None
+    trgm: bool | None = None
     vector: VectorIndexSpec | None = None
     unique: bool | None = None
     where: FilterExpr | None = None
@@ -209,6 +219,9 @@ class IndexDef(_S):
         # `search=False` (not just an absent/None flag) is omitted on the wire.
         if not out.get("search"):
             out.pop("search", None)
+        # Same falsy-drop for `trgm: bool` (FM-30).
+        if not out.get("trgm"):
+            out.pop("trgm", None)
         if out.get("vector") is None:
             out.pop("vector", None)
         # Same falsy-drop for `unique: bool`; `where` is Option<FilterExpr> so it
@@ -369,6 +382,16 @@ class TableBuilder:
         ``id``/``created_at``). No-op if no index has been declared yet."""
         if self._indexes:
             self._indexes[-1]["unique"] = True
+        return self
+
+    def trgm(self) -> TableBuilder:
+        """Opt the most recently declared search index into a trigram GIN
+        (``.search_index(...).trgm()``), enabling ``search``'s ``mode="trgm"``
+        (substring matching) on it (FM-30). Legal only on a search index; the
+        server rejects ``trgm`` on a btree/vector index at push-schema time.
+        No-op if no index has been declared yet."""
+        if self._indexes:
+            self._indexes[-1]["trgm"] = True
         return self
 
     def where(self, predicate: FilterExpr) -> TableBuilder:

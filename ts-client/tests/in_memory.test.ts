@@ -2395,6 +2395,49 @@ describe("InMemoryRtDbClient — additive schema push", () => {
       /changed language of search index 'by_content'/,
     );
   });
+
+  it("grandfathers trgm for a pre-existing search index on re-push (FM-30)", () => {
+    // Mirrors the server's
+    // `trgm_grandfathered_for_preexisting_search_index_on_repush` and
+    // rust-client's
+    // `push_schema_grandfathers_trgm_for_preexisting_search_index_on_repush`.
+    // A search index that predates the `trgm` flag (declared with no `trgm`
+    // key at all — exactly what a pre-flag schema JSON looks like) gets
+    // `trgm` silently flipped to `true` on the next push if that push still
+    // omits it too. A brand-new search index in that same push stays opt-in.
+    const noTrgmSchema = defineSchema({
+      items: defineTable({ name: t.string() }).searchIndex("by_content", ["name"]),
+    });
+    const c = new InMemoryRtDbClient();
+    c.pushSchema(noTrgmSchema);
+    // The installed schema is private; an empty migrate echoes it back.
+    const installed = () => c.migrate({ directives: [], dryRun: true }).schema;
+    expect(installed().tables.items.indexes).toEqual([
+      { name: "by_content", fields: ["name"], search: true },
+    ]);
+
+    // Routine re-push (additive: a second table with its own new search
+    // index): the pre-existing one is grandfathered, the new one is not.
+    const repush = defineSchema({
+      items: defineTable({ name: t.string() }).searchIndex("by_content", ["name"]),
+      notes: defineTable({ body: t.string() }).searchIndex("by_body", ["body"]),
+    });
+    c.pushSchema(repush);
+    expect(installed().tables.items.indexes).toEqual([
+      { name: "by_content", fields: ["name"], search: true, trgm: true },
+    ]);
+    expect(installed().tables.notes.indexes).toEqual([
+      { name: "by_body", fields: ["body"], search: true },
+    ]);
+    // The caller's fixture is untouched — the grandfather is applied to the
+    // installed copy only.
+    expect(repush.toJSON().tables.items.indexes?.[0]).not.toHaveProperty("trgm");
+
+    // A third identical push is a no-op (idempotent), and the grandfathered
+    // flag survives the (deliberately trgm-blind) destructive-change check.
+    expect(() => c.pushSchema(repush)).not.toThrow();
+    expect(installed().tables.items.indexes?.[0]?.trgm).toBe(true);
+  });
 });
 
 describe("InMemoryRtDbClient — push-time schema validation", () => {
@@ -3016,7 +3059,9 @@ describe("InMemoryRtDbClient — trgm search (mode: 'trgm')", () => {
     notes: defineTable({
       title: t.string(),
       body: t.string(),
-    }).searchIndex("search_text", ["title", "body"]),
+    })
+      .searchIndex("search_text", ["title", "body"])
+      .trgm(),
   });
   const trgmApi = createApi(trgmSchema);
 
@@ -3106,14 +3151,47 @@ describe("InMemoryRtDbClient — trgm search (mode: 'trgm')", () => {
     )) as Array<{ title: string }>;
     expect(word.map((d) => d.title)).toEqual(["Release plan"]);
   });
+
+  it("rejects mode 'trgm' on a search index that did not declare trgm (BAD_REQUEST)", async () => {
+    // FM-30: mirrors the server's `trgm_mode_rejected_when_not_declared` and
+    // rust-client's `query_search_trgm_mode_rejected_when_not_declared`.
+    const noTrgmSchema = defineSchema({
+      notes: defineTable({
+        title: t.string(),
+        body: t.string(),
+      }).searchIndex("search_text", ["title", "body"]),
+    });
+    const noTrgmApi = createApi(noTrgmSchema);
+    const c = new InMemoryRtDbClient({ now: () => 1_700_000_000_000, random: () => 0 });
+    c.pushSchema(noTrgmSchema);
+    let err: unknown;
+    try {
+      await c.query(
+        noTrgmApi.notes.query().search("search_text", "conv", { mode: "trgm" }).take(5),
+      );
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(RtDbError);
+    expect((err as RtDbError).code).toBe("BAD_REQUEST");
+    expect((err as RtDbError).message).toContain("trgm");
+    // The default (tsquery) mode is unaffected by the missing flag.
+    await expect(
+      c.query(noTrgmApi.notes.query().search("search_text", "conv").take(5)),
+    ).resolves.toEqual([]);
+  });
 });
 
 describe("InMemoryRtDbClient — phrase/operator search (websearch syntax, FM-31)", () => {
+  // `.trgm()` so the snippet+trgm rejection below reaches the snippet check
+  // (the FM-30 "does not declare trgm" gate runs first, like on the server).
   const phraseSchema = defineSchema({
     notes: defineTable({
       title: t.string(),
       body: t.string(),
-    }).searchIndex("search_text", ["title", "body"]),
+    })
+      .searchIndex("search_text", ["title", "body"])
+      .trgm(),
   });
   const phraseApi = createApi(phraseSchema);
 

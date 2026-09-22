@@ -207,6 +207,31 @@ def _detect_destructive_changes(old: SchemaDef, new: SchemaDef) -> None:
                 )
 
 
+def _grandfather_trgm(old: SchemaDef | None, new: SchemaDef) -> None:
+    """Mirror of ``core::engine::grandfather_trgm`` (FM-30): flip ``trgm`` to
+    ``True`` on every index in ``new`` that is a search index, does not declare
+    ``trgm``, and was already a search index in ``old`` (i.e. predates the
+    flag). Mutates ``new`` in place. No-op when ``old`` is ``None`` (first-ever
+    push) or for a table/index absent from ``old`` — a genuinely new search
+    index stays opt-in. Idempotent.
+
+    Must run BEFORE ``_detect_destructive_changes`` (which deliberately does
+    NOT compare ``trgm``, a create-time-only flag like ``softDelete``) so old
+    and new agree on it by then, and before ``new`` is stored, so the flip is
+    persisted rather than recomputed at every query site."""
+    if old is None:
+        return
+    for table_name, new_table in new.tables.items():
+        old_table = old.tables.get(table_name)
+        if old_table is None:
+            continue
+        for new_index in new_table.indexes:
+            if new_index.search and not new_index.trgm:
+                was_search = any(i.name == new_index.name and i.search for i in old_table.indexes)
+                if was_search:
+                    new_index.trgm = True
+
+
 def _field_type_signature(ty: Any) -> Any:
     """Structural signature of a ``FieldType`` for destructive-change detection
     (the live server compares the parsed type tree directly). FM-33: ``onDelete``

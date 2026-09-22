@@ -337,6 +337,37 @@ def test_unique_index_builder_emits_unique_true():
     assert "where" not in by_org
 
 
+def test_trgm_search_index_builder_emits_trgm_true():
+    """``.search_index(...).trgm()`` opts the most recently declared search
+    index into the trigram GIN (FM-30); on the wire ``trgm: true`` is emitted
+    alongside ``search: true`` and a plain search index omits the key (mirrors
+    server ``skip_serializing_if = "is_false"``)."""
+    schema = (
+        Schema.builder()
+        .table(
+            "docs",
+            lambda tb: (
+                tb.field("body", t.string())
+                .field("title", t.string())
+                .search_index("body_idx", ["body"])
+                .trgm()
+                .search_index("title_idx", ["title"])
+            ),
+        )
+        .build()
+    )
+    wire = json.loads(schema.model_dump_json(by_alias=True))
+    indexes = wire["tables"]["docs"]["indexes"]
+    body_idx = next(i for i in indexes if i["name"] == "body_idx")
+    title_idx = next(i for i in indexes if i["name"] == "title_idx")
+    assert body_idx == {"name": "body_idx", "fields": ["body"], "search": True, "trgm": True}
+    assert title_idx == {"name": "title_idx", "fields": ["title"], "search": True}
+    # Round-trip: the wire shape parses back and `trgm=False` drops the key.
+    assert IndexDef.model_validate(body_idx).trgm is True
+    explicit_false = IndexDef.model_validate({**title_idx, "trgm": False})
+    assert "trgm" not in json.loads(explicit_false.model_dump_json(by_alias=True))
+
+
 def test_plain_index_omits_unique_and_where_keys():
     """A plain btree index must serialize as ``{name, fields}`` only — ``unique``
     and ``where`` are omitted on the wire when absent (mirrors the server's

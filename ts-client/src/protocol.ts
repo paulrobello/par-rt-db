@@ -727,6 +727,14 @@ export interface IndexJson {
   fields: string[];
   /** `true` marks a full-text search index; omitted on the wire for ordinary btree indexes. */
   search?: boolean;
+  /** FM-30: `true` on a search index additionally builds a trigram GIN over
+   * its text `fields`, enabling `search`'s `mode: "trgm"` (substring matching)
+   * on this index. Legal only alongside `search: true`. Omitted on the wire
+   * when false so existing schemas deserialize unchanged. Create-time-only —
+   * deliberately NOT compared by destructive-change detection (like
+   * `softDelete`) because the server grandfathers it on push for a search
+   * index that predates the flag (see `core::engine::grandfather_trgm`). */
+  trgm?: boolean;
   /** Present marks a vector index; omitted otherwise. */
   vector?: VectorIndexSpec;
   /** `true` compiles to `CREATE UNIQUE INDEX` over the declared `fields` (no

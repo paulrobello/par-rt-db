@@ -177,6 +177,80 @@ struct InMemoryTests {
         #expect(descendingDocs.map(\.objectValue?["title"]) == [.string("a"), .string("c"), .string("b")])
     }
 
+    // MARK: Trigram search (FM-30)
+
+    private func noTrgmSchema() -> SchemaDef {
+        SchemaBuilder()
+            .table("items") {
+                $0.field("name", .string)
+                    .searchIndex("by_content", on: ["name"])
+            }
+            .build()
+    }
+
+    @Test func querySearchTrgmModeRejectedWhenNotDeclared() throws {
+        // Mirrors rust `query_search_trgm_mode_rejected_when_not_declared`:
+        // an index without `trgm: true` rejects `mode: .trgm` as BAD_REQUEST
+        // naming the missing declaration.
+        let client = deterministicClient()
+        try client.pushSchema(noTrgmSchema())
+        let query = try TableQuery("items").search("by_content", "conv", mode: .trgm).take(5).build()
+        do {
+            _ = try client.query(query)
+            Issue.record("expected trgm-mode query to be rejected")
+        } catch let error as RtDbError {
+            #expect(error.code == .badRequest)
+            #expect(error.message.contains("trgm"))
+        }
+    }
+
+    @Test func pushSchemaGrandfathersTrgmForPreexistingSearchIndexOnRepush() throws {
+        // Mirrors rust
+        // `push_schema_grandfathers_trgm_for_preexisting_search_index_on_repush`:
+        // a search index that predates the `trgm` flag (declared with no
+        // `trgm` key at all) gets `trgm` silently flipped to `true` on the
+        // next push if that push still omits it. Observed through the
+        // query-time gate: trgm mode is rejected after the first push and
+        // accepted after the identical re-push.
+        let client = deterministicClient()
+        try client.pushSchema(noTrgmSchema())
+        let query = try TableQuery("items").search("by_content", "conv", mode: .trgm).build()
+        #expect(throws: RtDbError.self) { try client.query(query) }
+
+        try client.pushSchema(noTrgmSchema())
+        #expect(try array(client.query(query)).isEmpty)
+    }
+
+    @Test func grandfatherTrgmSkipsFirstPushAndNewSearchIndexes() {
+        // `grandfatherTrgm` is a no-op on the first push and for a search
+        // index absent from the prior schema; only a pre-existing search
+        // index (matched by name, still `search`) flips.
+        var first = noTrgmSchema()
+        grandfatherTrgm(old: nil, next: &first)
+        #expect(first.tables["items"]?.indexes?[0].trgm == false)
+
+        var next = SchemaBuilder()
+            .table("items") {
+                $0.field("name", .string)
+                    .field("body", .string)
+                    .searchIndex("by_content", on: ["name"])
+                    .searchIndex("by_body", on: ["body"])
+            }
+            .table("notes") {
+                $0.field("text", .string)
+                    .searchIndex("by_text", on: ["text"])
+            }
+            .build()
+        grandfatherTrgm(old: first, next: &next)
+        #expect(next.tables["items"]?.indexes?[0].trgm == true)
+        #expect(next.tables["items"]?.indexes?[1].trgm == false)
+        #expect(next.tables["notes"]?.indexes?[0].trgm == false)
+        // Idempotent: a second run changes nothing.
+        let once = next
+        grandfatherTrgm(old: first, next: &next)
+        #expect(next == once)
+    }
+
     @Test func insertAppliesSchemaDefaults() throws {
         let client = deterministicClient()
         try client.pushSchema(

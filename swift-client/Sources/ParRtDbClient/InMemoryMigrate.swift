@@ -110,6 +110,34 @@ public func detectDestructiveChanges(_ oldSchema: SchemaDef, _ newSchema: Schema
 
 // swiftlint:enable cyclomatic_complexity function_body_length
 
+/// FM-30: grandfathers `trgm` on `next` for any search index that was already
+/// a search index in `old` (i.e. predates the `trgm` flag) and did not
+/// explicitly declare `trgm` on this push — a port of core
+/// `engine::grandfather_trgm`. Mutates `next` in place; a no-op when `old` is
+/// nil (first-ever push) or for a table/index absent from `old` (a genuinely
+/// new search index stays opt-in). Idempotent.
+///
+/// Must run BEFORE `detectDestructiveChanges` (which deliberately does NOT
+/// compare `trgm`, a create-time-only flag like `softDelete`) so old and new
+/// agree on it by the time that comparison runs, and before `next` is stored
+/// as the engine's schema, so the flip is persisted rather than recomputed at
+/// query time.
+func grandfatherTrgm(old: SchemaDef?, next: inout SchemaDef) {
+    guard let old else { return }
+    for (tableName, oldTable) in old.tables {
+        guard var indexes = next.tables[tableName]?.indexes else { continue }
+        for idx in indexes.indices where indexes[idx].search && !indexes[idx].trgm {
+            let wasSearch = (oldTable.indexes ?? []).contains {
+                $0.name == indexes[idx].name && $0.search
+            }
+            if wasSearch {
+                indexes[idx].trgm = true
+            }
+        }
+        next.tables[tableName]?.indexes = indexes
+    }
+}
+
 // MARK: - Push-time validation
 
 // swiftlint:disable cyclomatic_complexity function_body_length

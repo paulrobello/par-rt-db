@@ -974,6 +974,14 @@ class _QueryEngine(_Core):
         )
         if search_def is None:
             raise RtDbError(ErrorCode.BAD_REQUEST, f"search index '{q.search.index}' not found")
+        # FM-30: mirrors server `compile_search` — `trgm` mode requires the
+        # index to have declared (or been grandfathered) `trgm: true`.
+        if q.search.mode == "trgm" and not search_def.trgm:
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"search index '{q.search.index}' does not declare trgm: true"
+                " — trgm mode requires it",
+            )
         if q.search.snippet is True and q.search.mode == "trgm":
             raise RtDbError(ErrorCode.BAD_REQUEST, "snippet is only supported in tsquery mode")
         if q.search.filter is not None:

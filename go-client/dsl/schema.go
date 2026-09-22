@@ -189,6 +189,17 @@ func (t *TableBuilder) Unique() *TableBuilder {
 	return t
 }
 
+// Trgm opts the most recently declared search index into a trigram GIN,
+// enabling the search terminal's mode: "trgm" (substring matching) on it
+// (FM-30). Legal only on a search index; the server rejects trgm on a
+// btree/vector index at push time. No-op if no index has been declared yet.
+func (t *TableBuilder) Trgm() *TableBuilder {
+	if t.lastIndex != nil {
+		t.lastIndex["trgm"] = wire.Bool(true)
+	}
+	return t
+}
+
 // Where adds a partial-index predicate to the most recent index (wire key
 // "where").
 func (t *TableBuilder) Where(f wire.FilterExpr) *TableBuilder {
@@ -208,6 +219,7 @@ func (t *TableBuilder) SearchIndex(name string, language string, fields ...strin
 		idx["language"] = wire.String(language)
 	}
 	t.indexes = append(t.indexes, wire.Object(idx))
+	t.lastIndex = idx
 	return t
 }
 

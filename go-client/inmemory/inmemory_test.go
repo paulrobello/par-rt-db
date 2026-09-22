@@ -31,7 +31,7 @@ func testSchema() wire.JSONValue {
 				Index("by_name", "name").
 				Index("by_status", "status").
 				Index("by_status_and_order", "status", "order").
-				SearchIndex("by_content", "", "name")
+				SearchIndex("by_content", "", "name").Trgm()
 		})
 	})
 }

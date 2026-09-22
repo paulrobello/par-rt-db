@@ -277,6 +277,12 @@ func executeSearchTerminal(s *Store, q *wire.Query, search *wire.SearchQuery, ta
 	if indexDef == nil {
 		return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "search index '"+search.Index+"' not found")
 	}
+	// FM-30: mirrors server compile_search — trgm mode requires the index to
+	// have declared (or been grandfathered) trgm: true.
+	if search.Mode == wire.SearchModeTrgm && !indexDef.Trgm {
+		return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+			"search index '"+search.Index+"' does not declare trgm: true — trgm mode requires it")
+	}
 	indexFields := indexDef.Fields
 	snippet := search.Snippet != nil && *search.Snippet
 	if snippet && search.Mode == wire.SearchModeTrgm {

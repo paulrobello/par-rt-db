@@ -844,6 +844,11 @@ public final class InMemoryRtDbClient: MigrationStore {
     public func pushSchema(_ schema: SchemaDef) throws {
         try validateSchema(schema)
         try validateOnDelete(schema)
+        var schema = schema
+        // FM-30: mirrors server `ddl::push_schema` — grandfather `trgm` on a
+        // search index that already existed before this push declared it,
+        // before the (deliberately trgm-blind) destructive-change check.
+        grandfatherTrgm(old: self.schema, next: &schema)
         if let current = self.schema {
             try detectDestructiveChanges(current, schema)
             // Additive: keep existing tables' rows; only brand-new tables

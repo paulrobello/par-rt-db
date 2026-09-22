@@ -136,6 +136,42 @@ export function detectDestructiveChanges(oldSchema: SchemaJson, newSchema: Schem
   }
 }
 
+/** FM-30: grandfathers `trgm` on `next` for any search index that was already
+ *  a search index in `old` (i.e. predates the `trgm` flag) and did not
+ *  explicitly declare `trgm` on this push — a port of
+ *  `core::engine::grandfather_trgm`. Mutates `next` in place; a no-op when
+ *  `old` is `undefined` (first-ever push — nothing to grandfather) or for a
+ *  table/index absent from `old` (a genuinely new search index is opt-in, as
+ *  designed). Idempotent: re-running it once already grandfathered changes
+ *  nothing.
+ *
+ *  Must run BEFORE {@link detectDestructiveChanges} (which deliberately does
+ *  NOT compare `trgm` — a create-time-only flag, like `softDelete`) so old and
+ *  new always agree on it by the time that comparison runs, and before `next`
+ *  is stored as the installed schema, so the flip is persisted rather than
+ *  recomputed at every query site. */
+export function grandfatherTrgm(old: SchemaJson | undefined, next: SchemaJson): void {
+  if (!old) {
+    return;
+  }
+  for (const [tableName, newTable] of Object.entries(next.tables)) {
+    const oldTable = old.tables[tableName];
+    if (!oldTable) {
+      continue;
+    }
+    for (const newIndex of newTable.indexes ?? []) {
+      if (newIndex.search && !newIndex.trgm) {
+        const wasSearch = (oldTable.indexes ?? []).some(
+          (oldIndex) => oldIndex.name === newIndex.name && oldIndex.search,
+        );
+        if (wasSearch) {
+          newIndex.trgm = true;
+        }
+      }
+    }
+  }
+}
+
 /** Push-time schema validation — the TTL, updatedAtField, autoIncrementField,
  *  and index-field rules of server `schema::validate` (`schema::validate_indexes`
  *  + `validate_ttl` + `validate_updated_at` + `validate_auto_increment`),

@@ -183,6 +183,47 @@ func TestPushSchemaRejectsChangingASearchIndexLanguage(t *testing.T) {
 	}), rtdberrors.CodeBadRequest, "changed language of search index 'by_content'")
 }
 
+func TestPushSchemaGrandfathersTrgmForPreexistingSearchIndexOnRepush(t *testing.T) {
+	// FM-30 grandfather: a search index that predates the trgm flag (declared
+	// with no trgm key at all) gets Trgm silently flipped to true on the next
+	// push if that push still omits it too (mirrors rust
+	// push_schema_grandfathers_trgm_for_preexisting_search_index_on_repush).
+	noTrgm := buildSchema(func(b *dsl.SchemaBuilder) {
+		b.Table("items", func(tb *dsl.TableBuilder) {
+			tb.Field("name", dsl.Str()).SearchIndex("by_content", "", "name")
+		})
+	})
+	s := NewStore()
+	if err := s.PushSchema(noTrgm); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	if s.SchemaSnapshot().Tables["items"].Indexes[0].Trgm {
+		t.Fatal("fixture must start trgm:false")
+	}
+	// Routine re-push, same schema: grandfather flips it.
+	if err := s.PushSchema(noTrgm); err != nil {
+		t.Fatalf("second push: %v", err)
+	}
+	if !s.SchemaSnapshot().Tables["items"].Indexes[0].Trgm {
+		t.Fatal("existing search index should be grandfathered to trgm:true")
+	}
+	// A search index NEW in this push stays opt-in.
+	withNew := buildSchema(func(b *dsl.SchemaBuilder) {
+		b.Table("items", func(tb *dsl.TableBuilder) {
+			tb.Field("name", dsl.Str()).Field("note", dsl.Str()).
+				SearchIndex("by_content", "", "name").
+				SearchIndex("by_note", "", "note")
+		})
+	})
+	if err := s.PushSchema(withNew); err != nil {
+		t.Fatalf("third push: %v", err)
+	}
+	idx := s.SchemaSnapshot().Tables["items"].Indexes
+	if !idx[0].Trgm || idx[1].Trgm {
+		t.Fatalf("grandfather scope: by_content=%v by_note=%v", idx[0].Trgm, idx[1].Trgm)
+	}
+}
+
 func TestPushSchemaRejectsTTLOnANonNumericField(t *testing.T) {
 	bad := buildSchema(func(b *dsl.SchemaBuilder) {
 		b.Table("items", func(tb *dsl.TableBuilder) {

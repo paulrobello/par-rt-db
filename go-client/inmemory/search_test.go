@@ -136,6 +136,34 @@ func TestSearchSnippet(t *testing.T) {
 	}
 }
 
+func TestSearchTrgmModeRejectedWhenNotDeclared(t *testing.T) {
+	// FM-30: an index without trgm: true rejects mode: "trgm" as BAD_REQUEST
+	// naming the missing declaration (mirrors rust
+	// query_search_trgm_mode_rejected_when_not_declared).
+	s := NewStore()
+	noTrgm := buildSchema(func(b *dsl.SchemaBuilder) {
+		b.Table("items", func(tb *dsl.TableBuilder) {
+			tb.Field("name", dsl.Str()).SearchIndex("by_content", "", "name")
+		})
+	})
+	if err := s.PushSchema(noTrgm); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	_, err := EvalQuery(s, wire.Query{Table: "items", Search: &wire.SearchQuery{
+		Index: "by_content", Query: "conv", Mode: wire.SearchModeTrgm,
+	}})
+	re, ok := err.(*rtdberrors.RtDbError)
+	if !ok || re.Code != rtdberrors.CodeBadRequest || !strings.Contains(re.Message, "does not declare trgm: true") {
+		t.Fatalf("trgm undeclared: %v", err)
+	}
+	// tsquery mode on the same index is unaffected.
+	if _, err := EvalQuery(s, wire.Query{Table: "items", Search: &wire.SearchQuery{
+		Index: "by_content", Query: "conv",
+	}}); err != nil {
+		t.Fatalf("tsquery on non-trgm index: %v", err)
+	}
+}
+
 func TestSearchErrors(t *testing.T) {
 	s := searchStore(t)
 	// Empty query.

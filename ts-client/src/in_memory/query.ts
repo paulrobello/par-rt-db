@@ -840,6 +840,14 @@ function executeSearchTerminal(
   if (!searchDef) {
     throw new RtDbError("BAD_REQUEST", `search index '${search.index}' not found`);
   }
+  // FM-30: mirrors server `compile_search` — `trgm` mode requires the index
+  // to have declared (or been grandfathered) `trgm: true`.
+  if (search.mode === "trgm" && !searchDef.trgm) {
+    throw new RtDbError(
+      "BAD_REQUEST",
+      `search index '${search.index}' does not declare trgm: true — trgm mode requires it`,
+    );
+  }
   // Validate the search-level filter against declared fields once (mirrors
   // server `compile_filter` composed into the search WHERE).
   if (search.filter) {

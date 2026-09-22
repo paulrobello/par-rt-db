@@ -330,6 +330,19 @@ describe("unique / where index builder", () => {
     expect(s.toJSON().tables.users.indexes).toEqual([{ name: "by_email", fields: ["email"] }]);
   });
 
+  it(".searchIndex(...).trgm() emits trgm:true on the wire; omitted otherwise (FM-30)", () => {
+    const s = defineSchema({
+      notes: defineTable({ title: t.string(), body: t.string() })
+        .searchIndex("search_text", ["title", "body"])
+        .trgm()
+        .searchIndex("search_title", ["title"]),
+    });
+    expect(s.toJSON().tables.notes.indexes).toEqual([
+      { name: "search_text", fields: ["title", "body"], search: true, trgm: true },
+      { name: "search_title", fields: ["title"], search: true },
+    ]);
+  });
+
   it(".unique() composes with a sibling plain index without bleeding into it", () => {
     const s = defineSchema({
       users: defineTable({ email: t.string(), name: t.string() })

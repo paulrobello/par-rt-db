@@ -298,6 +298,14 @@ public struct IndexDef: Equatable, Codable, Sendable {
     public var fields: [String]
     /// `true` marks a full-text search index.
     public var search: Bool
+    /// FM-30: `true` on a search index additionally builds a trigram GIN over
+    /// its text `fields`, enabling `search`'s `mode: .trgm` (substring
+    /// matching) on this index. Legal only alongside `search`. Create-time-
+    /// only — deliberately NOT compared in `detectDestructiveChanges` (like
+    /// `softDelete`), because push time grandfathers it for a search index
+    /// that already existed before this flag (see `grandfatherTrgm`).
+    /// Omitted on the wire when `false`, so existing schemas decode unchanged.
+    public var trgm: Bool
     /// When present, marks this as a vector index: `fields[0]` must name a
     /// `vector` field whose `dimensions` match.
     public var vector: VectorIndexSpec?
@@ -316,6 +324,7 @@ public struct IndexDef: Equatable, Codable, Sendable {
         name: String,
         fields: [String],
         search: Bool = false,
+        trgm: Bool = false,
         vector: VectorIndexSpec? = nil,
         unique: Bool = false,
         whereClause: FilterExpr? = nil,
@@ -324,6 +333,7 @@ public struct IndexDef: Equatable, Codable, Sendable {
         self.name = name
         self.fields = fields
         self.search = search
+        self.trgm = trgm
         self.vector = vector
         self.unique = unique
         self.whereClause = whereClause
@@ -331,7 +341,7 @@ public struct IndexDef: Equatable, Codable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case name, fields, search, vector, unique
+        case name, fields, search, trgm, vector, unique
         case whereClause = "where"
         case language
     }
@@ -341,6 +351,7 @@ public struct IndexDef: Equatable, Codable, Sendable {
         name = try container.decode(String.self, forKey: .name)
         fields = try container.decode([String].self, forKey: .fields)
         search = try container.decodeIfPresent(Bool.self, forKey: .search) ?? false
+        trgm = try container.decodeIfPresent(Bool.self, forKey: .trgm) ?? false
         vector = try container.decodeIfPresent(VectorIndexSpec.self, forKey: .vector)
         unique = try container.decodeIfPresent(Bool.self, forKey: .unique) ?? false
         whereClause = try container.decodeIfPresent(FilterExpr.self, forKey: .whereClause)
@@ -353,6 +364,9 @@ public struct IndexDef: Equatable, Codable, Sendable {
         try container.encode(fields, forKey: .fields)
         if search {
             try container.encode(search, forKey: .search)
+        }
+        if trgm {
+            try container.encode(trgm, forKey: .trgm)
         }
         try container.encodeIfPresent(vector, forKey: .vector)
         if unique {
@@ -653,6 +667,19 @@ public struct TableBuilder: Sendable {
         with {
             if let last = $0.lastIndex {
                 $0.indexes[last].unique = true
+            }
+        }
+    }
+
+    /// Opt the most recently declared search index into a trigram GIN
+    /// (`.searchIndex(...).trgm()`), enabling `search`'s `mode: .trgm`
+    /// (substring matching) on it (FM-30). Legal only on a search index; the
+    /// server rejects `trgm` on a btree/vector index at push time. No-ops
+    /// when no index has been declared yet.
+    public func trgm() -> TableBuilder {
+        with {
+            if let last = $0.lastIndex {
+                $0.indexes[last].trgm = true
             }
         }
     }

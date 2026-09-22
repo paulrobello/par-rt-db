@@ -883,6 +883,14 @@ private func executeSearchTerminal(
     }) else {
         throw RtDbError(code: .badRequest, message: "search index '\(search.index)' not found")
     }
+    // FM-30: mirrors server `compile_search` — `trgm` mode requires the
+    // index to have declared (or been grandfathered) `trgm: true`.
+    if search.mode == .trgm, !searchDef.trgm {
+        throw RtDbError(
+            code: .badRequest,
+            message: "search index '\(search.index)' does not declare trgm: true — trgm mode requires it"
+        )
+    }
     // Validate the search-level filter once (server compile_filter).
     if let filter = search.filter {
         try validateFilter(filter, tableDef)

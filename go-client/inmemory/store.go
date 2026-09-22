@@ -216,6 +216,10 @@ func (s *Store) PushSchema(schema wire.JSONValue) error {
 	if err := validateOnDelete(parsed); err != nil {
 		return err
 	}
+	// FM-30: mirrors server ddl::push_schema — grandfather trgm on a search
+	// index that already existed before this push declared it, before the
+	// (deliberately trgm-blind) destructive-change check.
+	grandfatherTrgm(s.schema, parsed)
 	if s.schema != nil {
 		if err := detectDestructiveChanges(s.schema, parsed); err != nil {
 			return err

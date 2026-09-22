@@ -78,7 +78,12 @@ from ..wire import (
     WorkflowSpec,
     WorkflowStatus,
 )
-from .migrate import _detect_destructive_changes, _on_delete_ref, _validate_on_delete
+from .migrate import (
+    _detect_destructive_changes,
+    _grandfather_trgm,
+    _on_delete_ref,
+    _validate_on_delete,
+)
 from .validate import _eval_filter_expr, _validate_filter
 from .value_expr import _reject_relative_time, _stamp_computed, _validate_computed
 
@@ -1403,6 +1408,10 @@ class _InMemoryStoreCore:
         ``BAD_REQUEST`` with the same messages as the live server's
         ``ddl.rs::detect_destructive_changes``."""
         _validate_schema(schema)
+        # FM-30: mirrors server `ddl::push_schema` — grandfather `trgm` on a
+        # search index that already existed before this push declared it,
+        # before the (deliberately trgm-blind) destructive-change check.
+        _grandfather_trgm(self._schema, schema)
         if self._schema is not None:
             _detect_destructive_changes(self._schema, schema)
         # FM-33: the server validates `onDelete` placement/shape in

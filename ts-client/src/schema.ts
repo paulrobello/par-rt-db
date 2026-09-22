@@ -237,6 +237,15 @@ export class TableDefinition<
     return this.amendLastIndex((last) => ({ ...last, unique: true }));
   }
 
+  /** Opt the most recently declared search index into a trigram GIN
+   * (`.searchIndex(...).trgm()`), enabling `search`'s `mode: 'trgm'`
+   * (substring matching) on it (FM-30). Legal only on a search index; the
+   * server rejects `trgm` on a btree/vector index at push-schema time. Throws
+   * if no index has been declared yet (same as `unique()`). */
+  trgm(): TableDefinition<Fields, Indexes, Stamped> {
+    return this.amendLastIndex((last) => ({ ...last, trgm: true }));
+  }
+
   /** Attach a partial-index predicate to the most-recently appended btree index.
    * The server bakes the predicate into `CREATE INDEX … WHERE` (literal SQL — no
    * bind params at DDL time). Same `FilterExpr` shape as the query-time
@@ -253,7 +262,7 @@ export class TableDefinition<
     amend: (last: IndexJson) => IndexJson,
   ): TableDefinition<Fields, Indexes, Stamped> {
     if (this.indexes.length === 0) {
-      throw new Error("unique()/where() require a preceding index() call");
+      throw new Error("unique()/where()/trgm() require a preceding index() call");
     }
     const indexes = [...this.indexes];
     indexes[indexes.length - 1] = amend(indexes[indexes.length - 1]);

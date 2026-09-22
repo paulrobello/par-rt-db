@@ -328,6 +328,33 @@ struct SchemaIndexTests {
         #expect(back.indexes?[1].unique == false)
     }
 
+    @Test func trgmSearchIndexBuilderAndWireShape() throws {
+        // FM-30: `.trgm()` marks the most recently declared search index and
+        // serializes as `"trgm": true`; a plain search index omits the key
+        // (so a pre-flag schema JSON decodes with `trgm == false`).
+        let table = TableBuilder()
+            .field("title", .string)
+            .field("body", .string)
+            .searchIndex("search_title", on: ["title"])
+            .trgm()
+            .searchIndex("search_body", on: ["body"])
+            .finish()
+        let indexes = try arrayValue(wireValue(table).objectValue?["indexes"] ?? .null) ?? []
+        #expect(indexes[0].objectValue?["name"] == .string("search_title"))
+        #expect(indexes[0].objectValue?["search"] == .bool(true))
+        #expect(indexes[0].objectValue?["trgm"] == .bool(true))
+        #expect(indexes[1].objectValue?["name"] == .string("search_body"))
+        #expect(indexes[1].objectValue?["trgm"] == nil)
+        let back = try roundTrip(table)
+        #expect(back.indexes?[0].trgm == true)
+        #expect(back.indexes?[1].trgm == false)
+        let legacy = try decodeStruct(
+            IndexDef.self, #"{"name":"search_body","fields":["body"],"search":true}"#
+        )
+        #expect(legacy.search)
+        #expect(!legacy.trgm)
+    }
+
     @Test func partialUniqueIndexBuilderAndWireShape() throws {
         // Mirrors rust `partial_unique_index_builder_and_wire_shape`:
         // `.whereClause(...)` attaches a partial-index predicate (wire key

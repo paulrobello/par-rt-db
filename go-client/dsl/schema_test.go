@@ -38,6 +38,7 @@ func TestSchemaRichTable(t *testing.T) {
 			Index("by_status", "status").
 			Unique().
 			SearchIndex("by_title", "english", "title").
+			Trgm().
 			VectorIndex("by_embedding", "embedding", 3, []string{"status"}, "").
 			OwnerField("owner").
 			TTL("expiresAt", &defaultDur).
@@ -49,7 +50,7 @@ func TestSchemaRichTable(t *testing.T) {
 	}
 	for _, pin := range []string{
 		`"onDelete":"cascade"`, `"type":"literal"`, `"type":"vector"`, `"dimensions":3`,
-		`"unique":true`, `"search":true`, `"language":"english"`, `"filterFields":["status"]`,
+		`"unique":true`, `"search":true`, `"trgm":true`, `"language":"english"`, `"filterFields":["status"]`,
 		`"ownerField":"owner"`, `"ttl":{"defaultDurationMs":86400000,"field":"expiresAt"}`,
 		`"softDelete":true`,
 	} {

@@ -87,10 +87,14 @@ func (f *FieldType) equal(o *FieldType) bool {
 
 // IndexDef is one declared index on a table (btree, search, vector, unique,
 // partial). Mirrors swift IndexDef; nil vector means not a vector index.
+// Trgm (FM-30) marks a search index as also carrying a trigram GIN, which
+// the search terminal's mode: "trgm" requires; omitted on the wire when
+// false and grandfathered on re-push (see grandfatherTrgm).
 type IndexDef struct {
 	Name        string
 	Fields      []string
 	Search      bool
+	Trgm        bool
 	Vector      *VectorIndexSpec
 	Unique      bool
 	WhereClause wire.FilterExpr
@@ -265,7 +269,7 @@ func parseIndexDef(v wire.JSONValue) (*IndexDef, error) {
 	if !ok {
 		return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "index definition must be a JSON object")
 	}
-	if err := rejectUnknownKeys(obj, "index", "name", "fields", "search", "vector",
+	if err := rejectUnknownKeys(obj, "index", "name", "fields", "search", "trgm", "vector",
 		"unique", "where", "language"); err != nil {
 		return nil, err
 	}
@@ -299,6 +303,13 @@ func parseIndexDef(v wire.JSONValue) (*IndexDef, error) {
 			return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "index.unique must be a boolean")
 		}
 		idx.Unique = bool(b)
+	}
+	if v, ok := obj["trgm"]; ok && v != nil {
+		b, ok := v.(wire.Bool)
+		if !ok {
+			return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "index.trgm must be a boolean")
+		}
+		idx.Trgm = bool(b)
 	}
 	if v, ok := obj["vector"]; ok && v != nil {
 		vobj, ok := v.(wire.Object)
