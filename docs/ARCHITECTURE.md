@@ -169,12 +169,14 @@ over-approximates to re-run, so it never under-approximates):
 
 - **`get(id)` point reads** (`subs::ReadSet::Point`) skip when the txn's
   `WriteSet.docs` doesn't contain their `(table, id)`.
-- **`count`/`collect`/`unique` on a btree index's eq-prefix** (+ optional range
-  bound) (`subs::ReadSet::Indexed`) skip when every written doc is provably
-  outside their window — `WriteSet.doc_values` carries each written doc's
-  before/after state so `fan_out` evaluates `Window::contains` per written doc
-  (deleted ⇒ re-run; `count` is membership-only, `collect`/`unique` are
-  content-bearing).
+- **`count`/`collect`/`unique`/`aggregate` on a btree index's eq-prefix** (+
+  optional range bound) (`subs::ReadSet::Indexed`) skip when every written doc
+  is provably outside their window — `WriteSet.doc_values` carries each
+  written doc's before/after state so `fan_out` evaluates `Window::contains`
+  per written doc (deleted ⇒ re-run; `count` is membership-only,
+  `collect`/`unique`/`aggregate` are content-bearing). `aggregate`'s window is
+  the same eq/range `WHERE` clause regardless of `groupBy` shape, so grouping
+  doesn't need its own branch here.
 - **`take(N)`/`first`/`paginate`** (`subs::ReadSet::Ordered`) pair that window
   with the sort key of the last computed result's final row — the boundary —
   and skip a written doc that is outside the window or ranks beyond the
@@ -185,9 +187,11 @@ over-approximates to re-run, so it never under-approximates):
   plain membership. Ranking needs `created_at`, which `doc_values` carries (a
   `Delete` captures none ⇒ deletes always re-run).
 
-`distinct`/`aggregate`/`search`/`vector`/`hybrid` stay table-level by design —
-their results depend on member values or a ranking function (over-approximate
-freely, never under-approximate).
+`distinct`/`search`/`vector`/`hybrid` stay table-level by design — their
+results depend on member values beyond the eq/range window or on a ranking
+function (over-approximate freely, never under-approximate). An `aggregate`
+with no eq/range bound (window = whole table, no skip benefit) or an
+unresolvable index also falls back to `Table`, same as `count`/`collect`.
 
 ### Safety nets
 

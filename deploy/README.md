@@ -262,9 +262,10 @@ Beyond the missed-push alert, watch the **rerun ratio** — the share of fan-out
 decisions that ended in a full table-level re-run rather than a provable skip.
 Subscription re-runs execute inside the committer turn, so a database whose
 re-runs dominate is one whose writes queue behind its own subscriber load
-(`distinct`/`aggregate`/`search`/`vector` subscriptions stay table-level and
-re-run on every write to their table — see `docs/ARCHITECTURE.md`). The ratio
-over `/metrics`:
+(`distinct`/`search`/`vector`/`hybrid` subscriptions — and an unwindowed
+`aggregate` with no eq/range bound — stay table-level and re-run on every
+write to their table; a windowed `aggregate` skips like `count`/`collect` —
+see `docs/ARCHITECTURE.md`). The ratio over `/metrics`:
 
 ```promql
 rate(rtdb_subs_reruns_total[5m])

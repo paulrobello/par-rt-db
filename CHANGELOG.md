@@ -88,6 +88,19 @@ alter observable behavior on upgrade.
 
 ### Added
 
+- **`aggregate` subscriptions join `count`/`collect`/`unique` in the
+  eq-prefix/range window skip (FEATURE_MATRIX #21).** `ReadSet::Indexed` now
+  also derives from `aggregate` (any op — `sum`/`avg`/`min`/`max`/`count` —
+  and any `groupBy` shape): a written doc provably outside the query's
+  eq-prefix/range window cannot enter any group and cannot move the
+  aggregate, so `fan_out` skips the re-run exactly as it already does for
+  `count`/`collect`/`unique`. `content_bearing: true` (like `collect`/
+  `unique`), since a member's field-value change inside the window can move
+  the result. An `aggregate` with no eq/range bound, or an unresolvable
+  index, still falls back to `Table` re-run-on-every-write, same as
+  `count`/`collect`. Server-only, no protocol change; `DocOp` unchanged so
+  op-feed/audit/webhook stay byte-identical.
+
 - **Op-feed events carry a monotonic `seq` and a `feedEpoch` for reconnect
   dedup** (FEATURE_MATRIX §1). Every `OpEvent` — on `/admin/stream` frames,
   `GET /admin/ops/recent` rows, and webhook payloads, which embed the

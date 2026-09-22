@@ -139,6 +139,20 @@ fn take_by_status(status: &str, n: u32) -> Query {
     .expect("parse query")
 }
 
+/// `SUM(order)` over the `by_project_status_order` eq-prefix window — the
+/// aggregate-terminal analogue of `count_by_status`/`collect_by_status`. The
+/// three-field index leaves `order` (the field after the `[projectId,
+/// status]` eq-prefix) as the aggregate's value column.
+fn sum_order_by_project_status(proj: &str, status: &str) -> Query {
+    serde_json::from_value(serde_json::json!({
+        "table": "workItems",
+        "index": "by_project_status_order",
+        "eq": [proj, status],
+        "aggregate": { "op": "sum" }
+    }))
+    .expect("parse query")
+}
+
 // ---- assertion helpers ----
 
 /// Drains the initial QueryUpdate sent right after `subscribe`. Panics if
@@ -295,6 +309,140 @@ async fn unique_skips_out_of_window_pushes_in_window() -> anyhow::Result<()> {
         .mutate(&db, None, insert("backlog", 3.0), PrincipalCtx::bypass())
         .await?;
     expect_update(&mut rx, "matching insert").await;
+
+    Ok(())
+}
+
+// =====================================================================
+// 1b. aggregate skips out-of-window writes, pushes on an in-window value
+//     change, and stays consistent with the shadow verifier.
+// =====================================================================
+
+#[tokio::test]
+async fn aggregate_skips_out_of_window_pushes_in_window() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+
+    let mut rx = sub(&state, &db, sum_order_by_project_status(PROJ, "backlog")).await;
+
+    // Wrong status on the same project — outside the eq-prefix window.
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, insert("done", 5.0), PrincipalCtx::bypass())
+        .await?;
+    expect_no_update(&mut rx, "out-of-window insert");
+
+    // Wrong project, right status — also outside the eq-prefix window.
+    let mut other = work_item("backlog", 5.0);
+    other.insert(
+        "projectId".to_string(),
+        serde_json::Value::String(OTHER_PROJ.to_string()),
+    );
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            Transaction {
+                steps: vec![Step::Insert {
+                    table: "workItems".to_string(),
+                    doc: other,
+                }],
+            },
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    expect_no_update(&mut rx, "wrong-project insert");
+
+    // In-window insert (right project, right status) — the sum moves, push.
+    let outcome = state
+        .realtime
+        .committers
+        .mutate(&db, None, insert("backlog", 10.0), PrincipalCtx::bypass())
+        .await?;
+    let id = id_of(&outcome);
+    expect_update(&mut rx, "in-window insert").await;
+
+    // A patch to a field OTHER than the aggregated one (title) is still
+    // content-bearing (`IndexedRead::content_bearing`), so it re-runs rather
+    // than skips — but the sum itself is unaffected, so the canonical diff
+    // suppresses the push. This is the documented "skipped vs. re-ran and
+    // diff-suppressed" distinction, not a defect.
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            patch_field(&id, "title", serde_json::Value::String("renamed".into())),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    expect_no_update(&mut rx, "in-window title patch (sum unaffected)");
+
+    // A patch to the AGGREGATED field itself moves the sum — must push.
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            patch_field(&id, "order", 25.0.into()),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    expect_update(&mut rx, "in-window order patch (sum moves)").await;
+
+    // Move the member OUT of the window (backlog → done): the sum changes
+    // (it loses this member), so this must push too.
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            patch_field(&id, "status", "done".into()),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    expect_update(&mut rx, "patch out of window").await;
+
+    Ok(())
+}
+
+/// The window-skip test above cannot distinguish "skipped" from "re-ran and
+/// the canonical diff suppressed the push" — both are correct. This test
+/// closes that gap for `aggregate` specifically, the way section 13 does for
+/// the matrix as a whole: with `subs_verify_skip_every = 1`, every skip is
+/// shadow-verified against a real re-run, so if the aggregate skip class were
+/// unsound this would fail via `subsMissedPushesTotal` rather than silently
+/// dropping a push in production.
+#[tokio::test]
+async fn aggregate_verified_skip_records_no_missed_push() -> anyhow::Result<()> {
+    let state = test_state_with_skip_verification(1).await;
+    let db = fresh_db(&state).await;
+
+    let mut rx = sub(&state, &db, sum_order_by_project_status(PROJ, "backlog")).await;
+
+    state
+        .realtime
+        .committers
+        .mutate(&db, None, insert("done", 5.0), PrincipalCtx::bypass())
+        .await?;
+    expect_no_update(&mut rx, "out-of-window insert");
+
+    let (_, indexed, _, verifications, missed) = invalidation_counters(&state).await;
+    assert!(indexed > 0, "the aggregate sub should have skipped");
+    assert!(
+        verifications > 0,
+        "with every=1 the skip should have been shadow-verified"
+    );
+    assert_eq!(
+        missed, 0,
+        "aggregate skip diverged from a real re-run — invalidation is unsound"
+    );
 
     Ok(())
 }

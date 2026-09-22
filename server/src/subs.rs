@@ -6,9 +6,12 @@
 //! affect the result; any doubt over-approximates to re-run. Two safety nets
 //! guard the skip logic: an exhaustive `cmp_binds` match (a new `EqBind` variant
 //! is a compile error, not a silent under-approximation) and the
-//! `RTDB_SUBS_VERIFY_SKIP_EVERY` shadow-verify probe. `distinct`/`aggregate`/
-//! `search`/`vector`/`hybrid` stay table-level by design — their results depend
-//! on member values or a ranking function.
+//! `RTDB_SUBS_VERIFY_SKIP_EVERY` shadow-verify probe. `distinct`/`search`/
+//! `vector`/`hybrid` stay table-level by design — their results depend on
+//! member values (beyond the eq/range window) or a ranking function.
+//! `aggregate` (`sum`/`avg`/`min`/`max`/`count`) shares `count`/`collect`'s
+//! `ReadSet::Indexed` window: a write provably outside the eq-prefix/range
+//! window cannot move an aggregate scoped to that window.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,10 +56,15 @@ enum ReadSet {
     /// A `get(id)` point read: the result is exactly this one document, so a
     /// write to any other document cannot change it.
     Point { id: String },
-    /// A `count`, `collect`, or `unique` query filtered on a btree index's
-    /// eq-prefix (and an optional range bound on the next index field). A write
-    /// to a document provably outside the window cannot change the result, so
-    /// `fan_out` can skip the re-run. See `IndexedRead` for the soundness model.
+    /// A `count`, `collect`, `unique`, or `aggregate` query filtered on a
+    /// btree index's eq-prefix (and an optional range bound on the next index
+    /// field). A write to a document provably outside the window cannot
+    /// change the result, so `fan_out` can skip the re-run. See `IndexedRead`
+    /// for the soundness model. `aggregate` reuses the `content_bearing: true`
+    /// (in-window value change matters) path `collect`/`unique` already use —
+    /// its SUM/AVG/MIN/MAX/COUNT is a function of the values of documents
+    /// INSIDE the window, so any write that cannot cross the window boundary
+    /// cannot move it, exactly like a `collect`'s member set.
     Indexed(IndexedRead),
     /// A `take(N)` / `first` / `paginate` query: an ORDERED, truncated window.
     /// Window membership alone can't decide these (a doc can enter or leave the
@@ -64,8 +72,10 @@ enum ReadSet {
     /// tracks the sort key of the last result's final document — the boundary —
     /// and skips only writes that provably rank beyond it.
     Ordered(OrderedRead),
-    /// Every other shape (distinct / aggregate / search / vector / hybrid):
-    /// the result depends on the VALUES of the matching set or on a ranking
+    /// Every other shape (distinct / search / vector / hybrid), plus an
+    /// `aggregate` whose window derivation failed (no index, no eq/range
+    /// bound, an unresolvable index, or a mistyped eq/range value): the
+    /// result depends on the VALUES of the matching set or on a ranking
     /// function, neither of which membership or boundary reasoning can bound,
     /// so re-run on any write to the table (today's behavior).
     Table,
@@ -91,11 +101,14 @@ struct Window {
     range: Option<RangeBound>,
 }
 
-/// A `count` / `collect` / `unique` subscription's window. `fan_out` re-runs
-/// only when a written document may have crossed the window boundary.
+/// A `count` / `collect` / `unique` / `aggregate` subscription's window.
+/// `fan_out` re-runs only when a written document may have crossed the window
+/// boundary.
 ///
-/// `content_bearing` is true for `collect` and `unique` (return doc bodies — a
-/// member's content change matters) and false for `count` (pure membership).
+/// `content_bearing` is true for `collect`, `unique`, and `aggregate` (the
+/// result is a function of a member's field VALUES — a body change inside the
+/// window can change it) and false for `count` (pure membership: only a
+/// window-crossing changes the cardinality).
 #[derive(Debug, Clone)]
 struct IndexedRead {
     window: Window,
@@ -595,13 +608,23 @@ impl ReadSet {
 
     /// Derive an `Indexed` window from the query + table def. Returns `None`
     /// (⇒ try `Ordered`, else fall back to `Table`) when ANY of:
-    /// - the terminal is not one of `count` / `collect` (no terminal) / `unique`;
+    /// - the terminal is not one of `count` / `collect` (no terminal) /
+    ///   `unique` / `aggregate`;
     /// - a truncating/value-sensitive/ranking terminal is set
-    ///   (`take`/`first`/`paginate`/`distinct`/`aggregate`/`search`/`vector`/`hybrid`);
+    ///   (`take`/`first`/`paginate`/`distinct`/`search`/`vector`/`hybrid`);
     /// - no `index` is declared, or it has no eq bind AND no range bound
     ///   (the window would be the whole table → no skip benefit);
     /// - the index or any eq/range value fails to type (defensive: any doubt
     ///   ⇒ `Table`, which can only over-approximate).
+    ///
+    /// `aggregate` (any op, any `groupBy` shape) is eligible on the same
+    /// footing as `collect`: the query's `WHERE` clause is the eq/range window
+    /// regardless of grouping, so a write a written doc provably outside that
+    /// window cannot enter ANY group and cannot move the aggregate — grouping
+    /// only changes how the matching set is bucketed, not which docs are in
+    /// it. This mirrors `count`/`collect`'s precedent (ARC-013 spec matrix
+    /// row 21) and is the reason the window derivation needs no groupBy-aware
+    /// branch here.
     ///
     /// `from_query` never panics.
     fn try_indexed(query: &Query, table_def: &TableDef) -> Option<IndexedRead> {
@@ -617,7 +640,8 @@ impl ReadSet {
             && query.vector_search.is_none()
             && query.hybrid_search.is_none()
             && query.take.is_none();
-        let eligible_terminal = query.count || query.unique || is_collect;
+        let is_aggregate = query.aggregate.is_some();
+        let eligible_terminal = query.count || query.unique || is_aggregate || is_collect;
         if !eligible_terminal {
             return None;
         }
@@ -632,9 +656,10 @@ impl ReadSet {
 
         Some(IndexedRead {
             window,
-            // collect / unique return doc bodies (a member's content change
-            // matters); count returns only a cardinality.
-            content_bearing: query.unique || is_collect,
+            // collect / unique / aggregate return or depend on doc field
+            // values (a member's content change matters); count returns only
+            // a cardinality.
+            content_bearing: query.unique || is_aggregate || is_collect,
         })
     }
 
@@ -1387,9 +1412,12 @@ mod tests {
         // Value-sensitive / ranking terminals stay Table even with an index +
         // eq: their result depends on the VALUES of the matching set, which
         // neither window membership nor a sort boundary can bound.
+        // (`aggregate` is NOT in this list — see
+        // `aggregate_on_eq_prefix_derives_indexed` below: an aggregate's
+        // window is the same eq/range WHERE clause `count`/`collect` already
+        // window-bound.)
         let cases = [
             serde_json::json!({ "table": "t", "index": "by_status", "eq": ["x"], "distinct": true }),
-            serde_json::json!({ "table": "t", "index": "by_status_order", "eq": ["x"], "aggregate": { "op": "sum" } }),
             // Untruncated collect / count with no eq and no range ⇒ the window
             // is the whole table and there is no boundary ⇒ no skip benefit.
             serde_json::json!({ "table": "t" }),
@@ -1404,6 +1432,45 @@ mod tests {
                 query
             );
         }
+    }
+
+    #[test]
+    fn aggregate_on_eq_prefix_derives_indexed() {
+        let td = test_table_def();
+        // Ungrouped scalar sum over the eq-prefix window.
+        let query = q(
+            serde_json::json!({ "table": "t", "index": "by_status_order", "eq": ["backlog"], "aggregate": { "op": "sum" } }),
+        );
+        match ReadSet::from_query(&query, &td) {
+            ReadSet::Indexed(idx) => {
+                assert_eq!(idx.window.eq.len(), 1);
+                assert_eq!(idx.window.eq[0].0, "status");
+                // A member's field-VALUE change (not just membership) can
+                // move a sum, so aggregate is content-bearing like collect.
+                assert!(idx.content_bearing);
+            }
+            other => panic!("aggregate+eq should be Indexed, got {other:?}"),
+        }
+
+        // Grouped (legacy groupBy: true) still windows on the same eq prefix
+        // — grouping only buckets the matching set, it doesn't widen it.
+        let query = q(
+            serde_json::json!({ "table": "t", "index": "by_status", "eq": ["backlog"], "aggregate": { "op": "count", "groupBy": true } }),
+        );
+        assert!(matches!(
+            ReadSet::from_query(&query, &td),
+            ReadSet::Indexed(_)
+        ));
+
+        // No eq and no range ⇒ whole-table window ⇒ no skip benefit ⇒ Table.
+        let query = q(
+            serde_json::json!({ "table": "t", "index": "by_status_order", "aggregate": { "op": "count" } }),
+        );
+        assert!(matches!(ReadSet::from_query(&query, &td), ReadSet::Table));
+
+        // No index at all ⇒ Table (same as count/collect without an index).
+        let query = q(serde_json::json!({ "table": "t", "aggregate": { "op": "count" } }));
+        assert!(matches!(ReadSet::from_query(&query, &td), ReadSet::Table));
     }
 
     #[test]
