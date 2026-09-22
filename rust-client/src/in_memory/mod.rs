@@ -210,6 +210,14 @@ pub struct ScheduledJob {
     /// external claim surface with a fencing token. Mirrors the server's
     /// `scheduled_txns.external` column.
     pub external: bool,
+    /// Cumulative count of recurring-job windows that elapsed before a fire.
+    /// Computed exactly for interval jobs (`(now - due_at - 1) / every_ms`
+    /// when positive); always `0` for cron jobs, since this harness re-arms
+    /// cron on a fixed `CRON_STEP_MS` approximation rather than real cron
+    /// occurrence math and cannot count missed cron windows accurately.
+    pub missed_count: i64,
+    /// Epoch ms of the last fire at which a missed window was detected.
+    pub last_missed_at: Option<i64>,
 }
 
 /// A stored file blob with its server-side metadata. Mirrors the TS
@@ -1997,6 +2005,8 @@ impl InMemoryRtDbClient {
             fired_count: 0,
             last_error: None,
             external,
+            missed_count: 0,
+            last_missed_at: None,
         };
         self.schedules.push(job);
         Ok(id)
@@ -2095,6 +2105,7 @@ impl InMemoryRtDbClient {
             let job_id = job.id.clone();
             let kind = job.kind;
             let every_ms = job.every_ms;
+            let prev_due_at = job.due_at;
             match self.execute_transaction(&txn) {
                 Ok(_results) => {
                     // Re-borrow the job (it may have moved if execute_transaction
@@ -2113,14 +2124,30 @@ impl InMemoryRtDbClient {
                             ScheduleKind::Cron => {
                                 j.due_at = now + CRON_STEP_MS;
                                 j.status = ScheduleStatus::Pending;
+                                // This harness re-arms cron on a fixed
+                                // CRON_STEP_MS approximation, not real cron
+                                // occurrence math, so it cannot count missed
+                                // cron windows accurately — missed_count stays
+                                // 0 for cron jobs (see ScheduledJob doc).
                             }
                             // Interval re-arms from each actual fire time (cron
                             // parity: windows missed during the fire's latency
-                            // are skipped, not backfilled).
+                            // are skipped, not backfilled). The elapsed-window
+                            // count is exact here (unlike cron): the delta
+                            // between when this fire was due and now, divided
+                            // by the fixed recurrence.
                             ScheduleKind::Interval => match every_ms {
                                 Some(ms) => {
                                     j.due_at = now + ms;
                                     j.status = ScheduleStatus::Pending;
+                                    let delta = now - prev_due_at;
+                                    if ms > 0 && delta > 0 {
+                                        let missed = (delta - 1) / ms;
+                                        if missed > 0 {
+                                            j.missed_count += missed;
+                                            j.last_missed_at = Some(now);
+                                        }
+                                    }
                                 }
                                 None => {
                                     j.status = ScheduleStatus::Error;
@@ -2356,6 +2383,8 @@ fn schedule_info(job: &ScheduledJob) -> ScheduleInfo {
         created_at: job.created_at,
         fired_count: job.fired_count,
         external: job.external,
+        missed_count: job.missed_count,
+        last_missed_at: job.last_missed_at,
     }
 }
 

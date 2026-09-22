@@ -231,6 +231,12 @@ interface ScheduledJob {
    * via the external claim surface (server `scheduled_txns.external`). */
   external: boolean;
   lastError?: string;
+  /** Cumulative count of recurring-job windows that elapsed before a fire.
+   * Computed exactly for interval jobs; always 0 for cron jobs, since this
+   * harness re-arms cron on a fixed `CRON_STEP_MS` approximation rather than
+   * real cron occurrence math and cannot count missed cron windows accurately. */
+  missedCount: number;
+  lastMissedAt?: number;
 }
 
 /** Approximate cron re-fire interval for the in-memory stub. Real 5-field cron
@@ -1395,6 +1401,7 @@ export class InMemoryRtDbClient {
       createdAt: now,
       firedCount: 0,
       external,
+      missedCount: 0,
     };
     if (when.type === "cron") {
       job.cron = when.expr;
@@ -1678,6 +1685,7 @@ export class InMemoryRtDbClient {
         continue;
       }
       try {
+        const prevDueAt = job.dueAt;
         this.executeTransaction(job.txn);
         job.firedCount++;
         if (job.kind === "oneshot") {
@@ -1685,8 +1693,20 @@ export class InMemoryRtDbClient {
         } else {
           // Interval re-arms from each actual fire time (cron parity: windows
           // missed during the fire's latency are skipped, not backfilled).
+          // The elapsed-window count is exact for interval jobs (unlike
+          // cron, which this harness approximates on a fixed CRON_STEP_MS).
           const stepMs =
             job.kind === "interval" && job.everyMs !== undefined ? job.everyMs : CRON_STEP_MS;
+          if (job.kind === "interval" && job.everyMs !== undefined) {
+            const delta = now - prevDueAt;
+            if (delta > 0) {
+              const missed = Math.floor((delta - 1) / job.everyMs);
+              if (missed > 0) {
+                job.missedCount += missed;
+                job.lastMissedAt = now;
+              }
+            }
+          }
           job.dueAt = now + stepMs;
           job.status = "pending";
         }
@@ -1950,6 +1970,12 @@ export class InMemoryRtDbClient {
     }
     if (job.lastError !== undefined) {
       info.lastError = job.lastError;
+    }
+    if (job.missedCount > 0) {
+      info.missedCount = job.missedCount;
+    }
+    if (job.lastMissedAt !== undefined) {
+      info.lastMissedAt = job.lastMissedAt;
     }
     return info;
   }

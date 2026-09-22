@@ -46,6 +46,7 @@ func (s *Store) Tick(now int64) int {
 			continue
 		}
 		if j := s.findJob(jobID); j != nil {
+			prevDueAt := j.DueAt
 			j.FiredCount++
 			switch kind {
 			case ScheduleKindOneShot:
@@ -58,6 +59,17 @@ func (s *Store) Tick(now int64) int {
 				if everyMs != nil {
 					// Re-arm from each actual fire time: windows missed
 					// during the fire's latency are skipped, not backfilled.
+					// The elapsed-window count is exact here (unlike cron,
+					// which this harness approximates on a fixed cronStepMs).
+					delta := now - prevDueAt
+					if delta > 0 {
+						missed := (delta - 1) / *everyMs
+						if missed > 0 {
+							j.MissedCount += missed
+							missedAt := now
+							j.LastMissedAt = &missedAt
+						}
+					}
 					j.DueAt = now + *everyMs
 					j.Status = ScheduleStatusPending
 				} else {

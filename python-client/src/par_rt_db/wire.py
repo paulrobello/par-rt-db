@@ -171,15 +171,25 @@ class ScheduleInfo(_Camel):
     created_at: int
     fired_count: int
     external: bool = False
+    #: Cumulative count of recurring-job windows that elapsed before a fire
+    #: (e.g. the process was down across one or more fire times). Recurring
+    #: jobs skip missed windows by design — this is observability, not a
+    #: policy change. Omitted on the wire when 0.
+    missed_count: int = 0
+    #: Epoch ms of the last fire at which a missed window was detected.
+    #: Omitted on the wire when ``None``.
+    last_missed_at: int | None = None
 
     @model_serializer(mode="wrap")
     def _drop_none_optional(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
-        for alias in ("cron", "everyMs", "tz", "lastError"):
+        for alias in ("cron", "everyMs", "tz", "lastError", "lastMissedAt"):
             if out.get(alias) is None:
                 out.pop(alias, None)
         if not out.get("external"):
             out.pop("external", None)
+        if not out.get("missedCount"):
+            out.pop("missedCount", None)
         return out
 
 

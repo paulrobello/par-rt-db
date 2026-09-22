@@ -317,6 +317,12 @@ class _ScheduledJob:
     last_error: str | None
     tz: str | None = None
     external: bool = False
+    #: Cumulative count of recurring-job windows that elapsed before a fire.
+    #: Computed exactly for interval jobs; always 0 for cron jobs, since this
+    #: harness re-arms cron on a fixed CRON_STEP_MS approximation rather than
+    #: real cron occurrence math.
+    missed_count: int = 0
+    last_missed_at: int | None = None
 
 
 # The awaitSignal slot's "no delivery" state — a sentinel, not None, because
@@ -1276,6 +1282,8 @@ def _schedule_info(job: _ScheduledJob) -> ScheduleInfo:
             "createdAt": job.created_at,
             "firedCount": job.fired_count,
             "external": job.external,
+            "missedCount": job.missed_count,
+            "lastMissedAt": job.last_missed_at,
         }
     )
 
@@ -2795,6 +2803,7 @@ class _InMemoryStoreCore:
             else:
                 j = self._find_job(job_id)
                 if j is not None:
+                    prev_due_at = j.due_at
                     j.fired_count += 1
                     if kind == "oneshot":
                         # Remove after a successful fire; don't bump i (the next
@@ -2802,6 +2811,15 @@ class _InMemoryStoreCore:
                         self._schedules = [s for s in self._schedules if s.id != job_id]
                         continue
                     if kind == "interval" and j.every_ms is not None:
+                        # The elapsed-window count is exact for interval jobs
+                        # (unlike cron, which this harness approximates on a
+                        # fixed CRON_STEP_MS rather than real cron math).
+                        delta = now - prev_due_at
+                        if delta > 0:
+                            missed = (delta - 1) // j.every_ms
+                            if missed > 0:
+                                j.missed_count += missed
+                                j.last_missed_at = now
                         j.due_at = now + j.every_ms
                     else:
                         j.due_at = now + CRON_STEP_MS

@@ -328,6 +328,15 @@ pub struct Metrics {
     /// Total expired documents deleted by the per-db TTL reaper across all
     /// dbs/tables. Global (no db/table labels) to match the neighboring counters.
     ttl_expired_total: AtomicU64,
+    // ---- Scheduled/cron missed windows ----
+    /// Cumulative count of recurring-job windows that elapsed before a fire
+    /// (e.g. the process was down across one or more fire times), across all
+    /// dbs/tables. Global (no db/table labels) to match the neighboring
+    /// counters. Recurring jobs skip missed windows by design (see
+    /// `scheduler::missed_windows_interval`/`missed_windows_cron`) — this
+    /// counts how often that skip happened, it does not change the skip
+    /// policy.
+    scheduled_missed_total: AtomicU64,
     // ---- Anon→real merge (FM-27) ----
     /// Total documents re-stamped by the anon→real user merge across all
     /// dbs/tables. Global (no db/table labels) to match the neighboring counters.
@@ -532,6 +541,14 @@ impl Metrics {
         self.ttl_expired_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A recurring job's fire detected `n` elapsed windows before it (missed
+    /// while the process was down, or otherwise skipped). Call once per fire
+    /// that found `n > 0`; a fire with `n == 0` (the common case) never calls
+    /// this.
+    pub fn record_scheduled_missed(&self, n: u64) {
+        self.scheduled_missed_total.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// Documents re-stamped by the anon→real merge (FM-27), across all dbs/tables.
     pub fn record_merge_doc(&self) {
         self.merge_docs_total.fetch_add(1, Ordering::Relaxed);
@@ -668,6 +685,7 @@ impl Metrics {
                 .load(Ordering::Relaxed),
             subs_missed_pushes_total: self.subs_missed_pushes_total.load(Ordering::Relaxed),
             ttl_expired_total: self.ttl_expired_total.load(Ordering::Relaxed),
+            scheduled_missed_total: self.scheduled_missed_total.load(Ordering::Relaxed),
             merge_docs_total: self.merge_docs_total.load(Ordering::Relaxed),
             image_transforms_hit_total: self.image_transforms_hit_total.load(Ordering::Relaxed),
             image_transforms_miss_total: self.image_transforms_miss_total.load(Ordering::Relaxed),
@@ -779,6 +797,9 @@ pub struct MetricsSnapshot {
     pub subs_missed_pushes_total: u64,
     /// Total expired documents deleted by the TTL reaper (all dbs/tables).
     pub ttl_expired_total: u64,
+    /// Cumulative count of recurring-job windows that elapsed before a fire
+    /// (all dbs/tables). See `Metrics::scheduled_missed_total`.
+    pub scheduled_missed_total: u64,
     /// Total documents re-stamped by the anon→real user merge (all dbs/tables).
     pub merge_docs_total: u64,
     /// Image-transform cache lookups, by outcome (ENH-014).
@@ -962,6 +983,15 @@ pub fn render_prometheus(snap: &MetricsSnapshot, fingerprint: Option<(&str, &str
         snap.ttl_expired_total
     ));
 
+    s.push_str(
+        "# HELP rtdb_scheduled_missed_total Recurring-job windows that elapsed before a fire (e.g. process downtime), across all dbs/tables.\n",
+    );
+    s.push_str("# TYPE rtdb_scheduled_missed_total counter\n");
+    s.push_str(&format!(
+        "rtdb_scheduled_missed_total {}\n",
+        snap.scheduled_missed_total
+    ));
+
     // Anon→real merge (FM-27).
     s.push_str(
         "# HELP rtdb_merge_docs_total Total documents re-stamped by the anon-to-real user merge across all dbs/tables.\n",
@@ -1093,6 +1123,7 @@ mod tests {
             subs_skip_verifications_total: 15,
             subs_missed_pushes_total: 0,
             ttl_expired_total: 0,
+            scheduled_missed_total: 0,
             merge_docs_total: 0,
             image_transforms_hit_total: 0,
             image_transforms_miss_total: 0,
@@ -1159,6 +1190,7 @@ mod tests {
             subs_skip_verifications_total: 7,
             subs_missed_pushes_total: 9,
             ttl_expired_total: 0,
+            scheduled_missed_total: 0,
             merge_docs_total: 0,
             image_transforms_hit_total: 0,
             image_transforms_miss_total: 0,
@@ -1302,6 +1334,7 @@ mod tests {
             subs_skip_verifications_total: 0,
             subs_missed_pushes_total: 0,
             ttl_expired_total: 0,
+            scheduled_missed_total: 0,
             merge_docs_total: 0,
             image_transforms_hit_total: 0,
             image_transforms_miss_total: 0,
@@ -1391,6 +1424,7 @@ mod tests {
             subs_skip_verifications_total: 0,
             subs_missed_pushes_total: 0,
             ttl_expired_total: 0,
+            scheduled_missed_total: 0,
             merge_docs_total: 0,
             image_transforms_hit_total: 0,
             image_transforms_miss_total: 0,

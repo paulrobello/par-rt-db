@@ -983,6 +983,17 @@
       "status": "pending",
       "createdAt": 500,
       "firedCount": 0
+    },
+    {
+      "id": "jmissed",
+      "kind": "interval",
+      "dueAt": 2700,
+      "everyMs": 5000,
+      "status": "pending",
+      "createdAt": 500,
+      "firedCount": 3,
+      "missedCount": 2,
+      "lastMissedAt": 2650
     }
   ],
   "query_results": [

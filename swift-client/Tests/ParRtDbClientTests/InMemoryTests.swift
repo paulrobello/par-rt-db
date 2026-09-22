@@ -1253,7 +1253,31 @@ struct InMemoryTests {
         // (never a backfill burst), re-armed a full interval from the fire.
         _ = try client.tick(nowMs: pinnedNow + 10000)
         #expect(try count(client.query(Query(table: "items", count: true))) == 1)
-        #expect(client.listSchedules().first?.dueAt == pinnedNow + 11000)
+        let info = try #require(client.listSchedules().first)
+        #expect(info.dueAt == pinnedNow + 11000)
+        // ENH: the skip is now observable. due_at was pinnedNow + 1000; the
+        // fire at pinnedNow + 10000 is 9 intervals late, of which 8 full
+        // windows elapsed strictly before it (the 9th is the window this
+        // fire itself caught up on, not a miss).
+        #expect(info.missedCount == 8)
+        #expect(info.lastMissedAt == pinnedNow + 10000)
+    }
+
+    /// Negative control for the missed-window counter: a job firing on
+    /// normal poll cadence must never report a missed window. Without this,
+    /// `intervalScheduleSkipsMissedWindowsOnClockJump` alone can't
+    /// distinguish "counts real misses" from "always reports > 0".
+    @Test func intervalScheduleOnTimeReportsZeroMissedWindows() throws {
+        let client = deterministicClient()
+        try client.pushSchema(itemsSchema())
+        _ = try client.schedule(
+            Transaction(steps: [.insert(table: "items", doc: ["title": .string("s"), "n": .int(1)])]),
+            when: .interval(everyMs: 1000)
+        )
+        _ = try client.tick(nowMs: pinnedNow + 1000)
+        let info = try #require(client.listSchedules().first)
+        #expect(info.missedCount == 0)
+        #expect(info.lastMissedAt == nil)
     }
 
     @Test func intervalScheduleResumeShiftsDueAtWithoutBackfill() throws {

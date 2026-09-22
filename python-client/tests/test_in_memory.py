@@ -2619,7 +2619,28 @@ def test_tick_interval_skips_missed_windows_on_a_big_clock_jump() -> None:
     c.tick()
     # Fires once from the due instant — no backfill of the missed windows.
     assert len(c.run_query(TableQuery("items").build())) == 1
-    assert c.list_schedules()[0].due_at == clock[0] + every
+    info = c.list_schedules()[0]
+    assert info.due_at == clock[0] + every
+    # ENH: the skip is now observable. due_at was originally now0 + every;
+    # the clock then jumped by every*10, so the fire is every*9 late —
+    # 8 full windows elapsed before it (the delta isn't an exact multiple of
+    # `every`, so the 9th partial window doesn't count as missed).
+    assert info.missed_count == 8
+    assert info.last_missed_at == clock[0]
+
+
+def test_tick_interval_on_time_reports_zero_missed_windows() -> None:
+    """Negative control: firing on normal poll cadence must never report a
+    missed window — without this, the big-clock-jump test alone can't
+    distinguish "counts real misses" from "always reports > 0"."""
+    every = 5_000
+    c, clock = _new_clock_client()
+    c.schedule(_insert_todo_txn(), _when.validate_python({"type": "interval", "everyMs": every}))
+    clock[0] += every + 1  # one ordinary fire, not a downtime jump
+    c.tick()
+    info = c.list_schedules()[0]
+    assert info.missed_count == 0
+    assert info.last_missed_at is None
 
 
 def test_pause_then_resume_shifts_interval_due_from_resume_time() -> None:

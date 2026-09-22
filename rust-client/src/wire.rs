@@ -1831,6 +1831,8 @@ mod tests {
             created_at: 500,
             fired_count: 0,
             external: false,
+            missed_count: 0,
+            last_missed_at: None,
         };
         let v = serde_json::to_value(&oneshot).unwrap();
         assert_eq!(
@@ -1856,6 +1858,8 @@ mod tests {
             created_at: 500,
             fired_count: 3,
             external: false,
+            missed_count: 0,
+            last_missed_at: None,
         };
         let v = serde_json::to_value(&cron).unwrap();
         assert_eq!(
@@ -1883,6 +1887,8 @@ mod tests {
             created_at: 500,
             fired_count: 0,
             external: false,
+            missed_count: 0,
+            last_missed_at: None,
         };
         let iv = serde_json::to_value(&interval).unwrap();
         assert_eq!(

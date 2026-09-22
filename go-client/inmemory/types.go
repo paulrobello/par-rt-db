@@ -47,6 +47,13 @@ type ScheduledJob struct {
 	// External jobs are never internally executed; claimed by application
 	// workers with a fencing token.
 	External bool
+	// MissedCount is the cumulative count of recurring-job windows that
+	// elapsed before a fire. Computed exactly for interval jobs; always 0
+	// for cron jobs, since this harness re-arms cron on a fixed cronStepMs
+	// approximation rather than real cron occurrence math and cannot count
+	// missed cron windows accurately.
+	MissedCount  int64
+	LastMissedAt *int64
 }
 
 // storeSubscription is the inner state of one reactive subscription: alive is

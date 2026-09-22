@@ -190,6 +190,14 @@ type ScheduleInfo struct {
 	CreatedAt  int64          `json:"createdAt"`
 	FiredCount int64          `json:"firedCount"`
 	External   bool           `json:"external,omitempty"`
+	// MissedCount is the cumulative count of recurring-job windows that
+	// elapsed before a fire (e.g. the process was down across one or more
+	// fire times). Recurring jobs skip missed windows by design — this is
+	// observability, not a policy change. Omitted on the wire when 0.
+	MissedCount int64 `json:"missedCount,omitempty"`
+	// LastMissedAt is the epoch ms of the last fire at which a missed
+	// window was detected, present only when MissedCount is nonzero.
+	LastMissedAt *int64 `json:"lastMissedAt,omitempty"`
 }
 
 // Mirrors core/src/mutation.rs::ScheduleKind — snake_case values.

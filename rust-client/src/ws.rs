@@ -2759,6 +2759,8 @@ mod tests {
                     created_at: 1000,
                     fired_count: 0,
                     external: false,
+                    missed_count: 0,
+                    last_missed_at: None,
                 }],
             },
             &mut queues,

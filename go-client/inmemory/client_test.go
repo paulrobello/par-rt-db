@@ -97,6 +97,11 @@ func TestSchedulerIntervalReArms(t *testing.T) {
 	if job.FiredCount != 1 || job.DueAt != 1300 {
 		t.Fatalf("re-arm: fired=%d dueAt=%d", job.FiredCount, job.DueAt)
 	}
+	// Fired at 1200, due at 1100 (1000 + everyMs 100): 100ms late, less than
+	// one full window — normal poll cadence, not a missed window.
+	if job.MissedCount != 0 || job.LastMissedAt != nil {
+		t.Fatalf("on-time fire must not report a missed window: missed=%d lastMissedAt=%v", job.MissedCount, job.LastMissedAt)
+	}
 	// Failed fires mark the job errored with the last error preserved.
 	_, err = c.Mutate(context.Background(), wire.Transaction{Steps: []wire.Step{wire.StepSchedule{
 		When: wire.WhenInterval{EveryMs: 50},
@@ -117,6 +122,50 @@ func TestSchedulerIntervalReArms(t *testing.T) {
 	}
 	if bad == nil {
 		t.Fatal("failed fire not recorded")
+	}
+}
+
+// TestSchedulerIntervalRecordsMissedWindowsAfterBigClockJump is the
+// restart-equivalent shape: a stale DueAt (several windows in the past) is
+// observationally identical to process downtime. ENH: the skip must be
+// counted, not silent.
+func TestSchedulerIntervalRecordsMissedWindowsAfterBigClockJump(t *testing.T) {
+	var clock int64 = 1000
+	c := New(Options{Now: func() int64 { return clock }})
+	if err := c.PushSchema(testSchema()); err != nil {
+		t.Fatal(err)
+	}
+	_, err := c.Mutate(context.Background(), wire.Transaction{Steps: []wire.Step{wire.StepInsert{
+		Table: "items", Doc: docObj("name", "base", "status", "todo", "order", 0),
+	}}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Mutate(context.Background(), wire.Transaction{Steps: []wire.Step{wire.StepSchedule{
+		When: wire.WhenInterval{EveryMs: 100},
+		Txn: wire.Transaction{Steps: []wire.Step{wire.StepPatchByQuery{
+			Table:  "items",
+			Filter: dsl.Eq("name", wire.String("base")),
+			Patch:  docObj("order", 99),
+		}}},
+	}}}, "")
+	if err != nil {
+		t.Fatalf("schedule interval: %v", err)
+	}
+	// Job's due_at is 1000 + 100 = 1100. Jump the clock to 2100 — 10
+	// intervals past due. Fires exactly once (never a backfill burst),
+	// 9 full windows elapsed before it (the fire at 2100 is the 10th).
+	clock = 2100
+	c.Tick(clock)
+	job := c.store.scheduledJobs[0]
+	if job.FiredCount != 1 {
+		t.Fatalf("expected exactly one fire, got %d", job.FiredCount)
+	}
+	if job.MissedCount != 9 {
+		t.Fatalf("expected 9 missed windows, got %d", job.MissedCount)
+	}
+	if job.LastMissedAt == nil || *job.LastMissedAt != 2100 {
+		t.Fatalf("expected lastMissedAt=2100, got %v", job.LastMissedAt)
 	}
 }
 

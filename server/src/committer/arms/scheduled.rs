@@ -8,6 +8,7 @@ use crate::committer::*;
 /// logged, not propagated. `at-least-once` recovery (the scheduler's
 /// `reset_running` on startup) handles the rare crash window between commit
 /// and finalize.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::committer) async fn handle_scheduled(
     ctx: &CommitterCtx,
     id: String,
@@ -16,6 +17,7 @@ pub(in crate::committer) async fn handle_scheduled(
     cron: Option<String>,
     every_ms: Option<i64>,
     tz: Option<String>,
+    due_at: i64,
 ) -> Result<(), RtDbError> {
     let schema = match ctx.schemas.get(&ctx.pool, &ctx.db).await {
         Ok(schema) => schema,
@@ -56,12 +58,21 @@ pub(in crate::committer) async fn handle_scheduled(
                 true,
             )
             .await;
+            let now = now_ms();
             let finalize = match kind.as_str() {
                 "oneshot" => scheduler::finalize_one_shot_done(&ctx.pool, &ctx.db, &id).await,
                 "cron" => match cron.as_deref() {
-                    Some(expr) => match scheduler::next_fire(expr, now_ms(), tz.as_deref()) {
+                    Some(expr) => match scheduler::next_fire(expr, now, tz.as_deref()) {
                         Ok(next) => {
-                            scheduler::finalize_recurring_next(&ctx.pool, &ctx.db, &id, next).await
+                            let missed =
+                                scheduler::missed_windows_cron(expr, due_at, now, tz.as_deref());
+                            if missed > 0 {
+                                ctx.metrics.record_scheduled_missed(missed as u64);
+                            }
+                            scheduler::finalize_recurring_next(
+                                &ctx.pool, &ctx.db, &id, next, missed,
+                            )
+                            .await
                         }
                         Err(err) => {
                             scheduler::mark_error(&ctx.pool, &ctx.db, &id, &err.message).await
@@ -77,8 +88,18 @@ pub(in crate::committer) async fn handle_scheduled(
                 // backfilled).
                 "interval" => match every_ms {
                     Some(ms) => {
-                        scheduler::finalize_recurring_next(&ctx.pool, &ctx.db, &id, now_ms() + ms)
-                            .await
+                        let missed = scheduler::missed_windows_interval(due_at, now, ms);
+                        if missed > 0 {
+                            ctx.metrics.record_scheduled_missed(missed as u64);
+                        }
+                        scheduler::finalize_recurring_next(
+                            &ctx.pool,
+                            &ctx.db,
+                            &id,
+                            now + ms,
+                            missed,
+                        )
+                        .await
                     }
                     None => {
                         scheduler::mark_error(

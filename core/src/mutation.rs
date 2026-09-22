@@ -506,4 +506,21 @@ pub struct ScheduleInfo {
     /// (and old fixtures) decoding with the key absent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub external: bool,
+    /// Cumulative count of recurring-job windows that elapsed before this job
+    /// was next claimed (e.g. the process was down across one or more fire
+    /// times). Recurring jobs skip missed windows by design — this is
+    /// observability, not a policy change: `0` for a job that has always
+    /// fired on normal poll cadence. `default` keeps old payloads (and old
+    /// fixtures) decoding with the key absent; `0` is omitted on the wire so
+    /// ordinary jobs' list rows are byte-identical to pre-feature servers.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub missed_count: i64,
+    /// Epoch ms of the last fire at which a missed window was detected.
+    /// Absent when `missed_count` is `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_missed_at: Option<i64>,
+}
+
+fn is_zero_i64(n: &i64) -> bool {
+    *n == 0
 }

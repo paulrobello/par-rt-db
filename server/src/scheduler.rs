@@ -44,6 +44,85 @@ pub fn next_fire(expr: &str, now_ms: i64, tz: Option<&str>) -> Result<i64, RtDbE
 /// job can occupy a row for. Mirrored as a constant in all four clients.
 pub const MAX_EVERY_MS: i64 = 365 * 24 * 60 * 60 * 1000;
 
+/// Cap on how many missed cron occurrences [`missed_windows_cron`] will count
+/// in one call. Bounds the work `iter_after` does inside the single
+/// serialized committer turn (the scan runs synchronously on every recurring
+/// fire, so an unbounded scan against a very stale `due_at` — e.g. a database
+/// restored from an old backup — would stall every write to this database
+/// behind it). When the true count exceeds this cap, the returned count IS
+/// the cap (a warn is logged): the reported `missed_count` reads as "at
+/// least N", not an exact figure, past this bound.
+const MAX_COUNTED_MISSED_WINDOWS: usize = 100_000;
+
+/// Counts recurring-job windows that elapsed between `prev_due_at` (the fire
+/// currently in progress, itself late but not "missed") and `now_ms`
+/// (exclusive) for an interval job. `delta <= 0` (a fire that is not
+/// actually late) returns 0. Missed-window counting is best-effort
+/// observability layered on the fire itself — this never fails, only
+/// returns 0 on a nonsensical input.
+pub(crate) fn missed_windows_interval(prev_due_at: i64, now_ms: i64, every_ms: i64) -> i64 {
+    if every_ms <= 0 {
+        return 0;
+    }
+    let delta = now_ms - prev_due_at;
+    if delta <= 0 {
+        return 0;
+    }
+    (delta - 1) / every_ms
+}
+
+/// Counts cron occurrences strictly between `prev_due_at` (exclusive — the
+/// fire currently in progress, itself late but not "missed") and `now_ms`
+/// (exclusive), i.e. windows that elapsed without ever firing. Bounded by
+/// [`MAX_COUNTED_MISSED_WINDOWS`]; see its doc for the saturation behavior.
+/// Returns 0 on any parse/timezone/timestamp error rather than propagating —
+/// this is best-effort observability, never a reason to fail the fire it
+/// accompanies.
+pub(crate) fn missed_windows_cron(
+    expr: &str,
+    prev_due_at: i64,
+    now_ms: i64,
+    tz: Option<&str>,
+) -> i64 {
+    use chrono::{DateTime, Utc};
+    use chrono_tz::Tz;
+    let mut cron = croner::Cron::new(expr);
+    if cron.parse().is_err() {
+        return 0;
+    }
+    let Some(prev) = DateTime::<Utc>::from_timestamp_millis(prev_due_at) else {
+        return 0;
+    };
+    let Some(now) = DateTime::<Utc>::from_timestamp_millis(now_ms) else {
+        return 0;
+    };
+    let count = match tz {
+        Some(name) => {
+            let Ok(zone) = name.parse::<Tz>() else {
+                return 0;
+            };
+            cron.iter_after(prev.with_timezone(&zone))
+                .take(MAX_COUNTED_MISSED_WINDOWS + 1)
+                .take_while(|t| t.with_timezone(&Utc) < now)
+                .count()
+        }
+        None => cron
+            .iter_after(prev)
+            .take(MAX_COUNTED_MISSED_WINDOWS + 1)
+            .take_while(|t| *t < now)
+            .count(),
+    };
+    if count > MAX_COUNTED_MISSED_WINDOWS {
+        tracing::warn!(
+            expr,
+            cap = MAX_COUNTED_MISSED_WINDOWS,
+            "missed cron window count saturated at cap; actual count is higher"
+        );
+        return MAX_COUNTED_MISSED_WINDOWS as i64;
+    }
+    count as i64
+}
+
 /// Row fields `resolve_when` produces: `(kind, due_at, cron, every_ms)`.
 pub(crate) type ResolvedWhen = (
     &'static str,
@@ -109,6 +188,11 @@ pub struct ClaimedJob {
     pub cron: Option<String>,
     pub tz: Option<String>,
     pub every_ms: Option<i64>,
+    /// The row's `due_at` at the moment of claim — the window this fire was
+    /// due for. Used at finalize to detect and count windows that elapsed
+    /// before this fire (missed-window observability); untouched by the
+    /// claim UPDATE itself, so this is genuinely the pre-fire due time.
+    pub due_at: i64,
 }
 
 /// Canonical scheduled-job view. Promoted to the wire type in Task 4 and
@@ -135,7 +219,9 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
             fired_count bigint NOT NULL DEFAULT 0,
             external    boolean NOT NULL DEFAULT false,
             claim_generation bigint NOT NULL DEFAULT 0,
-            lease_deadline_ms bigint
+            lease_deadline_ms bigint,
+            missed_count bigint NOT NULL DEFAULT 0,
+            last_missed_at bigint
         )"
     ))
     .execute(pool)
@@ -171,6 +257,20 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
     sqlx::query(&format!(
         "ALTER TABLE \"{schema}\".scheduled_txns
          ADD COLUMN IF NOT EXISTS lease_deadline_ms bigint"
+    ))
+    .execute(pool)
+    .await?;
+    // Missed-window observability columns: pre-existing databases gain them
+    // via the same additive ALTER discipline.
+    sqlx::query(&format!(
+        "ALTER TABLE \"{schema}\".scheduled_txns
+         ADD COLUMN IF NOT EXISTS missed_count bigint NOT NULL DEFAULT 0"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(&format!(
+        "ALTER TABLE \"{schema}\".scheduled_txns
+         ADD COLUMN IF NOT EXISTS last_missed_at bigint"
     ))
     .execute(pool)
     .await?;
@@ -260,9 +360,11 @@ pub async fn list(pool: &PgPool, db: &str) -> Result<Vec<ScheduleInfo>, RtDbErro
         i64,
         i64,
         bool,
+        i64,
+        Option<i64>,
     );
     let rows: Vec<ScheduleRow> = sqlx::query_as(&format!(
-        "SELECT id, kind, due_at, cron, tz, every_ms, status, last_error, created_at, fired_count, external
+        "SELECT id, kind, due_at, cron, tz, every_ms, status, last_error, created_at, fired_count, external, missed_count, last_missed_at
              FROM \"{schema}\".scheduled_txns ORDER BY due_at, created_at"
     ))
     .fetch_all(pool)
@@ -281,6 +383,8 @@ pub async fn list(pool: &PgPool, db: &str) -> Result<Vec<ScheduleInfo>, RtDbErro
                 created_at,
                 fired_count,
                 external,
+                missed_count,
+                last_missed_at,
             )| {
                 let kind = kind.parse::<ScheduleKind>().map_err(|err| {
                     RtDbError::internal(format!("invalid scheduled_txns.kind: {err}"))
@@ -300,6 +404,8 @@ pub async fn list(pool: &PgPool, db: &str) -> Result<Vec<ScheduleInfo>, RtDbErro
                     created_at,
                     fired_count,
                     external,
+                    missed_count,
+                    last_missed_at,
                 })
             },
         )
@@ -453,6 +559,7 @@ pub async fn claim_due(
         Option<String>,
         Option<String>,
         Option<i64>,
+        i64,
     );
     let rows: Vec<ClaimRow> = sqlx::query_as(&format!(
         "WITH candidates AS MATERIALIZED (
@@ -466,14 +573,14 @@ pub async fn claim_due(
          SET status = 'running'
          FROM candidates
          WHERE target.id = candidates.id
-         RETURNING target.id, target.kind, target.txn, target.cron, target.tz, target.every_ms"
+         RETURNING target.id, target.kind, target.txn, target.cron, target.tz, target.every_ms, target.due_at"
     ))
     .bind(now)
     .bind(batch)
     .fetch_all(pool)
     .await?;
     rows.into_iter()
-        .map(|(id, kind, txn_json, cron, tz, every_ms)| {
+        .map(|(id, kind, txn_json, cron, tz, every_ms, due_at)| {
             let txn: Transaction = serde_json::from_value(txn_json).map_err(|err| {
                 tracing::error!(error = %err, db, %id, "failed to deserialize scheduled txn");
                 RtDbError::internal("failed to read scheduled txn")
@@ -485,6 +592,7 @@ pub async fn claim_due(
                 cron,
                 tz,
                 every_ms,
+                due_at,
             })
         })
         .collect()
@@ -763,24 +871,45 @@ pub async fn finalize_one_shot_done(pool: &PgPool, db: &str, id: &str) -> Result
 }
 
 /// Finalizes a recurring (cron/interval) job after a successful fire: back to
-/// `pending` at `next_due`, bump `fired_count`, clear `last_error`.
+/// `pending` at `next_due`, bump `fired_count`, clear `last_error`. `missed`
+/// is the count of windows that elapsed before this fire (0 for the common
+/// case of firing on normal poll cadence) — when nonzero, it accumulates
+/// into `missed_count` and stamps `last_missed_at`; when zero, both are left
+/// untouched so a job's missed-window history survives a subsequent
+/// on-time fire.
 pub async fn finalize_recurring_next(
     pool: &PgPool,
     db: &str,
     id: &str,
     next_due: i64,
+    missed: i64,
 ) -> Result<(), RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    sqlx::query(&format!(
-        "UPDATE \"{schema}\".scheduled_txns
-         SET status = 'pending', due_at = $2, fired_count = fired_count + 1, last_error = NULL
-         WHERE id = $1"
-    ))
-    .bind(id)
-    .bind(next_due)
-    .execute(pool)
-    .await?;
+    if missed > 0 {
+        sqlx::query(&format!(
+            "UPDATE \"{schema}\".scheduled_txns
+             SET status = 'pending', due_at = $2, fired_count = fired_count + 1, last_error = NULL,
+                 missed_count = missed_count + $3, last_missed_at = $4
+             WHERE id = $1"
+        ))
+        .bind(id)
+        .bind(next_due)
+        .bind(missed)
+        .bind(now_ms())
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query(&format!(
+            "UPDATE \"{schema}\".scheduled_txns
+             SET status = 'pending', due_at = $2, fired_count = fired_count + 1, last_error = NULL
+             WHERE id = $1"
+        ))
+        .bind(id)
+        .bind(next_due)
+        .execute(pool)
+        .await?;
+    }
     Ok(())
 }
 
@@ -947,6 +1076,7 @@ pub async fn run_scheduler(pool: PgPool, db: String, committer_tx: Sender<Commit
                     cron: job.cron,
                     every_ms: job.every_ms,
                     tz: job.tz,
+                    due_at: job.due_at,
                 };
                 if committer_tx.send(req).await.is_err() {
                     // Committer task is gone; this scheduler is now useless.
@@ -1028,6 +1158,82 @@ mod tests {
     fn now_ms_is_available() {
         // Sanity: the helper imports compile against the real clock helper.
         let _ = now_ms();
+    }
+
+    #[test]
+    fn missed_windows_interval_zero_when_on_time() {
+        // Firing exactly at (or before) the due time is never "missed".
+        assert_eq!(missed_windows_interval(ANCHOR_MS, ANCHOR_MS, 5_000), 0);
+        assert_eq!(missed_windows_interval(ANCHOR_MS, ANCHOR_MS - 1, 5_000), 0);
+        // A fire a few ms late (normal poll cadence) is not a missed window.
+        assert_eq!(missed_windows_interval(ANCHOR_MS, ANCHOR_MS + 1, 5_000), 0);
+        assert_eq!(
+            missed_windows_interval(ANCHOR_MS, ANCHOR_MS + 4_999, 5_000),
+            0
+        );
+    }
+
+    #[test]
+    fn missed_windows_interval_counts_elapsed_windows() {
+        // Exactly one every_ms late (T + 5000): this fire IS the T+5000
+        // window running late, not an extra missed one on top of it -> 0.
+        assert_eq!(
+            missed_windows_interval(ANCHOR_MS, ANCHOR_MS + 5_000, 5_000),
+            0
+        );
+        // One tick past that: the T+5000 window has now also elapsed before
+        // this (T+10000-due) fire -> 1 missed window.
+        assert_eq!(
+            missed_windows_interval(ANCHOR_MS, ANCHOR_MS + 5_001, 5_000),
+            1
+        );
+        // T+5000 and T+10000 elapsed before a fire at T+15000 -> 2 missed.
+        assert_eq!(
+            missed_windows_interval(ANCHOR_MS, ANCHOR_MS + 15_000, 5_000),
+            2
+        );
+    }
+
+    #[test]
+    fn missed_windows_interval_guards_nonpositive_every_ms() {
+        assert_eq!(missed_windows_interval(ANCHOR_MS, ANCHOR_MS + 10_000, 0), 0);
+        assert_eq!(
+            missed_windows_interval(ANCHOR_MS, ANCHOR_MS + 10_000, -5),
+            0
+        );
+    }
+
+    #[test]
+    fn missed_windows_cron_zero_when_on_time() {
+        // Firing right at the due minute boundary: no windows elapsed before it.
+        let n = missed_windows_cron("* * * * *", ANCHOR_MS, ANCHOR_MS + 1, None);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn missed_windows_cron_counts_elapsed_minutes() {
+        // `* * * * *` due at ANCHOR_MS; fired one hour late -> the ~59 minute
+        // boundaries strictly between due and now were skipped, not the fire
+        // in progress itself.
+        let n = missed_windows_cron("* * * * *", ANCHOR_MS, ANCHOR_MS + 3_600_000, None);
+        assert_eq!(n, 59);
+    }
+
+    #[test]
+    fn missed_windows_cron_returns_zero_on_bad_expr() {
+        assert_eq!(
+            missed_windows_cron("not a cron", ANCHOR_MS, ANCHOR_MS + 3_600_000, None),
+            0
+        );
+        assert_eq!(
+            missed_windows_cron(
+                "* * * * *",
+                ANCHOR_MS,
+                ANCHOR_MS + 3_600_000,
+                Some("Mars/Phobos")
+            ),
+            0
+        );
     }
 
     #[test]

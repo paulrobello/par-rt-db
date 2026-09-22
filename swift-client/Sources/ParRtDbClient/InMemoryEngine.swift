@@ -311,11 +311,19 @@ final class ScheduledJob {
     /// External-claim mode: `tick` skips it entirely — an application worker
     /// claims the job over HTTP and finalizes it with the fencing token.
     let external: Bool
+    /// Cumulative count of recurring-job windows that elapsed before a fire.
+    /// Computed exactly for interval jobs; always 0 for cron jobs, since this
+    /// harness re-arms cron on a fixed `cronStepMs` approximation rather than
+    /// real cron occurrence math and cannot count missed cron windows
+    /// accurately.
+    var missedCount: Int64
+    var lastMissedAt: Int64?
 
     init(
         id: String, kind: ScheduleKind, txn: Transaction, dueAt: Int64, cron: String?,
         tz: String? = nil, everyMs: Int64?, status: ScheduleStatus, createdAt: Int64,
-        firedCount: Int64, lastError: String? = nil, external: Bool = false
+        firedCount: Int64, lastError: String? = nil, external: Bool = false,
+        missedCount: Int64 = 0, lastMissedAt: Int64? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -329,6 +337,8 @@ final class ScheduledJob {
         self.firedCount = firedCount
         self.lastError = lastError
         self.external = external
+        self.missedCount = missedCount
+        self.lastMissedAt = lastMissedAt
     }
 }
 
@@ -1273,7 +1283,9 @@ public final class InMemoryRtDbClient: MigrationStore {
             lastError: job.lastError,
             createdAt: job.createdAt,
             firedCount: job.firedCount,
-            external: job.external
+            external: job.external,
+            missedCount: job.missedCount,
+            lastMissedAt: job.lastMissedAt
         )
     }
 
@@ -1455,6 +1467,21 @@ public final class InMemoryRtDbClient: MigrationStore {
 
     // MARK: Tick
 
+    /// Computes and accumulates the count of interval windows that elapsed
+    /// before this fire (`prevDueAt` to `now`, exclusive of the fire itself).
+    /// Exact for interval jobs, unlike cron, which this harness approximates
+    /// on a fixed `cronStepMs` rather than real cron occurrence math. A no-op
+    /// when nothing was missed (the common case: normal poll-cadence fires).
+    private func recordMissedIntervalWindows(on job: ScheduledJob, prevDueAt: Int64, now: Int64, everyMs ms: Int64) {
+        guard ms > 0 else { return }
+        let delta = now - prevDueAt
+        guard delta > 0 else { return }
+        let missed = (delta - 1) / ms
+        guard missed > 0 else { return }
+        job.missedCount += missed
+        job.lastMissedAt = now
+    }
+
     /// Fires every due non-paused, non-external job by applying its txn
     /// through the same atomic path as `mutate`; advances due workflow runs
     /// (FM-29); reaps expired TTL documents (FM-33-aware hard delete). Pass
@@ -1473,6 +1500,7 @@ public final class InMemoryRtDbClient: MigrationStore {
                 continue
             }
             do {
+                let prevDueAt = job.dueAt
                 _ = try executeTransaction(job.txn)
                 job.firedCount += 1
                 if job.kind == .oneshot {
@@ -1481,7 +1509,10 @@ public final class InMemoryRtDbClient: MigrationStore {
                 } else if job.kind == .interval, let ms = job.everyMs {
                     // Interval re-arms from each actual fire time (cron
                     // parity: windows missed during the fire's latency are
-                    // skipped, not backfilled).
+                    // skipped, not backfilled). The elapsed-window count is
+                    // exact here (unlike cron, which this harness
+                    // approximates on a fixed cronStepMs).
+                    recordMissedIntervalWindows(on: job, prevDueAt: prevDueAt, now: now, everyMs: ms)
                     job.dueAt = now + ms
                     job.status = .pending
                 } else {

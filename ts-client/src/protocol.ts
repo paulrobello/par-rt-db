@@ -184,6 +184,15 @@ export interface ScheduleInfo {
   firedCount: number;
   /** True when the job is never executed by the internal scheduler and is served to application workers via the external claim surface (`claimSchedules`) instead. */
   external?: boolean;
+  /** Cumulative count of recurring-job windows that elapsed before a fire
+   * (e.g. the process was down across one or more fire times). Recurring
+   * jobs skip missed windows by design — this is observability, not a
+   * policy change. Omitted on the wire when 0, so ordinary jobs' list rows
+   * are byte-identical to pre-feature servers. */
+  missedCount?: number;
+  /** Epoch ms of the last fire at which a missed window was detected. Absent
+   * when `missedCount` is 0/absent. */
+  lastMissedAt?: number;
 }
 
 /** One externally-claimed job returned by `POST /api/schedule/claim`. Mirrors

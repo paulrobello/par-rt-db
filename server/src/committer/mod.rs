@@ -96,6 +96,9 @@ pub enum CommitterRequest {
         cron: Option<String>,
         every_ms: Option<i64>,
         tz: Option<String>,
+        /// The row's `due_at` at claim time — the window this fire was due
+        /// for. Used to detect and count missed windows at finalize.
+        due_at: i64,
     },
     /// Apply a declarative schema migration on this database. Serialized through
     /// the per-db committer like `Mutate`, so the migration's DDL+DML and the
@@ -1169,6 +1172,7 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                 cron,
                 every_ms,
                 tz,
+                due_at,
             } => {
                 let span = tracing::info_span!(
                     "committer.scheduled",
@@ -1176,7 +1180,7 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                     kind,
                     id,
                 );
-                let outcome = handle_scheduled(&ctx, id, kind, *txn, cron, every_ms, tz)
+                let outcome = handle_scheduled(&ctx, id, kind, *txn, cron, every_ms, tz, due_at)
                     .instrument(span)
                     .await;
                 if let Err(err) = outcome {

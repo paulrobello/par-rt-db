@@ -88,6 +88,21 @@ alter observable behavior on upgrade.
 
 ### Added
 
+- **Recurring schedules surface missed windows instead of silently skipping
+  them (FEATURE_MATRIX #10).** A cron/interval job whose recompute detects
+  that one or more windows elapsed before its fire (e.g. the process was
+  down across a fire time) now records `missedCount`/`lastMissedAt` on
+  `ScheduleInfo` (additive, omitted on the wire when zero/absent) and
+  increments a global `rtdb_scheduled_missed_total` Prometheus counter. The
+  skip policy itself is unchanged — no backfill, no `onMissed` option — this
+  is purely observability: an operator can now see "this job lost N
+  windows" instead of inferring it from an absence. Interval's count is
+  exact; cron's is a bounded `croner` occurrence count (capped to keep the
+  scan out of the committer's serialized turn). Mirrored in all five
+  clients' `ScheduleInfo` and in-memory `tick()` (cron stays 0 in every
+  harness, matching the existing `CRON_STEP_MS`-approximation caveat) with
+  an interval-only wire-corpus case.
+
 - **`aggregate` subscriptions join `count`/`collect`/`unique` in the
   eq-prefix/range window skip (FEATURE_MATRIX #21).** `ReadSet::Indexed` now
   also derives from `aggregate` (any op — `sum`/`avg`/`min`/`max`/`count` —

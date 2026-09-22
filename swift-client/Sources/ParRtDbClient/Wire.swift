@@ -800,11 +800,21 @@ public struct ScheduleInfo: Equatable, Codable, Sendable {
     /// Decodes tolerantly (absent → false, the server's `#[serde(default)]`);
     /// omitted on encode when false so pre-flag payloads round-trip.
     public var external: Bool
+    /// Cumulative count of recurring-job windows that elapsed before this job
+    /// was next claimed (e.g. the process was down across one or more fire
+    /// times). Recurring jobs skip missed windows by design — this is
+    /// observability, not a policy change. Decodes tolerantly (absent → 0);
+    /// omitted on encode when 0 so ordinary jobs' payloads round-trip.
+    public var missedCount: Int64
+    /// Epoch ms of the last fire at which a missed window was detected,
+    /// present only when `missedCount` is nonzero.
+    public var lastMissedAt: Int64?
 
     public init(
         id: String, kind: ScheduleKind, dueAt: Int64, cron: String? = nil, tz: String? = nil,
         everyMs: Int64? = nil, status: ScheduleStatus, lastError: String? = nil, createdAt: Int64,
-        firedCount: Int64, external: Bool = false
+        firedCount: Int64, external: Bool = false, missedCount: Int64 = 0,
+        lastMissedAt: Int64? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -817,10 +827,13 @@ public struct ScheduleInfo: Equatable, Codable, Sendable {
         self.createdAt = createdAt
         self.firedCount = firedCount
         self.external = external
+        self.missedCount = missedCount
+        self.lastMissedAt = lastMissedAt
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
         case id, kind, dueAt, cron, tz, everyMs, status, lastError, createdAt, firedCount, external
+        case missedCount, lastMissedAt
     }
 
     public init(from decoder: Decoder) throws {
@@ -836,6 +849,8 @@ public struct ScheduleInfo: Equatable, Codable, Sendable {
         createdAt = try container.decode(Int64.self, forKey: .createdAt)
         firedCount = try container.decode(Int64.self, forKey: .firedCount)
         external = try container.decodeIfPresent(Bool.self, forKey: .external) ?? false
+        missedCount = try container.decodeIfPresent(Int64.self, forKey: .missedCount) ?? 0
+        lastMissedAt = try container.decodeIfPresent(Int64.self, forKey: .lastMissedAt)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -853,6 +868,10 @@ public struct ScheduleInfo: Equatable, Codable, Sendable {
         if external {
             try container.encode(external, forKey: .external)
         }
+        if missedCount != 0 {
+            try container.encode(missedCount, forKey: .missedCount)
+        }
+        try container.encodeIfPresent(lastMissedAt, forKey: .lastMissedAt)
     }
 }
 

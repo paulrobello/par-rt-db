@@ -138,7 +138,7 @@ async fn claim_due_and_finalize() {
         .await
         .unwrap();
     let next = scheduler::next_fire("*/5 * * * *", rtdb_server::db::now_ms(), None).unwrap();
-    scheduler::finalize_recurring_next(&pool, &db, &cron, next)
+    scheduler::finalize_recurring_next(&pool, &db, &cron, next, 0)
         .await
         .unwrap();
 
@@ -856,6 +856,159 @@ async fn cron_skips_missed_windows() {
         appeared,
         "cron should have written its doc on the single fire"
     );
+}
+
+/// ENH: elapsed windows are counted and surfaced, not just skipped silently.
+/// An interval job whose `due_at` is far in the past (the restart-equivalent
+/// shape `cron_skips_missed_windows` already uses — a stale `due_at` is
+/// observationally identical to process downtime) must record a nonzero
+/// `missed_count` and `last_missed_at` on the fire that catches it up.
+#[tokio::test]
+async fn interval_records_missed_windows_after_downtime() {
+    let pool = test_pool().await;
+    let db = unique_db(&pool).await;
+    let schema = push_simple_schema(&pool, &db).await;
+    let committers = Committers::new(
+        pool.clone(),
+        SubscriptionManager::new(),
+        SchemaCache::new(),
+        OpFeed::new(64, 32),
+        Arc::new(ArcSwap::from_pointee(crate::common::test_hot())),
+        Metrics::new(),
+        CommitterConfig {
+            quotas: Arc::new(quota::UsageCache::new()),
+            audit_log_enabled: false,
+            webhooks_enabled: false,
+            ttl_sweep_interval_secs: 60,
+            ttl_batch: 5000,
+            quota_cache_ttl_secs: 60,
+            idle_reclaim_secs: 0,
+            instance_id: String::new(),
+            multi_instance: false,
+            forwarder: None,
+        },
+    );
+
+    // Interval job due every 10s, but its due_at is ~1 minute in the past —
+    // several windows have elapsed before the scheduler ever gets to claim it.
+    let txn = Transaction {
+        steps: vec![Step::Insert {
+            table: "items".to_string(),
+            doc: serde_json::json!({ "n": 88 }).as_object().unwrap().clone(),
+        }],
+    };
+    let every_ms: i64 = 10_000;
+    let stale_due = rtdb_server::db::now_ms() - 60_000;
+    let _id = scheduler::insert(
+        &pool,
+        &db,
+        "interval",
+        stale_due,
+        &txn,
+        None,
+        Some(every_ms),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    warm_up_committer(&committers, &db).await;
+
+    let info = poll_list(&pool, &db, Duration::from_secs(10), |l| {
+        l.iter()
+            .find(|i| i.kind == ScheduleKind::Interval && i.fired_count == 1)
+            .cloned()
+    })
+    .await
+    .expect("interval job should fire once and catch up");
+
+    assert!(
+        info.missed_count > 0,
+        "an interval job firing ~60s late on a 10s cadence must report missed windows, got {}",
+        info.missed_count
+    );
+    assert!(
+        info.last_missed_at.is_some(),
+        "last_missed_at must be set when missed_count is nonzero"
+    );
+
+    let appeared = poll_for_n(&pool, &db, &schema, 88, Duration::from_secs(8)).await;
+    assert!(appeared, "interval job should have written its doc");
+}
+
+/// Negative control for the missed-window counter: a job firing on normal
+/// poll cadence (due_at at/just before now) must never report a missed
+/// window. Without this, `interval_records_missed_windows_after_downtime`
+/// alone can't distinguish "counts real misses" from "always reports > 0".
+#[tokio::test]
+async fn interval_on_time_reports_zero_missed_windows() {
+    let pool = test_pool().await;
+    let db = unique_db(&pool).await;
+    let schema = push_simple_schema(&pool, &db).await;
+    let committers = Committers::new(
+        pool.clone(),
+        SubscriptionManager::new(),
+        SchemaCache::new(),
+        OpFeed::new(64, 32),
+        Arc::new(ArcSwap::from_pointee(crate::common::test_hot())),
+        Metrics::new(),
+        CommitterConfig {
+            quotas: Arc::new(quota::UsageCache::new()),
+            audit_log_enabled: false,
+            webhooks_enabled: false,
+            ttl_sweep_interval_secs: 60,
+            ttl_batch: 5000,
+            quota_cache_ttl_secs: 60,
+            idle_reclaim_secs: 0,
+            instance_id: String::new(),
+            multi_instance: false,
+            forwarder: None,
+        },
+    );
+
+    let txn = Transaction {
+        steps: vec![Step::Insert {
+            table: "items".to_string(),
+            doc: serde_json::json!({ "n": 89 }).as_object().unwrap().clone(),
+        }],
+    };
+    // Long interval, due_at just barely past — routine poll-cadence latency,
+    // never several windows' worth of downtime.
+    let every_ms: i64 = 3_600_000;
+    let now = rtdb_server::db::now_ms();
+    let _id = scheduler::insert(
+        &pool,
+        &db,
+        "interval",
+        now,
+        &txn,
+        None,
+        Some(every_ms),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    warm_up_committer(&committers, &db).await;
+
+    let info = poll_list(&pool, &db, Duration::from_secs(10), |l| {
+        l.iter()
+            .find(|i| i.kind == ScheduleKind::Interval && i.fired_count == 1)
+            .cloned()
+    })
+    .await
+    .expect("interval job should fire once");
+
+    assert_eq!(
+        info.missed_count, 0,
+        "a job firing on normal poll cadence must not report a missed window"
+    );
+    assert!(info.last_missed_at.is_none());
+
+    let appeared = poll_for_n(&pool, &db, &schema, 89, Duration::from_secs(8)).await;
+    assert!(appeared, "interval job should have written its doc");
 }
 
 #[tokio::test]
