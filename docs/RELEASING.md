@@ -26,7 +26,9 @@ to crates.io / npm / PyPI is a separate, user-approved decision.
    consumer cannot resolve this as a remote git package pinned to a tag —
    add `swift-client` as a local package dependency (a path to a checkout of
    this repo) instead. `go-client` is the same story until the first release
-   tag exists: a Go consumer pins it via a `replace` directive to a local
+   `go-client/v*` tag exists (the root `v0.1.0` tag does not count: a Go module
+   in a subdirectory is versioned only by tags prefixed with its path): a Go
+   consumer pins it via a `replace` directive to a local
    checkout (see `go-client/README.md`), and `go.mod` carries no version field
    so it has nothing to bump in this step; once `go-client/v*` tags are cut as
    part of ENH-031's tag-driven publish pipeline, Go module semver imports

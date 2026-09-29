@@ -156,7 +156,7 @@ graph TD
     classDef task fill:#1E1E1E,stroke:#F44336,stroke-width:2px,color:#E6E6E6
     classDef plain fill:#1E1E1E,stroke:#78909c,stroke-width:1px,color:#E6E6E6
     class CO,SUBS core
-    class A1,A2,A3,A4,A5,A6,A7 arm
+    class A1,A2,A3,A4,A5,A6,A7,A8 arm
     class PT,OP,AU,WH,NT tap
     class SC,RE,WF task
     class WS,HTTP plain
@@ -836,7 +836,7 @@ constraint won't clear on retry). Over-cap is `QUOTA_EXCEEDED` (HTTP 507);
 metric `rtdb_quota_rejections_total{kind=tables|storage|subs}` with a per-db
 breakdown on the `/admin/metrics` JSON only (never the Prometheus scrape —
 per-db labels would blow up cardinality). `db_stats` exposes quota+usage;
-mirrored across all four clients (`HotConfig`/`HotConfigPatch` +
+mirrored across all five clients (`HotConfig`/`HotConfigPatch` +
 `QUOTA_EXCEEDED`).
 
 ## Realtime presence
@@ -900,19 +900,19 @@ its HTTP/admin/storage surfaces ship (a sync `httpx` client —
 `pip install par-rt-db[http]`), as does the reactive `ws` surface
 (`RtDbClient` async over `/sync` — `pip install par-rt-db[ws]`; live
 `subscribe` + at-most-once `mutate` + schedule ops), optimistic updates, and
-an in-memory test harness — the four clients are now at feature parity.
+an in-memory test harness — the five clients are now at feature parity.
 `FEATURE_MATRIX.md` tracks parity vs. Convex.
 
 ### The semantics corpus
 
 "Byte-identical" is a claim, and `wire-corpus/` is what tests it. Each case in
 `wire-corpus/semantics/` is a JSON description of a schema, a sequence of
-operations, and the expected outcome, and **five runners execute every case**:
-the real server against Postgres, and the four clients' in-memory engines
-(TypeScript, Rust, Python, Swift). A behavior that differs between any two of
+operations, and the expected outcome, and **six runners execute every case**:
+the real server against Postgres, and the five clients' in-memory engines
+(TypeScript, Rust, Python, Swift, Go). A behavior that differs between any two of
 them fails the corpus rather than surfacing later as a client bug.
 
-The corpus is what makes the "mirror every server change in all four clients"
+The corpus is what makes the "mirror every server change in all five clients"
 rule enforceable instead of aspirational, so every behavior-changing change
 ships with a case. `wire-corpus/README.md` states that authoring rule and the
 case format. `wire-corpus/golden-vector.json` separately pins the exact wire
@@ -1048,8 +1048,8 @@ the DB role (new — the server previously only ran `CREATE SCHEMA`/
 
 ## Hot config and dynamic CORS
 
-`config/` (hot config in `config/hot.rs`), `lib.rs`. Seven settings — `allowed_origins`, `session_ttl_days`,
-`max_file_size`, `idempotency_ttl_ms`, plus the three ENH-011 quota caps
+`config/` (hot config in `config/hot.rs`), `lib.rs`. Eight settings — `allowed_origins`, `session_ttl_days`,
+`max_file_size`, `idempotency_ttl_ms`, `change_log_max_rows`, plus the three ENH-011 quota caps
 (`maxTablesPerDb`/`maxStorageBytesPerDb`/`maxSubsPerDb`) — are
 runtime-mutable, held on `AppState` as `Arc<ArcSwap<HotConfig>>` and
 persisted in a single-row

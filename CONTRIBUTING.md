@@ -262,13 +262,13 @@ etc.).
 
 ## Versioning
 
-All packages — `server`, `cli`, `dashboard`, and the four client SDKs
+All packages — `server`, `cli`, `dashboard`, and the five client SDKs
 (`ts-client`, `rust-client`, `python-client`, `swift-client`) — version in
 **lockstep**: one version for the whole protocol surface, bumped together in
 the same release commit. `swift-client` carries no manifest version — SPM has
 no version field, so the repo's release tag is its version — but it is part of
 the lockstep unit all the same. The five implementations of the wire contract
-(`server/src/protocol.rs` plus the four client mirrors) are one unit;
+(`server/src/protocol.rs` plus the five client mirrors) are one unit;
 independent client versions would claim compatibility the five-way mirror does
 not have. The release procedure,
 including the lockstep bump, is [`docs/RELEASING.md`](docs/RELEASING.md).
@@ -405,7 +405,7 @@ Before requesting review:
 - [ ] `make checkall` passes locally on a clean checkout, including `make docs-api`.
 - [ ] `make docs-api` produces warning-free Rust, TypeScript, Python, and Swift references.
 - [ ] Tests are added or updated for any new behavior (every package the change touches).
-- [ ] If the change alters the wire protocol or DSL, all five clients (`server`, `ts-client`, `rust-client`, `python-client`, `swift-client`) are updated and tested in the same PR, and `FEATURE_MATRIX.md` reflects the new state.
+- [ ] If the change alters the wire protocol or DSL, all five client SDKs (`ts-client`, `rust-client`, `python-client`, `swift-client`, `go-client`) are updated and tested in the same PR, and `FEATURE_MATRIX.md` reflects the new state.
 - [ ] No `unwrap()`/`expect()` outside `#[cfg(test)]`; no new clippy warnings.
 - [ ] No real secrets in the diff. `pre-commit` (gitleaks) is installed and passes.
 - [ ] Commit messages follow Conventional Commits.
@@ -414,7 +414,7 @@ Before requesting review:
 - [ ] If the change adds a route, the root README Endpoints table and `server/README.md` are updated.
 - [ ] If the change adds or modifies a query terminal, `FilterExpr` variant, or mutation-step result shape, a case covering it is added to `wire-corpus/golden-vector.json` (the cross-client parity fixture consumed by all five golden-vector suites). The corpus is the source of truth for cross-client agreement; an uncovered terminal is a regression risk for the other four engines.
 - [ ] If the change alters any server behavior a client engine mirrors — step results, error codes, defaults, visibility (soft delete/TTL), cursor semantics — a case pinning the new behavior is added (or updated) in `wire-corpus/semantics/` per the authoring rule in [`wire-corpus/README.md`](wire-corpus/README.md).
-- [ ] If a property test (`server/tests/proptest_parity.rs`) found a server-vs-engine divergence, the fix also ships the minimized counterexample as a `wire-corpus/semantics/` case (so all four client engines inherit it, not just the rust one — unmirrored engines get a loud `skip` until they do) and commits the proptest seed under `server/proptest-regressions/`.
+- [ ] If a property test (`server/tests/proptest_parity.rs`) found a server-vs-engine divergence, the fix also ships the minimized counterexample as a `wire-corpus/semantics/` case (so all six client engines inherit it, not just the rust one — unmirrored engines get a loud `skip` until they do) and commits the proptest seed under `server/proptest-regressions/`.
 
 When the PR lands, **rebase onto the latest target branch before merging** so
 the merge is a clean fast-forward. Squash-merge one commit per logical change;

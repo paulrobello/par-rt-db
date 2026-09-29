@@ -20,8 +20,9 @@ where its detailed documentation lives.
 No package has been published to a registry yet; consume
 each SDK from this repo — see its README for workspace setup. This repo's
 root has no `Package.swift` (the Swift manifest lives at
-`swift-client/Package.swift`) and no release tag, so a Swift consumer adds
-the package by local path (see its README), not as a remote git dependency.
+`swift-client/Package.swift`), so a Swift consumer adds the package by local
+path (see its README), not as a remote git dependency, even though the repo
+carries a `v0.1.0` release tag.
 
 ## Surface comparison
 

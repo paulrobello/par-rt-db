@@ -455,7 +455,7 @@ curl -s https://rtdb.example.com/auth/me -H "Authorization: Bearer <session-toke
 
 ## Hardening
 
-Two security properties of the login flow are worth knowing when you operate
+Three security properties of the login flow are worth knowing when you operate
 or integrate with par-rt-db:
 
 - **Login-CSRF (double-submit nonce).** `/auth/{provider}/begin` sets a
@@ -492,7 +492,7 @@ or integrate with par-rt-db:
 | `503 {… "oauth not configured"}` | `CLIENT_ID`/`CLIENT_SECRET` not set in the **container's** env. Three causes: blank in `.env`, the container wasn't recreated after editing `.env`, or `docker-compose.yml` doesn't pass that provider's vars into the server `environment:` block (so they sit in `.env` unused — the bug that blocked Google on first enable). |
 | `403 "origin not allowed"` | The `origin=` you passed to `/auth/{provider}/begin` is not in `RTDB_ALLOWED_ORIGINS`. Add it (hot-reloadable via `PATCH /admin/config`). |
 | Provider error page: `redirect_uri_mismatch` | The callback URL registered at the provider doesn't exactly match `RTDB_PUBLIC_URL` + the callback path (see the [quick reference](#quick-reference)). Watch the scheme (`https://`) and trailing slash. |
-| `403 "no verified email"` (OIDC/Microsoft: `"email is not verified"`) | The account's email isn't verified at the provider. Verify it, or (Google) ensure the account is a *Test user* while the consent screen is in Testing. |
+| `403 "no verified email"` (OIDC/Microsoft/Apple: `"email is not verified"`) | The account's email isn't verified at the provider. Verify it, or (Google) ensure the account is a *Test user* while the consent screen is in Testing. |
 | Google login works only for one account | Consent screen still in *Testing*. **Publish app** → *In production*. |
 | `403 "userinfo missing sub"` (OIDC/Google) or `403 "user response missing id"` (GitLab) | The provider returned no stable subject. par-rt-db keys identity on it, so it will not fall back to email. For a generic OIDC IdP this means a non-compliant userinfo endpoint — OIDC Core requires `sub`; fix the IdP. |
 

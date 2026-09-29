@@ -55,8 +55,9 @@ PAR RT DB is a self-hosted, Convex-inspired realtime document database. Clients 
 WebSocket (`/sync`) or one-shot HTTP; the server executes them and pushes live query
 updates on change. There is no embedded JS runtime and no per-app server code — one
 generic server hosts many named databases for every app. Built in Rust on axum/tokio
-with Postgres 17 storage. Authoritative design:
-[`docs/superpowers/specs`](docs/superpowers/specs).
+with Postgres 17 storage. Internals:
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); the original design specs in
+[`docs/superpowers/specs`](docs/superpowers/specs) are a historical record.
 
 Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 [`PRODUCT.md`](PRODUCT.md), [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md),
@@ -74,12 +75,12 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 - **Two transports, one vocabulary**: mutations route through the same committer path over WebSocket (`/sync`) or one-shot HTTP, so subscriptions fire regardless of which transport wrote
 - **Many databases per instance**: one generic server hosts many named databases for every app
 - **Typed schemas**: pushed schemas compile to additive Postgres DDL — one typed column per indexed field plus the `doc` jsonb body
-- **First-class SDKs**: TypeScript (with React bindings), Rust, Python, and Swift (iOS/macOS) clients that mirror the wire contract directly, plus the `rtdb` CLI and an operator dashboard
+- **First-class SDKs**: TypeScript (with React bindings), Rust, Python, Swift (iOS/macOS), and Go clients that mirror the wire contract directly, plus the `rtdb` CLI and an operator dashboard
 
 ### Advanced Features
 - **Full-text search**: websearch-syntax `search` ranked by `ts_rank` with optional snippets, plus a `trgm` mode for substring/autocomplete matching
 - **Vector + hybrid search**: write-maintained pgvector columns ranked by the index's declared metric; `hybridSearch` fuses full-text and vector rankings via Reciprocal Rank Fusion
-- **Scheduling**: one-shot (`afterMs`/`runAt`), 5-field UTC `cron`, and fixed-interval (`everyMs`) transactions with cancel/pause/resume — scheduled work is data, not server code
+- **Scheduling**: one-shot (`afterMs`/`runAt`), 5-field `cron` (UTC by default, optional IANA `tz`), and fixed-interval (`everyMs`) transactions with cancel/pause/resume — scheduled work is data, not server code
 - **Durable workflows**: multi-step specs with per-step retry, backoff, and sleep, plus `awaitSignal` approval gates that park a run until an out-of-band signal (or timeout); at-least-once per step with crash-resume
 - **Server-stamped `updatedAt`**: a table may declare `updatedAtField` naming a `number`/`int64` field the server stamps with epoch-ms on every version-bumping write (insert/patch/replace/upsert/patchByQuery/cascade setNull), overwriting client-supplied values — no more hand-rolled timestamps in every mutation, and orderable with a declared index
 - **Auto-increment counters**: a table may declare `autoIncrementField` naming an `int64` field the server assigns from a per-table Postgres sequence on insert (overwriting client-supplied values, immutable afterward, unique-indexable) — ticket/issue numbers with zero races; snapshot import continues numbering past the imported max, and gaps from rolled-back transactions are documented behavior
@@ -104,10 +105,11 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 | **Rust client** | [`rust-client/`](rust-client) | Rust (`par-rt-db-client`) | Rust SDK: http + reactive ws + admin + `.filter()`/`.search()`/`.vector_search()` builders |
 | **Python client** | [`python-client/`](python-client) | Python (`par-rt-db`, uv) | Python SDK: wire + schema/mutation/query DSL + sync HTTP/admin/storage + reactive WS |
 | **Swift client** | [`swift-client/`](swift-client) | Swift 6 (`ParRtDbClient`/`ParRtDbUI`, SPM) | iOS 17+/macOS 14 SDK: wire + query/mutation/schema DSL + HTTP + reactive WS + SwiftUI `LiveQuery` (Darwin only) |
+| **Go client** | [`go-client/`](go-client) | Go 1.23+ (`github.com/paulrobello/par-rt-db/go-client`) | Go SDK: wire + schema DSL + typed HTTP queries + reactive WS + admin client + in-memory engine |
 | **Dashboard** | [`dashboard/`](dashboard) | Vite + React 19 + TS (bun) | Operator console SPA served same-origin at `RTDB_STATIC_DIR` |
 | **`rtdb` CLI** | [`cli/`](cli) | Rust (`rtdb` binary, cargo) | Operator/CI wrapper around `par-rt-db-client`: list/create dbs, push schema, query/mutate, mint/revoke tokens |
 
-The server is the source of truth; the four SDKs (ts/rust/python/swift) each mirror
+The server is the source of truth; the five SDKs (ts/rust/python/swift/go) each mirror
 its wire contract directly, the CLI wraps `rust-client`, and the dashboard SPA
 consumes `ts-client`. See [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) for the
 Convex-parity contract and [`CLAUDE.md`](CLAUDE.md) for contributor guidance.
@@ -160,7 +162,7 @@ committer (blobs don't touch document tables). See
 
 ## Prerequisites for dev
 * See [CONTRIBUTING's development setup](CONTRIBUTING.md#development-setup) for the full tool list and first-time setup
-* A GNU-compatible `make` — every target spans all eight packages (swift-client's lines are Darwin-guarded and skip loudly on Linux); first-time installs are `make ts-client-install`, `make dashboard-install`, and `make python-client-install` (see [Make targets](#make-targets))
+* A GNU-compatible `make` — every target spans all nine packages (swift-client's lines are Darwin-guarded and skip loudly on Linux); first-time installs are `make ts-client-install`, `make dashboard-install`, `make python-client-install`, and `make go-client-install` (see [Make targets](#make-targets))
 
 ## Quickstart
 
@@ -219,7 +221,7 @@ curl -s -X POST http://localhost:8300/api/query \
 To run the full test suite instead (dev Postgres must be up):
 
 ```bash
-make test   # dev-db-up + test suites across all eight packages (fmt/clippy/typecheck live in make checkall)
+make test   # dev-db-up + test suites across all nine packages (fmt/clippy/typecheck live in make checkall)
 ```
 
 ## Endpoints
@@ -244,7 +246,7 @@ since browsers cannot set headers on a WS handshake.
 | `POST /api/query-batch` | Bearer token | Fans out N queries in one round trip (per-query error isolation); each slot returns `{ok, result}` or `{ok:false, error}`. |
 | `POST /api/mutate` | Bearer token | One-shot transaction (`insert`/`patch`/`replace`/`delete`/`undelete`/`expectVersion`/`expectAbsent`/`upsert` + `patchByQuery`/`deleteByQuery` + `schedule`/`cancelSchedule` + `startWorkflow`/`cancelWorkflow` steps). |
 | `POST /api/mutate-batch` | Bearer token | Fans out N independent transactions in one round trip (per-entry error isolation, deliberately not atomic); each positional slot returns `{ok, results}` or `{ok:false, error}`. Entries may carry their own `idempotencyKey` (per-entry dedup/replay). |
-| `POST /api/schedule` | Bearer token | Schedules a transaction: `afterMs`/`runAt` one-shot, `cron` (5-field, UTC, min-first), or `interval` (fixed `everyMs`); returns `{id}`. Pass `"external": true` to create an external-claim job (never internally executed; claimed by an app worker via `/api/schedule/claim` with a fencing token). |
+| `POST /api/schedule` | Bearer token | Schedules a transaction: `afterMs`/`runAt` one-shot, `cron` (5-field, min-first, UTC unless `tz` is given), or `interval` (fixed `everyMs`); returns `{id}`. Pass `"external": true` to create an external-claim job (never internally executed; claimed by an app worker via `/api/schedule/claim` with a fencing token). |
 | `POST /api/schedule/claim` | Bearer token | Atomically claims up to `limit` due external jobs (`leaseMs` lease each), returning `ClaimedSchedule[]` with per-job monotonic `leaseGeneration` fencing tokens. |
 | `POST /api/schedule/{id}/{complete,retry,fail}` | Bearer token | Worker-owned finalize transitions for a claimed external job, each guarded by the claim's `lease` token — a stale token (job re-claimed after lease expiry) is `409 CONFLICT`. `complete` deletes a one-shot or advances a recurring job to its next due instant; `retry` re-arms at `now + delayMs` (default 60s) recording `error`; `fail` (requires `error`) parks the job in a terminal `error` state. |
 | `POST /api/schedule/{id}/{cancel,pause,resume}` | Bearer token | Cancels, pauses, or resumes a scheduled job. |
@@ -497,6 +499,7 @@ mirrored as the HTTP `Retry-After` header); every other code omits it:
 | `SCHEMA_VIOLATION`    | 422         | Schema push / type-coercion rejection. |
 | `RATE_LIMITED`        | 429         | Per-token or per-db rate limit hit (HTTP and WS frames). Carries `retryAfter`. The WS connection stays open for this error; the separate per-connection frame-rate limit below closes it instead. |
 | `INTERNAL`            | 500         | Unexpected server error (generic message; detail logged via `tracing`). |
+| `CURSOR_EXPIRED`      | 410         | Change-feed cursor older than the retention window or ahead of the log; resync from `since=0` (see [Change feed](#change-feed)). |
 | `QUOTA_EXCEEDED`      | 507         | Per-database resource cap hit (tables / storage bytes / concurrent subscriptions — ENH-011). |
 | `READ_ONLY`           | 409         | The database is frozen read-only (`PATCH /admin/db/{db}/readonly`); client-plane document writes are rejected until it is unfrozen. |
 
@@ -875,8 +878,10 @@ server-side code. `when` is one of:
 - `{type: "afterMs", ms}` — fire `ms` milliseconds from now (one-shot).
 - `{type: "runAt", ms}` — fire at this UTC epoch-ms instant (one-shot; in the past
   fires immediately).
-- `{type: "cron", expr}` — fire on a 5-field standard cron expression (UTC,
-  min-first, e.g. `"*/5 * * * *"` = every 5 minutes). The server validates `expr`.
+- `{type: "cron", expr, tz?}` — fire on a 5-field standard cron expression (min-first,
+  e.g. `"*/5 * * * *"` = every 5 minutes). Fields are evaluated in UTC unless the
+  optional IANA `tz` (e.g. `"America/New_York"`) is given; an unknown zone is
+  `BAD_REQUEST`. The server validates `expr`.
 - `{type: "interval", everyMs}` — fire every `everyMs` milliseconds, first fire
   one interval from now (e.g. `300000` = every 5 minutes, no cron expression
   needed). `everyMs` must be positive and at most 31,536,000,000 (one year).
@@ -1209,9 +1214,9 @@ frames, so the delta rollout never breaks an older SDK.
 
 ## Make targets
 
-Every sweep target spans **all eight packages** — `core` (`par-rt-db-core`,
+Every sweep target spans **all nine packages** — `core` (`par-rt-db-core`,
 the shared Rust wire vocabulary), `server`, `ts-client`, `rust-client`,
-`python-client`, `swift-client`, `dashboard`, and `cli`. The swift-client lines
+`python-client`, `swift-client`, `go-client`, `dashboard`, and `cli`. The swift-client lines
 in every sweep are Darwin-guarded: on Linux they print `Skipping swift-client
 (non-Darwin host)` and a macOS CI job runs `make swift-client-checkall`
 instead. The [`Makefile`](Makefile) holds the canonical commands; this section
@@ -1225,6 +1230,7 @@ here rather than restating it.
 | `make ts-client-install` | ts-client | `bun install` in `ts-client/` and `ts-client/docs-toolchain/`. |
 | `make dashboard-install` | dashboard | `bun install` at repo root + `dashboard/`. |
 | `make python-client-install` | python-client | `uv sync --all-extras` in `python-client/`, so pyright can resolve the optional `http`/`ws` deps. |
+| `make go-client-install` | go-client | `go mod download` in `go-client/`. |
 
 The Cargo workspace members (`core/`, `server/`, `rust-client/`, `cli/`) and
 `swift-client/` have no install target — `cargo` and SwiftPM fetch on first
@@ -1234,12 +1240,12 @@ build.
 
 | Target | What runs in each package |
 | --- | --- |
-| `make build` | core/server/rust-client/cli `cargo build` (rust-client and cli with `--all-features`) · dashboard `bun run build` · swift-client `swift build` (Darwin). Runs `ts-client-build` first, because the dashboard resolves `@par-rt-db/client` from the gitignored `ts-client/dist`. |
-| `make fmt` | workspace `cargo fmt --all` (core/server/rust-client/cli) · ts-client/dashboard `bun run fmt` · python-client `uv run ruff format .` · swift-client `swiftformat .` |
-| `make fmt-check` | the same commands in check mode (`--check`, `swiftformat --lint`). |
-| `make lint` | workspace `cargo clippy --all-targets --all-features -- -D warnings` (core/server/rust-client/cli) · ts-client/dashboard `bun run lint` · python-client `uv run ruff check .` · swift-client `swiftlint --strict` |
-| `make typecheck` | workspace `cargo check --all-targets --all-features` (core/server/rust-client/cli) · ts-client/dashboard `bun run typecheck` · python-client `uv run pyright` · swift-client `swift build`. Runs `ts-client-build` first. |
-| `make test` | workspace `cargo test --workspace --all-features` (core/server/rust-client/cli — the flag is required, or cargo silently skips rust-client's feature-gated test targets) · ts-client/dashboard `bun run test` · python-client `uv run pytest -q` · swift-client `swift test`. Runs `dev-db-up` first. |
+| `make build` | core/server/rust-client/cli `cargo build` (rust-client and cli with `--all-features`) · go-client `go mod download` · dashboard `bun run build` · swift-client `swift build` (Darwin). Runs `ts-client-build` first, because the dashboard resolves `@par-rt-db/client` from the gitignored `ts-client/dist`. |
+| `make fmt` | workspace `cargo fmt --all` (core/server/rust-client/cli) · ts-client/dashboard `bun run fmt` · python-client `uv run ruff format .` · go-client `gofmt -w .` · swift-client `swiftformat .` |
+| `make fmt-check` | the same commands in check mode (`--check`, `gofmt -l`, `swiftformat --lint`). |
+| `make lint` | workspace `cargo clippy --all-targets --all-features -- -D warnings` (core/server/rust-client/cli) · ts-client/dashboard `bun run lint` · python-client `uv run ruff check .` · go-client `go vet ./...` (also `-tags live`) · swift-client `swiftlint --strict` |
+| `make typecheck` | ts-client/dashboard `bun run typecheck` · python-client `uv run pyright` · go-client `go vet ./...` · swift-client `swift build`. The Rust crates are covered by `make lint`'s clippy run, which already fails on everything `cargo check` would. Runs `ts-client-build` first. |
+| `make test` | workspace `cargo nextest run --workspace --all-features` when `cargo-nextest` is installed, else `cargo test --workspace --all-features` (core/server/rust-client/cli — the flag is required, or cargo silently skips rust-client's feature-gated test targets) · ts-client/dashboard `bun run test` · python-client `uv run pytest -q` · go-client `go test ./...` · swift-client `swift test`. Runs `dev-db-up` first. |
 
 ### Verification gates
 
@@ -1251,13 +1257,14 @@ run.
 | --- | --- | --- |
 | 1. `env-drift-check` | Every `RTDB_*` var read by the server or documented in `.env.example` is forwarded to the container by `docker-compose.yml`'s `environment:` block. The block is an explicit allowlist, so a `.env`-only key silently does nothing. | `make env-drift-check` |
 | 2. `dockerfile-stub-check` | Every `[[test]]` declared by a non-server workspace member has a matching placeholder in the Dockerfile's dependency-caching layer. Without it `make deploy` fails at cargo's manifest parse — a break the rest of `checkall` cannot see. | `make dockerfile-stub-check` |
-| 3. `cli-docs-check` | `cli/README.md` matches what `gen-cli-docs` regenerates, so the CLI reference cannot drift from the CLI. | `make cli-docs-check` |
-| 4. `docs-api` | API docs regenerate cleanly for every SDK (`rust-client-doc`, `ts-client-doc`, `python-client-doc`, `swift-client-doc`), with warnings denied, so doc comments cannot rot. | `make docs-api` |
-| 5. `fmt-check` | Formatting across all eight packages. | `make fmt-check` |
-| 6. `lint` | Clippy under `-D warnings`, biome, ruff, swiftlint `--strict`. | `make lint` |
-| 7. `typecheck` | `cargo check`, `tsc`, pyright, `swift build`. | `make typecheck` |
-| 8. `test` | The full suite across all eight packages, against the dev Postgres. | `make test` |
-| 9. `rust-client-check-features` | The rust-client library **and** its test targets compile under every meaningful feature combination, not just `--all-features`. | `make rust-client-check-features` |
+| 3. `backup-persistence-check` | The rendered `docker-compose.yml` mounts a persistent volume at `/backups` for the server, so scheduled dumps survive a container restart. | `make backup-persistence-check` |
+| 4. `cli-docs-check` | `cli/README.md` matches what `gen-cli-docs` regenerates, so the CLI reference cannot drift from the CLI. | `make cli-docs-check` |
+| 5. `docs-api` | API docs regenerate cleanly for every SDK (`rust-client-doc`, `ts-client-doc`, `python-client-doc`, `swift-client-doc`), with warnings denied, so doc comments cannot rot. | `make docs-api` |
+| 6. `fmt-check` | Formatting across all nine packages. | `make fmt-check` |
+| 7. `lint` | Clippy under `-D warnings`, biome, ruff, `go vet`, swiftlint `--strict`. | `make lint` |
+| 8. `typecheck` | `tsc`, pyright, `go vet`, `swift build`. | `make typecheck` |
+| 9. `test` | The full suite across all nine packages, against the dev Postgres. | `make test` |
+| 10. `rust-client-check-features` | The rust-client library **and** its test targets compile under every meaningful feature combination, not just `--all-features`. | `make rust-client-check-features` |
 
 Never `--no-verify` past the gate. If you do, fix the gate before anything
 else.
@@ -1283,12 +1290,13 @@ else.
 | python-client | `python-client-fmt`, `python-client-lint`, `python-client-typecheck`, `python-client-test`, `python-client-checkall` |
 | swift-client | `swift-client-fmt`, `swift-client-fmt-check`, `swift-client-lint`, `swift-client-typecheck`, `swift-client-build`, `swift-client-test`, `swift-client-checkall` (Darwin only) |
 | rust-client | `rust-client-check-features` |
+| go-client | `go-client-install`, `go-client-fmt`, `go-client-fmt-check`, `go-client-lint`, `go-client-typecheck`, `go-client-test`, `go-client-checkall` |
 | ts-client | `ts-client-install`, `ts-client-build` |
 | dashboard | `dashboard-install`, `dashboard-test` |
 
 Other packages are exercised directly with their own tool: `cargo test` in
-`core/`, `server/`, `rust-client/`, and `cli/`, and `bunx vitest run` in
-`ts-client/`.
+`core/`, `server/`, `rust-client/`, and `cli/`, `go test ./...` in `go-client/`, and
+`bunx vitest run` in `ts-client/`.
 
 Server integration tests are a single consolidated binary, so run one test by
 name with `cargo test --test main <name>` from `server/`, not by test-file
@@ -1428,7 +1436,7 @@ plus an operator SPA and a CLI built on top of them:
 * Q: Can I use it over plain HTTP?
   * A: Yes — one-shot `POST /api/query` / `POST /api/mutate` cover reads and writes. The WebSocket (`/sync`) is only needed for live subscriptions and presence.
 * Q: Which languages have client SDKs?
-  * A: TypeScript (`@par-rt-db/client`, with React bindings), Rust (`par-rt-db-client`), Python (`par-rt-db`), and Swift (`ParRtDbClient`, iOS 17+/macOS 14), plus the `rtdb` CLI and the operator dashboard.
+  * A: TypeScript (`@par-rt-db/client`, with React bindings), Rust (`par-rt-db-client`), Python (`par-rt-db`), Swift (`ParRtDbClient`, iOS 17+/macOS 14), and Go (`go-client`), plus the `rtdb` CLI and the operator dashboard.
 * Q: Is auth required?
   * A: Machine tokens are the baseline. Each of the six OAuth providers is independently optional (blank env ⇒ its routes return 503), and anonymous access is opt-in (off by default).
 * Q: Can I run multiple replicas behind a load balancer?
@@ -1461,7 +1469,7 @@ database operations now answer `NOT_FOUND` rather than `INTERNAL`.
 ## Contributing
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development setup, the `make checkall`
-gate, Conventional Commits, the four-client wire-mirror rule, and the PR checklist.
+gate, Conventional Commits, the five-client wire-mirror rule, and the PR checklist.
 [`CLAUDE.md`](CLAUDE.md) is the agent-facing companion with the full invariant list.
 
 ## License
