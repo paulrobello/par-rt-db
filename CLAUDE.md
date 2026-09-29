@@ -1,16 +1,14 @@
 # CLAUDE.md
 
-Guidance for Claude Code (claude.ai/code) working in this repository.
-
 ## What this is
 
 par-rt-db is a self-hosted, Convex-inspired realtime document database in Rust (axum/tokio + Postgres 17). Clients send a **declarative JSON DSL** — typed queries and atomic multi-step transactions — over WebSocket (`/sync`) or one-shot HTTP; the server executes them and pushes live query updates on change. One instance hosts many named databases. There is **no embedded JS runtime** and **no per-app server code** — one generic server serves every app.
 
-Authoritative sources: [README.md](README.md) for the HTTP/WS surface, the DSL, and configuration; [FEATURE_MATRIX.md](FEATURE_MATRIX.md) for the Convex-parity contract; [wire-corpus/README.md](wire-corpus/README.md) for the executable semantics corpus that pins protocol behavior across all six implementations; and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for server internals (the committer, background tasks, auth, storage — with the reasoning behind each invariant). The [2026-07-21 design spec](docs/superpowers/specs/2026-07-21-par-rt-db-design.md) is a historical record of the original design and is superseded by those four — do not treat it as current.
+Authoritative sources: [README.md](README.md) for the HTTP/WS surface, the DSL, and configuration; [FEATURE_MATRIX.md](FEATURE_MATRIX.md) for the Convex-parity contract; [wire-corpus/README.md](wire-corpus/README.md) for the executable semantics corpus that pins protocol behavior across all six implementations; and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for server internals (the committer, background tasks, auth, storage — with the reasoning behind each invariant). The [2026-07-21 design spec](docs/superpowers/specs/2026-07-21-par-rt-db-design.md) is historical and superseded by those four.
 
 ## Workspace & commands
 
-Nine packages run from the root `Makefile` (swift-client's lines are Darwin-guarded — they echo a loud skip on Linux, and a macOS CI job runs `make swift-client-checkall`):
+Nine packages run from the root `Makefile` (swift-client's lines are Darwin-guarded; a macOS CI job runs `make swift-client-checkall`):
 
 | Package | Path | Tool |
 | --- | --- | --- |
@@ -24,12 +22,12 @@ Nine packages run from the root `Makefile` (swift-client's lines are Darwin-guar
 | Operator dashboard SPA | `dashboard/` | bun (Vite + React) |
 | `rtdb` CLI — wraps the rust client | `cli/` | cargo |
 
-- `make checkall` — the full gate: `env-drift-check`, `dockerfile-stub-check`, `cli-docs-check`, `fmt-check`, `lint`, `typecheck`, `test`, `rust-client-check-features`. **Definition of done; must pass before commit.** Each stage is described in [README.md](README.md#verification-gates).
-- `make dev-db-up` / `dev-db-down` — start/stop the dev Postgres on `127.0.0.1:55434`. **Required for any test run** — integration tests hit a real DB. `make dev-db-clean` periodically drops leaked test artifacts (per-test `db_t…` schemas and the corpus runner's `sc_…` databases; scoped to those patterns, never touches real DBs).
+- `make checkall` — the full gate (`fmt`, `lint`, `typecheck`, `test`, and drift checks). **Definition of done; must pass before commit.** Stage details: [README.md](README.md#verification-gates).
+- `make dev-db-up` / `dev-db-down` — the dev Postgres on `127.0.0.1:55434`. **Required for any test run.** `make dev-db-clean` drops leaked test artifacts (safe, pattern-scoped).
 - `make test` — dev-db-up then the whole suite. First-time setup: `make ts-client-install`, `make dashboard-install`, `make python-client-install`, `make go-client-install`.
-- Single test: `cargo test --test main txn_test::upsert_multiple_matches` (from `server/`), `cd ts-client && bunx vitest run tests/<file>.test.ts`, or `cd python-client && uv run pytest -q tests/<file>.py`. Since ARC-010 the server's integration tests are ONE binary (`tests/main.rs`); each `tests/<name>.rs` is a module of it, so a filter is `<file_stem>::<test_name>` and a whole file is `--test main <file_stem>::`. A new test file needs a `mod` line in `tests/main.rs`.
+- Single test: `cargo test --test main <file_stem>::<test_name>` from `server/` (all integration tests are one binary, `tests/main.rs` — a new test file needs a `mod` line there); `bunx vitest run` in `ts-client/`; `uv run pytest` in `python-client/`.
 - `build` and `typecheck` pull `ts-client-build` first — the dashboard resolves `@par-rt-db/client` from `ts-client/dist` (gitignored); build it on a fresh or stale checkout or the gate fails at dashboard typecheck.
-- Live-server tests are opt-in (`#[ignore]`, need `RTDB_TEST_SERVER_URL` + `RTDB_TEST_ADMIN_KEY`, run with `--ignored`).
+- Live-server tests are opt-in (`#[ignore]`, need `RTDB_TEST_SERVER_URL` + `RTDB_TEST_ADMIN_KEY`).
 
 Tests share one Postgres, isolating via uniquely-named databases per test. Never assume exclusive access, and never drop a database or schema you didn't create.
 
@@ -37,27 +35,27 @@ Tests share one Postgres, isolating via uniquely-named databases per test. Never
 
 Full detail and reasoning: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The one load-bearing fact: **each database has a single serialized committer task** (`committer/` + `subs.rs`) — all writes flow through it, then it re-runs affected subscriptions and pushes only on change. Reads run READ COMMITTED with no row locking, so this serialization is what makes correctness hold. **Never call `execute_txn` outside the committer; never add a second writer.**
 
-- **Per-db background tasks** (`scheduler.rs`, `workflows.rs`, `reaper.rs`): scheduler, TTL reaper, and mutation-log cleanup never write document tables — they only claim/enqueue work back through committer request arms (`RunScheduled` / `RunWorkflowAdvance` / `RunReaper`, plus `RunMigrate` for schema migrate). Workflow `awaitSignal` delivery (HTTP/WS/admin signal surfaces) reuses the cancel side-table pattern — one conditional UPDATE on the `workflows` row, no new committer arm.
-- **Data pipeline** (`schema.rs` → `ddl.rs` → `txn.rs`/`query/`): pushed schemas compile to Postgres DDL (one typed column per indexed field + `doc` jsonb, additive-only changes); transactions are ordered step lists with per-step caps; the read and write paths share index-value typing — keep them aligned.
+- **Per-db background tasks** (scheduler, workflows, TTL reaper) never write document tables — they only enqueue work back through committer request arms.
+- **Data pipeline** (`schema.rs` → `ddl.rs` → `txn.rs`/`query/`): pushed schemas compile to Postgres DDL (one typed column per indexed field + `doc` jsonb, additive-only changes); the read and write paths share index-value typing — keep them aligned.
 - **Two transports, one vocabulary** (`protocol.rs`, `ws.rs`, `http_api.rs`): both route mutations through `Committers::mutate` so subscriptions fire regardless of which transport wrote.
-- **Auth** (`auth/`): per-db machine tokens, OAuth sessions (six providers — see `docs/OAUTH_SETUP.md`), optional anonymous. The WS handler re-runs `authorize` on every Subscribe and Mutate so revocation, allowlist changes, and session expiry take effect on open connections. Opt-in per-row rules: `ownerField` / `collaboratorsField` / `authorize` predicate DSL.
-- **File storage** (`storage.rs`): HTTP-only and bypasses the committer (blobs touch no document tables); `GET /storage/{id}` is the one unauthenticated route. Image transforms, signed URLs, and Range requests are read-time capabilities on the serve routes.
-- **Quotas** (`quota.rs`): optional per-db caps (tables / storage / subs) enforced hard — no admin bypass; raise a cap via `PATCH /admin/config`.
-- **Wire contract**: `server/src/protocol.rs`, `ts-client/src/protocol.ts`, `rust-client/src/wire.rs`, `python-client/src/par_rt_db/wire.py`, `swift-client/Sources/ParRtDbClient/Wire.swift` (with the query/txn wire structs in `Query.swift`/`Mutation.swift` alongside it), and `go-client/wire/` are six implementations of one protocol and must stay byte-identical (serde tags and field names — the casing is deliberately non-uniform and load-bearing). The SDKs are no-codegen: a schema object is both pushed to the server and the source of inferred types.
-- **Dashboard SPA** (`lib.rs`): served same-origin from `RTDB_STATIC_DIR` as the router's last fallback — it can never shadow API routes.
+- **Auth** (`auth/`): per-db machine tokens, OAuth sessions (see `docs/OAUTH_SETUP.md`), optional anonymous; per-row rules via `ownerField` / `collaboratorsField` / `authorize`. The WS handler re-runs `authorize` on every Subscribe and Mutate, so revocation and session expiry take effect on open connections.
+- **File storage** (`storage.rs`): HTTP-only, bypasses the committer (blobs touch no document tables); `GET /storage/{id}` is the one unauthenticated route.
+- **Quotas** (`quota.rs`): optional per-db caps enforced hard — no admin bypass; raise via `PATCH /admin/config`.
+- **Wire contract**: `server/src/protocol.rs` plus one wire module per client (`ts-client/src/protocol.ts`, `rust-client/src/wire.rs`, `python-client/src/par_rt_db/wire.py`, `swift-client/.../Wire.swift`, `go-client/wire/`) are six implementations of one protocol and must stay byte-identical (serde tags and field names — the casing is deliberately non-uniform). The SDKs are no-codegen: a schema object is both pushed to the server and the source of inferred types.
+- **Dashboard SPA**: served same-origin from `RTDB_STATIC_DIR` as the router's last fallback — it can never shadow API routes.
 
 ## Invariants you must preserve
 
-- **SQL construction**: validate and double-quote every identifier; bind every value via `$n`. Never interpolate an unvalidated value. Physical names are lowercased and length-capped to fit Postgres's 63-byte limit (see `ddl.rs`) — don't raise the caps.
-- **Errors**: every failure is the `RtDbError` envelope `{code, message}` (codes/statuses in `error.rs`). Client-facing 500s carry a **generic** message — never stringify a sqlx/serde error into the body (log it via `tracing`). Use `fetch_optional` for any lookup that can legitimately miss.
-- **Op-feed tap**: every code path that commits a document txn must go through a committer `handle_*` arm calling `publish_taps` (`committer/taps.rs`, called only from `committer/arms/*.rs`; enumerated in ARCHITECTURE.md), or the op-feed, audit log, and webhooks will silently miss those writes. TTL deletes are durable writes the same way.
-- **The ownership lease is the multi-writer boundary**: under `RTDB_MULTI_INSTANCE`, exactly one replica holds a database's `pg_try_advisory_lock` lease and runs its committer; every other replica is a SHADOW that forwards writes to the owner and never executes them locally (`committer/lease.rs`, `committer/forwarding.rs`, `forward.rs`). **Never bypass `Committers::submit`** — it is what routes a write to the owner or the forward path. Adding a code path that writes directly on a shadow replica reintroduces the second writer the lease exists to prevent.
-- **Clients mirror the core**: the server is the source of truth for the protocol, DSL, step-result shapes, and behavior. Any server change must be mirrored in **all five** clients (ts-client, rust-client, python-client, swift-client, go-client) — wire types, DSL builders, and their tests. If a client doesn't yet cover a changed surface, file the gap explicitly rather than letting it drift. The [wire-corpus](wire-corpus/README.md) semantics corpus enforces this — all six runners (server + five in-memory engines, swift's engine shipped 2026-08-19, go's 2026-09-19) execute every case, and every behavior-changing change ships with a case (its README's authoring rule).
-- **Backups never touch the live DB**: restore goes into a fresh `rtdb_restored_<stamp>` Postgres DB (`backup.rs`, `admin/backups.rs`); the single-writer invariant is preserved. Credentials travel via `PG*` env, never argv.
-- **Hot config is live**: runtime-mutable settings (`allowed_origins`, `session_ttl_days`, `max_file_size`, `idempotency_ttl_ms`, quota caps) live on `AppState` as `Arc<ArcSwap<HotConfig>>` (`config.rs`); every consumer reads `state.hot.load()`, and the CORS layer re-reads `allowed_origins` per request.
-- No `unwrap()`/`expect()` outside `#[cfg(test)]`, enforced by `clippy::unwrap_used`/`clippy::expect_used` in `server/src/lib.rs`. Zero clippy warnings under `-D warnings`.
-- **Keep docs in sync**: when a feature lands or changes, update `FEATURE_MATRIX.md` (the Convex-parity contract), the relevant README(s)/docs, and any skill that documents par-rt-db's surface. A stale doc that contradicts the code is a bug.
+- **SQL construction**: validate and double-quote every identifier; bind every value via `$n`. Never interpolate an unvalidated value. Physical names are lowercased and length-capped to Postgres's 63-byte limit (`ddl.rs`) — don't raise the caps.
+- **Errors**: every failure is the `RtDbError` envelope `{code, message}` (codes in `error.rs`). Client-facing 500s carry a **generic** message — never stringify a sqlx/serde error into the body (log it via `tracing`). Use `fetch_optional` for any lookup that can legitimately miss.
+- **Op-feed tap**: every code path that commits a document txn must go through a committer `handle_*` arm calling `publish_taps` (`committer/taps.rs`), or the op-feed, audit log, and webhooks will silently miss those writes. TTL deletes are durable writes the same way.
+- **The ownership lease is the multi-writer boundary**: under `RTDB_MULTI_INSTANCE`, exactly one replica holds the advisory-lock lease and runs its committer; every other replica is a SHADOW that forwards writes to the owner and never executes locally. **Never bypass `Committers::submit`** — it routes each write to the owner or the forward path.
+- **Clients mirror the core**: the server is the source of truth for the protocol, DSL, step-result shapes, and behavior. Any server change must be mirrored in **all five** clients — wire types, DSL builders, and their tests; file any gap explicitly rather than letting it drift. The wire-corpus enforces this: all six runners execute every case, and every behavior-changing change ships with a case (its README's authoring rule).
+- **Backups never touch the live DB**: restore goes into a fresh `rtdb_restored_<stamp>` database; credentials travel via `PG*` env, never argv.
+- **Hot config is live**: runtime-mutable settings live on `AppState` as `Arc<ArcSwap<HotConfig>>` (`config.rs`); every consumer reads `state.hot.load()`.
+- No `unwrap()`/`expect()` outside `#[cfg(test)]`, enforced by clippy. Zero clippy warnings under `-D warnings`.
+- **Keep docs in sync**: when a feature lands or changes, update `FEATURE_MATRIX.md`, the relevant README(s)/docs, and any skill that documents par-rt-db's surface. A stale doc that contradicts the code is a bug.
 
 ## Deployment
 
-Production runs as plain `docker compose` on a standalone Docker host behind a Cloudflare tunnel (deploy target set by `DEPLOY_HOST`; runbook: `deploy/README.md`). **Build on the x86_64 host, not from an arm64 Mac.** Secrets come from a mode-600 `.env` (`.env.example` is the template). A new `RTDB_*` env var must be added to both `.env.example` and `docker-compose.yml`'s environment block, or `make checkall` fails at env-drift-check.
+Production runs as plain `docker compose` on a standalone Docker host behind a Cloudflare tunnel (runbook: `deploy/README.md`). **Build on the x86_64 host, not from an arm64 Mac.** Secrets come from a mode-600 `.env` (`.env.example` is the template). A new `RTDB_*` env var must be added to both `.env.example` and `docker-compose.yml`'s environment block, or `make checkall` fails at env-drift-check.
