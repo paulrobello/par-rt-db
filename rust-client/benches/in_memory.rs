@@ -6,12 +6,13 @@
 
 #![cfg(feature = "in_memory")]
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use par_rt_db_client::in_memory::{InMemoryRtDbClient, InMemoryRtDbClientOptions};
 use par_rt_db_client::query::TableQuery;
 use par_rt_db_client::schema::{FieldType, Table};
 use par_rt_db_client::{Mutation, Order, SchemaBuilderExt, SchemaDef};
 use serde_json::{Value, json};
+use std::hint::black_box;
 
 const ROW_COUNT: usize = 10_000;
 

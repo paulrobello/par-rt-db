@@ -10,6 +10,21 @@ use crate::db::{new_id, now_ms, validate_db_name};
 use crate::error::RtDbError;
 use crate::protocol::{ScheduleKind, ScheduleStatus, ScheduleWhen};
 
+/// Parses a cron expression with a superset of the grammar croner 2.x accepted
+/// by default: exactly 5 fields (croner 4's default would also accept 6-field
+/// seconds and 7-field year patterns) and single-number steps like `5/5`
+/// (croner 4 rejects them unless `sloppy_ranges`, which additionally accepts a
+/// bare `/10` as `*/10`). Tightening either would reject stored schedules.
+fn parse_cron(expr: &str) -> Result<croner::Cron, croner::errors::CronError> {
+    use croner::parser::{CronParser, Seconds, Year};
+    CronParser::builder()
+        .seconds(Seconds::Disallowed)
+        .year(Year::Disallowed)
+        .sloppy_ranges(true)
+        .build()
+        .parse(expr)
+}
+
 /// Computes the next fire time (UTC epoch ms) for a 5-field cron expression,
 /// strictly after `now_ms`. With `tz`, cron fields are evaluated against that
 /// IANA zone's local wall clock and the result is converted back to UTC. A
@@ -18,9 +33,7 @@ use crate::protocol::{ScheduleKind, ScheduleStatus, ScheduleWhen};
 pub fn next_fire(expr: &str, now_ms: i64, tz: Option<&str>) -> Result<i64, RtDbError> {
     use chrono::{DateTime, Utc};
     use chrono_tz::Tz;
-    let mut cron = croner::Cron::new(expr);
-    cron.parse()
-        .map_err(|_| RtDbError::bad_request("invalid cron expression"))?;
+    let cron = parse_cron(expr).map_err(|_| RtDbError::bad_request("invalid cron expression"))?;
     let now = DateTime::<Utc>::from_timestamp_millis(now_ms)
         .ok_or_else(|| RtDbError::internal("invalid timestamp"))?;
     let next = match tz {
@@ -86,10 +99,9 @@ pub(crate) fn missed_windows_cron(
 ) -> i64 {
     use chrono::{DateTime, Utc};
     use chrono_tz::Tz;
-    let mut cron = croner::Cron::new(expr);
-    if cron.parse().is_err() {
+    let Ok(cron) = parse_cron(expr) else {
         return 0;
-    }
+    };
     let Some(prev) = DateTime::<Utc>::from_timestamp_millis(prev_due_at) else {
         return 0;
     };

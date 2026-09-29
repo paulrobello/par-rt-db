@@ -15,8 +15,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rand::RngCore;
-use rand::rngs::OsRng;
+use rand::Rng;
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
 use serde::Serialize;
 use sqlx::PgPool;
 
@@ -182,13 +183,13 @@ pub fn is_blocked_ip(ip: IpAddr) -> bool {
 }
 
 /// Generates a fresh 256-bit webhook signing secret as 64 hex chars. Backed by
-/// `OsRng` (CSPRNG); the value never leaves the server except in the admin
+/// `SysRng` (OS CSPRNG); the value never leaves the server except in the admin
 /// list/edit response so an operator can copy it to the receiver. Used at
 /// `create_webhook`, on a `rotateSecret` edit, and to backfill any NULL rows
 /// at boot.
 pub fn generate_secret() -> String {
     let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
+    UnwrapErr(SysRng).fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
 
@@ -1153,7 +1154,7 @@ mod tests {
             "secret is hex: {a}"
         );
         // Two consecutive draws differ (CSPRNG; collision over 256 bits is
-        // cryptographically infeasible — a repeat here means OsRng is broken).
+        // cryptographically infeasible — a repeat here means SysRng is broken).
         assert_ne!(a, b, "two generated secrets must differ");
     }
 

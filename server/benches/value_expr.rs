@@ -5,11 +5,12 @@
 //! field reads, string concat, arithmetic, coalesce, string casing, and a
 //! `Case`/`when` predicate branch.
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::query::FilterExpr;
 use rtdb_server::value_expr::{CaseWhen, ValueExpr, eval_value_expr};
 use serde_json::json;
+use std::hint::black_box;
 
 fn bench_doc() -> serde_json::Map<String, serde_json::Value> {
     json!({

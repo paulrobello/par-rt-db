@@ -5,10 +5,11 @@
 //! order, search, vector search, and hybrid search — the shapes the read path
 //! sees in practice.
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::query::{FilterExpr, Query, compile_query};
 use rtdb_server::schema::SchemaDef;
+use std::hint::black_box;
 
 /// A `docs` table with btree, search, and vector indexes — enough surface to
 /// exercise every terminal `compile_query` supports.

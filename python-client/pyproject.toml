@@ -19,8 +19,8 @@ aio = ["par-rt-db[http]"]    # alias for [http] (ARC-124): async surface no long
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
-    "ruff>=0.16.6",
-    "pyright>=1.1.413",
+    "ruff>=0.16.9",
+    "pyright>=1.1.414",
     "pdoc>=16.0.0",
 ]
 

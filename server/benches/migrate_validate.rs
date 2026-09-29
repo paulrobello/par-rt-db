@@ -4,10 +4,11 @@
 //! every `Directive` kind) against a ~30-table schema — the shape a real
 //! `POST /admin/db/{db}/migrate` dry-run validates before touching any row.
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use rtdb_server::migrate::{Directive, ExprSource, plan_migration};
 use rtdb_server::schema::SchemaDef;
 use rtdb_server::value_expr::ValueExpr;
+use std::hint::black_box;
 
 const TABLE_COUNT: usize = 30;
 

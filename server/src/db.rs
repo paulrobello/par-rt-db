@@ -7,8 +7,9 @@
 
 use std::sync::Arc;
 
-use rand::RngCore;
-use rand::rngs::OsRng;
+use rand::Rng;
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool};
 
@@ -899,10 +900,10 @@ pub fn sha256_hex(s: &str) -> String {
 
 /// Mints a 64-hex-char (256-bit) token from the OS CSPRNG. Backs session
 /// tokens, machine tokens, OAuth state, and CSRF nonces — all security
-/// values (SEC-206: OsRng by contract, not just in practice).
+/// values (SEC-206: the OS CSPRNG, `SysRng`, by contract, not just in practice).
 pub fn random_token() -> String {
     let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
+    UnwrapErr(SysRng).fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
 

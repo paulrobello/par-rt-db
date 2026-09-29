@@ -129,7 +129,7 @@ impl RtDbAdminClient {
             Ok(Ok((socket, _response))) => Ok(AdminStream {
                 socket: socket.boxed(),
             }),
-            Ok(Err(WsError::Http(response))) => Err(upgrade_error(response)),
+            Ok(Err(WsError::Http(response))) => Err(upgrade_error(*response)),
             Ok(Err(e)) => Err(RtDbError::internal(format!(
                 "admin stream connect failed: {e}"
             ))),

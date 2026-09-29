@@ -3,8 +3,9 @@
 //! declared field on patch's merged result). Pure, no Postgres. Benchmarks a
 //! ~1 KB and a ~10 KB document against the same table schema.
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use rtdb_server::schema::{SchemaDef, validate_doc};
+use std::hint::black_box;
 
 fn bench_schema() -> SchemaDef {
     serde_json::from_value(serde_json::json!({"tables":{

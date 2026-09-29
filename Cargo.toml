@@ -17,7 +17,7 @@ members = ["core", "server", "rust-client", "cli"]
 # and may ADD features (member features are unioned onto the base declared here)
 # but cannot remove `default-features` the workspace enables, so every base
 # below is the lowest common denominator; members re-add what they need
-# (e.g. server re-adds `cookies` on reqwest and `std` on sha2).
+# (e.g. server re-adds `cookies` on reqwest and `alloc`/`oid` on sha2).
 [workspace.dependencies]
 # ARC-004: the wire vocabulary the server and the Rust client both speak.
 # Defined once so a drift between them is a compile error rather than a
@@ -27,17 +27,17 @@ par-rt-db-core = { path = "core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-base64 = "0.22"
+base64 = "0.23"
 # Both server and rust-client use rustls-tls + json; server additionally needs
 # `cookies` (re-added in server/Cargo.toml). default-features = false is the
 # common baseline so neither pulls in the native-tls backend.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1" }
-# server wants default (std) features; rust-client compiles it without defaults
-# (optional, behind `in_memory`). Base = no defaults so rust-client stays
-# minimal; server re-adds `std` to preserve its prior behavior exactly.
-sha2 = { version = "0.10", default-features = false }
-tokio-tungstenite = { version = "0.26" }
+# server wants default (alloc, oid) features; rust-client compiles it without
+# defaults (optional, behind `in_memory`). Base = no defaults so rust-client
+# stays minimal; server re-adds `alloc` + `oid` to keep sha2's defaults.
+sha2 = { version = "0.11", default-features = false }
+tokio-tungstenite = { version = "0.30" }
 futures-util = { version = "0.3" }
 # ENH-021 streaming storage: the streaming upload path consumes a body chunk
 # stream generically via `futures::Stream`/`StreamExt`, decoupled from
@@ -50,4 +50,4 @@ wiremock = "0.6"
 # dev-dep in server, prod dep in cli.
 anyhow = "1"
 # ENH-033: criterion micro-benchmarks, shared by server + rust-client.
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }

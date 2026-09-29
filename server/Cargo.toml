@@ -47,7 +47,7 @@ bytes = "1"
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors", "fs"] }
+tower-http = { version = "0.7", features = ["trace", "cors", "fs"] }
 serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "json"] }
@@ -55,12 +55,12 @@ thiserror.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v7"] }
-# `std` re-adds sha2's default features (the workspace base ships
-# default-features = false so rust-client can stay minimal); this matches the
-# pre-workspace `sha2 = "0.10"` behavior exactly.
-sha2 = { workspace = true, features = ["std"] }
+# `alloc` + `oid` re-add sha2 0.11's default features (the workspace base ships
+# default-features = false so rust-client can stay minimal), matching a plain
+# `sha2 = "0.11"` dependency. 0.11 removed the `std` feature 0.10 used here.
+sha2 = { workspace = true, features = ["alloc", "oid"] }
 hex = "0.4"
-rand = "0.8"
+rand = "0.10"
 subtle = "2"
 # HMAC-SHA256 backend for signed storage URLs (signed_url module). Already
 # compiled transitively via rustls (sqlx `tls-rustls`, reqwest `rustls-tls`);
@@ -70,12 +70,12 @@ reqwest = { workspace = true, features = ["cookies"] }
 base64.workspace = true
 # Sign in with Apple (ENH-001): Apple rejects a static client_secret, so the
 # secret sent to Apple's token endpoint is a short-lived ES256 JWT the server
-# signs with the registered EC private key. 9.x uses `ring` (already in the
-# tree via rustls) as its sole crypto backend — no new native build.
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+# signs with the registered EC private key. The `rust_crypto` backend is pure
+# Rust (p256/p384/hmac/ed25519-dalek/rsa) — no new native build.
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 chrono-tz = "0.10"
-croner = "2"
+croner = "4"
 # Used by the managed-backup task to parse `postgres://` connection strings
 # into PG* env vars (so credentials never appear in the child argv).
 url = "2"
@@ -99,23 +99,23 @@ tokio-stream = "0.1"
 # OpenTelemetry / OTLP tracing export (ENH-018). Optional + feature-gated behind
 # `otel` (default off). The exact versions are pinned because the
 # opentelemetry / tracing-opentelemetry pairing breaks across minor versions
-# more often than most crates — 0.32.x + tracing-opentelemetry 0.33.x is the
+# more often than most crates — 0.33.x + tracing-opentelemetry 0.34.x is the
 # verified-resolving matrix (checked with `cargo tree -d`, no duplicate tree).
-# sdk 0.32.1 is the floor for the Dependabot-moderate advisory (unbounded
+# sdk 0.32.1 was the floor for the Dependabot-moderate advisory (unbounded
 # memory allocation in W3C Baggage propagation); 0.31.x is vulnerable too.
 # Historical: the 0.31 API renamed `TracerProvider` → `SdkTracerProvider`,
 # dropped the runtime arg from `with_batch_exporter`, and replaced
 # `Resource::new` with a builder.
-opentelemetry = { version = "0.32", default-features = false, optional = true }
-opentelemetry_sdk = { version = "0.32", default-features = false, features = [
+opentelemetry = { version = "0.33", default-features = false, optional = true }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = [
     "trace",
     "rt-tokio",
 ], optional = true }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
     "trace",
     "grpc-tonic",
 ], optional = true }
-tracing-opentelemetry = { version = "0.33", optional = true }
+tracing-opentelemetry = { version = "0.34", optional = true }
 
 [dev-dependencies]
 anyhow.workspace = true
@@ -123,12 +123,15 @@ tempfile = "3"
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 wiremock.workspace = true
-serial_test = "3"
+serial_test = "4"
 # RS256 signing in the `auth/microsoft.rs` id_token unit tests: throwaway
 # runtime-generated keys (never a PEM/key literal in the repo, so gitleaks
 # stays meaningful). 0.9 is already in the tree via jsonwebtoken's rust_crypto
-# backend — declaring it adds no new crates to the build.
-rsa = "0.9"
+# backend — declaring it adds no new crates to the build. rsa 0.9 speaks the
+# rand_core 0.6 / digest 0.10 traits, so the tests use its re-exported
+# `rand_core::OsRng` (feature `getrandom`) and `sha2::Sha256` (feature `sha2`)
+# rather than the workspace's newer rand 0.10 / sha2 0.11.
+rsa = { version = "0.9", features = ["getrandom", "sha2"] }
 # ENH-027 property-based parity testing (`tests/proptest_parity.rs`):
 # generative schemas/docs/queries executed against both Postgres (this crate)
 # and the rust-client in-memory engine, asserting identical results. Both are

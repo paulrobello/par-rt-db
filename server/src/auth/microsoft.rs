@@ -767,7 +767,7 @@ mod tests {
 
     /// Throwaway RSA-2048 key generated at runtime for signing test id_tokens.
     fn fresh_rsa_key() -> rsa::RsaPrivateKey {
-        rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).expect("generate RSA-2048 key")
+        rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("generate RSA-2048 key")
     }
 
     fn b64url(bytes: &[u8]) -> String {
@@ -793,8 +793,8 @@ mod tests {
     /// `header.payload` signing input.
     fn sign_rs256_jwt(key: &rsa::RsaPrivateKey, kid: &str, claims: &serde_json::Value) -> String {
         use rsa::pkcs1v15::SigningKey;
+        use rsa::sha2::Sha256;
         use rsa::signature::{SignatureEncoding, Signer};
-        use sha2::Sha256;
 
         let header = json!({"alg": "RS256", "typ": "JWT", "kid": kid});
         let signing_input = format!(
@@ -825,7 +825,7 @@ mod tests {
     /// Claims of a well-formed Microsoft v2.0 id_token for `tid`, with `exp`
     /// offset `exp_offset_secs` from now.
     fn ms_claims(tid: &str, exp_offset_secs: i64) -> serde_json::Value {
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::db::now_ms() / 1000;
         json!({
             "iss": format!("https://login.microsoftonline.com/{tid}/v2.0"),
             "aud": TEST_CLIENT_ID,

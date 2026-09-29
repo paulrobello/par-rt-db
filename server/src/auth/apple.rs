@@ -400,7 +400,7 @@ mod tests {
             let point = ec_pair.public_key().as_ref().to_vec();
             let (x, y) = point[1..].split_at(32);
 
-            let rsa = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048)
+            let rsa = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048)
                 .expect("generate RSA-2048 key");
 
             jwks::seed_for_test(
@@ -435,8 +435,8 @@ mod tests {
     /// algorithm today.
     fn sign_rs256(key: &rsa::RsaPrivateKey, kid: &str, claims: &serde_json::Value) -> String {
         use rsa::pkcs1v15::SigningKey;
+        use rsa::sha2::Sha256;
         use rsa::signature::{SignatureEncoding, Signer};
-        use sha2::Sha256;
 
         let header = json!({"alg": "RS256", "typ": "JWT", "kid": kid});
         let signing_input = format!(
