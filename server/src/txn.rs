@@ -629,7 +629,8 @@ async fn do_patch(
         ""
     };
     let row: Option<(serde_json::Value, i64)> = sqlx::query_as(&format!(
-        "SELECT \"doc\", \"created_at\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1{live_only}"
+        "SELECT \"doc\", \"created_at\" FROM \"{pg_schema_name}\".\"{table_ident}\"  \
+        WHERE \"id\" = $1{live_only}"
     ))
     .bind(id)
     .fetch_optional(&mut *conn)
@@ -682,7 +683,8 @@ async fn do_replace(
         ""
     };
     let row: Option<(serde_json::Value, i64)> = sqlx::query_as(&format!(
-        "SELECT \"doc\", \"created_at\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1{live_only}"
+        "SELECT \"doc\", \"created_at\" FROM \"{pg_schema_name}\".\"{table_ident}\"  \
+        WHERE \"id\" = $1{live_only}"
     ))
     .bind(id)
     .fetch_optional(&mut *conn)
@@ -850,7 +852,8 @@ async fn do_expect_version(
         ""
     };
     let row: Option<(i64, serde_json::Value)> = sqlx::query_as(&format!(
-        "SELECT \"version\", \"doc\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1{live_only}"
+        "SELECT \"version\", \"doc\" FROM \"{pg_schema_name}\".\"{table_ident}\"  \
+        WHERE \"id\" = $1{live_only}"
     ))
     .bind(id)
     .fetch_optional(&mut *conn)
@@ -908,7 +911,8 @@ async fn eq_lookup(
         conditions.push("\"deleted_at\" IS NULL".to_string());
     }
     let sql = format!(
-        "SELECT \"id\", \"doc\", \"created_at\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE {}",
+        "SELECT \"id\", \"doc\", \"created_at\" FROM \"{pg_schema_name}\".\"{table_ident}\"  \
+        WHERE {}",
         conditions.join(" AND ")
     );
 
@@ -1354,134 +1358,159 @@ pub async fn execute_txn(
     // guard is `!Send` and would poison this `Send` future across the `.await`s.
     let span = tracing::info_span!("txn.execute", db, steps = count_steps(txn));
     async {
-    validate_db_name(db)?;
-    // Task 5: `ctx` carries `user_id` + `email`; the row-auth helpers below use
-    // only the uid, so derive the legacy `owner: Option<&str>` view once and
-    // thread it unchanged — byte-identical ownerField/collaboratorsField behavior.
-    let owner = ctx.user_id.as_deref();
+        validate_db_name(db)?;
+        // Task 5: `ctx` carries `user_id` + `email`; the row-auth helpers below use
+        // only the uid, so derive the legacy `owner: Option<&str>` view once and
+        // thread it unchanged — byte-identical ownerField/collaboratorsField behavior.
+        let owner = ctx.user_id.as_deref();
 
-    if count_steps(txn) > MAX_STEPS {
-        return Err(RtDbError::bad_request(format!(
-            "transaction exceeds maximum of {MAX_STEPS} steps (counted recursively, including scheduled txns)"
-        )));
-    }
-
-    // SEC-104: compose the per-step caps into an aggregate affected-document
-    // budget and a by-query step-count cap, both checked BEFORE any step
-    // executes so an over-cap txn commits nothing. Commit 82650c2 introduced
-    // by-query steps AND raised MAX_STEPS in the same change; without these
-    // composite caps the worst-case committer turn was ~1,000,000 rows — a
-    // single `/api/mutate` could stall the single-writer for a database and
-    // starve every other writer/subscription on it. The by-query step cap is
-    // the sharp bound; the affected-row budget is the blast-radius bound.
-    let by_query_steps = txn
-        .steps
-        .iter()
-        .filter(|s| matches!(s, Step::PatchByQuery { .. } | Step::DeleteByQuery { .. }))
-        .count();
-    if by_query_steps > MAX_BY_QUERY_STEPS_PER_TXN {
-        return Err(RtDbError::bad_request(format!(
-            "transaction has {by_query_steps} by-query steps, exceeding the limit of {MAX_BY_QUERY_STEPS_PER_TXN}"
-        )));
-    }
-    let worst = worst_case_affected(txn);
-    if worst > MAX_AFFECTED_ROWS_PER_TXN {
-        return Err(RtDbError::bad_request(format!(
-            "transaction could affect up to {worst} documents, exceeding the limit of {MAX_AFFECTED_ROWS_PER_TXN}"
-        )));
-    }
-
-    let pg_schema_name = pg_schema(db);
-    let mut results = Vec::with_capacity(txn.steps.len());
-    let mut write_set = WriteSet::default();
-
-    let mut tx = pool.begin().await?;
-    // SEC-104: bound every statement in this committer turn. A pathological
-    // scan (e.g. a filter over an unindexed field that escapes the row budget)
-    // aborts this transaction rather than stalling the single-writer for the
-    // whole database. `SET LOCAL` scopes the value to this transaction and
-    // reverts on commit/rollback — it never leaks to other pool users. The
-    // value is a const, never user input.
-    sqlx::query(&format!(
-        "SET LOCAL statement_timeout = {STATEMENT_TIMEOUT_MS}"
-    ))
-    .execute(&mut *tx)
-    .await?;
-
-    let mut sctx = StepCtx {
-        tx: &mut tx,
-        db,
-        pg_schema_name: pg_schema_name.as_str(),
-        schema,
-        ctx,
-        owner,
-        write_set: &mut write_set,
-        results: &mut results,
-    };
-    for step in &txn.steps {
-        // ENH-005 Task 4: gate each step against the machine-token table
-        // allowlist BEFORE any work. A scoped token cannot write a forbidden
-        // table via any step variant. `tables = None` (admin/scheduled/`User`/
-        // full-access machine tokens) bypasses; the gate is a pure read. Runs
-        // inside the sqlx tx so a `Forbidden` returns via `?` before commit and
-        // rolls back the whole transaction. The schedule control-flow steps
-        // carry no table (`table() == None`); `Step::Schedule` checks its
-        // NESTED steps recursively in `step_schedule`.
-        if let Some(table) = step.table() {
-            authorize_table(sctx.ctx, table)?;
+        if count_steps(txn) > MAX_STEPS {
+            return Err(RtDbError::bad_request(format!(
+                "transaction exceeds maximum of {MAX_STEPS} steps  \
+            (counted recursively, including scheduled txns)"
+            )));
         }
-        match step {
-            Step::Insert { table, doc } => step_insert(&mut sctx, table, doc).await?,
-            Step::Patch { table, id, fields } => step_patch(&mut sctx, table, id, fields).await?,
-            Step::AdjustCounter { table, id, field, delta, min, max, expected } => {
-                step_adjust_counter(&mut sctx, table, id, field, *delta, *min, *max, expected.as_ref()).await?
-            }
-            Step::Replace { table, id, doc } => step_replace(&mut sctx, table, id, doc).await?,
-            Step::Delete { table, id } => step_delete(&mut sctx, table, id).await?,
-            Step::Undelete { table, id } => step_undelete(&mut sctx, table, id).await?,
-            Step::ExpectVersion { table, id, version } => {
-                step_expect_version(&mut sctx, table, id, *version).await?
-            }
-            Step::ExpectAbsent { table, index, eq } => {
-                step_expect_absent(&mut sctx, table, index, eq).await?
-            }
-            Step::Upsert {
-                table,
-                index,
-                eq,
-                insert,
-                patch,
-            } => step_upsert(&mut sctx, table, index, eq, insert, patch).await?,
-            Step::PatchByQuery {
-                table,
-                filter,
-                patch,
-                limit,
-            } => step_patch_by_query(&mut sctx, table, filter, patch, *limit).await?,
-            Step::DeleteByQuery {
-                table,
-                filter,
-                limit,
-            } => step_delete_by_query(&mut sctx, table, filter, *limit).await?,
-            Step::Schedule { when, txn, external } => {
-                step_schedule(&mut sctx, when, txn, external.is_some_and(|e| e)).await?
-            }
-            Step::CancelSchedule { id } => step_cancel_schedule(&mut sctx, id).await?,
-            Step::StartWorkflow { spec } => step_start_workflow(&mut sctx, spec).await?,
-            Step::CancelWorkflow { id } => step_cancel_workflow(&mut sctx, id).await?,
+
+        // SEC-104: compose the per-step caps into an aggregate affected-document
+        // budget and a by-query step-count cap, both checked BEFORE any step
+        // executes so an over-cap txn commits nothing. Commit 82650c2 introduced
+        // by-query steps AND raised MAX_STEPS in the same change; without these
+        // composite caps the worst-case committer turn was ~1,000,000 rows — a
+        // single `/api/mutate` could stall the single-writer for a database and
+        // starve every other writer/subscription on it. The by-query step cap is
+        // the sharp bound; the affected-row budget is the blast-radius bound.
+        let by_query_steps = txn
+            .steps
+            .iter()
+            .filter(|s| matches!(s, Step::PatchByQuery { .. } | Step::DeleteByQuery { .. }))
+            .count();
+        if by_query_steps > MAX_BY_QUERY_STEPS_PER_TXN {
+            return Err(RtDbError::bad_request(format!(
+                "transaction has {by_query_steps} by-query steps,  \
+            exceeding the limit of {MAX_BY_QUERY_STEPS_PER_TXN}"
+            )));
         }
-    }
+        let worst = worst_case_affected(txn);
+        if worst > MAX_AFFECTED_ROWS_PER_TXN {
+            return Err(RtDbError::bad_request(format!(
+                "transaction could affect up to {worst} documents,  \
+            exceeding the limit of {MAX_AFFECTED_ROWS_PER_TXN}"
+            )));
+        }
 
-    // Durable change-feed stamp — INSIDE the transaction, so the documents
-    // and their change rows commit (or roll back) together. This is the
-    // mutate/scheduled/workflow choke point; the reaper/merge/migrate arms
-    // append on their own transactions (see the change-feed design spec).
-    // The tables are ensured at committer startup and db creation, so the
-    // append itself never needs DDL.
-    crate::change_log::append(&mut tx, pg_schema_name.as_str(), &write_set).await?;
+        let pg_schema_name = pg_schema(db);
+        let mut results = Vec::with_capacity(txn.steps.len());
+        let mut write_set = WriteSet::default();
 
-    tx.commit().await?;
-    Ok(TxnOutcome { results, write_set })
+        let mut tx = pool.begin().await?;
+        // SEC-104: bound every statement in this committer turn. A pathological
+        // scan (e.g. a filter over an unindexed field that escapes the row budget)
+        // aborts this transaction rather than stalling the single-writer for the
+        // whole database. `SET LOCAL` scopes the value to this transaction and
+        // reverts on commit/rollback — it never leaks to other pool users. The
+        // value is a const, never user input.
+        sqlx::query(&format!(
+            "SET LOCAL statement_timeout = {STATEMENT_TIMEOUT_MS}"
+        ))
+        .execute(&mut *tx)
+        .await?;
+
+        let mut sctx = StepCtx {
+            tx: &mut tx,
+            db,
+            pg_schema_name: pg_schema_name.as_str(),
+            schema,
+            ctx,
+            owner,
+            write_set: &mut write_set,
+            results: &mut results,
+        };
+        for step in &txn.steps {
+            // ENH-005 Task 4: gate each step against the machine-token table
+            // allowlist BEFORE any work. A scoped token cannot write a forbidden
+            // table via any step variant. `tables = None` (admin/scheduled/`User`/
+            // full-access machine tokens) bypasses; the gate is a pure read. Runs
+            // inside the sqlx tx so a `Forbidden` returns via `?` before commit and
+            // rolls back the whole transaction. The schedule control-flow steps
+            // carry no table (`table() == None`); `Step::Schedule` checks its
+            // NESTED steps recursively in `step_schedule`.
+            if let Some(table) = step.table() {
+                authorize_table(sctx.ctx, table)?;
+            }
+            match step {
+                Step::Insert { table, doc } => step_insert(&mut sctx, table, doc).await?,
+                Step::Patch { table, id, fields } => {
+                    step_patch(&mut sctx, table, id, fields).await?
+                }
+                Step::AdjustCounter {
+                    table,
+                    id,
+                    field,
+                    delta,
+                    min,
+                    max,
+                    expected,
+                } => {
+                    step_adjust_counter(
+                        &mut sctx,
+                        table,
+                        id,
+                        field,
+                        *delta,
+                        *min,
+                        *max,
+                        expected.as_ref(),
+                    )
+                    .await?
+                }
+                Step::Replace { table, id, doc } => step_replace(&mut sctx, table, id, doc).await?,
+                Step::Delete { table, id } => step_delete(&mut sctx, table, id).await?,
+                Step::Undelete { table, id } => step_undelete(&mut sctx, table, id).await?,
+                Step::ExpectVersion { table, id, version } => {
+                    step_expect_version(&mut sctx, table, id, *version).await?
+                }
+                Step::ExpectAbsent { table, index, eq } => {
+                    step_expect_absent(&mut sctx, table, index, eq).await?
+                }
+                Step::Upsert {
+                    table,
+                    index,
+                    eq,
+                    insert,
+                    patch,
+                } => step_upsert(&mut sctx, table, index, eq, insert, patch).await?,
+                Step::PatchByQuery {
+                    table,
+                    filter,
+                    patch,
+                    limit,
+                } => step_patch_by_query(&mut sctx, table, filter, patch, *limit).await?,
+                Step::DeleteByQuery {
+                    table,
+                    filter,
+                    limit,
+                } => step_delete_by_query(&mut sctx, table, filter, *limit).await?,
+                Step::Schedule {
+                    when,
+                    txn,
+                    external,
+                } => step_schedule(&mut sctx, when, txn, external.is_some_and(|e| e)).await?,
+                Step::CancelSchedule { id } => step_cancel_schedule(&mut sctx, id).await?,
+                Step::StartWorkflow { spec } => step_start_workflow(&mut sctx, spec).await?,
+                Step::CancelWorkflow { id } => step_cancel_workflow(&mut sctx, id).await?,
+            }
+        }
+
+        // Durable change-feed stamp — INSIDE the transaction, so the documents
+        // and their change rows commit (or roll back) together. This is the
+        // mutate/scheduled/workflow choke point; the reaper/merge/migrate arms
+        // append on their own transactions (see the change-feed design spec).
+        // The tables are ensured at committer startup and db creation, so the
+        // append itself never needs DDL.
+        crate::change_log::append(&mut tx, pg_schema_name.as_str(), &write_set).await?;
+
+        tx.commit().await?;
+        Ok(TxnOutcome { results, write_set })
     }
     .instrument(span)
     .await
@@ -2206,7 +2235,8 @@ pub(crate) fn delete_row_cascade<'a>(
                         .await?;
                         if let Some(child_id) = hits.first() {
                             return Err(RtDbError::conflict(format!(
-                                "cannot delete '{table_name}': '{child_table_name}.{field_name}' is referenced by document '{child_id}'"
+                                "cannot delete '{table_name}': '{child_table_name}.{field_name}'  \
+                                is referenced by document '{child_id}'"
                             )));
                         }
                     }
