@@ -424,7 +424,7 @@ async fn vector_search_rejects_non_finite_query_vector() {
     let state = test_state().await;
     let db = vec_db(&state).await;
     let schema = vector_schema(3, false);
-    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         let q = Query {
             table: "docs".to_string(),
             vector_search: Some(VectorSearchQuery {

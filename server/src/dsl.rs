@@ -16,79 +16,37 @@
 //! non-uniform — do not normalize them.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 
 use crate::auth::PrincipalCtx;
 use crate::error::RtDbError;
 use crate::schema::{FieldType, IndexDef, TableDef, indexed_column_type};
+pub use par_rt_db_core::wire::FilterExpr;
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Order {
-    Asc,
-    Desc,
-}
+// ARC-007: the wire `Query` and its terminal/helper types are now defined once
+// in `par_rt_db_core::query` (same reasoning as `FilterExpr`/`Step` before it:
+// two Rust copies of one wire type can only drift). Re-exported here at their
+// historical path so every `crate::dsl::` call site keeps resolving.
+// Server-only behavior lives in the extension traits below — the orphan rule
+// forbids inherent impls on these foreign types.
+pub use par_rt_db_core::query::{
+    AggregateGroup, AggregateMultiGroup, AggregateOp, AggregateSpec, GroupBy, HybridSearchQuery,
+    Order, Paginate, Query, SearchMode, SearchQuery, VectorSearchQuery,
+};
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Query {
-    pub table: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub get: Option<String>, // point read by id; excludes all below
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub index: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub eq: Vec<serde_json::Value>, // prefix binds on index fields
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gt: Option<serde_json::Value>, // exclusive lower bound on the index field after the eq prefix
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gte: Option<serde_json::Value>, // inclusive lower bound; mutually exclusive with gt
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lt: Option<serde_json::Value>, // exclusive upper bound on the index field after the eq prefix
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lte: Option<serde_json::Value>, // inclusive upper bound; mutually exclusive with lt
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub order: Option<Order>, // default Asc
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub take: Option<u32>, // cap 4096; absent => collect (cap 4096)
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub unique: bool, // with unique, take/order must be absent
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub first: bool, // sugar over take(1); returns Doc(Some) or Doc(None); mutually exclusive with take/unique
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub count: bool, // terminal: SELECT COUNT(*) over the same eq/range WHERE; mutually exclusive with get/take/unique/first/order
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub distinct: bool, // terminal: SELECT DISTINCT of index.fields[eq.len()] over the same eq/range WHERE; mutually exclusive with every other terminal
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub aggregate: Option<AggregateSpec>, // terminal: <OP>("<col>") [GROUP BY "<groupcol>"] over the same eq/range WHERE; mutually exclusive with every other terminal
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub paginate: Option<Paginate>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filter: Option<FilterExpr>, // additional WHERE predicate over doc fields; composes with index/order/take/cursor
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub search: Option<SearchQuery>, // full-text search terminal: ranks by ts_rank over a search index's tsvector; composes with take
-    #[serde(
-        default,
-        rename = "vectorSearch",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub vector_search: Option<VectorSearchQuery>, // vector-similarity terminal: ranks by cosine distance over a vector index; carries its own limit
-    #[serde(
-        default,
-        rename = "hybridSearch",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub hybrid_search: Option<HybridSearchQuery>, // hybrid terminal: fuses full-text (ts_rank) and vector (cosine) ranking via Reciprocal Rank Fusion; carries its own limit
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fields: Option<Vec<String>>, // projection: keep only these user fields per result doc; `_`-prefixed system fields are always kept. `Some([])` = system fields only; `None` = full docs
-}
-
-impl Query {
+/// Server-side extension methods on the core [`Query`] (orphan rule: an
+/// inherent `impl` on the foreign `par_rt_db_core::query::Query` is not
+/// allowed). Bring this trait into scope alongside `Query` for the
+/// `.terminal_name()` call syntax.
+pub trait QueryTerminalNameExt {
     /// The wire label for this query's terminal — the output mode an operator
     /// sees in the subscription inspector (`GET /admin/subscriptions`).
     /// Terminals are mutually exclusive (validated in `execute_query`), so the
     /// first set field wins; a query with no terminal is a plain `collect`.
-    pub fn terminal_name(&self) -> &'static str {
+    fn terminal_name(&self) -> &'static str;
+}
+
+impl QueryTerminalNameExt for Query {
+    fn terminal_name(&self) -> &'static str {
         if self.get.is_some() {
             "get"
         } else if self.count {
@@ -117,129 +75,19 @@ impl Query {
     }
 }
 
-/// Serde skip predicate for `bool` fields whose default is `false`. Keeps the
-/// wire form minimal — `unique`/`first`/`count` are omitted unless `true`,
-/// matching the TS client's `JSON.stringify` (which drops `undefined`) and the
-/// rust-client's mirror struct (ARC-008 wire-parity).
-fn is_false(b: &bool) -> bool {
-    !*b
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Paginate {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
-    pub num_items: u32,
-}
-
-/// A full-text search terminal over a declared search index. `index` names a
-/// search index on the query's table; `query` is free-form user text matched
-/// via `websearch_to_tsquery` so it can't inject tsquery syntax while still
-/// honoring web search operators — quoted phrases (`"exact phrase"`), the
-/// bare word `or`, and `-term` negation (FM-31). `filter` is an optional
-/// db-side predicate (the `filter()` DSL) narrowed into the search
-/// WHERE — scoped search ("within channel X" / "last N ms"); omitted on the
-/// wire when `None` so existing requests deserialize unchanged. `mode` selects
-/// the match strategy (FM-30): `None`/`"tsquery"` is the full-text
-/// behavior; `"trgm"` is substring/autocomplete matching over the index's text
-/// fields via `ILIKE`, ranked by trigram `similarity()` — see `SearchMode`.
-/// `snippet` (FM-31) opts each hit into a `_searchSnippet` field rendered by
-/// `ts_headline` with server-fixed options; tsquery mode only.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SearchQuery {
-    pub index: String,
-    pub query: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filter: Option<FilterExpr>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<SearchMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snippet: Option<bool>,
-}
-
-/// Match mode for the `search` terminal. `Tsquery` (the default, and the
-/// behavior when `mode` is omitted) matches stemmed words via
-/// `tsvector @@ websearch_to_tsquery`, ranked by `ts_rank`. `Trgm` matches
-/// substrings case-insensitively (`ILIKE '%query%'`) over the search index's
-/// text fields — prefix/infix/autocomplete lookups FTS can't serve — ranked by
-/// `GREATEST(similarity(field, query))` (the doc's best-matching field), with
-/// `created_at`/`id` tiebreaks for determinism. Wire form is lowercase
-/// (`"tsquery"` | `"trgm"`); serialized only when the caller opts in, so
-/// existing traffic stays byte-identical.
-/// docs/superpowers/specs/2026-08-15-trgm-search-design.md.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SearchMode {
-    #[default]
-    Tsquery,
-    Trgm,
-}
-
-/// A vector-similarity terminal over a declared vector index. `vector` is the
-/// caller-supplied query embedding (length must equal the index dimensions);
-/// ranked by the index's declared metric distance (`<=>`/`<->`/`<#>` for
-/// cosine/l2/ip) ascending. `filter` is an optional `FilterExpr` (the db-side
-/// `filter()` DSL) narrowed into the `WHERE` — scoped vector search ("within
-/// tenant X"), matching the `search` terminal; omitted on the wire when `None`.
-/// A declared `filterFields` set is no longer required to filter (any field
-/// works — typed column when indexed, jsonb extraction otherwise), though
-/// declared filterFields still create indexed columns for fast eq.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct VectorSearchQuery {
-    pub index: String,
-    pub vector: Vec<f32>,
-    pub limit: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filter: Option<FilterExpr>,
-}
-
-/// A hybrid search terminal that fuses full-text (`search`) and vector
-/// (`vectorSearch`) ranking over the SAME table into one result list via
-/// Reciprocal Rank Fusion (RRF). The table must declare BOTH a search index
-/// (tsvector) and a vector index; if either is missing → `BadRequest`. `query`
-/// is the text (matched via `websearch_to_tsquery`, like `search`); `vector` is the
-/// query embedding (length must equal the chosen vector index's dimensions).
-/// `search_index`/`vector_index` optionally name the indexes to use; when
-/// `None`, the table's first search index / first vector index is auto-selected.
-/// `limit` is the result count (capped by `MAX_TAKE`); `k` is the RRF constant
-/// (default 60).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct HybridSearchQuery {
-    pub query: String,
-    pub vector: Vec<f32>,
-    pub limit: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub search_index: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vector_index: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub k: Option<u32>,
-}
-
-/// Aggregate operator for the `aggregate` terminal. Mirrors the SQL aggregate
-/// of the same name. `Sum`/`Avg` require a numeric index field; `Min`/`Max`
-/// work on any orderable indexed field; `Count` counts matching rows and
-/// consumes no aggregate field (a grouped `count` is the count-per-group the
-/// dashboard "items by status" view needs — previously a `sum` over a constant
-/// `1` field workaround). Serializes lowercase (`"sum"`/`"avg"`/`"min"`/
-/// `"max"`/`"count"`) — byte-identical to the TS/Rust/Python client mirrors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AggregateOp {
-    Sum,
-    Avg,
-    Min,
-    Max,
-    Count,
-}
-
-impl AggregateOp {
+/// Server-side extension methods on the core [`AggregateOp`] (orphan rule —
+/// see [`QueryTerminalNameExt`]).
+pub trait AggregateOpSqlExt {
     /// The SQL aggregate function name (uppercase, matching the SQL keyword).
-    pub(crate) fn sql_fn(self) -> &'static str {
+    fn sql_fn(self) -> &'static str;
+    /// Whether this op aggregates a field value (and so needs an aggregate
+    /// index field beyond the eq prefix / group field). `Count` counts rows and
+    /// consumes no field.
+    fn needs_field(self) -> bool;
+}
+
+impl AggregateOpSqlExt for AggregateOp {
+    fn sql_fn(self) -> &'static str {
         match self {
             AggregateOp::Sum => "SUM",
             AggregateOp::Avg => "AVG",
@@ -249,44 +97,24 @@ impl AggregateOp {
         }
     }
 
-    /// Whether this op aggregates a field value (and so needs an aggregate
-    /// index field beyond the eq prefix / group field). `Count` counts rows and
-    /// consumes no field.
-    pub(crate) fn needs_field(self) -> bool {
+    fn needs_field(self) -> bool {
         !matches!(self, AggregateOp::Count)
     }
 }
 
-/// `aggregate` terminal spec. Exactly one of `op` (single scalar op) or
-/// `aggregates` (wire v2: alias → op map, evaluated in one pass) must be set —
-/// both or neither is a compile-time `BadRequest`. `group_by` shifts the
-/// terminal to a grouped aggregate: `Bool(true)` groups by
-/// `index.fields[eq.len()]` and aggregates `index.fields[eq.len()+1]`,
-/// returning `{key, value}` rows (legacy shape, byte-identical); `Fields`
-/// (wire v2) groups by the listed declared index fields, each at position
-/// ≥ eq prefix, returning `aggregateMultiGroups` rows. Wire shape is camelCase
-/// (`groupBy`, `aggregates`) to match the rest of the protocol.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AggregateSpec {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub op: Option<AggregateOp>,
-    #[serde(default)]
-    pub group_by: GroupBy,
-    /// Wire v2: alias → op. All field-needing ops share the ONE index-derived
-    /// aggregate field; aliases become the keys of the `aggregateMulti`
-    /// object / `values` map.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub aggregates: Option<BTreeMap<String, AggregateOp>>,
-}
-
-impl AggregateSpec {
+/// Server-side extension methods on the core [`AggregateSpec`] (orphan rule —
+/// see [`QueryTerminalNameExt`]).
+pub trait AggregateSpecOpsExt {
     /// The ops to evaluate as `(alias, op)` pairs in deterministic order. A
     /// single-`op` spec aliases its result by the lowercase op name (used only
     /// by the wire-v2 result shapes). Enforces exactly-one-of and the alias
     /// charset — aliases become `jsonb_build_object` labels, so anything
     /// outside `[A-Za-z0-9_]` (≤ 64 chars) is rejected rather than escaped.
-    pub(crate) fn aliased_ops(&self) -> Result<Vec<(String, AggregateOp)>, RtDbError> {
+    fn aliased_ops(&self) -> Result<Vec<(String, AggregateOp)>, RtDbError>;
+}
+
+impl AggregateSpecOpsExt for AggregateSpec {
+    fn aliased_ops(&self) -> Result<Vec<(String, AggregateOp)>, RtDbError> {
         match (&self.op, &self.aggregates) {
             (Some(op), None) => Ok(vec![(op.sql_fn().to_lowercase(), *op)]),
             (None, Some(map)) => {
@@ -317,38 +145,6 @@ impl AggregateSpec {
     }
 }
 
-/// Wire v2 widening of the aggregate `groupBy` clause: `false`/`true` keep the
-/// legacy wire bytes byte-identical (including the always-serialized
-/// `groupBy: false`), while a field list groups by those declared index fields.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
-pub enum GroupBy {
-    Bool(bool),
-    Fields(Vec<String>),
-}
-
-impl Default for GroupBy {
-    fn default() -> Self {
-        Self::Bool(false)
-    }
-}
-
-/// One `{key, value}` row from a grouped `aggregate` (`groupBy: true`) terminal.
-/// `key` is the group's value of the index field after the eq prefix; `value`
-/// is the aggregate over the field after that. Serializes camelCase.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AggregateGroup {
-    pub key: serde_json::Value,
-    pub value: serde_json::Value,
-}
-
-/// A db-side predicate appended to a query's WHERE clause. Defined once in
-/// `par-rt-db-core` (ARC-004) and re-exported here at its historical path:
-/// the server compiles it to SQL, the Rust client constructs it, and neither
-/// can drift from the other because there is only one definition.
-pub use par_rt_db_core::wire::FilterExpr;
-
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(untagged)]
 pub enum QueryResult {
@@ -368,15 +164,6 @@ pub enum QueryResult {
     /// alias (or, for a single-`op` spec, the lowercase op name) to its
     /// aggregate. Ordered by group keys ascending, capped by `MAX_TAKE`.
     AggregateMultiGroups(Vec<AggregateMultiGroup>),
-}
-
-/// One `{keys, values}` row from a wire-v2 grouped aggregate. See
-/// [`QueryResult::AggregateMultiGroups`].
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AggregateMultiGroup {
-    pub keys: Vec<serde_json::Value>,
-    pub values: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

@@ -7,6 +7,14 @@ use super::*;
 /// Stable advisory-lock key for `db`'s ownership lease (ENH-022 Stage 4,
 /// option A1 of docs/superpowers/specs/2026-08-22-multi-instance-stage4-design.md):
 /// the first 8 bytes of the db name's SHA-256, read as an i64.
+/// The fixed substring every ownership-conflict CONFLICT carries. ARC-009:
+/// producer (`acquire_ownership_lease`, `reply_ownership_conflict`) and
+/// consumer (`forward::is_shadow_ownership_conflict`) both interpolate this
+/// constant, so the wording can no longer drift — previously `forward.rs`
+/// matched a hard-coded copy and a message edit here silently broke the
+/// takeover-race detection.
+pub(crate) const SHADOW_CONFLICT_MARKER: &str = "single-writer lease";
+
 pub(in crate::committer) fn db_ownership_key(db: &str) -> i64 {
     let hex = crate::db::sha256_hex(db);
     u64::from_str_radix(&hex[..16], 16).unwrap_or(0) as i64
@@ -90,7 +98,7 @@ pub(in crate::committer) async fn acquire_ownership_lease(
                 return Err(RtDbError::new(
                     crate::error::ErrorCode::Conflict,
                     format!(
-                        "database '{db}' is owned by another instance (single-writer lease); \
+                        "database '{db}' is owned by another instance ({SHADOW_CONFLICT_MARKER}); \
                          writes must reach the owning replica until it releases"
                     ),
                 ));
@@ -114,7 +122,7 @@ pub(in crate::committer) async fn acquire_ownership_lease(
         return Err(RtDbError::new(
             crate::error::ErrorCode::Conflict,
             format!(
-                "database '{db}' is owned by another instance (single-writer lease); \
+                "database '{db}' is owned by another instance ({SHADOW_CONFLICT_MARKER}); \
                  writes must reach the owning replica until it releases"
             ),
         ));
@@ -150,9 +158,6 @@ pub(in crate::committer) async fn verify_lease(conn: &mut sqlx::PgConnection, db
     held
 }
 
-/// True for every request whose handling writes documents — the arms a SHADOW
-/// (non-owner) committer must reject, and the submits that attempt the
-/// ownership upgrade in `submit`.
 /// Replies CONFLICT to a write arm that reached a SHADOW (non-owner)
 /// committer (ENH-022 Stage 4). Fire-and-forget arms have no reply — the
 /// shadow runs no scheduler/reaper pollers, so those only arrive from a
@@ -164,7 +169,7 @@ pub(in crate::committer) async fn reply_ownership_conflict(
     let err = RtDbError::new(
         crate::error::ErrorCode::Conflict,
         format!(
-            "database '{}' is owned by another instance (single-writer lease); \
+            "database '{}' is owned by another instance ({SHADOW_CONFLICT_MARKER}); \
              writes must reach the owning replica until it releases",
             ctx.db
         ),
@@ -197,6 +202,9 @@ pub(in crate::committer) async fn reply_ownership_conflict(
     }
 }
 
+/// True for every request whose handling writes documents — the arms a SHADOW
+/// (non-owner) committer must reject, and the submits that attempt the
+/// ownership upgrade in `submit`.
 pub(in crate::committer) fn request_needs_write(req: &CommitterRequest) -> bool {
     matches!(
         req,

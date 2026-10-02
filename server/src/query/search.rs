@@ -491,8 +491,16 @@ pub(crate) fn compile_vector_search(
     }
     // serde_json can't carry NaN/Infinity, but a Rust-constructed query can —
     // reject before binding so pgvector never sees a non-finite value (which
-    // would surface as a 500 instead of a clean BadRequest).
-    if !vs.vector.iter().all(|v| v.is_finite()) {
+    // would surface as a 500 instead of a clean BadRequest). pgvector stores
+    // f32, so an f64 outside f32's range rounds to infinity at the cast even
+    // though it is finite here — the f32-cast check catches those too
+    // (ARC-007: the wire type widened from f32 to f64, moving this failure
+    // from deserialization to the guard).
+    if !vs
+        .vector
+        .iter()
+        .all(|v| v.is_finite() && (*v as f32).is_finite())
+    {
         return Err(RtDbError::bad_request(
             "vectorSearch query vector must contain only finite numbers",
         ));
@@ -742,7 +750,12 @@ pub(crate) fn compile_hybrid_search(
             vec_spec.dimensions
         )));
     }
-    if !hs.vector.iter().all(|v| v.is_finite()) {
+    // Same f32-range reasoning as the vectorSearch guard above.
+    if !hs
+        .vector
+        .iter()
+        .all(|v| v.is_finite() && (*v as f32).is_finite())
+    {
         return Err(RtDbError::bad_request(
             "hybridSearch query vector must contain only finite numbers",
         ));

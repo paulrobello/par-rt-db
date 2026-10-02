@@ -10,6 +10,7 @@
 pub mod engine;
 pub mod fields;
 pub mod mutation;
+pub mod query;
 pub mod query_combinations;
 pub mod schema;
 pub mod wire;

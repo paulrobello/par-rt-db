@@ -3,10 +3,11 @@
 //! affected subscriptions, diffs against the last pushed value, and pushes only
 //! on change. This serialization is load-bearing: `execute_txn`/`execute_query`
 //! run READ COMMITTED with no row locking, so every durable write must pass
-//! through here. Handles four request arms — `RunMutate`, `RunScheduled`,
-//! `RunMigrate`, `RunReaper` — plus `RunRestoreSchema`, `RunMergeUsers`, and
-//! `RunWorkflowAdvance`, and publishes each at the four tap sites (subscription
-//! fan-out, op-feed, audit log, webhooks). Never add a second writer.
+//! through here. Handles all ten `CommitterRequest` arms — `Mutate`,
+//! `Subscribe`, `RunScheduled`, `RunMigrate`, `RunPushSchema`, `RunReaper`,
+//! `RunWorkflowAdvance`, `RunMergeUsers`, `RunRestoreSchema`, and `Shutdown` —
+//! and publishes the write arms at the four tap sites (subscription fan-out,
+//! op-feed, audit log, webhooks). Never add a second writer.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -48,6 +49,8 @@ use forwarding::{
     decode_or_internal, fail_forwarded_reply, forward_write_of, mint_forward_idempotency_key,
 };
 use lease::{acquire_ownership_lease, reply_ownership_conflict, request_needs_write, verify_lease};
+
+pub(crate) use lease::SHADOW_CONFLICT_MARKER;
 use supervisor::{reclaim_idle_pass, run_quota_warmer};
 use taps::publish_taps;
 
@@ -669,6 +672,27 @@ impl Committers {
         }
     }
 
+    /// The shared tail of `channel_for`'s two drain-wait arms (ARC-012): the
+    /// caller registers `notified` + `enable()` WHILE STILL HOLDING the
+    /// `channels` lock (the race-safety requirement — see the draining-arm
+    /// comment there), DROPS the guard, and only then calls this, which awaits
+    /// the drain-completion notify bounded by `deadline`. This helper performs
+    /// no `.await` before the guard is gone — it never touches `channels`.
+    async fn wait_drained(
+        &self,
+        notified: std::pin::Pin<&mut tokio::sync::futures::Notified<'_>>,
+        deadline: std::time::Instant,
+    ) -> Result<(), RtDbError> {
+        if std::time::Instant::now() >= deadline {
+            return Err(RtDbError::internal(
+                "committer for database is draining and did not exit in time",
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let _ = tokio::time::timeout(remaining, notified).await;
+        Ok(())
+    }
+
     /// Returns `db`'s committer sender, lazily spawning the task on first use.
     /// No `.await` occurs while `channels` is locked: the cache-hit fast path
     /// checks and releases the lock immediately; on a miss, the lock is dropped
@@ -729,13 +753,7 @@ impl Committers {
                     tokio::pin!(notified);
                     notified.as_mut().enable();
                     drop(guard);
-                    if std::time::Instant::now() >= deadline {
-                        return Err(RtDbError::internal(
-                            "committer for database is draining and did not exit in time",
-                        ));
-                    }
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    let _ = tokio::time::timeout(remaining, notified).await;
+                    self.wait_drained(notified.as_mut(), deadline).await?;
                     continue;
                 } else if upgrade && self.multi_instance && entry.lease.is_none() {
                     // ENH-022 Stage 4/4c upgrade (takeover) path: retire
@@ -751,13 +769,7 @@ impl Committers {
                     notified.as_mut().enable();
                     drop(guard);
                     let _ = sender.send(CommitterRequest::Shutdown).await;
-                    if std::time::Instant::now() >= deadline {
-                        return Err(RtDbError::internal(
-                            "committer for database is draining and did not exit in time",
-                        ));
-                    }
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    let _ = tokio::time::timeout(remaining, notified).await;
+                    self.wait_drained(notified.as_mut(), deadline).await?;
                     continue;
                 } else {
                     entry.last_activity = std::time::Instant::now();

@@ -451,14 +451,6 @@ async fn recv_forwarded<T>(rx: oneshot::Receiver<Result<T, RtDbError>>) -> Resul
     }
 }
 
-/// The fixed substring of the message the shadow committer's ownership-
-/// conflict backstop emits (`committer::lease::reply_ownership_conflict`,
-/// itself sharing the wording of `committer::lease::acquire_ownership_lease`'s
-/// CONFLICT). `forward.rs` does not own `committer/lease.rs`, so this cannot
-/// be a cross-module shared `const` today — if that message ever changes,
-/// [`is_shadow_ownership_conflict`] must change with it.
-const SHADOW_OWNERSHIP_CONFLICT_MARKER: &str = "is owned by another instance (single-writer lease)";
-
 /// ARC-016: true when `err` is the shadow committer's ownership-conflict
 /// backstop rather than a genuine execution failure. `execute_as_owner`
 /// checks `is_owner` and then submits — a window in which this replica can
@@ -470,7 +462,9 @@ const SHADOW_OWNERSHIP_CONFLICT_MARKER: &str = "is owned by another instance (si
 /// surfacing a CONFLICT the client would see as a genuine failure.
 fn is_shadow_ownership_conflict(err: &RtDbError) -> bool {
     err.code == crate::error::ErrorCode::Conflict
-        && err.message.contains(SHADOW_OWNERSHIP_CONFLICT_MARKER)
+        && err
+            .message
+            .contains(crate::committer::SHADOW_CONFLICT_MARKER)
 }
 
 /// Owner-side half of Stage 4c, run inside the shared listener: execute a
