@@ -48,6 +48,8 @@ use forwarding::{
     decode_or_internal, fail_forwarded_reply, forward_write_of, mint_forward_idempotency_key,
 };
 use lease::{acquire_ownership_lease, reply_ownership_conflict, request_needs_write, verify_lease};
+
+pub(crate) use lease::SHADOW_CONFLICT_MARKER;
 use supervisor::{reclaim_idle_pass, run_quota_warmer};
 use taps::publish_taps;
 
