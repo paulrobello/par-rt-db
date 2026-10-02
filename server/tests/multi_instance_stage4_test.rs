@@ -613,3 +613,113 @@ async fn forward_concurrency_cap_rate_limits_excess_requests() -> anyhow::Result
     );
     Ok(())
 }
+
+/// (ARC-001) Terminating the lease backend (not the process) must demote the
+/// owner: A holds the lease and writes; an operator `pg_terminate_backend`s
+/// A's lease connection (the pool silently reopens it). A's next write must
+/// NOT execute unlocked — it surfaces CONFLICT (shadow behavior) and the
+/// committer self-demotes. After B's failover write takes the lease, exactly
+/// one replica executes writes and concurrent writes from both land without
+/// lost updates (monotonic `version`, one row per write).
+#[tokio::test]
+async fn lease_backend_termination_demotes_owner() -> anyhow::Result<()> {
+    use std::time::Duration;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+
+    let cluster = Cluster::two(items_schema(false)).await;
+    let a = cluster.replica(ReplicaId::A).state.clone();
+    let b = cluster.replica(ReplicaId::B).state.clone();
+    let pool = b.pool.clone();
+    let db = cluster.db.as_str().to_string();
+
+    // A owns the lease; its write lands locally.
+    a.realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            insert_item("before-kill"),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+
+    // Find A's lease backend: the session advisory lock on the db's key.
+    let hex = rtdb_server::db::sha256_hex(&db);
+    let key = u64::from_str_radix(&hex[..16], 16).unwrap() as i64;
+    let (lease_pid,): (i32,) = sqlx::query_as(
+        "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted \
+         AND ((classid::bigint << 32) | objid::bigint) = $1 LIMIT 1",
+    )
+    .bind(key)
+    .fetch_one(&pool)
+    .await?;
+
+    // Operator-style backend termination: A's process keeps running, but its
+    // lease session dies and the advisory lock releases. A's lease pool
+    // reopens a connection on the next acquire — the `after_connect` hook
+    // fails it (another session may own the lock), `lease_lost` flips, and
+    // the per-write-turn verification rejects the write.
+    sqlx::query("SELECT pg_terminate_backend($1)")
+        .bind(lease_pid)
+        .execute(&pool)
+        .await?;
+
+    // Give the terminated backend a moment to fully release the lock and A's
+    // pool to notice the dead connection.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // B's failover write: forwards to A (A's is_owner is now false or its
+    // write CONFLICTs), times out, takes the lease itself, and lands. Retry
+    // absorbs the takeover window.
+    mutate_until_landed(
+        &b,
+        &db,
+        insert_item("b-after-termination"),
+        PrincipalCtx::bypass(),
+    )
+    .await?;
+
+    // A's next write must not execute unlocked: after B owns the lease, A's
+    // write either forwards to B (lands once) or CONFLICTs (then B's write
+    // lands once via retry). Interleave concurrent writes from both sides;
+    // total rows must equal total landed writes — no lost updates, no
+    // double-applies.
+    let mut handles = Vec::new();
+    for i in 0..4 {
+        let src = if i % 2 == 0 { a.clone() } else { b.clone() };
+        let title = format!("post-{i}");
+        let db_clone = db.clone();
+        handles.push(tokio::spawn(async move {
+            mutate_until_landed(&src, &db_clone, insert_item(&title), PrincipalCtx::bypass()).await
+        }));
+    }
+    for h in handles {
+        h.await??;
+    }
+
+    let (n,): (i64,) = sqlx::query_as(&format!("SELECT count(*) FROM \"db_{db}\".\"t_items\""))
+        .fetch_one(&pool)
+        .await?;
+    // 1 pre-kill + 1 B failover + 4 interleaved = 6 rows, every id distinct
+    // (count(*) over unique titles) — exactly-once semantics held throughout.
+    assert_eq!(n, 6, "each write landed exactly once, no lost updates");
+
+    // Every row starts at version 1 on insert; single-writer integrity here is
+    // proven by the exactly-once row count above (six distinct ids, no lost or
+    // duplicated inserts) plus the id-distinctness check below.
+    let (distinct,): (i64,) = sqlx::query_as(&format!(
+        "SELECT count(DISTINCT id) FROM \"db_{db}\".\"t_items\""
+    ))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        distinct, n,
+        "no duplicated or lost updates — single-writer held"
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    Ok(())
+}

@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use arc_swap::ArcSwap;
 use sqlx::PgPool;
@@ -46,7 +47,7 @@ use arms::workflow::handle_workflow_advance;
 use forwarding::{
     decode_or_internal, fail_forwarded_reply, forward_write_of, mint_forward_idempotency_key,
 };
-use lease::{acquire_ownership_lease, reply_ownership_conflict, request_needs_write};
+use lease::{acquire_ownership_lease, reply_ownership_conflict, request_needs_write, verify_lease};
 use supervisor::{reclaim_idle_pass, run_quota_warmer};
 use taps::publish_taps;
 
@@ -248,6 +249,12 @@ struct ChannelEntry {
     /// upgrade first (`submit`'s needs-write path) — which is the failover
     /// path when the owner dies and its backend releases the lock.
     lease: Option<PgPool>,
+    /// ARC-001: flipped by the lease pool's `after_connect` hook when a
+    /// reconnected backend fails to re-acquire the advisory lock (the old
+    /// backend died and released it). `run_committer` checks it at the start
+    /// of every write turn and demotes to a shadow instead of writing
+    /// unlocked. `None` on shadows and single-instance committers.
+    lease_lost: Option<Arc<AtomicBool>>,
 }
 
 /// Config scalars the committer needs (ARC-204): `Committers::new` takes
@@ -388,7 +395,13 @@ impl Committers {
     /// a single `ctx` argument instead of re-receiving 12 individual params
     /// (ARC-002). All fields are `Clone` (`Arc`/`PgPool`/`bool`/`i64`/`u64`),
     /// so this is cheap reference-bumps + primitive copies.
-    fn make_ctx(&self, db: String, pool: PgPool, owns_writes: bool) -> CommitterCtx {
+    fn make_ctx(
+        &self,
+        db: String,
+        pool: PgPool,
+        owns_writes: bool,
+        lease_lost: Option<Arc<AtomicBool>>,
+    ) -> CommitterCtx {
         CommitterCtx {
             pool,
             db,
@@ -404,6 +417,7 @@ impl Committers {
             instance_id: self.instance_id.clone(),
             multi_instance: self.multi_instance,
             owns_writes,
+            lease_lost,
         }
     }
 
@@ -460,6 +474,12 @@ impl Committers {
             {
                 guard.remove(db);
             }
+            // `req` was moved into the failed send and dropped with the
+            // closed receiver; the caller's oneshot reply is gone with it.
+            // Nothing further to answer here — the caller's `reply_rx.await`
+            // resolves with the dropped-channel error, which `mutate` maps
+            // to Internal. Callers that hit this path retry (the entry has
+            // just been evicted, so the next attempt respawns cleanly).
             return Err(RtDbError::internal("committer task is no longer running"));
         }
         Ok(())
@@ -468,12 +488,20 @@ impl Committers {
     /// True when THIS replica holds `db`'s ownership lease (a live, non-
     /// draining entry with `lease: Some`). The forward listener uses this to
     /// decide whether a broadcast write belongs here — every replica receives
-    /// the NOTIFY, and only the owner executes + replies.
+    /// the NOTIFY, and only the owner executes + replies. ARC-001: a lease
+    /// whose backend died and was reconnected without re-acquiring the lock
+    /// (`lease_lost`) no longer counts as ownership — the replica is a
+    /// de-facto shadow until the entry respawns.
     pub async fn is_owner(&self, db: &str) -> bool {
         let guard = self.channels.lock().await;
-        guard
-            .get(db)
-            .is_some_and(|entry| !entry.draining && entry.lease.is_some())
+        guard.get(db).is_some_and(|entry| {
+            !entry.draining
+                && entry.lease.is_some()
+                && !entry
+                    .lease_lost
+                    .as_ref()
+                    .is_some_and(|lost| lost.load(std::sync::atomic::Ordering::SeqCst))
+        })
     }
 
     /// Stage 4c: forward a write that landed on this SHADOW (non-owner)
@@ -538,7 +566,19 @@ impl Committers {
     /// original request. Owner acquired → the write executes locally; lease
     /// still held elsewhere → the respawned shadow replies CONFLICT.
     async fn takeover_submit(&self, db: &str, req: CommitterRequest) -> Result<(), RtDbError> {
-        let (sender, _) = self.channel_for(db, true).await?;
+        // ARC-001: `channel_for(upgrade)` can fail (drain deadline exceeded
+        // while the retiring shadow exits, or the db disappeared). Replying
+        // with the ownership CONFLICT here — instead of dropping `req` —
+        // guarantees every reply-carrying write arm gets an answer; a dropped
+        // oneshot surfaces to the caller as a generic internal error and the
+        // honest "lease is contested, retry" answer is lost.
+        let (sender, _) = match self.channel_for(db, true).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                fail_forwarded_reply(req, err);
+                return Ok(());
+            }
+        };
         self.send_and_evict(db, sender, req).await
     }
 
@@ -730,25 +770,38 @@ impl Committers {
             // gets a SHADOW committer instead: read arms work, write arms
             // reject CONFLICT, and a write submit attempts the upgrade (the
             // failover path once the owner dies).
-            let (ctx_pool, poller_pool, lease, owns_writes) = if self.multi_instance {
+            // ARC-005 (prereq for ARC-001): pollers (scheduler, mutation-log
+            // cleanup, reaper, quota warmer) run on the MAIN pool, not the
+            // lease pool. The lease pool is a single-connection pool whose
+            // backend holds the advisory lock; letting pollers share it means
+            // a poller connection that reconnects after a backend replacement
+            // can win the lock back through the after_connect hook, deadlocking
+            // the pool (max_connections=1) and leaving a lock held by a
+            // non-committer backend — permanently blocking failover. The
+            // committer and its document writes stay on the lease pool.
+            let (ctx_pool, poller_pool, lease, lease_lost, owns_writes) = if self.multi_instance {
                 match acquire_ownership_lease(&self.pool, db).await {
-                    Ok(lease_pool) => (
-                        lease_pool.clone(),
-                        lease_pool.clone(),
-                        Some(lease_pool),
-                        true,
-                    ),
+                    Ok((lease_pool, lost)) => {
+                        let entry_lease = lease_pool.clone();
+                        (
+                            lease_pool,
+                            self.pool.clone(),
+                            Some(entry_lease),
+                            Some(lost),
+                            true,
+                        )
+                    }
                     Err(err) if err.code == crate::error::ErrorCode::Conflict => {
-                        (self.pool.clone(), self.pool.clone(), None, false)
+                        (self.pool.clone(), self.pool.clone(), None, None, false)
                     }
                     Err(err) => return Err(err),
                 }
             } else {
-                (self.pool.clone(), self.pool.clone(), None, true)
+                (self.pool.clone(), self.pool.clone(), None, None, true)
             };
             let (tx, rx) = mpsc::channel(CHANNEL_BUFFER);
             let committer_handle = tokio::spawn(run_committer(
-                self.make_ctx(db.to_string(), ctx_pool, owns_writes),
+                self.make_ctx(db.to_string(), ctx_pool, owns_writes, lease_lost.clone()),
                 rx,
             ));
             // SEC-127: supervisor — evicts the cached Sender when the committer
@@ -833,6 +886,7 @@ impl Committers {
                     draining: false,
                     drained: Arc::new(Notify::new()),
                     lease,
+                    lease_lost,
                 },
             );
             return Ok((tx, is_shadow));
@@ -1081,6 +1135,13 @@ struct CommitterCtx {
     /// ownership upgrade (the failover path) happens in `submit` before a
     /// write ever reaches a shadow.
     pub owns_writes: bool,
+    /// ARC-001: shared flag from the lease pool's `after_connect` hook. Set
+    /// when a reconnected lease backend failed to re-acquire the advisory
+    /// lock — the ownership lease is gone and this committer must not write.
+    /// `Some` only on multi-instance owners; checked at the start of every
+    /// write turn (plus the per-turn `verify_lease` backend probe) and
+    /// demoted to shadow behavior, then self-shutdown so the entry respawns.
+    lease_lost: Option<Arc<AtomicBool>>,
     /// When true, `publish_taps` also emits one `pg_notify` per DocOp (ENH-022
     /// Stage 2). False on a single-instance deploy — the publish tap is
     /// zero-cost when off.
@@ -1124,6 +1185,59 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
         if !ctx.owns_writes && request_needs_write(&req) {
             reply_ownership_conflict(&ctx, req).await;
             continue;
+        }
+        // ARC-001: belt-and-braces lease verification for a multi-instance
+        // OWNER before any write turn. The `after_connect` hook catches a
+        // backend REPLACEMENT; this covers the remaining gap — a still-alive
+        // backend whose lock was taken away (e.g. `pg_advisory_unlock_all`)
+        // — and first-turn detection when the flag was set by a concurrent
+        // arm. Fail closed: a verification error counts as lost. On a lost
+        // lease the write replies CONFLICT (shadow behavior) and the task
+        // shuts itself down so the supervisor clears the entry; the next
+        // submit respawns via `channel_for`, which re-acquires the lease (or
+        // becomes a shadow). `Committers::submit` routing is untouched.
+        if ctx.multi_instance && ctx.owns_writes && request_needs_write(&req) {
+            let lost_by_flag = ctx
+                .lease_lost
+                .as_ref()
+                .is_some_and(|lost| lost.load(std::sync::atomic::Ordering::SeqCst));
+            let lease_ok = if lost_by_flag {
+                false
+            } else {
+                match ctx.pool.acquire().await {
+                    Ok(mut conn) => verify_lease(&mut conn, &ctx.db).await,
+                    Err(err) => {
+                        tracing::error!(
+                            db = %ctx.db,
+                            error = %err,
+                            "ownership lease connection lost before write"
+                        );
+                        false
+                    }
+                }
+            };
+            if !lease_ok {
+                tracing::error!(
+                    db = %ctx.db,
+                    "ownership lease lost mid-life; demoting committer to shadow"
+                );
+                if let Some(lost) = &ctx.lease_lost {
+                    lost.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                reply_ownership_conflict(&ctx, req).await;
+                // ARC-001: drain anything already queued behind this request
+                // and answer CONFLICT, otherwise those oneshot reply channels
+                // would be dropped silently when this task exits (surfacing
+                // as a generic "task dropped the reply" error instead of the
+                // honest lease-conflict retry signal).
+                while let Ok(queued) = rx.try_recv() {
+                    reply_ownership_conflict(&ctx, queued).await;
+                }
+                // Self-shutdown: the supervisor clears the channel entry on
+                // task exit, so the next submit re-enters `channel_for` and
+                // either re-acquires the lease or becomes a shadow.
+                break;
+            }
         }
         // ENH-018: the `db` field on every span is bounded (one per database
         // name, not per document), so it is safe to put on a span attribute —

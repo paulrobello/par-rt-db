@@ -476,7 +476,7 @@ pub async fn replica(
 
 pub async fn shared_pool() -> PgPool {
     let config = crate::common::test_config();
-    crate::common::test_shared_pool(&config.database_url, 11)
+    crate::common::test_shared_pool(&config.database_url, 30)
         .await
         .expect("connect to shared cluster test postgres")
 }
