@@ -743,16 +743,8 @@ impl InMemoryRtDbClient {
     /// cascading delete may write several).
     fn execute_step(&mut self, step: &Step) -> Result<(StepResult, Vec<String>), RtDbError> {
         match step {
-            Step::Insert { table, doc } => {
-                let table_def = self.require_table(table)?.clone();
-                let id = self.do_insert(table, &table_def, doc)?;
-                Ok((StepResult::Insert { id }, vec![table.clone()]))
-            }
-            Step::Patch { table, id, fields } => {
-                let table_def = self.require_table(table)?.clone();
-                self.do_patch(&table_def, table, id, fields)?;
-                Ok((StepResult::Null, vec![table.clone()]))
-            }
+            Step::Insert { table, doc } => self.step_insert(table, doc),
+            Step::Patch { table, id, fields } => self.step_patch(table, id, fields),
             Step::AdjustCounter {
                 table,
                 id,
@@ -761,259 +753,382 @@ impl InMemoryRtDbClient {
                 min,
                 max,
                 expected,
-            } => {
-                let table_def = self.require_table(table)?.clone();
-                const MAX_SAFE: i64 = 9_007_199_254_740_991;
-                if delta.unsigned_abs() > MAX_SAFE as u64
-                    || min.is_some_and(|n| n.unsigned_abs() > MAX_SAFE as u64)
-                    || max.is_some_and(|n| n.unsigned_abs() > MAX_SAFE as u64)
-                    || (*min).zip(*max).is_some_and(|(lo, hi)| lo > hi)
-                {
-                    return Err(RtDbError::new(
-                        ErrorCode::BadRequest,
-                        "counter delta and bounds must be safe integers with min <= max",
-                    ));
-                }
-                let ty = table_def.fields.get(field).ok_or_else(|| {
-                    RtDbError::new(
-                        ErrorCode::SchemaViolation,
-                        format!("unknown field '{field}'"),
-                    )
-                })?;
-                if table_def.computed.contains_key(field) {
-                    return Err(RtDbError::new(
-                        ErrorCode::BadRequest,
-                        format!("computed field '{field}' cannot be adjusted"),
-                    ));
-                }
-                if table_def.auto_increment_field.as_deref() == Some(field) {
-                    return Err(RtDbError::new(
-                        ErrorCode::BadRequest,
-                        format!("autoIncrementField '{field}' cannot be changed"),
-                    ));
-                }
-                if table_def.updated_at_field.as_deref() == Some(field) {
-                    return Err(RtDbError::new(
-                        ErrorCode::BadRequest,
-                        format!("updatedAtField '{field}' cannot be adjusted"),
-                    ));
-                }
-                let numeric = matches!(ty, FieldType::Number)
-                    || matches!(ty, FieldType::Optional { inner } if matches!(inner.as_ref(), FieldType::Number));
-                if !numeric {
-                    return Err(RtDbError::new(
-                        ErrorCode::SchemaViolation,
-                        format!("counter field '{field}' must be number or optional(number)"),
-                    ));
-                }
-                let key = (table.clone(), id.clone());
-                let row = self
-                    .docs
-                    .get(&key)
-                    .filter(|row| row.deleted_at.is_none())
-                    .cloned()
-                    .ok_or_else(|| {
-                        RtDbError::new(ErrorCode::NotFound, format!("document '{id}' not found"))
-                    })?;
-                for (expected_field, wanted) in expected.iter().flat_map(|m| m.iter()) {
-                    if !table_def.fields.contains_key(expected_field) {
-                        return Err(RtDbError::new(
-                            ErrorCode::SchemaViolation,
-                            format!("unknown expected field '{expected_field}'"),
-                        ));
-                    }
-                    if !row
-                        .doc
-                        .get(expected_field)
-                        .is_some_and(|actual| expected_json_eq(actual, wanted))
-                    {
-                        return Err(RtDbError::new(
-                            ErrorCode::PreconditionFailed,
-                            format!("expected field '{expected_field}' did not match"),
-                        ));
-                    }
-                }
-                let ty = match ty {
-                    FieldType::Optional { inner } => inner.as_ref(),
-                    other => other,
-                };
-                let current = match ty {
-                    FieldType::Number => row
-                        .doc
-                        .get(field)
-                        .and_then(Value::as_f64)
-                        .filter(|n| {
-                            n.is_finite()
-                                && n.fract() == 0.0
-                                && *n >= -(MAX_SAFE as f64)
-                                && *n <= MAX_SAFE as f64
-                        })
-                        .map(|n| n as i64),
-                    _ => None,
-                }
-                .ok_or_else(|| {
-                    RtDbError::new(
-                        ErrorCode::BadRequest,
-                        format!("counter field '{field}' must contain a safe integer"),
-                    )
-                })?;
-                let next = current
-                    .checked_add(*delta)
-                    .filter(|n| n.unsigned_abs() <= MAX_SAFE as u64)
-                    .ok_or_else(|| {
-                        RtDbError::new(
-                            ErrorCode::BadRequest,
-                            "counter result is outside the safe integer range",
-                        )
-                    })?;
-                if min.is_some_and(|n| next < n) || max.is_some_and(|n| next > n) {
-                    return Err(RtDbError::new(
-                        ErrorCode::PreconditionFailed,
-                        "counter result is outside the configured bounds",
-                    ));
-                }
-                let value = Value::from(next);
-                self.do_patch(
-                    &table_def,
-                    table,
-                    id,
-                    &Map::from_iter([(field.clone(), value)]),
-                )?;
-                Ok((StepResult::Null, vec![table.clone()]))
-            }
-            Step::Replace { table, id, doc } => {
-                let table_def = self.require_table(table)?.clone();
-                self.do_replace(&table_def, table, id, doc)?;
-                Ok((StepResult::Null, vec![table.clone()]))
-            }
-            Step::Delete { table, id } => {
-                let table_def = self.require_table(table)?.clone();
-                // FM-33: a soft-delete table stamps the row (never a cascade
-                // trigger); a hard delete expands the app-level `onDelete`
-                // rules with a FRESH visited set + budget, mirroring
-                // `server/src/txn.rs::step_delete`.
-                let mut touched = Vec::new();
-                if table_def.soft_delete {
-                    self.do_soft_delete(table, id)?;
-                    touched.push(table.clone());
-                } else {
-                    let mut visited = HashSet::new();
-                    let mut cascade_rows = 0usize;
-                    self.delete_row_cascade(
-                        table,
-                        id,
-                        &mut visited,
-                        &mut cascade_rows,
-                        false,
-                        &mut touched,
-                    )?;
-                }
-                Ok((StepResult::Null, touched))
-            }
-            Step::Undelete { table, id } => {
-                let table_def = self.require_table(table)?.clone();
-                self.do_undelete(&table_def, table, id)?;
-                Ok((StepResult::Null, vec![table.clone()]))
-            }
+            } => self.step_adjust_counter(table, id, field, delta, min, max, expected),
+            Step::Replace { table, id, doc } => self.step_replace(table, id, doc),
+            Step::Delete { table, id } => self.step_delete(table, id),
+            Step::Undelete { table, id } => self.step_undelete(table, id),
             Step::ExpectVersion { table, id, version } => {
-                self.require_table(table)?;
-                self.do_expect_version(table, id, *version)?;
-                Ok((StepResult::Null, Vec::new()))
+                self.step_expect_version(table, id, *version)
             }
-            Step::ExpectAbsent { table, index, eq } => {
-                let table_def = self.require_table(table)?.clone();
-                let rows = self.eq_lookup(&table_def, table, index, eq)?;
-                if !rows.is_empty() {
-                    return Err(RtDbError::new(
-                        ErrorCode::PreconditionFailed,
-                        format!("index '{index}' already has a matching document"),
-                    ));
-                }
-                Ok((StepResult::Null, Vec::new()))
-            }
+            Step::ExpectAbsent { table, index, eq } => self.step_expect_absent(table, index, eq),
             Step::Upsert {
                 table,
                 index,
                 eq,
                 insert,
                 patch,
-            } => {
-                let table_def = self.require_table(table)?.clone();
-                let rows = self.eq_lookup(&table_def, table, index, eq)?;
-                if rows.len() > 1 {
-                    return Err(RtDbError::new(
-                        ErrorCode::PreconditionFailed,
-                        "upsert matched multiple documents",
-                    ));
-                }
-                if let Some(row) = rows.into_iter().next() {
-                    // FM-36: the update branch restamps `updatedAtField` into
-                    // the patch fields (server `step_upsert` update branch).
-                    let now = (self.now)();
-                    let patch = stamp_updated_at(&table_def, patch, now);
-                    let merged = apply_patch(&table_def, &row.doc, &patch, now)?;
-                    self.do_update(&table_def, table, &row.id, merged)?;
-                    Ok((
-                        StepResult::Upsert {
-                            id: row.id.clone(),
-                            inserted: false,
-                        },
-                        vec![table.clone()],
-                    ))
-                } else {
-                    let id = self.do_insert(table, &table_def, insert)?;
-                    Ok((
-                        StepResult::Upsert { id, inserted: true },
-                        vec![table.clone()],
-                    ))
-                }
-            }
+            } => self.step_upsert(table, index, eq, insert, patch),
             Step::PatchByQuery {
                 table,
                 filter,
                 patch,
                 limit,
-            } => {
-                let (patched, truncated) = self.patch_by_query(table, filter, patch, *limit)?;
-                Ok((
-                    StepResult::PatchByQuery { patched, truncated },
-                    vec![table.clone()],
-                ))
-            }
+            } => self.step_patch_by_query(table, filter, patch, *limit),
             Step::DeleteByQuery {
                 table,
                 filter,
                 limit,
-            } => {
-                let ((deleted, truncated), touched) =
-                    self.delete_by_query(table, filter, *limit)?;
-                Ok((StepResult::DeleteByQuery { deleted, truncated }, touched))
-            }
+            } => self.step_delete_by_query(table, filter, *limit),
             Step::Schedule {
                 when,
                 txn,
                 external,
-            } => {
-                let schedule_id =
-                    self.schedule((**txn).clone(), when.clone(), external.is_some_and(|e| e))?;
-                Ok((StepResult::Schedule { schedule_id }, Vec::new()))
-            }
-            Step::CancelSchedule { id } => {
-                // Matches the server: `false` (not an error) when the id is
-                // missing, already fired, or already cancelled.
-                let cancelled = self.cancel_schedule(id).is_ok();
-                Ok((StepResult::Cancelled { cancelled }, Vec::new()))
-            }
-            // FM-29: this harness does not model the workflow engine (the
-            // ts/python harnesses do); workflow steps fail explicitly rather
-            // than pretending to run. awaitSignal engine behavior (park /
-            // deliver / timeout) is likewise pinned by the server's
-            // integration tests, not ported here.
-            Step::StartWorkflow { .. } | Step::CancelWorkflow { .. } => Err(RtDbError::new(
-                ErrorCode::Internal,
-                "workflow steps are not supported by the in-memory harness",
-            )),
+            } => self.step_schedule(when, txn, external),
+            Step::CancelSchedule { id } => self.step_cancel_schedule(id),
+            Step::StartWorkflow { .. } | Step::CancelWorkflow { .. } => self.step_workflow(),
         }
+    }
+
+    /// `Insert` step: stamp the new row (id, defaults, timestamps) into the
+    /// store; result `{id}`.
+    fn step_insert(
+        &mut self,
+        table: &str,
+        doc: &Map<String, Value>,
+    ) -> Result<(StepResult, Vec<String>), RtDbError> {
+        let table_def = self.require_table(table)?.clone();
+        let id = self.do_insert(table, &table_def, doc)?;
+        Ok((StepResult::Insert { id }, vec![table.to_string()]))
+    }
+
+    /// `Patch` step: merge `fields` into the row; result `null`.
+    fn step_patch(
+        &mut self,
+        table: &str,
+        id: &str,
+        fields: &Map<String, Value>,
+    ) -> Result<(StepResult, Vec<String>), RtDbError> {
+        let table_def = self.require_table(table)?.clone();
+        self.do_patch(&table_def, table, id, fields)?;
+        Ok((StepResult::Null, vec![table.to_string()]))
+    }
+
+    /// `AdjustCounter` step: atomically add a safe-integer `delta` to a
+    /// declared numeric field under optional min/max bounds and expected-field
+    /// preconditions; result `null`.
+    #[allow(clippy::too_many_arguments)]
+    fn step_adjust_counter(
+        &mut self,
+        table: &str,
+        id: &str,
+        field: &str,
+        delta: &i64,
+        min: &Option<i64>,
+        max: &Option<i64>,
+        expected: &Option<Map<String, Value>>,
+    ) -> Result<(StepResult, Vec<String>), RtDbError> {
+        let table_def = self.require_table(table)?.clone();
+        const MAX_SAFE: i64 = 9_007_199_254_740_991;
+        if delta.unsigned_abs() > MAX_SAFE as u64
+            || min.is_some_and(|n| n.unsigned_abs() > MAX_SAFE as u64)
+            || max.is_some_and(|n| n.unsigned_abs() > MAX_SAFE as u64)
+            || (*min).zip(*max).is_some_and(|(lo, hi)| lo > hi)
+        {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "counter delta and bounds must be safe integers with min <= max",
+            ));
+        }
+        let ty = table_def.fields.get(field).ok_or_else(|| {
+            RtDbError::new(
+                ErrorCode::SchemaViolation,
+                format!("unknown field '{field}'"),
+            )
+        })?;
+        if table_def.computed.contains_key(field) {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("computed field '{field}' cannot be adjusted"),
+            ));
+        }
+        if table_def.auto_increment_field.as_deref() == Some(field) {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("autoIncrementField '{field}' cannot be changed"),
+            ));
+        }
+        if table_def.updated_at_field.as_deref() == Some(field) {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("updatedAtField '{field}' cannot be adjusted"),
+            ));
+        }
+        let numeric = matches!(ty, FieldType::Number)
+            || matches!(ty, FieldType::Optional { inner } if matches!(inner.as_ref(), FieldType::Number));
+        if !numeric {
+            return Err(RtDbError::new(
+                ErrorCode::SchemaViolation,
+                format!("counter field '{field}' must be number or optional(number)"),
+            ));
+        }
+        let key = (table.to_string(), id.to_string());
+        let row = self
+            .docs
+            .get(&key)
+            .filter(|row| row.deleted_at.is_none())
+            .cloned()
+            .ok_or_else(|| {
+                RtDbError::new(ErrorCode::NotFound, format!("document '{id}' not found"))
+            })?;
+        for (expected_field, wanted) in expected.iter().flat_map(|m| m.iter()) {
+            if !table_def.fields.contains_key(expected_field) {
+                return Err(RtDbError::new(
+                    ErrorCode::SchemaViolation,
+                    format!("unknown expected field '{expected_field}'"),
+                ));
+            }
+            if !row
+                .doc
+                .get(expected_field)
+                .is_some_and(|actual| expected_json_eq(actual, wanted))
+            {
+                return Err(RtDbError::new(
+                    ErrorCode::PreconditionFailed,
+                    format!("expected field '{expected_field}' did not match"),
+                ));
+            }
+        }
+        let ty = match ty {
+            FieldType::Optional { inner } => inner.as_ref(),
+            other => other,
+        };
+        let current = match ty {
+            FieldType::Number => row
+                .doc
+                .get(field)
+                .and_then(Value::as_f64)
+                .filter(|n| {
+                    n.is_finite()
+                        && n.fract() == 0.0
+                        && *n >= -(MAX_SAFE as f64)
+                        && *n <= MAX_SAFE as f64
+                })
+                .map(|n| n as i64),
+            _ => None,
+        }
+        .ok_or_else(|| {
+            RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("counter field '{field}' must contain a safe integer"),
+            )
+        })?;
+        let next = current
+            .checked_add(*delta)
+            .filter(|n| n.unsigned_abs() <= MAX_SAFE as u64)
+            .ok_or_else(|| {
+                RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "counter result is outside the safe integer range",
+                )
+            })?;
+        if min.is_some_and(|n| next < n) || max.is_some_and(|n| next > n) {
+            return Err(RtDbError::new(
+                ErrorCode::PreconditionFailed,
+                "counter result is outside the configured bounds",
+            ));
+        }
+        let value = Value::from(next);
+        self.do_patch(
+            &table_def,
+            table,
+            id,
+            &Map::from_iter([(field.to_string(), value)]),
+        )?;
+        Ok((StepResult::Null, vec![table.to_string()]))
+    }
+
+    /// `Replace` step: overwrite the whole document; result `null`.
+    fn step_replace(
+        &mut self,
+        table: &str,
+        id: &str,
+        doc: &Map<String, Value>,
+    ) -> Result<(StepResult, Vec<String>), RtDbError> {
+        let table_def = self.require_table(table)?.clone();
+        self.do_replace(&table_def, table, id, doc)?;
+        Ok((StepResult::Null, vec![table.to_string()]))
+    }
+
+    /// `Delete` step: soft-delete on a `softDelete` table, otherwise a hard
+    /// delete that expands app-level `onDelete` cascade rules; writes may
+    /// touch several tables (children + parent).
+    fn step_delete(
+        &mut self,
+        table: &str,
+        id: &str,
+    ) -> Result<(StepResult, Vec<String>), RtDbError> {
+        let table_def = self.require_table(table)?.clone();
+        // FM-33: a soft-delete table stamps the row (never a cascade
+        // trigger); a hard delete expands the app-level `onDelete`
+        // rules with a FRESH visited set + budget, mirroring
+        // `server/src/txn.rs::step_delete`.
+        let mut touched = Vec::new();
+        if table_def.soft_delete {
+            self.do_soft_delete(table, id)?;
+            touched.push(table.to_string());
+        } else {
+            let mut visited = HashSet::new();
+            let mut cascade_rows = 0usize;
+            self.delete_row_cascade(
+                table,
+                id,
+                &mut visited,
+                &mut cascade_rows,
+                false,
+                &mut touched,
+            )?;
+        }
+        Ok((StepResult::Null, touched))
+    }
+
+    /// `Undelete` step: restore a soft-deleted row; result `null`.
+    fn step_undelete(
+        &mut self,
+        table: &str,
+        id: &str,
+    ) -> Result<(StepResult, Vec<String>), RtDbError> {
+        let table_def = self.require_table(table)?.clone();
+        self.do_undelete(&table_def, table, id)?;
+        Ok((StepResult::Null, vec![table.to_string()]))
+    }
+
+    /// `ExpectVersion` step: precondition only, writes nothing.
+    fn step_expect_version(
+        &self,
+        table: &str,
+        id: &str,
+        version: i64,
+    ) -> Result<(StepResult, Vec<String>), RtDbError> {
+        self.require_table(table)?;
+        self.do_expect_version(table, id, version)?;
+        Ok((StepResult::Null, Vec::new()))
+    }
+
+    /// `ExpectAbsent` step: precondition that an index eq-prefix matches no
+    /// row; writes nothing.
+    fn step_expect_absent(
+        &self,
+        table: &str,
+        index: &str,
+        eq: &[Value],
+    ) -> Result<(StepResult, Vec<String>), RtDbError> {
+        let table_def = self.require_table(table)?.clone();
+        let rows = self.eq_lookup(&table_def, table, index, eq)?;
+        if !rows.is_empty() {
+            return Err(RtDbError::new(
+                ErrorCode::PreconditionFailed,
+                format!("index '{index}' already has a matching document"),
+            ));
+        }
+        Ok((StepResult::Null, Vec::new()))
+    }
+
+    /// `Upsert` step: insert-or-patch keyed by an index eq-prefix match; the
+    /// update branch restamps `updatedAtField`. Result `{id, inserted}`.
+    fn step_upsert(
+        &mut self,
+        table: &str,
+        index: &str,
+        eq: &[Value],
+        insert: &Map<String, Value>,
+        patch: &Map<String, Value>,
+    ) -> Result<(StepResult, Vec<String>), RtDbError> {
+        let table_def = self.require_table(table)?.clone();
+        let rows = self.eq_lookup(&table_def, table, index, eq)?;
+        if rows.len() > 1 {
+            return Err(RtDbError::new(
+                ErrorCode::PreconditionFailed,
+                "upsert matched multiple documents",
+            ));
+        }
+        if let Some(row) = rows.into_iter().next() {
+            // FM-36: the update branch restamps `updatedAtField` into
+            // the patch fields (server `step_upsert` update branch).
+            let now = (self.now)();
+            let patch = stamp_updated_at(&table_def, patch, now);
+            let merged = apply_patch(&table_def, &row.doc, &patch, now)?;
+            self.do_update(&table_def, table, &row.id, merged)?;
+            Ok((
+                StepResult::Upsert {
+                    id: row.id.clone(),
+                    inserted: false,
+                },
+                vec![table.to_string()],
+            ))
+        } else {
+            let id = self.do_insert(table, &table_def, insert)?;
+            Ok((
+                StepResult::Upsert { id, inserted: true },
+                vec![table.to_string()],
+            ))
+        }
+    }
+
+    /// `PatchByQuery` step: patch every row matching a `FilterExpr`; result
+    /// `{patched, truncated}`.
+    fn step_patch_by_query(
+        &mut self,
+        table: &str,
+        filter: &FilterExpr,
+        patch: &Map<String, Value>,
+        limit: Option<u32>,
+    ) -> Result<(StepResult, Vec<String>), RtDbError> {
+        let (patched, truncated) = self.patch_by_query(table, filter, patch, limit)?;
+        Ok((
+            StepResult::PatchByQuery { patched, truncated },
+            vec![table.to_string()],
+        ))
+    }
+
+    /// `DeleteByQuery` step: delete every row matching a `FilterExpr`
+    /// (cascades enabled); result `{deleted, truncated}`.
+    fn step_delete_by_query(
+        &mut self,
+        table: &str,
+        filter: &FilterExpr,
+        limit: Option<u32>,
+    ) -> Result<(StepResult, Vec<String>), RtDbError> {
+        let ((deleted, truncated), touched) = self.delete_by_query(table, filter, limit)?;
+        Ok((StepResult::DeleteByQuery { deleted, truncated }, touched))
+    }
+
+    /// `Schedule` step: enqueue a nested transaction (FM-28); result
+    /// `{scheduleId}`.
+    fn step_schedule(
+        &mut self,
+        when: &ScheduleWhen,
+        txn: &Transaction,
+        external: &Option<bool>,
+    ) -> Result<(StepResult, Vec<String>), RtDbError> {
+        let schedule_id =
+            self.schedule((*txn).clone(), when.clone(), external.is_some_and(|e| e))?;
+        Ok((StepResult::Schedule { schedule_id }, Vec::new()))
+    }
+
+    /// `CancelSchedule` step: `false` (not an error) when the id is missing,
+    /// already fired, or already cancelled — matching the server.
+    fn step_cancel_schedule(&mut self, id: &str) -> Result<(StepResult, Vec<String>), RtDbError> {
+        let cancelled = self.cancel_schedule(id).is_ok();
+        Ok((StepResult::Cancelled { cancelled }, Vec::new()))
+    }
+
+    /// Workflow steps are unsupported by this harness (FM-29): fail
+    /// explicitly rather than pretending to run.
+    fn step_workflow(&self) -> Result<(StepResult, Vec<String>), RtDbError> {
+        Err(RtDbError::new(
+            ErrorCode::Internal,
+            "workflow steps are not supported by the in-memory harness",
+        ))
     }
 
     /// Stamps the table's `autoIncrementField` (FM-37) with the next value of
