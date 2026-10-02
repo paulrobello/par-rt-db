@@ -77,11 +77,14 @@ respect to a later one.
 
 The per-database read-only freeze (`GET|PATCH /admin/db/{db}/readonly`, a
 persisted `read_only` column on `rtdb_auth.databases`) is checked **fresh per
-write** at the top of the `Mutate` arm (`committer/arms/mutate.rs`), after the
-idempotency-replay lookup. One gate covers every client-plane document write:
-WS, HTTP one-shot, mutate-batch, admin direct mutate, and forwarded-owner
-writes all enter through that arm, and the check is principal-agnostic —
-machine tokens, OAuth users, and admins are all rejected while frozen.
+write** inside the write transaction — `execute_txn_with_side`'s combined
+preamble statement (ENH-048) reads the flag and the idempotency cache in the
+same round trip as the `BEGIN`, replaying a cached result (after rollback)
+BEFORE the freeze rejects (also after rollback). One gate covers every
+client-plane document write: WS, HTTP one-shot, mutate-batch, admin direct
+mutate, and forwarded-owner writes all enter through that arm, and the check
+is principal-agnostic — machine tokens, OAuth users, and admins are all
+rejected while frozen.
 
 What stays open is decided by which arm a request rides, not by who sent it:
 

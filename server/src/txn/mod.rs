@@ -22,7 +22,7 @@ use sqlx::PgPool;
 use tracing::Instrument;
 
 use crate::auth::{PrincipalCtx, authorize_table};
-use crate::db::validate_db_name;
+use crate::db::{now_ms, validate_db_name};
 use crate::ddl::pg_schema;
 use crate::dsl::StepTableExt;
 use crate::error::{ErrorCode, RtDbError};
@@ -304,6 +304,22 @@ pub struct TxnSideWrites {
     pub webhooks: bool,
 }
 
+/// ENH-048: the per-mutate preamble checks folded into the first statement of
+/// the write transaction. The committer serializes a database's turns, so
+/// every preamble round trip used to be taken out of its write throughput; the
+/// combined statement (see `execute_txn_with_side`) now answers both in the
+/// `BEGIN` → first-statement round trip the turn already paid.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MutatePreamble<'a> {
+    /// The caller's idempotency key, when present. A still-live cached result
+    /// for it replays INSTEAD of executing (and before the freeze check).
+    pub idem_key: Option<&'a str>,
+    /// Whether the per-database read-only freeze gate applies. `false` for the
+    /// system arms (scheduled fires, workflow advances, TTL reaping), which are
+    /// exempt from the freeze by construction.
+    pub check_freeze: bool,
+}
+
 /// Executes all of `txn`'s steps plus, when `side` requests them, the audit
 /// and webhook side-writes on the SAME Postgres transaction; any step's or
 /// side-write's error aborts and rolls back everything. This is the general
@@ -311,6 +327,16 @@ pub struct TxnSideWrites {
 /// tell `publish_taps` to skip the satisfied taps; `execute_txn` is the
 /// `side.audit = side.webhooks = false` wrapper the tests and non-tap callers
 /// use. See [`execute_txn`] for the step semantics.
+///
+/// ENH-048: when `preamble` is non-default, the first statement inside the
+/// transaction also sets the statement timeout via `set_config`, reads the
+/// per-database read-only freeze flag, and (key present) looks up the
+/// idempotency cache — the checks `handle_mutate` used to pay as separate
+/// pre-transaction round trips. A cached result rolls back and replays before
+/// the freeze check; `read_only = true` rolls back and returns `READ_ONLY`.
+// ENH-048: eight params — the preamble rides alongside `idem`; each is
+// independently needed (same `#[allow]` shape as `publish_taps_skip_side_writes`).
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_txn_with_side(
     pool: &PgPool,
     db: &str,
@@ -319,6 +345,7 @@ pub async fn execute_txn_with_side(
     ctx: &PrincipalCtx,
     idem: Option<(&str, i64)>,
     side: TxnSideWrites,
+    preamble: MutatePreamble<'_>,
 ) -> Result<TxnOutcome, RtDbError> {
     // ENH-018: `txn.execute` spans the write path so "the DSL is slow" vs
     // "Postgres is slow" is a distinguishable question. The step count is the
@@ -375,14 +402,54 @@ pub async fn execute_txn_with_side(
         // SEC-104: bound every statement in this committer turn. A pathological
         // scan (e.g. a filter over an unindexed field that escapes the row budget)
         // aborts this transaction rather than stalling the single-writer for the
-        // whole database. `SET LOCAL` scopes the value to this transaction and
-        // reverts on commit/rollback — it never leaks to other pool users. The
-        // value is a const, never user input.
-        sqlx::query(&format!(
-            "SET LOCAL statement_timeout = {STATEMENT_TIMEOUT_MS}"
-        ))
-        .execute(&mut *tx)
-        .await?;
+        // whole database. `set_config(..., true)` has the same transaction scope as
+        // `SET LOCAL` — it reverts on commit/rollback, never leaking to other pool
+        // users. The value is a const, never user input.
+        //
+        // ENH-048: the freeze flag and the idempotency lookup ride this first
+        // statement instead of costing separate pre-transaction round trips.
+        // Ordering is the documented ruling: a cached result is an idempotent
+        // replay (rollback, return the cached results) BEFORE the freeze check;
+        // only a non-replayed write sees `READ_ONLY`. Both paths roll back —
+        // nothing commits. System arms (`check_freeze = false`, no key) fall
+        // back to the plain set_config so the combined query is not wasted on
+        // subselects they would ignore.
+        if preamble.idem_key.is_none() && !preamble.check_freeze {
+            sqlx::query(&format!(
+                "SET LOCAL statement_timeout = {STATEMENT_TIMEOUT_MS}"
+            ))
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            let combined = format!(
+                "SELECT set_config('statement_timeout', $1, true), \
+                 COALESCE((SELECT read_only FROM rtdb_auth.databases WHERE name = $2), FALSE), \
+                 (SELECT result FROM \"{pg_schema_name}\".mutations \
+                  WHERE mut_id = $3 AND expires_at > $4)"
+            );
+            let row: (String, bool, Option<serde_json::Value>) = sqlx::query_as(&combined)
+                .bind(STATEMENT_TIMEOUT_MS.to_string())
+                .bind(db)
+                .bind(preamble.idem_key)
+                .bind(now_ms())
+                .fetch_one(&mut *tx)
+                .await?;
+            if let Some(value) = row.2 {
+                let results: Vec<serde_json::Value> = serde_json::from_value(value).map_err(|err| {
+                    tracing::error!(error = %err, db, "failed to deserialize cached mutation result");
+                    RtDbError::internal("failed to read cached mutation result")
+                })?;
+                tx.rollback().await?;
+                return Ok(TxnOutcome {
+                    results,
+                    write_set: WriteSet::default(),
+                });
+            }
+            if row.1 {
+                tx.rollback().await?;
+                return Err(RtDbError::read_only());
+            }
+        }
 
         let mut sctx = StepCtx {
             tx: &mut tx,
@@ -538,6 +605,9 @@ pub async fn execute_txn(
             audit: false,
             webhooks: false,
         },
+        // ENH-048: the non-tap callers (tests, snapshot import) run no preamble
+        // checks — the timeout still applies via the plain set_config branch.
+        MutatePreamble::default(),
     )
     .await
 }

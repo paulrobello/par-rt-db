@@ -44,6 +44,14 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
 /// committer, sweeping at 60s). Expired rows are still filtered at read time
 /// (`expires_at > now`) so a stale entry is treated as absent even before the
 /// next cleanup sweep reclaims its space.
+///
+/// ENH-048: the client-facing mutate no longer calls this before its
+/// transaction — `execute_txn_with_side`'s combined preamble statement reads
+/// the same row (same `expires_at > now` filter) inside the write transaction,
+/// so replay and freeze cost one round trip instead of three. This standalone
+/// form remains for the other callers: the dedup tests, and the ARC-003 race
+/// path in the Mutate arm that re-reads the cached result after a
+/// `is_idempotency_replay` error.
 pub async fn check(pool: &PgPool, db: &str, mut_id: &str) -> Result<Option<Vec<Value>>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);

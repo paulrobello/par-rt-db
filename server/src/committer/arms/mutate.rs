@@ -15,26 +15,18 @@ pub(in crate::committer) async fn handle_mutate(
     // slot for the whole db) — treat it the same as no key at all.
     let idempotency_key = idempotency_key.filter(|key| !key.is_empty());
 
-    if let Some(key) = &idempotency_key
-        && let Some(results) = mutation_log::check(&ctx.pool, &ctx.db, key).await?
-    {
-        return Ok(TxnOutcome {
-            results,
-            write_set: WriteSet::default(),
-        });
-    }
-
     // Per-database read-only freeze: after the idempotency replay (a retry of
     // an already-committed write returns its cached result, not an error) and
-    // before any work. One indexed lookup per write; principal-agnostic — the
-    // freeze covers machine tokens, OAuth users, admin direct mutate, and the
-    // forwarded-owner path alike, on every transport. System arms (scheduled
-    // fires, workflow advances, TTL reaping) and admin schema ops bypass this
-    // gate by construction: they never enter the Mutate arm.
-    if crate::db::is_read_only(&ctx.pool, &ctx.db).await? {
-        return Err(RtDbError::read_only());
-    }
-
+    // before any work. Principal-agnostic — the freeze covers machine tokens,
+    // OAuth users, admin direct mutate, and the forwarded-owner path alike, on
+    // every transport. System arms (scheduled fires, workflow advances, TTL
+    // reaping) and admin schema ops bypass this gate by construction: they
+    // never enter the Mutate arm.
+    //
+    // ENH-048: the freeze flag and the idempotency lookup are no longer
+    // separate pre-transaction round trips — `execute_txn_with_side`'s
+    // combined preamble statement (below) reads both inside the write
+    // transaction, in the documented order (replay wins over the freeze).
     let schema = ctx.schemas.get(&ctx.pool, &ctx.db).await?;
     // ENH-011 / ARC-004: enforce per-db storage cap before the first write.
     // Uniform — no admin bypass — `enforce(cap=0)` is a no-op, so an unset cap
@@ -54,10 +46,15 @@ pub(in crate::committer) async fn handle_mutate(
     // (atomic with the write it guards), so this arm no longer fills the cache
     // post-commit. The TTL is read live from hot config so a
     // `PATCH /admin/config` to `idempotencyTtlMs` takes effect on the next
-    // mutate, no restart.
+    // mutate, no restart. ENH-048: the key also drives the in-transaction
+    // preamble (cache lookup + freeze read on the first statement).
     let idem = idempotency_key
         .as_deref()
         .map(|key| (key, ctx.hot.load().idempotency_ttl_ms));
+    let preamble = crate::txn::MutatePreamble {
+        idem_key: idempotency_key.as_deref(),
+        check_freeze: true,
+    };
     // ENH-047: the audit and webhook side-writes run INSIDE execute_txn's
     // transaction (the outbox guarantee), so this arm's tap skips them.
     let side = crate::txn::TxnSideWrites {
@@ -73,6 +70,7 @@ pub(in crate::committer) async fn handle_mutate(
         &principal_ctx,
         idem,
         side,
+        preamble,
     )
     .await
     {

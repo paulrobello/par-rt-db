@@ -213,7 +213,15 @@ pub(in crate::committer) async fn handle_workflow_advance(
             Some(e) => Err(e),
             None => {
                 crate::txn::execute_txn_with_side(
-                    &ctx.pool, &ctx.db, &schema, txn, &fire_ctx, None, side,
+                    &ctx.pool,
+                    &ctx.db,
+                    &schema,
+                    txn,
+                    &fire_ctx,
+                    None,
+                    side,
+                    // ENH-048: system arm — no idem key, exempt from the freeze gate.
+                    crate::txn::MutatePreamble::default(),
                 )
                 .await
             }

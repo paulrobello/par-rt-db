@@ -427,3 +427,56 @@ async fn readonly_new_starts_rejected_and_replay_wins() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// ENH-048: the documented order is pinned at the new combined-preamble level
+/// too — a frozen database's mutate carrying an already-committed idempotency
+/// key replays the cached result instead of erroring `READ_ONLY`. The replay
+/// decision now happens inside `execute_txn_with_side`'s preamble statement,
+/// so this guards the in-transaction ordering (cached-result branch before
+/// the freeze branch).
+#[tokio::test]
+async fn readonly_frozen_replay_returns_cached_result_not_read_only() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+
+    // Commit one keyed write BEFORE the freeze so the cached result exists.
+    let txn = insert_work_item_txn();
+    let key = "frozen-replay-preamble";
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/mutate"))
+        .header(TOKEN_HEADER, format!("Bearer {token}"))
+        .json(&json!({"db": db.as_str(), "txn": txn, "idempotencyKey": key}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let first: Value = resp.json().await?;
+
+    freeze(addr, &db, true).await;
+
+    // Same key again while frozen: the preamble's cached-result branch must
+    // fire before the freeze branch — cached outcome, HTTP 200, not 409.
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/mutate"))
+        .header(TOKEN_HEADER, format!("Bearer {token}"))
+        .json(&json!({"db": db.as_str(), "txn": txn, "idempotencyKey": key}))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "replay must win over READ_ONLY"
+    );
+    let second: Value = resp.json().await?;
+    assert_eq!(first, second, "replay returns the original outcome");
+
+    // And a fresh (unkeyed) write under the same freeze is still rejected,
+    // proving the freeze itself is live.
+    let resp = http_mutate(addr, &token, db.as_str(), insert_work_item_txn()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body: Value = resp.json().await?;
+    assert_eq!(body["code"], json!("READ_ONLY"));
+
+    Ok(())
+}
