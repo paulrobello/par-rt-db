@@ -1096,7 +1096,7 @@ to run either.
 
 The numbers below are quoted from `bench/baseline.json`, the median of 3
 real runs captured 2026-08-25 against the live deployed instance
-(`RTDB_BUILD_COMMIT=3ab8b13`), run directly on `lenny2` against
+(`RTDB_BUILD_COMMIT=3ab8b13`), run directly on the deploy host against
 `127.0.0.1:8300` (no Cloudflare tunnel) with the `bench` database reset to
 empty before the series. Scenario (c) is not represented — the production
 deploy is a single instance, so multi-instance forward/takeover has no real
@@ -1135,6 +1135,6 @@ to ~1500ms (~27%) with no regression to scenario a's commit throughput.
 A regression beyond 15% on any metric (latency up, throughput down) is
 checked manually with `scripts/bench/compare.ts` — no CI job runs benchmarks
 (GitHub-hosted runners are noisy shared hardware, not comparable run to run).
-Runs happen only from the operator's dev machine or `lenny2` (the deploy
+Runs happen only from the operator's dev machine or the deploy host (the deploy
 host, run there against `127.0.0.1:8300` to skip the tunnel) — see
 [CONTRIBUTING.md's Benchmarks section](../CONTRIBUTING.md#benchmarks).

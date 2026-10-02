@@ -60,15 +60,15 @@ limit would not provide this protection because it applies only after an image
 has been built.
 
 For a live verification, run the deploy in the background and sample the host
-load plus every lenny2 tunnel hostname until that deploy exits. The monitor is
+load plus every tunnel hostname until that deploy exits. The monitor is
 bounded: 540 samples at 5s covers 45 minutes, a trap tears the background
 deploy down on interrupt, and the closing wait only runs once the deploy has
 exited, so a hung deploy cannot block it forever:
 
 ```sh
-hosts="l2-streamer.parflare.com kanban.pardev.net projects.pardev.net \
-rtdb.pardev.net linekeep.pardev.net hack.pardev.net"
-make deploy DEPLOY_HOST=root@lenny2.par-com.net \
+hosts="app-1.example.com app-2.example.com app-3.example.com \
+rtdb.example.com app-4.example.com app-5.example.com"
+make deploy DEPLOY_HOST=root@docker-host.example.com \
   >/tmp/par-rt-db-deploy.log 2>&1 &
 deploy_pid=$!
 cleanup() {
@@ -80,7 +80,7 @@ trap cleanup INT TERM
 for sample in $(seq 1 540); do
   kill -0 "$deploy_pid" 2>/dev/null || break
   date -Is
-  ssh root@lenny2.par-com.net 'uptime'
+  ssh root@docker-host.example.com 'uptime'
   for host in $hosts; do
     curl --fail --silent --show-error --output /dev/null \
       --write-out "$host %{http_code}\n" "https://$host/"
@@ -103,8 +103,8 @@ exit "$deploy_rc"
 
 Inspect `/tmp/par-rt-db-deploy.log` and the terminal output. The acceptance
 threshold is load below 16 on every sample and HTTP 200 from
-`kanban.pardev.net`, `projects.pardev.net`, `rtdb.pardev.net`, and
-`hack.pardev.net` throughout the build window. The additional lenny2 tunnel
+`app-2.example.com`, `app-3.example.com`, `rtdb.example.com`, and
+`app-5.example.com` throughout the build window. The additional tunnel
 hostnames must remain healthy too. Do not mark the mitigation verified from a
 local `docker compose config` check alone.
 

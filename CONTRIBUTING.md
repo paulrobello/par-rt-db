@@ -172,16 +172,16 @@ ENH-033 adds a two-layer benchmark harness, deliberately excluded from
 hardware — commit throughput and latency numbers measured there aren't
 comparable run to run, so they'd produce false regressions and hide real
 ones. Benchmarks are run manually, only from two known, reproducible
-machines: the operator's local dev Mac, and `lenny2` (the deploy host,
-`root@lenny2.par-com.net`) — running there against the deployed instance's
+machines: the operator's local dev Mac, and the deploy host
+(`root@docker-host.example.com`) — running there against the deployed instance's
 `127.0.0.1:8300` avoids the Cloudflare tunnel's network latency and measures
 the server alone.
 
-To run against the live deployed server from `lenny2` instead of a local dev
+To run against the live deployed server from the deploy host instead of a local dev
 server: sync the current `scripts/bench/` and `ts-client/dist/` to
 `/docker/par-rt-db` (`make deploy` already keeps that tree current; a
 between-deploys sync can use `rsync -avz scripts/bench/
-lenny2.par-com.net:/docker/par-rt-db/scripts/bench/` plus the same for
+docker-host.example.com:/docker/par-rt-db/scripts/bench/` plus the same for
 `ts-client/dist/`), then run `bun run scripts/bench/load.ts` there with
 `RTDB_ADMIN_KEY` read from the deployed `.env` and `--url
 http://127.0.0.1:8300`. This talks to the same Postgres the live traffic

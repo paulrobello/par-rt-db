@@ -71,3 +71,6 @@ server/target/
 # ENH-033: benchmark run output (only bench/baseline.json is committed)
 bench/results/
 */docs-api/
+
+# SEC-007: local hostname-leak patterns (never commit; see Makefile hostname-leak-check)
+.hostname-leak-patterns

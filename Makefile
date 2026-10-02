@@ -297,7 +297,24 @@ dockerfile-stub-check:
 backup-persistence-check:
 	./scripts/backup-persistence-check.sh
 
-checkall: env-drift-check dockerfile-stub-check backup-persistence-check cli-docs-check docs-api fmt-check lint typecheck test rust-client-check-features
+# SEC-007: fail when tracked files reference the operator's real infrastructure
+# hostnames. The patterns live in a gitignored local file (.hostname-leak-patterns,
+# one extended regex per line) so the patterns themselves are never published.
+# A fresh checkout without the file skips the check (CI-safe).
+hostname-leak-check:
+	@if [ ! -f .hostname-leak-patterns ]; then \
+		echo "hostname-leak-check: .hostname-leak-patterns not present — skipping"; \
+	else \
+		if ! git grep -qEf .hostname-leak-patterns -- . ; then \
+			echo "hostname-leak-check: no tracked file matches the leak patterns"; \
+		else \
+			echo "hostname-leak-check: LEAK — tracked files reference real infrastructure hostnames:" >&2; \
+			git grep -nEf .hostname-leak-patterns -- . >&2; \
+			exit 1; \
+		fi; \
+	fi
+
+checkall: env-drift-check dockerfile-stub-check backup-persistence-check hostname-leak-check cli-docs-check docs-api fmt-check lint typecheck test rust-client-check-features
 	@mkdir -p target && echo "$(GATE_KEY)" > $(GATE_STAMP)
 
 # Content-addressed gate reuse for deploys: `checkall` stamps the gate key
@@ -389,7 +406,7 @@ deploy: checkall-cached
 	ssh $(DEPLOY_HOST) 'cd $(DEPLOY_PATH) && BUILDER=par-rt-db-builder && if ! docker buildx inspect "$$BUILDER" >/dev/null 2>&1; then docker buildx create --name "$$BUILDER" --driver docker-container --driver-opt default-load=true --driver-opt cpu-quota=400000 --driver-opt cpu-period=100000 --buildkitd-config "$(DEPLOY_PATH)/deploy/buildkitd.toml"; fi && docker buildx use "$$BUILDER" && RTDB_BUILD_COMMIT=$(DEPLOY_COMMIT) BUILDX_BUILDER="$$BUILDER" docker compose up -d --build && docker compose ps'
 	ssh $(DEPLOY_HOST) 'curl -fsS http://127.0.0.1:8300/healthz'
 	@echo
-	curl -fsS https://rtdb.pardev.net/healthz
+	curl -fsS https://rtdb.example.com/healthz
 	@echo
 
 # ==== Grind loop (~/Repos/par-grind) ========================================
