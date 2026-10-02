@@ -170,6 +170,7 @@ pub fn test_config() -> Config {
             storage_per_ip_rpm: 0,
             anonymous_per_ip_rpm: 0,
             admin_per_ip_rpm: 0,
+            oauth_begin_per_ip_rpm: 0,
         },
         storage: rtdb_server::config::StorageConfig {
             require_signed_urls: false,

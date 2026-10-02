@@ -463,11 +463,40 @@ struct BeginResponse {
 async fn provider_begin<P: OAuthProvider>(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     QueryParams(params): QueryParams<BeginParams>,
 ) -> Response {
     let Some(provider) = P::from_config(&state.config) else {
         return unconfigured_response(P::name());
     };
+
+    // SEC-003: per-IP rate limit on the unauthenticated `/begin` route, so a
+    // single attacker cannot mint state rows in a loop (the global
+    // MAX_PENDING_STATES cap bounds the table; this bounds one IP). Same
+    // canonicalization and limiter as the anonymous mint (SEC-103). Disabled
+    // when `limits.oauth_begin_per_ip_rpm == 0` (code default; the shipped
+    // `.env.example`/`docker-compose.yml` set a non-zero default).
+    let ip_key = crate::http_api::client_ip_key(&headers, addr.ip(), state.config.trusted_proxy);
+    let limit = state.config.limits.oauth_begin_per_ip_rpm;
+    if limit > 0 {
+        match state
+            .limits
+            .rate_limiter
+            .check(
+                crate::rate_limit::RateKey::Ip {
+                    route: "oauth_begin",
+                    ip: ip_key.clone(),
+                },
+                limit,
+            )
+            .await
+        {
+            crate::rate_limit::RateDecision::Denied { retry_after_secs } => {
+                return RtDbError::rate_limited(retry_after_secs).into_response();
+            }
+            crate::rate_limit::RateDecision::Allowed => {}
+        }
+    }
 
     if !state
         .runtime

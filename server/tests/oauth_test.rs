@@ -1326,3 +1326,49 @@ async fn oauth_state_is_single_use_at_the_db() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// SEC-003: `GET /auth/{provider}/begin` is per-IP rate-limited when
+// `limits.oauth_begin_per_ip_rpm > 0`: after the limit is exhausted within
+// one minute, further calls from the same IP return 429 RATE_LIMITED with a
+// `Retry-After` hint. The code default is 0 (disabled); this mirrors the
+// SEC-103 anon-mint test.
+#[tokio::test]
+async fn sec003_oauth_begin_is_ip_rate_limited() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let mut cfg = test_config();
+    cfg.oauth.github.base_url = mock.uri();
+    cfg.oauth.github.api_url = mock.uri();
+    cfg.oauth.github.client_id = Some("test-client".into());
+    cfg.oauth.github.client_secret = Some("test-secret".into());
+    cfg.limits.oauth_begin_per_ip_rpm = 2;
+
+    let pool = crate::common::test_pool(&cfg.database_url)
+        .await
+        .expect("connect to test postgres");
+    db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
+    let state = AppState::new(pool, cfg, crate::common::test_hot());
+    let addr = spawn_app(state.clone()).await;
+
+    let client = no_redirect_client();
+    let url = format!("http://{addr}/auth/github/begin?origin=http://localhost:5173");
+    // First 2 calls within the same minute are allowed.
+    for i in 0..2 {
+        let resp = client.get(&url).send().await?;
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "begin call {} should be allowed",
+            i + 1
+        );
+    }
+    // Third call in the same minute is denied with 429 RATE_LIMITED.
+    let resp = client.get(&url).send().await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        resp.headers().get("retry-after").is_some(),
+        "Retry-After header should be present on a 429"
+    );
+    let body: Value = resp.json().await?;
+    assert_eq!(body["code"], json!("RATE_LIMITED"));
+    Ok(())
+}

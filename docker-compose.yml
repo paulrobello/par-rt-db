@@ -90,6 +90,11 @@ services:
       # failure also increments the rtdb_admin_auth_failures_total counter
       # and logs at WARN.
       RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM: ${RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM:-10}
+      # SEC-003: per-IP rate limit on GET /auth/{provider}/begin so one IP
+      # cannot mint login states in a loop. 0 disables; the code default is 0
+      # (tests stay unlimited) — this shipped non-zero default turns the
+      # mitigation on out-of-the-box.
+      RTDB_RATE_LIMIT_OAUTH_BEGIN_PER_IP_RPM: ${RTDB_RATE_LIMIT_OAUTH_BEGIN_PER_IP_RPM:-30}
       # SEC-120: cookie Secure attribute ships on by default — a misconfigured
       # proxy that strips X-Forwarded-Proto can no longer cause a session cookie
       # to be sent over plain HTTP. Set to "false" ONLY for local-http dev.

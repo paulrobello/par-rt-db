@@ -27,6 +27,10 @@ pub struct LimitsConfig {
     /// RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM (default 10; 0 disables —
     /// SEC-109/SEC-203). Per-IP rate limit on `POST /admin/login`.
     pub admin_per_ip_rpm: u32,
+    /// RTDB_RATE_LIMIT_OAUTH_BEGIN_PER_IP_RPM (default 0 = disabled; the
+    /// shipped `.env.example`/`docker-compose.yml` set 30 — SEC-003). Per-IP
+    /// rate limit on the unauthenticated `GET /auth/{provider}/begin` route.
+    pub oauth_begin_per_ip_rpm: u32,
     /// RTDB_RATE_LIMIT_EXACT (default false). ARC-007: multi-instance-only.
     /// false = each replica counts locally and reconciles with
     /// `rtdb_auth.rate_counters` every `sync_ms` (approximate, no
@@ -50,6 +54,7 @@ impl Default for LimitsConfig {
             storage_per_ip_rpm: 300,
             anonymous_per_ip_rpm: 10,
             admin_per_ip_rpm: 10,
+            oauth_begin_per_ip_rpm: 0,
             exact: false,
             sync_ms: 1000,
         }
@@ -85,12 +90,19 @@ impl LimitsConfig {
         // (the default), preserving today's behavior.
         let admin_per_ip_rpm = env_parsed("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM", 10u32)?;
 
+        // SEC-003: per-IP rate limit on `GET /auth/{provider}/begin`. 0 =
+        // disabled (the code default; the shipped `.env.example`/
+        // `docker-compose.yml` set a non-zero default so the mitigation is
+        // on out-of-the-box).
+        let oauth_begin_per_ip_rpm = env_parsed("RTDB_RATE_LIMIT_OAUTH_BEGIN_PER_IP_RPM", 0u32)?;
+
         Ok(Self {
             per_token_rpm,
             per_db_rpm,
             storage_per_ip_rpm,
             anonymous_per_ip_rpm,
             admin_per_ip_rpm,
+            oauth_begin_per_ip_rpm,
             exact,
             sync_ms,
         })

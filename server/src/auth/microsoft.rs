@@ -717,6 +717,7 @@ mod tests {
                 storage_per_ip_rpm: 0,
                 anonymous_per_ip_rpm: 0,
                 admin_per_ip_rpm: 0,
+                oauth_begin_per_ip_rpm: 0,
             },
             storage: crate::config::StorageConfig {
                 require_signed_urls: false,
