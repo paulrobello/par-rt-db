@@ -369,7 +369,7 @@ loss is `DROP TABLE` for tables absent from the target snapshot, and migrate dat
 | `DELETE /admin/backups/{name}` | Bearer admin key | Deletes a dump file. |
 | `POST /admin/restore` | Bearer admin key | Restores a dump into a fresh `rtdb_restored_<stamp>` Postgres DB via `pg_restore --no-owner --no-privileges`. Body `{ name, confirm }`, `confirm` = name. The live `rtdb` DB is never touched (single-writer invariant intact). |
 | `GET /admin/export-db?db=` | Bearer admin key | Snapshot export: schema line + one JSONL doc line per document. |
-| `POST /admin/import-db?db=` | Bearer admin key | Snapshot import: applies the schema line, replays each doc with original id/timestamp/version. |
+| `POST /admin/import-db?db=` | Bearer admin key | Snapshot import: applies the schema line, replays each doc with original id/timestamp/version. Requires an empty target — importing into a database that already holds documents is `409 CONFLICT` (clone-db and restore always target fresh databases). |
 | `POST /admin/merge-users` | Bearer admin key | Runs the anon→real account merge synchronously and returns the full report. Body `{ anonUserId, realUserId, confirm }`, `confirm` must equal `realUserId`; 404 when the anon row does not exist. Operator escape hatch (crash-window cleanup, manual consolidation) — the OAuth callback merges automatically on sign-in. |
 
 ### Auth (OAuth + sessions)
@@ -1276,13 +1276,14 @@ run.
 | 1. `env-drift-check` | Every `RTDB_*` var read by the server or documented in `.env.example` is forwarded to the container by `docker-compose.yml`'s `environment:` block. The block is an explicit allowlist, so a `.env`-only key silently does nothing. | `make env-drift-check` |
 | 2. `dockerfile-stub-check` | Every `[[test]]` declared by a non-server workspace member has a matching placeholder in the Dockerfile's dependency-caching layer. Without it `make deploy` fails at cargo's manifest parse — a break the rest of `checkall` cannot see. | `make dockerfile-stub-check` |
 | 3. `backup-persistence-check` | The rendered `docker-compose.yml` mounts a persistent volume at `/backups` for the server, so scheduled dumps survive a container restart. | `make backup-persistence-check` |
-| 4. `cli-docs-check` | `cli/README.md` matches what `gen-cli-docs` regenerates, so the CLI reference cannot drift from the CLI. | `make cli-docs-check` |
-| 5. `docs-api` | API docs regenerate cleanly for every SDK (`rust-client-doc`, `ts-client-doc`, `python-client-doc`, `swift-client-doc`), with warnings denied, so doc comments cannot rot. | `make docs-api` |
-| 6. `fmt-check` | Formatting across all nine packages. | `make fmt-check` |
-| 7. `lint` | Clippy under `-D warnings`, biome, ruff, `go vet`, swiftlint `--strict`. | `make lint` |
-| 8. `typecheck` | `tsc`, pyright, `go vet`, `swift build`. | `make typecheck` |
-| 9. `test` | The full suite across all nine packages, against the dev Postgres. | `make test` |
-| 10. `rust-client-check-features` | The rust-client library **and** its test targets compile under every meaningful feature combination, not just `--all-features`. | `make rust-client-check-features` |
+| 4. `hostname-leak-check` | Runs when a local, gitignored `.hostname-leak-patterns` file exists (skips silently in CI, where it doesn't): no tracked file may match the compiled hostname patterns, so a scrubbed hostname cannot quietly reappear in a doc or commit. | `make hostname-leak-check` |
+| 5. `cli-docs-check` | `cli/README.md` matches what `gen-cli-docs` regenerates, so the CLI reference cannot drift from the CLI. | `make cli-docs-check` |
+| 6. `docs-api` | API docs regenerate cleanly for every SDK (`rust-client-doc`, `ts-client-doc`, `python-client-doc`, `swift-client-doc`), with warnings denied, so doc comments cannot rot. | `make docs-api` |
+| 7. `fmt-check` | Formatting across all nine packages. | `make fmt-check` |
+| 8. `lint` | Clippy under `-D warnings`, biome, ruff, `go vet`, swiftlint `--strict`. | `make lint` |
+| 9. `typecheck` | `tsc`, pyright, `go vet`, `swift build`. | `make typecheck` |
+| 10. `test` | The full suite across all nine packages, against the dev Postgres. | `make test` |
+| 11. `rust-client-check-features` | The rust-client library **and** its test targets compile under every meaningful feature combination, not just `--all-features`. | `make rust-client-check-features` |
 
 Never `--no-verify` past the gate. If you do, fix the gate before anything
 else.
