@@ -959,14 +959,21 @@ async fn trgm_mode_explicit_tsquery_matches_default() {
 }
 
 // An unknown mode value fails Query deserialization (deny_unknown_fields +
-// enum) — a BadRequest at the transport boundary, never a silent fallback.
+// enum) — a BadRequest at the transport boundary (ApiJson maps the serde
+// rejection to RtDbError::bad_request), never a silent fallback. At this
+// layer there is no coded envelope yet, so assert the rejection is about the
+// mode value itself rather than any incidental parse failure.
 #[test]
 fn trgm_mode_invalid_value_is_rejected() {
     let parsed: Result<Query, _> = serde_json::from_value(serde_json::json!({
         "table": "notes",
         "search": {"index": "search_content", "query": "x", "mode": "fuzzy"}
     }));
-    assert!(parsed.is_err());
+    let err = parsed.expect_err("unknown search mode must fail deserialization");
+    assert!(
+        err.to_string().contains("fuzzy"),
+        "rejection must name the bad mode value: {err}"
+    );
 }
 
 async fn index_def(pool: &PgPool, schema_name: &str, index_name: &str) -> Option<String> {
