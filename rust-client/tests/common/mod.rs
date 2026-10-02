@@ -1,6 +1,7 @@
 //! Shared harness for opt-in live-server integration tests.
 //! Creates a uniquely-named `t<uuid>` database, pushes a tiny schema, and mints
 //! a machine token. Tests never touch a db they didn't create.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};

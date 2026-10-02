@@ -5,6 +5,7 @@
 //! field reads, string concat, arithmetic, coalesce, string casing, and a
 //! `Case`/`when` predicate branch.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use criterion::{Criterion, criterion_group, criterion_main};
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::query::FilterExpr;

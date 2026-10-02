@@ -31,6 +31,7 @@
 //! the `MigrateResult` compared like any op result; a follow-up `then` reads
 //! against the DERIVED schema.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};

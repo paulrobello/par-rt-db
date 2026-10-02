@@ -27,7 +27,7 @@ import type {
   QueryJson,
   TableJson,
 } from "../protocol.js";
-import { type QueryComboClause, QUERY_COMBO_RULES } from "./query-combinations.js";
+import { QUERY_COMBO_RULES, type QueryComboClause } from "./query-combinations.js";
 import type { StoredRow } from "./store.js";
 import {
   coerceIndexValue,
@@ -980,13 +980,27 @@ function executeDistinctTerminal(
 
 /** `aggregate` terminal: supports legacy single-op results and wire-v2
  * multi-op/composite-group results. */
-function executeAggregateTerminal(
+/** Shared validation + planning output for `executeAggregateTerminal`: the
+ * op/alias list, the resolved groupBy fields, and the aggregate field (null
+ * when every op is count — counts consume no field). */
+interface AggregatePlan {
+  ops: Array<[string, AggregateOp]>;
+  groupFields: string[];
+  legacy: boolean;
+  aggregateField: string | null;
+}
+
+/** Validates an AggregateSpec against the scan plan and resolves the ops
+ * list, groupBy fields, and aggregate field — all the BAD_REQUEST gates
+ * (mutual exclusion, alias charset, groupBy membership, numeric-field
+ * requirements) in one place so the shaping arms can assume a well-formed
+ * plan. Mirrors go-client's `planAggregate`. */
+function planAggregate(
   q: QueryJson,
   tableDef: TableJson,
   indexDef: IndexJson | null,
   eqLen: number,
-  filtered: StoredRow[],
-): unknown {
+): AggregatePlan {
   const isNumeric = (fieldName: string): boolean => {
     const ft = tableDef.fields[fieldName];
     // `number` and `int64` are the numeric indexable types; an optional
@@ -1005,20 +1019,20 @@ function executeAggregateTerminal(
   if (op !== undefined && aggregates !== undefined) {
     throw new RtDbError("BAD_REQUEST", "aggregate op and aggregates are mutually exclusive");
   }
-  const aggregateOps: Array<[string, AggregateOp]> = aggregates
+  const ops: Array<[string, AggregateOp]> = aggregates
     ? Object.entries(aggregates)
     : op
       ? [[op, op]]
       : [];
-  if (aggregateOps.length === 0) {
+  if (ops.length === 0) {
     throw new RtDbError("BAD_REQUEST", "aggregate requires op or aggregates");
   }
-  for (const [alias] of aggregateOps) {
+  for (const [alias] of ops) {
     if (!/^[A-Za-z0-9_]{1,64}$/.test(alias)) {
       throw new RtDbError("BAD_REQUEST", "aggregates alias may contain only [A-Za-z0-9_]");
     }
   }
-  const needsField = aggregateOps.some(([, aggregateOp]) => aggregateOp !== "count");
+  const needsField = ops.some(([, aggregateOp]) => aggregateOp !== "count");
   // `count` aggregates rows, not a field — it consumes no aggregate index
   const legacy = op !== undefined && aggregates === undefined && !Array.isArray(groupBy);
   const groupFields =
@@ -1029,21 +1043,31 @@ function executeAggregateTerminal(
       "aggregate groupBy requires an index field beyond the eq prefix",
     );
   }
+  const resolvedGroups: string[] = [];
+  for (const field of groupFields) {
+    if (field === undefined) {
+      throw new RtDbError(
+        "BAD_REQUEST",
+        "aggregate groupBy requires an index field beyond the eq prefix",
+      );
+    }
+    resolvedGroups.push(field);
+  }
   if (
-    groupFields.length > 0 &&
-    (!indexDef || groupFields.some((field) => !indexDef.fields.includes(field!)))
+    resolvedGroups.length > 0 &&
+    (!indexDef || resolvedGroups.some((field) => !indexDef.fields.includes(field)))
   ) {
     throw new RtDbError("BAD_REQUEST", "aggregate groupBy field is not a declared index field");
   }
-  let aggregateField: string | undefined;
+  let aggregateField: string | null = null;
   if (needsField) {
     if (!indexDef)
       throw new RtDbError("BAD_REQUEST", "aggregate requires an index field beyond the eq prefix");
-    aggregateField = indexDef.fields.slice(eqLen).find((field) => !groupFields.includes(field));
-    if (!aggregateField)
+    const found = indexDef.fields.slice(eqLen).find((field) => !resolvedGroups.includes(field));
+    if (!found)
       throw new RtDbError("BAD_REQUEST", "aggregate requires an index field beyond the eq prefix");
-    const aggregatePg = indexColumnType(tableDef.fields[aggregateField]).pg;
-    for (const [, aggregateOp] of aggregateOps) {
+    aggregateField = found;
+    for (const [, aggregateOp] of ops) {
       if ((aggregateOp === "sum" || aggregateOp === "avg") && !isNumeric(aggregateField)) {
         throw new RtDbError(
           "BAD_REQUEST",
@@ -1057,53 +1081,106 @@ function executeAggregateTerminal(
         "aggregate groupBy requires two index fields beyond the eq prefix",
       );
     }
-    void aggregatePg;
   }
+  return { ops, groupFields: resolvedGroups, legacy, aggregateField };
+}
+
+function executeAggregateTerminal(
+  q: QueryJson,
+  tableDef: TableJson,
+  indexDef: IndexJson | null,
+  eqLen: number,
+  filtered: StoredRow[],
+): unknown {
+  const plan = planAggregate(q, tableDef, indexDef, eqLen);
+  const aggregateField = plan.aggregateField;
   const valueFor = (row: StoredRow, aggregateOp: AggregateOp): unknown[] => {
-    if (aggregateOp === "count") return [row];
-    return [row.doc[aggregateField!]];
+    if (aggregateOp === "count" || aggregateField === null) return [row];
+    return [row.doc[aggregateField]];
   };
   const evaluate = (rows: StoredRow[], aggregateOp: AggregateOp): unknown => {
     const values = rows
       .flatMap((row) => valueFor(row, aggregateOp))
       .filter((value) => value !== null && value !== undefined);
-    return aggregateOp === "count"
-      ? rows.length
-      : values.length === 0
-        ? null
-        : applyAggregate(aggregateOp, values, indexColumnType(tableDef.fields[aggregateField!]).pg);
+    if (aggregateOp === "count") return rows.length;
+    if (values.length === 0 || aggregateField === null) return null;
+    return applyAggregate(aggregateOp, values, indexColumnType(tableDef.fields[aggregateField]).pg);
   };
-  if (groupFields.length > 0) {
-    const groups = new Map<string, { keys: unknown[]; rows: StoredRow[] }>();
-    for (const row of filtered) {
-      const keys = groupFields.map((field) => row.doc[field!] ?? null);
-      const key = JSON.stringify(keys);
-      const existing = groups.get(key);
-      if (existing) existing.rows.push(row);
-      else groups.set(key, { keys, rows: [row] });
-    }
-    const sorted = [...groups.values()]
-      .sort((a, b) => {
-        for (let i = 0; i < groupFields.length; i++) {
-          const pg = indexColumnType(tableDef.fields[groupFields[i]!]).pg;
-          const cmp = compareIndexValues(a.keys[i], b.keys[i], pg);
-          if (cmp !== 0) return cmp;
-        }
-        return 0;
-      })
-      .slice(0, MAX_TAKE);
-    if (legacy && groupBy === true)
-      return sorted.map(({ keys, rows }) => ({ key: keys[0], value: evaluate(rows, op!) }));
-    return sorted.map(({ keys, rows }) => ({
-      keys,
-      values: Object.fromEntries(
-        aggregateOps.map(([alias, aggregateOp]) => [alias, evaluate(rows, aggregateOp)]),
-      ),
-    }));
+  if (plan.groupFields.length > 0) {
+    return aggregateGrouped(plan, tableDef, filtered, evaluate);
   }
-  if (legacy) return evaluate(filtered, op!);
+  return aggregateScalar(plan, filtered, evaluate);
+}
+
+/** Shapes the grouped result: one row per group sorted by key ascending
+ * (legacy boolean groupBy emits `{key, value}`; wire-v2 emits `{keys,
+ * values}`), capped by MAX_TAKE. */
+function aggregateGrouped(
+  plan: AggregatePlan,
+  tableDef: TableJson,
+  filtered: StoredRow[],
+  evaluate: (rows: StoredRow[], op: AggregateOp) => unknown,
+): unknown {
+  const sorted = groupRows(plan.groupFields, tableDef, filtered);
+  if (plan.legacy) {
+    const legacyOp = plan.ops[0]?.[1];
+    if (legacyOp === undefined) {
+      throw new RtDbError("BAD_REQUEST", "aggregate requires op or aggregates");
+    }
+    return sorted.map(({ keys, rows }) => ({ key: keys[0], value: evaluate(rows, legacyOp) }));
+  }
+  return sorted.map(({ keys, rows }) => ({
+    keys,
+    values: Object.fromEntries(
+      plan.ops.map(([alias, aggregateOp]) => [alias, evaluate(rows, aggregateOp)]),
+    ),
+  }));
+}
+
+/** Groups `filtered` rows by the resolved groupBy fields (rows missing a
+ * field form the SQL NULL group), sorts groups by key ascending per
+ * `compareIndexValues`, and caps the group count at MAX_TAKE. */
+function groupRows(
+  groupFields: string[],
+  tableDef: TableJson,
+  filtered: StoredRow[],
+): Array<{ keys: unknown[]; rows: StoredRow[] }> {
+  const groups = new Map<string, { keys: unknown[]; rows: StoredRow[] }>();
+  for (const row of filtered) {
+    const keys = groupFields.map((field) => row.doc[field] ?? null);
+    const key = JSON.stringify(keys);
+    const existing = groups.get(key);
+    if (existing) existing.rows.push(row);
+    else groups.set(key, { keys, rows: [row] });
+  }
+  return [...groups.values()]
+    .sort((a, b) => {
+      for (let i = 0; i < groupFields.length; i++) {
+        const pg = indexColumnType(tableDef.fields[groupFields[i]]).pg;
+        const cmp = compareIndexValues(a.keys[i], b.keys[i], pg);
+        if (cmp !== 0) return cmp;
+      }
+      return 0;
+    })
+    .slice(0, MAX_TAKE);
+}
+
+/** Shapes the ungrouped result: the bare evaluated value (legacy) or one
+ * `{alias: value}` entry per op (wire-v2). */
+function aggregateScalar(
+  plan: AggregatePlan,
+  filtered: StoredRow[],
+  evaluate: (rows: StoredRow[], op: AggregateOp) => unknown,
+): unknown {
+  if (plan.legacy) {
+    const legacyOp = plan.ops[0]?.[1];
+    if (legacyOp === undefined) {
+      throw new RtDbError("BAD_REQUEST", "aggregate requires op or aggregates");
+    }
+    return evaluate(filtered, legacyOp);
+  }
   return Object.fromEntries(
-    aggregateOps.map(([alias, aggregateOp]) => [alias, evaluate(filtered, aggregateOp)]),
+    plan.ops.map(([alias, aggregateOp]) => [alias, evaluate(filtered, aggregateOp)]),
   );
 }
 

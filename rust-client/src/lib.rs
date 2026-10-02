@@ -41,6 +41,7 @@
 //! storage), and the design spec
 //! (`docs/superpowers/specs/2026-07-22-rust-client-design.md`).
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #![warn(missing_docs)]
 
 pub mod cursor;

@@ -15,11 +15,8 @@ ws = ["dep:tokio", "dep:tokio-tungstenite"]
 admin = ["http"]
 in_memory = ["dep:sha2"]
 
-[lints.rust]
-warnings = "deny"
-
-[lints.clippy]
-all = { level = "warn", priority = -1 }
+[lints]
+workspace = true
 
 [dependencies]
 par-rt-db-core.workspace = true

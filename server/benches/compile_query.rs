@@ -5,6 +5,7 @@
 //! order, search, vector search, and hybrid search — the shapes the read path
 //! sees in practice.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use criterion::{Criterion, criterion_group, criterion_main};
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::query::{FilterExpr, Query, compile_query};

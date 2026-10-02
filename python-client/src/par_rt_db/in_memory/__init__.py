@@ -170,6 +170,8 @@ from .query import (
 from .query import (
     _websearch_unit_in as _websearch_unit_in,
 )
+from .schedule import _ScheduleEngine
+from .storage import _StorageEngine
 from .store import (
     _BOOLEAN as _BOOLEAN,
 )
@@ -396,9 +398,19 @@ from .validate import (
 from .validate import (
     _validate_filter as _validate_filter,
 )
+from .workflow import _WorkflowEngine
+from .writes import _WritesEngine
 
 
-class InMemoryRtDbClient(_QueryEngine, _MigrateEngine, _InMemoryStoreCore):
+class InMemoryRtDbClient(
+    _QueryEngine,
+    _MigrateEngine,
+    _WritesEngine,
+    _ScheduleEngine,
+    _WorkflowEngine,
+    _StorageEngine,
+    _InMemoryStoreCore,
+):
     """In-memory par-rt-db client for unit tests.
 
     Construct with :class:`InMemoryRtDbClientOptions` (defaults: system clock,

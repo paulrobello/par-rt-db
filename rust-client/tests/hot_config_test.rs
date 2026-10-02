@@ -1,5 +1,6 @@
 //! Wire round-trip for the ENH-011 quota fields + the QUOTA_EXCEEDED error code.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use par_rt_db_client::{ErrorCode, HotConfig, HotConfigPatch};
 use serde_json::json;
 

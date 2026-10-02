@@ -3,6 +3,7 @@
 //! answers with an app-level `{type:"pong"}` TEXT frame — neither side sends
 //! protocol-level pings, so before the fix `Liveness::last_pong` never
 //! refreshed and every session was force-reconnected at exactly `2 × heartbeat`.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 #![cfg(feature = "ws")]
 
 use std::sync::Arc;

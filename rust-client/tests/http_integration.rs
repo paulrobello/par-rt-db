@@ -4,6 +4,7 @@
 //!   RTDB_TEST_ADMIN_KEY=dev-admin-key \
 //!   cargo test --test http_integration -- --ignored
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 #![cfg(feature = "http")]
 
 mod common;

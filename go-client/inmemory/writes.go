@@ -224,147 +224,195 @@ func diffCanonical(result wire.JSONValue, q *wire.Query) string {
 func executeStep(s *Store, step wire.Step) (wire.StepResult, []string, error) {
 	switch t := step.(type) {
 	case wire.StepInsert:
-		tableDef, err := requireTable(s, t.Table)
-		if err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		doc, err := wireObject(t.Doc)
-		if err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		id, err := doInsert(s, t.Table, tableDef, doc)
-		if err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		return wire.StepResult{ID: &id}, []string{t.Table}, nil
+		return stepInsert(s, t)
 	case wire.StepPatch:
-		tableDef, err := requireTable(s, t.Table)
-		if err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		fields, err := wireObject(t.Fields)
-		if err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		if err := doPatch(s, tableDef, t.Table, t.ID, fields); err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		return wire.StepResult{}, []string{t.Table}, nil
+		return stepPatch(s, t)
 	case wire.StepAdjustCounter:
 		return executeAdjustCounter(s, t)
 	case wire.StepReplace:
-		tableDef, err := requireTable(s, t.Table)
-		if err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		doc, err := wireObject(t.Doc)
-		if err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		if err := doReplace(s, tableDef, t.Table, t.ID, doc); err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		return wire.StepResult{}, []string{t.Table}, nil
+		return stepReplace(s, t)
 	case wire.StepDelete:
-		tableDef, err := requireTable(s, t.Table)
-		if err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		var touched []string
-		if tableDef.SoftDelete {
-			if err := doSoftDelete(s, t.Table, t.ID); err != nil {
-				return wire.StepResult{}, nil, err
-			}
-			touched = append(touched, t.Table)
-		} else {
-			visited := map[rowKey]bool{}
-			cascadeRows := 0
-			if err := deleteRowCascade(s, t.Table, t.ID, visited, &cascadeRows, false, &touched); err != nil {
-				return wire.StepResult{}, nil, err
-			}
-		}
-		return wire.StepResult{}, touched, nil
+		return stepDelete(s, t)
 	case wire.StepUndelete:
-		tableDef, err := requireTable(s, t.Table)
-		if err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		if err := doUndelete(s, tableDef, t.Table, t.ID); err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		return wire.StepResult{}, []string{t.Table}, nil
+		return stepUndelete(s, t)
 	case wire.StepExpectVersion:
-		if _, err := requireTable(s, t.Table); err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		if err := doExpectVersion(s, t.Table, t.ID, t.Version); err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		return wire.StepResult{}, nil, nil
+		return stepExpectVersion(s, t)
 	case wire.StepExpectAbsent:
-		tableDef, err := requireTable(s, t.Table)
-		if err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		rows, err := eqLookup(s, tableDef, t.Table, t.Index, t.Eq)
-		if err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		if len(rows) > 0 {
-			return wire.StepResult{}, nil, rtdberrors.New(rtdberrors.CodePreconditionFailed,
-				"index '"+t.Index+"' already has a matching document")
-		}
-		return wire.StepResult{}, nil, nil
+		return stepExpectAbsent(s, t)
 	case wire.StepUpsert:
 		return executeUpsert(s, t)
 	case wire.StepPatchByQuery:
-		tableDef, err := requireTable(s, t.Table)
-		if err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		if t.Limit != nil && *t.Limit < 0 {
-			return wire.StepResult{}, nil, rtdberrors.New(rtdberrors.CodeBadRequest,
-				"limit must be >= 0")
-		}
-		patch, err := wireObject(t.Patch)
-		if err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		patched, truncated, err := patchByQuery(s, tableDef, t.Table, t.Filter, patch, t.Limit)
-		if err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		return wire.StepResult{Patched: i64Ptr(int64(patched)), Truncated: boolPtr(truncated)}, []string{t.Table}, nil
+		return stepPatchByQuery(s, t)
 	case wire.StepDeleteByQuery:
-		tableDef, err := requireTable(s, t.Table)
-		if err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		if t.Limit != nil && *t.Limit < 0 {
-			return wire.StepResult{}, nil, rtdberrors.New(rtdberrors.CodeBadRequest,
-				"limit must be >= 0")
-		}
-		deleted, truncated, touched, err := deleteByQuery(s, tableDef, t.Table, t.Filter, t.Limit)
-		if err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		return wire.StepResult{Deleted: i64Ptr(int64(deleted)), Truncated: boolPtr(truncated)}, touched, nil
+		return stepDeleteByQuery(s, t)
 	case wire.StepSchedule:
-		id, err := scheduleJob(s, t.Txn, t.When, t.External != nil && *t.External)
-		if err != nil {
-			return wire.StepResult{}, nil, err
-		}
-		return wire.StepResult{ScheduleID: &id}, nil, nil
+		return stepSchedule(s, t)
 	case wire.StepCancelSchedule:
-		cancelled := cancelScheduleLocked(s, t.ID) == nil
-		return wire.StepResult{Cancelled: boolPtr(cancelled)}, nil, nil
+		return stepCancelSchedule(s, t)
 	case wire.StepStartWorkflow, wire.StepCancelWorkflow:
-		// FM-29: the workflow engine is server-pinned and not modeled here.
-		return wire.StepResult{}, nil, rtdberrors.New(rtdberrors.CodeInternal,
-			"workflow steps are not supported by the in-memory harness")
+		return stepWorkflow()
 	default:
 		return wire.StepResult{}, nil, rtdberrors.New(rtdberrors.CodeInternal, "unknown step kind")
 	}
+}
+
+func stepInsert(s *Store, t wire.StepInsert) (wire.StepResult, []string, error) {
+	tableDef, err := requireTable(s, t.Table)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	doc, err := wireObject(t.Doc)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	id, err := doInsert(s, t.Table, tableDef, doc)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	return wire.StepResult{ID: &id}, []string{t.Table}, nil
+}
+
+func stepPatch(s *Store, t wire.StepPatch) (wire.StepResult, []string, error) {
+	tableDef, err := requireTable(s, t.Table)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	fields, err := wireObject(t.Fields)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	if err := doPatch(s, tableDef, t.Table, t.ID, fields); err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	return wire.StepResult{}, []string{t.Table}, nil
+}
+
+func stepReplace(s *Store, t wire.StepReplace) (wire.StepResult, []string, error) {
+	tableDef, err := requireTable(s, t.Table)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	doc, err := wireObject(t.Doc)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	if err := doReplace(s, tableDef, t.Table, t.ID, doc); err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	return wire.StepResult{}, []string{t.Table}, nil
+}
+
+func stepDelete(s *Store, t wire.StepDelete) (wire.StepResult, []string, error) {
+	tableDef, err := requireTable(s, t.Table)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	var touched []string
+	if tableDef.SoftDelete {
+		if err := doSoftDelete(s, t.Table, t.ID); err != nil {
+			return wire.StepResult{}, nil, err
+		}
+		touched = append(touched, t.Table)
+	} else {
+		visited := map[rowKey]bool{}
+		cascadeRows := 0
+		if err := deleteRowCascade(s, t.Table, t.ID, visited, &cascadeRows, false, &touched); err != nil {
+			return wire.StepResult{}, nil, err
+		}
+	}
+	return wire.StepResult{}, touched, nil
+}
+
+func stepUndelete(s *Store, t wire.StepUndelete) (wire.StepResult, []string, error) {
+	tableDef, err := requireTable(s, t.Table)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	if err := doUndelete(s, tableDef, t.Table, t.ID); err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	return wire.StepResult{}, []string{t.Table}, nil
+}
+
+func stepExpectVersion(s *Store, t wire.StepExpectVersion) (wire.StepResult, []string, error) {
+	if _, err := requireTable(s, t.Table); err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	if err := doExpectVersion(s, t.Table, t.ID, t.Version); err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	return wire.StepResult{}, nil, nil
+}
+
+func stepExpectAbsent(s *Store, t wire.StepExpectAbsent) (wire.StepResult, []string, error) {
+	tableDef, err := requireTable(s, t.Table)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	rows, err := eqLookup(s, tableDef, t.Table, t.Index, t.Eq)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	if len(rows) > 0 {
+		return wire.StepResult{}, nil, rtdberrors.New(rtdberrors.CodePreconditionFailed,
+			"index '"+t.Index+"' already has a matching document")
+	}
+	return wire.StepResult{}, nil, nil
+}
+
+func stepPatchByQuery(s *Store, t wire.StepPatchByQuery) (wire.StepResult, []string, error) {
+	tableDef, err := requireTable(s, t.Table)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	if t.Limit != nil && *t.Limit < 0 {
+		return wire.StepResult{}, nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+			"limit must be >= 0")
+	}
+	patch, err := wireObject(t.Patch)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	patched, truncated, err := patchByQuery(s, tableDef, t.Table, t.Filter, patch, t.Limit)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	return wire.StepResult{Patched: i64Ptr(int64(patched)), Truncated: boolPtr(truncated)}, []string{t.Table}, nil
+}
+
+func stepDeleteByQuery(s *Store, t wire.StepDeleteByQuery) (wire.StepResult, []string, error) {
+	tableDef, err := requireTable(s, t.Table)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	if t.Limit != nil && *t.Limit < 0 {
+		return wire.StepResult{}, nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+			"limit must be >= 0")
+	}
+	deleted, truncated, touched, err := deleteByQuery(s, tableDef, t.Table, t.Filter, t.Limit)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	return wire.StepResult{Deleted: i64Ptr(int64(deleted)), Truncated: boolPtr(truncated)}, touched, nil
+}
+
+func stepSchedule(s *Store, t wire.StepSchedule) (wire.StepResult, []string, error) {
+	id, err := scheduleJob(s, t.Txn, t.When, t.External != nil && *t.External)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	return wire.StepResult{ScheduleID: &id}, nil, nil
+}
+
+func stepCancelSchedule(s *Store, t wire.StepCancelSchedule) (wire.StepResult, []string, error) {
+	cancelled := cancelScheduleLocked(s, t.ID) == nil
+	return wire.StepResult{Cancelled: boolPtr(cancelled)}, nil, nil
+}
+
+// stepWorkflow: FM-29 — the workflow engine is server-pinned and not modeled here.
+func stepWorkflow() (wire.StepResult, []string, error) {
+	return wire.StepResult{}, nil, rtdberrors.New(rtdberrors.CodeInternal,
+		"workflow steps are not supported by the in-memory harness")
 }
 
 // wireObject narrows a JSONValue to an object, BAD_REQUEST otherwise.

@@ -16,6 +16,7 @@
 //! A case that should Reject but Accepts (or vice versa) is a REAL cascade gap
 //! in the rust in-memory engine — it is fixed in `src/in_memory.rs`, not weakened here.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use par_rt_db_client::error::{ErrorCode, RtDbError};
 use par_rt_db_client::in_memory::{InMemoryRtDbClient, InMemoryRtDbClientOptions};
 use par_rt_db_client::query::Query;

@@ -76,6 +76,10 @@ struct Rule {
 }
 
 static RULES: LazyLock<RuleTable> = LazyLock::new(|| {
+    // RULES_JSON is embedded at compile time from the wire-corpus fixture, so
+    // a parse failure is a repo build bug (malformed fixture), not a runtime
+    // condition a caller could recover from — panicking here is the contract.
+    #[allow(clippy::expect_used)]
     let table: RuleTable = serde_json::from_str(RULES_JSON)
         .expect("wire-corpus/query-combinations.json must parse as a RuleTable");
     for rule in &table.rules {

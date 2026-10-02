@@ -9,6 +9,7 @@
 //! `src/schema.rs`. Ports the TS client's defaults behavior
 //! (`ts-client/src/in_memory.ts`).
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 #![cfg(feature = "in_memory")]
 
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -556,7 +556,25 @@ func isAggAliasChar(c byte) bool {
 // (in_memory/query.ts): one code path handles the legacy single-`op` scalar/
 // grouped shapes and the wire-v2 `aggregates` map / composite `groupBy`
 // shapes, dispatching only at the final result-shape choice.
-func executeAggregateTerminal(agg *wire.AggregateSpec, table *TableDef, plan *scanPlan, filtered []*StoredRow) (wire.JSONValue, error) {
+// aggregatePlan is the validated, normalized form of an AggregateSpec that
+// executeAggregateTerminal's shaping arms consume: the op/alias list, the
+// resolved groupBy fields, and the aggregate field ("" when every op is
+// count — counts consume no field).
+type aggregatePlan struct {
+	ops         []aggregateOpAlias
+	groupFields []string
+	groupPgs    []PgType
+	legacy      bool
+	aggField    string
+	aggFieldPg  PgType
+}
+
+// planAggregate validates an AggregateSpec against the scan plan and resolves
+// the ops/alias list, groupBy fields, and the aggregate field. All the
+// BAD_REQUEST validation (mutual exclusion, alias charset, groupBy
+// membership, numeric-field requirements) happens here so the shaping arms
+// below can assume a well-formed plan.
+func planAggregate(agg *wire.AggregateSpec, table *TableDef, plan *scanPlan) (*aggregatePlan, error) {
 	eqLen := len(plan.typedEq)
 	// A caller-constructed AggregateSpec (not decoded from JSON) may leave
 	// GroupBy nil; normalize to the legacy default the wire form always
@@ -686,6 +704,29 @@ func executeAggregateTerminal(agg *wire.AggregateSpec, table *TableDef, plan *sc
 	if aggField != "" {
 		aggFieldPg = plan.fieldPg(table, aggField)
 	}
+	groupPgs := make([]PgType, len(groupFields))
+	for i, f := range groupFields {
+		groupPgs[i] = plan.fieldPg(table, f)
+	}
+	return &aggregatePlan{
+		ops:         ops,
+		groupFields: groupFields,
+		groupPgs:    groupPgs,
+		legacy:      legacy,
+		aggField:    aggField,
+		aggFieldPg:  aggFieldPg,
+	}, nil
+}
+
+// executeAggregateTerminal ports ts-client's unified `executeAggregateTerminal`
+// (in_memory/query.ts): one code path handles the legacy single-`op` scalar/
+// grouped shapes and the wire-v2 `aggregates` map / composite `groupBy`
+// shapes, dispatching only at the final result-shape choice.
+func executeAggregateTerminal(agg *wire.AggregateSpec, table *TableDef, plan *scanPlan, filtered []*StoredRow) (wire.JSONValue, error) {
+	ap, err := planAggregate(agg, table, plan)
+	if err != nil {
+		return nil, err
+	}
 
 	evaluate := func(rows []*StoredRow, op wire.AggregateOp) wire.JSONValue {
 		if op == wire.AggCount {
@@ -693,85 +734,94 @@ func executeAggregateTerminal(agg *wire.AggregateSpec, table *TableDef, plan *sc
 		}
 		var values wire.Array
 		for _, row := range rows {
-			if v, present := row.Doc[aggField]; present && !isNullValue(v) {
+			if v, present := row.Doc[ap.aggField]; present && !isNullValue(v) {
 				values = append(values, v)
 			}
 		}
 		if len(values) == 0 {
 			return wire.Null{}
 		}
-		return applyAggregate(op, values, aggFieldPg)
+		return applyAggregate(op, values, ap.aggFieldPg)
 	}
 
-	if len(groupFields) > 0 {
-		groupPgs := make([]PgType, len(groupFields))
-		for i, f := range groupFields {
-			groupPgs[i] = plan.fieldPg(table, f)
-		}
-		type groupEntry struct {
-			keys []wire.JSONValue
-			rows []*StoredRow
-		}
-		var groups []groupEntry
-		groupIndex := map[string]int{}
-		for _, row := range filtered {
-			keys := make([]wire.JSONValue, len(groupFields))
-			var keyParts []byte
-			for i, f := range groupFields {
-				v, present := row.Doc[f]
-				if !present {
-					v = wire.Null{}
-				}
-				keys[i] = v
-				keyParts = append(keyParts, canonical(v)...)
-				keyParts = append(keyParts, 0x1f)
+	if len(ap.groupFields) > 0 {
+		return aggregateGrouped(ap, filtered, evaluate), nil
+	}
+	return aggregateScalar(ap, filtered, evaluate), nil
+}
+
+// aggregateGrouped shapes the grouped result: one row per group, sorted by
+// key ascending (legacy emits {key, value}; wire-v2 emits {keys, values}),
+// capped by maxTake.
+func aggregateGrouped(ap *aggregatePlan, filtered []*StoredRow, evaluate func([]*StoredRow, wire.AggregateOp) wire.JSONValue) wire.JSONValue {
+	type groupEntry struct {
+		keys []wire.JSONValue
+		rows []*StoredRow
+	}
+	var groups []groupEntry
+	groupIndex := map[string]int{}
+	for _, row := range filtered {
+		keys := make([]wire.JSONValue, len(ap.groupFields))
+		var keyParts []byte
+		for i, f := range ap.groupFields {
+			v, present := row.Doc[f]
+			if !present {
+				v = wire.Null{}
 			}
-			key := string(keyParts)
-			i, seen := groupIndex[key]
-			if !seen {
-				i = len(groups)
-				groupIndex[key] = i
-				groups = append(groups, groupEntry{keys: keys})
-			}
-			groups[i].rows = append(groups[i].rows, row)
+			keys[i] = v
+			keyParts = append(keyParts, canonical(v)...)
+			keyParts = append(keyParts, 0x1f)
 		}
-		sort.SliceStable(groups, func(a, b int) bool {
-			for i := range groupFields {
-				c := compareIndexValues(groups[a].keys[i], groups[b].keys[i], groupPgs[i])
-				if c != cmpEqual {
-					return c == cmpLess
-				}
-			}
-			return false
-		})
-		if len(groups) > maxTake {
-			groups = groups[:maxTake]
+		key := string(keyParts)
+		i, seen := groupIndex[key]
+		if !seen {
+			i = len(groups)
+			groupIndex[key] = i
+			groups = append(groups, groupEntry{keys: keys})
 		}
-		if legacy {
-			out := make(wire.Array, 0, len(groups))
-			for _, g := range groups {
-				out = append(out, wire.Object{"key": g.keys[0], "value": evaluate(g.rows, ops[0].op)})
+		groups[i].rows = append(groups[i].rows, row)
+	}
+	sort.SliceStable(groups, func(a, b int) bool {
+		for i := range ap.groupFields {
+			c := compareIndexValues(groups[a].keys[i], groups[b].keys[i], ap.groupPgs[i])
+			if c != cmpEqual {
+				return c == cmpLess
 			}
-			return out, nil
 		}
+		return false
+	})
+	if len(groups) > maxTake {
+		groups = groups[:maxTake]
+	}
+	if ap.legacy {
 		out := make(wire.Array, 0, len(groups))
 		for _, g := range groups {
-			values := wire.Object{}
-			for _, o := range ops {
-				values[o.alias] = evaluate(g.rows, o.op)
-			}
-			out = append(out, wire.Object{"keys": wire.Array(g.keys), "values": values})
+			out = append(out, wire.Object{"key": g.keys[0], "value": evaluate(g.rows, ap.ops[0].op)})
 		}
-		return out, nil
+		return out
 	}
-	if legacy {
-		return evaluate(filtered, ops[0].op), nil
+	out := make(wire.Array, 0, len(groups))
+	for _, g := range groups {
+		values := wire.Object{}
+		for _, o := range ap.ops {
+			values[o.alias] = evaluate(g.rows, o.op)
+		}
+		out = append(out, wire.Object{"keys": wire.Array(g.keys), "values": values})
+	}
+	return out
+}
+
+// aggregateScalar shapes the ungrouped result: a single evaluated object
+// (legacy: the bare value; wire-v2: one {alias: value} entry per op).
+func aggregateScalar(ap *aggregatePlan, filtered []*StoredRow, evaluate func([]*StoredRow, wire.AggregateOp) wire.JSONValue) wire.JSONValue {
+	if ap.legacy {
+		return evaluate(filtered, ap.ops[0].op)
 	}
 	out := wire.Object{}
-	for _, o := range ops {
+	for _, o := range ap.ops {
 		out[o.alias] = evaluate(filtered, o.op)
 	}
-	return out, nil
+	return out
 }
 
 // applyAggregate applies one aggregate op over a non-empty value set:

@@ -4,6 +4,7 @@
 //! engine) over a 10k-row table. No network, no server — the engine is the
 //! client-side optimistic path every live client mirrors.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 #![cfg(feature = "in_memory")]
 
 use criterion::{Criterion, criterion_group, criterion_main};
