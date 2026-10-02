@@ -103,6 +103,10 @@ pub(in crate::committer) async fn handle_migrate(
     crate::change_log::append(&mut tx, &schema_name, &write_set).await?;
     tx.commit().await?;
     ctx.schemas.put(&ctx.db, derived.clone()).await;
+    // ARC-004: cross-replica schema-cache invalidation (same as push/restore).
+    if ctx.multi_instance {
+        crate::notify::publish_schema_changed(&ctx.read_pool, &ctx.instance_id, &ctx.db).await;
+    }
 
     // Schema history capture — best-effort, like the audit/webhook taps below.
     // `derived` is the post-migration schema; principal is None (migrate carries

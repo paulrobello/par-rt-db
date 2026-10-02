@@ -723,3 +723,129 @@ async fn lease_backend_termination_demotes_owner() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_millis(50)).await;
     Ok(())
 }
+
+/// (ARC-004) SchemaCache coherence across replicas. Push v1 via A (the
+/// cluster bootstrap), warm B's cache with a forwarded write, push v2 adding
+/// table `t2` via A, then within a short window a write against `t2` on B
+/// must succeed: the schema NOTIFY invalidates B's cached entry and the next
+/// read reloads from Postgres.
+#[tokio::test]
+async fn schema_push_invalidates_peer_cache() -> anyhow::Result<()> {
+    fn schema_with(tables: serde_json::Value) -> rtdb_server::schema::SchemaDef {
+        serde_json::from_value(serde_json::json!({ "tables": tables })).expect("valid schema")
+    }
+    let items_table = serde_json::json!({
+        "fields": { "title": { "type": "string" } },
+        "indexes": [{ "name": "by_title", "fields": ["title"] }]
+    });
+
+    let cluster = Cluster::two(schema_with(serde_json::json!({ "items": items_table }))).await;
+    let a = cluster.replica(ReplicaId::A).state.clone();
+    let b = cluster.replica(ReplicaId::B).state.clone();
+    let pool = b.pool.clone();
+    let db = cluster.db.as_str().to_string();
+
+    // Warm B's cache with v1 (its forwarded write goes through A, and B's own
+    // schema reads on the forward path populate the cache).
+    mutate_until_landed(&b, &db, insert_item("warm-cache"), PrincipalCtx::bypass()).await?;
+
+    // Push v2 adding `t2` via A (the owner).
+    let v2 = schema_with(serde_json::json!({
+        "items": items_table,
+        "t2": {
+            "fields": { "name": { "type": "string" } },
+            "indexes": [{ "name": "by_name", "fields": ["name"] }]
+        }
+    }));
+    let _applied = a.realtime.committers.push_schema(&db, v2).await?;
+
+    // Within 2s, a write against `t2` on B must succeed: B's stale cache
+    // would answer NotFound until the NOTIFY-driven invalidation lands.
+    let insert_t2 = || Transaction {
+        steps: vec![Step::Insert {
+            table: "t2".to_string(),
+            doc: serde_json::json!({ "name": "peer" })
+                .as_object()
+                .expect("object")
+                .clone(),
+        }],
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let landed = loop {
+        match b
+            .realtime
+            .committers
+            .mutate(&db, None, insert_t2(), PrincipalCtx::bypass())
+            .await
+        {
+            Ok(_) => break true,
+            Err(err) if err.code == ErrorCode::NotFound => {
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    };
+    assert!(
+        landed,
+        "B must see the pushed table t2 within 2s (cache invalidated)"
+    );
+
+    // Forwarded case: push v3 adding `t3` via the SHADOW B; the owner A
+    // executes and replies; B's origin-side cache refresh must make B's very
+    // next write against `t3` succeed without waiting for its own NOTIFY
+    // round trip.
+    let v3 = schema_with(serde_json::json!({
+        "items": { "fields": { "title": { "type": "string" } },
+                   "indexes": [{ "name": "by_title", "fields": ["title"] }] },
+        "t2": { "fields": { "name": { "type": "string" } },
+                "indexes": [{ "name": "by_name", "fields": ["name"] }] },
+        "t3": { "fields": { "name": { "type": "string" } },
+                "indexes": [{ "name": "by_name", "fields": ["name"] }] }
+    }));
+    let deadline = std::time::Instant::now() + RETRY_DEADLINE;
+    loop {
+        match b.realtime.committers.push_schema(&db, v3.clone()).await {
+            Ok(_) => break,
+            Err(err) if err.code == ErrorCode::Conflict => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "forwarded push kept conflicting: {err}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    b.realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            Transaction {
+                steps: vec![Step::Insert {
+                    table: "t3".to_string(),
+                    doc: serde_json::json!({ "name": "origin-refresh" })
+                        .as_object()
+                        .expect("object")
+                        .clone(),
+                }],
+            },
+            PrincipalCtx::bypass(),
+        )
+        .await
+        .expect("B must see t3 immediately after its own forwarded push");
+
+    // Sanity: both tables actually exist in Postgres.
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM information_schema.tables \
+         WHERE table_schema = $1 AND table_name IN ('t_t2','t_t3')",
+    )
+    .bind(format!("db_{db}"))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(n, 2, "t2 and t3 exist in Postgres");
+    Ok(())
+}

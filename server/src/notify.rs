@@ -86,6 +86,13 @@ pub const PRESENCE_CHANNEL: &str = "rtdb_presence";
 /// See [`publish_write_set`] and [`run_write_set_listener`].
 pub const WRITE_SET_CHANNEL: &str = "rtdb_write_sets";
 
+/// Postgres NOTIFY channel for cross-replica schema-cache invalidation
+/// (ARC-004). After a replica pushes/migrates/restores a schema, it publishes
+/// `{"i": instance_id, "db": db}` here so every OTHER replica invalidates its
+/// in-memory [`crate::db::SchemaCache`] entry; the next read reloads from
+/// Postgres. Server-internal payload — not part of the wire protocol.
+pub const SCHEMA_CHANNEL: &str = "rtdb_schema";
+
 /// Serialized-size threshold above which a write set travels through the
 /// forward spool instead of inline in the NOTIFY. Postgres caps a `pg_notify`
 /// payload at 8000 bytes; 7500 leaves headroom for multi-byte escaping in the
@@ -299,6 +306,94 @@ pub async fn publish_write_set(pool: &PgPool, instance_id: &str, db: &str, write
             error = %e,
             "notify: write-set pg_notify failed (best-effort; write already committed)"
         );
+    }
+}
+
+/// Publish a schema-changed notification (ARC-004), best-effort. Called after a
+/// successful `schemas.put` on push, restore, and migrate arms (multi-instance
+/// only). Receivers self-dedupe by `instance_id` — the publisher already put
+/// the fresh schema into its own cache.
+pub async fn publish_schema_changed(pool: &PgPool, instance_id: &str, db: &str) {
+    let payload = serde_json::json!({ "i": instance_id, "db": db }).to_string();
+    if let Err(e) = sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(SCHEMA_CHANNEL)
+        .bind(&payload)
+        .execute(pool)
+        .await
+    {
+        tracing::warn!(
+            db = %db,
+            error = %e,
+            "notify: schema-changed pg_notify failed (best-effort)"
+        );
+    }
+}
+
+/// Long-lived LISTEN loop for the `rtdb_schema` channel (ARC-004). Spawned by
+/// `AppState::new` only when `RTDB_MULTI_INSTANCE` is true. On a notification
+/// from ANOTHER instance it invalidates THIS replica's in-memory schema cache
+/// entry for that database; the next `schemas.get` reloads from Postgres.
+/// Performs NO write and NO committer interaction.
+pub async fn run_schema_listener(
+    pool: PgPool,
+    schemas: crate::db::SchemaCache,
+    own_instance_id: String,
+) {
+    let backoff = std::time::Duration::from_secs(2);
+    loop {
+        let mut listener = match PgListener::connect_with(&pool).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "schema listener: connect_with failed; retrying in {:?}",
+                    backoff
+                );
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+        };
+        if let Err(e) = listener.listen_all([SCHEMA_CHANNEL]).await {
+            tracing::error!(
+                error = %e,
+                "schema listener: listen_all failed; retrying in {:?}",
+                backoff
+            );
+            tokio::time::sleep(backoff).await;
+            continue;
+        }
+        tracing::info!(
+            "schema listener: LISTENing on '{}' for cross-replica schema invalidation (instance_id={})",
+            SCHEMA_CHANNEL,
+            own_instance_id
+        );
+        loop {
+            let notif = match listener.recv().await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "schema listener: recv failed; reconnecting in {:?}",
+                        backoff
+                    );
+                    break;
+                }
+            };
+            let payload: Result<(String, String), _> = serde_json::from_str(notif.payload());
+            let (instance_id, db) = match payload {
+                Ok((i, db)) => (i, db),
+                Err(e) => {
+                    tracing::warn!(error = %e, "schema listener: failed to decode payload");
+                    continue;
+                }
+            };
+            // Self-dedupe: the publisher already put the fresh schema in its
+            // own cache; invalidating here would just force a wasteful reload.
+            if instance_id == own_instance_id {
+                continue;
+            }
+            schemas.invalidate(&db).await;
+        }
     }
 }
 

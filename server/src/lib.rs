@@ -450,6 +450,14 @@ impl AppState {
                 schemas.clone(),
                 instance_id.clone(),
             ));
+            // ARC-004: cross-replica schema-cache invalidation. A push/migrate/
+            // restore on one replica drops the cached schema entry on every
+            // other replica; the next read reloads from Postgres. Reads only.
+            background.spawn(notify::run_schema_listener(
+                pool.clone(),
+                schemas.clone(),
+                instance_id.clone(),
+            ));
         }
         // ENH-022 Stage 3: cross-instance presence LISTEN task. Only spawned
         // when BOTH `RTDB_MULTI_INSTANCE=true` AND `RTDB_PRESENCE_ENABLED=true`

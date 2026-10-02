@@ -626,15 +626,30 @@ impl Committers {
                 }
             }
             CommitterRequest::RunMigrate { reply, .. } => {
+                // ARC-004: the origin did not execute this migration — refresh
+                // its cache entry (the reply does not carry the derived schema,
+                // so a full put is impossible; invalidate for a lazy reload).
+                self.schemas.invalidate(db).await;
                 decode_or_internal::<crate::migrate::MigrateResult>(value, reply)
             }
             CommitterRequest::RunPushSchema { reply, .. } => {
+                match serde_json::from_value::<crate::schema::SchemaDef>(value.clone()) {
+                    // ARC-004: the reply carries the applied schema — put it
+                    // directly so the origin's very next read sees it.
+                    Ok(applied) => self.schemas.put(db, applied).await,
+                    Err(err) => {
+                        tracing::warn!(db, error = %err, "forwarded push reply failed to decode as schema; invalidating cache instead");
+                        self.schemas.invalidate(db).await;
+                    }
+                }
                 decode_or_internal::<crate::schema::SchemaDef>(value, reply)
             }
             CommitterRequest::RunMergeUsers { reply, .. } => {
                 decode_or_internal::<crate::merge::MergeDbResult>(value, reply)
             }
             CommitterRequest::RunRestoreSchema { reply, .. } => {
+                // ARC-004: same as migrate — invalidate for a lazy reload.
+                self.schemas.invalidate(db).await;
                 decode_or_internal::<i64>(value, reply)
             }
             // `forward_write_of` returned Some only for the five arms above;

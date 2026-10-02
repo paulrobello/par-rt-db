@@ -40,6 +40,11 @@ pub(in crate::committer) async fn handle_push_schema(
 ) -> Result<crate::schema::SchemaDef, RtDbError> {
     let (applied, backfilled) = crate::ddl::push_schema(&ctx.pool, &ctx.db, schema).await?;
     ctx.schemas.put(&ctx.db, applied.clone()).await;
+    // ARC-004: tell peer replicas to drop their cached schema for this db so
+    // their next read reloads the new definition from Postgres.
+    if ctx.multi_instance {
+        crate::notify::publish_schema_changed(&ctx.read_pool, &ctx.instance_id, &ctx.db).await;
+    }
     if let Err(err) =
         crate::schema_history::capture(&ctx.pool, &ctx.db, "push", None, &applied).await
     {
@@ -94,6 +99,10 @@ pub(in crate::committer) async fn handle_restore_schema(
     .await?;
     tx.commit().await?;
     ctx.schemas.put(&ctx.db, target.clone()).await;
+    // ARC-004: cross-replica schema-cache invalidation (same as push).
+    if ctx.multi_instance {
+        crate::notify::publish_schema_changed(&ctx.read_pool, &ctx.instance_id, &ctx.db).await;
+    }
 
     // Capture the incoming (target) state so the latest history row == live schema.
     if let Err(err) =
