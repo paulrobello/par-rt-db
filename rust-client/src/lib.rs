@@ -30,11 +30,11 @@
 //!
 //! # Wire contract
 //!
-//! `src/wire.rs` is one of four implementations of par-rt-db's protocol contract
-//! (alongside `server/src/protocol.rs`, `ts-client/src/protocol.ts`, and the Python
-//! client's `wire.py`). They must stay byte-identical — same serde tags and field
-//! names. Changing the wire format on any side is a breaking change unless mirrored
-//! across all clients.
+//! `src/wire.rs` is one of six implementations of par-rt-db's protocol contract
+//! (alongside `server/src/protocol.rs`, `ts-client/src/protocol.ts`, the Python
+//! client's `wire.py`, Swift's `Wire.swift`, and Go's `wire/`). They must stay
+//! byte-identical — same serde tags and field names. Changing the wire format on
+//! any side is a breaking change unless mirrored across all clients.
 //!
 //! See the crate [`README`](https://github.com/paulrobello/par-rt-db/blob/main/rust-client/README.md)
 //! for install snippets, quick-start examples (HTTP query/mutate, scheduling, file

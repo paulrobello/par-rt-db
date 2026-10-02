@@ -81,13 +81,14 @@ impl LimitsConfig {
         // SEC-203: non-zero default — see the field doc above.
         let storage_per_ip_rpm = env_parsed("RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM", 300u32)?;
 
-        // SEC-103: per-IP rate limit on `POST /auth/anonymous`. 0 = unlimited
-        // (the code default; the shipped `.env.example`/`docker-compose.yml`
-        // set a non-zero default so the mitigation is on out-of-the-box).
+        // SEC-103: per-IP rate limit on `POST /auth/anonymous`. The code
+        // default is 10; 0 disables. The shipped `.env.example`/
+        // `docker-compose.yml` also set 10, so the mitigation is on
+        // out-of-the-box.
         let anonymous_per_ip_rpm = env_parsed("RTDB_ANONYMOUS_RATE_LIMIT_PER_IP_RPM", 10u32)?;
 
-        // SEC-109: per-IP rate limit on `POST /admin/login`. 0 = unlimited
-        // (the default), preserving today's behavior.
+        // SEC-109: per-IP rate limit on `POST /admin/login`. The code default
+        // is 10; 0 disables.
         let admin_per_ip_rpm = env_parsed("RTDB_ADMIN_RATE_LIMIT_PER_IP_RPM", 10u32)?;
 
         // SEC-003: per-IP rate limit on `GET /auth/{provider}/begin`. 0 =

@@ -52,7 +52,7 @@ Full detail and reasoning: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The one
 - **The ownership lease is the multi-writer boundary**: under `RTDB_MULTI_INSTANCE`, exactly one replica holds the advisory-lock lease and runs its committer; every other replica is a SHADOW that forwards writes to the owner and never executes locally. **Never bypass `Committers::submit`** — it routes each write to the owner or the forward path.
 - **Clients mirror the core**: the server is the source of truth for the protocol, DSL, step-result shapes, and behavior. Any server change must be mirrored in **all five** clients — wire types, DSL builders, and their tests; file any gap explicitly rather than letting it drift. The wire-corpus enforces this: all six runners execute every case, and every behavior-changing change ships with a case (its README's authoring rule).
 - **Backups never touch the live DB**: restore goes into a fresh `rtdb_restored_<stamp>` database; credentials travel via `PG*` env, never argv.
-- **Hot config is live**: runtime-mutable settings live on `AppState` as `Arc<ArcSwap<HotConfig>>` (`config.rs`); every consumer reads `state.hot.load()`.
+- **Hot config is live**: runtime-mutable settings live on `AppState` as `Arc<ArcSwap<HotConfig>>` (`config/`, hot row in `config/hot.rs`); every consumer reads `state.runtime.hot.load()`.
 - No `unwrap()`/`expect()` outside `#[cfg(test)]`, enforced by clippy. Zero clippy warnings under `-D warnings`.
 - **Keep docs in sync**: when a feature lands or changes, update `FEATURE_MATRIX.md`, the relevant README(s)/docs, and any skill that documents par-rt-db's surface. A stale doc that contradicts the code is a bug.
 

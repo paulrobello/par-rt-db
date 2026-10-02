@@ -43,7 +43,9 @@ The `http` surface also carries `.filter()` / `.search()` / `.vector_search()` /
 field projection — `.fields(&["title"])` keeps the listed user fields per
 result doc, system fields always kept, `&[]` an ids-only view, FM-38;
 `.search()` takes an optional `mode: "tsquery" | "trgm"` — `trgm` is
-substring/autocomplete matching ranked by pg_trgm similarity, FM-30 — and a
+substring/autocomplete matching ranked by pg_trgm similarity, FM-30 (the
+index must declare `trgm: true` at push time, or the server rejects the query
+with `BAD_REQUEST`) — and a
 `snippet: bool` opt, FM-31: the query text honors web-search operator syntax
 server-side (quoted phrases, bare `or`, `-term` exclusion) and `snippet: true`
 asks the server to attach a `<mark>`-highlighted `_searchSnippet` fragment to

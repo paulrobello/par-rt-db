@@ -22,6 +22,7 @@ VPS and no reverse proxy is needed — TLS is terminated at Cloudflare's edge.
 - [Secrets (`/docker/par-rt-db/.env`, not committed)](#secrets-dockerpar-rt-dbenv-not-committed)
 - [Dashboard / SPA](#dashboard--spa)
 - [Admin bootstrap (after first deploy)](#admin-bootstrap-after-first-deploy)
+- [Hot config beats env](#hot-config-beats-env)
 - [Backups & restore](#backups--restore)
 - [Troubleshooting](#troubleshooting)
 - [Rollback](#rollback)
@@ -240,8 +241,8 @@ metrics exist for it on `/metrics` and `GET /admin/metrics`:
 
 `RTDB_SUBS_VERIFY_SKIP_EVERY=N` shadow-verifies 1 skip in every N: the query
 runs anyway and its result is compared against the last pushed one. **It ships
-enabled at 1000** (`DEFAULT_SUBS_VERIFY_SKIP_EVERY` in `server/src/config.rs`;
-`.env.example` and compose agree) — set `0` to disable it.
+on at 1000** (`.env.example` and compose agree) — set `0` to disable it, lower
+it to tune (every verification costs the Postgres round-trip the skip avoided).
 **Setting it in `.env` is not enough on its own** — compose's
 `environment:` block is an explicit allowlist, so a new `RTDB_*` key must also
 be forwarded there (this one is). After changing it, recreate the
@@ -294,7 +295,8 @@ anything above 0.5 in amber. Remediation levers, in order of effectiveness:
 - **Split hot tables** — move the rows a table-level subscription doesn't need
   (or the ones it does) into a separate table, so each write fans out to fewer
   subscriptions.
-- **Quota caps** — `max_subs_per_db` (via `PATCH /admin/config`) bounds how
+- **Quota caps** — `maxSubsPerDb` (via `PATCH /admin/config`; one of the eight
+  hot fields, alongside `maxTablesPerDb` and `maxStorageBytesPerDb`) bounds how
   many subscriptions a database can hold, capping the worst-case fan-out per
   committer turn.
 
@@ -379,8 +381,13 @@ operator-critical subset.
 - `RTDB_AUTH_ANONYMOUS_ENABLED` (default `false`) is the server-wide gate for
   anonymous login; when it is on, each database still opts in individually via
   `GET|PATCH /admin/db/{db}/anonymous-access` (SEC-103).
-- `RTDB_ALLOWED_ORIGINS` — the SPA origin(s); adjust when the client's final
-  origin is known, then `docker compose up -d` to apply.
+- `RTDB_ALLOWED_ORIGINS` — the SPA origin(s). This is a hot setting: after
+  first boot, change it with
+  `PATCH /admin/config` (body `{ "allowedOrigins": ["https://spa.example.com"] }`)
+  or the dashboard Settings page — the value is persisted in the `rtdb_config`
+  row and overlaid onto env on every subsequent boot, so editing
+  `RTDB_ALLOWED_ORIGINS` in `.env` and restarting has no effect once a PATCH
+  has ever been applied. See [Hot config beats env](#hot-config-beats-env).
 - `RTDB_BUILD_COMMIT` (optional) — git short sha baked into `/healthz`. Set it
   to the deployed commit before `BUILDX_BUILDER=par-rt-db-builder docker
   compose up -d --build`, e.g. `RTDB_BUILD_COMMIT=$(git rev-parse --short HEAD)`
@@ -422,14 +429,44 @@ the bun/vite build and copies `dist/` to `/app/dashboard-dist`, and
 ```sh
 # create a database, push its schema, mint a machine token, allowlist a user:
 curl -s -X POST https://rtdb.example.com/admin/create-db \
-  -H "Authorization: Bearer $RTDB_ADMIN_KEY" -d '{"name":"kanban"}'
+  -H "Authorization: Bearer $RTDB_ADMIN_KEY" -H "Content-Type: application/json" \
+  -d '{"name":"kanban"}'
 curl -s -X POST https://rtdb.example.com/admin/push-schema \
-  -H "Authorization: Bearer $RTDB_ADMIN_KEY" -d '{"db":"kanban","schema":{...}}'
+  -H "Authorization: Bearer $RTDB_ADMIN_KEY" -H "Content-Type: application/json" \
+  -d '{"db":"kanban","schema":{...}}'
 curl -s -X POST https://rtdb.example.com/admin/mint-token \
-  -H "Authorization: Bearer $RTDB_ADMIN_KEY" -d '{"db":"kanban","name":"cli"}'
+  -H "Authorization: Bearer $RTDB_ADMIN_KEY" -H "Content-Type: application/json" \
+  -d '{"db":"kanban","name":"cli"}'
 curl -s -X POST https://rtdb.example.com/admin/allowlist \
-  -H "Authorization: Bearer $RTDB_ADMIN_KEY" -d '{"db":"kanban","action":"add","email":"you@example.com"}'
+  -H "Authorization: Bearer $RTDB_ADMIN_KEY" -H "Content-Type: application/json" \
+  -d '{"db":"kanban","action":"add","email":"you@example.com"}'
 ```
+
+## Hot config beats env
+
+Eight settings (`allowedOrigins`, `sessionTtlDays`, `maxFileSize`,
+`idempotencyTtlMs`, `maxTablesPerDb`, `maxStorageBytesPerDb`, `maxSubsPerDb`,
+`changeLogMaxRows` — the `HotConfig` fields) are runtime-mutable and
+**persisted**: the first `PATCH /admin/config` writes the merged row into the
+single-row `rtdb_config` table, and every boot thereafter loads that row and
+overlays it onto the env-seeded defaults field by field
+(`config/hot.rs` `load_hot` / `PersistedHotConfig::merge_onto`). After that
+first PATCH, editing the corresponding `RTDB_*` variables in `.env` and
+restarting has **no effect** — the persisted field wins.
+
+Change these settings through `PATCH /admin/config` or the dashboard Settings
+page (both validate and persist). Example:
+
+```sh
+curl -X PATCH "$RTDB_URL/admin/config" \
+  -H "Authorization: Bearer $RTDB_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"allowedOrigins": ["https://spa.example.com"], "maxSubsPerDb": 500}'
+```
+
+To fall back to env for one field, PATCH it to the value you want env to
+carry (there is no "unset to env" — the row stores every field). `0` on a
+quota cap means unlimited.
 
 ## Backups & restore
 
@@ -541,6 +578,19 @@ Common operator symptoms on the live deploy:
   Its failure output lists each missing `<member>/tests/<name>.rs` path —
   add each one to the `touch` stub list in the Dockerfile's dependency layer
   and re-run the check.
+- **An env change to a hot setting has no effect after a restart.** See
+  [Hot config beats env](#hot-config-beats-env): once any `PATCH /admin/config`
+  has been applied, the persisted `rtdb_config` row overlays env on every boot.
+  Change the value via `PATCH /admin/config` or the dashboard Settings page.
+- **Boot fails with "RTDB_ADMIN_KEY is set to an obvious placeholder" (or the
+  min-length error).** SEC-110's boot gate rejects an empty key, a key under
+  16 characters, and a denylist of copy-paste placeholders
+  (`changeme`, `admin`, `test-key`, …). Set a real random key (e.g. 64 hex
+  chars) in the deploy `.env`.
+- **Boot fails on a malformed numeric env value.** Every `RTDB_*` knob parsed
+  as a number (timeouts, caps, intervals) aborts startup naming the offending
+  variable — fix the value in `.env`; the server does not silently fall back
+  to the default.
 - **Dashboard shows the old SPA after a frontend change.** The SPA is baked into
   the server image, not a live-mounted volume — a frontend change ships only via
   `BUILDX_BUILDER=par-rt-db-builder docker compose up -d --build` (image rebuild

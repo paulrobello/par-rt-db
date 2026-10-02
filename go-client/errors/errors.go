@@ -2,11 +2,11 @@
 package errors
 
 // Mirrors server/src/error.rs::ErrorCode and the canonical {code,
-// httpStatus} table in wire-corpus/error-codes.json. Twelve codes, closed
+// httpStatus} table in wire-corpus/error-codes.json. Thirteen codes, closed
 // domain; the fixture is regenerated from the server enum and this package
 // must match it exactly (pinned by TestErrorCodesCorpus in wire/).
 
-// ErrorCode is one of the twelve wire error codes.
+// ErrorCode is one of the thirteen wire error codes.
 type ErrorCode string
 
 const (

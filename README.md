@@ -91,7 +91,7 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 - **Operator surfaces**: op feed, audit log, webhooks, Prometheus `/metrics` with optional OTLP tracing, backup/restore, schema migration with snapshot history and restore, hot-reloaded config, per-database quotas, slow-query ring, and query explain
 
 ### Technical Excellence
-- **Single serialized committer per database**: all writes flow through one committer task per database and reads run under READ COMMITTED — realtime correctness without distributed coordination
+- **Single serialized committer per database**: all writes flow through one committer task per database and reads run under READ COMMITTED (except `adjustCounter`, which row-locks its counter) — realtime correctness without distributed coordination
 - **Rust on axum/tokio with Postgres 17 storage**: graceful shutdown drains in-flight requests before exiting, bounded by `RTDB_SHUTDOWN_DRAIN_MS`
 - **One wire contract, six implementations**: the server and the ts/rust/python/go clients stay byte-identical, enforced by a shared semantics corpus ([`wire-corpus/`](wire-corpus/README.md)); the Swift client mirrors the same wire types, pinned by the wire-parity corpus
 - **Security defaults**: constant-time key comparison, generic client-facing 500 messages (detail only in logs), typed `confirm` guards on destructive operations, path-traversal-guarded downloads
@@ -198,7 +198,7 @@ curl -s -X POST http://localhost:8300/admin/create-db \
 curl -s -X POST http://localhost:8300/admin/push-schema \
   -H "Authorization: Bearer $RTDB_ADMIN_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"db":"myapp","schema":{"tables":{"tasks":{"fields":{"title":{"type":"string"},"done":{"type":"boolean"}}}}}}'
+  -d '{"db":"myapp","schema":{"tables":{"tasks":{"fields":{"title":{"type":"string"},"done":{"type":"boolean"}},"indexes":[{"name":"by_done","fields":["done"]}]}}}}'
 
 # 6. Mint a machine token scoped to the new database.
 TOKEN=$(curl -s -X POST http://localhost:8300/admin/mint-token \
@@ -244,7 +244,7 @@ since browsers cannot set headers on a WS handshake.
 | `GET /sync` | first WS frame | WebSocket upgrade. Speaks the realtime protocol (auth, subscribe, mutate, schedule, ping). |
 | `POST /api/query` | Bearer token | One-shot query against a database; see [Query shape](#query-shape). |
 | `POST /api/query-batch` | Bearer token | Fans out N queries in one round trip (per-query error isolation); each slot returns `{ok, result}` or `{ok:false, error}`. |
-| `POST /api/mutate` | Bearer token | One-shot transaction (`insert`/`patch`/`replace`/`delete`/`undelete`/`expectVersion`/`expectAbsent`/`upsert` + `patchByQuery`/`deleteByQuery` + `schedule`/`cancelSchedule` + `startWorkflow`/`cancelWorkflow` steps). |
+| `POST /api/mutate` | Bearer token | One-shot transaction (`insert`/`patch`/`replace`/`delete`/`undelete`/`expectVersion`/`expectAbsent`/`upsert`/`adjustCounter` + `patchByQuery`/`deleteByQuery` + `schedule`/`cancelSchedule` + `startWorkflow`/`cancelWorkflow` steps). |
 | `POST /api/mutate-batch` | Bearer token | Fans out N independent transactions in one round trip (per-entry error isolation, deliberately not atomic); each positional slot returns `{ok, results}` or `{ok:false, error}`. Entries may carry their own `idempotencyKey` (per-entry dedup/replay). |
 | `POST /api/schedule` | Bearer token | Schedules a transaction: `afterMs`/`runAt` one-shot, `cron` (5-field, min-first, UTC unless `tz` is given), or `interval` (fixed `everyMs`); returns `{id}`. Pass `"external": true` to create an external-claim job (never internally executed; claimed by an app worker via `/api/schedule/claim` with a fencing token). |
 | `POST /api/schedule/claim` | Bearer token | Atomically claims up to `limit` due external jobs (`leaseMs` lease each), returning `ClaimedSchedule[]` with per-job monotonic `leaseGeneration` fencing tokens. |
@@ -527,7 +527,9 @@ websearch syntax — quoted phrases require adjacency, a bare `or` unions,
 `ts_headline` fragment per hit with matched terms wrapped in `<mark>`
 (server-fixed word bounds, tsquery mode only); an optional
 `mode: "trgm"` switches to substring/autocomplete matching — case-insensitive
-`ILIKE` ranked by `pg_trgm` `similarity()`, backed by a GIN trigram index),
+`ILIKE` ranked by `pg_trgm` `similarity()`, backed by a GIN trigram index; the
+index **must** declare `trgm: true` at push time — a search index without the
+flag is rejected with `BAD_REQUEST` ("does not declare trgm: true")),
 `vectorSearch` ranks by
 the index's declared metric distance over a write-maintained pgvector column
 (also accepting an optional full `filter`), `hybridSearch` fuses the full-text
@@ -562,7 +564,10 @@ fields (the pushed payloads still carry `_version`).
 `{"steps": [...]}` where each step is tagged by `"op"`: `insert`, `patch`,
 `replace`, `delete`, `undelete` (softDelete tables only — clears the
 `deleted_at` stamp), `expectVersion`, `expectAbsent`, `upsert` (per-id, one
-document each), the predicate-driven bulk steps `patchByQuery` and
+document each), `adjustCounter` (atomically adds a safe-integer delta to a
+declared numeric field, with optional `min`/`max` bounds and `expected` row
+fields — see [`docs/atomic-counter.md`](docs/atomic-counter.md)), the
+predicate-driven bulk steps `patchByQuery` and
 `deleteByQuery` (each finds rows matching a `filter` and acts on up to
 `MAX_BY_QUERY_ROWS` of them in one serialized committer turn), the
 scheduler control-flow steps `schedule` (enqueues a nested txn by inserting
@@ -624,10 +629,10 @@ frame type it cannot parse:
 
 ```jsonc
 // -> client: authenticate with a machine token scoped to db "myapp"
-{"type": "auth", "token": "<machine-token>", "db": "myapp", "protocolVersion": 1}
+{"type": "auth", "token": "<machine-token>", "db": "myapp", "protocolVersion": 3}
 
 // <- server
-{"type": "authOk", "user": {"kind": "machine", "email": null, "name": null}, "protocolVersion": 1}
+{"type": "authOk", "user": {"kind": "machine", "email": null, "name": null}, "protocolVersion": 3}
 
 // -> client: subscribe to all not-done tasks via the "by_done" index
 {"type": "subscribe", "queryId": "q1", "query": {"table": "tasks", "index": "by_done", "eq": [false]}}
@@ -816,7 +821,7 @@ The HTTP client maps the result to `Paginated<T>`. See
 use par_rt_db_client::{Order, Paginated, RtDbHttpClient, TableQuery};
 
 let page: Paginated<Item> = http
-    .query(
+    .run(
         TableQuery::new("items")
             .with_index("by_priority", &[])
             .order(Order::Asc)
@@ -833,9 +838,16 @@ if let Some(cursor) = page.next_cursor.as_deref() {
 
 `TableQuery.paginate(*, cursor=None, num_items)` mirrors the same shape; combine
 it with `encode_cursor` / `decode_cursor` if you crack cursors client-side. The
-HTTP client (`pip install par-rt-db[http]`) runs the built query against
-`POST /api/query` and returns the `Paginated` result. See
-[`python-client/`](python-client).
+HTTP client runs the built query against `POST /api/query` and returns the
+`Paginated` result. Install with the extras quoted so zsh doesn't glob the
+brackets:
+
+```bash
+uv add "par-rt-db[http] @ git+https://github.com/paulrobello/par-rt-db#subdirectory=python-client"
+# or: pip install "par-rt-db[http] @ git+https://github.com/paulrobello/par-rt-db#subdirectory=python-client"
+```
+
+See [`python-client/`](python-client).
 
 ```python
 from par_rt_db import TableQuery

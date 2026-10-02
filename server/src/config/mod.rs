@@ -1,7 +1,9 @@
 //! Configuration — boot-time `Config` (env-sourced, immutable) and
 //! runtime-mutable `HotConfig` (held on `AppState` as `Arc<ArcSwap<HotConfig>>`,
-//! persisted in a single-row `rtdb_config` table). The four hot settings —
-//! `allowed_origins`, `session_ttl_days`, `max_file_size`, `idempotency_ttl_ms`
+//! persisted in a single-row `rtdb_config` table). The eight hot settings —
+//! `allowed_origins`, `session_ttl_days`, `max_file_size`, `idempotency_ttl_ms`,
+//! and the quota/change-log caps `max_tables_per_db`, `max_storage_bytes_per_db`,
+//! `max_subs_per_db`, `change_log_max_rows`
 //! — swap live via `PATCH /admin/config` with no restart; the `CorsLayer` origin
 //! check re-reads `allowed_origins` per request. `GET /admin/config` is
 //! structurally redacted (secrets surface as configured-bools, never values).
@@ -221,12 +223,14 @@ pub struct Config {
     pub trusted_proxy: bool,
     /// RTDB_SHUTDOWN_DRAIN_MS (default 30000). Upper bound, in
     /// milliseconds, on axum's graceful drain after SIGINT/SIGTERM. The drain
-    /// waits for every connection task to finish, and an upgraded WebSocket
-    /// whose peer never speaks never does — so without this bound the wait had
-    /// no end of its own and Docker's SIGTERM→SIGKILL window was the only
-    /// backstop. When the bound elapses the remaining connections are closed
-    /// and shutdown proceeds to the (already bounded) background-task cleanup.
-    /// 0 = wait forever, the pre-bound behavior. Boot-only (not hot).
+    /// waits for every connection task to finish; upgraded WebSockets detach
+    /// from the drain (their tasks exit during it), so only plain HTTP
+    /// connections keep the wait alive — but a client that keeps a plain
+    /// connection open never finishes on its own, so without this bound the
+    /// wait had no end of its own and Docker's SIGTERM→SIGKILL window was the
+    /// only backstop. When the bound elapses the remaining connections are
+    /// closed and shutdown proceeds to the (already bounded) background-task
+    /// cleanup. 0 = wait forever, the pre-bound behavior. Boot-only (not hot).
     pub shutdown_drain_ms: u64,
     // ---- OpenTelemetry / OTLP tracing export (ENH-018) ----
     // All boot-only. The cargo `otel` feature gates the dependency + subscriber

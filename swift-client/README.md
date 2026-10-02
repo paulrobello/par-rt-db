@@ -221,9 +221,13 @@ let page = try TableQuery("items").withIndex("by_priority").order(.asc)
     .paginate(cursor: nil, numItems: 20).build()
 let pageResult: Paginated<TaskDoc> = try await http.run(page, as: Paginated<TaskDoc>.self)
 
-// Full-text search (trgm mode + snippet highlighting); vector + hybrid search
-let hits = try TableQuery("items")
-    .search("by_title", "database notes", mode: .trgm, snippet: true).build()
+// Full-text search; vector + hybrid search. `snippet: true` is tsquery-mode
+// only, and trgm mode requires the index to have been pushed with
+// `trgm: true` (otherwise the server rejects the query with `BAD_REQUEST`).
+let tsquery = try TableQuery("items")
+    .search("by_title", "database notes", snippet: true).build()
+let trgm = try TableQuery("items")
+    .search("by_title", "database notes", mode: .trgm).build()
 let near = try TableQuery("items").vectorSearch("embedding", vector, limit: 10).build()
 let fused = try TableQuery("items").hybridSearch("database notes", vector, limit: 10).build()
 
@@ -330,7 +334,8 @@ let diff = try await http.previewSchema(schema)   // advisory diff, applies noth
 
 The full `FieldType` set is supported (15 variants — including `int64`, `bytes`,
 `any`, `record`, `vector`, `literal`, `union`, `array`, `object`), plus search
-indexes (`searchIndex(_:on:language:)`), vector indexes
+indexes (`searchIndex(_:on:language:)`, chain `.trgm()` to add the trigram GIN
+that `mode: .trgm` search requires), vector indexes
 (`vectorIndex(_:on:dimensions:filterFields:metric:)`), partial indexes
 (`whereClause(_:)`), `collaboratorsField`, `authorize(_:)`, `defaults(_:)`,
 `computed(_:_:)` (server re-derives the named field from a `ValueExpr` on every

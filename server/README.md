@@ -122,9 +122,9 @@ Paths below are relative to `server/src/` (this directory's `src/`).
 | Op feed (in-memory ring + `/admin/stream`) | `src/op_feed.rs` |
 | Snapshot export/import | `src/snapshot.rs` |
 | Metrics | `src/metrics.rs` |
-| Hot config + dynamic CORS | `src/config.rs` (`Arc<ArcSwap<HotConfig>>` on `AppState`) |
+| Hot config + dynamic CORS | `src/config/` (hot row in `src/config/hot.rs`; `Arc<ArcSwap<HotConfig>>` on `AppState`) |
 | Health | `src/health.rs` |
-| Schema model + validation | `src/schema.rs` |
+| Schema model + validation | `src/schema/` |
 | Computed-field expression grammar + evaluation (ENH-028) | `src/value_expr.rs` (shared by push validation, the write-path stamp in `src/txn.rs`, push/restore backfill, and migrate re-stamps in `src/migrate.rs`) |
 | Schema → Postgres DDL | `src/ddl.rs` |
 | Write / read paths | `src/txn.rs`, `src/query/` (`mod.rs` compile + dispatch, `filter.rs`, `terminals.rs`, `search.rs`, `row_auth.rs`) |
@@ -343,7 +343,9 @@ or schema you didn't create.
 The committer is the correctness core: every write for a database flows through
 one serialized committer task, and subscriptions are re-evaluated under that same
 serialization. `execute_txn`/`execute_query` run under READ COMMITTED with no row
-locking — never call `execute_txn` outside the committer, and never add a second
+locking — the one exception is `adjustCounter`, which takes `SELECT … FOR UPDATE`
+on its counter row (`txn/steps.rs`). Never call `execute_txn` outside the
+committer, and never add a second
 concurrent writer. Every SQL identifier is validated and double-quoted, every
 value goes through a `$n` bind, and every failure is the `RtDbError` envelope
 `{code, message}` (500s carry a generic message). No `unwrap()`/`expect()`

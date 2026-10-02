@@ -44,7 +44,9 @@ re-runs affected subscriptions, diffs against the last pushed value, and pushes
 only on change. Subscription registration rides the same queue.
 
 **This serialization is load-bearing**: `execute_txn`/`execute_query` run READ
-COMMITTED with no row locking. Never call `execute_txn` outside the committer;
+COMMITTED with no row locking — except `adjustCounter`, which takes
+`SELECT … FOR UPDATE` on its counter row so concurrent adjustments serialize on
+the row itself. Never call `execute_txn` outside the committer;
 never add a second writer.
 
 One write, end to end:
@@ -1055,7 +1057,7 @@ runtime-mutable, held on `AppState` as `Arc<ArcSwap<HotConfig>>` and
 persisted in a single-row
 `rtdb_config` table (boot seeds from env when no row exists; a malformed row
 warns and falls back to env rather than blocking startup). Every consumer
-reads `state.hot.load()` (the committer reads `idempotency_ttl_ms` live at
+reads `state.runtime.hot.load()` (the committer reads `idempotency_ttl_ms` live at
 mutate-dedup time via the same shared `Arc`); `PATCH /admin/config` validates
 + persists + swaps live (no restart). The `CorsLayer` is built once but its
 origin check is an `AllowOrigin::predicate` that re-reads live

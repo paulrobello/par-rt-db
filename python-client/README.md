@@ -3,9 +3,10 @@
 Python client for [par-rt-db](..) — a port of the TypeScript SDK
 ([`../ts-client/`](../ts-client)) and Rust crate ([`../rust-client/`](../rust-client))
 for server-side and automation apps. Speaks the server's declarative
-query/transaction DSL; the wire layer is one of four implementations of
+query/transaction DSL; the wire layer is one of six implementations of
 par-rt-db's JSON contract (alongside `server/src/protocol.rs`,
-`ts-client/src/protocol.ts`, and `rust-client/src/wire.rs`). No codegen: you
+`ts-client/src/protocol.ts`, `rust-client/src/wire.rs`, Swift's `Wire.swift`,
+and Go's `wire/`). No codegen: you
 build a `SchemaDef` that serializes to the exact server `SchemaDef`, and
 query/mutate results deserialize generically into your own `pydantic` models or
 plain `dict`s.
@@ -178,7 +179,9 @@ point = TableQuery("items").get("i1").build()
 
 # Full-text search over a declared search index. `mode="trgm"` switches to
 # case-insensitive substring/autocomplete matching over the index's text fields
-# (FM-30); an omitted `mode` (or `"tsquery"`) is full-text — and omits `mode`
+# (FM-30) — the index must have been pushed with `trgm: True`, or the server
+# rejects the query with `BAD_REQUEST` ("does not declare trgm: true"); an
+# omitted `mode` (or `"tsquery"`) is full-text — and omits `mode`
 # from the wire entirely, so existing requests stay byte-identical. The query
 # text honors web search operators (FM-31): quoted phrases require adjacency
 # (`"exact phrase"`), the bare word `or` unions, `-term` excludes. `snippet=True`
@@ -293,7 +296,7 @@ schema = SchemaDef.model_validate(
                 },
                 "indexes": [
                     {"name": "by_n", "fields": ["n"]},
-                    {"name": "by_name", "fields": ["name"], "search": True},
+                    {"name": "by_name", "fields": ["name"], "search": True, "trgm": True},
                     {
                         "name": "by_embedding",
                         "fields": ["embedding"],
@@ -571,11 +574,12 @@ Published reference: https://paulrobello.github.io/par-rt-db/python/par_rt_db.ht
 
 ## Wire contract
 
-`src/par_rt_db/wire.py` is one of four implementations of par-rt-db's protocol
-contract (alongside the server, the TS SDK, and the Rust crate). They must stay
+`src/par_rt_db/wire.py` is one of six implementations of par-rt-db's protocol
+contract (alongside the server, the TS SDK, the Rust crate, the Swift package,
+and the Go module). They must stay
 byte-identical — same discriminator tags (`type` / `op`), same camelCase field
 aliases, same omit-when-absent rules. Changing the wire format on any side is a
-breaking change unless mirrored across all four. See
+breaking change unless mirrored across all six. See
 [`../CLAUDE.md`](../CLAUDE.md) and the design spec
 [`../docs/superpowers/specs/2026-07-25-python-client-design.md`](../docs/superpowers/specs/2026-07-25-python-client-design.md).
 `tests/test_wire_parity.py` is the cross-client oracle — it pins the Python
