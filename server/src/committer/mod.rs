@@ -403,6 +403,7 @@ impl Committers {
         lease_lost: Option<Arc<AtomicBool>>,
     ) -> CommitterCtx {
         CommitterCtx {
+            read_pool: self.pool.clone(),
             pool,
             db,
             subs: self.subs.clone(),
@@ -1110,7 +1111,17 @@ impl Committers {
 /// (read for the dedup TTL at `mutation_log::store` time), bundled to keep
 /// the per-request handlers' argument lists small.
 struct CommitterCtx {
+    /// The write pool: the lease pool under multi-instance (its backend holds
+    /// the ownership advisory lock), the main pool otherwise. Document writes
+    /// and side-table claims go here.
     pool: PgPool,
+    /// ARC-005: read/independent-insert pool — always the main pool. Non-write
+    /// work in the committer turn (subscription fan-out re-runs, cross-replica
+    /// NOTIFY publishing, audit rows, webhook enqueues, quota-cache refresh)
+    /// runs here so it never contends with — or lands on — the single locked
+    /// lease backend. READ COMMITTED on another connection still sees the
+    /// just-committed write (this code runs after `tx.commit()`).
+    read_pool: PgPool,
     db: String,
     subs: Arc<SubscriptionManager>,
     schemas: SchemaCache,

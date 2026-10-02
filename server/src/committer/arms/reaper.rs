@@ -44,7 +44,7 @@ pub(in crate::committer) async fn handle_reaper(ctx: &CommitterCtx) -> Result<()
                 Ok(rows) => rows,
                 Err(e) => {
                     if matches!(
-                        crate::db::database_exists(&ctx.pool, &ctx.db).await,
+                        crate::db::database_exists(&ctx.read_pool, &ctx.db).await,
                         Ok(false)
                     ) {
                         return Ok(());
@@ -83,7 +83,7 @@ pub(in crate::committer) async fn handle_reaper(ctx: &CommitterCtx) -> Result<()
                 .await
                 {
                     if matches!(
-                        crate::db::database_exists(&ctx.pool, &ctx.db).await,
+                        crate::db::database_exists(&ctx.read_pool, &ctx.db).await,
                         Ok(false)
                     ) {
                         return Ok(());
@@ -124,7 +124,7 @@ pub(in crate::committer) async fn handle_reaper(ctx: &CommitterCtx) -> Result<()
                 // exit like the scheduler/cleanup tasks do. The dropped tx
                 // rolls the whole batch back atomically.
                 if matches!(
-                    crate::db::database_exists(&ctx.pool, &ctx.db).await,
+                    crate::db::database_exists(&ctx.read_pool, &ctx.db).await,
                     Ok(false)
                 ) {
                     return Ok(());

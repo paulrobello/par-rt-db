@@ -48,7 +48,7 @@ pub(in crate::committer) async fn publish_taps(
     refresh_quota_cache: bool,
 ) {
     ctx.subs
-        .fan_out(&ctx.pool, &ctx.db, schema, write_set)
+        .fan_out(&ctx.read_pool, &ctx.db, schema, write_set)
         .await;
     // ARC-001: cross-replica subscription invalidation. The local `fan_out`
     // above only reaches subscribers connected to THIS replica; peers holding
@@ -58,7 +58,8 @@ pub(in crate::committer) async fn publish_taps(
     // a DDL-only write (`handle_restore_schema`) invalidates subscriptions on
     // every replica exactly as it does locally.
     if ctx.multi_instance {
-        crate::notify::publish_write_set(&ctx.pool, &ctx.instance_id, &ctx.db, write_set).await;
+        crate::notify::publish_write_set(&ctx.read_pool, &ctx.instance_id, &ctx.db, write_set)
+            .await;
     }
     if !docop_taps {
         return;
@@ -76,7 +77,7 @@ pub(in crate::committer) async fn publish_taps(
     // second writer: the write already committed inside this serialized turn;
     // NOTIFY only notifies.
     if ctx.multi_instance {
-        let pool = ctx.pool.clone();
+        let pool = ctx.read_pool.clone();
         let instance_id = ctx.instance_id.clone();
         let db = ctx.db.clone();
         let owner = owner.map(|s| s.to_string());
@@ -89,14 +90,16 @@ pub(in crate::committer) async fn publish_taps(
     // Durable audit tap (the persistent counterpart to the op-feed above).
     if ctx.audit_log_enabled
         && let Err(err) =
-            crate::audit::write_audit_rows(&ctx.pool, &ctx.db, owner, source, &write_set.ops).await
+            crate::audit::write_audit_rows(&ctx.read_pool, &ctx.db, owner, source, &write_set.ops)
+                .await
     {
         tracing::warn!(db = %ctx.db, source, error = %err, "audit log write failed");
     }
     // Webhook enqueue tap — mirrors the audit tap above.
     if ctx.webhooks_enabled
         && let Err(err) =
-            crate::webhook::enqueue_for_ops(&ctx.pool, &ctx.db, owner, source, &write_set.ops).await
+            crate::webhook::enqueue_for_ops(&ctx.read_pool, &ctx.db, owner, source, &write_set.ops)
+                .await
     {
         tracing::warn!(db = %ctx.db, source, error = %err, "webhook enqueue failed");
     }
@@ -111,7 +114,7 @@ pub(in crate::committer) async fn publish_taps(
         // write so a subsequent enforce sees the fresh size. Divergent gates are
         // how this drifted in the first place — keep them identical.
         let quotas = ctx.quotas.clone();
-        let pool = ctx.pool.clone();
+        let pool = ctx.read_pool.clone();
         let db = ctx.db.clone();
         tokio::spawn(async move {
             if let Err(e) = quotas.refresh(&pool, &db).await {
