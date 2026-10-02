@@ -345,12 +345,12 @@ final class ScheduledJob {
 /// FM-29 retry policy applied when a step spec omits `retry` (server
 /// `protocol::StepRetry::default` — the Swift wire type already carries the
 /// same defaults).
-private let defaultStepRetry = StepRetry(maxAttempts: 3)
+let defaultStepRetry = StepRetry(maxAttempts: 3)
 
 /// FM-29: exponential backoff after the `attempts`-th failure of a step —
 /// `initialRetryMs * 2^(attempts-1)` (shift capped at 32), clamped to
 /// `maxRetryMs` (store.ts `backoffMs`).
-private func backoffMs(_ retry: StepRetry, _ attempts: Int) -> Int64 {
+func backoffMs(_ retry: StepRetry, _ attempts: Int) -> Int64 {
     let shift = UInt64(min(attempts - 1, 32))
     let doubled = retry.initialRetryMs << shift
     let capped = min(doubled, retry.maxRetryMs)
@@ -772,9 +772,9 @@ public final class InMemoryRtDbClient: MigrationStore {
     var tables: [String: RowStore] = [:]
     private var idempotency: [String: [JSONValue]] = [:]
     private var subs: [EngineSubscription] = []
-    private var schedules: [String: ScheduledJob] = [:]
+    var schedules: [String: ScheduledJob] = [:]
     private var scheduleOrder: [String] = []
-    private var workflows: [String: WorkflowRun] = [:]
+    var workflows: [String: WorkflowRun] = [:]
     private var workflowOrder: [String] = []
     private var workflowSeq = 0
     private var files: [String: StoredFile] = [:]
@@ -981,7 +981,7 @@ public final class InMemoryRtDbClient: MigrationStore {
     /// fires (store.ts `executeTransaction`): enforces the step caps,
     /// snapshots, applies every step (rolling back the whole txn on any
     /// error), then notifies subscriptions.
-    private func executeTransaction(_ txn: Transaction) throws -> [JSONValue] {
+    func executeTransaction(_ txn: Transaction) throws -> [JSONValue] {
         if countSteps(txn) > InMemoryLimits.maxSteps {
             throw RtDbError(
                 code: .badRequest,
@@ -1554,201 +1554,6 @@ public final class InMemoryRtDbClient: MigrationStore {
         return try reapTtl(now)
     }
 
-    // swiftlint:disable cyclomatic_complexity function_body_length
-    /// FM-29: drives one claimed run across step boundaries (store.ts
-    /// `advanceWorkflow`). Success on the last step finalizes; success earlier
-    /// moves to the next step and applies its `sleepBeforeMs` gate (a future
-    /// gate re-pends the run; a `now` gate continues in the same tick);
-    /// failure re-pends with exponential backoff or, once attempts are
-    /// exhausted, marks the run failed with a terminal outcome. An
-    /// `awaitSignal` step takes the server committer's three-way branch
-    /// instead: a delivered payload consumes the wait as a success outcome
-    /// carrying the payload; a first arrival parks the run (`waiting`, fresh
-    /// `waitedSince`, gate `now + timeoutMs` or forever); an expired gate is a
-    /// timeout attempt — re-parked with the FULL timeout again, terminal fail
-    /// `awaitSignal '<name>' timed out` at exhaustion.
-    private func advanceWorkflow(_ run: WorkflowRun, now: Int64) {
-        while true {
-            // Per-boundary liveness check: a cancel (or terminal transition)
-            // between steps ends the pass — the server re-checks the row each
-            // boundary.
-            guard workflows[run.id] === run, run.status == .running else { return }
-            guard run.currentStep < run.spec.steps.count else { return }
-            let step = run.spec.steps[run.currentStep]
-            if let signal = step.awaitSignal {
-                if advanceAwaitSignal(run, signal, step, now: now) {
-                    return
-                }
-                continue
-            }
-            // Every step carries exactly one of txn/awaitSignal (submit-time
-            // `validateWorkflowSpec`); the branch above handled the latter. A
-            // txn-less step here is unreachable — stop the pass like the
-            // out-of-range guard above rather than trap.
-            guard let txn = step.txn else { return }
-            var execError: String?
-            do {
-                _ = try executeTransaction(txn)
-            } catch {
-                execError = errorMessage(error)
-            }
-            if execError == nil {
-                let outcome = StepOutcome(
-                    stepIndex: UInt32(run.currentStep),
-                    status: .success,
-                    attempts: UInt32(run.attempts + 1),
-                    at: now
-                )
-                let isLast = run.currentStep + 1 >= run.spec.steps.count
-                run.stepOutcomes.append(outcome)
-                run.updatedAt = now
-                if isLast {
-                    run.status = .success
-                    run.attempts = 0
-                    run.lastError = nil
-                    run.finishedAt = now
-                    return
-                }
-                run.currentStep += 1
-                run.attempts = 0
-                let next = run.spec.steps[run.currentStep]
-                let gate = now + Int64(next.sleepBeforeMs ?? 0)
-                if gate > now {
-                    run.status = .pending
-                    run.sleepUntil = gate
-                    run.updatedAt = now
-                    return
-                }
-                continue
-            }
-            let retry = step.retry ?? defaultStepRetry
-            run.attempts += 1
-            if run.attempts < Int(retry.maxAttempts) {
-                run.status = .pending
-                run.sleepUntil = now + backoffMs(retry, run.attempts)
-                run.updatedAt = now
-                return
-            }
-            run.stepOutcomes.append(
-                StepOutcome(
-                    stepIndex: UInt32(run.currentStep),
-                    status: .failed,
-                    attempts: UInt32(run.attempts),
-                    at: now,
-                    error: execError
-                )
-            )
-            run.status = .failed
-            run.lastError = execError
-            run.finishedAt = now
-            run.updatedAt = now
-            return
-        }
-    }
-
-    // swiftlint:enable cyclomatic_complexity function_body_length
-
-    // swiftlint:disable function_body_length
-    /// The awaitSignal half of `advanceWorkflow` — the server committer's
-    /// three-way branch. Side-store only (no document writes); the wake
-    /// discriminator is the claimed run itself: `signalPayload` set =
-    /// delivered, else `waitedSince` nil = first arrival, set = the timeout
-    /// gate expired. Returns true when the pass ends (boundary written and
-    /// re-pended, parked, or terminal); false when the consumed signal's next
-    /// step gate is due now and the caller should keep looping.
-    private func advanceAwaitSignal(
-        _ run: WorkflowRun, _ signal: AwaitSignalSpec, _ step: WorkflowStepSpec, now: Int64
-    ) -> Bool {
-        if let payload = run.signalPayload {
-            run.signalPayload = nil
-            let outcome = StepOutcome(
-                stepIndex: UInt32(run.currentStep),
-                status: .success,
-                attempts: UInt32(run.attempts + 1),
-                at: now,
-                signal: payload
-            )
-            run.stepOutcomes.append(outcome)
-            run.updatedAt = now
-            let isLast = run.currentStep + 1 >= run.spec.steps.count
-            if isLast {
-                run.status = .success
-                run.attempts = 0
-                run.lastError = nil
-                run.waitName = nil
-                run.waitedSince = nil
-                run.finishedAt = now
-                return true
-            }
-            run.currentStep += 1
-            run.attempts = 0
-            run.waitName = nil
-            run.waitedSince = nil
-            let next = run.spec.steps[run.currentStep]
-            let gate = now + Int64(next.sleepBeforeMs ?? 0)
-            if gate > now {
-                run.status = .pending
-                run.sleepUntil = gate
-                run.updatedAt = now
-                return true
-            }
-            return false
-        }
-        // Timeout gate — Int64.max when the step omits `timeoutMs` (never
-        // due; only a delivery or cancel wakes the run). The u64→Int64 clamp
-        // and saturating add mirror the server's wrap-hazard guards.
-        let timeoutGate: Int64
-        if let timeoutMs = signal.timeoutMs {
-            let clamped = Int64(min(timeoutMs, UInt64(Int64.max)))
-            let (added, overflow) = now.addingReportingOverflow(clamped)
-            timeoutGate = overflow ? Int64.max : added
-        } else {
-            timeoutGate = Int64.max
-        }
-        if run.waitedSince == nil {
-            // First arrival: park. `attempts` rides the run so a timeout
-            // retry that re-parks keeps its count.
-            run.status = .waiting
-            run.waitName = signal.name
-            run.waitedSince = now
-            run.sleepUntil = timeoutGate
-            run.updatedAt = now
-            return true
-        }
-        // The run parked and its gate expired: a timed-out attempt. A retry
-        // waits the FULL timeoutMs again — never backoff.
-        run.attempts += 1
-        let retry = step.retry ?? defaultStepRetry
-        if run.attempts < Int(retry.maxAttempts) {
-            run.status = .waiting
-            run.waitName = signal.name
-            run.waitedSince = now
-            run.sleepUntil = timeoutGate
-            run.updatedAt = now
-            return true
-        }
-        let error = "awaitSignal '\(signal.name)' timed out"
-        run.stepOutcomes.append(
-            StepOutcome(
-                stepIndex: UInt32(run.currentStep),
-                status: .failed,
-                attempts: UInt32(run.attempts),
-                at: now,
-                error: error
-            )
-        )
-        run.status = .failed
-        run.lastError = error
-        run.waitName = nil
-        run.waitedSince = nil
-        run.signalPayload = nil
-        run.finishedAt = now
-        run.updatedAt = now
-        return true
-    }
-
-    // swiftlint:enable function_body_length
-
     /// Removes documents whose TTL field value is a number strictly less than
     /// `now` (store.ts `reapTtl`). The reaper always HARD-deletes — even rows
     /// on a softDelete table — expanding onDelete cascades with one shared
@@ -1795,148 +1600,252 @@ public final class InMemoryRtDbClient: MigrationStore {
         var extraTables: [String]
     }
 
-    // swiftlint:disable cyclomatic_complexity function_body_length
     /// Applies one step and returns its raw result, primary table, and any
-    /// cascade-touched extra tables (store.ts `executeStep`).
+    /// cascade-touched extra tables (store.ts `executeStep`). Dispatches to a
+    /// per-step handler; the four control-flow steps target their own stores
+    /// (schedule/workflow), not a table.
     private func executeStep(_ step: Step) throws -> StepExecution {
-        // The schedule/workflow control-flow steps target their own stores,
-        // not a table; cancel mirrors the standalone ops (cancelled: false is
-        // not an error).
-        if case let .schedule(when, txn, external) = step {
-            let id = try scheduleJob(txn, when, external: external ?? false)
-            return StepExecution(
-                result: .object(["scheduleId": .string(id)]), table: nil, extraTables: []
-            )
+        // The control-flow steps target the schedule/workflow stores, not a
+        // table; everything else dispatches through the table-op layer.
+        switch step {
+        case .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
+            try executeControlFlowStep(step)
+        case .insert, .patch, .adjustCounter, .replace, .delete, .undelete,
+             .expectVersion, .expectAbsent, .upsert, .patchByQuery, .deleteByQuery:
+            try executeTableStep(step)
         }
-        if case let .cancelSchedule(id) = step {
-            let cancelled = cancelSchedule(id)
-            return StepExecution(
-                result: .object(["cancelled": .bool(cancelled)]), table: nil, extraTables: []
-            )
+    }
+
+    /// The schedule/workflow control-flow half of `executeStep`.
+    private func executeControlFlowStep(_ step: Step) throws -> StepExecution {
+        switch step {
+        case let .schedule(when, txn, external):
+            return try stepSchedule(when, txn, external ?? false)
+        case let .cancelSchedule(id):
+            return stepCancelSchedule(id)
+        case let .startWorkflow(spec):
+            return try stepStartWorkflow(spec)
+        case let .cancelWorkflow(id):
+            return stepCancelWorkflow(id)
+        case .insert, .patch, .adjustCounter, .replace, .delete, .undelete,
+             .expectVersion, .expectAbsent, .upsert, .patchByQuery, .deleteByQuery:
+            throw RtDbError(code: .internal, message: "table steps handled by executeTableStep")
         }
-        if case let .startWorkflow(spec) = step {
-            try validateWorkflowSpec(spec)
-            let run = try startWorkflowJob(spec)
-            return StepExecution(
-                result: .object(["workflowId": .string(run.id)]), table: nil, extraTables: []
-            )
-        }
-        if case let .cancelWorkflow(id) = step {
-            let cancelled = cancelWorkflow(id)
-            return StepExecution(
-                result: .object(["cancelled": .bool(cancelled)]), table: nil, extraTables: []
-            )
-        }
+    }
+
+    /// The per-id table-op half of `executeStep` — one handler per variant.
+    private func executeTableStep(_ step: Step) throws -> StepExecution {
         switch step {
         case let .insert(table, doc):
-            let tableDef = try requireTable(table)
-            let id = try doInsert(table, tableDef, doc)
-            return StepExecution(result: .object(["id": .string(id)]), table: table, extraTables: [])
+            return try stepInsert(table, doc)
         case let .patch(table, id, fields):
-            let tableDef = try requireTable(table)
-            try doPatch(tableDef, table, id, fields)
-            return StepExecution(result: .null, table: table, extraTables: [])
+            return try stepPatch(table, id, fields)
         case let .adjustCounter(table, id, field, delta, minimum, maximum, expected):
-            let tableDef = try requireTable(table)
             let adjustment = CounterAdjustment(
                 field: field, delta: delta, min: minimum, max: maximum, expected: expected
             )
-            try doAdjustCounter(tableDef, table, id, adjustment)
-            return StepExecution(result: .null, table: table, extraTables: [])
+            return try stepAdjustCounter(table, id, adjustment)
         case let .replace(table, id, doc):
-            let tableDef = try requireTable(table)
-            try doReplace(tableDef, table, id, doc)
-            return StepExecution(result: .null, table: table, extraTables: [])
+            return try stepReplace(table, id, doc)
         case let .delete(table, id):
-            let tableDef = try requireTable(table)
-            let extraTables = try doDelete(tableDef, table, id)
-            return StepExecution(result: .null, table: table, extraTables: extraTables)
+            return try stepDelete(table, id)
         case let .undelete(table, id):
-            let tableDef = try requireTable(table)
-            try doUndelete(tableDef, table, id)
-            return StepExecution(result: .null, table: table, extraTables: [])
-        case let .expectVersion(table, id, version):
-            _ = try requireTable(table)
-            try doExpectVersion(table, id, version)
-            return StepExecution(result: .null, table: nil, extraTables: [])
-        case let .expectAbsent(table, index, eq):
-            let tableDef = try requireTable(table)
-            let rows = try eqLookup(tableDef, table, index, eq)
-            if !rows.isEmpty {
-                throw RtDbError(
-                    code: .preconditionFailed,
-                    message: "index '\(index)' already has a matching document"
-                )
-            }
-            return StepExecution(result: .null, table: nil, extraTables: [])
-        case let .upsert(table, index, eq, insert, patch):
-            let tableDef = try requireTable(table)
-            let rows = try eqLookup(tableDef, table, index, eq)
-            if rows.count > 1 {
-                throw RtDbError(
-                    code: .preconditionFailed, message: "upsert matched multiple documents"
-                )
-            }
-            guard let row = rows.first else {
-                let id = try doInsert(table, tableDef, insert)
-                return StepExecution(
-                    result: .object(["id": .string(id), "inserted": .bool(true)]),
-                    table: table, extraTables: []
-                )
-            }
-            let merged = try applyPatch(
-                tableDef, row.doc, stampUpdatedAt(tableDef, patch, nowFn()), now: nowFn()
-            )
-            try doUpdate(table, tableDef, row, merged)
-            return StepExecution(
-                result: .object(["id": .string(row.id), "inserted": .bool(false)]),
-                table: table, extraTables: []
-            )
-        case let .patchByQuery(table, filter, patch, limit):
-            let tableDef = try requireTable(table)
-            let (rows, truncated) = try scanByQuery(tableDef, table, filter, limit)
-            for row in rows {
-                // Fresh stamp per row, exactly as the server restamps inside
-                // its per-row loop.
-                let merged = try applyPatch(
-                    tableDef, row.doc, stampUpdatedAt(tableDef, patch, nowFn()), now: nowFn()
-                )
-                try doUpdate(table, tableDef, row, merged)
-            }
-            return StepExecution(
-                result: .object(["patched": .int(Int64(rows.count)), "truncated": .bool(truncated)]),
-                table: table, extraTables: []
-            )
-        case let .deleteByQuery(table, filter, limit):
-            let tableDef = try requireTable(table)
-            let (rows, truncated) = try scanByQuery(tableDef, table, filter, limit)
-            // FM-33: every matched row deletes through the same onDelete-aware
-            // path as a per-id delete, with ONE shared visited set and budget.
-            if tableDef.softDelete {
-                let now = nowFn()
-                for row in rows {
-                    row.deletedAt = now
-                    row.version += 1
-                }
-                return StepExecution(
-                    result: .object(["deleted": .int(Int64(rows.count)), "truncated": .bool(truncated)]),
-                    table: table, extraTables: []
-                )
-            }
-            let context = CascadeContext()
-            for row in rows {
-                try deleteRowCascade(table, row.id, context, forceHard: false)
-            }
-            return StepExecution(
-                result: .object(["deleted": .int(Int64(rows.count)), "truncated": .bool(truncated)]),
-                table: table, extraTables: Array(context.touched)
-            )
+            return try stepUndelete(table, id)
+        case .expectVersion, .expectAbsent, .upsert, .patchByQuery, .deleteByQuery:
+            return try executeLookupStep(step)
         case .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
             throw RtDbError(code: .internal, message: "control-flow steps handled above")
         }
     }
 
-    // swiftlint:enable cyclomatic_complexity function_body_length
+    /// The lookup / by-query half of `executeStep` — the variants whose
+    /// validation reads the index scan surface.
+    private func executeLookupStep(_ step: Step) throws -> StepExecution {
+        switch step {
+        case let .expectVersion(table, id, version):
+            return try stepExpectVersion(table, id, version)
+        case let .expectAbsent(table, index, eq):
+            return try stepExpectAbsent(table, index, eq)
+        case let .upsert(table, index, eq, insert, patch):
+            return try stepUpsert(table, index, eq, insert, patch)
+        case let .patchByQuery(table, filter, patch, limit):
+            return try stepPatchByQuery(table, filter, patch, limit)
+        case let .deleteByQuery(table, filter, limit):
+            return try stepDeleteByQuery(table, filter, limit)
+        default:
+            throw RtDbError(code: .internal, message: "lookup steps handled here only")
+        }
+    }
+
+    private func stepSchedule(
+        _ when: ScheduleWhen, _ txn: Transaction, _ external: Bool
+    ) throws -> StepExecution {
+        let id = try scheduleJob(txn, when, external: external)
+        return StepExecution(
+            result: .object(["scheduleId": .string(id)]), table: nil, extraTables: []
+        )
+    }
+
+    private func stepCancelSchedule(_ id: String) -> StepExecution {
+        let cancelled = cancelSchedule(id)
+        return StepExecution(
+            result: .object(["cancelled": .bool(cancelled)]), table: nil, extraTables: []
+        )
+    }
+
+    private func stepStartWorkflow(_ spec: WorkflowSpec) throws -> StepExecution {
+        try validateWorkflowSpec(spec)
+        let run = try startWorkflowJob(spec)
+        return StepExecution(
+            result: .object(["workflowId": .string(run.id)]), table: nil, extraTables: []
+        )
+    }
+
+    private func stepCancelWorkflow(_ id: String) -> StepExecution {
+        let cancelled = cancelWorkflow(id)
+        return StepExecution(
+            result: .object(["cancelled": .bool(cancelled)]), table: nil, extraTables: []
+        )
+    }
+
+    private func stepInsert(_ table: String, _ doc: [String: JSONValue]) throws -> StepExecution {
+        let tableDef = try requireTable(table)
+        let id = try doInsert(table, tableDef, doc)
+        return StepExecution(result: .object(["id": .string(id)]), table: table, extraTables: [])
+    }
+
+    private func stepPatch(
+        _ table: String, _ id: String, _ fields: [String: JSONValue]
+    ) throws -> StepExecution {
+        let tableDef = try requireTable(table)
+        try doPatch(tableDef, table, id, fields)
+        return StepExecution(result: .null, table: table, extraTables: [])
+    }
+
+    private func stepAdjustCounter(
+        _ table: String, _ id: String, _ adjustment: CounterAdjustment
+    ) throws -> StepExecution {
+        let tableDef = try requireTable(table)
+        try doAdjustCounter(tableDef, table, id, adjustment)
+        return StepExecution(result: .null, table: table, extraTables: [])
+    }
+
+    private func stepReplace(
+        _ table: String, _ id: String, _ doc: [String: JSONValue]
+    ) throws -> StepExecution {
+        let tableDef = try requireTable(table)
+        try doReplace(tableDef, table, id, doc)
+        return StepExecution(result: .null, table: table, extraTables: [])
+    }
+
+    private func stepDelete(_ table: String, _ id: String) throws -> StepExecution {
+        let tableDef = try requireTable(table)
+        let extraTables = try doDelete(tableDef, table, id)
+        return StepExecution(result: .null, table: table, extraTables: extraTables)
+    }
+
+    private func stepUndelete(_ table: String, _ id: String) throws -> StepExecution {
+        let tableDef = try requireTable(table)
+        try doUndelete(tableDef, table, id)
+        return StepExecution(result: .null, table: table, extraTables: [])
+    }
+
+    private func stepExpectVersion(
+        _ table: String, _ id: String, _ version: Int64
+    ) throws -> StepExecution {
+        _ = try requireTable(table)
+        try doExpectVersion(table, id, version)
+        return StepExecution(result: .null, table: nil, extraTables: [])
+    }
+
+    private func stepExpectAbsent(
+        _ table: String, _ index: String, _ eq: [JSONValue]
+    ) throws -> StepExecution {
+        let tableDef = try requireTable(table)
+        let rows = try eqLookup(tableDef, table, index, eq)
+        if !rows.isEmpty {
+            throw RtDbError(
+                code: .preconditionFailed,
+                message: "index '\(index)' already has a matching document"
+            )
+        }
+        return StepExecution(result: .null, table: nil, extraTables: [])
+    }
+
+    private func stepUpsert(
+        _ table: String, _ index: String, _ eq: [JSONValue],
+        _ insert: [String: JSONValue], _ patch: [String: JSONValue]
+    ) throws -> StepExecution {
+        let tableDef = try requireTable(table)
+        let rows = try eqLookup(tableDef, table, index, eq)
+        if rows.count > 1 {
+            throw RtDbError(
+                code: .preconditionFailed, message: "upsert matched multiple documents"
+            )
+        }
+        guard let row = rows.first else {
+            let id = try doInsert(table, tableDef, insert)
+            return StepExecution(
+                result: .object(["id": .string(id), "inserted": .bool(true)]),
+                table: table, extraTables: []
+            )
+        }
+        let merged = try applyPatch(
+            tableDef, row.doc, stampUpdatedAt(tableDef, patch, nowFn()), now: nowFn()
+        )
+        try doUpdate(table, tableDef, row, merged)
+        return StepExecution(
+            result: .object(["id": .string(row.id), "inserted": .bool(false)]),
+            table: table, extraTables: []
+        )
+    }
+
+    private func stepPatchByQuery(
+        _ table: String, _ filter: FilterExpr, _ patch: [String: JSONValue], _ limit: UInt32?
+    ) throws -> StepExecution {
+        let tableDef = try requireTable(table)
+        let (rows, truncated) = try scanByQuery(tableDef, table, filter, limit)
+        for row in rows {
+            // Fresh stamp per row, exactly as the server restamps inside
+            // its per-row loop.
+            let merged = try applyPatch(
+                tableDef, row.doc, stampUpdatedAt(tableDef, patch, nowFn()), now: nowFn()
+            )
+            try doUpdate(table, tableDef, row, merged)
+        }
+        return StepExecution(
+            result: .object(["patched": .int(Int64(rows.count)), "truncated": .bool(truncated)]),
+            table: table, extraTables: []
+        )
+    }
+
+    private func stepDeleteByQuery(
+        _ table: String, _ filter: FilterExpr, _ limit: UInt32?
+    ) throws -> StepExecution {
+        let tableDef = try requireTable(table)
+        let (rows, truncated) = try scanByQuery(tableDef, table, filter, limit)
+        // FM-33: every matched row deletes through the same onDelete-aware
+        // path as a per-id delete, with ONE shared visited set and budget.
+        if tableDef.softDelete {
+            let now = nowFn()
+            for row in rows {
+                row.deletedAt = now
+                row.version += 1
+            }
+            return StepExecution(
+                result: .object(["deleted": .int(Int64(rows.count)), "truncated": .bool(truncated)]),
+                table: table, extraTables: []
+            )
+        }
+        let context = CascadeContext()
+        for row in rows {
+            try deleteRowCascade(table, row.id, context, forceHard: false)
+        }
+        return StepExecution(
+            result: .object(["deleted": .int(Int64(rows.count)), "truncated": .bool(truncated)]),
+            table: table, extraTables: Array(context.touched)
+        )
+    }
 
     private func doInsert(
         _ tableName: String, _ tableDef: TableDef, _ doc: [String: JSONValue]
@@ -2399,7 +2308,7 @@ public final class InMemoryRtDbClient: MigrationStore {
 }
 
 /// Extracts a stable message from a thrown error (the TS reads `Error.message`).
-private func errorMessage(_ error: Error) -> String {
+func errorMessage(_ error: Error) -> String {
     if let rtError = error as? RtDbError {
         return rtError.message
     }
