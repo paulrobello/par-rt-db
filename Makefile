@@ -39,6 +39,7 @@ SWIFT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(1),$(SW
 	go-client-typecheck go-client-checkall \
 	swift-client-build swift-client-test swift-client-lint swift-client-fmt \
 	swift-client-fmt-check swift-client-typecheck swift-client-checkall \
+	swift-client-deps audit-deps \
 	bench-micro bench bench-baseline \
 	grind-start grind-start-anthropic grind-start-zai grind-start-grok grind-start-codex \
 	grind-start-omp grind-stop grind-clean-logs
@@ -120,6 +121,35 @@ dev-db-down:
 # periodically. Requires psql on PATH and the dev Postgres up (make dev-db-up).
 dev-db-clean:
 	psql "$(RTDB_TEST_DATABASE_URL)" -f scripts/dev-db-clean.sql
+
+# ENH-051: SwiftPM has no advisory database, so the Swift ecosystem's audit is
+# a dependency *listing* only — the tree lands in the log for eyeball review.
+# Darwin-guarded like every other swift line, so audit-deps passes on Linux.
+swift-client-deps:
+	$(call SWIFT_IF_DARWIN,swift package show-dependencies --format json)
+
+# ENH-051: supply-chain audit across all six ecosystems. Needs the network
+# (advisory databases), so it stays out of `checkall`; run by hand and by the
+# weekly `deps-audit-weekly` CI job. Scanner versions are pinned: bump each one
+# deliberately, after checking the release notes.
+audit-deps: swift-client-deps
+	@mkdir -p target
+	@echo "=== [1/5] Rust: cargo audit (pinned 0.22.2) ==="
+	cargo audit --version
+	cargo audit --deny warnings
+	@echo "=== [2/5] ts-client: bun audit ==="
+	cd ts-client && bun audit
+	@echo "=== [3/5] dashboard: bun audit ==="
+	cd dashboard && bun audit
+	@echo "=== [4/5] python-client: pip-audit (pinned 2.10.1) ==="
+	@# --no-emit-project drops the `-e .` self-entry pip-audit cannot parse;
+	@# --no-deps + --disable-pip: the export is already a fully resolved,
+	@# exact-pinned set, and pip-audit's pip-resolution mode builds a venv via
+	@# ensurepip, which crashes (SIGABRT) under uv-managed CPython 3.14.
+	cd python-client && uv export --frozen --no-hashes --no-emit-project > ../target/requirements-audit.txt
+	uvx pip-audit@2.10.1 --strict --no-deps --disable-pip -r target/requirements-audit.txt
+	@echo "=== [5/5] go-client: govulncheck (golang.org/x/vuln v1.8.0) ==="
+	cd go-client && go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 
 # ARC-014: one workspace-level `cargo test` instead of four per-crate
 # invocations. --all-features is REQUIRED, not optional: rust-client declares

@@ -10,6 +10,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
   schedule:
     - cron: '17 4 * * 1'
@@ -214,6 +215,49 @@ jobs:
         run: make dev-db-up
       - name: Run property tests
         run: cargo test --manifest-path server/Cargo.toml --all-features --test main proptest_parity
+
+  # ENH-051: weekly supply-chain audit across all six ecosystems
+  # (`make audit-deps`: cargo audit, bun audit for both bun workspaces,
+  # pip-audit, govulncheck, plus a SwiftPM dependency listing). Network-bound
+  # (advisory databases), so it runs here on the weekly schedule and on demand
+  # via workflow_dispatch — never inside `make checkall`. The Swift advisory gap
+  # is inherent: SwiftPM has no advisory database, so Swift gets a listing only.
+  deps-audit-weekly:
+    name: dependency audit (make audit-deps)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: stable
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2.9.2
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2.2.0
+      - name: Set up uv
+        uses: astral-sh/setup-uv@227a0f6bea25cde3444f52decccf4a18de6635f4
+        with:
+          enable-cache: true
+      - name: Set up Go
+        uses: actions/setup-go@90ad2b35f69faf97585ad74d28fa006d2739b7af
+        with:
+          go-version: "1.23"
+          cache-dependency-path: go-client/go.sum
+      # SEC-138: pinned to an immutable commit SHA. The action ref above pins
+      # the installer; this pins the audit scanner itself so a weekly run
+      # reproduces the locally-verified verdict. Bump both deliberately.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29
+        with:
+          tool: cargo-audit@0.22.2
+      - name: Run dependency audit
+        run: make audit-deps
 
   # --- Swift client (macOS runner) --------------------------------------
   # `swift build`/`swift test` need the Swift 6 toolchain, which ships with the

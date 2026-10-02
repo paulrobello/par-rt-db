@@ -41,7 +41,9 @@ to crates.io / npm / PyPI is a separate, user-approved decision.
 3. **Run the gate**: `make checkall` from the repo root must be green. On
    Darwin that already sweeps `swift-client` (the aggregate fmt/lint/typecheck/
    test targets carry Darwin-guarded swift lines); on Linux those lines skip
-   loudly and the macOS CI job runs `make swift-client-checkall`.
+   loudly and the macOS CI job runs `make swift-client-checkall`. Also run
+   `make audit-deps` (needs the network; not part of the gate) so no known
+   dependency vulnerability ships in the tag.
 4. **Commit**: `release: v0.x.y` (versions, lockfiles, CHANGELOG together).
 5. **Tag the release commit** (annotated, so it carries the release message):
    ```bash

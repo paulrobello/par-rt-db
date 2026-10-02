@@ -12,6 +12,7 @@ notes), see [`CLAUDE.md`](CLAUDE.md).
 - [The build gate](#the-build-gate)
 - [Running tests](#running-tests)
 - [Benchmarks](#benchmarks)
+- [Dependency audit](#dependency-audit)
 - [Style and formatting](#style-and-formatting)
 - [Commit messages](#commit-messages)
 - [Versioning](#versioning)
@@ -219,6 +220,21 @@ bench/results/<sha>.json` — exits 1 on any metric regressing more than 15%
 (latency up, throughput down). If `bench/baseline.json` is stale or still the
 placeholder shipped with ENH-033, run `make bench-baseline` (from the dev
 Mac, against a local server) to capture a real one.
+
+## Dependency audit
+
+`make audit-deps` scans every ecosystem's dependencies against the advisory
+databases: `cargo audit` (Rust), `bun audit` (`ts-client` and `dashboard`),
+`pip-audit` (python-client), `govulncheck` (go-client), and a SwiftPM
+dependency listing (SwiftPM has no advisory database, so Swift is a listing
+only — a documented gap). It exits non-zero on any known vulnerability and
+needs the network, so it is deliberately **not** part of `make checkall`;
+CI runs it weekly (the `deps-audit-weekly` job) and you can run it by hand any
+time. Scanner versions are pinned in the `audit-deps` target — bump them
+deliberately. `cargo audit --deny warnings` also fails on yanked and
+unmaintained crates; a crate with no fixed release gets a documented `ignore`
+entry in `.cargo/audit.toml` (advisory ID plus the reason), never a silently
+dropped flag. Run it before tagging a release (see `docs/RELEASING.md`).
 
 ## Style and formatting
 
