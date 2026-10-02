@@ -61,6 +61,7 @@ async fn insert_note(
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("insert note");
@@ -537,6 +538,7 @@ async fn insert_post(
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("insert post");

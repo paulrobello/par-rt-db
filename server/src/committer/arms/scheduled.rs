@@ -65,7 +65,7 @@ pub(in crate::committer) async fn handle_scheduled(
         let _ = scheduler::mark_error(&ctx.pool, &ctx.db, &id, &e.message).await;
         return Ok(());
     }
-    match execute_txn(&ctx.pool, &ctx.db, &schema, &txn, &fire_ctx).await {
+    match execute_txn(&ctx.pool, &ctx.db, &schema, &txn, &fire_ctx, None).await {
         Ok(outcome) => {
             // Four-tap publication (fan_out → op-feed → audit → webhook → quota-
             // refresh). System-enqueued jobs carry no interactive principal

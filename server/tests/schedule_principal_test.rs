@@ -115,6 +115,7 @@ async fn seed_note(pool: &sqlx::PgPool, db: &str, title: &str, uid: &str) -> Str
         &schema,
         &txn,
         &rtdb_server::auth::PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("seed insert");

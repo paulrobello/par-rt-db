@@ -233,6 +233,7 @@ async fn schedule_step_commits_atomically_with_writes() -> anyhow::Result<()> {
             ],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
 
@@ -281,6 +282,7 @@ async fn schedule_step_rolls_back_with_failed_txn() -> anyhow::Result<()> {
             ],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect_err("ExpectVersion on a missing doc must fail");
@@ -328,6 +330,7 @@ async fn bad_when_rolls_back_writes() -> anyhow::Result<()> {
                 ],
             },
             &PrincipalCtx::bypass(),
+            None,
         )
         .await
         .expect_err("invalid when must reject the txn");
@@ -368,6 +371,7 @@ async fn cancel_schedule_step_result_and_idempotence() -> anyhow::Result<()> {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     let id = outcome.results[0]["scheduleId"]
@@ -383,6 +387,7 @@ async fn cancel_schedule_step_result_and_idempotence() -> anyhow::Result<()> {
             steps: vec![Step::CancelSchedule { id: id.clone() }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     assert_eq!(
@@ -399,6 +404,7 @@ async fn cancel_schedule_step_result_and_idempotence() -> anyhow::Result<()> {
             steps: vec![Step::CancelSchedule { id: id.clone() }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     assert_eq!(
@@ -434,6 +440,7 @@ async fn cancel_step_commits_atomically_with_writes() -> anyhow::Result<()> {
             ],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
 
@@ -481,6 +488,7 @@ async fn scoped_token_cannot_enqueue_forbidden_table() -> anyhow::Result<()> {
             }],
         },
         &scoped,
+        None,
     )
     .await
     .expect_err("scoped token must not write workItems directly");
@@ -508,6 +516,7 @@ async fn scoped_token_cannot_enqueue_forbidden_table() -> anyhow::Result<()> {
             ],
         },
         &scoped,
+        None,
     )
     .await
     .expect_err("scoped token must not enqueue a workItems write");
@@ -540,6 +549,7 @@ async fn scoped_token_cannot_enqueue_forbidden_table() -> anyhow::Result<()> {
             ],
         },
         &scoped,
+        None,
     )
     .await?;
     assert!(ok.results[1]["scheduleId"].as_str().is_some());
@@ -574,7 +584,7 @@ async fn recursive_step_budget() -> anyhow::Result<()> {
             }))
             .collect(),
     };
-    let err = execute_txn(&pool, &db, &schema, &over, &PrincipalCtx::bypass())
+    let err = execute_txn(&pool, &db, &schema, &over, &PrincipalCtx::bypass(), None)
         .await
         .expect_err("1026 recursive steps must be rejected");
     assert_eq!(err.code, ErrorCode::BadRequest);
@@ -596,7 +606,7 @@ async fn recursive_step_budget() -> anyhow::Result<()> {
             }))
             .collect(),
     };
-    let outcome = execute_txn(&pool, &db, &schema, &exact, &PrincipalCtx::bypass()).await?;
+    let outcome = execute_txn(&pool, &db, &schema, &exact, &PrincipalCtx::bypass(), None).await?;
     assert!(outcome.results[511]["scheduleId"].as_str().is_some());
     assert_eq!(table_count(&pool, &db, &schema, "projects").await?, 511);
     assert_eq!(scheduler::list(&pool, &db).await?.len(), 1);

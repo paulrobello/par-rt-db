@@ -59,6 +59,7 @@ async fn run(
         schema,
         &Transaction { steps },
         &rtdb_server::auth::PrincipalCtx::bypass(),
+        None,
     )
     .await?)
 }

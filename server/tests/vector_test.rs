@@ -255,6 +255,7 @@ async fn insert_maintains_vector_column() {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("insert vector doc");
@@ -288,6 +289,7 @@ async fn patch_maintains_vector_column() {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("insert vector doc");
@@ -311,6 +313,7 @@ async fn patch_maintains_vector_column() {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("patch vector embedding");
@@ -345,6 +348,7 @@ async fn vector_search_ranks_by_cosine_and_applies_limit() {
                 }],
             },
             &PrincipalCtx::bypass(),
+            None,
         )
         .await
         .expect("insert vector doc");
@@ -590,6 +594,7 @@ async fn vector_search_applies_eq_filter() {
                 }],
             },
             &PrincipalCtx::bypass(),
+            None,
         )
         .await
         .expect("insert vector doc with userId");
@@ -752,6 +757,7 @@ async fn hybrid_search_fuses_text_and_vector_via_rrf() {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("insert both");
@@ -767,6 +773,7 @@ async fn hybrid_search_fuses_text_and_vector_via_rrf() {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("insert text-only");
@@ -782,6 +789,7 @@ async fn hybrid_search_fuses_text_and_vector_via_rrf() {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("insert vector-only");
@@ -829,6 +837,7 @@ async fn hybrid_search_auto_selects_and_names_indexes() {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("insert");
@@ -1104,6 +1113,7 @@ async fn vector_search_honors_declared_metric() {
                     }],
                 },
                 &PrincipalCtx::bypass(),
+                None,
             )
             .await
             .expect("insert vector doc");
@@ -1254,6 +1264,7 @@ async fn vector_search_paginate_pages_reconstruct_the_unpaginated_ranking() {
                 }],
             },
             &PrincipalCtx::bypass(),
+            None,
         )
         .await
         .expect("insert doc");
@@ -1342,6 +1353,7 @@ async fn vector_search_paginate_limit_bounds_the_candidate_pool() {
                 }],
             },
             &PrincipalCtx::bypass(),
+            None,
         )
         .await
         .expect("insert doc");
@@ -1386,6 +1398,7 @@ async fn hybrid_search_paginate_pages_reconstruct_the_unpaginated_ranking() {
                 }],
             },
             &PrincipalCtx::bypass(),
+            None,
         )
         .await
         .expect("insert hybrid doc");
@@ -1518,6 +1531,7 @@ async fn hybrid_search_paginate_binds_after_the_owner_predicate() {
                 }],
             },
             &PrincipalCtx::bypass(),
+            None,
         )
         .await
         .expect("insert hybrid doc");

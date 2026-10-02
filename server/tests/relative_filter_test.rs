@@ -103,6 +103,7 @@ async fn seed(
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .unwrap();
@@ -174,6 +175,7 @@ async fn patch_by_query_older_than_patches_old_rows_only() -> anyhow::Result<()>
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     assert_eq!(outcome.results[0]["patched"], 1, "only the old row matches");
@@ -204,6 +206,7 @@ async fn delete_by_query_older_than_deletes_old_rows_only() -> anyhow::Result<()
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     assert_eq!(outcome.results[0]["deleted"], 1, "only the old row matches");
@@ -253,6 +256,7 @@ async fn patch_by_query_older_than_takes_the_int64_column_path() -> anyhow::Resu
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     assert_eq!(outcome.results[0]["patched"], 1);
@@ -337,6 +341,7 @@ async fn patch_by_query_older_than_rejects_non_numeric_field_and_negative_ms() -
                 }],
             },
             &PrincipalCtx::bypass(),
+            None,
         )
         .await
         .unwrap_err();

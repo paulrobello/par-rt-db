@@ -217,6 +217,7 @@ async fn run_steps(
         schema,
         &Transaction { steps },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
 }
@@ -925,6 +926,7 @@ async fn cascade_child_lookup_bypasses_per_row_owner_auth() {
             }],
         },
         &alice,
+        None,
     )
     .await
     .expect("insert child as alice");
@@ -951,6 +953,7 @@ async fn cascade_child_lookup_bypasses_per_row_owner_auth() {
             }],
         },
         &bob,
+        None,
     )
     .await
     .expect_err("bob cannot patch alice's child");
@@ -968,6 +971,7 @@ async fn cascade_child_lookup_bypasses_per_row_owner_auth() {
             }],
         },
         &bob,
+        None,
     )
     .await
     .expect("parent delete as bob cascades");

@@ -61,6 +61,7 @@ async fn insert(
             }],
         },
         &rtdb_server::auth::PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     Ok(outcome.results[0]["id"].as_str().expect("id").to_string())
@@ -220,6 +221,7 @@ async fn patch_does_not_reapply_after_clear() -> anyhow::Result<()> {
             }],
         },
         &rtdb_server::auth::PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     let doc = fetch_doc(&pool, &db, &id).await?;
@@ -241,6 +243,7 @@ async fn patch_does_not_reapply_after_clear() -> anyhow::Result<()> {
             }],
         },
         &rtdb_server::auth::PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     let doc = fetch_doc(&pool, &db, &id).await?;
@@ -282,6 +285,7 @@ async fn replace_reapplies_defaults() -> anyhow::Result<()> {
             }],
         },
         &rtdb_server::auth::PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     let doc = fetch_doc(&pool, &db, &id).await?;
@@ -315,6 +319,7 @@ async fn upsert_insert_applies_and_update_does_not() -> anyhow::Result<()> {
             }],
         },
         &rtdb_server::auth::PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     let id = outcome.results[0]["id"].as_str().unwrap().to_string();
@@ -342,6 +347,7 @@ async fn upsert_insert_applies_and_update_does_not() -> anyhow::Result<()> {
             }],
         },
         &rtdb_server::auth::PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     let doc = fetch_doc(&pool, &db, &id).await?;
@@ -388,6 +394,7 @@ async fn ttl_default_wins_over_defaults_entry() -> anyhow::Result<()> {
             }],
         },
         &rtdb_server::auth::PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     let id = outcome.results[0]["id"].as_str().unwrap().to_string();

@@ -46,6 +46,7 @@ async fn seed_projects(pool: &sqlx::PgPool, db: &str, schema: &SchemaDef, n: usi
                 }],
             },
             &PrincipalCtx::bypass(),
+            None,
         )
         .await
         .expect("seed project row");

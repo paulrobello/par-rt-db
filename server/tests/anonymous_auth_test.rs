@@ -339,6 +339,7 @@ async fn anonymous_owns_its_inserted_docs() -> anyhow::Result<()> {
             }],
         },
         &ctx,
+        None,
     )
     .await?;
     let id = outcome.results[0]["id"].as_str().expect("id").to_string();

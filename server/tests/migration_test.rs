@@ -66,6 +66,7 @@ async fn insert_doc(db: &Db, table: &str, doc_json: &str) -> String {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("insert doc");

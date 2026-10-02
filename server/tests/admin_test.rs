@@ -519,6 +519,7 @@ async fn export_then_import_round_trips_docs_indexes_and_schema() -> anyhow::Res
             ],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     let project_id = insert_outcome.results[0]["id"]
@@ -545,6 +546,7 @@ async fn export_then_import_round_trips_docs_indexes_and_schema() -> anyhow::Res
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
 
@@ -659,6 +661,7 @@ async fn clone_db_round_trips_schema_and_documents() -> anyhow::Result<()> {
             ],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     let project_id = outcome.results[0]["id"]
@@ -679,6 +682,7 @@ async fn clone_db_round_trips_schema_and_documents() -> anyhow::Result<()> {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
 
@@ -903,6 +907,7 @@ async fn import_db_doc_replay_failure_after_schema_commit_refreshes_schema_cache
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     let existing_id = insert_outcome.results[0]["id"]

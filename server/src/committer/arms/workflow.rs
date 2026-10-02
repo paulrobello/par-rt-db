@@ -204,7 +204,7 @@ pub(in crate::committer) async fn handle_workflow_advance(
         };
         let exec = match quota_err.take() {
             Some(e) => Err(e),
-            None => execute_txn(&ctx.pool, &ctx.db, &schema, txn, &fire_ctx).await,
+            None => execute_txn(&ctx.pool, &ctx.db, &schema, txn, &fire_ctx, None).await,
         };
         match exec {
             Ok(outcome) => {

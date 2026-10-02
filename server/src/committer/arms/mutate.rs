@@ -50,7 +50,38 @@ pub(in crate::committer) async fn handle_mutate(
             .record_quota_rejection(&ctx.db, crate::metrics::QuotaKind::Storage);
         return Err(e);
     }
-    let outcome = execute_txn(&ctx.pool, &ctx.db, &schema, &txn, &principal_ctx).await?;
+    // ARC-003: the dedup row is written inside execute_txn's transaction
+    // (atomic with the write it guards), so this arm no longer fills the cache
+    // post-commit. The TTL is read live from hot config so a
+    // `PATCH /admin/config` to `idempotencyTtlMs` takes effect on the next
+    // mutate, no restart.
+    let idem = idempotency_key
+        .as_deref()
+        .map(|key| (key, ctx.hot.load().idempotency_ttl_ms));
+    let outcome = match execute_txn(&ctx.pool, &ctx.db, &schema, &txn, &principal_ctx, idem).await {
+        Ok(outcome) => outcome,
+        Err(err) if crate::txn::is_idempotency_replay(&err) => {
+            // A previous execution already committed under this key (its
+            // dedup row raced ours inside the serialized turn). Replay the
+            // stored result with an empty write set — no second fan-out.
+            let key = idempotency_key.as_deref().unwrap_or_default();
+            let results = mutation_log::check(&ctx.pool, &ctx.db, key)
+                .await?
+                .ok_or_else(|| {
+                    tracing::error!(
+                        db = %ctx.db,
+                        key,
+                        "idempotency replay flagged but no cached result found"
+                    );
+                    RtDbError::internal("failed to read cached mutation result")
+                })?;
+            return Ok(TxnOutcome {
+                results,
+                write_set: WriteSet::default(),
+            });
+        }
+        Err(err) => return Err(err),
+    };
     // Four-tap publication (fan_out → op-feed → audit → webhook → quota-refresh).
     // `owner = principal_ctx.user_id` carries the interactive uid into the
     // op-feed/audit/webhook payloads; `source = "mutate"` distinguishes the
@@ -65,25 +96,6 @@ pub(in crate::committer) async fn handle_mutate(
         true,
     )
     .await;
-
-    if let Some(key) = &idempotency_key {
-        // The dedup TTL is read live from hot config so a `PATCH /admin/config`
-        // to `idempotencyTtlMs` takes effect on the next mutate, no restart.
-        // The mutation already committed and fanned out by this point — a
-        // caching failure here must never turn a successful write into a
-        // client-visible error. Best-effort: log and move on. (A retry with
-        // this key will simply re-execute, same as if it had never cached.)
-        let ttl_ms = ctx.hot.load().idempotency_ttl_ms;
-        if let Err(err) =
-            mutation_log::store(&ctx.pool, &ctx.db, key, &outcome.results, ttl_ms).await
-        {
-            tracing::error!(
-                db = %ctx.db,
-                error = %err,
-                "failed to cache mutation result for idempotency key; a retry with this key will re-execute"
-            );
-        }
-    }
 
     Ok(outcome)
 }

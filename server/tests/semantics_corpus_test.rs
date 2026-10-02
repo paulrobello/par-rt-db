@@ -391,7 +391,7 @@ pub async fn run_case(pool: &sqlx::PgPool, case_name: &str, case: &Value) {
             }],
         };
         let outcome: TxnOutcome =
-            execute_txn(pool, &db_name, &schema, &txn, &PrincipalCtx::bypass())
+            execute_txn(pool, &db_name, &schema, &txn, &PrincipalCtx::bypass(), None)
                 .await
                 .unwrap_or_else(|e| panic!("{case_name}: seed #{i} into '{table}': {e:?}"));
         if let Some(label) = label {
@@ -437,7 +437,7 @@ pub async fn run_case(pool: &sqlx::PgPool, case_name: &str, case: &Value) {
             assert_error_code(&e, expect, case_name);
             return; // a frozen op has no `then` follow-up
         }
-        match execute_txn(pool, &db_name, &schema, &txn, &PrincipalCtx::bypass()).await {
+        match execute_txn(pool, &db_name, &schema, &txn, &PrincipalCtx::bypass(), None).await {
             Ok(outcome) => Value::Array(outcome.results),
             Err(e) => {
                 if !expects_error {
@@ -608,7 +608,7 @@ pub async fn capture_case_expect(
             }],
         };
         let outcome: TxnOutcome =
-            execute_txn(pool, &db_name, &schema, &txn, &PrincipalCtx::bypass())
+            execute_txn(pool, &db_name, &schema, &txn, &PrincipalCtx::bypass(), None)
                 .await
                 .unwrap_or_else(|e| panic!("{case_name}: seed #{i} into '{table}': {e:?}"));
         if let Some(label) = label {
@@ -627,7 +627,7 @@ pub async fn capture_case_expect(
         if let Some(txn_json) = case.pointer("/op/txn") {
             let txn: Transaction = serde_json::from_value(substitute(txn_json, &ids, case_name))
                 .unwrap_or_else(|e| panic!("{case_name}: op.txn does not parse: {e}"));
-            match execute_txn(pool, &db_name, &schema, &txn, &PrincipalCtx::bypass()).await {
+            match execute_txn(pool, &db_name, &schema, &txn, &PrincipalCtx::bypass(), None).await {
                 Ok(outcome) => (Ok(Value::Array(outcome.results)), None),
                 Err(e) => (Err(e), None),
             }

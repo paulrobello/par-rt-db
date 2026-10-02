@@ -120,6 +120,7 @@ async fn seed_note(pool: &PgPool, db: &str, schema: &SchemaDef, title: &str, uid
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("seed insert");
@@ -349,6 +350,7 @@ async fn non_owner_table_is_unaffected_by_owner() -> anyhow::Result<()> {
                 }],
             },
             &PrincipalCtx::bypass(),
+            None,
         )
         .await?;
     }
@@ -582,6 +584,7 @@ async fn search_filters_to_own_rows() -> anyhow::Result<()> {
                 }],
             },
             &PrincipalCtx::bypass(),
+            None,
         )
         .await?;
     }
@@ -705,6 +708,7 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
                 }],
             },
             &PrincipalCtx::bypass(),
+            None,
         )
         .await?;
     }
@@ -844,6 +848,7 @@ async fn vector_search_composes_filter_fields_with_owner() -> anyhow::Result<()>
                 }],
             },
             &PrincipalCtx::bypass(),
+            None,
         )
         .await?;
     }
@@ -910,6 +915,7 @@ async fn insert_auto_stamps_owner() -> anyhow::Result<()> {
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect("insert should succeed");
@@ -947,6 +953,7 @@ async fn insert_cannot_forge_another_users_owner() -> anyhow::Result<()> {
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect("insert should succeed");
@@ -1003,6 +1010,7 @@ async fn patch_on_unowned_doc_is_forbidden_and_atomic() -> anyhow::Result<()> {
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect_err("patch on unowned doc must fail");
@@ -1056,6 +1064,7 @@ async fn delete_and_replace_on_unowned_doc_are_forbidden() -> anyhow::Result<()>
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect_err("delete on unowned doc must fail");
@@ -1087,6 +1096,7 @@ async fn delete_and_replace_on_unowned_doc_are_forbidden() -> anyhow::Result<()>
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect_err("replace on unowned doc must fail");
@@ -1132,6 +1142,7 @@ async fn upsert_insert_branch_stamps_and_update_branch_checks_owner() -> anyhow:
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect("upsert insert should succeed");
@@ -1168,6 +1179,7 @@ async fn upsert_insert_branch_stamps_and_update_branch_checks_owner() -> anyhow:
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect_err("upsert update on unowned doc must fail");
@@ -1203,6 +1215,7 @@ async fn machine_bypass_ignores_ownership() -> anyhow::Result<()> {
             }],
         },
         &PrincipalCtx::bypass(), // bypass — machine token / scheduled job
+        None,
     )
     .await
     .expect("bypass patch should succeed");
@@ -1247,6 +1260,7 @@ async fn patch_cannot_transfer_ownership() -> anyhow::Result<()> {
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect("patch on owned doc should succeed");
@@ -1311,6 +1325,7 @@ async fn replace_cannot_transfer_ownership() -> anyhow::Result<()> {
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect("replace on owned doc should succeed");
@@ -1830,6 +1845,7 @@ async fn seed_collab_note(
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("seed insert");
@@ -1926,6 +1942,7 @@ async fn collab_missing_array_degrades_to_owner_only() -> anyhow::Result<()> {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
 
@@ -2049,6 +2066,7 @@ async fn collab_collaborator_can_write_non_collaborator_forbidden() -> anyhow::R
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect_err("non-collaborator patch must fail");
@@ -2076,6 +2094,7 @@ async fn collab_collaborator_can_write_non_collaborator_forbidden() -> anyhow::R
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect("collaborator patch should succeed");
@@ -2104,6 +2123,7 @@ async fn collab_collaborator_can_write_non_collaborator_forbidden() -> anyhow::R
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect_err("non-collaborator delete must fail");
@@ -2125,6 +2145,7 @@ async fn collab_collaborator_can_write_non_collaborator_forbidden() -> anyhow::R
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect("collaborator delete should succeed");
@@ -2161,6 +2182,7 @@ async fn collab_upsert_update_branch_checks_collaborator() -> anyhow::Result<()>
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect_err("non-collaborator upsert-update must fail");
@@ -2185,6 +2207,7 @@ async fn collab_upsert_update_branch_checks_collaborator() -> anyhow::Result<()>
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect("collaborator upsert-update should succeed");
@@ -2479,6 +2502,7 @@ async fn seed_post(
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("seed post insert");
@@ -2846,6 +2870,7 @@ async fn authorize_patch_on_unauthorized_doc_is_forbidden_and_atomic() -> anyhow
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect_err("patch on unauthorized doc must fail");
@@ -2903,6 +2928,7 @@ async fn authorize_patch_own_and_delete_other_public_succeed() -> anyhow::Result
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect("patch own doc should succeed");
@@ -2927,6 +2953,7 @@ async fn authorize_patch_own_and_delete_other_public_succeed() -> anyhow::Result
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect("delete other user's public doc should succeed");
@@ -2961,6 +2988,7 @@ async fn authorize_replace_and_delete_on_unauthorized_doc_are_forbidden() -> any
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect_err("delete on unauthorized doc must fail");
@@ -2993,6 +3021,7 @@ async fn authorize_replace_and_delete_on_unauthorized_doc_are_forbidden() -> any
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect_err("replace on unauthorized doc must fail");
@@ -3043,6 +3072,7 @@ async fn authorize_upsert_update_on_unauthorized_doc_is_forbidden() -> anyhow::R
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect_err("upsert update on unauthorized doc must fail");
@@ -3079,6 +3109,7 @@ async fn authorize_bypass_write_ignores_predicate() -> anyhow::Result<()> {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("bypass patch should succeed");
@@ -3292,6 +3323,7 @@ async fn authorize_insert_stamps_eq_user_leaf_to_caller() -> anyhow::Result<()> 
             }],
         },
         &alice_ctx(),
+        None,
     )
     .await
     .expect("insert should succeed: owner is stamped to caller");
@@ -3331,6 +3363,7 @@ async fn authorize_insert_or_with_user_leaf_always_succeeds() -> anyhow::Result<
             }],
         },
         &alice_ctx(),
+        None,
     )
     .await
     .expect("insert should succeed: owner arm is stamped to caller");
@@ -3369,6 +3402,7 @@ async fn authorize_insert_without_user_leaf_forbidden_when_predicate_fails() -> 
             }],
         },
         &alice_ctx(),
+        None,
     )
     .await
     .expect_err("insert must fail: visibility=private fails the predicate");
@@ -3431,6 +3465,7 @@ async fn authorize_insert_with_array_only_predicate_forbidden_when_self_omitted(
             }],
         },
         &alice_ctx(),
+        None,
     )
     .await
     .expect_err("insert must fail: alice is not in editors");
@@ -3461,6 +3496,7 @@ async fn authorize_insert_with_array_only_predicate_succeeds_when_self_included(
             }],
         },
         &alice_ctx(),
+        None,
     )
     .await
     .expect("insert should succeed: alice is in editors");
@@ -3501,6 +3537,7 @@ async fn authorize_insert_bypass_skips_stamp_and_verify() -> anyhow::Result<()> 
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("bypass insert should skip authorize verify");
@@ -3543,6 +3580,7 @@ async fn authorize_upsert_insert_stamps_eq_user_leaf_to_caller() -> anyhow::Resu
             }],
         },
         &alice_ctx(),
+        None,
     )
     .await
     .expect("upsert-insert should succeed: owner is stamped to caller");
@@ -3627,6 +3665,7 @@ async fn authorize_patch_re_stamps_eq_user_leaf_closing_injection() -> anyhow::R
             }],
         },
         &alice_ctx(),
+        None,
     )
     .await
     .expect("insert ok");
@@ -3650,6 +3689,7 @@ async fn authorize_patch_re_stamps_eq_user_leaf_closing_injection() -> anyhow::R
             }],
         },
         &alice_ctx(),
+        None,
     )
     .await
     .expect("patch ok (owner re-stamped to alice)");
@@ -3707,6 +3747,7 @@ async fn authorize_replace_re_stamps_eq_user_leaf() -> anyhow::Result<()> {
             }],
         },
         &alice_ctx(),
+        None,
     )
     .await
     .expect("insert ok");
@@ -3732,6 +3773,7 @@ async fn authorize_replace_re_stamps_eq_user_leaf() -> anyhow::Result<()> {
             }],
         },
         &alice_ctx(),
+        None,
     )
     .await
     .expect("replace ok (owner re-stamped to alice)");
@@ -3772,6 +3814,7 @@ async fn authorize_patch_no_user_leaf_forbidden_when_predicate_fails() -> anyhow
             }],
         },
         &alice_ctx(),
+        None,
     )
     .await
     .expect("insert ok (visibility=public satisfies the predicate)");
@@ -3795,6 +3838,7 @@ async fn authorize_patch_no_user_leaf_forbidden_when_predicate_fails() -> anyhow
             }],
         },
         &alice_ctx(),
+        None,
     )
     .await
     .expect_err("patch must fail: visibility=private fails the predicate");
@@ -3831,6 +3875,7 @@ async fn authorize_bypass_patch_skips_stamp_and_verify() -> anyhow::Result<()> {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("bypass insert ok");
@@ -3854,6 +3899,7 @@ async fn authorize_bypass_patch_skips_stamp_and_verify() -> anyhow::Result<()> {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("bypass patch ok");
@@ -3892,6 +3938,7 @@ async fn authorize_upsert_update_re_stamps_eq_user_leaf() -> anyhow::Result<()> 
             }],
         },
         &alice_ctx(),
+        None,
     )
     .await
     .expect("insert ok");
@@ -3920,6 +3967,7 @@ async fn authorize_upsert_update_re_stamps_eq_user_leaf() -> anyhow::Result<()> 
             }],
         },
         &alice_ctx(),
+        None,
     )
     .await
     .expect("upsert-update ok (owner re-stamped to alice)");
@@ -4015,6 +4063,7 @@ async fn seed_doc(
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("seed doc insert");
@@ -4112,6 +4161,7 @@ async fn owner_and_authorize_both_gates_must_pass() -> anyhow::Result<()> {
             }],
         },
         &alice,
+        None,
     )
     .await
     .expect_err("patch on owner-pass/auth-fail must be forbidden");
@@ -4132,6 +4182,7 @@ async fn owner_and_authorize_both_gates_must_pass() -> anyhow::Result<()> {
             }],
         },
         &alice,
+        None,
     )
     .await
     .expect_err("patch on auth-pass/owner-fail must be forbidden");
@@ -4165,6 +4216,7 @@ async fn expect_version_does_not_leak_unowned_doc() -> anyhow::Result<()> {
                 }],
             },
             &alice,
+            None,
         )
         .await
         .expect_err("expectVersion on unowned doc must not succeed");
@@ -4203,6 +4255,7 @@ async fn expect_version_own_doc_behaves_as_before() -> anyhow::Result<()> {
             }],
         },
         &alice,
+        None,
     )
     .await
     .expect_err("wrong version must fail");
@@ -4220,6 +4273,7 @@ async fn expect_version_own_doc_behaves_as_before() -> anyhow::Result<()> {
             }],
         },
         &alice,
+        None,
     )
     .await
     .expect("matching version succeeds");
@@ -4236,6 +4290,7 @@ async fn expect_version_own_doc_behaves_as_before() -> anyhow::Result<()> {
             }],
         },
         &alice,
+        None,
     )
     .await
     .expect_err("absent doc must fail");
@@ -4266,6 +4321,7 @@ async fn expect_version_bypass_is_unaffected() -> anyhow::Result<()> {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("bypass sees the doc");
@@ -4282,6 +4338,7 @@ async fn expect_version_bypass_is_unaffected() -> anyhow::Result<()> {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect_err("wrong version must fail for bypass too");
@@ -4325,6 +4382,7 @@ async fn expect_version_authorize_hides_invisible_doc() -> anyhow::Result<()> {
             }],
         },
         &alice,
+        None,
     )
     .await
     .expect_err("invisible doc must not be probeable");
@@ -4347,6 +4405,7 @@ async fn expect_version_authorize_hides_invisible_doc() -> anyhow::Result<()> {
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect_err("owner sees a wrong version");
@@ -4391,6 +4450,7 @@ async fn expect_absent_does_not_leak_unowned_doc() -> anyhow::Result<()> {
             }],
         },
         &alice,
+        None,
     )
     .await
     .expect("alice sees bob's key as absent");
@@ -4408,6 +4468,7 @@ async fn expect_absent_does_not_leak_unowned_doc() -> anyhow::Result<()> {
             }],
         },
         &alice,
+        None,
     )
     .await
     .expect("unused key is absent");
@@ -4437,6 +4498,7 @@ async fn expect_absent_own_doc_behaves_as_before() -> anyhow::Result<()> {
             }],
         },
         &alice,
+        None,
     )
     .await
     .expect_err("own row must be present");
@@ -4462,6 +4524,7 @@ async fn expect_absent_bypass_is_unaffected() -> anyhow::Result<()> {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect_err("bypass sees bob's row as present");
@@ -4493,6 +4556,7 @@ async fn expect_absent_collaborators_visibility() -> anyhow::Result<()> {
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect("non-collaborator sees the key as absent");
@@ -4513,6 +4577,7 @@ async fn expect_absent_collaborators_visibility() -> anyhow::Result<()> {
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect_err("collaborator sees the row as present");
@@ -4550,6 +4615,7 @@ async fn expect_absent_authorize_hides_invisible_doc() -> anyhow::Result<()> {
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect("non-matching user sees bob's key as absent");
@@ -4571,6 +4637,7 @@ async fn expect_absent_authorize_hides_invisible_doc() -> anyhow::Result<()> {
             email: None,
             ..Default::default()
         },
+        None,
     )
     .await
     .expect_err("owner sees his own row as present");

@@ -170,6 +170,55 @@ const CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60)
 /// cleanup cadence does not affect correctness.
 const CLEANUP_INTERVAL_IDLE: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Transaction-scoped variant of [`store`] (ARC-003): inserts the dedup row on
+/// the SAME connection/transaction as the document writes, so "committed" and
+/// "deduplicated" become atomic — a crash between the two can no longer leave a
+/// committed write that a takeover resubmit re-applies. An expired row for the
+/// key is deleted first, matching `check`'s read-time `expires_at > now` filter
+/// (an expired entry is treated as absent). Returns `true` when the row was
+/// inserted (first execution), `false` when a still-live row for `mut_id`
+/// exists (`ON CONFLICT DO NOTHING` skipped the insert — a concurrent or
+/// previous execution committed under this key and the caller must roll back
+/// and replay instead of double-applying).
+pub async fn store_on(
+    conn: &mut sqlx::PgConnection,
+    db: &str,
+    mut_id: &str,
+    results: &[Value],
+    ttl_ms: i64,
+) -> Result<bool, RtDbError> {
+    validate_db_name(db)?;
+    let schema = pg_schema(db);
+    let now = now_ms();
+    let expires_at = now + ttl_ms;
+    let value = serde_json::to_value(results).map_err(|err| {
+        tracing::error!(error = %err, db, mut_id, "failed to serialize mutation result for caching");
+        RtDbError::internal("failed to cache mutation result")
+    })?;
+
+    // An expired row is semantically absent to `check`; clear it so the insert
+    // below is not blocked by a stale key. Same transaction — atomic.
+    sqlx::query(&format!(
+        "DELETE FROM \"{schema}\".mutations WHERE mut_id = $1 AND expires_at <= $2"
+    ))
+    .bind(mut_id)
+    .bind(now)
+    .execute(&mut *conn)
+    .await?;
+
+    let row: Option<(String,)> = sqlx::query_as(&format!(
+        "INSERT INTO \"{schema}\".mutations (mut_id, result, expires_at) VALUES ($1, $2, $3)
+         ON CONFLICT (mut_id) DO NOTHING
+         RETURNING mut_id"
+    ))
+    .bind(mut_id)
+    .bind(value)
+    .bind(expires_at)
+    .fetch_optional(conn)
+    .await?;
+    Ok(row.is_some())
+}
+
 /// Caches `results` under `mut_id` for `ttl_ms`. Uses `ON CONFLICT DO NOTHING`
 /// as a safety net only — the per-db committer already serializes every
 /// mutation for `db`, so two concurrent stores of the same `mut_id` cannot

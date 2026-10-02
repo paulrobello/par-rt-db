@@ -492,6 +492,7 @@ async fn start_workflow_step_is_atomic_with_writes() -> anyhow::Result<()> {
             ],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     assert!(
@@ -520,6 +521,7 @@ async fn start_workflow_step_is_atomic_with_writes() -> anyhow::Result<()> {
             ],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect_err("ExpectVersion on a missing doc must fail");
@@ -552,6 +554,7 @@ async fn cancel_workflow_step_result_shape() -> anyhow::Result<()> {
             steps: vec![Step::CancelWorkflow { id: id.clone() }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     assert_eq!(
@@ -568,6 +571,7 @@ async fn cancel_workflow_step_result_shape() -> anyhow::Result<()> {
             steps: vec![Step::CancelWorkflow { id }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     assert_eq!(
@@ -602,6 +606,7 @@ async fn spec_bounds_and_allowlist_rejected() -> anyhow::Result<()> {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect_err("empty workflow spec must be rejected");
@@ -636,6 +641,7 @@ async fn spec_bounds_and_allowlist_rejected() -> anyhow::Result<()> {
             }],
         },
         &scoped,
+        None,
     )
     .await
     .expect_err("scoped token must not start a workflow writing workItems");
@@ -674,6 +680,7 @@ async fn spec_bounds_and_allowlist_rejected() -> anyhow::Result<()> {
             }],
         },
         &scoped,
+        None,
     )
     .await
     .expect_err("scoped token must not smuggle a workflow via Schedule");

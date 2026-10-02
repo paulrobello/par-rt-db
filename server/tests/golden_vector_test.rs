@@ -188,7 +188,7 @@ async fn seed_db(fx: &Fixture) -> anyhow::Result<(String, SchemaDef, TestDb)> {
                 doc: doc.as_object().expect("seed doc object").clone(),
             }],
         };
-        execute_txn(&pool, &name, &schema, &txn, &PrincipalCtx::bypass())
+        execute_txn(&pool, &name, &schema, &txn, &PrincipalCtx::bypass(), None)
             .await
             .map_err(|e| anyhow::anyhow!("seed insert #{i}: {e:?}"))?;
     }

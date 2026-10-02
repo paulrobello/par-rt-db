@@ -223,3 +223,125 @@ async fn expired_mut_id_re_executes() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ARC-003: the dedup row commits in the SAME transaction as the write, so
+// the `mutations` row is visible the instant the write is — no post-commit
+// cache-fill window a crash or takeover resubmit could fall into. A retry
+// under the same key replays the cached results and applies nothing.
+#[tokio::test]
+async fn dedup_row_commits_atomically_with_the_write() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+
+    let txn = Transaction {
+        steps: vec![Step::Insert {
+            table: "projects".to_string(),
+            doc: valid_project_doc(),
+        }],
+    };
+
+    let first = state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            Some("atomic-key".to_string()),
+            txn.clone(),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+
+    // No delay, no cleanup tick: the row must already be committed alongside
+    // the document write.
+    let pg_schema = format!("db_{db}");
+    let row: (serde_json::Value, i64) = sqlx::query_as(&format!(
+        "SELECT result, expires_at FROM \"{pg_schema}\".mutations WHERE mut_id = 'atomic-key'"
+    ))
+    .fetch_one(&state.pool)
+    .await?;
+    assert_eq!(row.0, serde_json::to_value(&first.results)?);
+    assert!(row.1 > rtdb_server::db::now_ms());
+
+    // Retry with no second write; version unchanged.
+    let second = state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            Some("atomic-key".to_string()),
+            txn,
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    assert_eq!(first.results, second.results);
+    let count: (i64,) = sqlx::query_as(&format!(
+        "SELECT COUNT(*) FROM \"{pg_schema}\".\"t_projects\""
+    ))
+    .fetch_one(&state.pool)
+    .await?;
+    assert_eq!(count.0, 1);
+
+    Ok(())
+}
+
+// ARC-003: a pre-existing dedup row makes a concurrent execution replay
+// instead of double-applying. `execute_txn` is called directly with the
+// `idem` tuple (bypassing the arm's `check` fast path) to prove the in-
+// transaction conflict detection rolls the second execution back.
+#[tokio::test]
+async fn pre_existing_key_row_replays_instead_of_double_applying() -> anyhow::Result<()> {
+    use rtdb_server::schema::SchemaDef;
+
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let schema: SchemaDef =
+        serde_json::from_value(crate::common::kanban_schema_json()).expect("parse kanban schema");
+
+    let txn = Transaction {
+        steps: vec![Step::Insert {
+            table: "projects".to_string(),
+            doc: valid_project_doc(),
+        }],
+    };
+
+    // Seed a still-live sentinel row for the key — as if another execution
+    // already committed under it.
+    let sentinel = vec![serde_json::json!({"replayed": true})];
+    mutation_log::store(
+        &state.pool,
+        &db,
+        "race-key",
+        &sentinel,
+        mutation_log::DEFAULT_DEDUP_TTL_MS,
+    )
+    .await?;
+
+    let err = rtdb_server::txn::execute_txn(
+        &state.pool,
+        &db,
+        &schema,
+        &txn,
+        &PrincipalCtx::bypass(),
+        Some(("race-key", mutation_log::DEFAULT_DEDUP_TTL_MS)),
+    )
+    .await
+    .expect_err("must be rejected as a replay");
+    assert!(
+        rtdb_server::txn::is_idempotency_replay(&err),
+        "expected the idempotency-replay marker, got {err:?}"
+    );
+
+    // The second execution's write rolled back: still zero documents, and the
+    // sentinel row is untouched.
+    let pg_schema = format!("db_{db}");
+    let count: (i64,) = sqlx::query_as(&format!(
+        "SELECT COUNT(*) FROM \"{pg_schema}\".\"t_projects\""
+    ))
+    .fetch_one(&state.pool)
+    .await?;
+    assert_eq!(count.0, 0);
+    let cached = mutation_log::check(&state.pool, &db, "race-key").await?;
+    assert_eq!(cached, Some(sentinel));
+
+    Ok(())
+}

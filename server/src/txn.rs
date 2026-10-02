@@ -1344,12 +1344,27 @@ pub fn worst_case_affected(txn: &Transaction) -> usize {
     par_rt_db_core::engine::worst_case_affected(txn, MAX_BY_QUERY_ROWS)
 }
 
+/// Internal signal (ARC-003) — never reaches the wire. `execute_txn` returns
+/// it when the idempotency insert inside the write transaction found an
+/// existing row, meaning a previous execution already committed under this
+/// key; the transaction has been rolled back and nothing was double-applied.
+/// `handle_mutate` matches it (via [`is_idempotency_replay`]) and replays the
+/// stored result instead of surfacing an error. Matched as an `Internal`-code
+/// error with this exact message, since `RtDbError` carries no private marker
+/// field and a new `ErrorCode` would extend the client-visible wire enum.
+pub const IDEMPOTENCY_REPLAY_MSG: &str = "idempotency key already committed";
+
+pub fn is_idempotency_replay(err: &RtDbError) -> bool {
+    err.code == ErrorCode::Internal && err.message == IDEMPOTENCY_REPLAY_MSG
+}
+
 pub async fn execute_txn(
     pool: &PgPool,
     db: &str,
     schema: &SchemaDef,
     txn: &Transaction,
     ctx: &PrincipalCtx,
+    idem: Option<(&str, i64)>,
 ) -> Result<TxnOutcome, RtDbError> {
     // ENH-018: `txn.execute` spans the write path so "the DSL is slow" vs
     // "Postgres is slow" is a distinguishable question. The step count is the
@@ -1507,6 +1522,19 @@ pub async fn execute_txn(
         // append on their own transactions (see the change-feed design spec).
         // The tables are ensured at committer startup and db creation, so the
         // append itself never needs DDL.
+        // ARC-003: record the dedup row in the SAME transaction as the writes,
+        // so "committed" and "deduplicated" are atomic — a crash between the
+        // write and a post-commit cache fill can no longer let a takeover
+        // resubmit re-apply an already-committed mutation. A `false` return
+        // means the key was already committed; rolling back here leaves the
+        // first execution's result in place for the caller to replay.
+        if let Some((key, ttl)) = idem {
+            let inserted = crate::mutation_log::store_on(&mut tx, db, key, &results, ttl).await?;
+            if !inserted {
+                return Err(RtDbError::internal(IDEMPOTENCY_REPLAY_MSG));
+            }
+        }
+
         crate::change_log::append(&mut tx, pg_schema_name.as_str(), &write_set).await?;
 
         tx.commit().await?;

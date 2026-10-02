@@ -48,6 +48,7 @@ async fn insert_project(
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     Ok(outcome.results[0]["id"]
@@ -81,6 +82,7 @@ async fn insert_work_item(
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     // Guarantee strictly increasing `created_at` between inserts so
@@ -3938,6 +3940,7 @@ async fn filter_range_on_jsonb_numeric_field() -> anyhow::Result<()> {
                 }],
             },
             &PrincipalCtx::bypass(),
+            None,
         )
         .await?;
         tokio::time::sleep(Duration::from_millis(2)).await;
@@ -4279,6 +4282,7 @@ async fn insert_event(
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     Ok(outcome.results[0]["id"]
@@ -4960,6 +4964,7 @@ async fn projection_collect_sql_returns_only_requested_fields() -> anyhow::Resul
                 }],
             },
             &PrincipalCtx::bypass(),
+            None,
         )
         .await?;
     }
@@ -5101,6 +5106,7 @@ async fn projection_keeps_owner_and_collaborator_authorization() -> anyhow::Resu
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
 

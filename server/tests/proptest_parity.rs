@@ -748,9 +748,16 @@ async fn run_case(pool: &sqlx::PgPool, case: &Case) -> Result<(), String> {
         .map_err(|e| format!("push_schema (generator bug?): {e:?}"))?;
     let seed: ServerTransaction = serde_json::from_value(seed_json.clone())
         .map_err(|e| format!("server seed parse (generator bug): {e}"))?;
-    execute_txn(pool, &db_name, &schema, &seed, &PrincipalCtx::bypass())
-        .await
-        .map_err(|e| format!("server seed txn (generator bug?): {e:?}"))?;
+    execute_txn(
+        pool,
+        &db_name,
+        &schema,
+        &seed,
+        &PrincipalCtx::bypass(),
+        None,
+    )
+    .await
+    .map_err(|e| format!("server seed txn (generator bug?): {e:?}"))?;
 
     // Engine side: the same schema + seed through the public surface.
     let mut client = InMemoryRtDbClient::new(

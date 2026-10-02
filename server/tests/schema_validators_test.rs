@@ -130,6 +130,7 @@ async fn insert_rejects_invalid_values_for_each_new_type() -> anyhow::Result<()>
                 }],
             },
             &PrincipalCtx::bypass(),
+            None,
         )
         .await
         .expect_err("invalid value must be a schema violation");
@@ -155,6 +156,7 @@ async fn document_round_trips_through_insert_patch_and_query() -> anyhow::Result
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     let id = outcome.results[0]["id"]
@@ -177,6 +179,7 @@ async fn document_round_trips_through_insert_patch_and_query() -> anyhow::Result
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
 
@@ -400,6 +403,7 @@ async fn unique_index_dup_pre_check_returns_conflict() -> anyhow::Result<()> {
                 }],
             },
             &PrincipalCtx::bypass(),
+            None,
         )
         .await?;
     }

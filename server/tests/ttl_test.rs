@@ -130,6 +130,7 @@ async fn insert_stamps_ttl_default_when_field_absent() {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("insert txn");
@@ -185,6 +186,7 @@ async fn insert_keeps_caller_expires_at_when_field_present() {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("insert txn");
@@ -245,6 +247,7 @@ async fn adding_ttl_backfills_existing_rows() {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("insert row A under v1");
@@ -287,6 +290,7 @@ async fn adding_ttl_backfills_existing_rows() {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("insert row B under v2");
@@ -876,6 +880,7 @@ async fn upsert_insert_stamps_ttl_default_when_field_absent() {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("upsert txn");
@@ -928,6 +933,7 @@ async fn upsert_update_does_not_restamp_ttl_field() {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("insert txn");
@@ -958,6 +964,7 @@ async fn upsert_update_does_not_restamp_ttl_field() {
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await
     .expect("upsert txn");

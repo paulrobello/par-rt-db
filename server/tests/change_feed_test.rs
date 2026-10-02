@@ -48,6 +48,7 @@ async fn insert_project(pool: &sqlx::PgPool, db: &str, name: &str) -> anyhow::Re
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
     let id = outcome.results[0]["id"]
@@ -80,6 +81,7 @@ async fn stamping_records_kind_and_post_image_per_write() -> anyhow::Result<()> 
             }],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
 
@@ -128,6 +130,7 @@ async fn rolled_back_txn_leaves_no_rows_and_no_gap() -> anyhow::Result<()> {
             ],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await;
     assert!(err.is_err(), "unknown-table step fails the txn");
@@ -173,6 +176,7 @@ async fn net_row_for_insert_then_delete_in_one_txn() -> anyhow::Result<()> {
             ],
         },
         &PrincipalCtx::bypass(),
+        None,
     )
     .await?;
 
