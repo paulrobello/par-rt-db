@@ -1796,11 +1796,6 @@ impl InMemoryRtDbClient {
         self.subscribers.push(sub.clone());
 
         // Initial value, delivered synchronously (server's first queryUpdate).
-        // DIVERGENCE from TS: the TS harness has no try/catch here or in
-        // `notifySubs`, so a query error propagates out of `subscribe`/`mutate`/
-        // `tick`. This port suppresses such errors (a failing query simply never
-        // fires) to keep `subscribe`/`notify_subs` infallible — tests that need
-        // to assert on a failing query should call `run_query` directly.
         if let Ok(initial) = self.run_query(&query) {
             let initial_canon = diff_canonical(&initial, &query);
             *sub.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(initial_canon);
@@ -1827,7 +1822,7 @@ impl InMemoryRtDbClient {
             }
             let next = match self.run_query(&sub.query) {
                 Ok(v) => v,
-                Err(_) => continue, // DIVERGENCE from TS (which propagates): suppress so a bad subscriber query can't abort the write
+                Err(_) => continue, // suppress so a bad subscriber query can't abort the write
             };
             let next_canon = diff_canonical(&next, &sub.query);
             let mut last_lock = sub.last.lock().unwrap_or_else(|p| p.into_inner());

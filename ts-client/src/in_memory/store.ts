@@ -2580,7 +2580,14 @@ export class InMemoryRtDbClient {
       if (!writeSet.has(sub.table) || sub.listeners.size === 0) {
         continue;
       }
-      const next = this.executeQuery(sub.query);
+      // Skip a failing subscriber query (mirrors the Rust engine and keeps a
+      // bad subscription from aborting the write) and keep notifying the rest.
+      let next: unknown;
+      try {
+        next = this.executeQuery(sub.query);
+      } catch {
+        continue;
+      }
       if (sub.hasValue && diffCanonical(next, sub.query) === diffCanonical(sub.last, sub.query)) {
         continue;
       }
