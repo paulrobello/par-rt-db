@@ -1,15 +1,15 @@
 //! Webhook delivery registry — the native answer to "trigger external work on
 //! document changes" in a no-embedded-JS architecture.
 //!
-//! When `Config::webhooks_enabled` is set at boot, the committer calls
-//! `enqueue_for_ops` at its four op-feed tap sites (`handle_mutate`,
-//! `handle_scheduled`, `handle_migrate`, and `handle_reaper`) so every durable
-//! document mutation fans out one `rtdb.webhook_deliveries` row per matching
-//! webhook. A background worker
+//! When `Config::webhooks_enabled` is set at boot, `execute_txn` enqueues one
+//! `rtdb.webhook_deliveries` row per matching webhook INSIDE the write's
+//! transaction (ENH-047 — the outbox guarantee: delivery rows commit or roll
+//! back with the documents), on the mutate/scheduled/workflow paths. The other
+//! durable-write arms (ttl/migrate/merge) keep the best-effort post-commit tap
+//! via `enqueue_for_ops`. A background worker
 //! (`run_delivery_worker`) drains that outbox and POSTs each payload
 //! at-least-once to the registered URL with exponential backoff (capped) and a
-//! hard attempt ceiling. Enqueue is best-effort by contract: a logging failure
-//! is warned and never fails a durable mutation, mirroring `audit::write_audit_rows`.
+//! hard attempt ceiling.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -390,15 +390,21 @@ pub async fn validate_webhook_url(url: &str, allow_http: bool) -> Result<(), Str
     Ok(())
 }
 
-/// Enqueues one `webhook_deliveries` row per webhook matching any of `ops`,
-/// best-effort: a DB error is returned to the caller (the committer tap) which
-/// logs and continues, so a delivery-table hiccup never fails a durable
-/// mutation. Matching webhooks for a `(db, table, kind)` triple are those whose
+/// Enqueues one `webhook_deliveries` row per webhook matching any of `ops` on
+/// the given connection — the transactional form. Inside `execute_txn` the
+/// inserts join the write's Postgres transaction (the outbox guarantee:
+/// delivery rows commit or roll back together with the documents). Errors
+/// propagate: on the txn path the whole write rolls back.
+///
+/// Matching webhooks for a `(db, table, kind)` triple are those whose
 /// `tbl IS NULL OR tbl = table` and whose `events` array is either exactly
-/// `{*}` (all events) or contains the op's lowercase kind name. The payload is
-/// an [`WebhookPayload`] serialized to JSONB.
-pub async fn enqueue_for_ops(
-    pool: &PgPool,
+/// `{*}` (all events) or contains the op's lowercase kind name. All enabled
+/// webhooks for `db` are loaded with ONE query up front (the pre-ENH-047
+/// per-op SELECT ran one round trip per op inside the committer turn) and
+/// matched in memory with identical semantics. The payload is a
+/// [`WebhookPayload`] serialized to JSONB.
+pub async fn enqueue_for_ops_on(
+    conn: &mut sqlx::PgConnection,
     db: &str,
     owner: Option<&str>,
     source: &'static str,
@@ -407,26 +413,40 @@ pub async fn enqueue_for_ops(
     if ops.is_empty() {
         return Ok(());
     }
+    // One query for every enabled webhook of this db, matched in memory below.
+    // `tbl IS NULL` = all tables; `events = '{*}'` = the literal single-element
+    // wildcard array; `enabled` excludes paused webhooks so they produce no
+    // deliveries while retaining their config.
+    let webhooks: Vec<(i64, Option<String>, Vec<String>)> = sqlx::query_as(
+        "SELECT id, tbl, events FROM rtdb.webhooks \
+         WHERE db = $1 AND enabled",
+    )
+    .bind(db)
+    .fetch_all(&mut *conn)
+    .await?;
+    if webhooks.is_empty() {
+        return Ok(());
+    }
+    let matches_for = |webhooks: &[(i64, Option<String>, Vec<String>)],
+                       table: &str,
+                       kind: &str|
+     -> Vec<i64> {
+        webhooks
+            .iter()
+            .filter(|(_, tbl, events)| {
+                tbl.as_deref().is_none_or(|t| t == table)
+                    && (events.as_slice() == ["*"] || events.iter().any(|e| e == kind))
+            })
+            .map(|(id, _, _)| *id)
+            .collect()
+    };
     let ts = now_ms();
     let owner = owner.map(|s| s.to_string());
+    // Ops sharing a (webhook, payload) would double-POST; group per op instead
+    // so every op produces its own delivery rows exactly as before.
     for op in ops {
         let kind = op_kind_name(op.kind);
-        // Match webhooks for this (db, table, kind). `tbl IS NULL` = all tables;
-        // `events = '{*}'` = the literal single-element wildcard array; otherwise
-        // the op kind must appear in the events array. `enabled` excludes paused
-        // webhooks so they produce no deliveries while retaining their config.
-        let matches: Vec<(i64,)> = sqlx::query_as(
-            "SELECT id FROM rtdb.webhooks \
-             WHERE db = $1 \
-               AND (tbl IS NULL OR tbl = $2) \
-               AND (events = '{*}' OR $3 = ANY(events)) \
-               AND enabled",
-        )
-        .bind(db)
-        .bind(&op.table)
-        .bind(kind)
-        .fetch_all(pool)
-        .await?;
+        let matches = matches_for(&webhooks, &op.table, kind);
         if matches.is_empty() {
             continue;
         }
@@ -447,16 +467,31 @@ pub async fn enqueue_for_ops(
             "INSERT INTO rtdb.webhook_deliveries \
              (webhook_id, payload, attempts, next_attempt, status) ",
         );
-        builder.push_values(matches, |mut b, (webhook_id,)| {
+        builder.push_values(matches, |mut b, webhook_id| {
             b.push_bind(webhook_id)
                 .push_bind(payload.clone())
                 .push_bind(0_i32)
                 .push_bind(ts)
                 .push_bind("pending");
         });
-        builder.build().execute(pool).await?;
+        builder.build().execute(&mut *conn).await?;
     }
     Ok(())
+}
+
+/// Pool form of [`enqueue_for_ops_on`] for non-committer callers: acquires a
+/// connection and delegates. Best-effort by contract — callers (the
+/// committer tap) log a warning on `Err` and continue, so a delivery-table
+/// hiccup never fails an already-committed durable mutation.
+pub async fn enqueue_for_ops(
+    pool: &PgPool,
+    db: &str,
+    owner: Option<&str>,
+    source: &'static str,
+    ops: &[DocOp],
+) -> Result<(), RtDbError> {
+    let mut conn = pool.acquire().await?;
+    enqueue_for_ops_on(&mut conn, db, owner, source, ops).await
 }
 
 /// Selects up to [`DRAIN_BATCH`] due deliveries joined with their webhook URL

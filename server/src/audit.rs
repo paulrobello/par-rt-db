@@ -1,11 +1,11 @@
 //! Durable audit log — the persistent counterpart to the in-memory `OpFeed`.
 //!
-//! When `Config::audit_log_enabled` is set at boot, the committer calls
-//! `write_audit_rows` at its four op-feed tap sites (`handle_mutate`,
-//! `handle_scheduled`, `handle_migrate`, and `handle_reaper`) so every durable
-//! document mutation is recorded in the global `rtdb.audit_log` table. Writes are best-effort: a logging failure is
-//! warned and never fails a mutation, mirroring the idempotency-cache error
-//! handling in `committer::handle_mutate`.
+//! When `Config::audit_log_enabled` is set at boot, `execute_txn` writes one
+//! `rtdb.audit_log` row per `DocOp` INSIDE the write's transaction (ENH-047 —
+//! the outbox guarantee: audit rows commit or roll back with the documents) on
+//! the mutate/scheduled/workflow paths. The other durable-write arms
+//! (ttl/migrate/merge) keep the best-effort post-commit tap via
+//! `write_audit_rows`.
 
 use sqlx::PgPool;
 
@@ -26,13 +26,15 @@ fn op_kind_name(kind: OpKind) -> &'static str {
     }
 }
 
-/// Inserts one audit row per `DocOp`. Best-effort by contract — callers (the
-/// committer tap sites) log a warning on `Err` and continue, so a logging
-/// failure never fails a durable mutation. All values are `$n`-bound; the
-/// table/column identifiers are fixed literals. `ts_ms` is read once for the
-/// call so a multi-op batch shares a single timestamp (matches `OpFeed::publish`).
-pub async fn write_audit_rows(
-    pool: &PgPool,
+/// Inserts one audit row per `DocOp` on the given connection — the
+/// transactional form. Inside `execute_txn` the insert joins the write's
+/// Postgres transaction (the outbox guarantee: audit rows commit or roll back
+/// together with the documents). All values are `$n`-bound; the table/column
+/// identifiers are fixed literals. `ts_ms` is read once for the call so a
+/// multi-op batch shares a single timestamp (matches `OpFeed::publish`).
+/// Errors propagate: on the txn path the whole write rolls back.
+pub async fn write_audit_rows_on(
+    conn: &mut sqlx::PgConnection,
     db: &str,
     owner: Option<&str>,
     source: &str,
@@ -54,8 +56,21 @@ pub async fn write_audit_rows(
             .push_bind(owner)
             .push_bind(source);
     });
-    builder.build().execute(pool).await?;
+    builder.build().execute(conn).await?;
     Ok(())
+}
+
+/// Pool form of [`write_audit_rows_on`] for non-committer callers: acquires a
+/// connection and delegates.
+pub async fn write_audit_rows(
+    pool: &PgPool,
+    db: &str,
+    owner: Option<&str>,
+    source: &str,
+    ops: &[DocOp],
+) -> Result<(), RtDbError> {
+    let mut conn = pool.acquire().await?;
+    write_audit_rows_on(&mut conn, db, owner, source, ops).await
 }
 
 /// One row of the audit log, in the shape served by `GET /admin/audit`.
