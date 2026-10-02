@@ -84,6 +84,34 @@ pub async fn export_database(
     Ok(out)
 }
 
+/// ARC-002 guard for [`import_database`]: rejects a target that already holds
+/// documents. Import writes document tables directly (no committer), so a
+/// populated target would race the single-writer invariant. Callers that
+/// legitimately import guarantee an empty target: `admin/dbs.rs::import_db`
+/// rejects non-empty up front; clone-db and backup restore create fresh
+/// databases. An empty database with a pushed schema but zero rows passes.
+pub async fn ensure_target_empty(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
+    validate_db_name(db)?;
+    let schema_name = pg_schema(db);
+    // Whatever schema has been pushed (if any), probe each of its tables for
+    // at least one row. Schema-absent databases are trivially empty.
+    if let Some(schema) = crate::db::load_schema(pool, db).await? {
+        for table_name in schema.tables.keys() {
+            let sql = format!(
+                "SELECT EXISTS(SELECT 1 FROM \"{schema_name}\".\"{}\" LIMIT 1)",
+                pg_table(table_name)
+            );
+            let (has_rows,): (bool,) = sqlx::query_as(&sql).fetch_one(pool).await?;
+            if has_rows {
+                return Err(RtDbError::conflict(
+                    "import-db requires an empty database; create a fresh database or use clone-db",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Loads a snapshot produced by `export_database` into `db`: the first non-blank
 /// line must be a `schema` line, applied via `ddl::push_schema` (creates `db`'s
 /// tables/indexes when empty, or additively updates them like any other schema
@@ -115,6 +143,9 @@ pub async fn import_database(pool: &PgPool, db: &str, jsonl: &str) -> Result<Sch
 
     // Import replays into a freshly-created database (no subscribers, no
     // concurrent writers), so the backfill-affected set is always empty here.
+    // ARC-002 contract: the caller guarantees an EMPTY target — import_db
+    // rejects a database that already holds documents; clone-db and backup
+    // restore create fresh databases. Import itself does not enforce this.
     let (applied, _) = push_schema(pool, db, schema).await?;
     let pg_schema_name = pg_schema(db);
     let mut tx = pool.begin().await?;
@@ -168,13 +199,13 @@ pub async fn import_database(pool: &PgPool, db: &str, jsonl: &str) -> Result<Sch
         }
     }
 
-    // Change-feed stamp: imported documents are observable like any write, so
-    // an import into a LIVE database moves the cursor world forward instead of
-    // silently stranding consumers. One `Insert` op with the post-image per
-    // restored row, on this same transaction (the change_head row lock
-    // serializes the import against the committer's counter UPDATE, so seq
-    // order still equals commit order). Clone-db and backup restore ride this
-    // same path into fresh databases, where the stamps are pure bookkeeping.
+    // Change-feed stamp: imported documents are observable like any write. Under
+    // the ARC-002 empty-target contract the target is fresh, so these stamps are
+    // bookkeeping — one `Insert` op with the post-image per restored row, on
+    // this same transaction (the change_head row lock serializes the import
+    // against the committer's counter UPDATE, so seq order still equals commit
+    // order). Clone-db and backup restore ride this same path into fresh
+    // databases, where the stamps are pure bookkeeping.
     if !stamped.is_empty() {
         let mut write_set = crate::txn::WriteSet::default();
         for (table, id, doc, created_at) in &stamped {

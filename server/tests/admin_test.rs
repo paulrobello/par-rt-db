@@ -864,10 +864,13 @@ async fn import_db_into_unknown_database_is_not_found() -> anyhow::Result<()> {
     Ok(())
 }
 
-// (n) B3: when import-db's doc-replay phase fails (id collision) after its
-// internal push_schema already committed the new schema to Postgres, the
-// stale pre-import schema cache entry must be invalidated rather than left
-// serving the old schema forever.
+// (n) B3: when import-db's doc-replay phase fails (a doc line naming a table
+// absent from the snapshot schema) after its internal push_schema already
+// committed the new schema to Postgres, the stale pre-import schema cache
+// entry must be invalidated rather than left serving the old schema forever.
+// (ARC-002 closed the old trigger — an id collision with a seeded row — by
+// rejecting non-empty targets, so the failure now comes from a bad doc line
+// against an empty-but-pushed-schema target.)
 #[tokio::test]
 async fn import_db_doc_replay_failure_after_schema_commit_refreshes_schema_cache()
 -> anyhow::Result<()> {
@@ -885,36 +888,10 @@ async fn import_db_doc_replay_failure_after_schema_commit_refreshes_schema_cache
             .contains_key("priority")
     );
 
-    // Seed one document so its id can collide with an imported doc line, forcing
-    // the doc-replay phase to fail after `import_database`'s internal
-    // `push_schema` call has already committed.
-    let insert_outcome = execute_txn(
-        &pool,
-        &target_db,
-        &old_schema,
-        &Transaction {
-            steps: vec![Step::Insert {
-                table: "projects".to_string(),
-                doc: serde_json::json!({
-                    "name": "Existing",
-                    "status": "active",
-                    "tags": [],
-                    "updatedAt": 1
-                })
-                .as_object()
-                .unwrap()
-                .clone(),
-            }],
-        },
-        &PrincipalCtx::bypass(),
-        None,
-    )
-    .await?;
-    let existing_id = insert_outcome.results[0]["id"]
-        .as_str()
-        .expect("project id")
-        .to_string();
-
+    // The target stays EMPTY (ARC-002). The snapshot's schema line adds the
+    // `priority` field — its push_schema commits — and the doc line then names
+    // a table absent from that schema, forcing the doc-replay phase to fail
+    // after the schema has already committed.
     let mut new_schema = kanban_schema_json();
     new_schema["tables"]["projects"]["fields"]["priority"] =
         serde_json::json!({"type": "optional", "inner": {"type": "number"}});
@@ -924,9 +901,9 @@ async fn import_db_doc_replay_failure_after_schema_commit_refreshes_schema_cache
         serde_json::json!({"kind": "schema", "schema": new_schema}),
         serde_json::json!({
             "kind": "doc",
-            "table": "projects",
-            "id": existing_id,
-            "doc": {"name": "Colliding", "status": "active", "tags": [], "updatedAt": 2},
+            "table": "nonexistent",
+            "id": "missing-table-doc",
+            "doc": {"x": 1},
             "createdAt": 2,
             "version": 1
         })
@@ -934,13 +911,12 @@ async fn import_db_doc_replay_failure_after_schema_commit_refreshes_schema_cache
 
     let import_resp =
         admin_post_raw(addr, &format!("/admin/import-db?db={target_db}"), jsonl).await;
-    // The doc-replay id collision is a Postgres primary-key violation (SQLSTATE
-    // 23505), which the blanket `From<sqlx::Error>` maps to CONFLICT (409) — a
-    // more accurate status than the former generic 500. The point of this test
-    // is the cache invalidation below, not the exact failure code.
-    assert_eq!(import_resp.status(), reqwest::StatusCode::CONFLICT);
+    // A doc line naming a table absent from the snapshot schema is NOT_FOUND
+    // (SchemaDefExt::table). The point of this test is the cache invalidation
+    // below, not the exact failure code.
+    assert_eq!(import_resp.status(), reqwest::StatusCode::NOT_FOUND);
     let body: serde_json::Value = import_resp.json().await?;
-    assert_eq!(body["code"], "CONFLICT");
+    assert_eq!(body["code"], "NOT_FOUND");
 
     // A stale cache entry would still report the pre-import schema here; the
     // fix invalidates it on the failed import so this reload reflects what the
@@ -951,6 +927,52 @@ async fn import_db_doc_replay_failure_after_schema_commit_refreshes_schema_cache
             .fields
             .contains_key("priority")
     );
+
+    Ok(())
+}
+
+// ARC-002: import-db into a database that already holds documents is a 409
+// CONFLICT — import bypasses the committer, so a populated target would race
+// the single-writer invariant.
+#[tokio::test]
+async fn import_into_non_empty_db_is_conflict() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let target_db = fresh_db(&state).await;
+
+    // Seed one row via the committer path.
+    let schema = state.schemas.get(&state.pool, &target_db).await?;
+    rtdb_server::txn::execute_txn(
+        &state.pool,
+        &target_db,
+        &schema,
+        &Transaction {
+            steps: vec![Step::Insert {
+                table: "projects".to_string(),
+                doc: serde_json::json!({
+                    "name": "Occupant",
+                    "status": "active",
+                    "tags": [],
+                    "updatedAt": 1
+                })
+                .as_object()
+                .expect("json object")
+                .clone(),
+            }],
+        },
+        &PrincipalCtx::bypass(),
+        None,
+    )
+    .await?;
+
+    let jsonl = format!(
+        "{}\n",
+        serde_json::json!({"kind": "schema", "schema": kanban_schema_json()})
+    );
+    let resp = admin_post_raw(addr, &format!("/admin/import-db?db={target_db}"), jsonl).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], "CONFLICT");
 
     Ok(())
 }

@@ -142,12 +142,20 @@ pub(super) struct ImportDbParams {
 /// Loads a JSONL snapshot produced by `export_db` back into `db` (see
 /// `snapshot::import_database`), refreshing the schema cache with whatever schema
 /// the snapshot applied.
+///
+/// ARC-002: the target must be EMPTY — no schema with table rows. Import bypasses
+/// the per-db committer (it writes document tables directly), so importing into a
+/// live, populated database would race the single-writer invariant and corrupt
+/// serialization. Every legitimate caller (clone-db, backup restore, a CLI
+/// round-trip) already targets a fresh database; a non-empty target is rejected
+/// with CONFLICT up front.
 pub(super) async fn import_db(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
     QueryParams(params): QueryParams<ImportDbParams>,
     body: String,
 ) -> Result<Json<OkResponse>, RtDbError> {
+    snapshot::ensure_target_empty(&state.pool, &params.db).await?;
     match snapshot::import_database(&state.pool, &params.db, &body).await {
         Ok(applied) => {
             state.schemas.put(&params.db, applied).await;
