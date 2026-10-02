@@ -488,6 +488,7 @@ import asyncio
 
 from par_rt_db.mutation import await_signal
 
+
 async def main() -> None:
     gate = WorkflowSpec(
         name="gate",
@@ -495,6 +496,7 @@ async def main() -> None:
     )
     run_id = await db.start_workflow(gate)
     await db.signal_workflow(run_id, "approve", {"approvedBy": "u1"})  # releases the gate
+
 
 asyncio.run(main())
 ```
