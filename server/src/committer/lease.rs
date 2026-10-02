@@ -158,9 +158,6 @@ pub(in crate::committer) async fn verify_lease(conn: &mut sqlx::PgConnection, db
     held
 }
 
-/// True for every request whose handling writes documents — the arms a SHADOW
-/// (non-owner) committer must reject, and the submits that attempt the
-/// ownership upgrade in `submit`.
 /// Replies CONFLICT to a write arm that reached a SHADOW (non-owner)
 /// committer (ENH-022 Stage 4). Fire-and-forget arms have no reply — the
 /// shadow runs no scheduler/reaper pollers, so those only arrive from a
@@ -205,6 +202,9 @@ pub(in crate::committer) async fn reply_ownership_conflict(
     }
 }
 
+/// True for every request whose handling writes documents — the arms a SHADOW
+/// (non-owner) committer must reject, and the submits that attempt the
+/// ownership upgrade in `submit`.
 pub(in crate::committer) fn request_needs_write(req: &CommitterRequest) -> bool {
     matches!(
         req,

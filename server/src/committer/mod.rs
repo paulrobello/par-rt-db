@@ -3,10 +3,11 @@
 //! affected subscriptions, diffs against the last pushed value, and pushes only
 //! on change. This serialization is load-bearing: `execute_txn`/`execute_query`
 //! run READ COMMITTED with no row locking, so every durable write must pass
-//! through here. Handles four request arms — `RunMutate`, `RunScheduled`,
-//! `RunMigrate`, `RunReaper` — plus `RunRestoreSchema`, `RunMergeUsers`, and
-//! `RunWorkflowAdvance`, and publishes each at the four tap sites (subscription
-//! fan-out, op-feed, audit log, webhooks). Never add a second writer.
+//! through here. Handles all ten `CommitterRequest` arms — `Mutate`,
+//! `Subscribe`, `RunScheduled`, `RunMigrate`, `RunPushSchema`, `RunReaper`,
+//! `RunWorkflowAdvance`, `RunMergeUsers`, `RunRestoreSchema`, and `Shutdown` —
+//! and publishes the write arms at the four tap sites (subscription fan-out,
+//! op-feed, audit log, webhooks). Never add a second writer.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
