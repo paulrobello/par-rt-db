@@ -157,10 +157,23 @@ enum OpNotifyPayloadOrBatch {
 pub fn generate_instance_id() -> String {
     let rng = ring::rand::SystemRandom::new();
     let mut bytes = [0u8; 4];
-    // `fill` is infallible for `SystemRandom`; an error means the system RNG is
-    // unavailable, which is a fatal environment condition — fall back to a
-    // zero id rather than panicking in a boot path.
-    let _ = ring::rand::SecureRandom::fill(&rng, &mut bytes);
+    if let Err(err) = ring::rand::SecureRandom::fill(&rng, &mut bytes) {
+        // A zero id on EVERY replica (every replica collides with every
+        // other) breaks self-dedupe and cross-replica message routing, so a
+        // failed fill falls back to a process-id + nanosecond-derived value
+        // instead of the all-zero bytes `fill` leaves behind.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let mixed = (std::process::id() as u64) ^ nanos.rotate_left(32);
+        tracing::warn!(
+            error = %err,
+            instance_id = %hex::encode(mixed.to_le_bytes()),
+            "system RNG unavailable for instance id; using pid+time fallback"
+        );
+        return hex::encode(mixed.to_le_bytes());
+    }
     hex::encode(bytes)
 }
 
