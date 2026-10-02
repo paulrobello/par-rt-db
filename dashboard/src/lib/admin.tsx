@@ -32,6 +32,9 @@ export interface AdminValue {
   /** Newest-first op events, capped. */
   ops: OpEvent[];
   metrics: MetricsSnapshot | null;
+  /** Set when the initial metrics fetch fails; null on a good fetch. The
+   * stream usually re-delivers gauges, so this is advisory, not fatal. */
+  metricsError: string | null;
   connection: ConnectionState;
 }
 
@@ -66,6 +69,7 @@ export function AdminProvider({ children }: { children: ReactNode }) {
   const [databasesError, setDatabasesError] = useState<string | null>(null);
   const [ops, setOps] = useState<OpEvent[]>([]);
   const [metrics, setMetrics] = useState<MetricsSnapshot | null>(null);
+  const [metricsError, setMetricsError] = useState<string | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("idle");
 
   const refreshDatabases = useRef<() => Promise<void>>(async () => {});
@@ -75,6 +79,7 @@ export function AdminProvider({ children }: { children: ReactNode }) {
       setDatabases([]);
       setOps([]);
       setMetrics(null);
+      setMetricsError(null);
       setConnection("idle");
       return;
     }
@@ -157,8 +162,16 @@ export function AdminProvider({ children }: { children: ReactNode }) {
     loadDbs();
     client
       .metrics()
-      .then(setMetrics)
-      .catch(() => {});
+      .then((snapshot) => {
+        if (cancelled) return;
+        setMetrics(snapshot);
+        setMetricsError(null);
+      })
+      .catch((e) => {
+        // The stream usually re-delivers gauges; keep the last good value and
+        // surface the failure so a silent poll failure is distinguishable.
+        if (!cancelled) setMetricsError(toErrorMessage(e));
+      });
     connect();
     const dbsTimer = setInterval(loadDbs, 20000);
     return () => {
@@ -177,6 +190,7 @@ export function AdminProvider({ children }: { children: ReactNode }) {
     refreshDatabases: () => refreshDatabases.current(),
     ops,
     metrics,
+    metricsError,
     connection,
   };
 

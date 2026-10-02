@@ -22,6 +22,7 @@ export function DataBrowserPage() {
   const { db = "", table = "" } = useParams();
   const { client } = useAdmin();
   const [schema, setSchema] = useState<SchemaJson | null>(null);
+  const [schemaError, setSchemaError] = useState<string | null>(null);
   const [order, setOrder] = useState<"asc" | "desc">("desc");
   const [take, setTake] = useState(100);
   const { docs, loading, error, live, refresh } = useLiveTable(db, table, order, take);
@@ -51,9 +52,16 @@ export function DataBrowserPage() {
     client
       .getSchema(db)
       .then((sc) => {
-        if (!cancelled) setSchema(sc);
+        if (!cancelled) {
+          setSchema(sc);
+          setSchemaError(null);
+        }
       })
-      .catch(() => {});
+      .catch((e) => {
+        // Without the schema the browser's field list and insert form can't
+        // work — surface why instead of failing silently.
+        if (!cancelled) setSchemaError(toErrorMessage(e));
+      });
     return () => {
       cancelled = true;
     };
@@ -220,6 +228,7 @@ export function DataBrowserPage() {
         </div>
       )}
       {mutError && <p className={s.error}>{mutError}</p>}
+      {schemaError && <p className={s.error}>Failed to load schema: {schemaError}</p>}
 
       {loading ? (
         <Spinner label="loading documents" />

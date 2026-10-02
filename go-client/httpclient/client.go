@@ -97,6 +97,12 @@ func (c *Client) RawCall(ctx context.Context, method, path, contentType string, 
 
 // do performs one request through the auth seam and decodes the response.
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
+	return c.doWithAuth(ctx, method, path, body, out, c.token)
+}
+
+// doWithAuth is do() with a caller-supplied bearer — for AuthValidate, whose
+// bearer is the token being validated rather than the client's own.
+func (c *Client) doWithAuth(ctx context.Context, method, path string, body, out any, token string) error {
 	var rdr io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -109,7 +115,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	if err != nil {
 		return fmt.Errorf("httpclient: build request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-Rtdb-Protocol", strconv.FormatUint(uint64(wire.PROTOCOL_VERSION), 10))
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")

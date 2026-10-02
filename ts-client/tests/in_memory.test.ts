@@ -648,6 +648,32 @@ describe("InMemoryRtDbClient — subscribe", () => {
     await c.mutate(mutation().insert("items", { name: "c", status: "todo", order: 3 }).build());
     expect(updates).toEqual([0, 1]); // unsubscribed: no further updates
   });
+
+  it("skips a failing subscriber query without aborting the write or other listeners", async () => {
+    const c = newClient();
+    await c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
+
+    const updates: number[] = [];
+    c.subscribe(api.items.query().withIndex("by_status", ["todo"]).count(), (n) => updates.push(n));
+
+    // Subscribe with a query that references an index, then drop that index, so
+    // the subscription's query throws on every later recompute.
+    const doomed = api.items.query().withIndex("by_name", ["a"]).count();
+    c.subscribe(doomed, () => {});
+    const res = c.migrate(new Migration().dropIndex("items", "by_name").build());
+    expect(res.applied).toBe(true);
+
+    // The failing subscription's query must not abort the write, and the valid
+    // subscription must still fire.
+    await expect(
+      c.mutate(mutation().insert("items", { name: "b", status: "todo", order: 2 }).build()),
+    ).resolves.toBeDefined();
+    expect(updates).toEqual([1, 2]);
+
+    // The write persisted.
+    const docs = await c.query(api.items.query().collect());
+    expect(docs).toHaveLength(2);
+  });
 });
 
 describe("InMemoryRtDbClient — fields projection", () => {

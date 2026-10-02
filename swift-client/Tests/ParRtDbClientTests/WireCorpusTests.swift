@@ -24,10 +24,11 @@ import Testing
 // authed_users (5), schedule_whens (4), schedule_infos (11), queries (15),
 // the admin-plane migrate sections — migrate_requests (3) and
 // migrate_results (3), through MigrateRequest/MigrateResult — the
-// change_feed_responses (2) pages through ChangeFeedResponse, the six
-// rejects_* sections (7 total), and protocol_constants.max_steps.
-// query_results / error_envelopes / db_stats belong to their owning tasks'
-// types.
+// change_feed_responses (2) pages through ChangeFeedResponse,
+// error_envelopes (7) through RtDbError, db_stats (2) through DbStats,
+// query_results (9) as raw JSON (QueryResult is untagged on the wire), the
+// six rejects_* sections (7 total), and protocol_constants.max_steps.
+// Every corpus section has a consumer in this runner.
 //
 // NOTE: the generic helpers below use Issue.record rather than #expect —
 // the expectation macro's autoclosure thunk inside a generic function trips
@@ -77,6 +78,15 @@ private struct WireCorpus {
         return entries
     }
 
+    /// Entries as unconstrained JSON values — for the sections whose rows are
+    /// not guaranteed objects (query_results carries scalars and arrays too).
+    func rawSection(_ name: String) throws -> [Any] {
+        guard let entries = json[name] as? [Any] else {
+            throw CorpusFailure("corpus missing array section '\(name)' — has: \(sectionNames)")
+        }
+        return entries
+    }
+
     func object(_ name: String) throws -> [String: Any] {
         guard let object = json[name] as? [String: Any] else {
             throw CorpusFailure("corpus missing object section '\(name)' — has: \(sectionNames)")
@@ -100,28 +110,35 @@ private func pretty(_ data: Data) -> String {
 /// semantics). Failures name the section, index, and both payloads.
 private func corpusRoundTrip<T: Codable>(_: T.Type, _ section: String, _ corpus: WireCorpus) throws {
     for (idx, raw) in try corpus.section(section).enumerated() {
-        let input = try JSONSerialization.data(withJSONObject: raw)
-        let parsed: T
-        do {
-            parsed = try JSONDecoder().decode(T.self, from: input)
-        } catch {
-            Issue.record("\(section) #\(idx): parse failure: \(error)\n  input: \(pretty(input))")
-            continue
-        }
-        let dumped: Data
-        do {
-            dumped = try JSONEncoder().encode(parsed)
-        } catch {
-            Issue.record("\(section) #\(idx): encode failure: \(error)\n  input: \(pretty(input))")
-            continue
-        }
-        let inputObject = try JSONSerialization.jsonObject(with: input) as AnyObject
-        let dumpedObject = try JSONSerialization.jsonObject(with: dumped) as AnyObject
-        if !dumpedObject.isEqual(inputObject) {
-            Issue.record(
-                "\(section) #\(idx): wire drift —\n  dumped: \(pretty(dumped))\n  input:  \(pretty(input))"
-            )
-        }
+        try corpusRoundTripEntry(T.self, section, idx, raw)
+    }
+}
+
+/// One entry's decode → encode → deep value-compare (the per-entry body of
+/// `corpusRoundTrip`, split out so callers that pre-process an entry — e.g.
+/// stripping the corpus's `$comment` annotation key — reuse the same path).
+private func corpusRoundTripEntry<T: Codable>(_: T.Type, _ section: String, _ idx: Int, _ raw: [String: Any]) throws {
+    let input = try JSONSerialization.data(withJSONObject: raw)
+    let parsed: T
+    do {
+        parsed = try JSONDecoder().decode(T.self, from: input)
+    } catch {
+        Issue.record("\(section) #\(idx): parse failure: \(error)\n  input: \(pretty(input))")
+        return
+    }
+    let dumped: Data
+    do {
+        dumped = try JSONEncoder().encode(parsed)
+    } catch {
+        Issue.record("\(section) #\(idx): encode failure: \(error)\n  input: \(pretty(input))")
+        return
+    }
+    let inputObject = try JSONSerialization.jsonObject(with: input) as AnyObject
+    let dumpedObject = try JSONSerialization.jsonObject(with: dumped) as AnyObject
+    if !dumpedObject.isEqual(inputObject) {
+        Issue.record(
+            "\(section) #\(idx): wire drift —\n  dumped: \(pretty(dumped))\n  input:  \(pretty(input))"
+        )
     }
 }
 
@@ -213,6 +230,56 @@ struct WireCorpusTests {
     /// omitted).
     @Test func changeFeedResponsesRoundTrip() throws {
         try corpusRoundTrip(ChangeFeedResponse.self, "change_feed_responses", WireCorpus())
+    }
+
+    /// Error envelopes decoded through the client's real `RtDbError` envelope
+    /// (its `ErrorCode` is a closed enum — an unknown code fails to decode).
+    @Test func errorEnvelopesRoundTrip() throws {
+        try corpusRoundTrip(RtDbError.self, "error_envelopes", WireCorpus())
+    }
+
+    /// Admin db-stats decoded through the client's `DbStats`. Entry #0
+    /// carries a documentation `$comment` key — annotation, not wire data —
+    /// so strip it before the strict decode.
+    @Test func dbStatsRoundTrip() throws {
+        let corpus = try WireCorpus()
+        for (idx, raw) in try corpus.section("db_stats").enumerated() {
+            var entry = raw
+            entry.removeValue(forKey: "$comment")
+            try corpusRoundTripEntry(DbStats.self, "db_stats", idx, entry)
+        }
+    }
+
+    /// Query results stay a raw section by design (`QueryResult` is untagged
+    /// on the wire; the client deliberately keeps results untyped): each
+    /// entry must re-serialize to a JSON-equal value. Entries can be any
+    /// JSON value including `null` (a JSONNSNull here) — JSONSerialization
+    /// refuses a bare null as the top level of `data(withJSONObject:)`, so
+    /// a scalar/`null` entry trivially satisfies the contract after an
+    /// object/array entry is checked through the serializer.
+    @Test func queryResultsRoundTrip() throws {
+        let corpus = try WireCorpus()
+        for (idx, raw) in try corpus.rawSection("query_results").enumerated() {
+            if raw is NSNull || raw is NSNumber || raw is String || raw is Bool {
+                // Scalars (incl. null) have no container structure to drift.
+                continue
+            }
+            let input = try JSONSerialization.data(withJSONObject: raw)
+            guard
+                let reparsed = try? JSONSerialization.jsonObject(with: input),
+                let reparsedData = try? JSONSerialization.data(withJSONObject: reparsed)
+            else {
+                Issue.record("query_results #\(idx): re-serialization failed\n  input: \(pretty(input))")
+                continue
+            }
+            let inputObject = try JSONSerialization.jsonObject(with: input) as AnyObject
+            let dumpedObject = try JSONSerialization.jsonObject(with: reparsedData) as AnyObject
+            if !dumpedObject.isEqual(inputObject) {
+                Issue.record(
+                    "query_results #\(idx): wire drift —\n  dumped: \(pretty(reparsedData))\n  input:  \(pretty(input))"
+                )
+            }
+        }
     }
 
     /// Admin op-feed `OpEvent` rows — the reconnect-dedup stamps: 1-based

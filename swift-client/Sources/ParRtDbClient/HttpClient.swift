@@ -433,6 +433,19 @@ public actor RtDbHttpClient {
         return response.user
     }
 
+    /// Validate an arbitrary session/machine token via `GET /auth/validate`,
+    /// returning the authed user. Unlike `authMe` (which validates this
+    /// client's own bearer), this takes the token to validate as an argument
+    /// and accepts both token kinds — for a trusted backend validating a
+    /// player's credential. An invalid/expired token surfaces as the standard
+    /// `RtDbError` auth envelope.
+    public func authValidate(_ token: String) async throws -> AuthedUser {
+        let response: MeResponse = try await getJson(
+            "auth_validate", "/auth/validate", overrideAuth: token
+        )
+        return response.user
+    }
+
     /// Push a schema to this client's database (`POST /admin/push-schema`
     /// `{db, schema}` → `{ok: true}`) — the admin route with the same token.
     public func pushSchema(_ schema: SchemaDef) async throws {
@@ -630,11 +643,16 @@ extension RtDbHttpClient {
         )
     }
 
-    /// GET and decode a JSON response.
+    /// GET and decode a JSON response. `overrideAuth` replaces the client's
+    /// own bearer — for `authValidate`, whose bearer is the token being
+    /// validated.
     private func getJson<Res: Decodable>(
-        _ what: String, _ path: String, query: [URLQueryItem] = []
+        _ what: String,
+        _ path: String,
+        query: [URLQueryItem] = [],
+        overrideAuth: String? = nil
     ) async throws -> Res {
-        try await request(what, method: "GET", path: path, query: query)
+        try await request(what, method: "GET", path: path, query: query, overrideAuth: overrideAuth)
     }
 
     /// Issue a request and decode the response envelope as `Res`.
@@ -644,11 +662,12 @@ extension RtDbHttpClient {
         path: String,
         body: Data? = nil,
         contentType: String? = nil,
-        query: [URLQueryItem] = []
+        query: [URLQueryItem] = [],
+        overrideAuth: String? = nil
     ) async throws -> Res {
         let (status, data) = try await execute(
             what, method: method, path: path, body: body,
-            contentType: contentType, query: query
+            contentType: contentType, query: query, overrideAuth: overrideAuth
         )
         return try decode(status, data, as: Res.self)
     }
@@ -661,7 +680,8 @@ extension RtDbHttpClient {
         path: String,
         body: Data? = nil,
         contentType: String? = nil,
-        query: [URLQueryItem] = []
+        query: [URLQueryItem] = [],
+        overrideAuth: String? = nil
     ) async throws -> (status: Int, data: Data) {
         var components = URLComponents(string: baseUrl + path)
         if !query.isEmpty {
@@ -672,7 +692,7 @@ extension RtDbHttpClient {
         }
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(overrideAuth ?? token)", forHTTPHeaderField: "Authorization")
         // ARC-013: lets the server diagnose/reject a version mismatch instead
         // of a generic 400 from `deny_unknown_fields`.
         request.setValue(String(WireProtocol.version), forHTTPHeaderField: "X-Rtdb-Protocol")

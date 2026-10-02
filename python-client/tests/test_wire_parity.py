@@ -293,6 +293,69 @@ def test_corpus_admin_op_events_round_trip(entry: dict[str, Any]) -> None:
     assert dumped == entry, f"OpEvent wire drift: {dumped} != {entry}"
 
 
+# --- corpus: error envelopes (RtDbError.from_envelope) ------------------------
+#
+# Decoded through the client's real envelope reader: the code must be a known
+# ``ErrorCode`` (a ValueError here means wire drift) and ``retryAfter`` must
+# survive as the retry delay.
+
+
+@pytest.mark.parametrize(
+    "entry",
+    _corpus_section("error_envelopes"),
+    ids=lambda e: e.get("code", "?"),
+)
+def test_corpus_error_envelopes_decode(entry: dict[str, Any]) -> None:
+    from par_rt_db.errors import RtDbError
+
+    err = RtDbError.from_envelope(entry)
+    assert err.code.value == entry["code"]
+    assert err.message == entry["message"]
+    raw_retry = entry.get("retryAfter")
+    assert err.retry_after == (raw_retry if isinstance(raw_retry, int) else None)
+
+
+# --- corpus: admin db stats (DbStats, extra='forbid') -------------------------
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [e for e in _corpus_section("db_stats") if "$comment" not in e],
+    ids=lambda e: f"tables={len(e.get('tables', []))}",
+)
+def test_corpus_db_stats_round_trip(entry: dict[str, Any]) -> None:
+    from par_rt_db.admin_models import DbStats
+
+    msg = DbStats.model_validate(entry)
+    dumped = json.loads(msg.model_dump_json(by_alias=True))
+    assert dumped == entry, f"DbStats wire drift: {dumped} != {entry}"
+
+
+# --- corpus: query results (untagged raw values) ------------------------------
+#
+# ``QueryResult`` is deliberately untyped on the client (results are plain
+# JSON values), so the contract here is byte-stable re-serialization over a
+# canonical (key-sorted) form, not a model round-trip.
+
+
+def _canonical(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _canonical(value[k]) for k in sorted(value)}
+    if isinstance(value, list):
+        return [_canonical(v) for v in value]
+    return value
+
+
+@pytest.mark.parametrize(
+    "entry",
+    _corpus_section("query_results"),
+    ids=lambda e: type(e).__name__,
+)
+def test_corpus_query_results_reserialize(entry: Any) -> None:
+    round_tripped = json.loads(json.dumps(entry))
+    assert _canonical(round_tripped) == _canonical(entry)
+
+
 @pytest.mark.parametrize(
     "entry",
     _corpus_section("rejects_client_message_unknown_field"),

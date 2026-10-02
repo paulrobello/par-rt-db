@@ -53,6 +53,7 @@ layers. A divergence between any client engine and these fixtures is a bug in th
 ## Table of contents
 
 - [The authoring rule](#the-authoring-rule)
+- [Every wire section must be consumed](#every-wire-section-must-be-consumed)
 - [Semantics corpus format](#semantics-corpus-format)
 - [How a runner executes a case](#how-a-runner-executes-a-case)
 - [Determinism rulings](#determinism-rulings)
@@ -77,6 +78,30 @@ same commit as the server change — all six runners consume the files directly,
 so a deliberate semantic flip turns exactly the cases that pinned the old
 behavior red until the fixture is updated. Never delete a case to make a runner
 green; either the client is wrong or the fixture is stale.
+
+## Every wire section must be consumed
+
+Every top-level section in `wire-corpus.json` must be consumed by all six
+runners (`server/tests/wire_corpus.rs`, `rust-client/tests/wire_corpus.rs`,
+`ts-client/tests/wire-corpus.test.ts`, `python-client/tests/test_wire_parity.py`,
+`swift-client/Tests/ParRtDbClientTests/WireCorpusTests.swift`,
+`go-client/wire/wire_corpus_test.go`), decoded through that runner's own wire
+type where one exists — a decode through the real type catches field renames a
+raw `JSON.parse` round-trip cannot. A section may stay raw JSON only when the
+wire value is deliberately untyped on that client (e.g. `query_results`, since
+`QueryResult` is untagged on the wire); the raw consumer must still assert
+byte-stable re-serialization.
+
+The only exemption is the top-level `$comment` key (documentation, not wire
+data) and a per-entry `$comment` annotation key inside a section — strip it
+before a strict decode, never weaken the decode to admit it.
+
+**Enforcement:** the server runner carries the coverage meta-test
+(`server/tests/wire_corpus.rs::every_corpus_section_has_a_consumer`): a new
+`wire-corpus.json` section with no runner consumer fails the server suite
+until a consumer is added there and extended to the other five runners. The
+meta-test also fails when its `CONSUMED_SECTIONS` list names a section the
+corpus no longer has, so renames surface immediately.
 
 ## Semantics corpus format
 

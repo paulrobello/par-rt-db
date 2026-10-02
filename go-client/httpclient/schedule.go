@@ -1,7 +1,9 @@
 // go-client/httpclient/schedule.go
 package httpclient
 
-// Mirrors rust-client/src/http.rs schedule section.
+// Mirrors rust-client/src/http.rs schedule section. The create entry point
+// (Schedule with its ScheduleOption variadics) lives in claim.go next to the
+// external claim/finalize surface it shares the wire shape with.
 
 import (
 	"context"
@@ -9,19 +11,6 @@ import (
 
 	"github.com/paulrobello/par-rt-db/go-client/wire"
 )
-
-// Schedule creates a scheduled job; returns the minted job id.
-// POST /api/schedule {db, when, txn} → {id}.
-func (c *Client) Schedule(ctx context.Context, when wire.ScheduleWhen, txn wire.Transaction) (string, error) {
-	body := map[string]any{"db": c.db, "when": when, "txn": txn}
-	var resp struct {
-		ID string `json:"id"`
-	}
-	if err := c.do(ctx, http_POST, "/api/schedule", body, &resp); err != nil {
-		return "", err
-	}
-	return resp.ID, nil
-}
 
 // manageSchedule POSTs {db} to /api/schedule/{id}/{op} → {ok}.
 func (c *Client) manageSchedule(ctx context.Context, id, op string) (bool, error) {

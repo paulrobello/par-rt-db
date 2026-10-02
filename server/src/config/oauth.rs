@@ -26,10 +26,18 @@ impl Default for GithubOAuth {
     }
 }
 
+/// Reads an env var, treating unset AND blank (whitespace-only) as absent.
+/// Compose (and systemd `EnvironmentFile=`) forward unset variables as the
+/// empty string, so `.ok()` alone would surface `Some("")` and a provider
+/// would look configured with an empty credential. Mirrors QA-014.
+fn env_nonblank(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
 impl GithubOAuth {
     pub(super) fn from_env() -> Self {
-        let client_id = std::env::var("RTDB_GITHUB_CLIENT_ID").ok();
-        let client_secret = std::env::var("RTDB_GITHUB_CLIENT_SECRET").ok();
+        let client_id = env_nonblank("RTDB_GITHUB_CLIENT_ID");
+        let client_secret = env_nonblank("RTDB_GITHUB_CLIENT_SECRET");
 
         let base_url = std::env::var("RTDB_GITHUB_BASE_URL")
             .unwrap_or_else(|_| "https://github.com".to_string());
@@ -56,8 +64,8 @@ pub struct GoogleOAuth {
 impl GoogleOAuth {
     pub(super) fn from_env() -> Self {
         Self {
-            client_id: std::env::var("RTDB_GOOGLE_CLIENT_ID").ok(),
-            client_secret: std::env::var("RTDB_GOOGLE_CLIENT_SECRET").ok(),
+            client_id: env_nonblank("RTDB_GOOGLE_CLIENT_ID"),
+            client_secret: env_nonblank("RTDB_GOOGLE_CLIENT_SECRET"),
         }
     }
 }
@@ -82,8 +90,8 @@ impl Default for GitlabOAuth {
 
 impl GitlabOAuth {
     pub(super) fn from_env() -> Self {
-        let client_id = std::env::var("RTDB_GITLAB_CLIENT_ID").ok();
-        let client_secret = std::env::var("RTDB_GITLAB_CLIENT_SECRET").ok();
+        let client_id = env_nonblank("RTDB_GITLAB_CLIENT_ID");
+        let client_secret = env_nonblank("RTDB_GITLAB_CLIENT_SECRET");
         let base_url = std::env::var("RTDB_GITLAB_BASE_URL")
             .unwrap_or_else(|_| "https://gitlab.com".to_string());
         Self {
@@ -111,11 +119,11 @@ pub struct OidcProvider {
 impl OidcProvider {
     pub(super) fn from_env() -> Self {
         Self {
-            client_id: std::env::var("RTDB_OIDC_CLIENT_ID").ok(),
-            client_secret: std::env::var("RTDB_OIDC_CLIENT_SECRET").ok(),
-            authorize_url: std::env::var("RTDB_OIDC_AUTHORIZE_URL").ok(),
-            token_url: std::env::var("RTDB_OIDC_TOKEN_URL").ok(),
-            userinfo_url: std::env::var("RTDB_OIDC_USERINFO_URL").ok(),
+            client_id: env_nonblank("RTDB_OIDC_CLIENT_ID"),
+            client_secret: env_nonblank("RTDB_OIDC_CLIENT_SECRET"),
+            authorize_url: env_nonblank("RTDB_OIDC_AUTHORIZE_URL"),
+            token_url: env_nonblank("RTDB_OIDC_TOKEN_URL"),
+            userinfo_url: env_nonblank("RTDB_OIDC_USERINFO_URL"),
         }
     }
 }
@@ -145,8 +153,8 @@ impl Default for MicrosoftOAuth {
 
 impl MicrosoftOAuth {
     pub(super) fn from_env() -> Self {
-        let client_id = std::env::var("RTDB_MICROSOFT_CLIENT_ID").ok();
-        let client_secret = std::env::var("RTDB_MICROSOFT_CLIENT_SECRET").ok();
+        let client_id = env_nonblank("RTDB_MICROSOFT_CLIENT_ID");
+        let client_secret = env_nonblank("RTDB_MICROSOFT_CLIENT_SECRET");
         // `tenant` defaults to "common" (any Microsoft account); an empty
         // value falls back to that default so a blank RTDB_MICROSOFT_TENANT
         // isn't interpolated into the endpoint URL.
@@ -179,12 +187,10 @@ impl AppleOAuth {
     pub(super) fn from_env() -> Self {
         // Sign in with Apple. The private key is a PEM, which can't carry real
         // newlines through most env stores, so `\n` escapes are unescaped here.
-        let client_id = std::env::var("RTDB_APPLE_CLIENT_ID").ok();
-        let team_id = std::env::var("RTDB_APPLE_TEAM_ID").ok();
-        let key_id = std::env::var("RTDB_APPLE_KEY_ID").ok();
-        let private_key = std::env::var("RTDB_APPLE_PRIVATE_KEY")
-            .ok()
-            .map(|v| v.replace("\\n", "\n"));
+        let client_id = env_nonblank("RTDB_APPLE_CLIENT_ID");
+        let team_id = env_nonblank("RTDB_APPLE_TEAM_ID");
+        let key_id = env_nonblank("RTDB_APPLE_KEY_ID");
+        let private_key = env_nonblank("RTDB_APPLE_PRIVATE_KEY").map(|v| v.replace("\\n", "\n"));
         Self {
             client_id,
             team_id,

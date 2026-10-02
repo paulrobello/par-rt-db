@@ -78,7 +78,6 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 /// let _bg = common::background_guard(&state);
 /// let addr = spawn_app(state.clone()).await;
 /// ```
-#[allow(dead_code)] // opt-in helper (see docs above) — not yet adopted by any test file
 pub struct BackgroundGuard(Arc<rtdb_server::BackgroundTasks>);
 
 impl Drop for BackgroundGuard {
@@ -89,7 +88,6 @@ impl Drop for BackgroundGuard {
 
 /// Build a [`BackgroundGuard`] for `state`. See its docs for why this is an
 /// opt-in helper rather than automatic.
-#[allow(dead_code)] // opt-in helper — not yet adopted by any test file
 pub fn background_guard(state: &AppState) -> BackgroundGuard {
     BackgroundGuard(state.background.clone())
 }

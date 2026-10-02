@@ -573,6 +573,24 @@ struct HttpClientTests {
         #expect(user.name == nil)
     }
 
+    @Test func authValidateBearsTheTokenBeingValidated() async throws {
+        StubProtocol.handler = { request in
+            try demand(request.httpMethod == "GET", "expected GET")
+            try demand(request.url?.path == "/auth/validate", "expected /auth/validate")
+            // The bearer is the token BEING validated, not the client's own.
+            try demand(
+                request.value(forHTTPHeaderField: "Authorization") == "Bearer players-token",
+                "expected the validated token as the bearer"
+            )
+            return (
+                200,
+                Data(#"{"user":{"kind":"machine","email":null,"name":null}}"#.utf8)
+            )
+        }
+        let user = try await makeClient().authValidate("players-token")
+        #expect(user.kind == .machine)
+    }
+
     @Test func pushSchemaPostsDbAndSchema() async throws {
         StubProtocol.handler = { request in
             try demand(request.httpMethod == "POST", "expected POST")

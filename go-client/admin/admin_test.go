@@ -249,6 +249,39 @@ func TestManageScheduleOKFalse(t *testing.T) {
 	}
 }
 
+func TestCreateScheduleCarriesExternal(t *testing.T) {
+	var body string
+	c := &capture{t: t, method: "POST", path: "/admin/db/app/schedules",
+		status: 200, respBody: `{"id":"s1"}`}
+	// Wrap the capture handler to record the request body.
+	client := stub(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		body = string(b)
+		c.handler(w, r)
+	})
+	if _, err := client.CreateSchedule(context.Background(), "app",
+		wire.WhenAfterMs{Ms: 1000}, wire.Transaction{}, true); err != nil {
+		t.Fatalf("CreateSchedule: %v", err)
+	}
+	if !strings.Contains(body, `"external":true`) {
+		t.Fatalf("body missing external: %s", body)
+	}
+
+	// external=false must omit the field (the server defaults it).
+	client2 := stub(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		body = string(b)
+		c.handler(w, r)
+	})
+	if _, err := client2.CreateSchedule(context.Background(), "app",
+		wire.WhenAfterMs{Ms: 1000}, wire.Transaction{}, false); err != nil {
+		t.Fatalf("CreateSchedule: %v", err)
+	}
+	if strings.Contains(body, "external") {
+		t.Fatalf("body must omit external: %s", body)
+	}
+}
+
 func TestExportDBRaw(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/admin/export-db" || r.URL.Query().Get("db") != "app" {

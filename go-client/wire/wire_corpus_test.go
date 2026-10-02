@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 
@@ -219,19 +220,98 @@ func TestWireCorpusAdminOpEvents(t *testing.T) {
 	}
 }
 
-func TestWireCorpusRawSectionsRoundTrip(t *testing.T) {
-	// query_results / error_envelopes are raw JSON values (QueryResult is
-	// untagged on the wire; the error envelope model lives in errors) —
-	// JSON round-trip only, like the ts runner's untyped sections.
+func TestWireCorpusErrorEnvelopes(t *testing.T) {
+	// Decoded through the client's real envelope type (strict: an unknown
+	// field or code-shape drift fails here).
+	for idx, raw := range entries(t, loadCorpus(t), "error_envelopes") {
+		roundTripTyped(t, "error_envelopes", idx, raw, &wire.ErrorEnvelope{})
+	}
+}
+
+func TestWireCorpusDbStats(t *testing.T) {
+	// Decoded through the admin DbStats type (GET /admin/dbs/{db}/stats).
+	// Entry #0 carries a documentation `$comment` key — documentation, not
+	// wire data — so strip it before the strict decode.
+	for idx, raw := range entries(t, loadCorpus(t), "db_stats") {
+		roundTripTyped(t, "db_stats", idx, stripComment(t, raw), &admin.DbStats{})
+	}
+}
+
+// stripComment removes a top-level `$comment` documentation key (wire-corpus
+// annotation convention) from a raw entry.
+func stripComment(t *testing.T, raw json.RawMessage) json.RawMessage {
+	t.Helper()
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return raw // not an object (or malformed — the decode below reports it)
+	}
+	delete(m, "$comment")
+	out, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("strip $comment: %v", err)
+	}
+	return out
+}
+
+func TestWireCorpusQueryResultsRawRoundTrip(t *testing.T) {
+	// query_results stays a raw section by design (QueryResult is untagged on
+	// the wire; the clients deliberately keep results untyped): parse each
+	// entry and canonicalize both sides over sorted keys so the comparison is
+	// over the JSON value, not map ordering.
 	corpus := loadCorpus(t)
-	for _, section := range []string{"query_results", "error_envelopes"} {
-		for idx, raw := range entries(t, corpus, section) {
-			v, err := wire.UnmarshalJSON(raw)
-			if err != nil {
-				t.Fatalf("%s #%d: parse: %v", section, idx, err)
-			}
-			_ = v // parse == round-trip for a raw section
+	for idx, raw := range entries(t, corpus, "query_results") {
+		var v any
+		if err := json.Unmarshal(raw, &v); err != nil {
+			t.Fatalf("query_results #%d: parse: %v", idx, err)
 		}
+		if got, want := canonicalJSON(t, v), canonicalJSON(t, raw); got != want {
+			t.Fatalf("query_results #%d: re-serialization drifted:\n got %s\nwant %s", idx, got, want)
+		}
+	}
+}
+
+// canonicalJSON marshals any JSON value with object keys recursively sorted,
+// giving a stable textual form for a byte-equal comparison.
+func canonicalJSON(t *testing.T, v any) string {
+	t.Helper()
+	switch value := v.(type) {
+	case json.RawMessage:
+		var decoded any
+		if err := json.Unmarshal(value, &decoded); err != nil {
+			t.Fatalf("canonicalize raw: %v", err)
+		}
+		return canonicalJSON(t, decoded)
+	case map[string]any:
+		keys := make([]string, 0, len(value))
+		for k := range value {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var b strings.Builder
+		b.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			kb, _ := json.Marshal(k)
+			b.Write(kb)
+			b.WriteByte(':')
+			b.WriteString(canonicalJSON(t, value[k]))
+		}
+		b.WriteByte('}')
+		return b.String()
+	case []any:
+		parts := make([]string, len(value))
+		for i, e := range value {
+			parts[i] = canonicalJSON(t, e)
+		}
+		return "[" + strings.Join(parts, ",") + "]"
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("canonicalize leaf: %v", err)
+		}
+		return string(b)
 	}
 }
 

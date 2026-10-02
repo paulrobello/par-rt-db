@@ -9,6 +9,28 @@ import (
 	"github.com/paulrobello/par-rt-db/go-client/wire"
 )
 
+// ScheduleExternal marks the step external: the server never executes it —
+// an application worker claims and finalizes it via the claim surface.
+func TestScheduleExternalCarriesExternal(t *testing.T) {
+	txn := NewMutation().ScheduleExternal(wire.WhenAfterMs{Ms: 1000}, NewMutation()).Build()
+	b, err := json.Marshal(txn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytesHas(b, `"op":"schedule"`) || !bytesHas(b, `"external":true`) {
+		t.Fatalf("scheduleExternal shape: %s", b)
+	}
+
+	// The plain Schedule builder must not set external.
+	plain, err := json.Marshal(NewMutation().Schedule(wire.WhenAfterMs{Ms: 1000}, NewMutation()).Build())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytesHas(plain, "external") {
+		t.Fatalf("plain schedule must omit external: %s", plain)
+	}
+}
+
 func TestMutationBuilderChain(t *testing.T) {
 	txn := NewMutation().
 		Insert("items", wire.Object(map[string]wire.JSONValue{"n": wire.Number("1")})).

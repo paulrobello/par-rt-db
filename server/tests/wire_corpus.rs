@@ -231,3 +231,157 @@ fn arc004_enums_serialize_byte_identical_to_prior_strings() {
     assert_eq!(parsed.kind, UserKind::Machine);
     assert_eq!(serde_json::to_value(&parsed).unwrap(), wire);
 }
+
+/// Error envelopes decoded through the server's real `RtDbError` envelope
+/// (`code` is the closed `ErrorCode` enum — an unknown code fails at parse).
+#[test]
+fn error_envelopes_round_trip() {
+    let corpus = load_corpus();
+    for (i, entry) in section(&corpus, "error_envelopes").iter().enumerate() {
+        round_trip::<rtdb_server::error::RtDbError>("error_envelopes", i, entry);
+    }
+}
+
+/// Admin db-stats decoded through the server's `DbStatsResponse`
+/// (`admin/dbs.rs`). It is `pub(super)` and Serialize-only (a response
+/// shape), so the assertion is the round-trip of a mirror struct defined
+/// here against the same serde field names — the corpus bytes still pin the
+/// camelCase keys and the six ENH-011 quota/usage fields.
+#[test]
+fn db_stats_round_trip() {
+    #[derive(serde::Deserialize, serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TableStat {
+        name: String,
+        row_count: i64,
+        size_bytes: i64,
+    }
+    #[derive(serde::Deserialize, serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct DbStatsResponse {
+        tables: Vec<TableStat>,
+        total_size_bytes: i64,
+        tables_quota: usize,
+        tables_used: usize,
+        storage_quota_bytes: u64,
+        storage_used_bytes: u64,
+        subs_quota: usize,
+        subs_used: usize,
+    }
+    let corpus = load_corpus();
+    for (i, entry) in section(&corpus, "db_stats").iter().enumerate() {
+        let raw = match entry.get("$comment") {
+            // Documentation key in the corpus fixture, not wire data.
+            Some(_) => {
+                let mut map = entry
+                    .as_object()
+                    .expect("db_stats entry is an object")
+                    .clone();
+                map.remove("$comment");
+                Value::Object(map)
+            }
+            None => entry.clone(),
+        };
+        round_trip::<DbStatsResponse>("db_stats", i, &raw);
+    }
+}
+
+/// Query results stay a raw section by design (`QueryResult` is untagged on
+/// the wire): parse each entry and re-serialize, requiring deep equality
+/// over the parsed value — the "typed" check a value-level parse gives.
+#[test]
+fn query_results_round_trip() {
+    let corpus = load_corpus();
+    for (i, entry) in section(&corpus, "query_results").iter().enumerate() {
+        // A serde_json Value parse == round-trip, but going through
+        // `serde_json::from_str(to_string(..))` asserts byte-stable
+        // re-serialization of the canonical form.
+        let text = serde_json::to_string(entry)
+            .unwrap_or_else(|e| panic!("serialize failure [query_results #{i}]: {e}"));
+        let reparsed: Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("reparse failure [query_results #{i}]: {e}"));
+        assert_eq!(
+            reparsed, *entry,
+            "wire drift [query_results #{i}]: re-serialization differs"
+        );
+    }
+}
+
+/// Change-feed pages decoded through the server's `ChangeFeedResponse`
+/// (`protocol.rs` + `change_log::ChangeRow` — Serialize-only, so a local
+/// mirror struct with the same serde shape is the decode net).
+#[test]
+fn change_feed_responses_round_trip() {
+    #[derive(serde::Deserialize, serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ChangeRow {
+        seq: i64,
+        table: String,
+        doc_id: String,
+        kind: String,
+        doc: Option<Value>,
+        ts: i64,
+    }
+    #[derive(serde::Deserialize, serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ChangeFeedResponse {
+        ops: Vec<ChangeRow>,
+        next_seq: i64,
+        head: i64,
+        log_id: String,
+    }
+    let corpus = load_corpus();
+    for (i, entry) in section(&corpus, "change_feed_responses").iter().enumerate() {
+        round_trip::<ChangeFeedResponse>("change_feed_responses", i, entry);
+    }
+}
+
+/// QA-003 coverage meta-test: every top-level corpus section must be
+/// consumed by this runner. `CONSUMED_SECTIONS` lists the sections the
+/// tests above decode; `$comment` is the corpus's documentation key. A new
+/// section added to wire-corpus.json without a runner update fails here.
+#[test]
+fn every_corpus_section_has_a_consumer() {
+    const CONSUMED_SECTIONS: &[&str] = &[
+        "client_messages",
+        "server_messages",
+        "authed_users",
+        "schedule_whens",
+        "schedule_infos",
+        "query_results",
+        "error_envelopes",
+        "queries",
+        "migrate_requests",
+        "migrate_results",
+        "rejects_client_message_unknown_field",
+        "rejects_schedule_when_unknown_field",
+        "rejects_workflow_spec_unknown_field",
+        "rejects_authed_user_unknown_kind",
+        "rejects_schedule_info_unknown_kind",
+        "rejects_schedule_info_unknown_status",
+        "db_stats",
+        "change_feed_responses",
+        "admin_op_events",
+        "protocol_constants",
+    ];
+    let corpus = load_corpus();
+    let unconsumed: Vec<&String> = corpus
+        .as_object()
+        .expect("corpus is an object")
+        .keys()
+        .filter(|k| *k != "$comment" && !CONSUMED_SECTIONS.contains(&k.as_str()))
+        .collect();
+    assert!(
+        unconsumed.is_empty(),
+        "corpus sections with no server runner consumer: {unconsumed:?} — \
+         add a round-trip test above and extend CONSUMED_SECTIONS"
+    );
+    // And the inverse: a renamed/removed section leaves a dead CONSUMED_
+    // SECTIONS entry that silently stops being checked.
+    for name in CONSUMED_SECTIONS {
+        assert!(
+            corpus.get(name).is_some(),
+            "CONSUMED_SECTIONS lists '{name}' but the corpus no longer has that section"
+        );
+    }
+}

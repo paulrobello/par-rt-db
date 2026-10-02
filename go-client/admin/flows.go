@@ -108,13 +108,19 @@ func (c *AdminClient) ListSchedules(ctx context.Context, db string) ([]wire.Sche
 	return resp.Schedules, nil
 }
 
-// CreateSchedule: POST /admin/db/{db}/schedules {when, txn} → the new
-// job's id.
-func (c *AdminClient) CreateSchedule(ctx context.Context, db string, when wire.ScheduleWhen, txn wire.Transaction) (string, error) {
+// CreateSchedule: POST /admin/db/{db}/schedules {when, txn[, external]} →
+// the new job's id. Pass external=true to create an external-claim job:
+// one the server never executes — an application worker claims it via the
+// per-db /api/schedule/claim surface and finalizes it with the returned
+// leaseGeneration fencing token.
+func (c *AdminClient) CreateSchedule(ctx context.Context, db string, when wire.ScheduleWhen, txn wire.Transaction, external bool) (string, error) {
 	var resp struct {
 		ID string `json:"id"`
 	}
 	body := map[string]any{"when": when, "txn": txn}
+	if external {
+		body["external"] = true
+	}
 	if err := c.api.Call(ctx, methodPost, fmt.Sprintf("/admin/db/%s/schedules", db), body, &resp); err != nil {
 		return "", err
 	}

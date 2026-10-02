@@ -10,6 +10,7 @@
 //! referenced through `par_rt_db_client::wire::` because they are not (yet)
 //! re-exported from the crate root.
 
+use par_rt_db_client::ErrorEnvelope;
 use par_rt_db_client::Query;
 use par_rt_db_client::wire::{
     AuthedUser, ChangeFeedResponse, ClientMessage, ScheduleInfo, ScheduleKind, ScheduleStatus,
@@ -101,6 +102,47 @@ fn change_feed_responses_round_trip() {
     let corpus = load_corpus();
     for (i, entry) in section(&corpus, "change_feed_responses").iter().enumerate() {
         round_trip::<ChangeFeedResponse>("change_feed_responses", i, entry);
+    }
+}
+
+/// Error envelopes decoded through the client's real `ErrorEnvelope` type
+/// (`code` is the closed `ErrorCode` enum — an unknown code fails at parse).
+#[test]
+fn error_envelopes_round_trip() {
+    let corpus = load_corpus();
+    for (i, entry) in section(&corpus, "error_envelopes").iter().enumerate() {
+        round_trip::<ErrorEnvelope>("error_envelopes", i, entry);
+    }
+}
+
+/// Admin db-stats decoded through the client's `DbStats` (feature `admin`;
+/// camelCase + the six ENH-011 quota/usage fields). `DbStats` is
+/// decode-only (`Deserialize`, no `Serialize` — ARC-130 response-shaped), so
+/// the assertion is a strict typed decode of every entry; the `$comment`
+/// documentation key the corpus annotates entry #0 with is stripped first.
+#[cfg(feature = "admin")]
+#[test]
+fn db_stats_round_trip() {
+    let corpus = load_corpus();
+    for (i, entry) in section(&corpus, "db_stats").iter().enumerate() {
+        let raw = match entry.get("$comment") {
+            Some(_) => {
+                let mut map = entry
+                    .as_object()
+                    .expect("db_stats entry is an object")
+                    .clone();
+                map.remove("$comment");
+                Value::Object(map)
+            }
+            None => entry.clone(),
+        };
+        let parsed: par_rt_db_client::wire::admin::DbStats = serde_json::from_value(raw.clone())
+            .unwrap_or_else(|e| panic!("parse failure [db_stats #{i}]: {e}\n  input: {raw}"));
+        assert_eq!(
+            parsed.total_size_bytes,
+            raw["totalSizeBytes"].as_i64().unwrap_or(-1),
+            "db_stats #{i}: totalSizeBytes decode drifted"
+        );
     }
 }
 

@@ -439,7 +439,10 @@ pub async fn enqueue_for_ops(
             owner: owner.clone(),
             source,
         })
-        .map_err(|e| RtDbError::internal(format!("encode webhook payload: {e}")))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to encode webhook payload");
+            RtDbError::internal("failed to encode webhook payload")
+        })?;
         let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
             "INSERT INTO rtdb.webhook_deliveries \
              (webhook_id, payload, attempts, next_attempt, status) ",
@@ -602,7 +605,10 @@ fn build_delivery_client() -> Result<reqwest::Client, RtDbError> {
         .redirect(reqwest::redirect::Policy::none())
         .dns_resolver(Arc::new(WebhookDnsResolver))
         .build()
-        .map_err(|e| RtDbError::internal(format!("build webhook HTTP client: {e}")))
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to build webhook HTTP client");
+            RtDbError::internal("failed to build webhook HTTP client")
+        })
 }
 
 /// The delivery worker loop: drain, sleep [`WORKER_POLL_INTERVAL`], repeat.

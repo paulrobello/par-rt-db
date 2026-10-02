@@ -10,7 +10,7 @@
       "import": "./dist/index.js"
     },
     "./react": {
-      "development": "./src/react.ts",
+      "development": "./src/react.tsx",
       "types": "./dist/react.d.ts",
       "import": "./dist/react.js"
     }

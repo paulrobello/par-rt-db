@@ -185,11 +185,11 @@ pub struct Config {
     /// accumulating as permanent `rtdb_auth.users`/`rtdb_auth.sessions` rows
     /// (SEC-103). Boot-only (not hot-reloadable).
     pub anonymous_session_ttl_days: i64,
-    /// RTDB_QUOTA_CACHE_TTL_SECS (default 60). TTL for the per-db quota
-    /// counters (table count, storage bytes, active subs) maintained by the
-    /// enforcement layer (ENH-011). 0 is interpreted as "no caching" by the
-    /// reader; boot-only (not hot-reloadable) because the cache lives outside
-    /// `HotConfig` and is rebuilt from `AppState` on its own cadence.
+    /// RTDB_QUOTA_CACHE_TTL_SECS (default 60, clamped to at least 1). The
+    /// per-db quota warmer's tick period and the staleness bound for the
+    /// cached per-db storage-bytes reading (ENH-011); 0 is clamped to 1
+    /// (boot-only, not hot-reloadable — the cache lives outside `HotConfig`
+    /// and is rebuilt from `AppState` on its own cadence).
     pub quota_cache_ttl_secs: u64,
     /// RTDB_DB_IDLE_RECLAIM_SECS (default 0 = disabled). When non-zero, a
     /// background sweep retires a database's five per-db tasks (committer +
@@ -351,20 +351,26 @@ where
 /// Boot-time env boolean (QA-106). `default` is returned when the var is
 /// unset. Recognized spellings ("true"/"1"/"yes" ⇒ true; "false"/"0"/"no" ⇒
 /// false, case-insensitive, trimmed) are honored; an UNRECOGNIZED value
-/// resolves to `default`, so a typo cannot flip a knob away from its
-/// documented posture — security flags that ship on stay on; opt-in flags
-/// that ship off stay off.
+/// resolves to `default` (with a warning — Config::from_env runs before the
+/// tracing subscriber is installed, so it surfaces on stderr via the fallback
+/// formatting) so a typo cannot flip a knob away from its documented posture —
+/// security flags that ship on stay on; opt-in flags that ship off stay off.
 fn env_bool(key: &str, default: bool) -> bool {
-    let Some(v) = std::env::var(key)
-        .ok()
-        .map(|v| v.trim().to_ascii_lowercase())
-    else {
+    let Some(raw) = std::env::var(key).ok() else {
         return default;
     };
+    let v = raw.trim().to_ascii_lowercase();
     match v.as_str() {
         "true" | "1" | "yes" => true,
         "false" | "0" | "no" => false,
-        _ => default,
+        _ => {
+            // Config::from_env runs before the tracing subscriber exists
+            // (main.rs parses config first on purpose), so warn on stderr.
+            eprintln!(
+                "warning: {key}={raw:?} is not a recognized boolean (true/1/yes, false/0/no); using the default ({default})"
+            );
+            default
+        }
     }
 }
 
@@ -593,8 +599,10 @@ impl Config {
         // quickly rather than living for the standard 30-day TTL. Default 1.
         let anonymous_session_ttl_days = env_parsed("RTDB_ANONYMOUS_SESSION_TTL_DAYS", 1i64)?;
 
-        // Quota counter cache TTL (ENH-011). 0 = no caching.
-        let quota_cache_ttl_secs = env_parsed("RTDB_QUOTA_CACHE_TTL_SECS", 60u64)?;
+        // Quota counter cache TTL (ENH-011): the warmer's tick period and the
+        // storage-bytes staleness bound. Clamped to at least 1 so a 0 (or
+        // negative-in-spirit) value can never spin the warmer into a hot loop.
+        let quota_cache_ttl_secs = env_parsed("RTDB_QUOTA_CACHE_TTL_SECS", 60u64)?.max(1);
 
         // ARC-102 step 4: idle-database reclamation threshold. 0 = disabled
         // (default); a non-zero value retires a db's per-db tasks once it has
@@ -1093,6 +1101,75 @@ mod tests {
                 "RTDB_OTEL_SERVICE_NAME",
                 "RTDB_OTEL_SAMPLE_RATIO",
             ] {
+                std::env::remove_var(v);
+            }
+            match saved_db {
+                Some(v) => std::env::set_var("RTDB_DATABASE_URL", v),
+                None => std::env::remove_var("RTDB_DATABASE_URL"),
+            }
+            match saved_key {
+                Some(v) => std::env::set_var("RTDB_ADMIN_KEY", v),
+                None => std::env::remove_var("RTDB_ADMIN_KEY"),
+            }
+        }
+    }
+
+    /// QA-014: a blank OAuth credential env var is treated as unset — Compose
+    /// (and systemd EnvironmentFile) forward unset variables as the empty
+    /// string, and `.ok()` alone would surface `Some("")`, making a provider
+    /// look configured with an empty credential. QA-015 rides the same test:
+    /// `RTDB_QUOTA_CACHE_TTL_SECS=0` clamps to 1.
+    #[test]
+    #[serial_test::serial]
+    fn blank_oauth_env_is_unset_and_quota_ttl_clamps() {
+        unsafe {
+            let saved_db = std::env::var("RTDB_DATABASE_URL").ok();
+            let saved_key = std::env::var("RTDB_ADMIN_KEY").ok();
+            std::env::set_var("RTDB_DATABASE_URL", "postgres://test");
+            std::env::set_var("RTDB_ADMIN_KEY", "test-admin-key-0123");
+
+            let touched = [
+                "RTDB_GOOGLE_CLIENT_ID",
+                "RTDB_GOOGLE_CLIENT_SECRET",
+                "RTDB_QUOTA_CACHE_TTL_SECS",
+            ];
+            for v in touched {
+                std::env::remove_var(v);
+            }
+
+            // Unset → None.
+            let oauth = OAuthConfig::from_env();
+            assert!(oauth.google.client_id.is_none());
+            assert!(oauth.google.client_secret.is_none());
+
+            // Blank → also None (the QA-014 contract).
+            std::env::set_var("RTDB_GOOGLE_CLIENT_ID", "");
+            std::env::set_var("RTDB_GOOGLE_CLIENT_SECRET", "   ");
+            let oauth = OAuthConfig::from_env();
+            assert!(
+                oauth.google.client_id.is_none(),
+                "a blank client id must read as unset"
+            );
+            assert!(
+                oauth.google.client_secret.is_none(),
+                "a whitespace-only client secret must read as unset"
+            );
+
+            // A real value still wins.
+            std::env::set_var("RTDB_GOOGLE_CLIENT_ID", "real-id");
+            let oauth = OAuthConfig::from_env();
+            assert_eq!(oauth.google.client_id.as_deref(), Some("real-id"));
+
+            // QA-015: 0 clamps to 1 so the warmer can never spin on a 0 tick.
+            std::env::set_var("RTDB_QUOTA_CACHE_TTL_SECS", "0");
+            let c = Config::from_env().expect("from_env with required vars set");
+            assert_eq!(c.quota_cache_ttl_secs, 1, "0 clamps to 1");
+            std::env::set_var("RTDB_QUOTA_CACHE_TTL_SECS", "30");
+            let c = Config::from_env().expect("from_env with required vars set");
+            assert_eq!(c.quota_cache_ttl_secs, 30);
+
+            // Cleanup so nothing leaks into other lib tests.
+            for v in touched {
                 std::env::remove_var(v);
             }
             match saved_db {

@@ -7,12 +7,11 @@
 //! current three ways: a per-db background warmer (`committer::run_quota_warmer`,
 //! ARC-004), a stale-read on the hot path (`enforce`), and an eager post-commit
 //! refresh.
+use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use sqlx::PgPool;
-
+use crate::db::now_ms;
 use crate::error::RtDbError;
 
 #[derive(Clone, Copy, Debug)]
@@ -178,13 +177,6 @@ impl UsageCache {
         self.store(db, Self::measure(pool, db).await?);
         Ok(())
     }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

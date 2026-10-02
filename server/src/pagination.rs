@@ -9,8 +9,10 @@ use serde_json::Value;
 
 /// Encode a cursor from an array of values: [index values..., created_at, id]
 pub fn encode_cursor(values: &[Value]) -> Result<String, RtDbError> {
-    let json = serde_json::to_string(values)
-        .map_err(|e| RtDbError::internal(format!("failed to encode cursor: {e}")))?;
+    let json = serde_json::to_string(values).map_err(|e| {
+        tracing::error!(error = %e, "failed to encode cursor");
+        RtDbError::internal("failed to encode cursor")
+    })?;
     Ok(BASE64.encode(json))
 }
 

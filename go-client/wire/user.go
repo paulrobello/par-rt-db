@@ -200,6 +200,41 @@ type ScheduleInfo struct {
 	LastMissedAt *int64 `json:"lastMissedAt,omitempty"`
 }
 
+// Mirrors server/src/protocol.rs::ClaimedSchedule — one externally-claimed
+// job returned by POST /api/schedule/claim. LeaseGeneration is the per-job
+// monotonic fencing token: it increments on every claim (including re-claims
+// after lease expiry), and the worker's complete/retry/fail calls are
+// rejected CONFLICT once a newer generation exists. Cron/Tz/EveryMs ride
+// along for recurring jobs so a complete can advance the job to its next
+// due instant; cron/tz/everyMs omitted when absent.
+type ClaimedSchedule struct {
+	ID              string       `json:"id"`
+	Kind            ScheduleKind `json:"kind"`
+	DueAt           int64        `json:"dueAt"`
+	Txn             Transaction  `json:"txn"`
+	Cron            *string      `json:"cron,omitempty"`
+	Tz              *string      `json:"tz,omitempty"`
+	EveryMs         *int64       `json:"everyMs,omitempty"`
+	LeaseGeneration int64        `json:"leaseGeneration"`
+	LeaseDeadlineMs int64        `json:"leaseDeadlineMs"`
+}
+
+// UnmarshalJSON rejects unknown fields.
+func (s *ClaimedSchedule) UnmarshalJSON(b []byte) error {
+	type alias ClaimedSchedule
+	v, err := StrictUnmarshal[alias](b)
+	if err != nil {
+		return err
+	}
+	switch v.Kind {
+	case ScheduleKindOneshot, ScheduleKindCron, ScheduleKindInterval:
+	default:
+		return errUnknownKind
+	}
+	*s = ClaimedSchedule(v)
+	return nil
+}
+
 // Mirrors core/src/mutation.rs::ScheduleKind — snake_case values.
 type ScheduleKind string
 

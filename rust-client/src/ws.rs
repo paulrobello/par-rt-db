@@ -249,6 +249,7 @@ enum ScheduleMsg {
     Schedule {
         when: ScheduleWhen,
         txn: Transaction,
+        external: bool,
     },
     Cancel {
         id: String,
@@ -878,11 +879,13 @@ impl RtDbClient {
         &self,
         txn: &Transaction,
         when: ScheduleWhen,
+        external: bool,
     ) -> Result<String, RtDbError> {
         match self
             .queue_schedule(ScheduleMsg::Schedule {
                 when,
                 txn: txn.clone(),
+                external,
             })
             .await?
         {
@@ -1581,15 +1584,18 @@ where
     S: Sink<WsMessage> + Unpin,
 {
     let frame = match &q.msg {
-        ScheduleMsg::Schedule { when, txn } => ClientMessage::Schedule {
+        ScheduleMsg::Schedule {
+            when,
+            txn,
+            external,
+        } => ClientMessage::Schedule {
             schedule_id: q.schedule_id.clone(),
             when: when.clone(),
             txn: txn.clone(),
-            // The WS `schedule` surface stays internal-job-only (external
-            // jobs are created via the DSL's `schedule_external` step or the
-            // HTTP `schedule` op); the field exists on the frame to mirror
-            // the server's wire vocabulary. Omitted on the wire when `None`.
-            external: None,
+            // `true` opts the job out of internal execution: an application
+            // worker claims it via the HTTP claim route. Omitted on the wire
+            // when false.
+            external: if *external { Some(true) } else { None },
         },
         ScheduleMsg::Cancel { id } => ClientMessage::CancelSchedule {
             schedule_id: q.schedule_id.clone(),

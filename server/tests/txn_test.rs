@@ -568,7 +568,8 @@ async fn replace_rolled_back_by_later_failed_step() -> anyhow::Result<()> {
     };
 
     let result = execute_txn(&pool, &db, &schema, &txn, &PrincipalCtx::bypass(), None).await;
-    assert!(result.is_err());
+    let err = result.expect_err("missing target doc must fail the step");
+    assert_eq!(err.code, ErrorCode::NotFound);
 
     let pg_schema = format!("db_{db}");
     let row: (String, i64) = sqlx::query_as(&format!(
@@ -693,7 +694,8 @@ async fn failed_step_rolls_back_earlier_steps_in_same_txn() -> anyhow::Result<()
     };
 
     let result = execute_txn(&pool, &db, &schema, &txn, &PrincipalCtx::bypass(), None).await;
-    assert!(result.is_err());
+    let err = result.expect_err("missing target doc must fail the step");
+    assert_eq!(err.code, ErrorCode::NotFound);
 
     let pg_schema = format!("db_{db}");
     let count: i64 = sqlx::query_scalar(&format!(

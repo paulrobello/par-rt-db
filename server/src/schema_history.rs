@@ -64,8 +64,10 @@ pub async fn capture(
 ) -> Result<(), RtDbError> {
     ensure_table(pool, db).await?;
     let schema_name = pg_schema(db);
-    let value = serde_json::to_value(schema)
-        .map_err(|e| RtDbError::internal(format!("failed to serialize schema: {e}")))?;
+    let value = serde_json::to_value(schema).map_err(|e| {
+        tracing::error!(error = %e, db, "failed to serialize schema for schema_history");
+        RtDbError::internal("failed to serialize schema")
+    })?;
     sqlx::query(&format!(
         "INSERT INTO \"{schema_name}\".schema_history (captured_at, source, principal, schema) \
          VALUES ($1, $2, $3, $4)"

@@ -343,9 +343,8 @@ impl Forwarder {
         };
         // Every field is a plain serde type; this cannot fail in practice.
         let payload_json = serde_json::to_string(&payload).map_err(|e| {
-            ForwardFail::Notify(RtDbError::internal(format!(
-                "failed to serialize forwarded write: {e}"
-            )))
+            tracing::error!(error = %e, "failed to serialize forwarded write");
+            ForwardFail::Notify(RtDbError::internal("failed to serialize forwarded write"))
         })?;
         if payload_json.len() > MAX_FORWARD_PAYLOAD_BYTES {
             return Err(ForwardFail::Notify(RtDbError::bad_request(
@@ -370,9 +369,10 @@ impl Forwarder {
         {
             self.pending.lock().await.remove(&request_id);
             let _ = spool_delete(&self.pool, row_id).await;
-            return Err(ForwardFail::Notify(RtDbError::internal(format!(
-                "forward pg_notify failed: {e}"
-            ))));
+            tracing::error!(error = %e, "forward pg_notify failed");
+            return Err(ForwardFail::Notify(RtDbError::internal(
+                "forward pg_notify failed",
+            )));
         }
         let reply = tokio::time::timeout(self.timeout, rx).await;
         match reply {
@@ -623,8 +623,10 @@ pub async fn run_forward_sweeper(pool: PgPool, retention: std::time::Duration) {
 /// these plain serde types; a failure still maps to an internal error rather
 /// than panicking inside the listener.
 fn serialize_result<T: serde::Serialize>(value: T) -> Result<serde_json::Value, RtDbError> {
-    serde_json::to_value(value)
-        .map_err(|e| RtDbError::internal(format!("forward reply serialize: {e}")))
+    serde_json::to_value(value).map_err(|e| {
+        tracing::error!(error = %e, "forward reply serialize failed");
+        RtDbError::internal("forward reply serialize failed")
+    })
 }
 
 /// Long-lived LISTEN loop for Stage 4c, spawned by `AppState::new` only when

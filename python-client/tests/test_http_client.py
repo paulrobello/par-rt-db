@@ -1629,6 +1629,53 @@ def test_changes_cursor_expired_surfaces_as_rtdb_error_410() -> None:
     assert exc.value.status_code == 410
 
 
+# --- auth token validation (GET /auth/me, GET /auth/validate) ----------------
+
+
+def test_auth_me_gets_the_principal_with_the_clients_own_bearer() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(
+            200,
+            json={"user": {"kind": "user", "email": "a@b.com", "name": "A"}},
+        )
+
+    user = _client(handler).auth_me()
+    assert seen["method"] == "GET"
+    assert seen["path"] == "/auth/me"
+    assert seen["auth"] == "Bearer machine-token"
+    assert user.kind == "user"
+    assert user.email == "a@b.com"
+
+
+def test_auth_validate_bears_the_token_being_validated() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"user": {"kind": "machine", "email": None, "name": None}})
+
+    user = _client(handler).auth_validate("players-token")
+    assert seen["path"] == "/auth/validate"
+    # The bearer is the token BEING validated, not the client's own.
+    assert seen["auth"] == "Bearer players-token"
+    assert user.kind == "machine"
+
+
+def test_auth_validate_invalid_token_surfaces_the_envelope() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"code": "UNAUTHORIZED", "message": "expired"})
+
+    with pytest.raises(RtDbError) as exc:
+        _client(handler).auth_validate("stale")
+    assert exc.value.code is ErrorCode.UNAUTHORIZED
+
+
 # --- data plane: workflows (FM-29) ------------------------------------------
 
 

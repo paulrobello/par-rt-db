@@ -50,7 +50,8 @@ pub async fn export_database(
         schema: schema.clone(),
     };
     out.push_str(&serde_json::to_string(&schema_line).map_err(|err| {
-        RtDbError::internal(format!("failed to serialize snapshot schema line: {err}"))
+        tracing::error!(error = %err, db, "failed to serialize snapshot schema line");
+        RtDbError::internal("failed to serialize snapshot schema line")
     })?);
     out.push('\n');
 
@@ -75,7 +76,8 @@ pub async fn export_database(
                 version,
             };
             out.push_str(&serde_json::to_string(&line).map_err(|err| {
-                RtDbError::internal(format!("failed to serialize snapshot doc line: {err}"))
+                tracing::error!(error = %err, db, table = %table_name, "failed to serialize snapshot doc line");
+                RtDbError::internal("failed to serialize snapshot doc line")
             })?);
             out.push('\n');
         }
