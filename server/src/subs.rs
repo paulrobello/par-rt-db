@@ -25,6 +25,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::Instrument;
 
 use crate::auth::{PrincipalCtx, authorize_table};
+use crate::dsl::QueryTerminalNameExt;
 use crate::error::RtDbError;
 use crate::metrics::{Metrics, SkipClass};
 use crate::protocol::ServerMessage;

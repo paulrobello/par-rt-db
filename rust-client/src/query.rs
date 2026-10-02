@@ -4,128 +4,16 @@ use crate::wire::{AggregateOp, AggregateSpec, FilterExpr, SearchMode, SearchQuer
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-/// Sort direction for `order` (wire `asc`/`desc`).
-pub enum Order {
-    /// Ascending.
-    Asc,
-    /// Descending.
-    Desc,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-/// Cursor-pagination terminal parameters.
-pub struct Paginate {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    /// Opaque cursor from a previous page; `None` starts at the first page.
-    pub cursor: Option<String>,
-    /// Page size.
-    pub num_items: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-/// The wire `Query` — one table plus at most one read terminal. Built via
-/// [`TableQuery`] (or constructed directly); sent with `POST /api/query` / WS
-/// `Query`.
-pub struct Query {
-    /// Table name.
-    pub table: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Point-read terminal: the document id.
-    pub get: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Index name for eq/range access.
-    pub index: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    /// Eq-prefix values bound to the index's leading fields.
-    pub eq: Vec<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Exclusive lower bound on the index field after the eq prefix.
-    pub gt: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Inclusive lower bound on the index field after the eq prefix.
-    pub gte: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Exclusive upper bound on the index field after the eq prefix.
-    pub lt: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Inclusive upper bound on the index field after the eq prefix.
-    pub lte: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Sort direction over the index.
-    pub order: Option<Order>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// `take(N)` terminal: first N rows.
-    pub take: Option<u32>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    /// `unique` terminal: the one matching row or `null` (error on >1).
-    pub unique: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    /// `first` terminal: the first matching row or `null`.
-    pub first: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    /// `count` terminal: number of matching rows.
-    pub count: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    /// `distinct` terminal: unique values of the index field after the eq prefix.
-    pub distinct: bool,
-    /// Aggregate terminal: SUM/AVG/MIN/MAX over the index field after the eq
-    /// prefix; `group_by` shifts to a grouped aggregate. Mutually exclusive with
-    /// every other terminal except `eq`/range bounds/`filter`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub aggregate: Option<AggregateSpec>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Cursor-pagination terminal. Also composes as a PEER clause with the
-    /// ranked terminals `search`/`vectorSearch`/`hybridSearch` (ENH-030),
-    /// paging that terminal's own ranking rather than replacing it.
-    pub paginate: Option<Paginate>,
-    /// Additional db-side WHERE predicate over doc fields; composes with
-    /// index/order/take/cursor.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filter: Option<FilterExpr>,
-    /// Full-text search terminal: ranks by `ts_rank` over a search index's
-    /// tsvector; composes with `take` and with `paginate` (ENH-030).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub search: Option<SearchQuery>,
-    /// Vector-similarity terminal: ranks by cosine distance over a vector index;
-    /// carries its own limit. Composes with `paginate` (ENH-030), where `limit`
-    /// keeps its meaning as the ranked candidate POOL and `paginate.num_items`
-    /// slices that pool into pages. The wire key is camelCase `vectorSearch`
-    /// (matches the server's explicit `#[serde(rename = "vectorSearch")]`; this
-    /// struct has no `rename_all`, so the rename must be explicit).
-    #[serde(
-        default,
-        rename = "vectorSearch",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub vector_search: Option<crate::wire::VectorSearchQuery>,
-    /// Hybrid terminal: fuses full-text (`search`) and vector (`vectorSearch`)
-    /// ranking via Reciprocal Rank Fusion; carries its own limit. Composes with
-    /// `paginate` (ENH-030) on the same pool-and-page terms as `vectorSearch`.
-    /// The wire key is camelCase `hybridSearch` (explicit rename, matching
-    /// `vector_search`).
-    #[serde(
-        default,
-        rename = "hybridSearch",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub hybrid_search: Option<crate::wire::HybridSearchQuery>,
-    /// Projection: keep only these user fields per result doc. Every
-    /// `_`-prefixed key (the system fields `_id`/`_creationTime`/`_version`
-    /// plus synthetics like `_searchSnippet`) is always kept, so listing one
-    /// is an accepted no-op. `Some(vec![])` is a meaningful system-fields-only
-    /// (ids-only) view, not treated as absent; `None` (omitted on the wire) is
-    /// full docs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fields: Option<Vec<String>>,
-}
-
-fn is_false(b: &bool) -> bool {
-    !*b
-}
+// ARC-007: `Query`/`Order`/`Paginate` are now defined once in
+// `par_rt_db_core::query` (same reasoning as `FilterExpr` in `wire.rs`) and
+// re-exported here at their historical path, so every existing
+// `par_rt_db_client::query::Query` import — and the crate-root
+// `pub use query::{..}` — keeps resolving unchanged. `AggregateSpec` and the
+// other terminal types come from `crate::wire`'s re-export of the same core
+// module. The `TableQuery` builder below and the opts bags are
+// rust-client-only ergonomics and stay defined here; they produce the core
+// `Query` directly.
+pub use par_rt_db_core::query::{Order, Paginate, Query};
 
 // ARC-130: response-shaped (returned by the paginate terminal). The caller
 // reads it; the server constructs it. `#[non_exhaustive]` lets the wire shape
@@ -586,15 +474,15 @@ mod tests {
 
     #[test]
     fn aggregate_terminal() {
-        // Aggregate without groupBy: bare `{op}` wire shape (groupBy defaults
-        // false and is omitted on the wire by the rust-client mirror, which
-        // round-trips back via `#[serde(default)]`).
+        // Aggregate without groupBy: `groupBy: false` ALWAYS rides the wire
+        // (ARC-007 unified the mirror with the core type, where the server's
+        // always-serialize attr won — matching the Go client's shape).
         let q = TableQuery::new("items")
             .with_index("by_project_and_order", &[json!("p1")])
             .aggregate(AggregateOp::Sum, false);
         assert_eq!(
             serde_json::to_value(&q).unwrap(),
-            json!({"table":"items","index":"by_project_and_order","eq":["p1"],"aggregate":{"op":"sum"}})
+            json!({"table":"items","index":"by_project_and_order","eq":["p1"],"aggregate":{"op":"sum","groupBy":false}})
         );
     }
 

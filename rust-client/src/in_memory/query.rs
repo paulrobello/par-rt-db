@@ -1130,69 +1130,11 @@ pub(super) fn diff_canonical(result: &Value, q: &Query) -> String {
     canonical(&stripped)
 }
 
-/// Build the wire-corpus clause-presence set for `q` — mirrors the server's
-/// `query_clauses` in `server/src/query/mod.rs`. Fed once, up front, to
-/// `par_rt_db_core::query_combinations::check_query_combinations`.
+/// Build the clause-presence set for `q`. Defined once in
+/// `par_rt_db_core::query` (ARC-007) so the in-memory engine and the server
+/// cannot drift; this thin wrapper keeps the internal call sites unchanged.
 fn query_clauses(q: &Query) -> std::collections::HashSet<&'static str> {
-    let mut set = std::collections::HashSet::new();
-    if q.get.is_some() {
-        set.insert("get");
-    }
-    if q.index.is_some() {
-        set.insert("index");
-    }
-    if !q.eq.is_empty() {
-        set.insert("eq");
-    }
-    if q.gt.is_some() {
-        set.insert("gt");
-    }
-    if q.gte.is_some() {
-        set.insert("gte");
-    }
-    if q.lt.is_some() {
-        set.insert("lt");
-    }
-    if q.lte.is_some() {
-        set.insert("lte");
-    }
-    if q.order.is_some() {
-        set.insert("order");
-    }
-    if q.take.is_some() {
-        set.insert("take");
-    }
-    if q.unique {
-        set.insert("unique");
-    }
-    if q.first {
-        set.insert("first");
-    }
-    if q.count {
-        set.insert("count");
-    }
-    if q.distinct {
-        set.insert("distinct");
-    }
-    if q.aggregate.is_some() {
-        set.insert("aggregate");
-    }
-    if q.paginate.is_some() {
-        set.insert("paginate");
-    }
-    if q.filter.is_some() {
-        set.insert("filter");
-    }
-    if q.search.is_some() {
-        set.insert("search");
-    }
-    if q.vector_search.is_some() {
-        set.insert("vectorSearch");
-    }
-    if q.hybrid_search.is_some() {
-        set.insert("hybridSearch");
-    }
-    set
+    par_rt_db_core::query::query_clauses(q)
 }
 
 /// ENH-028 phase 2: the single combination check for the in-memory engine,

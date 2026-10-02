@@ -22,9 +22,9 @@ use crate::auth::{PrincipalCtx, authorize_table};
 use crate::db::validate_db_name;
 use crate::ddl::{pg_col, pg_schema, pg_table};
 use crate::dsl::{
-    AggregateGroup, AggregateMultiGroup, AggregateOp, AggregateSpec, EqBind, GroupBy, Order,
-    Paginate, PaginatedResult, Query, QueryResult, eq_bind_for, eq_binds, filter_matches,
-    row_visible_to,
+    AggregateGroup, AggregateMultiGroup, AggregateOp, AggregateOpSqlExt, AggregateSpec,
+    AggregateSpecOpsExt, EqBind, GroupBy, Order, Paginate, PaginatedResult, Query, QueryResult,
+    eq_bind_for, eq_binds, filter_matches, row_visible_to,
 };
 use crate::error::RtDbError;
 use crate::pagination::{decode_cursor, encode_cursor};
