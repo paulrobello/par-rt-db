@@ -21,6 +21,40 @@ alter observable behavior on upgrade.
 
 ### Breaking
 
+- **The trigram GIN for `search`'s `mode: "trgm"` is now opt-in per index
+  (`trgm: true`, `fcc8ae7` — FEATURE_MATRIX #30).** Every search index used to
+  pay for a second GIN (roughly doubling index storage) even when trgm mode
+  was never used. An additive `trgm: bool` on `IndexDef` (omitted when false,
+  following the `unique`/`search` flag convention) now gates trigram index
+  creation; it is create-time-only and deliberately NOT compared in
+  `detect_destructive_changes` (same treatment as `softDelete`). **Migration:**
+  an index you call trgm-mode search against must declare `trgm: true` — add
+  the flag and re-push the schema; otherwise the server rejects the query with
+  `BAD_REQUEST` ("does not declare trgm: true"). A search index that predates
+  the flag is grandfathered to `trgm: true` at push time when the incoming push
+  still omits it, so existing schemas keep working unchanged.
+- **Schedule/workflow manage operations are now creator-scoped (`cca12c3`,
+  SEC-002).** Cancel/pause/resume on a scheduled job and cancel/signal on a
+  workflow run were authorized only at the database level — any authorized
+  user could operate on any other user's job. Machine tokens are unchanged; a
+  User principal must now match the row's stored enqueuer (`NULL` enqueuer —
+  system/machine — is `FORBIDDEN` for users), and `/admin/*` is untouched. The
+  external claim and finalize surfaces reject User principals outright (the
+  external worker is a machine token by design). Wire shapes are unchanged;
+  users get new `FORBIDDEN` responses.
+- **`POST /admin/import-db` requires an empty target database (`5b4af54`,
+  ARC-002).** An import writes document tables directly, bypassing the per-db
+  committer, so importing into a populated database raced the single-writer
+  invariant. A target holding any row of the currently-pushed schema is
+  rejected up front with `409 CONFLICT`. Legitimate callers (clone-db, backup
+  restore, CLI round-trips) already target fresh databases.
+- **`AggregateSpec.groupBy` always serializes on the wire (`39ea360`,
+  ARC-007).** Extracting the shared `Query` into `par-rt-db-core` fixed the
+  historical Rust-client divergence: `group_by` is now always present in the
+  serialized aggregate (previously omitted when absent on one side), matching
+  the Go client's shape. Clients strict-decoding aggregates must accept the
+  always-present field; the wire-corpus pins it.
+
 - **`sum`/`min`/`max` over an `int64` index field now return the exact decimal
   string instead of a JSON number** (FEATURE_MATRIX #13). The old projection
   put Postgres's exact `numeric`/`bigint` result through a JSON number — exact
@@ -87,6 +121,94 @@ alter observable behavior on upgrade.
   migration.
 
 ### Added
+
+- **Go client — the sixth protocol mirror (`5d0d57f`).** `go-client/` ships the
+  Go implementation of the par-rt-db wire contract (Go 1.23+, stdlib-only
+  outside `coder/websocket`): `wire` (strict-decode vocabulary), `dsl`
+  (TableQuery/filter/value-expr/Mutation/schema builders, cursor codec),
+  `errors` (codes + `HTTPStatus`), `httpclient` (typed `Query[T]`, mutate with
+  retry, storage, schedules), `wsclient` (reactive `/sync` subscriptions,
+  presence, reconnect/backoff/dedupe), `admin` (the `/admin/*` control plane),
+  `optimistic`, and an in-memory engine. Executed by the shared semantics
+  corpus with zero skips.
+- **`POST /api/mutate-batch` (`457ea3f`)** — fans out N independent
+  transactions in one round trip through the same committer path as
+  `/api/mutate` (subscriptions, op-feed taps, per-entry idempotency replay all
+  fire). Deliberately not atomic — that is what the txn DSL is for; this is
+  transport efficiency, sibling of `/api/query-batch`. Slots are positionally
+  aligned and may carry their own idempotency keys.
+- **Per-database read-only freeze + the `READ_ONLY` error code (`c1b3f95`).**
+  `GET|PATCH /admin/db/{db}/readonly` freezes one database's client-plane
+  writes without touching the others (restore verification, schema surgery,
+  incident containment). The persisted flag is checked fresh per write in the
+  committer's Mutate arm after the idempotency-replay lookup — one gate covers
+  WS, HTTP one-shot, mutate-batch, admin direct mutate, and forwarded writes,
+  for every principal (admin included).
+- **Durable per-db change feed and the `CURSOR_EXPIRED` code (`cdf210c`,
+  FEATURE_MATRIX #40).** `GET /api/db/{db}/changes?since=&table=&limit=`
+  (machine tokens) returns every committed document op strictly after the
+  seq cursor, oldest first, with post-images and `doc: null` on deletes. Rows
+  are stamped inside the write's own Postgres transaction under a gap-free
+  `change_head` counter, so an impossible cursor is `410 CURSOR_EXPIRED`
+  (resync from 0) — never silent data loss. Mirrored in all five clients.
+- **`rtdb import` and `--start-line` (`aa3ce25`, `afb7a56`).** The CLI
+  bulk-loads a JSONL file into one table with a normal machine token: one
+  object per line, wrapped into bounded insert/upsert transactions, per-batch
+  progress on stderr, non-zero exit on the first failed batch naming its line
+  range. `--start-line` resumes a failed batch from a 1-based line number
+  instead of re-reading the file from line 1.
+- **`adjustCounter` — atomic bounded counter adjustments (`e7a291a`,
+  FEATURE_MATRIX #41).** A new step (`Step::AdjustCounter`) atomically adds a
+  safe-integer delta to a declared numeric field inside the enclosing
+  transaction, with optional inclusive `min`/`max` bounds and `expected` row
+  fields. Takes `SELECT … FOR UPDATE` on the counter row — the one row-locking
+  exception to the READ COMMITTED read path. Mirrored in all five clients;
+  step count is now 15. See `docs/atomic-counter.md`.
+- **`presenceDelta` frames and protocol v3 (`b441e77`).** `PROTOCOL_VERSION`
+  moves 2 → 3 with a dedicated `PRESENCE_DELTA_MIN_VERSION = 3`: a v3+
+  connection's presence updates arrive as deltas (joins/leaves/touches)
+  instead of full `PresenceSnapshot` frames; older connections keep receiving
+  full snapshots, so the delta can never reach an SDK that cannot apply it.
+  Mirrored in all five clients.
+- **`RTDB_LOG_FORMAT=json` (`d8f2d97`)** — boot-only env var switching every
+  stdout log line to a single JSON object (tracing-subscriber's json
+  formatter, OTel path included) so container log pipelines ingest stdout
+  without regex parsing. The default text formatter is byte-identical to
+  before; an unrecognized value fails boot.
+- **`RTDB_SHUTDOWN_DRAIN_MS` (`2a50433`)** — bounds axum's graceful shutdown
+  drain (default 30000 ms; `0` waits forever). Before this knob the only thing
+  ending the drain was Docker's SIGTERM→SIGKILL window: a connection whose
+  streaming body never finishes (e.g. a storage download to a stalled reader)
+  held it open indefinitely. When the bound elapses, remaining connections are
+  closed and shutdown proceeds to the already-bounded background-task cleanup.
+- **`x-rtdb-server-time-ms` (`9f16554`)** — `POST /api/query` responses carry
+  the server's monotonic-ish epoch-ms in a response header, so clock-skew
+  diagnostics (keyset cursors, `olderThan` filters) can be reasoned about
+  against the server's clock rather than the client's.
+- **`rtdb watch` (`b868283`)** — tails a live query from the terminal: prints
+  the initial result as NDJSON, then every `queryUpdate` as it lands. A thin
+  wrapper over the rust-client reactive subscribe; Ctrl-C exits cleanly.
+- **`rtdb ops watch` (`44b3353`)** — tails the admin op feed (`/admin/stream`)
+  from the terminal as NDJSON via the rust-client's new `stream_admin`
+  (feature-gated `ws+admin`): gauge snapshots consumed and dropped, `--pretty`
+  to expand, `--db` filter, reconnecting on jittered backoff and stopping on
+  credential failures with the server's error envelope.
+- **`GET /admin/presence` (`665c0fd`)** — lists each replica's in-memory
+  presence rooms (name, member count, serialized-state bytes, oldest member's
+  join age) so an operator can see what exists server-side; the same rows
+  surface as `presenceDetail` on `/admin/metrics`.
+- **`AuthedUser.name` (`4473461`)** — a nullable `users.name` column populated
+  from each provider's profile payload (GitHub name-or-login, Google/GitLab/
+  OIDC/Microsoft claims, Apple when relayed), persisted with `COALESCE` so an
+  absent name never wipes a stored one, and returned on `/auth/me`,
+  `/auth/validate`, and the WS auth ack.
+- **Pagination over ranked terminals (`ae2a563`)** — `paginate` composes with
+  `search`, `vectorSearch`, and `hybridSearch` as a peer clause, carrying a
+  keyset predicate on the ranking key (`ts_rank`/`similarity`, metric
+  distance, or RRF fused score) instead of index-field values, so paging
+  delivers the same top-`limit` results the unpaginated call returns, in
+  instalments. `search` has no `limit` of its own; paged search walks the
+  whole match set.
 
 - **Recurring schedules surface missed windows instead of silently skipping
   them (FEATURE_MATRIX #10).** A cron/interval job whose recompute detects
