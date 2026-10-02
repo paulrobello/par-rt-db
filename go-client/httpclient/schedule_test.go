@@ -114,3 +114,25 @@ func TestAuthMeDecode(t *testing.T) {
 		t.Fatalf("user %+v", u)
 	}
 }
+
+func TestAuthValidateBearsTheTokenBeingValidated(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/auth/validate" {
+			t.Errorf("path %s", r.URL.Path)
+		}
+		// The bearer is the token BEING validated, not the client's own.
+		if got := r.Header.Get("Authorization"); got != "Bearer players-token" {
+			t.Errorf("authorization %q", got)
+		}
+		w.Write([]byte(`{"user":{"kind":"user","email":"a@b.com","name":"A"}}`))
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "d1", "tk")
+	u, err := c.AuthValidate(context.Background(), "players-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Kind != wire.UserKindUser || u.Email == nil || *u.Email != "a@b.com" {
+		t.Fatalf("user %+v", u)
+	}
+}

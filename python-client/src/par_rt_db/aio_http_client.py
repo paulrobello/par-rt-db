@@ -93,6 +93,7 @@ from .http_client import (
 )
 from .wire import (
     PROTOCOL_VERSION,
+    AuthedUser,
     BatchMutateOutcome,
     BatchQueryOutcome,
     ChangeFeedResponse,
@@ -509,6 +510,31 @@ class RtDbAsyncHttpClient:
             params["limit"] = limit
         resp = await self._send("GET", f"/api/db/{self._db}/changes", params=params)
         return ChangeFeedResponse.model_validate(resp.json())
+
+    # --- auth token validation (GET /auth/me, GET /auth/validate) ---
+
+    async def auth_me(self) -> AuthedUser:
+        """``GET /auth/me`` → the principal this client's bearer resolves to.
+
+        See :meth:`RtDbHttpClient.auth_me` for the session-only validation
+        contract (machine tokens surface as the 401 envelope) and
+        :meth:`auth_validate` for arbitrary-token validation.
+        """
+        resp = await self._send("GET", "/auth/me")
+        return AuthedUser.model_validate(resp.json()["user"])
+
+    async def auth_validate(self, token: str) -> AuthedUser:
+        """``GET /auth/validate`` with ``token`` as the bearer → the principal
+        it resolves to (async).
+
+        See :meth:`RtDbHttpClient.auth_validate` for the semantics — takes the
+        token to validate as an argument, accepts session and machine tokens,
+        invalid/expired surfaces as the standard :class:`RtDbError` envelope.
+        """
+        resp = await self._send(
+            "GET", "/auth/validate", headers={"Authorization": f"Bearer {token}"}
+        )
+        return AuthedUser.model_validate(resp.json()["user"])
 
     # --- storage (machine token; HTTP-only, bypasses the committer) ---
 

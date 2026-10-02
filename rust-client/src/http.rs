@@ -415,11 +415,18 @@ impl RtDbHttpClient {
 
     /// Schedule `txn` to fire at `when`. The server validates cron expressions
     /// and resolves the due time; the client does no schedule arithmetic. Returns
-    /// the new schedule's id. Mirrors `ts-client`'s `schedule`.
+    /// the new schedule's id. Mirrors `ts-client`'s `schedule`. Pass `external =
+    /// true` to create an external job instead: one never executed by the server
+    /// — an application worker claims it via `POST /api/schedule/claim`
+    /// ([`claim_schedules`](Self::claim_schedules) is TS-only; the rust worker
+    /// calls the route directly) and finalizes it with the returned
+    /// `leaseGeneration` fencing token. The field is omitted on the wire when
+    /// false, matching the server's `#[serde(default)]`.
     pub async fn schedule(
         &self,
         txn: &Transaction,
         when: ScheduleWhen,
+        external: bool,
     ) -> Result<String, RtDbError> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
@@ -427,11 +434,14 @@ impl RtDbHttpClient {
             db: &'a str,
             when: ScheduleWhen,
             txn: &'a Transaction,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            external: bool,
         }
         let body = Body {
             db: &self.db,
             when,
             txn,
+            external,
         };
         let resp = self
             .client
@@ -1628,15 +1638,40 @@ mod tests {
                 "when": {"type": "afterMs", "ms": 5000},
                 "txn": {"steps": []}
             })))
+            // external=false must be OMITTED (the server serde-defaults it);
+            // a wiremock matched-body check for the absent key rides on the
+            // exact-body assertion in the external test below.
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "job-7"})))
             .mount(&server)
             .await;
         let txn = Mutation::new().build();
         let id = client
-            .schedule(&txn, crate::wire::ScheduleWhen::AfterMs { ms: 5000 })
+            .schedule(&txn, crate::wire::ScheduleWhen::AfterMs { ms: 5000 }, false)
             .await
             .unwrap();
         assert_eq!(id, "job-7");
+    }
+
+    #[tokio::test]
+    async fn schedule_external_posts_the_external_flag() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/schedule"))
+            .and(body_partial_json(json!({
+                "db": "t<uuid>",
+                "when": {"type": "afterMs", "ms": 1000},
+                "txn": {"steps": []},
+                "external": true
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "job-8"})))
+            .mount(&server)
+            .await;
+        let txn = Mutation::new().build();
+        let id = client
+            .schedule(&txn, crate::wire::ScheduleWhen::AfterMs { ms: 1000 }, true)
+            .await
+            .unwrap();
+        assert_eq!(id, "job-8");
     }
 
     #[tokio::test]
@@ -2498,7 +2533,7 @@ mod tests {
 
         let txn = Mutation::new().build();
         client
-            .schedule(&txn, crate::wire::ScheduleWhen::AfterMs { ms: 1 })
+            .schedule(&txn, crate::wire::ScheduleWhen::AfterMs { ms: 1 }, false)
             .await
             .unwrap();
         client

@@ -119,6 +119,7 @@ from .query import Query, TableQuery, _terminal_of, parse_result
 from .schema import SchemaDef
 from .wire import (
     PROTOCOL_VERSION,
+    AuthedUser,
     BatchMutateOutcome,
     BatchQueryOutcome,
     ChangeFeedResponse,
@@ -621,6 +622,32 @@ class RtDbHttpClient:
             params["limit"] = limit
         resp = self._send("GET", f"/api/db/{self._db}/changes", params=params)
         return ChangeFeedResponse.model_validate(resp.json())
+
+    # --- auth token validation (GET /auth/me, GET /auth/validate) ---
+
+    def auth_me(self) -> AuthedUser:
+        """``GET /auth/me`` → the principal this client's bearer resolves to.
+
+        Session-only validation: machine tokens are rejected by the server
+        (401) and surface as the standard :class:`RtDbError` envelope. To
+        validate an arbitrary token (a trusted backend checking a player's
+        credential), use :meth:`auth_validate`.
+        """
+        resp = self._send("GET", "/auth/me")
+        return AuthedUser.model_validate(resp.json()["user"])
+
+    def auth_validate(self, token: str) -> AuthedUser:
+        """``GET /auth/validate`` with ``token`` as the bearer → the principal
+        it resolves to.
+
+        Unlike :meth:`auth_me` (which validates this client's own credential),
+        this takes the token to validate as an argument and accepts both
+        session and machine tokens — for a trusted backend validating a
+        player's token. An invalid/expired token surfaces as the standard
+        :class:`RtDbError` auth envelope.
+        """
+        resp = self._send("GET", "/auth/validate", headers={"Authorization": f"Bearer {token}"})
+        return AuthedUser.model_validate(resp.json()["user"])
 
     # --- storage (machine token; HTTP-only, bypasses the committer) ---
 
