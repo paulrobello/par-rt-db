@@ -182,6 +182,66 @@ async fn webhook_enqueue_matches_table_and_event_filters() -> anyhow::Result<()>
     Ok(())
 }
 
+// (a.1) ENH-047: the delivery rows are committed IN the write's transaction,
+// so they are visible the instant the mutate returns — no polling, no drain.
+// (The outbox guarantee; the rollback half is exercised indirectly: an enqueue
+// failure now fails the mutate instead of silently dropping the delivery.)
+#[tokio::test]
+#[serial_test::serial]
+async fn webhook_deliveries_commit_with_the_write_no_polling() -> anyhow::Result<()> {
+    let state = test_state_with_webhooks().await;
+    let pool = state.pool.clone();
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    let a = create_webhook(
+        addr,
+        &name,
+        json!({"url": "http://example.com/a", "events": ["*"]}),
+    )
+    .await;
+
+    let results = mutate(
+        addr,
+        &name,
+        json!([{"op": "insert", "table": "projects", "doc": {
+            "name": "alpha", "status": "active", "tags": [], "updatedAt": 0
+        }}]),
+    )
+    .await;
+    let doc_id = results[0]["id"].as_str().expect("insert returns doc id");
+
+    // No wait_until: the row must already be committed when the mutate
+    // response arrives, because the INSERT rode the write's own transaction.
+    let payload = newest_payload(&pool, a).await;
+    assert_eq!(payload["db"], name.as_str());
+    assert_eq!(payload["docId"], doc_id);
+    assert_eq!(payload["kind"], "insert");
+    assert_eq!(payload["source"], "mutate");
+    assert_eq!(delivery_count(&pool, a).await, 1);
+
+    // A rolled-back write (unknown table → BAD_REQUEST after the step engine
+    // aborts the transaction) leaves NO delivery row behind — the enqueue
+    // shares the write's fate instead of outliving it.
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{name}/mutate"),
+        json!({ "txn": { "steps": [
+            {"op": "insert", "table": "projects", "doc": {"name": "beta", "status": "active", "tags": [], "updatedAt": 0}},
+            {"op": "patch", "table": "noSuchTable", "id": "x", "fields": {"v": 1}}
+        ] } }),
+    )
+    .await;
+    assert_ne!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        delivery_count(&pool, a).await,
+        1,
+        "a rolled-back write enqueues nothing"
+    );
+
+    Ok(())
+}
+
 // (a.2) Disabled webhooks do not enqueue deliveries; enabled ones on the same
 // db/table/event still do. The `enabled` flag round-trips on create + list.
 #[tokio::test]

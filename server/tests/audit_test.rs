@@ -163,6 +163,38 @@ async fn audit_enabled_records_each_doc_op_newest_first() -> anyhow::Result<()> 
     Ok(())
 }
 
+// (a.1) ENH-047: audit rows are committed IN the write's transaction, so they
+// are visible the instant the mutate returns — the endpoint needs no settle
+// delay. (A rolled-back write leaves no audit rows behind, shared with the
+// webhook test's rollback assertion.)
+#[tokio::test]
+async fn audit_rows_commit_with_the_write_no_polling() -> anyhow::Result<()> {
+    let state = test_state_with_audit().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    let results = mutate(
+        addr,
+        &name,
+        json!([
+            {"op": "insert", "table": "projects", "doc": {"name": "alpha", "status": "active", "tags": [], "updatedAt": 0}},
+            {"op": "insert", "table": "projects", "doc": {"name": "beta", "status": "active", "tags": [], "updatedAt": 0}}
+        ]),
+    )
+    .await;
+    let alpha_id = results[0]["id"].as_str().expect("insert returns doc id");
+    let beta_id = results[1]["id"].as_str().expect("insert returns doc id");
+
+    // No sleep/wait_until: the rows must already be committed when the mutate
+    // response arrives.
+    let arr = audit_doc_ids(addr, &name, "").await;
+    assert_eq!(arr.len(), 2, "both inserts audited immediately: {arr:?}");
+    assert!(arr.contains(&alpha_id.to_string()));
+    assert!(arr.contains(&beta_id.to_string()));
+
+    Ok(())
+}
+
 // (b) `limit`/`offset` page: with three inserts (six durable ops would also
 // work, but three keeps the math obvious), limit=2 returns the two newest and
 // offset=2 returns the oldest.
