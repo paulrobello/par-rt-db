@@ -58,7 +58,24 @@ pub(in crate::committer) async fn handle_mutate(
     let idem = idempotency_key
         .as_deref()
         .map(|key| (key, ctx.hot.load().idempotency_ttl_ms));
-    let outcome = match execute_txn(&ctx.pool, &ctx.db, &schema, &txn, &principal_ctx, idem).await {
+    // ENH-047: the audit and webhook side-writes run INSIDE execute_txn's
+    // transaction (the outbox guarantee), so this arm's tap skips them.
+    let side = crate::txn::TxnSideWrites {
+        source: "mutate",
+        audit: ctx.audit_log_enabled,
+        webhooks: ctx.webhooks_enabled,
+    };
+    let outcome = match crate::txn::execute_txn_with_side(
+        &ctx.pool,
+        &ctx.db,
+        &schema,
+        &txn,
+        &principal_ctx,
+        idem,
+        side,
+    )
+    .await
+    {
         Ok(outcome) => outcome,
         Err(err) if crate::txn::is_idempotency_replay(&err) => {
             // A previous execution already committed under this key (its
@@ -82,11 +99,14 @@ pub(in crate::committer) async fn handle_mutate(
         }
         Err(err) => return Err(err),
     };
-    // Four-tap publication (fan_out → op-feed → audit → webhook → quota-refresh).
+    // Four-tap publication (fan_out → op-feed → [audit+webhook already done
+    // in-transaction] → quota-refresh).
     // `owner = principal_ctx.user_id` carries the interactive uid into the
-    // op-feed/audit/webhook payloads; `source = "mutate"` distinguishes the
-    // interactive tap from scheduled/ttl/migrate.
-    publish_taps(
+    // op-feed payload; `source = "mutate"` distinguishes the interactive tap
+    // from scheduled/ttl/migrate. Audit and webhook were written on the open
+    // transaction inside `execute_txn_with_side` (ENH-047), so the post-commit
+    // tap runs only the in-memory/NOTIFY work.
+    publish_taps_skip_side_writes(
         ctx,
         &schema,
         &outcome.write_set,
@@ -94,6 +114,7 @@ pub(in crate::committer) async fn handle_mutate(
         "mutate",
         true,
         true,
+        side,
     )
     .await;
 

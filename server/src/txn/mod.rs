@@ -287,13 +287,38 @@ pub fn is_idempotency_replay(err: &RtDbError) -> bool {
     err.code == ErrorCode::Internal && err.message == IDEMPOTENCY_REPLAY_MSG
 }
 
-pub async fn execute_txn(
+/// ENH-047: which post-commit taps `execute_txn_with_side` has already
+/// satisfied IN the write's transaction. When `audit`/`webhooks` are set, the
+/// audit-log and webhook-delivery INSERTs run on the open transaction before
+/// its commit (the outbox guarantee — they commit or roll back with the
+/// documents) and the caller's `publish_taps` must skip them. `owner` for
+/// those rows is the `PrincipalCtx`'s user id, matching what the arm's tap
+/// used to pass.
+#[derive(Debug, Clone, Copy)]
+pub struct TxnSideWrites {
+    /// Audit/webhook `source` tag — `"mutate"` / `"scheduled"` / `"workflow"`.
+    pub source: &'static str,
+    /// Write the audit-log rows in-transaction.
+    pub audit: bool,
+    /// Enqueue the webhook-delivery rows in-transaction.
+    pub webhooks: bool,
+}
+
+/// Executes all of `txn`'s steps plus, when `side` requests them, the audit
+/// and webhook side-writes on the SAME Postgres transaction; any step's or
+/// side-write's error aborts and rolls back everything. This is the general
+/// form — production committer arms pass the flags from `CommitterCtx` and
+/// tell `publish_taps` to skip the satisfied taps; `execute_txn` is the
+/// `side.audit = side.webhooks = false` wrapper the tests and non-tap callers
+/// use. See [`execute_txn`] for the step semantics.
+pub async fn execute_txn_with_side(
     pool: &PgPool,
     db: &str,
     schema: &SchemaDef,
     txn: &Transaction,
     ctx: &PrincipalCtx,
     idem: Option<(&str, i64)>,
+    side: TxnSideWrites,
 ) -> Result<TxnOutcome, RtDbError> {
     // ENH-018: `txn.execute` spans the write path so "the DSL is slow" vs
     // "Postgres is slow" is a distinguishable question. The step count is the
@@ -464,12 +489,56 @@ pub async fn execute_txn(
             }
         }
 
+        // ENH-047: the audit and webhook side-writes join the write's
+        // transaction (before `change_log::append`, mirroring the previous
+        // tap order) so they commit or roll back together with the documents
+        // — a crash between commit and enqueue can no longer lose audit rows
+        // or webhook deliveries. An insert failure propagates (`?`), rolling
+        // the whole write back: the intended outbox semantics (documented in
+        // docs/ARCHITECTURE.md). These are server-owned global tables ensured
+        // at boot, so a failure means Postgres is unhealthy.
+        if side.audit {
+            crate::audit::write_audit_rows_on(&mut tx, db, owner, side.source, &write_set.ops)
+                .await?;
+        }
+        if side.webhooks {
+            crate::webhook::enqueue_for_ops_on(&mut tx, db, owner, side.source, &write_set.ops)
+                .await?;
+        }
+
         crate::change_log::append(&mut tx, pg_schema_name.as_str(), &write_set).await?;
 
         tx.commit().await?;
         Ok(TxnOutcome { results, write_set })
     }
     .instrument(span)
+    .await
+}
+
+/// No-side-write form of [`execute_txn_with_side`]: the audit/webhook taps
+/// stay post-commit at the caller. Used by the non-tap callers (tests, the
+/// snapshot import) that publish nothing.
+pub async fn execute_txn(
+    pool: &PgPool,
+    db: &str,
+    schema: &SchemaDef,
+    txn: &Transaction,
+    ctx: &PrincipalCtx,
+    idem: Option<(&str, i64)>,
+) -> Result<TxnOutcome, RtDbError> {
+    execute_txn_with_side(
+        pool,
+        db,
+        schema,
+        txn,
+        ctx,
+        idem,
+        TxnSideWrites {
+            source: "",
+            audit: false,
+            webhooks: false,
+        },
+    )
     .await
 }
 

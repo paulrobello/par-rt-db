@@ -427,19 +427,17 @@ pub async fn enqueue_for_ops_on(
     if webhooks.is_empty() {
         return Ok(());
     }
-    let matches_for = |webhooks: &[(i64, Option<String>, Vec<String>)],
-                       table: &str,
-                       kind: &str|
-     -> Vec<i64> {
-        webhooks
-            .iter()
-            .filter(|(_, tbl, events)| {
-                tbl.as_deref().is_none_or(|t| t == table)
-                    && (events.as_slice() == ["*"] || events.iter().any(|e| e == kind))
-            })
-            .map(|(id, _, _)| *id)
-            .collect()
-    };
+    let matches_for =
+        |webhooks: &[(i64, Option<String>, Vec<String>)], table: &str, kind: &str| -> Vec<i64> {
+            webhooks
+                .iter()
+                .filter(|(_, tbl, events)| {
+                    tbl.as_deref().is_none_or(|t| t == table)
+                        && (events.as_slice() == ["*"] || events.iter().any(|e| e == kind))
+                })
+                .map(|(id, _, _)| *id)
+                .collect()
+        };
     let ts = now_ms();
     let owner = owner.map(|s| s.to_string());
     // Ops sharing a (webhook, payload) would double-POST; group per op instead

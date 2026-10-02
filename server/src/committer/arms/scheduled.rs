@@ -65,15 +65,26 @@ pub(in crate::committer) async fn handle_scheduled(
         let _ = scheduler::mark_error(&ctx.pool, &ctx.db, &id, &e.message).await;
         return Ok(());
     }
-    match execute_txn(&ctx.pool, &ctx.db, &schema, &txn, &fire_ctx, None).await {
+    // ENH-047: the audit and webhook side-writes run INSIDE the write's
+    // transaction (the outbox guarantee), so this arm's tap skips them.
+    let side = crate::txn::TxnSideWrites {
+        source: "scheduled",
+        audit: ctx.audit_log_enabled,
+        webhooks: ctx.webhooks_enabled,
+    };
+    match crate::txn::execute_txn_with_side(
+        &ctx.pool, &ctx.db, &schema, &txn, &fire_ctx, None, side,
+    )
+    .await
+    {
         Ok(outcome) => {
-            // Four-tap publication (fan_out → op-feed → audit → webhook → quota-
-            // refresh). System-enqueued jobs carry no interactive principal
-            // (`owner = None`); a user-enqueued job (SEC-001) publishes with the
-            // enqueuer's user id so op-feed/audit/webhook attribute the writes
-            // correctly. `source = "scheduled"` distinguishes from
-            // mutate/ttl/migrate in delivered payloads.
-            publish_taps(
+            // Four-tap publication (fan_out → op-feed → [audit+webhook already
+            // done in-transaction] → quota-refresh). System-enqueued jobs carry
+            // no interactive principal (`owner = None`); a user-enqueued job
+            // (SEC-001) publishes with the enqueuer's user id so the op-feed
+            // attributes the writes correctly. `source = "scheduled"`
+            // distinguishes from mutate/ttl/migrate in delivered payloads.
+            publish_taps_skip_side_writes(
                 ctx,
                 &schema,
                 &outcome.write_set,
@@ -81,6 +92,7 @@ pub(in crate::committer) async fn handle_scheduled(
                 "scheduled",
                 true,
                 true,
+                side,
             )
             .await;
             let now = now_ms();

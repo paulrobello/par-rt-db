@@ -29,7 +29,7 @@ use crate::protocol::ServerMessage;
 use crate::query::{Query, diff_canonical, execute_query};
 use crate::scheduler;
 use crate::subs::{ConnId, SubscriptionManager};
-use crate::txn::{OpKind, Transaction, TxnOutcome, WriteSet, execute_txn};
+use crate::txn::{OpKind, Transaction, TxnOutcome, WriteSet};
 
 pub(in crate::committer) mod arms;
 mod forwarding;
@@ -52,7 +52,7 @@ use lease::{acquire_ownership_lease, reply_ownership_conflict, request_needs_wri
 
 pub(crate) use lease::SHADOW_CONFLICT_MARKER;
 use supervisor::{reclaim_idle_pass, run_quota_warmer};
-use taps::publish_taps;
+use taps::{publish_taps, publish_taps_skip_side_writes};
 
 /// Bound on each per-db committer task's inbox.
 const CHANNEL_BUFFER: usize = 64;

@@ -8,6 +8,29 @@
 
 use super::*;
 
+/// ENH-047: which arms write the audit/webhook taps WHERE.
+///
+/// **Transactional (in `execute_txn_with_side`'s transaction, atomic with the
+/// documents):** `handle_mutate` ("mutate"), `handle_scheduled`
+/// ("scheduled"), `handle_workflow_advance` ("workflow").
+///
+/// **Best-effort, post-commit** (still via `publish_taps`' pool-form calls,
+/// a failure warned and never propagated): `handle_reaper` ("ttl"),
+/// `handle_migrate` ("migrate"), `handle_merge_users` ("merge"). These arms
+/// own their own transactions (reaper batch tx, merge per-row tx, migrate tx)
+/// but their per-row/batch loops make a failure inside the tx ambiguous at
+/// arm level (a reaper batch fails its whole batch; a merge row conflict
+/// skips just that row), so they keep the simpler post-commit discipline.
+///
+/// `handle_push_schema` ("push") and `handle_restore_schema` ("restore") emit
+/// no DocOps (`docop_taps = false`) and never touch audit/webhooks either way.
+///
+/// The op-feed `publish`, subscription `fan_out`, and the cross-replica
+/// NOTIFYs always stay post-commit: they are in-memory and must only observe
+/// committed writes.
+///
+/// ---
+///
 /// Four-tap publication of a durable write: subscription `fan_out` → op-feed
 /// `publish` → audit-log `write_audit_rows` → webhook `enqueue_for_ops`, with
 /// an optional fire-and-forget storage-cache refresh at the end.
@@ -46,6 +69,39 @@ pub(in crate::committer) async fn publish_taps(
     source: &'static str,
     docop_taps: bool,
     refresh_quota_cache: bool,
+) {
+    publish_taps_skip_side_writes(
+        ctx,
+        schema,
+        write_set,
+        owner,
+        source,
+        docop_taps,
+        refresh_quota_cache,
+        // None of these arms write the audit/webhook taps in-transaction.
+        crate::txn::TxnSideWrites {
+            source: "",
+            audit: false,
+            webhooks: false,
+        },
+    )
+    .await;
+}
+
+/// [`publish_taps`] with an ENH-047 override: when `side.audit`/`side.webhooks`
+/// are set, the audit and webhook INSERTs already ran on the write's open
+/// transaction inside `execute_txn_with_side`, so the post-commit tap skips
+/// them. Everything else (fan-out, NOTIFYs, op-feed) runs as before.
+#[allow(clippy::too_many_arguments)] // same shape as `publish_taps` + the ENH-047 override
+pub(in crate::committer) async fn publish_taps_skip_side_writes(
+    ctx: &CommitterCtx,
+    schema: &crate::schema::SchemaDef,
+    write_set: &WriteSet,
+    owner: Option<&str>,
+    source: &'static str,
+    docop_taps: bool,
+    refresh_quota_cache: bool,
+    side: crate::txn::TxnSideWrites,
 ) {
     ctx.subs
         .fan_out(&ctx.read_pool, &ctx.db, schema, write_set)
@@ -88,15 +144,20 @@ pub(in crate::committer) async fn publish_taps(
         });
     }
     // Durable audit tap (the persistent counterpart to the op-feed above).
+    // Skipped when the audit rows were already written in-transaction
+    // (ENH-047).
     if ctx.audit_log_enabled
+        && !side.audit
         && let Err(err) =
             crate::audit::write_audit_rows(&ctx.read_pool, &ctx.db, owner, source, &write_set.ops)
                 .await
     {
         tracing::warn!(db = %ctx.db, source, error = %err, "audit log write failed");
     }
-    // Webhook enqueue tap — mirrors the audit tap above.
+    // Webhook enqueue tap — mirrors the audit tap above. Skipped when the
+    // delivery rows were already enqueued in-transaction (ENH-047).
     if ctx.webhooks_enabled
+        && !side.webhooks
         && let Err(err) =
             crate::webhook::enqueue_for_ops(&ctx.read_pool, &ctx.db, owner, source, &write_set.ops)
                 .await

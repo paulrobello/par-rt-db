@@ -202,20 +202,32 @@ pub(in crate::committer) async fn handle_workflow_advance(
                 return Ok(());
             }
         };
+        // ENH-047: the audit and webhook side-writes run INSIDE the write's
+        // transaction (the outbox guarantee), so this arm's tap skips them.
+        let side = crate::txn::TxnSideWrites {
+            source: "workflow",
+            audit: ctx.audit_log_enabled,
+            webhooks: ctx.webhooks_enabled,
+        };
         let exec = match quota_err.take() {
             Some(e) => Err(e),
-            None => execute_txn(&ctx.pool, &ctx.db, &schema, txn, &fire_ctx, None).await,
+            None => {
+                crate::txn::execute_txn_with_side(
+                    &ctx.pool, &ctx.db, &schema, txn, &fire_ctx, None, side,
+                )
+                .await
+            }
         };
         match exec {
             Ok(outcome) => {
-                // Four-tap publication (fan_out → op-feed → audit → webhook →
-                // quota-refresh). System-started runs advance as the system
-                // principal (`owner = None`); a user-started run (SEC-001)
-                // publishes with the enqueuer's user id so op-feed/audit/
-                // webhook attribute the writes correctly. `source = "workflow"`
-                // distinguishes them from scheduled/ttl/migrate in delivered
-                // payloads.
-                publish_taps(
+                // Four-tap publication (fan_out → op-feed → [audit+webhook
+                // already done in-transaction] → quota-refresh). System-started
+                // runs advance as the system principal (`owner = None`); a
+                // user-started run (SEC-001) publishes with the enqueuer's user
+                // id so the op-feed attributes the writes correctly.
+                // `source = "workflow"` distinguishes them from
+                // scheduled/ttl/migrate in delivered payloads.
+                publish_taps_skip_side_writes(
                     ctx,
                     &schema,
                     &outcome.write_set,
@@ -223,6 +235,7 @@ pub(in crate::committer) async fn handle_workflow_advance(
                     "workflow",
                     true,
                     true,
+                    side,
                 )
                 .await;
                 ctx.metrics
