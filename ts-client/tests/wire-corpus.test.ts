@@ -20,7 +20,9 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { ALL_ERROR_CODES } from "../src/errors.js";
+import { ALL_ERROR_CODES, RtDbError } from "../src/errors.js";
+import type { RtDbErrorEnvelope } from "../src/errors.js";
+import type { DbStats } from "../src/admin.js";
 import { PROTOCOL_VERSION } from "../src/protocol.js";
 import { MAX_STEPS } from "../src/in_memory/index.js";
 import { QUERY_COMBO_CLAUSES, QUERY_COMBO_RULES } from "../src/in_memory/query-combinations.js";
@@ -56,13 +58,16 @@ interface Corpus {
   // pre-feature entries legitimately omit it. The corpus is typed through
   // that decode view; the external-jobs block below pins the serialized form.
   schedule_infos: Array<Omit<ScheduleInfo, "external"> & { external?: boolean }>;
-  // Untyped-on-purpose sections: query_results / error_envelopes / queries are
-  // raw JSON values, not TS wire types (QueryResult is untagged on the wire,
-  // and the error envelope model lives in errors.ts). We assert JSON
-  // round-trip only.
+  // query_results is raw JSON by design (QueryResult is untagged on the
+  // wire and TS keeps results untyped): re-serialized byte-stably and
+  // canonical-key-order compared, not a plain JSON.parse(JSON.stringify()).
   query_results: unknown[];
-  error_envelopes: unknown[];
-  queries: unknown[];
+  // Decoded through RtDbError.isEnvelope (the client's real envelope guard).
+  error_envelopes: RtDbErrorEnvelope[];
+  // Decoded through the client's own QueryJson type.
+  queries: QueryJson[];
+  // Decoded through the admin DbStats type.
+  db_stats: DbStats[];
   // Admin migrate shapes — type-checked against MigrateRequestJson /
   // MigrateResultJson (op tag, camelCase, `where`/`from` aliases, cast literals).
   migrate_requests: MigrateRequestJson[];
@@ -245,23 +250,70 @@ describe("wire-corpus: migrate_results (admin MigrateResult)", () => {
   }
 });
 
-describe("wire-corpus: raw-JSON sections round-trip", () => {
+describe("wire-corpus: query_results (untagged wire values, canonical re-serialize)", () => {
+  // Canonical-key-order re-serialization: sorts object keys recursively so
+  // the comparison is over the JSON *value*, not JS key insertion order.
+  function canonical(value: unknown): string {
+    if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+    if (value !== null && typeof value === "object") {
+      const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+        a.localeCompare(b),
+      );
+      return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`;
+    }
+    return JSON.stringify(value);
+  }
+
+  for (const [idx, entry] of loadCorpus().query_results.entries()) {
+    it(`query_results #${idx} re-serializes byte-stably`, () => {
+      const roundTripped: unknown = JSON.parse(JSON.stringify(entry));
+      expect(canonical(roundTripped)).toBe(canonical(entry));
+    });
+  }
+});
+
+describe("wire-corpus: error_envelopes (RtDbError.isEnvelope)", () => {
   const corpus = loadCorpus();
-  for (const [idx, entry] of corpus.query_results.entries()) {
-    it(`query_results #${idx} round-trips`, () => {
-      assertJsonRoundTrip(entry);
-    });
-  }
   for (const [idx, entry] of corpus.error_envelopes.entries()) {
-    it(`error_envelopes #${idx} round-trips`, () => {
-      assertJsonRoundTrip(entry);
+    it(`error_envelopes #${idx} (${entry.code}) matches the client envelope`, () => {
+      // The client's own runtime guard: code must be a known RtDbErrorCode
+      // and message a string. A wire drift (renamed field, unknown code)
+      // fails here.
+      expect(RtDbError.isEnvelope(entry)).toBe(true);
+      const roundTripped: unknown = JSON.parse(JSON.stringify(entry));
+      expect(roundTripped).toStrictEqual(entry);
     });
   }
+});
+
+describe("wire-corpus: queries (client QueryJson type)", () => {
+  const corpus = loadCorpus();
   for (const [idx, entry] of corpus.queries.entries()) {
-    it(`queries #${idx} round-trips`, () => {
+    const _typeCheck: QueryJson = entry; // compile-time shape check
+    void _typeCheck;
+    it(`queries #${idx} (${entry.table}) round-trips`, () => {
       assertJsonRoundTrip(entry);
     });
   }
+});
+
+describe("wire-corpus: db_stats (admin DbStats type)", () => {
+  const corpus = loadCorpus();
+  for (const [idx, entry] of corpus.db_stats.entries()) {
+    const _typeCheck: DbStats = entry; // compile-time shape check
+    void _typeCheck;
+    it(`db_stats #${idx} round-trips`, () => {
+      assertJsonRoundTrip(entry);
+    });
+  }
+
+  it("carries the quota/usage fields (ENH-011) on the populated entry", () => {
+    const populated = corpus.db_stats.find((s) => s.tables.length > 0);
+    expect(populated?.tablesQuota).toBe(10);
+    expect(populated?.tablesUsed).toBe(2);
+    expect(populated?.storageUsedBytes).toBe(36864);
+    expect(populated?.subsUsed).toBe(3);
+  });
 });
 
 /**
