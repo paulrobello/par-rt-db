@@ -2,6 +2,10 @@ COMPOSE_DEV = docker compose -f docker-compose.dev.yml
 export RTDB_TEST_DATABASE_URL ?= postgres://rtdb:rtdb@127.0.0.1:55434/rtdb
 DEPLOY_HOST ?= root@docker-host.example.com
 DEPLOY_PATH = /docker/par-rt-db
+# Public healthz URL the deploy target verifies after the rollout. The default
+# is the scrubbed placeholder; operators override it (or DEPLOY_HOST) locally —
+# never commit real hostnames (see the hostname-leak-check gate).
+DEPLOY_PUBLIC_URL ?= https://rtdb.example.com/healthz
 # Short sha of the working-tree HEAD, baked into /healthz on deploy. Passed as
 # a shell env on the remote `docker compose up` (shell env overrides .env) so
 # the build arg — and thus the deployed binary's git_commit label — always tracks
@@ -406,7 +410,7 @@ deploy: checkall-cached
 	ssh $(DEPLOY_HOST) 'cd $(DEPLOY_PATH) && BUILDER=par-rt-db-builder && if ! docker buildx inspect "$$BUILDER" >/dev/null 2>&1; then docker buildx create --name "$$BUILDER" --driver docker-container --driver-opt default-load=true --driver-opt cpu-quota=400000 --driver-opt cpu-period=100000 --buildkitd-config "$(DEPLOY_PATH)/deploy/buildkitd.toml"; fi && docker buildx use "$$BUILDER" && RTDB_BUILD_COMMIT=$(DEPLOY_COMMIT) BUILDX_BUILDER="$$BUILDER" docker compose up -d --build && docker compose ps'
 	ssh $(DEPLOY_HOST) 'curl -fsS http://127.0.0.1:8300/healthz'
 	@echo
-	curl -fsS https://rtdb.example.com/healthz
+	curl -fsS $(DEPLOY_PUBLIC_URL)
 	@echo
 
 # ==== Grind loop (~/Repos/par-grind) ========================================
