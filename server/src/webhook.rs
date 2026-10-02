@@ -125,9 +125,14 @@ fn truncate_error(s: &str) -> String {
 }
 
 /// `true` for IP addresses a webhook must never target — the SSRF denylist
-/// (SEC-001). Covers loopback, private (RFC1918), link-local (including the
-/// `169.254.169.254` cloud-metadata IP), unspecified, multicast, broadcast,
-/// and IPv6 unique-local/link-local. Pure (no I/O) so it is unit-testable.
+/// (SEC-001, SEC-005). Covers loopback, private (RFC1918), link-local
+/// (including the `169.254.169.254` cloud-metadata IP), unspecified,
+/// multicast, broadcast, IPv6 unique-local/link-local, the shared-address
+/// space `100.64.0.0/10` (CGNAT), the benchmarking range `198.18.0.0/15`,
+/// and the NAT64 translation prefixes (`64:ff9b::/96` embedded IPv4 is
+/// re-checked against the V4 table; `64:ff9b:1::/48` local-use is blocked
+/// outright) and `2002::/16` 6to4 (embedded IPv4 re-checked). Pure (no I/O)
+/// so it is unit-testable.
 pub fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v) => {
@@ -145,6 +150,12 @@ pub fn is_blocked_ip(ip: IpAddr) -> bool {
             // 169.254.0.0/16 — link-local, which includes the cloud-metadata
             // IP 169.254.169.254 (AWS/Azure/GCP).
             || (oct[0] == 169 && oct[1] == 254)
+            // 100.64.0.0/10 — CGNAT shared address space (RFC6598). Not
+            // globally routable; blocks reach into carrier/VPN inner nets.
+            || (oct[0] == 100 && (oct[1] & 0xC0) == 64)
+            // 198.18.0.0/15 — RFC2544 benchmarking; used by some VPNs and
+            // sandboxes as an internal range.
+            || (oct[0] == 198 && (oct[1] == 18 || oct[1] == 19))
             // 224.0.0.0/4 — multicast.
             || (oct[0] & 0xf0) == 224
             // 255.255.255.255 — broadcast.
@@ -155,6 +166,43 @@ pub fn is_blocked_ip(ip: IpAddr) -> bool {
             // `[::ffff:169.254.169.254]` as an Ipv6 host, so without this the
             // V4 table below would never be consulted for it.
             if let Some(v4) = v.to_ipv4_mapped() {
+                return is_blocked_ip(IpAddr::V4(v4));
+            }
+            let seg = v.segments();
+            // 64:ff9b:1::/48 — local-use NAT64 (RFC8215): always an internal
+            // translation target. Blocked before the /96 extraction below.
+            if seg[0] == 0x64 && seg[1] == 0xff9b && seg[2] == 0x0001 {
+                return true;
+            }
+            // 64:ff9b::/96 — stateless NAT64. The last 32 bits carry the
+            // literal IPv4 the translator maps to — extract and re-check it
+            // against the V4 table so `64:ff9b::a9fe:a9fe`
+            // (169.254.169.254) cannot smuggle the metadata IP past the
+            // denylist.
+            if seg[0] == 0x64
+                && seg[1] == 0xff9b
+                && seg[2] == 0
+                && seg[3] == 0
+                && seg[4] == 0
+                && seg[5] == 0
+            {
+                let v4 = std::net::Ipv4Addr::new(
+                    (seg[6] >> 8) as u8,
+                    (seg[6] & 0xff) as u8,
+                    (seg[7] >> 8) as u8,
+                    (seg[7] & 0xff) as u8,
+                );
+                return is_blocked_ip(IpAddr::V4(v4));
+            }
+            // 2002::/16 — 6to4. Segments 1-2 carry the embedded IPv4;
+            // re-check it the same way.
+            if seg[0] == 0x2002 {
+                let v4 = std::net::Ipv4Addr::new(
+                    (seg[1] >> 8) as u8,
+                    (seg[1] & 0xff) as u8,
+                    (seg[2] >> 8) as u8,
+                    (seg[2] & 0xff) as u8,
+                );
                 return is_blocked_ip(IpAddr::V4(v4));
             }
             let blocked =
@@ -896,6 +944,39 @@ pub async fn fetch_deliveries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SEC-005 denylist additions: CGNAT, benchmarking, NAT64, and 6to4.
+    #[test]
+    fn denylist_blocks_cgnat_benchmarking_nat64_sixtofour() {
+        let blocked = [
+            // 100.64.0.0/10 — CGNAT shared address space (both bounds).
+            "100.64.0.1",
+            "100.127.255.254",
+            // 198.18.0.0/15 — benchmarking (both bounds).
+            "198.18.0.1",
+            "198.19.255.254",
+            // NAT64 local-use prefix, blocked outright.
+            "64:ff9b:1::1",
+            // NAT64 /96 embedding the cloud-metadata IP.
+            "64:ff9b::a9fe:a9fe",
+            // 6to4 embedding the cloud-metadata IP.
+            "2002:a9fe:a9fe::1",
+        ];
+        for s in blocked {
+            let ip: IpAddr = s.parse().expect("parse ip");
+            assert!(is_blocked_ip(ip), "{s} must be blocked");
+        }
+        // 100.63.x (below the /10) and 100.128.x (above) stay allowed.
+        assert!(!is_blocked_ip("100.63.255.255".parse().expect("ip")));
+        assert!(!is_blocked_ip("100.128.0.1".parse().expect("ip")));
+        // 198.17.x (below the /15) and 198.20.x (above) stay allowed.
+        assert!(!is_blocked_ip("198.17.0.1".parse().expect("ip")));
+        assert!(!is_blocked_ip("198.20.0.1".parse().expect("ip")));
+        // A NAT64 /96 wrapping a PUBLIC address stays allowed.
+        assert!(!is_blocked_ip("64:ff9b::801:100c".parse().expect("ip"))); // 8.1.16.12
+        // A 6to4 wrapping a public address stays allowed.
+        assert!(!is_blocked_ip("2002:801:100c::1".parse().expect("ip")));
+    }
 
     #[test]
     fn backoff_is_monotonic_until_capped() {
