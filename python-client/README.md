@@ -15,24 +15,20 @@ Package name: `par-rt-db` → in Python, `import par_rt_db`.
 
 ## Table of Contents
 
-- [Status / features](#status--features)
+- [Status / features](#status-features)
 - [Install](#install)
 - [Quick start](#quick-start)
   - [Atomic multi-step transaction](#atomic-multi-step-transaction)
-  - [Query + subscribe](#query--subscribe)
+  - [Query + subscribe](#query-subscribe)
   - [Reactive WebSocket (`[ws]` extra)](#reactive-websocket-ws-extra)
-  - [Async HTTP / admin / storage (`[aio]` extra)](#async-http--admin--storage-aio-extra)
+  - [Async HTTP / admin / storage (`[aio]` extra)](#async-http-admin-storage-aio-extra)
   - [Schemas and cursors](#schemas-and-cursors)
   - [Computed fields (ENH-028)](#computed-fields-enh-028)
   - [Schema migration (`[http]` extra)](#schema-migration-http-extra)
   - [Durable workflows (FM-29)](#durable-workflows-fm-29)
-  - [Cascade delete + soft delete (FM-33)](#cascade-delete--soft-delete-fm-33)
+  - [Cascade delete + soft delete (FM-33)](#cascade-delete-soft-delete-fm-33)
 - [Errors](#errors)
-- [Full API](#full-api)
-  - [Wire and DSL types](#wire-and-dsl-types)
-  - [Reactive client: presence (`[ws]` extra)](#reactive-client-presence-ws-extra)
-  - [HTTP clients: storage, batch query, index helpers, schedules](#http-clients-storage-batch-query-index-helpers-schedules)
-  - [Admin control plane (`[http]` extra)](#admin-control-plane-http-extra)
+- [API reference](#api-reference)
 - [Wire contract](#wire-contract)
 - [Develop](#develop)
 
@@ -488,13 +484,19 @@ re-wait is the full timeout again, no backoff); omit it to wait forever —
 cancel is the escape. The harness models the parked state on `tick()` too.
 
 ```python
+import asyncio
+
 from par_rt_db.mutation import await_signal
 
-gate = WorkflowSpec(
-    name="gate",
-    steps=[WorkflowStepSpec(await_signal=await_signal("approve", timeout_ms=86_400_000))],
-)
-await db.signal_workflow(run_id, "approve", {"approvedBy": "u1"})  # releases the gate
+async def main() -> None:
+    gate = WorkflowSpec(
+        name="gate",
+        steps=[WorkflowStepSpec(await_signal=await_signal("approve", timeout_ms=86_400_000))],
+    )
+    run_id = await db.start_workflow(gate)
+    await db.signal_workflow(run_id, "approve", {"approvedBy": "u1"})  # releases the gate
+
+asyncio.run(main())
 ```
 
 ### Cascade delete + soft delete (FM-33)
@@ -514,6 +516,7 @@ always hard-deletes.
 
 ```python
 from par_rt_db import Mutation, RtDbHttpClient
+from par_rt_db.admin import RtDbAdminClient
 from par_rt_db.schema import Schema, t
 
 schema = (
@@ -539,10 +542,13 @@ schema = (
     .build()
 )
 
-client = RtDbHttpClient("https://rtdb.example.com", "mydb", "<machine-token>")
+admin = RtDbAdminClient("https://rtdb.example.com", "<admin-key>")
+user_id = "<user-id>"
+comment_id = "<comment-id>"
 
 # Deleting the user cascades: posts hard-delete, comments soft-delete (stamped).
-client.push_schema("mydb", schema)
+# push_schema is an admin route — a machine-token client gets 403.
+admin.push_schema("mydb", schema)
 client.mutate(Mutation.builder().delete("users", user_id).build())
 client.mutate(Mutation.builder().undelete("comments", comment_id).build())  # restore
 ```

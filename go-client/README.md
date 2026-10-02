@@ -19,11 +19,11 @@ way).
 | --- | --- |
 | `wire` | The wire vocabulary: strict-decoding JSONValue, envelope types (client/server messages), `Query`/`FilterExpr`/`ValueExpr`, `Transaction`/`Step`, schedules, errors-adjacent shapes. Unknown fields are rejected on decode, mirroring the server's `deny_unknown_fields`. |
 | `dsl` | Builders: `TableQuery`, filter/value-expr constructors, `Mutation`, schema DSL, cursor codec. |
-| `errors` | The eleven `ErrorCode` constants, `{code, message}` `RtDbError`, `HTTPStatus`. |
-| `httpclient` | One-shot HTTP: typed `Query[T]`/`QueryRaw`, `Mutate` (+ retry helper), `authMe`, schedules, storage upload/download/delete, and the exported `Call`/`RawCall` seams. |
+| `errors` | The thirteen `ErrorCode` constants, `{code, message}` `RtDbError`, `HTTPStatus`. |
+| `httpclient` | One-shot HTTP: typed `Query[T]`/`QueryRaw`, `Mutate` (+ retry helper), `AuthMe`, schedules, storage upload/download/delete, and the exported `Call`/`RawCall` seams. |
 | `wsclient` | Reactive WebSocket client over `/sync`: live-query subscriptions with snapshot channels, presence, mutate-over-WS, reconnect/backoff/dedupe. |
 | `admin` | The `/admin/*` control plane: db lifecycle, schema push/preview, tokens, sessions, webhooks, backups, ops feed, admin query/mutate, workflows, schedules, storage, anonymous access. |
-| `inmemory` | The in-memory engine (`inmemory.Client`) — the same usage surface as httpclient/wsclient with server-identical semantics for tests (schema validation, queries, transactions, migrate, scheduler, presence, subscriptions). |
+| `inmemory` | The in-memory engine (`inmemory.Client`) — a similar API to httpclient/wsclient (method names differ; there is no shared interface) with server-identical semantics for tests (schema validation, queries, transactions, migrate, scheduler, presence, subscriptions). |
 | `optimistic` | Optimistic-update layer: compose over any `MutationApplier` (httpclient or wsclient) with `optimistic.New`; the wsclient composition is manual (no wsclient option yet). |
 | `internal/corpus` | The wire-corpus semantics runner harness (internal; drives the engine in the repo's corpus tests). |
 
@@ -106,11 +106,11 @@ minted, _ := adm.MintToken(ctx, "mydb", "app")
 
 ## In-memory engine (tests)
 
-The same usage surface with no network: schema-push validation that matches
+A similar surface with no network (method names may differ from the HTTP/WS clients; there is no shared interface): schema-push validation that matches
 the server's `SCHEMA_VIOLATION`/`BAD_REQUEST` codes, the full query DSL,
 atomic transactions, migrations, a deterministic `Tick`, presence, and
 subscriptions. The wire-corpus semantics runner drives exactly this engine
-(164 cases, zero Go skips), so harness behavior is pinned to the server's.
+(175 cases, zero Go skips), so harness behavior is pinned to the server's.
 
 ```go
 c := inmemory.New(inmemory.Options{})
@@ -124,7 +124,7 @@ rows, _ := c.Query(ctx, dsl.NewTableQuery("items"))
 `wire/` is one of the six implementations of the par-rt-db protocol and must
 stay byte-identical with the server (and the other clients' wire files).
 The [`wire-corpus/`](../wire-corpus/README.md) fixtures pin the envelope
-shapes, the error codes, the golden query vectors, and 164 semantics cases —
+shapes, the error codes, the golden query vectors, and 175 semantics cases —
 all executed by this repo's `make test` via the Go runners.
 
 ## Develop

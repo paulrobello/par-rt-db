@@ -1029,7 +1029,8 @@ Workflows page (which shows waiting runs and can send the signal). Spec:
 ### TypeScript client
 
 ```ts
-import { WorkflowSpec, awaitSignal } from "@par-rt-db/client";
+import type { WorkflowSpec } from "@par-rt-db/client";
+import { awaitSignal } from "@par-rt-db/client";
 
 const spec: WorkflowSpec = {
   name: "onboard",

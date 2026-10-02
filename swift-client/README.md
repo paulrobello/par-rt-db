@@ -25,7 +25,7 @@ Design and scope:
 - [Admin client](#admin-client)
 - [Error handling](#error-handling)
 - [In-memory engine](#in-memory-engine)
-- [Full API](#full-api)
+- [API reference](#api-reference)
 - [Testing](#testing)
 - [Coverage: v1 surfaces vs deferred](#coverage-v1-surfaces-vs-deferred)
 - [License](#license)
@@ -34,7 +34,7 @@ Design and scope:
 
 - Swift 6 (Swift concurrency in strict mode; `swift-tools-version:6.0`)
 - iOS 17+ / macOS 14+ (the `@Observable` macro requires it)
-- Zero third-party dependencies — Foundation (+ `Observation` in `ParRtDbUI`) only
+- Zero third-party runtime dependencies — Foundation (+ `Observation` in `ParRtDbUI`) only. The `swift-docc-plugin` (1.4.3+) is a dev-only dependency for building the documentation archive, not a runtime link.
 - Building/linting from the repo: `swiftformat` and `swiftlint` on PATH
   (`brew install swiftformat swiftlint`)
 
@@ -331,8 +331,10 @@ let schema = SchemaBuilder()
     }
     .build()
 
-try await http.pushSchema(schema)          // POST /admin/push-schema (same token)
-let diff = try await http.previewSchema(schema)   // advisory diff, applies nothing
+// Push is an admin route — a machine-token HTTP client gets 403.
+let admin = RtDbAdminClient(url: "https://rtdb.example.com", adminKey: adminKey)
+try await admin.pushSchema(db: "myapp", schema: schema)
+let diff = try await admin.previewSchema(db: "myapp", schema: schema)   // advisory diff, applies nothing
 ```
 
 The full `FieldType` set is supported (15 variants — including `int64`, `bytes`,

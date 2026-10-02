@@ -11,18 +11,18 @@ Crate name: `par-rt-db-client` → in Rust, `use par_rt_db_client::...`.
 
 ## Table of contents
 
-- [Status / features](#status--features)
+- [Status / features](#status-features)
 - [Install](#install)
 - [Quick start (HTTP)](#quick-start-http)
 - [Scheduling](#scheduling)
 - [Durable workflows](#durable-workflows)
-- [Cascade delete + soft delete (FM-33)](#cascade-delete--soft-delete-fm-33)
+- [Cascade delete + soft delete (FM-33)](#cascade-delete-soft-delete-fm-33)
 - [Computed fields](#computed-fields)
 - [Schema migration](#schema-migration)
 - [File storage](#file-storage)
 - [Errors](#errors)
 - [Wire contract](#wire-contract)
-- [Full API](#full-api)
+- [API reference](#api-reference)
 - [Develop](#develop)
 
 ## Status / features
@@ -30,8 +30,10 @@ Crate name: `par-rt-db-client` → in Rust, `use par_rt_db_client::...`.
 | Feature | Default | Surface |
 | --- | --- | --- |
 | `http` | yes | `RtDbHttpClient` — typed query / mutate / `auth_me` / `fetch_schema` (machine-token schema read-back) / `changes` (durable change-feed cursor polling) |
-| `ws` | no | `RtDbClient` (`src/ws.rs`) — reactive WebSocket client (live query subscriptions + mutate) |
-| `admin` | no | `RtDbAdminClient` (`src/admin/mod.rs`) — `/admin/*` control-plane client: db create/list/push-schema, schema/stats read-back, token mint/revoke/list, db + server-wide admin allowlist CRUD, metrics, hot config GET/PATCH, op-feed `recent`, owner-bypass query/mutate (incl. `include_deleted` for soft-deleted rows), snapshot export/import, schema preview (advisory additive/reject diff), admin schedules CRUD (list/create/cancel/pause/resume), admin storage (list/upload/delete), per-db anonymous-access toggle (SEC-103). Browser-only `login`/`logout`/`/admin/stream` are excluded (the Rust client is a machine client). Construct via `RtDbAdminClient::new(url, admin_key)` or `RtDbHttpClient::admin_client()` (shares the connection pool). The admin methods also remain on `RtDbHttpClient` as `#[deprecated]` re-exports (ARC-121, non-breaking). |
+| `ws` | no | `RtDbClient` (`src/ws.rs`) — reactive WebSocket client (live query subscriptions, mutate, presence, optimistic updates, schedules, workflows) |
+| `admin` | no | `RtDbAdminClient` (`src/admin/mod.rs`) — `/admin/*` control-plane client: db create/list/push-schema, schema/stats read-back, token mint/revoke/list, db + server-wide admin allowlist CRUD, metrics, hot config GET/PATCH, op-feed `recent`, `stream_admin(db, table)` —
+the `/admin/stream` WebSocket consumer (features `admin` + `ws`; carries the
+admin key as an Authorization bearer), owner-bypass query/mutate (incl. `include_deleted` for soft-deleted rows), snapshot export/import, schema preview (advisory additive/reject diff), admin schedules CRUD (list/create/cancel/pause/resume), admin storage (list/upload/delete), per-db anonymous-access toggle (SEC-103). Browser-only `login`/`logout` (cookie flows) are excluded (the Rust client is a machine client); `/admin/stream` is available via `stream_admin`. Construct via `RtDbAdminClient::new(url, admin_key)` or `RtDbHttpClient::admin_client()` (shares the connection pool). The admin methods also remain on `RtDbHttpClient` as `#[deprecated]` re-exports (ARC-121, non-breaking). |
 | `in_memory` | no | `InMemoryRtDbClient` (`src/in_memory/`) — in-memory test harness (no network, no Postgres). Ports `ts-client/src/in_memory/`: schema push, mutate (with `mut_id` idempotency), one-shot query DSL (`get`/`first`/`unique`/`count`/`take`/`collect`/`distinct`/`aggregate` + index eq + range + `order` + cursor-keyset `paginate`), `filter()` predicate evaluation (validated against the declared schema — a kind-mismatched value, e.g. a number on a string field, errors with `BAD_REQUEST` instead of silently matching nothing, SEC-126), reactive `subscribe` (re-runs and fires `on_update` on change), `schedule`/`cancel_schedule`/`pause_schedule`/`resume_schedule`/`list_schedules` + a timer-less `tick(now_ms)` (one-shot catches up if past due; cron re-arms by `CRON_STEP_MS = 60_000` and skips missed windows), and the `upload`/`delete_file`/`get_file_metadata`/`get_url` storage stubs. `search` approximates server behavior by mode — websearch operator matching (quoted phrases, `or` unions, `-term` exclusion, FM-31) with optional `_searchSnippet` highlights for `tsquery`, substring + similarity ranking for `trgm` (FM-30); `vector_search` over-approximates (no distance model — every table doc is a candidate, narrowed by the carried `filter`); rejected combinations still throw. |
 
 `core` (wire types, schema/query/mutation builders, error model) compiles with
@@ -86,9 +88,11 @@ grammar on every write (see below).
 
 `InMemoryRtDbClient` mirrors the server's schema/query/txn/step-result semantics
 with no network and no Postgres — a direct port of `ts-client/src/in_memory/`.
-It exposes the same data surface as the live clients (`push_schema`,
-`run`/`run_query`, `mutate` with `mut_id` idempotency, and reactive `subscribe`)
-so a unit test can swap it in behind a shared interface. Atomic rollback on step
+It exposes a similar API surface to the live clients (`push_schema`,
+`run`, `mutate` with `mut_id` idempotency, and reactive `subscribe`) —
+there is no shared trait; signatures may differ (e.g. the harness's `run`
+is sync where the HTTP client's is async), but a unit test can still swap
+it in where the call sites use the common method names. Atomic rollback on step
 failure, system-field merging at read time, and cursor-keyset pagination all
 behave like the server. The harness is opt-in (gates a `sha2` dependency for
 SHA-256 file digests); `search` approximates ranking client-side
@@ -195,8 +199,10 @@ slot's `{ok:false,error}` and never fails the call).
 
 `RtDbHttpClient` and the reactive `RtDbClient` (`ws` feature) both expose
 scheduled/cron transactions. `when` is `ScheduleWhen::AfterMs { ms }`,
-`RunAt { ms }`, or `Cron { expr }` (5-field, min-first, UTC; the server
-validates); wire shapes mirror the server byte-for-byte (see `src/wire.rs`).
+`RunAt { ms }`, `Cron { expr, tz }` (5-field, min-first, UTC unless `tz`
+names an IANA zone; the server validates), or `Interval { every_ms }`
+(fixed recurrence; missed windows skipped, never backfilled); wire shapes
+mirror the server byte-for-byte (see `src/wire.rs`).
 
 ```rust
 use par_rt_db_client::{ScheduleWhen, ScheduleInfo};
@@ -280,9 +286,12 @@ stamp: the row disappears from every read, write lookup, and unique index
 ```rust
 use par_rt_db_client::schema::{FieldType, OnDeleteAction, Table};
 
+// A cascade `on_delete` requires an index on the referencing field —
+// the server rejects the push with SCHEMA_VIOLATION otherwise.
 let table = Table::new()
     .field("note", FieldType::String)
     .field("parentId", FieldType::id("parents").on_delete(OnDeleteAction::Cascade))
+    .index("by_parent", &["parentId"])
     .soft_delete();
 let txn = Mutation::new().undelete("children", &id).build();
 ```
@@ -346,15 +355,20 @@ migrate interplay (see `src/in_memory/tests/computed.rs`).
 ## Schema migration
 
 Destructive/type-changing schema transformations are a deliberate admin operation,
-separate from the additive `push_schema`. Build a `Migration` (feature `admin`)
-and apply it via `db.admin_client().migrate_schema(...)` — `POST /admin/db/{db}/migrate`
+separate from the additive `push_schema`. Admin routes reject machine tokens —
+build a `Migration` (feature `admin`) and apply it via a dedicated
+`RtDbAdminClient::new(url, admin_key)` (or `db.admin_client()` when the HTTP
+client itself carries the admin key): `POST /admin/db/{db}/migrate`
 runs the directives transactionally inside the committer, so live queries, the op
 feed, audit, and webhooks all fire. (`RtDbHttpClient::migrate_schema` still exists
 but is `#[deprecated]` — ARC-121 — prefer the admin client.)
 
 ```rust
+use par_rt_db_client::admin::RtDbAdminClient;
 use par_rt_db_client::{Cast, FieldType, Migration};
 use serde_json::json;
+
+let admin = RtDbAdminClient::new("https://rtdb.example.com", "<admin-key>");
 
 let migration = Migration::new()
     .rename_field("items", "title", "summary")
@@ -363,7 +377,7 @@ let migration = Migration::new()
     .build();
 
 // dry_run = true previews first — returns the report + derived schema with no writes.
-let result = db.admin_client().migrate_schema("kanban", &migration, true).await?;
+let result = admin.migrate_schema("kanban", &migration, true).await?;
 // re-run with dry_run = false to apply
 ```
 

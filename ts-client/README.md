@@ -8,20 +8,20 @@ inferred types.
 ## Table of Contents
 
 - [Install](#install)
-- [Define a schema (once, shared by app + admin)](#define-a-schema-once-shared-by-app--admin)
+- [Define a schema (once, shared by app + admin)](#define-a-schema-once-shared-by-app-admin)
 - [React](#react)
-  - [Authentication & token storage](#authentication--token-storage)
-- [Node / CLI](#node--cli)
-- [React Native / Expo](#react-native--expo)
+  - [Authentication & token storage](#authentication-token-storage)
+- [Node / CLI](#node-cli)
+- [React Native / Expo](#react-native-expo)
 - [Scheduling](#scheduling)
 - [Durable workflows](#durable-workflows)
-- [Cascade delete & soft delete](#cascade-delete--soft-delete)
+- [Cascade delete & soft delete](#cascade-delete-soft-delete)
 - [Search](#search)
 - [Realtime presence](#realtime-presence)
 - [Schema migration](#schema-migration)
 - [File storage](#file-storage)
 - [In-memory test client](#in-memory-test-client)
-- [Full API](#full-api)
+- [API reference](#api-reference)
 - [Development](#development)
 
 ## Install
@@ -117,7 +117,7 @@ mutate, and subscription re-run; machine tokens bypass):
   to store into an `int64` field).
 
 The `ve` namespace builds the expression grammar for `.computed(...)`
-(and migrate's typed `evalExpr`): `ve.field(name)` reads a declared field as
+(and migrate's typed `evalExprTyped`): `ve.field(name)` reads a declared field as
 text (numbers become `"42"`-style strings), `ve.literal(v)` is any JSON
 literal, `ve.concat(...parts)` skips null parts, `ve.add/sub/mul/div` do
 IEEE-double arithmetic with null propagation, `ve.coalesce(...parts)`,
@@ -205,7 +205,7 @@ does not apply.
 
 For a credential-less guest, `useRtDbAuth().signInAnonymous()` (or a plain
 `POST /auth/anonymous` outside React — see
-[React Native / Expo](#react-native--expo)) mints an ephemeral anonymous
+[React Native / Expo](#react-native-expo)) mints an ephemeral anonymous
 session — gated by the server's `RTDB_AUTH_ANONYMOUS_ENABLED` boot flag (default
 off ⇒ `403`). It sets the same HttpOnly cookie **and** returns the plaintext
 session token for the SDK/bearer path; an anonymous user owns its own documents
@@ -545,8 +545,9 @@ if (result.applied) { /* … */ }   // re-run without .dryRun() to apply
 
 `changeType` takes a closed `cast` (`toString`/`toNumber`/`toInt64`/`toBoolean`);
 the optional `default` substitutes for un-coercible rows (without it a single bad
-value rolls the whole migrate back atomically). `evalExpr` is the scoped raw-SQL
-escape hatch (one table's `doc` jsonb, no joins/DDL). See
+value rolls the whole migrate back atomically). `evalExprTyped` (preferred) and the
+legacy raw-SQL `evalExpr` are the scoped escape hatch (one table's `doc` jsonb,
+no joins/DDL). See
 [`docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md`](../docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md).
 
 ## File storage
@@ -574,7 +575,10 @@ reactive updates).
 `InMemoryRtDbClient` (`src/in_memory/`) is an in-memory implementation of the
 client surface for unit tests — no server, no Postgres. It mirrors the schema,
 query, and transaction semantics, including cursor pagination, so app code can
-exercise the full DSL against it directly.
+exercise the full DSL against it directly. Storage is partially mirrored:
+`upload`, `deleteFile`, `getFileMetadata`, and `getUrl` work in memory
+(`getUrl` returns a synthetic URL); the transform and signed-URL variants do
+not.
 
 `RtDbClient` also accepts an opt-in `optimisticUpdates` option that applies
 mutations to local state before the server confirms them.

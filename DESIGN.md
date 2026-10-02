@@ -14,9 +14,9 @@ against. Authoritative for visuals; for product scope see
 >
 > **THESIS** — A deep-navy operations cockpit that treats the database as a live
 > machine: rounded glowing cards, a glassy masthead, big mono readouts, and teal
-> liveness. Adopted from the **par-mem** dashboard (`../par-mem/web`) — that
-> aesthetic is the pinned reference; this is its visual language on par-rt-db's
-> own layout and content.
+> liveness. Adopted from the par-mem dashboard (a sibling project's web SPA;
+> not part of this repository) — that aesthetic is the pinned reference; this
+> is its visual language on par-rt-db's own layout and content.
 > **OWN-WORLD** — Deep-navy ground lit by teal + violet radial glows; rounded
 > gradient panels with a teal→violet top hairline and soft
 > shadow; cool off-white ink over blue-tinted hairlines; teal is the live/active
@@ -30,9 +30,9 @@ against. Authoritative for visuals; for product scope see
 > **FIRST VIEWPORT** — glassy masthead top, rounded command rail left, dense
 > rounded document table center with a live count, live op-feed rail right, the
 > connection dot glowing. Primary action: open a table.
-> **FORM** — par-mem ops cockpit (pinned reference: `pm-*` dashboard CSS in
-> `../par-mem/web/src/dashboard/index.ts` and `APP_CSS` in
-> `../par-mem/web/src/app/theme.ts`). Layout and content are par-rt-db's own.
+> **FORM** — par-mem ops cockpit (pinned reference: the reference dashboard's
+> `pm-*` CSS classes and `APP_CSS` theme constant in the sibling par-mem
+> repository). Layout and content are par-rt-db's own.
 
 ## Mode
 Operate. Scanability, consistency, and the real usage scene outrank expression.
