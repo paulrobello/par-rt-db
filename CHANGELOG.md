@@ -361,6 +361,23 @@ alter observable behavior on upgrade.
 
 ### Changed
 
+- **Audit-log and webhook-delivery rows commit with the write they describe
+  (ENH-047).** On the mutate, scheduled, and workflow paths the
+  `rtdb.audit_log` and `rtdb.webhook_deliveries` INSERTs now run inside the
+  write's Postgres transaction (`execute_txn_with_side` next to the
+  change-feed stamp) instead of best-effort post-commit taps — the outbox
+  guarantee: a crash between commit and enqueue can no longer lose audit
+  records or webhook deliveries, and a rolled-back write no longer publishes
+  taps for a write that did not happen. The semantics change is intended: an
+  audit/webhook insert failure now fails the whole write, but both tables are
+  server-owned globals ensured at boot, so a failure means Postgres is
+  unhealthy. The TTL-reaper, migrate, and merge arms keep the best-effort
+  post-commit tap (their per-row/batch transactions make in-transaction
+  failure semantics ambiguous at arm level), and `enqueue_for_ops_on` now
+  loads all of a database's enabled webhooks with one query instead of one
+  `SELECT` per op. Op-feed publication, subscription fan-out, and
+  cross-replica NOTIFYs stay post-commit — they must observe only committed
+  writes.
 - **All six OAuth providers resolve their user through one `resolve_user`.**
   GitHub, Apple, and Microsoft previously carried three near-identical
   `upsert_user` blocks and Google, GitLab, and OIDC three inline

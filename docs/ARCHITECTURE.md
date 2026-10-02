@@ -368,7 +368,7 @@ graph LR
         FWD["rtdb_auth.forward_queue — spooled forward requests + replies<br />(the NOTIFY carries only a row id)"]
         SIDX["rtdb.storage_index — storage id → owning db"]
         CFG["rtdb_config — single-row hot config"]
-        AUD["rtdb.audit_log — best-effort per-DocOp rows"]
+        AUD["rtdb.audit_log — per-DocOp rows<br />(txn-atomic on mutate/scheduled/workflow,<br />best-effort on ttl/migrate/merge)"]
         WHK["rtdb.webhooks + webhook_deliveries — registrations + outbox"]
     end
 
@@ -985,14 +985,33 @@ point — the `publish_taps` helper (`committer/taps.rs`) — called from
 
 | Arm | `source` | Emits DocOps | Notes |
 | --- | --- | --- | --- |
-| `handle_mutate` | `"mutate"` | yes | The ordinary write path, WS and HTTP alike |
-| `handle_scheduled` | `"scheduled"` | yes | Scheduler-claimed jobs |
-| `handle_workflow_advance` | `"workflow"` | yes | Durable workflow step commits |
-| `handle_migrate` | `"migrate"` | yes | Schema migrate DDL + DML |
-| `handle_reaper` | `"ttl"` | yes | TTL deletes are durable writes, `owner = None` |
-| `handle_merge_users` | `"merge"` | yes | The anon→real merge's committed doc restamps |
+| `handle_mutate` | `"mutate"` | yes | The ordinary write path, WS and HTTP alike. Audit + webhook taps are written IN the txn (ENH-047) |
+| `handle_scheduled` | `"scheduled"` | yes | Scheduler-claimed jobs. Audit + webhook taps in-txn |
+| `handle_workflow_advance` | `"workflow"` | yes | Durable workflow step commits. Audit + webhook taps in-txn |
+| `handle_migrate` | `"migrate"` | yes | Schema migrate DDL + DML — best-effort post-commit taps |
+| `handle_reaper` | `"ttl"` | yes | TTL deletes are durable writes, `owner = None` — best-effort post-commit taps |
+| `handle_merge_users` | `"merge"` | yes | The anon→real merge's committed doc restamps — best-effort post-commit taps |
 | `handle_push_schema` | `"push"` | no | `docop_taps = false`: fan-out + cross-replica invalidation only — DDL/backfills emit no DocOps, so no op-feed/audit/webhook taps |
 | `handle_restore_schema` | `"restore"` | no | Same shape as push, for schema-history restore |
+
+ENH-047 splits the audit and webhook taps by arm. The mutate, scheduled, and
+workflow arms call `execute_txn_with_side`, which runs
+`audit::write_audit_rows_on` and `webhook::enqueue_for_ops_on` on the write's
+OPEN transaction (next to the change-feed stamp) and then
+`publish_taps_skip_side_writes` skips those two taps post-commit. The
+guarantee is the outbox one: the audit/webhook rows commit or roll back
+together with the documents, so a crash between commit and enqueue can no
+longer lose them, and a rolled-back write publishes nothing. The intended
+semantics change: an audit or webhook insert failure now FAILS the whole
+write — both tables are server-owned globals ensured at boot, so a failure
+means Postgres is unhealthy and the write would likely have failed anyway.
+The ttl/migrate/merge arms keep the best-effort post-commit discipline (a
+failure is warned, never propagated): their per-row/per-batch transaction
+loops make an in-transaction failure ambiguous at arm level (a merge row
+conflict skips only that row; a reaper batch fails wholesale). The op-feed
+`publish`, subscription `fan_out`, and the cross-replica NOTIFYs stay
+post-commit on every arm — they are in-memory and must observe only
+committed writes.
 
 
 ### The change log is stamped in-transaction, not via a tap
@@ -1036,15 +1055,20 @@ move — no behavior changed.
   through `authenticate_admin` (`admin/mod.rs`), preserving the constant-time
   admin-key compare and the OAuth-admin-allowlist check.
 - **Durable audit log**: when `RTDB_AUDIT_LOG_ENABLED` (boot, default off) is
-  set, `publish_taps` best-effort writes one `rtdb.audit_log` row per `DocOp`
-  (`ts_ms, db, table, op, doc_id, principal=owner, source`) — so the audit
-  trail inherits the op-feed's "every durable write publishes here" guarantee;
-  the table is ensured at boot only when enabled, and
+  set, one `rtdb.audit_log` row per `DocOp`
+  (`ts_ms, db, table, op, doc_id, principal=owner, source`) is committed
+  IN the write's transaction on the mutate/scheduled/workflow paths (ENH-047,
+  see the tap table above) — so the audit trail inherits the op-feed's "every
+  durable write publishes here" guarantee AND atomicity with the write; the
+  ttl/migrate/merge arms write best-effort post-commit. The table is ensured
+  at boot only when enabled, and
   `GET /admin/audit?db=&limit=&offset=` reads it (empty when disabled).
 - **Webhook/event delivery**: when `RTDB_WEBHOOKS_ENABLED` (boot, default off)
-  is set, `publish_taps` enqueues one `rtdb.webhook_deliveries` (outbox) row
-  per matching `DocOp` (per `rtdb.webhooks` row filtered by db/table/events),
-  and a boot worker drains the outbox via reqwest POSTs with exponential
+  is set, one `rtdb.webhook_deliveries` (outbox) row
+  per matching `DocOp` (per `rtdb.webhooks` row filtered by db/table/events)
+  is committed IN the write's transaction on the mutate/scheduled/workflow
+  paths (ENH-047; the other arms best-effort post-commit), and a boot worker
+  drains the outbox via reqwest POSTs with exponential
   backoff (at-least-once); admin CRUD at `/admin/db/{db}/webhooks`.
 
 ### Admin CSRF
