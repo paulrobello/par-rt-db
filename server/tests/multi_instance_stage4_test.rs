@@ -6,6 +6,8 @@
 //! with the ENH-029 `common::cluster` harness (`Cluster::two`/`two_with`/`two_bare`),
 //! the shared shape for all multi-instance tests.
 
+use std::net::SocketAddr;
+
 use crate::common::cluster::{Cluster, ReplicaId, ReplicaOpts, insert_item, mutate_until_landed};
 use rtdb_server::auth::{Principal, PrincipalCtx};
 use rtdb_server::error::ErrorCode;
@@ -15,6 +17,28 @@ use rtdb_server::txn::{Step, Transaction};
 /// harness's 2_000ms forward timeout so a loop that does pay one full timeout
 /// still has many attempts left to converge.
 const RETRY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// ENH-049: scrape `/metrics` (Prometheus text) and return the sample value
+/// for `series` as a float. Fails the test when the series is missing — every
+/// series renders unconditionally.
+async fn scrape_metric(addr: SocketAddr, series: &str) -> f64 {
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .header("Accept", "text/plain")
+        .send()
+        .await
+        .expect("GET /metrics");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = resp.text().await.expect("read /metrics body");
+    let line = body
+        .lines()
+        .find(|l| l.starts_with(series))
+        .unwrap_or_else(|| panic!("series {series} missing from scrape: {body}"));
+    line.rsplit(' ')
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("series {series} sample not a number: {line}"))
+}
 
 /// (T2) A per-db rate budget configured on two replicas is ONE budget: the
 /// counters live in `rtdb_auth.rate_counters`, so the Nth+1 request is denied
@@ -105,6 +129,26 @@ async fn ownership_lease_forwarding_and_failover_on_death() -> anyhow::Result<()
         .mutate(&db, None, insert_item("from-a"), PrincipalCtx::bypass())
         .await?;
 
+    // ENH-049: pre-failover, the Prometheus scrape shows A holding the lease
+    // and shadow B holding none (and having contended once, at its spawn).
+    let a_addr = cluster.replica(ReplicaId::A).addr;
+    let b_addr = cluster.replica(ReplicaId::B).addr;
+    assert_eq!(
+        scrape_metric(a_addr, "rtdb_leases_owned").await,
+        1.0,
+        "owner A must report exactly its one lease"
+    );
+    assert_eq!(
+        scrape_metric(b_addr, "rtdb_leases_owned").await,
+        0.0,
+        "shadow B holds no lease"
+    );
+    assert_eq!(
+        scrape_metric(b_addr, "rtdb_lease_contended_total").await,
+        1.0
+    );
+    assert_eq!(scrape_metric(b_addr, "rtdb_multi_instance").await, 1.0);
+
     // Owner death: kill(A) drops A's committer entry (releasing the lease),
     // stops its axum server and background listeners, and drops every AppState
     // clone — what process death looks like to Postgres.
@@ -125,6 +169,24 @@ async fn ownership_lease_forwarding_and_failover_on_death() -> anyhow::Result<()
         .fetch_one(&pool)
         .await?;
     assert_eq!(n, 3, "two forwarded/owner writes + one post-failover write");
+
+    // ENH-049: after failover, survivor B re-acquired — its acquired counter
+    // shows the takeover, its gauge shows the lease it now holds, and its
+    // failover write paid exactly one forward timeout.
+    let b_addr = cluster.replica(ReplicaId::B).addr;
+    assert!(
+        scrape_metric(b_addr, "rtdb_lease_acquired_total").await >= 1.0,
+        "survivor B took over the lease after A died"
+    );
+    assert_eq!(
+        scrape_metric(b_addr, "rtdb_leases_owned").await,
+        1.0,
+        "survivor B now holds the lease"
+    );
+    assert!(
+        scrape_metric(b_addr, "rtdb_forward_timeouts_total").await >= 1.0,
+        "B's failover write paid one forward timeout"
+    );
     Ok(())
 }
 

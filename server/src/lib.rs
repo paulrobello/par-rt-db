@@ -299,6 +299,9 @@ impl AppState {
     pub fn new(pool: sqlx::PgPool, config: Config, hot: HotConfig) -> Arc<Self> {
         let schemas = SchemaCache::with_capacity(config.schema_cache_max_entries);
         let metrics = metrics::Metrics::with_slow_query_capacity(config.slow_query_capacity);
+        // ENH-049: the multi-instance gauge is a boot-time constant of this
+        // replica; it is Prometheus-only (see `render_prometheus`).
+        metrics.set_multi_instance(config.multi_instance.enabled);
         // The subscription manager records invalidation effectiveness on the
         // same `Metrics` the dashboard reads, and owns the skip-verification
         // sampler — so it is built after metrics and before the committers.
@@ -768,7 +771,12 @@ async fn prometheus_metrics_handler(
             presence_sessions,
         )
         .await;
-    let body = metrics::render_prometheus(&snap, admin_fingerprint(&state, &headers).await);
+    let body = metrics::render_prometheus(
+        &snap,
+        &state.runtime.metrics,
+        admin_fingerprint(&state, &headers).await,
+        &state.runtime.instance_id,
+    );
     let mut h = HeaderMap::new();
     h.insert(
         header::CONTENT_TYPE,

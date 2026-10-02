@@ -68,6 +68,36 @@ const CHANNEL_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_se
 /// configured thresholds.
 const RECLAIM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// ENH-049: the ONLY way a `channels` entry leaves the map. Decrements the
+/// `rtdb_leases_owned` gauge when the removed entry held the ownership lease,
+/// so the gauge tracks the map on every removal path (drop-db, committer task
+/// exit via the supervisor, failed send) instead of drifting. When
+/// `only_if_sender` is `Some`, the removal applies only if the cached entry
+/// still holds that exact sender (the `same_channel` guard against clobbering
+/// a concurrent respawn under the same db key). Callers already hold the
+/// `channels` lock.
+fn remove_channel_entry(
+    guard: &mut HashMap<String, ChannelEntry>,
+    metrics: &Metrics,
+    db: &str,
+    only_if_sender: Option<&mpsc::Sender<CommitterRequest>>,
+) -> Option<ChannelEntry> {
+    let matches = match only_if_sender {
+        Some(sender) => guard
+            .get(db)
+            .is_some_and(|current| current.sender.same_channel(sender)),
+        None => guard.contains_key(db),
+    };
+    if !matches {
+        return None;
+    }
+    let entry = guard.remove(db);
+    if entry.as_ref().is_some_and(|e| e.lease.is_some()) {
+        metrics.lease_owned_dec();
+    }
+    entry
+}
+
 pub enum CommitterRequest {
     Mutate {
         idempotency_key: Option<String>,
@@ -378,7 +408,7 @@ impl Committers {
     pub async fn drop_db(&self, db: &str) {
         let sender = {
             let mut guard = self.channels.lock().await;
-            guard.remove(db)
+            remove_channel_entry(&mut guard, &self.metrics, db, None)
         };
         if let Some(entry) = sender {
             let _ = entry.sender.try_send(CommitterRequest::Shutdown);
@@ -472,12 +502,7 @@ impl Committers {
     ) -> Result<(), RtDbError> {
         if sender.send(req).await.is_err() {
             let mut guard = self.channels.lock().await;
-            if guard
-                .get(db)
-                .is_some_and(|current| current.sender.same_channel(&sender))
-            {
-                guard.remove(db);
-            }
+            remove_channel_entry(&mut guard, &self.metrics, db, Some(&sender));
             // `req` was moved into the failed send and dropped with the
             // closed receiver; the caller's oneshot reply is gone with it.
             // Nothing further to answer here — the caller's `reply_rx.await`
@@ -552,6 +577,9 @@ impl Committers {
                 Ok(())
             }
             Err(fail) => {
+                if matches!(fail, crate::forward::ForwardFail::Timeout) {
+                    self.metrics.record_forward_timeout();
+                }
                 tracing::info!(
                     db = %db,
                     reason = %match &fail {
@@ -570,6 +598,13 @@ impl Committers {
     /// original request. Owner acquired → the write executes locally; lease
     /// still held elsewhere → the respawned shadow replies CONFLICT.
     async fn takeover_submit(&self, db: &str, req: CommitterRequest) -> Result<(), RtDbError> {
+        // ENH-049: the takeover attempt is the failover moment operators alert
+        // on — say which replica is attempting it.
+        tracing::warn!(
+            db = %db,
+            instance_id = %self.instance_id,
+            "attempting ownership-lease takeover after no owner answered a forward"
+        );
         // ARC-001: `channel_for(upgrade)` can fail (drain deadline exceeded
         // while the retiring shadow exits, or the db disappeared). Replying
         // with the ownership CONFLICT here — instead of dropping `req` —
@@ -814,6 +849,8 @@ impl Committers {
             let (ctx_pool, poller_pool, lease, lease_lost, owns_writes) = if self.multi_instance {
                 match acquire_ownership_lease(&self.pool, db).await {
                     Ok((lease_pool, lost)) => {
+                        // ENH-049: this acquire won the advisory-lock race.
+                        self.metrics.record_lease_acquired();
                         let entry_lease = lease_pool.clone();
                         (
                             lease_pool,
@@ -824,6 +861,9 @@ impl Committers {
                         )
                     }
                     Err(err) if err.code == crate::error::ErrorCode::Conflict => {
+                        // ENH-049: the lease is held elsewhere — this replica
+                        // becomes a shadow.
+                        self.metrics.record_lease_contended();
                         (self.pool.clone(), self.pool.clone(), None, None, false)
                     }
                     Err(err) => return Err(err),
@@ -846,14 +886,13 @@ impl Committers {
             {
                 let db_owned = db.to_string();
                 let channels = Arc::clone(&self.channels);
+                let metrics = Arc::clone(&self.metrics);
                 let supervised = tx.clone();
                 tokio::spawn(async move {
                     let _ = committer_handle.await;
                     let mut guard = channels.lock().await;
-                    if guard
-                        .get(&db_owned)
-                        .is_some_and(|current| current.sender.same_channel(&supervised))
-                        && let Some(entry) = guard.remove(&db_owned)
+                    if let Some(entry) =
+                        remove_channel_entry(&mut guard, &metrics, &db_owned, Some(&supervised))
                     {
                         // ARC-015: wake any `channel_for` caller parked on this
                         // entry's drain-wait. Done under the same lock as the
@@ -910,6 +949,17 @@ impl Committers {
                 ));
             }
             let is_shadow = lease.is_none();
+            if lease.is_some() {
+                // ENH-049: the gauge counts live channel entries that hold a
+                // lease; the matching decrement is `remove_channel_entry` —
+                // the one removal path of this map.
+                self.metrics.lease_owned_inc();
+                tracing::info!(
+                    db = %db,
+                    instance_id = %self.instance_id,
+                    "ownership lease acquired; committer is owner"
+                );
+            }
             guard.insert(
                 db.to_string(),
                 ChannelEntry {
@@ -1259,8 +1309,12 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                 }
             };
             if !lease_ok {
-                tracing::error!(
+                // ENH-049: this is ARC-001's demotion point — the held lease
+                // is gone, so count it and log with the replica identity.
+                ctx.metrics.record_lease_lost();
+                tracing::warn!(
                     db = %ctx.db,
+                    instance_id = %ctx.instance_id,
                     "ownership lease lost mid-life; demoting committer to shadow"
                 );
                 if let Some(lost) = &ctx.lease_lost {

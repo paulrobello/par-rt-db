@@ -697,6 +697,35 @@ enabled. New multi-instance tests should build on `Cluster::two` (see
 [CONTRIBUTING.md](../CONTRIBUTING.md#running-tests)) rather than
 hand-building replica pairs.
 
+### Multi-instance observability
+
+The ownership lease is observable on the Prometheus `/metrics` scrape
+(ENH-049). The series render from the live `Metrics` counters, not the
+`/admin/metrics` JSON snapshot, so the admin wire — mirrored in all five
+clients — is untouched. Per-database detail lives in the tracing logs (each
+lease event carries `db` and `instance_id`), not in metric labels.
+
+| Series | Type | Meaning |
+| --- | --- | --- |
+| `rtdb_multi_instance` | gauge | `1` when multi-instance mode is on for this replica |
+| `rtdb_leases_owned` | gauge | Databases whose lease this replica holds right now |
+| `rtdb_lease_acquired_total` | counter | Successful `pg_try_advisory_lock` acquisitions, at first spawn or on takeover |
+| `rtdb_lease_contended_total` | counter | Acquisitions that lost the race and produced a shadow |
+| `rtdb_lease_lost_total` | counter | Leases lost after being held (lease backend replaced, lock revoked) |
+| `rtdb_forward_timeouts_total` | counter | Forwards to an owner that hit the timeout with no reply (the takeover trigger) |
+
+On an admin-authenticated scrape, `rtdb_build_info` additionally carries an
+`instance_id` label so a fleet-wide scrape can attribute lease churn to a
+replica. Two alerts are worth wiring:
+
+- **Lease churn / loss**: `increase(rtdb_lease_lost_total[5m]) > 0`. Any
+  increase means a replica was demoted mid-life and writes briefly
+  conflicted — investigate the lease backend's stability.
+- **Split-brain / over-ownership**: `sum(rtdb_leases_owned)` across the
+  fleet exceeding the number of live databases. A db should have exactly one
+  owner fleet-wide; a higher sum means two replicas both believe they hold
+  the lease.
+
 ## Auth
 
 `auth/`: per-database machine tokens and OAuth sessions (GitHub, Google,

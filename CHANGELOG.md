@@ -122,6 +122,17 @@ alter observable behavior on upgrade.
 
 ### Added
 
+- **Multi-instance lease observability on `/metrics` (ENH-049).** Six
+  Prometheus-only series make write ownership visible per replica:
+  `rtdb_multi_instance`, `rtdb_leases_owned` (gauge), and counters
+  `rtdb_lease_acquired_total` / `rtdb_lease_contended_total` /
+  `rtdb_lease_lost_total` / `rtdb_forward_timeouts_total`. The admin JSON
+  snapshot (`/admin/metrics`) is deliberately unchanged — the series render
+  from the live `Metrics`, so no client mirror is required — and
+  `rtdb_build_info` carries an `instance_id` label on an admin-authenticated
+  scrape. Lease events log with `db` + `instance_id`; the demotion point on a
+  lost lease logs at `warn`. Suggested alerts and the series table are in
+  docs/ARCHITECTURE.md's "Multi-instance observability".
 - **Go client — the sixth protocol mirror (`5d0d57f`).** `go-client/` ships the
   Go implementation of the par-rt-db wire contract (Go 1.23+, stdlib-only
   outside `coder/websocket`): `wire` (strict-decode vocabulary), `dsl`

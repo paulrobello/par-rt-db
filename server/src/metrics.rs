@@ -364,6 +364,27 @@ pub struct Metrics {
     /// SEC-109: admin-key login failures (wrong key guesses at `POST /admin/login`).
     /// Monotonic counter for brute-force detection — a spike signals an attack.
     admin_auth_failures_total: AtomicU64,
+    // ---- Ownership-lease observability (ENH-049) ----
+    // Prometheus-only: rendered by `render_prometheus` from the live `Metrics`,
+    // deliberately absent from `MetricsSnapshot` so the admin JSON wire (mirrored
+    // in four clients, Python's extra="forbid") stays byte-identical.
+    /// Whether multi-instance mode is on. Set once at boot from the config.
+    multi_instance: AtomicI64,
+    /// Databases whose ownership lease this replica currently holds. Inc when a
+    /// lease-holding channel entry is inserted, dec on every removal of such an
+    /// entry — all removal paths go through `remove_channel_entry`
+    /// (committer/mod.rs) so the gauge cannot drift from the map state.
+    leases_owned: AtomicI64,
+    /// Successful `pg_try_advisory_lock` acquisitions (first spawn or takeover).
+    lease_acquired_total: AtomicU64,
+    /// Acquisitions that lost the race and produced a shadow.
+    lease_contended_total: AtomicU64,
+    /// Leases lost after being held (backend replacement or per-turn
+    /// `verify_lease` failure).
+    lease_lost_total: AtomicU64,
+    /// Forwards to an owner that hit the timeout with no reply (the takeover
+    /// trigger). Notify-send failures are not timeouts and are not counted.
+    forward_timeouts_total: AtomicU64,
 }
 
 impl Metrics {
@@ -552,6 +573,39 @@ impl Metrics {
     /// Documents re-stamped by the anon→real merge (FM-27), across all dbs/tables.
     pub fn record_merge_doc(&self) {
         self.merge_docs_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Flag multi-instance mode (ENH-049). Called once at boot from the
+    /// resolved config; the gauge never changes for the process's lifetime.
+    pub fn set_multi_instance(&self, on: bool) {
+        self.multi_instance.store(i64::from(on), Ordering::Relaxed);
+    }
+    /// This replica acquired `db`'s ownership lease (`pg_try_advisory_lock`
+    /// returned true) — at first spawn or on takeover.
+    pub fn record_lease_acquired(&self) {
+        self.lease_acquired_total.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Another replica held the lease, so this replica spawned a shadow.
+    pub fn record_lease_contended(&self) {
+        self.lease_contended_total.fetch_add(1, Ordering::Relaxed);
+    }
+    /// A held lease was lost (lease backend replaced, or the per-turn
+    /// `verify_lease` probe found the lock gone).
+    pub fn record_lease_lost(&self) {
+        self.lease_lost_total.fetch_add(1, Ordering::Relaxed);
+    }
+    /// A forward to the lease owner hit the timeout with no owner reply —
+    /// the trigger for the takeover path.
+    pub fn record_forward_timeout(&self) {
+        self.forward_timeouts_total.fetch_add(1, Ordering::Relaxed);
+    }
+    /// A lease-holding channel entry was inserted (this replica now owns a db).
+    pub fn lease_owned_inc(&self) {
+        self.leases_owned.fetch_add(1, Ordering::Relaxed);
+    }
+    /// A lease-holding channel entry was removed, by any removal path.
+    pub fn lease_owned_dec(&self) {
+        self.leases_owned.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Snapshot of the per-db subscription-invalidation counters, sorted by db
@@ -866,7 +920,18 @@ pub struct MetricsSnapshot {
 /// liveness/metrics stay unauthenticated, build fingerprint is admin-gated).
 /// Both fields are build-time constants (semver / hex sha or `"unknown"`), so
 /// they are interpolated into the label value without escaping.
-pub fn render_prometheus(snap: &MetricsSnapshot, fingerprint: Option<(&str, &str)>) -> String {
+///
+/// ENH-049: the ownership-lease series render from the live [`Metrics`]
+/// counters rather than the snapshot — they are Prometheus-only by design, so
+/// `MetricsSnapshot` (the admin JSON wire, mirrored in four clients) stays
+/// untouched. `instance_id` labels `rtdb_build_info` so a fleet-wide scrape
+/// can attribute lease churn to a replica.
+pub fn render_prometheus(
+    snap: &MetricsSnapshot,
+    m: &Metrics,
+    fingerprint: Option<(&str, &str)>,
+    instance_id: &str,
+) -> String {
     let mut s = String::with_capacity(1024);
     // Counters — monotonic totals incremented at the transport boundary.
     s.push_str("# HELP rtdb_queries_total Total query requests served (HTTP /api/query + WS).\n");
@@ -1087,14 +1152,74 @@ pub fn render_prometheus(snap: &MetricsSnapshot, fingerprint: Option<(&str, &str
     s.push_str(&format!("rtdb_uptime_seconds {}\n", snap.uptime_seconds));
 
     // build_info: constant 1 gauge carrying version + git_commit labels.
-    // Omitted entirely on an unauthenticated request (SEC-129).
+    // Omitted entirely on an unauthenticated request (SEC-129). ENH-049:
+    // `instance_id` joins the label set so fleet-wide scrapes can attribute
+    // lease churn; the value is a boot-resolved config scalar or a generated
+    // short hex id (never per-request data), so no escaping is needed.
     if let Some((version, git_commit)) = fingerprint {
-        s.push_str("# HELP rtdb_build_info Build identity (version, git_commit).\n");
+        s.push_str("# HELP rtdb_build_info Build identity (version, git_commit, instance_id).\n");
         s.push_str("# TYPE rtdb_build_info gauge\n");
         s.push_str(&format!(
-            "rtdb_build_info{{version=\"{version}\",git_commit=\"{git_commit}\"}} 1\n"
+            "rtdb_build_info{{version=\"{version}\",git_commit=\"{git_commit}\",instance_id=\"{instance_id}\"}} 1\n"
         ));
     }
+
+    // Ownership-lease observability (ENH-049). Aggregate gauges + counters —
+    // per-db detail belongs in the tracing logs (each lease event carries the
+    // `db` field), not metric labels (cardinality).
+    s.push_str(
+        "# HELP rtdb_multi_instance Whether multi-instance mode is enabled on this replica.\n",
+    );
+    s.push_str("# TYPE rtdb_multi_instance gauge\n");
+    s.push_str(&format!(
+        "rtdb_multi_instance {}\n",
+        m.multi_instance.load(Ordering::Relaxed)
+    ));
+
+    s.push_str(
+        "# HELP rtdb_leases_owned Databases whose ownership lease this replica currently holds.\n",
+    );
+    s.push_str("# TYPE rtdb_leases_owned gauge\n");
+    s.push_str(&format!(
+        "rtdb_leases_owned {}\n",
+        m.leases_owned.load(Ordering::Relaxed)
+    ));
+
+    s.push_str(
+        "# HELP rtdb_lease_acquired_total Successful ownership-lease acquisitions (first spawn or takeover).\n",
+    );
+    s.push_str("# TYPE rtdb_lease_acquired_total counter\n");
+    s.push_str(&format!(
+        "rtdb_lease_acquired_total {}\n",
+        m.lease_acquired_total.load(Ordering::Relaxed)
+    ));
+
+    s.push_str(
+        "# HELP rtdb_lease_contended_total Acquisitions that lost the race and produced a shadow.\n",
+    );
+    s.push_str("# TYPE rtdb_lease_contended_total counter\n");
+    s.push_str(&format!(
+        "rtdb_lease_contended_total {}\n",
+        m.lease_contended_total.load(Ordering::Relaxed)
+    ));
+
+    s.push_str(
+        "# HELP rtdb_lease_lost_total Leases lost after being held (lease backend replaced, lock revoked). ALERT ON ANY INCREASE.\n",
+    );
+    s.push_str("# TYPE rtdb_lease_lost_total counter\n");
+    s.push_str(&format!(
+        "rtdb_lease_lost_total {}\n",
+        m.lease_lost_total.load(Ordering::Relaxed)
+    ));
+
+    s.push_str(
+        "# HELP rtdb_forward_timeouts_total Forwards to the lease owner that timed out with no owner reply (the takeover trigger).\n",
+    );
+    s.push_str("# TYPE rtdb_forward_timeouts_total counter\n");
+    s.push_str(&format!(
+        "rtdb_forward_timeouts_total {}\n",
+        m.forward_timeouts_total.load(Ordering::Relaxed)
+    ));
     s
 }
 
@@ -1146,7 +1271,12 @@ mod tests {
             per_db_workflows: Vec::new(),
             presence_detail: Vec::new(),
         };
-        let body = render_prometheus(&snap, Some(("0.0.0", "abc")));
+        let body = render_prometheus(
+            &snap,
+            &Metrics::default(),
+            Some(("0.0.0", "abc")),
+            "test-instance",
+        );
         assert!(
             body.contains("# TYPE rtdb_queries_total counter"),
             "missing counter TYPE: {body}"
@@ -1164,8 +1294,22 @@ mod tests {
             "missing presence_sessions gauge TYPE: {body}"
         );
         assert!(
-            body.contains("rtdb_build_info{version=\"0.0.0\",git_commit=\"abc\"} 1"),
+            body.contains("rtdb_build_info{version=\"0.0.0\",git_commit=\"abc\",instance_id=\"test-instance\"} 1"),
             "missing build_info sample: {body}"
+        );
+        // ENH-049: the six ownership-lease series render (zero defaults).
+        assert!(
+            body.contains("# TYPE rtdb_multi_instance gauge")
+                && body.contains("rtdb_multi_instance 0"),
+            "missing multi_instance gauge: {body}"
+        );
+        assert!(
+            body.contains("rtdb_leases_owned 0"),
+            "missing leases_owned gauge: {body}"
+        );
+        assert!(
+            body.contains("rtdb_lease_acquired_total 0"),
+            "missing lease_acquired counter: {body}"
         );
     }
 
@@ -1213,7 +1357,12 @@ mod tests {
             per_db_workflows: Vec::new(),
             presence_detail: Vec::new(),
         };
-        let body = render_prometheus(&snap, Some(("0.0.0", "abc")));
+        let body = render_prometheus(
+            &snap,
+            &Metrics::default(),
+            Some(("0.0.0", "abc")),
+            "test-instance",
+        );
         // One metric name, one sample per skip class.
         assert!(
             body.contains("# TYPE rtdb_subs_skips_total counter"),
@@ -1357,7 +1506,12 @@ mod tests {
             per_db_workflows: Vec::new(),
             presence_detail: Vec::new(),
         };
-        let body = render_prometheus(&snap, Some(("0.0.0", "abc")));
+        let body = render_prometheus(
+            &snap,
+            &Metrics::default(),
+            Some(("0.0.0", "abc")),
+            "test-instance",
+        );
         assert!(
             body.contains("# TYPE rtdb_quota_rejections_total counter"),
             "{body}"
@@ -1447,7 +1601,12 @@ mod tests {
             per_db_workflows: Vec::new(),
             presence_detail: Vec::new(),
         };
-        let body = render_prometheus(&snap, Some(("0.0.0", "abc")));
+        let body = render_prometheus(
+            &snap,
+            &Metrics::default(),
+            Some(("0.0.0", "abc")),
+            "test-instance",
+        );
         assert!(
             body.contains("# TYPE rtdb_workflow_steps_total counter"),
             "{body}"
@@ -1549,5 +1708,85 @@ mod tests {
         assert_eq!(m.presence_updates_total(), 2);
         assert_eq!(m.presence_broadcasts_total(), 1);
         assert_eq!(m.presence_ttl_expiries_total(), 1);
+    }
+
+    #[test]
+    fn lease_series_record_and_render() {
+        // ENH-049: the ownership-lease counters/gauge land on the live Metrics
+        // and render in the Prometheus scrape, while MetricsSnapshot (the
+        // admin JSON wire) carries none of them — the compile-time proof is
+        // that this test constructs a snapshot with no lease fields.
+        let m = Metrics::default();
+        m.set_multi_instance(true);
+        m.record_lease_acquired();
+        m.record_lease_contended();
+        m.record_lease_contended();
+        m.lease_owned_inc();
+        m.record_forward_timeout();
+
+        let snap = MetricsSnapshot {
+            queries_total: 0,
+            mutations_total: 0,
+            uploads_total: 0,
+            ws_connections: 0,
+            active_subscriptions: 0,
+            pool_size: 0,
+            pool_idle: 0,
+            uptime_seconds: 0,
+            query_latency: LatencyStats::default(),
+            mutate_latency: LatencyStats::default(),
+            subscribe_latency: LatencyStats::default(),
+            subs_reruns_total: 0,
+            subs_skips_point_total: 0,
+            subs_skips_indexed_total: 0,
+            subs_skips_ordered_total: 0,
+            subs_skip_verifications_total: 0,
+            subs_missed_pushes_total: 0,
+            ttl_expired_total: 0,
+            scheduled_missed_total: 0,
+            merge_docs_total: 0,
+            image_transforms_hit_total: 0,
+            image_transforms_miss_total: 0,
+            image_transforms_error_total: 0,
+            image_transform_bytes_total: 0,
+            presence_updates_total: 0,
+            presence_broadcasts_total: 0,
+            presence_ttl_expiries_total: 0,
+            presence_rooms: 0,
+            presence_sessions: 0,
+            per_db_subs: Vec::new(),
+            quota_rejections_tables_total: 0,
+            quota_rejections_storage_total: 0,
+            quota_rejections_subs_total: 0,
+            admin_auth_failures_total: 0,
+            per_db_quota: Vec::new(),
+            workflow_steps_success_total: 0,
+            workflow_steps_retry_total: 0,
+            workflow_steps_fail_total: 0,
+            per_db_workflows: Vec::new(),
+            presence_detail: Vec::new(),
+        };
+        let body = render_prometheus(&snap, &m, Some(("0.0.0", "abc")), "inst-1");
+        assert!(body.contains("rtdb_multi_instance 1"), "{body}");
+        assert!(body.contains("rtdb_leases_owned 1"), "{body}");
+        assert!(body.contains("rtdb_lease_acquired_total 1"), "{body}");
+        assert!(body.contains("rtdb_lease_contended_total 2"), "{body}");
+        assert!(body.contains("rtdb_lease_lost_total 0"), "{body}");
+        assert!(body.contains("rtdb_forward_timeouts_total 1"), "{body}");
+        assert!(
+            body.contains(
+                "rtdb_build_info{version=\"0.0.0\",git_commit=\"abc\",instance_id=\"inst-1\"} 1"
+            ),
+            "{body}"
+        );
+
+        // Removal decrements the gauge; a lost lease is recorded.
+        m.lease_owned_dec();
+        m.record_lease_lost();
+        let body = render_prometheus(&snap, &m, None, "inst-1");
+        assert!(body.contains("rtdb_leases_owned 0"), "{body}");
+        assert!(body.contains("rtdb_lease_lost_total 1"), "{body}");
+        // No fingerprint => no build_info line at all (SEC-129 unchanged).
+        assert!(!body.contains("rtdb_build_info"), "{body}");
     }
 }
