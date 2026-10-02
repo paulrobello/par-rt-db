@@ -91,6 +91,16 @@ func (m Mutation) Schedule(when wire.ScheduleWhen, txn Mutation) Mutation {
 	return m
 }
 
+// ScheduleExternal queues an external scheduled nested transaction: one the
+// server never executes — an application worker claims it via
+// POST /api/schedule/claim and finalizes it with the returned
+// leaseGeneration fencing token.
+func (m Mutation) ScheduleExternal(when wire.ScheduleWhen, txn Mutation) Mutation {
+	external := true
+	m.t.Steps = append(m.t.Steps, wire.StepSchedule{When: when, Txn: txn.Build(), External: &external})
+	return m
+}
+
 // CancelSchedule queues a schedule cancellation.
 func (m Mutation) CancelSchedule(id string) Mutation {
 	m.t.Steps = append(m.t.Steps, wire.StepCancelSchedule{ID: id})
