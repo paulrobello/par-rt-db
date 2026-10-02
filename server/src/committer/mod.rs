@@ -619,9 +619,13 @@ impl Committers {
                         let _ = reply.send(Ok(outcome));
                     }
                     Err(err) => {
-                        let _ = reply.send(Err(RtDbError::internal(format!(
-                            "forwarded mutate reply failed to decode: {err}; payload: {value}"
-                        ))));
+                        tracing::error!(
+                            error = %err,
+                            "forwarded mutate reply failed to decode"
+                        );
+                        let _ = reply.send(Err(RtDbError::internal(
+                            "forwarded mutate reply failed to decode",
+                        )));
                     }
                 }
             }
