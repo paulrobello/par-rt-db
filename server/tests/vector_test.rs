@@ -1263,6 +1263,7 @@ async fn vector_search_paginate_pages_reconstruct_the_unpaginated_ranking() {
         user_id: Some("u1".to_string()),
         email: None,
         tables: None,
+        enqueuer: None,
     };
     let base = serde_json::json!({
         "table": "docs",
@@ -1526,6 +1527,7 @@ async fn hybrid_search_paginate_binds_after_the_owner_predicate() {
         user_id: Some("u1".to_string()),
         email: None,
         tables: None,
+        enqueuer: None,
     };
     let base = serde_json::json!({
         "table": "docs",

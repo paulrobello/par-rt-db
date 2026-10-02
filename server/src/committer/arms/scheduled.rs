@@ -18,7 +18,30 @@ pub(in crate::committer) async fn handle_scheduled(
     every_ms: Option<i64>,
     tz: Option<String>,
     due_at: i64,
+    enqueuer: Option<crate::auth::EnqueuerIdentity>,
 ) -> Result<(), RtDbError> {
+    // SEC-001: resolve the stored enqueuer to a fire-time principal. `None`
+    // (system/machine enqueue) keeps the bypass exactly as before; `Some` is
+    // re-authorized against the DATABASE gates only (anonymous opt-in / email
+    // allowlist — deliberately NOT session liveness: a recurring job must
+    // keep firing after its enqueuer logs out). A lapsed enqueuer is a
+    // terminal error that also stops recurrence (mark_error never reschedules).
+    let fire_ctx = match &enqueuer {
+        None => PrincipalCtx::bypass(),
+        Some(e) => match crate::auth::resolve_enqueuer(&ctx.pool, &ctx.db, e).await {
+            Ok(p) => p,
+            Err(err) => {
+                let _ = scheduler::mark_error(
+                    &ctx.pool,
+                    &ctx.db,
+                    &id,
+                    &format!("enqueuer no longer authorized: {}", err.message),
+                )
+                .await;
+                return Ok(());
+            }
+        },
+    };
     let schema = match ctx.schemas.get(&ctx.pool, &ctx.db).await {
         Ok(schema) => schema,
         Err(err) => {
@@ -42,17 +65,19 @@ pub(in crate::committer) async fn handle_scheduled(
         let _ = scheduler::mark_error(&ctx.pool, &ctx.db, &id, &e.message).await;
         return Ok(());
     }
-    match execute_txn(&ctx.pool, &ctx.db, &schema, &txn, &PrincipalCtx::bypass()).await {
+    match execute_txn(&ctx.pool, &ctx.db, &schema, &txn, &fire_ctx).await {
         Ok(outcome) => {
             // Four-tap publication (fan_out → op-feed → audit → webhook → quota-
-            // refresh). Scheduled jobs carry no interactive principal
-            // (`owner = None`); `source = "scheduled"` distinguishes from
+            // refresh). System-enqueued jobs carry no interactive principal
+            // (`owner = None`); a user-enqueued job (SEC-001) publishes with the
+            // enqueuer's user id so op-feed/audit/webhook attribute the writes
+            // correctly. `source = "scheduled"` distinguishes from
             // mutate/ttl/migrate in delivered payloads.
             publish_taps(
                 ctx,
                 &schema,
                 &outcome.write_set,
-                None,
+                fire_ctx.user_id.as_deref(),
                 "scheduled",
                 true,
                 true,

@@ -861,6 +861,7 @@ mod tests {
                     user_id: Some("u1".into()),
                     email: Some("u1@example.com".into()),
                     tables: None,
+                    enqueuer: None,
                 },
             },
             ForwardWrite::MergeUsers {

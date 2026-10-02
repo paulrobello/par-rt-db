@@ -48,6 +48,7 @@ mod quota_test;
 mod rate_limit_test;
 mod read_only_test;
 mod relative_filter_test;
+mod schedule_principal_test;
 mod schedule_step_test;
 mod scheduled_test;
 mod scheduler_lifecycle_test;

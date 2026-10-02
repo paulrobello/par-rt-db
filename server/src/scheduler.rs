@@ -6,6 +6,7 @@
 //! as `RunWorkflowAdvance`; the committer alone advances them. See
 //! `docs/superpowers/specs/2026-07-23-scheduled-cron-transactions-design.md`.
 
+use crate::auth::{EnqueuerIdentity, Principal, PrincipalCtx};
 use crate::db::{new_id, now_ms, validate_db_name};
 use crate::error::RtDbError;
 use crate::protocol::{ScheduleKind, ScheduleStatus, ScheduleWhen};
@@ -205,6 +206,10 @@ pub struct ClaimedJob {
     /// before this fire (missed-window observability); untouched by the
     /// claim UPDATE itself, so this is genuinely the pre-fire due time.
     pub due_at: i64,
+    /// SEC-001: the enqueuing user, when the job was enqueued by a `User`
+    /// principal; `None` (system or machine token) fires as the bypass
+    /// principal exactly as before the fix.
+    pub enqueuer: Option<EnqueuerIdentity>,
 }
 
 /// Canonical scheduled-job view. Promoted to the wire type in Task 4 and
@@ -286,6 +291,15 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
     ))
     .execute(pool)
     .await?;
+    // SEC-001 (2026-10-01): the enqueuing user's durable identity. NULL = a
+    // system or machine enqueue, which fires as the bypass principal exactly
+    // as before; pre-existing rows keep today's behavior.
+    sqlx::query(&format!(
+        "ALTER TABLE \"{schema}\".scheduled_txns
+         ADD COLUMN IF NOT EXISTS enqueuer jsonb"
+    ))
+    .execute(pool)
+    .await?;
     sqlx::query(&format!(
         "CREATE INDEX IF NOT EXISTS \"{schema}_scheduled_due_idx\"
          ON \"{schema}\".scheduled_txns (status, due_at)"
@@ -310,6 +324,7 @@ pub(crate) async fn insert_on(
     every_ms: Option<i64>,
     tz: Option<&str>,
     external: bool,
+    enqueuer: Option<&EnqueuerIdentity>,
 ) -> Result<String, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
@@ -318,10 +333,17 @@ pub(crate) async fn insert_on(
         tracing::error!(error = %err, db, "failed to serialize scheduled txn");
         RtDbError::internal("failed to schedule txn")
     })?;
+    let enqueuer_json = match enqueuer {
+        Some(e) => serde_json::to_value(e).map_err(|err| {
+            tracing::error!(error = %err, db, "failed to serialize schedule enqueuer");
+            RtDbError::internal("failed to schedule txn")
+        })?,
+        None => serde_json::Value::Null,
+    };
     sqlx::query(&format!(
         "INSERT INTO \"{schema}\".scheduled_txns
-            (id, kind, due_at, txn, cron, tz, every_ms, status, created_at, external)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9)"
+            (id, kind, due_at, txn, cron, tz, every_ms, status, created_at, external, enqueuer)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, $10)"
     ))
     .bind(&id)
     .bind(kind)
@@ -332,6 +354,7 @@ pub(crate) async fn insert_on(
     .bind(every_ms)
     .bind(now_ms())
     .bind(external)
+    .bind(enqueuer_json)
     .execute(&mut *conn)
     .await?;
     Ok(id)
@@ -348,10 +371,78 @@ pub async fn insert(
     every_ms: Option<i64>,
     tz: Option<&str>,
     external: bool,
+    enqueuer: Option<&EnqueuerIdentity>,
 ) -> Result<String, RtDbError> {
     let mut conn = pool.acquire().await?;
     insert_on(
-        &mut conn, db, kind, due_at, txn, cron, every_ms, tz, external,
+        &mut conn, db, kind, due_at, txn, cron, every_ms, tz, external, enqueuer,
+    )
+    .await
+}
+
+/// Whether the enqueue surface enforces the per-db read-only freeze. Interactive
+/// surfaces (`POST /api/schedule`, the WS `Schedule` frame) enforce — a schedule
+/// is a future document write. The admin CRUD preserves its documented freeze
+/// exemption with [`FreezePolicy::Skip`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreezePolicy {
+    Enforce,
+    Skip,
+}
+
+/// The ONE enqueue path for scheduled jobs (ARC-006): every surface — HTTP,
+/// WS, and admin — funnels through here so the gate ordering and the SEC-001
+/// enqueuer capture cannot drift between transports. Performs, in order:
+/// read-only-principal rejection, the optional read-only-freeze gate,
+/// the FM-28 recursive table-allowlist check, committer + table warm-up
+/// (a cold-db insert would otherwise sit pending forever), `resolve_when`,
+/// and the insert carrying the captured [`Principal::enqueuer`] identity.
+/// Transport-specific gates (bearer/`authorize`, rate limits) stay at each
+/// surface; admin passes `principal: None` (its bypass exemption) and
+/// [`FreezePolicy::Skip`].
+pub async fn enqueue(
+    state: &crate::AppState,
+    principal: Option<&Principal>,
+    db: &str,
+    when: ScheduleWhen,
+    txn: &Transaction,
+    external: bool,
+    freeze: FreezePolicy,
+) -> Result<String, RtDbError> {
+    if principal.is_some_and(Principal::is_read_only) {
+        return Err(RtDbError::forbidden("read-only token cannot mutate"));
+    }
+    if freeze == FreezePolicy::Enforce && crate::db::is_read_only(&state.pool, db).await? {
+        return Err(RtDbError::read_only());
+    }
+    // FM-28 tightening: a scoped machine token cannot smuggle a future write
+    // into a table outside its allowlist via a scheduled job (matches the
+    // per-step gate `execute_txn` applies at fire time — but fire time runs
+    // as the enqueuer or bypass, so enqueue time is the only scoped check).
+    crate::txn::authorize_txn_tables(
+        &principal.map_or_else(PrincipalCtx::bypass, Principal::row_ctx),
+        txn,
+    )?;
+    // Fire time runs on the per-db scheduler, which only exists once the
+    // per-db tasks spawn — ensure that before insert or the job sits pending
+    // forever on a cold db (no Mutate/Subscribe since creation). The spawned
+    // scheduler's startup ensure is NOT ordered against this insert, so
+    // ensure the table inline too or a cold-db insert can lose the race and
+    // error once.
+    state.realtime.committers.ensure_spawned(db).await?;
+    ensure_table(&state.pool, db).await?;
+    let (kind, due_at, cron, every_ms, tz) = resolve_when(when, now_ms())?;
+    insert(
+        &state.pool,
+        db,
+        kind,
+        due_at,
+        txn,
+        cron.as_deref(),
+        every_ms,
+        tz.as_deref(),
+        external,
+        principal.and_then(Principal::enqueuer).as_ref(),
     )
     .await
 }
@@ -572,6 +663,7 @@ pub async fn claim_due(
         Option<String>,
         Option<i64>,
         i64,
+        Option<serde_json::Value>,
     );
     let rows: Vec<ClaimRow> = sqlx::query_as(&format!(
         "WITH candidates AS MATERIALIZED (
@@ -585,28 +677,43 @@ pub async fn claim_due(
          SET status = 'running'
          FROM candidates
          WHERE target.id = candidates.id
-         RETURNING target.id, target.kind, target.txn, target.cron, target.tz, target.every_ms, target.due_at"
+         RETURNING target.id, target.kind, target.txn, target.cron, target.tz, target.every_ms, target.due_at, target.enqueuer"
     ))
     .bind(now)
     .bind(batch)
     .fetch_all(pool)
     .await?;
     rows.into_iter()
-        .map(|(id, kind, txn_json, cron, tz, every_ms, due_at)| {
-            let txn: Transaction = serde_json::from_value(txn_json).map_err(|err| {
-                tracing::error!(error = %err, db, %id, "failed to deserialize scheduled txn");
-                RtDbError::internal("failed to read scheduled txn")
-            })?;
-            Ok(ClaimedJob {
-                id,
-                kind,
-                txn,
-                cron,
-                tz,
-                every_ms,
-                due_at,
-            })
-        })
+        .map(
+            |(id, kind, txn_json, cron, tz, every_ms, due_at, enqueuer)| {
+                let txn: Transaction = serde_json::from_value(txn_json).map_err(|err| {
+                    tracing::error!(error = %err, db, %id, "failed to deserialize scheduled txn");
+                    RtDbError::internal("failed to read scheduled txn")
+                })?;
+                // SQL NULL (system/machine enqueue) decodes as json null —
+                // filter it before the EnqueuerIdentity deserialize.
+                let enqueuer: Option<EnqueuerIdentity> = enqueuer
+                    .filter(|v| !v.is_null())
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|err| {
+                        tracing::error!(
+                            error = %err, db, id, "failed to deserialize schedule enqueuer"
+                        );
+                        RtDbError::internal("failed to read scheduled txn")
+                    })?;
+                Ok(ClaimedJob {
+                    id,
+                    kind,
+                    txn,
+                    cron,
+                    tz,
+                    every_ms,
+                    due_at,
+                    enqueuer,
+                })
+            },
+        )
         .collect()
 }
 
@@ -1089,6 +1196,7 @@ pub async fn run_scheduler(pool: PgPool, db: String, committer_tx: Sender<Commit
                     every_ms: job.every_ms,
                     tz: job.tz,
                     due_at: job.due_at,
+                    enqueuer: job.enqueuer,
                 };
                 if committer_tx.send(req).await.is_err() {
                     // Committer task is gone; this scheduler is now useless.

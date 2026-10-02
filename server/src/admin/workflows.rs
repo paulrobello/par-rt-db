@@ -14,7 +14,6 @@ use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
-use crate::auth::PrincipalCtx;
 use crate::db;
 use crate::error::RtDbError;
 use crate::http_api::ApiJson;
@@ -72,8 +71,10 @@ pub(super) async fn admin_list_workflows(
 }
 
 /// `POST /admin/db/{db}/workflows` — start a run. Mirrors the other three
-/// start surfaces (WS/HTTP/txn step): `validate_spec` + the recursive
-/// table-allowlist check, then `insert`.
+/// start surfaces (WS/HTTP/txn step). ARC-006: routes through the single
+/// `workflows::start` path with `principal: None` (the admin bypass
+/// principal) and `FreezePolicy::Skip` — the admin surface's documented
+/// freeze exemption.
 pub(super) async fn admin_create_workflow(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
@@ -83,18 +84,7 @@ pub(super) async fn admin_create_workflow(
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
-    workflows::ensure_table(&state.pool, &db).await?;
-    workflows::validate_spec(&spec)?;
-    // Uniform with the other start surfaces (FM-28's tightened pattern).
-    // Admin is a bypass principal (`tables = None`) so this is a no-op today —
-    // it exists so the four surfaces cannot drift if admin principals ever
-    // carry scopes.
-    crate::txn::authorize_spec_tables(&PrincipalCtx::bypass(), &spec)?;
-    // Steps fire from the per-db scheduler, which only exists once the per-db
-    // tasks spawn — ensure that before insert or the run sits `pending`
-    // forever on a cold db.
-    state.realtime.committers.ensure_spawned(&db).await?;
-    let id = workflows::insert(&state.pool, &db, &spec).await?;
+    let id = workflows::start(&state, None, &db, &spec, workflows::FreezePolicy::Skip).await?;
     Ok(Json(AdminWorkflowCreateResponse { id }))
 }
 

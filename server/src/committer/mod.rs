@@ -99,6 +99,9 @@ pub enum CommitterRequest {
         /// The row's `due_at` at claim time — the window this fire was due
         /// for. Used to detect and count missed windows at finalize.
         due_at: i64,
+        /// SEC-001: the enqueuing user, when a `User` enqueued the job.
+        /// `None` (system/machine) fires as the bypass principal.
+        enqueuer: Option<crate::auth::EnqueuerIdentity>,
     },
     /// Apply a declarative schema migration on this database. Serialized through
     /// the per-db committer like `Mutate`, so the migration's DDL+DML and the
@@ -1173,6 +1176,7 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                 every_ms,
                 tz,
                 due_at,
+                enqueuer,
             } => {
                 let span = tracing::info_span!(
                     "committer.scheduled",
@@ -1180,9 +1184,10 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                     kind,
                     id,
                 );
-                let outcome = handle_scheduled(&ctx, id, kind, *txn, cron, every_ms, tz, due_at)
-                    .instrument(span)
-                    .await;
+                let outcome =
+                    handle_scheduled(&ctx, id, kind, *txn, cron, every_ms, tz, due_at, enqueuer)
+                        .instrument(span)
+                        .await;
                 if let Err(err) = outcome {
                     tracing::error!(db = %ctx.db, error = %err, "scheduled job handling failed");
                 }

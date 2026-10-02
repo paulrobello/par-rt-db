@@ -108,6 +108,9 @@ pub struct WorkflowRow {
     pub wait_name: Option<String>,
     pub waited_since: Option<i64>,
     pub signal_payload: Option<serde_json::Value>,
+    /// SEC-001: the enqueuing user, when a `User` started the run; `None`
+    /// (system/machine) advances as the bypass principal.
+    pub enqueuer: Option<crate::auth::EnqueuerIdentity>,
 }
 
 /// `CREATE TABLE IF NOT EXISTS` for databases that predate this feature.
@@ -151,6 +154,15 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
     ))
     .execute(pool)
     .await?;
+    // SEC-001 (2026-10-01): the enqueuing user's durable identity. NULL = a
+    // system or machine enqueue, which advances as the bypass principal
+    // exactly as before; pre-existing rows keep today's behavior.
+    sqlx::query(&format!(
+        "ALTER TABLE \"{schema}\".workflows
+            ADD COLUMN IF NOT EXISTS enqueuer jsonb"
+    ))
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -163,6 +175,7 @@ pub(crate) async fn insert_on(
     db: &str,
     spec: &WorkflowSpec,
     sleep_until: i64,
+    enqueuer: Option<&crate::auth::EnqueuerIdentity>,
 ) -> Result<String, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
@@ -172,16 +185,24 @@ pub(crate) async fn insert_on(
         tracing::error!(error = %err, db, "failed to serialize workflow spec");
         RtDbError::internal("failed to start workflow")
     })?;
+    let enqueuer_json = match enqueuer {
+        Some(e) => serde_json::to_value(e).map_err(|err| {
+            tracing::error!(error = %err, db, "failed to serialize workflow enqueuer");
+            RtDbError::internal("failed to start workflow")
+        })?,
+        None => serde_json::Value::Null,
+    };
     sqlx::query(&format!(
         "INSERT INTO \"{schema}\".workflows
-            (id, name, status, spec, sleep_until, created_at, updated_at)
-         VALUES ($1, $2, 'pending', $3, $4, $5, $5)"
+            (id, name, status, spec, sleep_until, created_at, updated_at, enqueuer)
+         VALUES ($1, $2, 'pending', $3, $4, $5, $5, $6)"
     ))
     .bind(&id)
     .bind(&spec.name)
     .bind(&spec_json)
     .bind(sleep_until)
     .bind(now)
+    .bind(enqueuer_json)
     .execute(&mut *conn)
     .await?;
     Ok(id)
@@ -189,7 +210,12 @@ pub(crate) async fn insert_on(
 
 /// Start a run on the pool (WS/HTTP/admin surfaces). The first step's
 /// `sleepBeforeMs` becomes the initial advance gate.
-pub async fn insert(pool: &PgPool, db: &str, spec: &WorkflowSpec) -> Result<String, RtDbError> {
+pub async fn insert(
+    pool: &PgPool,
+    db: &str,
+    spec: &WorkflowSpec,
+    enqueuer: Option<&crate::auth::EnqueuerIdentity>,
+) -> Result<String, RtDbError> {
     // Clamp before the u64→i64 cast: a serde-accepted u64 above i64::MAX
     // would wrap negative ⇒ an instantly-due gate.
     let sleep_ms = spec
@@ -200,7 +226,70 @@ pub async fn insert(pool: &PgPool, db: &str, spec: &WorkflowSpec) -> Result<Stri
         .min(i64::MAX as u64) as i64;
     let gate = now_ms().saturating_add(sleep_ms);
     let mut conn = pool.acquire().await?;
-    insert_on(&mut conn, db, spec, gate).await
+    insert_on(&mut conn, db, spec, gate, enqueuer).await
+}
+
+/// Whether the start surface enforces the per-db read-only freeze. Mirrors
+/// [`crate::scheduler::FreezePolicy`]; shared semantics, separate enums so
+/// each store stays self-contained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreezePolicy {
+    Enforce,
+    Skip,
+}
+
+/// The ONE start path for workflow runs (ARC-006): every surface — HTTP, WS,
+/// and admin — funnels through here so the gate ordering and the SEC-001
+/// enqueuer capture cannot drift between transports. Gate-for-gate mirror of
+/// [`crate::scheduler::enqueue`] (same ordering rationale documented there);
+/// the spec validation and the recursive FM-29 table-allowlist check run
+/// before the scheduler warm-up and the enqueuer-carrying insert.
+pub async fn start(
+    state: &crate::AppState,
+    principal: Option<&crate::auth::Principal>,
+    db: &str,
+    spec: &WorkflowSpec,
+    freeze: FreezePolicy,
+) -> Result<String, RtDbError> {
+    if principal.is_some_and(crate::auth::Principal::is_read_only) {
+        return Err(RtDbError::forbidden("read-only token cannot mutate"));
+    }
+    if freeze == FreezePolicy::Enforce && crate::db::is_read_only(&state.pool, db).await? {
+        return Err(RtDbError::read_only());
+    }
+    workflows_validate_and_scope(principal, spec)?;
+    // Steps fire from the per-db scheduler, which only exists once the per-db
+    // tasks spawn — ensure that before insert or the run sits `pending`
+    // forever on a cold db. The spawned scheduler's startup ensure is NOT
+    // ordered against this insert, so ensure the table inline too or a
+    // cold-db insert can lose the race and error once.
+    state.realtime.committers.ensure_spawned(db).await?;
+    ensure_table(&state.pool, db).await?;
+    insert(
+        &state.pool,
+        db,
+        spec,
+        principal
+            .and_then(crate::auth::Principal::enqueuer)
+            .as_ref(),
+    )
+    .await
+}
+
+/// Shared submit-time validation + FM-29 recursive table-scope check over the
+/// caller's principal (the admin bypass when `None`), used by [`start`].
+fn workflows_validate_and_scope(
+    principal: Option<&crate::auth::Principal>,
+    spec: &WorkflowSpec,
+) -> Result<(), RtDbError> {
+    validate_spec(spec)?;
+    crate::txn::authorize_spec_tables(
+        &principal.map_or_else(
+            crate::auth::PrincipalCtx::bypass,
+            crate::auth::Principal::row_ctx,
+        ),
+        spec,
+    )
 }
 
 // Column order matches the RETURNING list in `claim_due`.
@@ -214,6 +303,7 @@ type ClaimRow = (
     serde_json::Value,
     Option<String>,
     Option<i64>,
+    Option<serde_json::Value>,
     Option<serde_json::Value>,
 );
 
@@ -240,7 +330,7 @@ pub async fn claim_due(
                  FOR UPDATE SKIP LOCKED
              )
              RETURNING id, name, spec, current_step, attempts, sleep_until, step_outcomes,
-                       wait_name, waited_since, signal_payload"
+                       wait_name, waited_since, signal_payload, enqueuer"
     ))
     .bind(now)
     .bind(now)
@@ -260,6 +350,7 @@ pub async fn claim_due(
                 wait_name,
                 waited_since,
                 signal_payload,
+                enqueuer,
             )| {
                 Ok(WorkflowRow {
                     id: id.clone(),
@@ -273,6 +364,11 @@ pub async fn claim_due(
                     wait_name,
                     waited_since,
                     signal_payload,
+                    enqueuer: enqueuer
+                        .filter(|v| !v.is_null())
+                        .map(serde_json::from_value)
+                        .transpose()
+                        .map_err(deser_err(db, &id))?,
                 })
             },
         )

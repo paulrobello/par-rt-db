@@ -17,6 +17,27 @@ pub(in crate::committer) async fn handle_workflow_advance(
     ctx: &CommitterCtx,
     mut row: crate::workflows::WorkflowRow,
 ) -> Result<(), RtDbError> {
+    // SEC-001: resolve the stored enqueuer to a fire-time principal. `None`
+    // (system/machine start) keeps the bypass exactly as before; `Some` is
+    // re-authorized against the DATABASE gates only (anonymous opt-in / email
+    // allowlist — deliberately NOT session liveness: a run must keep
+    // advancing after its enqueuer logs out). A lapsed enqueuer fails the
+    // first txn step (execute_txn surfaces the Forbidden error, which the
+    // step retry/terminal machinery below treats like any other step
+    // failure). The per-row ownerField scoping of every step comes from
+    // `fire_ctx.user_id` inside execute_txn — no new enforcement code.
+    let fire_ctx = match &row.enqueuer {
+        None => PrincipalCtx::bypass(),
+        Some(e) => match crate::auth::resolve_enqueuer(&ctx.pool, &ctx.db, e).await {
+            Ok(p) => p,
+            Err(err) => {
+                let outcome = failed_outcome(&row, &err.message);
+                let msg = format!("enqueuer no longer authorized: {}", err.message);
+                crate::workflows::mark_failed(&ctx.pool, &ctx.db, &row.id, &outcome, &msg).await?;
+                return Ok(());
+            }
+        },
+    };
     let schema = match ctx.schemas.get(&ctx.pool, &ctx.db).await {
         Ok(schema) => schema,
         Err(err) => {
@@ -183,19 +204,22 @@ pub(in crate::committer) async fn handle_workflow_advance(
         };
         let exec = match quota_err.take() {
             Some(e) => Err(e),
-            None => execute_txn(&ctx.pool, &ctx.db, &schema, txn, &PrincipalCtx::bypass()).await,
+            None => execute_txn(&ctx.pool, &ctx.db, &schema, txn, &fire_ctx).await,
         };
         match exec {
             Ok(outcome) => {
                 // Four-tap publication (fan_out → op-feed → audit → webhook →
-                // quota-refresh). Workflow steps fire as the system principal
-                // (`owner = None`); `source = "workflow"` distinguishes them
-                // from scheduled/ttl/migrate in delivered payloads.
+                // quota-refresh). System-started runs advance as the system
+                // principal (`owner = None`); a user-started run (SEC-001)
+                // publishes with the enqueuer's user id so op-feed/audit/
+                // webhook attribute the writes correctly. `source = "workflow"`
+                // distinguishes them from scheduled/ttl/migrate in delivered
+                // payloads.
                 publish_taps(
                     ctx,
                     &schema,
                     &outcome.write_set,
-                    None,
+                    fire_ctx.user_id.as_deref(),
                     "workflow",
                     true,
                     true,

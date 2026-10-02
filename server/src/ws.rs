@@ -23,13 +23,11 @@ use crate::AppState;
 use crate::auth::{
     Principal, PrincipalCtx, authed_user, authorize, is_admin, resolve_bearer, session_still_valid,
 };
-use crate::db::now_ms;
 use crate::error::{ErrorCode, RtDbError};
 use crate::protocol::{ClientMessage, ScheduleWhen, ServerMessage, WorkflowSpec, WorkflowStatus};
 use crate::rate_limit::{RateDecision, evaluate};
 use crate::scheduler;
 use crate::subs::{ConnId, next_conn_id};
-use crate::txn::{authorize_spec_tables, authorize_txn_tables};
 use crate::workflows;
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -670,10 +668,11 @@ async fn handle_mutate(
 }
 
 /// `Schedule` arm: `authorize`-only gate (the schedule family never carried
-/// the admin bypass), reject read-only tokens, table-scope-check the txn
-/// recursively at enqueue (FM-28 — fire time runs as bypass, so this is the
-/// only scoped check), resolve the schedule timing, then insert the scheduled
-/// transaction.
+/// the admin bypass), then ARC-006's single enqueue path — read-only
+/// rejection, the freeze gate, the FM-28 table-scope check, scheduler
+/// warm-up, `resolve_when`, and the SEC-001 enqueuer capture all live in
+/// `scheduler::enqueue`. The transport-specific reply shape
+/// (`ScheduleOk`/`ScheduleErr`) stays here.
 async fn handle_schedule(
     fctx: &FrameCtx<'_>,
     schedule_id: String,
@@ -687,61 +686,20 @@ async fn handle_schedule(
     let out_tx = fctx.out_tx;
 
     let reply = match authorize(&state.pool, principal, db).await {
-        Ok(()) if principal.is_read_only() => ServerMessage::ScheduleErr {
-            schedule_id,
-            error: RtDbError::forbidden("read-only token cannot mutate"),
-        },
         Ok(()) => {
-            // A schedule is a future document write: reject new starts under
-            // the per-db read-only freeze (already-created jobs keep firing —
-            // the fire path is the exempt system arm).
-            match crate::db::is_read_only(&state.pool, db).await {
-                Ok(true) => ServerMessage::ScheduleErr {
-                    schedule_id,
-                    error: RtDbError::read_only(),
-                },
+            match scheduler::enqueue(
+                state,
+                Some(principal),
+                db,
+                when,
+                &txn,
+                external.is_some_and(|e| e),
+                scheduler::FreezePolicy::Enforce,
+            )
+            .await
+            {
+                Ok(id) => ServerMessage::ScheduleOk { schedule_id, id },
                 Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
-                Ok(false) => {
-                    let prepared = authorize_txn_tables(&principal.row_ctx(), &txn)
-                        .and_then(|()| scheduler::resolve_when(when, now_ms()));
-                    match prepared {
-                        Ok((kind, due_at, cron, every_ms, _tz)) => {
-                            // Fire time runs on the per-db scheduler, which only
-                            // exists once the per-db tasks spawn — ensure that (and
-                            // the table inline: the spawned scheduler's startup
-                            // ensure is not ordered against this insert) or a job
-                            // scheduled on a cold db sits pending forever.
-                            let spawned = match state.realtime.committers.ensure_spawned(db).await {
-                                Ok(()) => scheduler::ensure_table(&state.pool, db).await,
-                                Err(error) => Err(error),
-                            };
-                            match spawned {
-                                Ok(()) => {
-                                    match scheduler::insert(
-                                        &state.pool,
-                                        db,
-                                        kind,
-                                        due_at,
-                                        &txn,
-                                        cron.as_deref(),
-                                        every_ms,
-                                        None,
-                                        external.is_some_and(|e| e),
-                                    )
-                                    .await
-                                    {
-                                        Ok(id) => ServerMessage::ScheduleOk { schedule_id, id },
-                                        Err(error) => {
-                                            ServerMessage::ScheduleErr { schedule_id, error }
-                                        }
-                                    }
-                                }
-                                Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
-                            }
-                        }
-                        Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
-                    }
-                }
             }
         }
         Err(error) => ServerMessage::ScheduleErr { schedule_id, error },
@@ -782,10 +740,11 @@ async fn handle_list_schedules(fctx: &FrameCtx<'_>, schedule_id: String) -> bool
 }
 
 /// `StartWorkflow` arm: `authorize`-only gate (the schedule family's
-/// precedent — workflows never carried the admin bypass), reject read-only
-/// tokens, then validate the spec and table-scope-check it recursively at
-/// submit (FM-29 — steps fire later as bypass, so this is the only scoped
-/// check), insert the run row, and re-read it for the `WorkflowInfo` reply.
+/// precedent — workflows never carried the admin bypass), then ARC-006's
+/// single start path (`workflows::start`): validation, the FM-29 table-scope
+/// check, the freeze gate, scheduler warm-up, and the SEC-001 enqueuer
+/// capture. The transport-specific reply shape and the post-insert re-read
+/// for the `WorkflowInfo` reply stay here.
 async fn handle_start_workflow(
     fctx: &FrameCtx<'_>,
     workflow_id: String,
@@ -797,60 +756,27 @@ async fn handle_start_workflow(
     let out_tx = fctx.out_tx;
 
     let reply = match authorize(&state.pool, principal, db).await {
-        Ok(()) if principal.is_read_only() => ServerMessage::StartWorkflowErr {
-            workflow_id,
-            error: RtDbError::forbidden("read-only token cannot mutate"),
-        },
-        Ok(()) => {
-            // A workflow start is a future document write: reject new starts
-            // under the per-db read-only freeze (in-flight runs keep advancing
-            // via the exempt system arm).
-            match crate::db::is_read_only(&state.pool, db).await {
-                Ok(true) => ServerMessage::StartWorkflowErr {
+        Ok(()) => match workflows::start(
+            state,
+            Some(principal),
+            db,
+            &spec,
+            workflows::FreezePolicy::Enforce,
+        )
+        .await
+        {
+            Ok(id) => match workflows::get(&state.pool, db, &id).await {
+                Ok(Some(full)) => ServerMessage::StartWorkflowOk {
                     workflow_id,
-                    error: RtDbError::read_only(),
+                    info: full.info,
                 },
-                Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
-                Ok(false) => {
-                    let prepared = workflows::validate_spec(&spec)
-                        .and_then(|()| authorize_spec_tables(&principal.row_ctx(), &spec));
-                    match prepared {
-                        // Steps fire from the per-db scheduler, which only exists once
-                        // the per-db tasks spawn — ensure that before insert or the
-                        // run sits `pending` forever on a cold db. The spawned
-                        // scheduler's own startup ensure is NOT ordered against this
-                        // insert, so ensure the table inline too or a cold-db insert
-                        // can lose the race and error.
-                        Ok(()) => match state.realtime.committers.ensure_spawned(db).await {
-                            Ok(()) => match workflows::ensure_table(&state.pool, db).await {
-                                Ok(()) => match workflows::insert(&state.pool, db, &spec).await {
-                                    Ok(id) => match workflows::get(&state.pool, db, &id).await {
-                                        Ok(Some(full)) => ServerMessage::StartWorkflowOk {
-                                            workflow_id,
-                                            info: full.info,
-                                        },
-                                        _ => ServerMessage::StartWorkflowErr {
-                                            workflow_id,
-                                            error: RtDbError::internal(
-                                                "workflow started but unreadable",
-                                            ),
-                                        },
-                                    },
-                                    Err(error) => {
-                                        ServerMessage::StartWorkflowErr { workflow_id, error }
-                                    }
-                                },
-                                Err(error) => {
-                                    ServerMessage::StartWorkflowErr { workflow_id, error }
-                                }
-                            },
-                            Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
-                        },
-                        Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
-                    }
-                }
-            }
-        }
+                _ => ServerMessage::StartWorkflowErr {
+                    workflow_id,
+                    error: RtDbError::internal("workflow started but unreadable"),
+                },
+            },
+            Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
+        },
         Err(error) => ServerMessage::StartWorkflowErr { workflow_id, error },
     };
     let _ = out_tx.send(reply);

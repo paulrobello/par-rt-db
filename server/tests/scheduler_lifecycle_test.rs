@@ -23,7 +23,7 @@ async fn scheduler_exits_when_its_database_is_deleted() -> anyhow::Result<()> {
     let far_future = i64::MAX - 1_000_000;
     let txn = Transaction { steps: vec![] };
     scheduler::insert(
-        &pool, &db, "oneshot", far_future, &txn, None, None, None, false,
+        &pool, &db, "oneshot", far_future, &txn, None, None, None, false, None,
     )
     .await?;
 

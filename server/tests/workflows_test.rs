@@ -48,7 +48,7 @@ async fn insert_claim_reset_roundtrip() {
     let pool = state.pool.clone();
     let db = fresh_db(&state).await;
     workflows::ensure_table(&pool, &db).await.unwrap();
-    let id = workflows::insert(&pool, &db, &one_step_spec("rt"))
+    let id = workflows::insert(&pool, &db, &one_step_spec("rt"), None)
         .await
         .unwrap();
     let due = workflows::next_due(&pool, &db).await.unwrap();
@@ -92,7 +92,7 @@ async fn await_signal_side_table_lifecycle() {
         "name": "gate", "steps": [ { "awaitSignal": { "name": "approve", "timeoutMs": 50 } } ]
     }))
     .unwrap();
-    let id = workflows::insert(&pool, &db, &spec).await.unwrap();
+    let id = workflows::insert(&pool, &db, &spec, None).await.unwrap();
     // Only the advance arm parks, on a row it holds `running` — claim first
     // (the `status = 'running'` guard on `park_waiting`).
     let claimed = workflows::claim_due(&pool, &db, now_ms(), 10)
@@ -169,7 +169,7 @@ async fn await_signal_side_table_lifecycle() {
     );
 
     // Typed classification against a fresh parked row + unknown id.
-    let id2 = workflows::insert(&pool, &db, &spec).await.unwrap();
+    let id2 = workflows::insert(&pool, &db, &spec, None).await.unwrap();
     assert!(matches!(
         workflows::deliver_signal(&pool, &db, "nope", "approve", None)
             .await
@@ -295,7 +295,7 @@ async fn three_step_workflow_advances_to_success() {
         "steps": [insert_step("S0"), insert_step("S1"), insert_step("S2")]
     }))
     .expect("parse 3-step workflow spec");
-    let id = workflows::insert(&pool, &db, &spec).await.unwrap();
+    let id = workflows::insert(&pool, &db, &spec, None).await.unwrap();
 
     let full = await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Success).await;
     assert_eq!(full.info.step_count, 3);
@@ -330,7 +330,7 @@ async fn exhausted_retries_mark_failed_with_trail() {
         ]
     }))
     .expect("parse doomed workflow spec");
-    let id = workflows::insert(&pool, &db, &spec).await.unwrap();
+    let id = workflows::insert(&pool, &db, &spec, None).await.unwrap();
 
     let full = await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Failed).await;
     assert_eq!(full.info.current_step, 0);
@@ -364,7 +364,7 @@ async fn sleep_before_ms_gates_next_step() {
         "name": "gated", "steps": [insert_step("G0"), gated]
     }))
     .expect("parse gated workflow spec");
-    let id = workflows::insert(&pool, &db, &spec).await.unwrap();
+    let id = workflows::insert(&pool, &db, &spec, None).await.unwrap();
 
     // Wait for step 0's doc, then observe the gate still closed: only one
     // doc, run back to `pending` with a future `sleepUntil`. (300ms is safely
@@ -408,7 +408,7 @@ async fn orphaned_running_row_resumes_to_success() {
         "name": "resume", "steps": [insert_step("R")]
     }))
     .expect("parse resume workflow spec");
-    let id = workflows::insert(&pool, &db, &spec).await.unwrap();
+    let id = workflows::insert(&pool, &db, &spec, None).await.unwrap();
 
     // Simulate the crash: claim the row (→ `running`) but never advance it.
     let claimed = workflows::claim_due(&pool, &db, now_ms(), 10)
@@ -542,7 +542,7 @@ async fn cancel_workflow_step_result_shape() -> anyhow::Result<()> {
     let db = fresh_db(&state).await;
     let schema = kanban_schema();
     workflows::ensure_table(&pool, &db).await?;
-    let id = workflows::insert(&pool, &db, &one_step_spec("cancelme")).await?;
+    let id = workflows::insert(&pool, &db, &one_step_spec("cancelme"), None).await?;
 
     let cancel = execute_txn(
         &pool,
@@ -615,6 +615,7 @@ async fn spec_bounds_and_allowlist_rejected() -> anyhow::Result<()> {
         user_id: None,
         email: None,
         tables: Some(vec!["projects".to_string()]),
+        enqueuer: None,
     };
 
     // The smuggle attempt: a spec whose step txn writes the forbidden table.
@@ -1386,6 +1387,7 @@ async fn await_signal_parks_delivers_and_advances_with_payload() -> anyhow::Resu
         &pool,
         &db,
         &await_gate_spec("park", "approve", Some(60_000), 5),
+        None,
     )
     .await?;
 
@@ -1444,6 +1446,7 @@ async fn await_signal_payloadless_delivery_consumes_gate() -> anyhow::Result<()>
         &pool,
         &db,
         &await_gate_spec("payloadless", "approve", Some(60_000), 5),
+        None,
     )
     .await?;
 
@@ -1515,6 +1518,7 @@ async fn await_signal_timeout_retries_with_fresh_timeout_then_succeeds() -> anyh
         &pool,
         &db,
         &await_gate_spec("fresh-timeout", "approve", Some(GATE_TIMEOUT_MS), 3),
+        None,
     )
     .await?;
 
@@ -1580,6 +1584,7 @@ async fn await_signal_timeout_exhaustion_fails_typed() -> anyhow::Result<()> {
         &pool,
         &db,
         &await_gate_spec("exhaust", "approve", Some(100), 1),
+        None,
     )
     .await?;
 
@@ -1640,6 +1645,7 @@ async fn signal_delivery_typed_errors_on_all_three_surfaces() -> anyhow::Result<
         &pool,
         &db,
         &await_gate_spec("typed", "approve", Some(60_000), 5),
+        None,
     )
     .await?;
     await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Waiting).await;
@@ -1843,7 +1849,13 @@ async fn await_signal_no_timeout_waits_indefinitely() -> anyhow::Result<()> {
     let committers = make_committers(&state).await;
     warm_up(&committers, &db).await;
 
-    let id = workflows::insert(&pool, &db, &await_gate_spec("forever", "approve", None, 5)).await?;
+    let id = workflows::insert(
+        &pool,
+        &db,
+        &await_gate_spec("forever", "approve", None, 5),
+        None,
+    )
+    .await?;
 
     let parked = await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Waiting).await;
     assert_eq!(parked.info.waiting_for.as_deref(), Some("approve"));
@@ -1908,7 +1920,7 @@ async fn await_signal_latest_wins_payload() -> anyhow::Result<()> {
         ]
     }))
     .expect("parse latest-wins workflow spec");
-    let id = workflows::insert(&pool, &db, &spec).await?;
+    let id = workflows::insert(&pool, &db, &spec, None).await?;
     let claimed = workflows::claim_due(&pool, &db, now_ms(), 10).await?;
     assert_eq!(claimed.len(), 1);
     workflows::park_waiting(&pool, &db, &id, 0, "approve", now_ms() + 60_000).await?;
@@ -1959,6 +1971,7 @@ async fn cancel_while_waiting_then_late_signal_conflicts() -> anyhow::Result<()>
         &pool,
         &db,
         &await_gate_spec("cancel-wait", "approve", Some(60_000), 5),
+        None,
     )
     .await?;
     await_status(&pool, &db, &id, |i| i.status == WorkflowStatus::Waiting).await;
@@ -2025,12 +2038,14 @@ async fn await_signal_ws_and_admin_surfaces_deliver() -> anyhow::Result<()> {
         &pool,
         &db,
         &await_gate_spec("ws-gate", "approve", Some(60_000), 5),
+        None,
     )
     .await?;
     let admin_id = workflows::insert(
         &pool,
         &db,
         &await_gate_spec("admin-gate", "approve", Some(60_000), 5),
+        None,
     )
     .await?;
     await_status(&pool, &db, &ws_id, |i| i.status == WorkflowStatus::Waiting).await;
@@ -2100,7 +2115,7 @@ async fn await_signal_payload_cap_rejects_without_consuming() -> anyhow::Result<
     let spec: WorkflowSpec = serde_json::from_value(serde_json::json!({
         "name": "cap", "steps": [ { "awaitSignal": { "name": "approve", "timeoutMs": 60_000 } } ]
     }))?;
-    let id = workflows::insert(&pool, &db, &spec).await?;
+    let id = workflows::insert(&pool, &db, &spec, None).await?;
     // Only the advance arm parks, on a row it holds `running` — claim first
     // (the `status = 'running'` guard on `park_waiting`).
     let claimed = workflows::claim_due(&pool, &db, now_ms(), 10).await?;

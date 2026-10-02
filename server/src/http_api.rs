@@ -522,43 +522,18 @@ async fn schedule_handler(
     ApiJson(body): ApiJson<ScheduleRequest>,
 ) -> Result<Json<ScheduleResponse>, RtDbError> {
     let principal = authed(&state, &headers, &body.db).await?;
-    if principal.is_read_only() {
-        return Err(RtDbError::forbidden("read-only token cannot mutate"));
-    }
     check_http_rate_limits(&state, &principal, &body.db).await?;
-    // A schedule is a future document write: reject new starts under the
-    // per-db read-only freeze (already-created jobs keep firing — the fire
-    // path is the exempt system arm).
-    if crate::db::is_read_only(&state.pool, &body.db).await? {
-        return Err(RtDbError::read_only());
-    }
-
-    // FM-28 tightening: a scoped machine token cannot smuggle a future write
-    // into a table outside its allowlist via a scheduled job (matches the
-    // per-step gate `execute_txn` applies at fire time — but fire time runs
-    // as bypass, so enqueue time is the only scoped check).
-    crate::txn::authorize_txn_tables(&principal.row_ctx(), &body.txn)?;
-
-    // Fire time runs on the per-db scheduler, which only exists once the
-    // per-db tasks spawn — ensure that before insert or the job sits pending
-    // forever on a cold db (no Mutate/Subscribe since creation). The spawned
-    // scheduler's startup ensure is NOT ordered against this insert, so
-    // ensure the table inline too or a cold-db insert can lose the race and
-    // error once.
-    state.realtime.committers.ensure_spawned(&body.db).await?;
-    scheduler::ensure_table(&state.pool, &body.db).await?;
-
-    let (kind, due_at, cron, every_ms, tz) = scheduler::resolve_when(body.when, now_ms())?;
-    let id = scheduler::insert(
-        &state.pool,
+    // ARC-006: the single enqueue path — read-only rejection, freeze gate,
+    // FM-28 table-scope check, scheduler warm-up, resolve_when, insert with
+    // the SEC-001 enqueuer capture all live in `scheduler::enqueue`.
+    let id = scheduler::enqueue(
+        &state,
+        Some(&principal),
         &body.db,
-        kind,
-        due_at,
+        body.when,
         &body.txn,
-        cron.as_deref(),
-        every_ms,
-        tz.as_deref(),
         body.external,
+        scheduler::FreezePolicy::Enforce,
     )
     .await?;
     Ok(Json(ScheduleResponse { id }))
@@ -836,36 +811,24 @@ struct StartWorkflowResponse {
     id: String,
 }
 
-/// `POST /api/workflows`: start a run. Mirrors `schedule_handler` — FM-29's
-/// version of the FM-28 tightening: a scoped machine token cannot smuggle a
-/// future write into a table outside its allowlist via a workflow step (steps
-/// fire later as bypass, so submit time is the only scoped check).
+/// `POST /api/workflows`: start a run. ARC-006: the single start path —
+/// spec validation, the FM-29 table-scope check, the freeze gate, scheduler
+/// warm-up, and the SEC-001 enqueuer capture all live in `workflows::start`.
 async fn start_workflow_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     ApiJson(body): ApiJson<StartWorkflowRequest>,
 ) -> Result<Json<StartWorkflowResponse>, RtDbError> {
     let principal = authed(&state, &headers, &body.db).await?;
-    if principal.is_read_only() {
-        return Err(RtDbError::forbidden("read-only token cannot mutate"));
-    }
     check_http_rate_limits(&state, &principal, &body.db).await?;
-    // A workflow start is a future document write: reject new starts under the
-    // per-db read-only freeze (in-flight runs keep advancing — the advance
-    // path is the exempt system arm).
-    if crate::db::is_read_only(&state.pool, &body.db).await? {
-        return Err(RtDbError::read_only());
-    }
-    workflows::validate_spec(&body.spec)?;
-    crate::txn::authorize_spec_tables(&principal.row_ctx(), &body.spec)?;
-    // Steps fire from the per-db scheduler, which only exists once the per-db
-    // tasks spawn — ensure that before insert or the run sits `pending`
-    // forever on a cold db. The spawned scheduler's startup ensure is NOT
-    // ordered against this insert, so ensure the table inline too or a
-    // cold-db insert can lose the race and error once.
-    state.realtime.committers.ensure_spawned(&body.db).await?;
-    workflows::ensure_table(&state.pool, &body.db).await?;
-    let id = workflows::insert(&state.pool, &body.db, &body.spec).await?;
+    let id = workflows::start(
+        &state,
+        Some(&principal),
+        &body.db,
+        &body.spec,
+        workflows::FreezePolicy::Enforce,
+    )
+    .await?;
     Ok(Json(StartWorkflowResponse { id }))
 }
 

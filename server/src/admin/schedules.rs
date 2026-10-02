@@ -12,14 +12,13 @@ use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 
-use crate::auth::PrincipalCtx;
-use crate::db::now_ms;
+use crate::AppState;
+use crate::db;
 use crate::error::RtDbError;
 use crate::http_api::ApiJson;
 use crate::protocol::{ScheduleInfo, ScheduleWhen};
 use crate::scheduler;
 use crate::txn::Transaction;
-use crate::{AppState, db};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,7 +68,9 @@ pub(super) async fn admin_list_schedules(
 
 /// `POST /admin/db/{db}/schedules` — create a scheduled job. Mirrors
 /// `http_api::schedule_handler` exactly, minus the per-db bearer/authorize gate
-/// (admin-gated instead).
+/// (admin-gated instead). ARC-006: routes through the single `scheduler::enqueue`
+/// path with `principal: None` (the admin bypass principal) and
+/// `FreezePolicy::Skip` — the admin surface's documented freeze exemption.
 pub(super) async fn admin_create_schedule(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
@@ -79,29 +80,14 @@ pub(super) async fn admin_create_schedule(
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
-    // Uniform with the other three enqueue paths (FM-28). Admin is a bypass
-    // principal (`tables = None`) so this is a no-op today — it exists so
-    // the four surfaces cannot drift if admin principals ever carry scopes.
-    crate::txn::authorize_txn_tables(&PrincipalCtx::bypass(), &body.txn)?;
-
-    // Fire time runs on the per-db scheduler, which only exists once the
-    // per-db tasks spawn — ensure that before insert or a job started on a
-    // cold db sits `pending` forever. The spawned scheduler's startup ensure
-    // is NOT ordered against this insert, so ensure the table inline too.
-    state.realtime.committers.ensure_spawned(&db).await?;
-    scheduler::ensure_table(&state.pool, &db).await?;
-
-    let (kind, due_at, cron, every_ms, tz) = scheduler::resolve_when(body.when, now_ms())?;
-    let id = scheduler::insert(
-        &state.pool,
+    let id = scheduler::enqueue(
+        &state,
+        None,
         &db,
-        kind,
-        due_at,
+        body.when,
         &body.txn,
-        cron.as_deref(),
-        every_ms,
-        tz.as_deref(),
         body.external,
+        scheduler::FreezePolicy::Skip,
     )
     .await?;
     Ok(Json(AdminScheduleCreateResponse { id }))

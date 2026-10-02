@@ -87,6 +87,116 @@ impl Principal {
             Principal::Machine { .. } => None,
         }
     }
+
+    /// The durable identity a background job enqueued by this principal runs
+    /// as (SEC-001): `Some` for `User` (the job keeps the user's row rights
+    /// after they log out), `None` for `Machine` (jobs keep firing as the
+    /// system bypass exactly as before). Stored on the `scheduled_txns` /
+    /// `workflows` rows at enqueue and resolved back to a `PrincipalCtx` at
+    /// fire time via [`resolve_enqueuer`].
+    pub fn enqueuer(&self) -> Option<EnqueuerIdentity> {
+        match self {
+            Principal::User {
+                user_id,
+                email,
+                anonymous,
+                ..
+            } => Some(EnqueuerIdentity {
+                user_id: user_id.clone(),
+                email: email.clone(),
+                anonymous: *anonymous,
+            }),
+            Principal::Machine { .. } => None,
+        }
+    }
+}
+
+/// The persisted enqueuer identity of a scheduled job or workflow run
+/// (SEC-001): the `Principal::User` that enqueued it, captured at enqueue
+/// time and stored as the row's `enqueuer` jsonb column. `NULL` means a
+/// system or machine-token enqueue, which fires as the bypass principal
+/// exactly as before. `Serialize`/`Deserialize` because the column is jsonb
+/// and `Clone` because the identity is copied into the claimed job payload.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EnqueuerIdentity {
+    pub user_id: String,
+    pub email: Option<String>,
+    pub anonymous: bool,
+}
+
+/// Database-level re-authorization of a stored enqueuer identity at fire
+/// time (SEC-001). Checks ONLY the database gates — anonymous opt-in or the
+/// email allowlist — deliberately NOT session liveness or expiry: a user's
+/// recurring cron job must keep firing after they log out. The security
+/// property is that the job runs with the enqueuer's row rights (ownerField
+/// scoping via the returned `PrincipalCtx.user_id`), not that the enqueuer
+/// still holds a live session. Any failure is `Forbidden`, which the fire
+/// path turns into a terminal job error.
+pub async fn resolve_enqueuer(
+    pool: &PgPool,
+    db: &str,
+    enqueuer: &EnqueuerIdentity,
+) -> Result<PrincipalCtx, RtDbError> {
+    if enqueuer.anonymous {
+        if db_allows_anonymous(pool, db).await? {
+            return Ok(PrincipalCtx {
+                user_id: Some(enqueuer.user_id.clone()),
+                email: None,
+                tables: None,
+                enqueuer: Some(enqueuer.clone()),
+            });
+        }
+        return Err(RtDbError::forbidden(
+            "anonymous access is not enabled for this database",
+        ));
+    }
+    let Some(email) = &enqueuer.email else {
+        return Err(RtDbError::forbidden(
+            "enqueuer has no verified email and is not allowlisted for this database",
+        ));
+    };
+    if db_email_allowlisted(pool, db, email).await? {
+        Ok(PrincipalCtx {
+            user_id: Some(enqueuer.user_id.clone()),
+            email: Some(email.clone()),
+            tables: None,
+            enqueuer: Some(enqueuer.clone()),
+        })
+    } else {
+        Err(RtDbError::forbidden(
+            "enqueuer is no longer allowlisted for this database",
+        ))
+    }
+}
+
+/// Shared database gate behind `authorize`'s anonymous branch and
+/// [`resolve_enqueuer`]: `true` only when `rtdb_auth.databases.anonymous_enabled`
+/// is set for `db` (missing row ⇒ false, safe default).
+pub async fn db_allows_anonymous(pool: &PgPool, db: &str) -> Result<bool, RtDbError> {
+    let (allowed,): (bool,) = sqlx::query_as(
+        "SELECT COALESCE((
+            SELECT anonymous_enabled FROM rtdb_auth.databases WHERE name = $1
+        ), FALSE)",
+    )
+    .bind(db)
+    .fetch_one(pool)
+    .await?;
+    Ok(allowed)
+}
+
+/// Shared database gate behind `authorize`'s allowlist branch and
+/// [`resolve_enqueuer`]: `true` only when `email` is on `db`'s allowlist.
+/// Allowlist emails are stored lowercase (see `admin::allowlist_write`), so
+/// the input is lowercased here — the same case-insensitive choke point
+/// `authorize` uses.
+pub async fn db_email_allowlisted(pool: &PgPool, db: &str, email: &str) -> Result<bool, RtDbError> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT email FROM rtdb_auth.allowlist WHERE db_name = $1 AND email = $2")
+            .bind(db)
+            .bind(email.to_lowercase())
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.is_some())
 }
 
 /// Resolves a bearer token to a `Principal`: first a machine-token digest
@@ -193,15 +303,7 @@ pub async fn authorize(pool: &PgPool, principal: &Principal, db: &str) -> Result
             // anonymous principal authorized for db A is rejected for db B.
             // Per-row `ownerField` still scopes it to its own documents.
             if *anonymous {
-                let (allowed,): (bool,) = sqlx::query_as(
-                    "SELECT COALESCE((
-                        SELECT anonymous_enabled FROM rtdb_auth.databases WHERE name = $1
-                    ), FALSE)",
-                )
-                .bind(db)
-                .fetch_one(pool)
-                .await?;
-                if allowed {
+                if db_allows_anonymous(pool, db).await? {
                     return Ok(());
                 }
                 return Err(RtDbError::forbidden(
@@ -214,15 +316,7 @@ pub async fn authorize(pool: &PgPool, principal: &Principal, db: &str) -> Result
                 ));
             };
 
-            let row: Option<(String,)> = sqlx::query_as(
-                "SELECT email FROM rtdb_auth.allowlist WHERE db_name = $1 AND email = $2",
-            )
-            .bind(db)
-            .bind(email.to_lowercase())
-            .fetch_optional(pool)
-            .await?;
-
-            if row.is_some() {
+            if db_email_allowlisted(pool, db, email).await? {
                 Ok(())
             } else {
                 Err(RtDbError::forbidden(
@@ -281,20 +375,35 @@ pub struct PrincipalCtx {
     pub user_id: Option<String>,
     pub email: Option<String>,
     pub tables: Option<Vec<String>>,
+    /// SEC-001: the durable enqueuer identity carried on a fire context so a
+    /// `Schedule`/`StartWorkflow` step inside a user's mutate enqueues the
+    /// background row AS THAT USER. `None` for bypass/machine contexts (and
+    /// `#[serde(default)]` keeps a mixed-version fleet during a rolling
+    /// multi-instance deploy decoding — a `Some` from a newer origin simply
+    /// arrives as `None` on the older owner, which then fires as bypass).
+    #[serde(default)]
+    pub enqueuer: Option<EnqueuerIdentity>,
 }
 
 impl PrincipalCtx {
     /// Bypass context: no user identity, no table restriction. Used for machine
     /// tokens (the table allowlist is populated separately by `row_ctx` for
-    /// scoped tokens), scheduled jobs, the TTL reaper, schema migrations, and
-    /// the WS admin bypass — every path that must NOT enforce per-row ownership
+    /// scoped tokens), the TTL reaper, schema migrations, and the WS admin
+    /// bypass — every path that must NOT enforce per-row ownership
     /// (ownerField / collaboratorsField) or resolve `$user`/`$email` markers.
     /// Equivalent to the pre-Task-5 `owner = None`.
+    ///
+    /// SEC-001: user-enqueued scheduled jobs and workflow runs are the one
+    /// exception to "background jobs run as system" — since that fix they
+    /// fire with the ENQUEUER's per-row identity (see [`resolve_enqueuer`]);
+    /// machine/system enqueues (`enqueuer = NULL` on the job row) still fire
+    /// exactly as this bypass context.
     pub fn bypass() -> Self {
         PrincipalCtx {
             user_id: None,
             email: None,
             tables: None,
+            enqueuer: None,
         }
     }
 }
@@ -310,11 +419,13 @@ impl Principal {
                 user_id: Some(user_id.clone()),
                 email: email.clone(),
                 tables: None,
+                enqueuer: self.enqueuer(),
             },
             Principal::Machine { tables, .. } => PrincipalCtx {
                 user_id: None,
                 email: None,
                 tables: tables.clone(),
+                enqueuer: None,
             },
         }
     }

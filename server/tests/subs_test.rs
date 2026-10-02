@@ -859,6 +859,7 @@ async fn inspector_snapshots_subscriptions_and_per_db_counters() -> anyhow::Resu
                 user_id: Some("user-1".to_string()),
                 email: Some("user-1@example.com".to_string()),
                 tables: None,
+                enqueuer: None,
             },
         )
         .await?;

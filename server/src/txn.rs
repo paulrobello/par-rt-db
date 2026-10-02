@@ -2398,6 +2398,10 @@ async fn step_schedule(
 ) -> Result<(), RtDbError> {
     authorize_txn_tables(sctx.ctx, txn)?;
     let (kind, due_at, cron, every_ms, tz) = scheduler::resolve_when(when.clone(), now_ms())?;
+    // SEC-001: the enqueuer identity rides the PrincipalCtx (filled by
+    // `row_ctx` for a User, `None` for bypass/machine), so a `Schedule` step
+    // inside a user's mutate enqueues the row AS THAT USER and the job fires
+    // with their row rights. `None` keeps the bypass fire path.
     let id = scheduler::insert_on(
         sctx.tx,
         sctx.db,
@@ -2408,6 +2412,7 @@ async fn step_schedule(
         every_ms,
         tz.as_deref(),
         external,
+        sctx.ctx.enqueuer.as_ref(),
     )
     .await?;
     sctx.results.push(serde_json::json!({ "scheduleId": id }));
@@ -2462,7 +2467,10 @@ async fn step_start_workflow(
         .unwrap_or(0)
         .min(i64::MAX as u64) as i64;
     let gate = now_ms().saturating_add(sleep_ms);
-    let id = crate::workflows::insert_on(sctx.tx, sctx.db, spec, gate).await?;
+    // SEC-001: same enqueuer capture as `step_schedule` — a workflow started
+    // from inside a user's mutate advances with the user's row rights.
+    let id = crate::workflows::insert_on(sctx.tx, sctx.db, spec, gate, sctx.ctx.enqueuer.as_ref())
+        .await?;
     sctx.results.push(serde_json::json!({ "workflowId": id }));
     Ok(())
 }

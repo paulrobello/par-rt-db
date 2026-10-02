@@ -437,9 +437,11 @@ async fn scheduled_sweep_fires_with_the_server_clock() -> anyhow::Result<()> {
             limit: None,
         }],
     };
-    scheduler::insert(&pool, &db, "oneshot", 1, &txn, None, None, None, false)
-        .await
-        .unwrap();
+    scheduler::insert(
+        &pool, &db, "oneshot", 1, &txn, None, None, None, false, None,
+    )
+    .await
+    .unwrap();
 
     // Lazy-spawn db's committer + scheduler tasks via a no-op mutate (both
     // spawn inside `channel_for` on first use).
