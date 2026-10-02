@@ -1665,25 +1665,22 @@ export class InMemoryRtDbClient {
     return `memory://${id}`;
   }
 
-  /** Fires every due non-paused job by applying its txn through the same atomic
-   * path as `mutate` (so reactive subscriptions see the write). One-shots are
-   * removed after a successful fire; crons and intervals are re-armed (an
-   * interval from each actual fire time — missed windows are skipped, never
-   * backfilled). Pass `nowMs` to drive the clock deterministically; omit it to
-   * use the client's injected clock.
-   *
-   * FM-29: also advances due workflow runs (pending + `sleepUntil <= now`)
-   * through the server's `handle_workflow_advance` semantics — claim to
-   * running, execute the current step txn atomically, then success/retry/
-   * exhaust transitions (see `advanceWorkflow`).
-   *
-   * Also reaps expired documents: any table that declares a `ttl` has rows
-   * removed whose TTL field value is a number strictly less than `now` (a no-op
-   * for tables without TTL). Returns the count of documents reaped. The live
-   * server's per-db reaper is the real expiry; this is best-effort, for
-   * tests/local workflows. */
   tick(nowMs?: number): number {
     const now = nowMs ?? this.now();
+    this.fireDueJobs(now);
+    this.claimDueWorkflows(now);
+    return this.reapTtl(now);
+  }
+
+  /** Fire every due non-paused scheduled job (the first `tick` phase): apply
+   * the job's txn through the same atomic path as `mutate`, then remove
+   * one-shots or re-arm recurring kinds (a cron on the fixed CRON_STEP_MS
+   * approximation; an interval from each actual fire time — missed windows
+   * are skipped, never backfilled). A failing fire marks the job `error`
+   * with the message but leaves it in place (recurring kinds re-arm too, so
+   * the next tick retries). External jobs are NEVER fired — the worker that
+   * claims them owns their execution. */
+  private fireDueJobs(now: number): void {
     for (const job of this.schedules.values()) {
       // External jobs are never internally executed (server `claim_due`/
       // `next_due`/`reset_running` all exclude `external` rows): they sit
@@ -1728,8 +1725,13 @@ export class InMemoryRtDbClient {
         }
       }
     }
-    // FM-29: claim due pending runs and waiting runs whose timeout gate
-    // expired (server `claim_due` covers both), then advance each.
+  }
+
+  /** Claim and advance every due workflow run (the second `tick` phase):
+   * pending runs and waiting runs whose timeout gate expired (server
+   * `claim_due` covers both) flip to running — `startedAt` stamped on the
+   * first claim only — then advance through `advanceWorkflow`. */
+  private claimDueWorkflows(now: number): void {
     const due = [...this.workflows.values()].filter(
       (run) => (run.status === "pending" || run.status === "waiting") && run.sleepUntil <= now,
     );
@@ -1741,7 +1743,6 @@ export class InMemoryRtDbClient {
       run.updatedAt = now;
       this.advanceWorkflow(run, now);
     }
-    return this.reapTtl(now);
   }
 
   /** FM-29: drives one claimed run across step boundaries, mirroring the
