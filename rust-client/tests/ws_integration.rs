@@ -5,6 +5,7 @@
 //!   RTDB_TEST_ADMIN_KEY=dev-admin-key \
 //!   cargo test --test ws_integration --features ws -- --ignored
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 #![cfg(feature = "ws")]
 
 mod common;

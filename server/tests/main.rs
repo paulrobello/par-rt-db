@@ -9,6 +9,8 @@
 //! Adding a test file means adding one `mod` line here. `common` holds the
 //! shared fixtures; submodules reach it as `crate::common::…`.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 mod common;
 
 mod admin_test;

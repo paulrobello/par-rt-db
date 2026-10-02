@@ -5,6 +5,7 @@
 //! time when the caller omits it. Ports the TS client's TTL behavior
 //! (`ts-client/src/in_memory.ts:1156-1221`, `:407-425`).
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 #![cfg(feature = "in_memory")]
 
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -13,6 +13,7 @@
 //! catch **sort-comparator / boundary / terminal-cascade** divergence, not
 //! id-minting drift.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use par_rt_db_client::in_memory::InMemoryRtDbClientOptions;
 use par_rt_db_client::schema::{DistanceMetric, FieldType, Schema, SchemaBuilderExt, Table};
 use par_rt_db_client::{InMemoryRtDbClient, Mutation, Query, StepResult};

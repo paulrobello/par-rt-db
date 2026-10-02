@@ -5,6 +5,7 @@
 //!   RTDB_TEST_ADMIN_KEY=dev-admin-key \
 //!   cargo test --manifest-path cli/Cargo.toml --test live -- --ignored
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use assert_cmd::Command;
 use predicates::str::contains;
 use std::io::{BufRead, BufReader, Write};

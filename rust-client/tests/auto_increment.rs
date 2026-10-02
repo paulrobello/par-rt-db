@@ -16,6 +16,7 @@
 //! cases (the harness has no snapshot surface, and its `&mut self` API admits
 //! no concurrent mutates); the wire-shape serde tests live in `src/schema.rs`.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 #![cfg(feature = "in_memory")]
 
 use std::sync::atomic::{AtomicU64, Ordering};

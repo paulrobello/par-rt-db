@@ -10,6 +10,7 @@
 //! referenced through `par_rt_db_client::wire::` because they are not (yet)
 //! re-exported from the crate root.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use par_rt_db_client::ErrorEnvelope;
 use par_rt_db_client::Query;
 use par_rt_db_client::wire::{

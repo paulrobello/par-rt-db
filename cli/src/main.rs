@@ -19,6 +19,8 @@
 //! client/credential/input helpers, and [`output`] the error-formatting
 //! helper. This root is parse → dispatch only.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 mod args;
 mod commands;
 mod output;

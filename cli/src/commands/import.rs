@@ -99,7 +99,9 @@ pub(crate) async fn run_import(cli: &Cli, args: ImportArgs<'_>) -> Result<()> {
     };
 
     if dry_run {
-        let schema = schema.expect("schema fetched for dry run");
+        let Some(schema) = schema else {
+            anyhow::bail!("dry run requires the schema but it was not fetched");
+        };
         let table_def = resolve_table(&schema, table)?;
         for (n, doc) in &lines {
             validate_line(table_def, mode, key, doc).map_err(|e| anyhow!("line {n}: {e}"))?;
@@ -124,7 +126,9 @@ pub(crate) async fn run_import(cli: &Cli, args: ImportArgs<'_>) -> Result<()> {
     let key_index = match (mode, key) {
         (Mode::Insert, _) => None,
         (_, Some(key)) => {
-            let schema = schema.as_ref().expect("schema fetched for upsert mode");
+            let Some(schema) = schema.as_ref() else {
+                anyhow::bail!("upsert mode requires the schema but it was not fetched");
+            };
             Some(resolve_key_index(schema, table, key)?)
         }
         (_, None) => unreachable!("resolve_mode pairs every non-insert mode with a key"),
@@ -135,7 +139,7 @@ pub(crate) async fn run_import(cli: &Cli, args: ImportArgs<'_>) -> Result<()> {
     for (i, chunk) in lines.chunks(batch).enumerate() {
         let first = chunk[0].0;
         let last = chunk[chunk.len() - 1].0;
-        let txn = build_txn(table, mode, key_index.as_deref(), key, chunk);
+        let txn = build_txn(table, mode, key_index.as_deref(), key, chunk)?;
         client
             .mutate(&txn, None)
             .await
@@ -280,17 +284,31 @@ fn build_txn(
     key_index: Option<&str>,
     key: Option<&str>,
     chunk: &[Line],
-) -> par_rt_db_client::Transaction {
+) -> anyhow::Result<par_rt_db_client::Transaction> {
+    // resolve_mode pairs every non-insert mode with `--key`, and run_import
+    // resolves the key index from the fetched schema before batching starts,
+    // so both are known by the time the first chunk is built.
+    let upsert_key = match (mode, key) {
+        (Mode::Insert, _) => None,
+        (_, Some(key)) => {
+            let index = key_index.ok_or_else(|| {
+                anyhow::anyhow!("upsert mode requires a resolved key index but none was resolved")
+            })?;
+            Some((key, index))
+        }
+        (_, None) => {
+            anyhow::bail!("upsert mode requires --key but none was resolved");
+        }
+    };
     let mut m = Mutation::new();
     for (_, doc) in chunk {
-        match mode {
-            Mode::Insert => {
+        match upsert_key {
+            // insert mode: `upsert_key` is None exactly when mode == Insert
+            None => {
                 m = m.insert(table, doc.clone());
             }
-            Mode::Update | Mode::Skip => {
-                let key = key.expect("resolve_mode pairs every upsert mode with a key");
+            Some((key, index)) => {
                 let eq = [doc.get(key).cloned().unwrap_or(Value::Null)];
-                let index = key_index.expect("key index resolved for upsert mode");
                 let patch = match mode {
                     Mode::Update => doc.clone(),
                     _ => serde_json::json!({}),
@@ -299,7 +317,7 @@ fn build_txn(
             }
         }
     }
-    m.build()
+    Ok(m.build())
 }
 
 #[cfg(test)]
@@ -425,10 +443,11 @@ mod tests {
             (1, serde_json::json!({"slug": "a", "qty": 1})),
             (2, serde_json::json!({"slug": "b", "qty": 2})),
         ];
-        let insert_txn = build_txn("items", Mode::Insert, None, None, &lines);
+        let insert_txn = build_txn("items", Mode::Insert, None, None, &lines).unwrap();
         assert_eq!(insert_txn.steps.len(), 2);
 
-        let upsert_txn = build_txn("items", Mode::Update, Some("by_slug"), Some("slug"), &lines);
+        let upsert_txn =
+            build_txn("items", Mode::Update, Some("by_slug"), Some("slug"), &lines).unwrap();
         assert_eq!(upsert_txn.steps.len(), 2);
     }
 

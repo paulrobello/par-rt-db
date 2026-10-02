@@ -4,6 +4,7 @@
 //! every `Directive` kind) against a ~30-table schema — the shape a real
 //! `POST /admin/db/{db}/migrate` dry-run validates before touching any row.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use criterion::{Criterion, criterion_group, criterion_main};
 use rtdb_server::migrate::{Directive, ExprSource, plan_migration};
 use rtdb_server::schema::SchemaDef;

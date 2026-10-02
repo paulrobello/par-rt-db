@@ -3,6 +3,7 @@
 //! declared field on patch's merged result). Pure, no Postgres. Benchmarks a
 //! ~1 KB and a ~10 KB document against the same table schema.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use criterion::{Criterion, criterion_group, criterion_main};
 use rtdb_server::schema::{SchemaDef, validate_doc};
 use std::hint::black_box;

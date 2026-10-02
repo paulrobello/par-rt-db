@@ -13,6 +13,20 @@
 resolver = "2"
 members = ["core", "server", "rust-client", "cli"]
 
+# QA-004: one shared lint table — every member inherits via `[lints]
+# workspace = true`. Production code must not panic. unwrap/expect are `warn`
+# here rather than `deny` because command-line `-D` would override the
+# in-source test-code allow attributes; the gate's `clippy -- -D warnings`
+# is what turns them into build failures. Test code opts out at each crate
+# root via `#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]`.
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+
 # Deps shared by two or more members. Members opt in via `dep.workspace = true`
 # and may ADD features (member features are unioned onto the base declared here)
 # but cannot remove `default-features` the workspace enables, so every base

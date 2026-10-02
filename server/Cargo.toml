@@ -167,8 +167,5 @@ harness = false
 # rust-analyzer, pre-commit) denies warnings without needing the Makefile's
 # `-D warnings` flag. The Makefile's `make lint`/`make checkall` already pass
 # `-D warnings` so this is belt-and-suspenders, not a behavior change.
-[lints.rust]
-warnings = "deny"
-
-[lints.clippy]
-all = { level = "warn", priority = -1 }
+[lints]
+workspace = true

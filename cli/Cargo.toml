@@ -42,8 +42,5 @@ futures-util.workspace = true
 name = "live"
 path = "tests/live.rs"
 
-[lints.rust]
-warnings = "deny"
-
-[lints.clippy]
-all = { level = "warn", priority = -1 }
+[lints]
+workspace = true

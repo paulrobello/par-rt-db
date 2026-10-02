@@ -4,6 +4,7 @@
 //! `serde` and `serde_json` and nothing else, so both a tokio/sqlx server and a
 //! `no-default-features` client can take it without inheriting a stack.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #![deny(missing_docs)]
 #![deny(warnings)]
 
