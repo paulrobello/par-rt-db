@@ -150,7 +150,10 @@ async fn insert_widgets_batch(addr: std::net::SocketAddr, db: &str, n: usize) {
 #[tokio::test]
 async fn cross_replica_op_feed_fan_out_and_self_dedupe() -> anyhow::Result<()> {
     let cfg = test_config();
-    let pool = crate::common::test_shared_pool(&cfg.database_url, 8)
+    // Two multi-instance AppStates hold six LISTEN connections here, and the
+    // ARC-005 read-pool move puts pollers and tap publishes on this pool too —
+    // sized to match the stage4 cluster harness (30).
+    let pool = crate::common::test_shared_pool(&cfg.database_url, 30)
         .await
         .expect("connect to test postgres");
     rtdb_server::db::bootstrap(&pool)
@@ -268,7 +271,10 @@ async fn multi_instance_disabled_does_not_fan_out() -> anyhow::Result<()> {
 #[tokio::test]
 async fn large_batch_write_coalesces_notifications() -> anyhow::Result<()> {
     let cfg = test_config();
-    let pool = crate::common::test_shared_pool(&cfg.database_url, 9)
+    // Same sizing rationale as cross_replica_op_feed_fan_out_and_self_dedupe
+    // above: two multi-instance AppStates' listeners plus ARC-005 read-pool
+    // traffic overflow the smaller bound.
+    let pool = crate::common::test_shared_pool(&cfg.database_url, 30)
         .await
         .expect("connect to test postgres");
     rtdb_server::db::bootstrap(&pool)
