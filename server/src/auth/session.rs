@@ -161,6 +161,19 @@ pub async fn delete_session(pool: &PgPool, token: &str) -> Result<(), RtDbError>
     Ok(())
 }
 
+/// Deletes an admin session by its plaintext token (SEC-004: `POST
+/// /admin/logout` must revoke the server-side row, not just clear the
+/// cookie). Not an error if the row doesn't exist — logout is idempotent,
+/// mirroring `delete_session`.
+pub async fn delete_admin_session(pool: &PgPool, token: &str) -> Result<(), RtDbError> {
+    let hash = sha256_hex(token);
+    sqlx::query("DELETE FROM rtdb_auth.admin_sessions WHERE token_hash = $1")
+        .bind(&hash)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// One row of the admin sessions list. `token_hash` is a non-reversible sha256
 /// digest (the plaintext token is never stored), so it is safe to surface to an
 /// authenticated admin and lets the UI target a specific row.

@@ -113,8 +113,21 @@ pub(super) async fn admin_login(
     Ok(resp)
 }
 
-/// `POST /admin/logout` — clears the SEC-001 session cookie and SEC-106 CSRF nonce.
-pub(super) async fn admin_logout() -> Response {
+/// `POST /admin/logout` — clears the SEC-001 session cookie and SEC-106 CSRF
+/// nonce, and deletes the matching `rtdb_auth.admin_sessions` row (SEC-004:
+/// clearing the cookie alone left the server-side session valid until TTL, so
+/// a stolen or logged-out cookie kept working). Idempotent: a missing row is
+/// fine. A deletion failure is logged and the cookies are still cleared — a
+/// transient DB hiccup must not trap the operator in a logged-in state.
+pub(super) async fn admin_logout(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(token) = auth::cookie::session_cookie(&headers)
+        && let Err(err) = auth::session::delete_admin_session(&state.pool, token).await
+    {
+        tracing::warn!(error = %err, "admin: failed to delete admin session at logout");
+    }
     let mut resp = StatusCode::NO_CONTENT.into_response();
     resp.headers_mut()
         .append(SET_COOKIE, auth::cookie::clear_session_cookie());

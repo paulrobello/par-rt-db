@@ -2304,3 +2304,42 @@ async fn supported_protocol_header_does_not_block_admin_routes() -> anyhow::Resu
 
     Ok(())
 }
+
+// SEC-004: logout must revoke the server-side admin session row, not just
+// clear the cookie — a logged-out (or stolen) cookie reused on /admin/dbs
+// must 401 after logout. Mirrors /auth/logout's row deletion.
+#[tokio::test]
+async fn sec004_admin_logout_revokes_server_session() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+
+    let (client, session, _csrf) = admin_login_cookies(addr).await;
+    // The row exists and the cookie authenticates before logout.
+    assert!(
+        rtdb_server::auth::session::resolve_admin_session(&state.pool, &session).await?,
+        "admin session row must resolve before logout"
+    );
+
+    let resp = client
+        .post(format!("http://{addr}/admin/logout"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    // The row is gone AND the old cookie no longer authenticates.
+    assert!(
+        !rtdb_server::auth::session::resolve_admin_session(&state.pool, &session).await?,
+        "admin session row must be deleted after logout"
+    );
+    let reuse = reqwest::Client::new()
+        .get(format!("http://{addr}/admin/dbs"))
+        .header("cookie", &format!("rtdb_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(
+        reuse.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a logged-out admin cookie must not authenticate"
+    );
+    Ok(())
+}
