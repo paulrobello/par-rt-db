@@ -227,7 +227,11 @@ write publishes here" guarantee extends to migrate (see `migrate.rs` and the
 ## Per-database background tasks
 
 `Committers::channel_for` spawns the per-db task set: committer, scheduler,
-TTL reaper, mutation-log cleanup, and the storage-quota cache warmer. All the
+TTL reaper, mutation-log cleanup, and the storage-quota cache warmer. ARC-001:
+the pollers spawn **only when the replica owns writes** — a shadow replica
+spawns none, so a failover re-spawns them on the new owner and a demoted
+replica's pollers stop with its committer. Workflow polling runs inside the
+scheduler task (one timer, two side tables), not a separate poller. All the
 non-committer tasks follow the same rule: **they never write document
 tables** — they only claim/enqueue work
 back through the committer, preserving the single-writer invariant.
@@ -239,15 +243,24 @@ The scheduler is a second per-db task, not a second writer: a timer
 `(due_at, txn)` rows. It writes ONLY that side table (claim/reset) and enqueues
 each due job as a `CommitterRequest::RunScheduled`; the committer's `RunScheduled`
 arm (`handle_scheduled`) executes it via the normal `execute_txn` +
-`subs.fan_out` path and finalizes the row. Delivery is at-least-once; one-shot
+`subs.fan_out` path and finalizes the row. SEC-001: the job fires as its
+enqueuer's resolved principal — a user-enqueued job keeps that user's row
+rights (`ownerField` scoping via the stored `EnqueuerIdentity`, re-checked
+against the db allowlist at fire time but deliberately not against session
+liveness, so a recurring job survives logout); system and machine-token
+enqueues fire as the bypass principal. Delivery is at-least-once; one-shot
 catches up if past due, cron skips missed windows.
 
 **Durable declarative workflows (FM-29, `workflows.rs`)**: the same timer task
 also polls the per-db `workflows` side table and enqueues each due run as a
 `CommitterRequest::RunWorkflowAdvance`; the committer's arm
 (`handle_workflow_advance`) executes the current step's txn via the normal
-`execute_txn` + `subs.fan_out` path — steps fire as the system (bypass)
-principal like scheduled jobs — records the step outcome, and applies
+`execute_txn` + `subs.fan_out` path — like scheduled jobs, steps fire as the
+enqueuer's resolved principal (SEC-001): a job enqueued by an authenticated
+user keeps that user's row rights at fire time (re-authorized against the
+per-db allowlist, never against session liveness), while a system or
+machine-token enqueue fires as the bypass principal — records the step
+outcome, and applies
 `StepRetry` backoff and `sleepBeforeMs` before re-arming. Still at-least-once
 per step; a crash mid-advance leaves the row `running`, and scheduler startup
 `reset_running` re-arms it.
@@ -344,6 +357,8 @@ graph LR
         CHUNK["storage_chunks — 1 MiB bytea chunks (streamed uploads, ENH-021)"]
         MUT["mutations — idempotency-key replay log"]
         HIST["schema_history — captured schema versions (push/migrate/restore)"]
+        CHG["changes — durable change-feed rows (per written (table,id))"]
+        CHGH["change_head — per-db seq counter (transactional with the append)"]
     end
 
     subgraph global["Server-wide schemas"]
@@ -516,8 +531,14 @@ so the lease and every write share one Postgres backend.
 That single-backend coupling is what makes the guarantee structural rather than
 procedural:
 
-- No other replica can acquire the lock mid-flight, so split-brain is
-  impossible by construction — there is no fencing token to get wrong.
+- No other replica can acquire the lock mid-flight. ARC-001 closes the one
+  residual hole — a Postgres session advisory lock does not survive a backend
+  replacement, so the lease pool's `after_connect` hook re-asserts
+  `pg_try_advisory_lock` on every reconnect and flips a `lease_lost` flag when
+  the lock comes back already held by someone else — and the committer
+  re-verifies the lease at the start of every write turn, demoting itself to a
+  shadow instead of writing on a possibly-lost lease. There is no fencing
+  token to get wrong; there is a flag and a per-turn check.
 - An owner's death (`kill -9`, container stop, a partition that drops the
   session) ends the backend's session, which releases the advisory lock.
   Failover is the next replica's ordinary acquire path; there is no separate
@@ -527,7 +548,29 @@ procedural:
 
 A replica that does not hold the lease runs a **shadow** committer for that
 database. A shadow serves reads, live subscriptions, and presence normally. It
-never calls `execute_txn`.
+never calls `execute_txn`. Two ARC-004/ARC-005 mechanics make the shadow path
+sound:
+
+- **Cross-replica schema NOTIFY (ARC-004)** — a schema push on the owner
+  publishes `publish_schema_changed` (`notify.rs`) on the shared
+  `rtdb_ops` NOTIFY channel; every other replica's listener invalidates its
+  in-memory `SchemaCache` entry for that db, so the next read reloads the new
+  schema instead of compiling queries against a stale one. A replica that
+  *receives* a forwarded `PushSchema` write puts the schema change on its own
+  forward path rather than applying it locally, so the owner's committer stays
+  the single applier of DDL.
+- **Split read pool (ARC-005)** — the committer context carries two pools:
+  the write pool (the lease pool under multi-instance — its single backend
+  holds the ownership advisory lock) and a read pool (always the main pool)
+  for non-write work in the committer turn: subscription fan-out re-runs,
+  cross-replica NOTIFY publishing, audit rows, webhook enqueues, and
+  quota-cache refresh. This keeps that work off the single locked lease
+  backend — contention there deadlocks a `max_connections(1)` pool and blocks
+  failover. The pollers (scheduler, mutation-log cleanup, reaper, quota
+  warmer) likewise run on the main pool, never the lease pool, for the same
+  reason; a poller connection that reconnects and wins the advisory lock back
+  through the `after_connect` hook would otherwise permanently block
+  failover.
 
 ### Forwarding a write to the owner
 
@@ -585,7 +628,13 @@ then died, or replied late, would otherwise have its write applied twice. So a
 forwarded `Mutate` carrying no client idempotency key is given a server-minted
 UUIDv7 key, threaded through both the forward payload and the takeover
 re-submit. The dedup table is shared by every replica, so the takeover replays
-the owner's first outcome instead of writing again. The non-`Mutate` arms are
+the owner's first outcome instead of writing again. ARC-003: the dedup row is
+recorded **inside the write transaction itself** (`txn/mod.rs` — the insert
+rides the open `execute_txn` transaction rather than a pre-check plus
+post-insert), so "committed" and "deduplicated" are atomic — a crash can never
+leave a write that committed without its dedup row, and a concurrent replay
+races the same serialized turn instead of the gap between two statements. The
+non-`Mutate` arms are
 idempotent by construction.
 
 What the *client* observes is still ambiguous in the timeout window — the write
@@ -688,8 +737,12 @@ On top of the db-level gate:
   it adds are also available in client `.filter()`, while principal markers
   are valid only in `authorize`.
 
-Machine tokens and scheduled jobs (no interactive principal) bypass per-row
-rules; the db-level allowlist/token/session gate still runs first.
+Machine tokens and system-enqueued jobs bypass per-row rules; the db-level
+allowlist/token/session gate still runs first. SEC-001: a scheduled job or
+workflow run enqueued by an authenticated user is the exception — it fires as
+that user's resolved principal (`EnqueuerIdentity` stored on the job row,
+re-authorized against the db gate at fire time) and its per-row rules apply
+with the user's `user_id`.
 
 ### OAuth login flow
 
@@ -813,7 +866,8 @@ a shared instance.
   `storage` blob table; framework side-tables `meta`/`mutations`/
   `scheduled_txns`/`schema_history` excluded; `RTDB_QUOTA_CACHE_TTL_SECS`
   default 60 doubles as the warmer interval). Enforced at
-  `handle_mutate`/`handle_scheduled`/`handle_migrate` entry before
+  `handle_mutate`/`handle_scheduled`/`handle_migrate`/`handle_workflow_advance`
+  entry before
   `execute_txn` (so an over-cap write commits nothing partial) as a **cheap
   stale-read** — `enforce` uses any cached reading (fresh *or* stale) and runs
   **no** `pg_total_relation_size` scan on the serialized committer turn; the
@@ -1031,7 +1085,12 @@ route also accepts `includeDeleted: true` (an internal `execute_query` param, NO
 
 ## Backups and restore
 
-`backup.rs`, `admin/backups.rs`. The manual `POST /admin/backup` trigger
+`backup.rs`, `admin/backups.rs`. ARC-002: `POST /admin/import-db` requires an
+**empty** target database — a non-empty target is rejected up front with
+`CONFLICT` (`admin/dbs.rs::import_db` checks before any write), because an
+import replays documents with their original ids and could otherwise collide
+with or silently overwrite live rows. Clone-db and backup restore already
+target fresh databases, so they are unaffected. The manual `POST /admin/backup` trigger
 spawns one `pg_dump` **outside the committer** (a read — same as the cron
 task) and is gated by an `AppState` `backup_running` flag (a second call while
 running → 409). `POST /admin/restore` restores a dump into a **fresh

@@ -22,7 +22,7 @@ notes), see [`CLAUDE.md`](CLAUDE.md).
 
 ## Repository layout
 
-par-rt-db is a monorepo with **eight packages** built from one root `Makefile`:
+par-rt-db is a monorepo with **nine packages** built from one root `Makefile`:
 
 | Package | Path | Stack |
 | --- | --- | --- |
@@ -44,8 +44,8 @@ against Convex with per-row notes on which clients mirror each feature.
 
 ## Development setup
 
-You need `docker` (for the dev Postgres), `cargo` (Rust stable), `bun`, and
-`uv` (Python). Then:
+You need `docker` (for the dev Postgres), `cargo` (Rust stable), `bun`,
+`uv` (Python), and `go` (1.23, per `go-client/go.mod`). Then:
 
 ```bash
 # 1. Start the dev Postgres on 127.0.0.1:55434. Required for any test run.
@@ -80,8 +80,9 @@ gitignored and rebuilt on demand.
 ## The build gate
 
 `make checkall` is the **definition of done**. It must pass before every
-commit, and it spans all eight packages (`core`, `server`, `ts-client`,
-`rust-client`, `python-client`, `swift-client`, `dashboard`, `cli`).
+commit, and it spans all nine packages (`core`, `server`, `ts-client`,
+`rust-client`, `python-client`, `swift-client`, `go-client`, `dashboard`,
+`cli`).
 
 Its eight stages, what each one catches, and every other make target are
 documented once in the root README under
@@ -123,6 +124,7 @@ cd ts-client && bunx vitest run                 # ts-client tests
 cd rust-client && cargo test --all-features     # rust-client tests
 cd dashboard && bun run test                    # dashboard tests (vitest, 18 files)
 cd python-client && uv run pytest -q            # python-client tests
+cd go-client && go test ./...                   # go-client tests
 cd cli && cargo test                            # cli tests (rtdb binary)
 make swift-client-test                          # swift-client tests (Darwin only)
 
@@ -263,13 +265,14 @@ etc.).
 ## Versioning
 
 All packages — `server`, `cli`, `dashboard`, and the five client SDKs
-(`ts-client`, `rust-client`, `python-client`, `swift-client`) — version in
+(`ts-client`, `rust-client`, `python-client`, `swift-client`, `go-client`) —
+version in
 **lockstep**: one version for the whole protocol surface, bumped together in
 the same release commit. `swift-client` carries no manifest version — SPM has
 no version field, so the repo's release tag is its version — but it is part of
-the lockstep unit all the same. The five implementations of the wire contract
+the lockstep unit all the same. The six implementations of the wire contract
 (`server/src/protocol.rs` plus the five client mirrors) are one unit;
-independent client versions would claim compatibility the five-way mirror does
+independent client versions would claim compatibility the six-way mirror does
 not have. The release procedure,
 including the lockstep bump, is [`docs/RELEASING.md`](docs/RELEASING.md).
 
@@ -342,12 +345,13 @@ failing test.
   every value via `$n`. Never interpolate an unvalidated value. Physical names
   are lowercased and length-capped to fit Postgres's 63-byte limit — don't
   raise the caps.
-- **Five implementations, one wire contract** — `server/src/protocol.rs`,
+- **Six implementations, one wire contract** — `server/src/protocol.rs`,
   `ts-client/src/protocol.ts`, `rust-client/src/wire.rs`,
-  `python-client/src/par_rt_db/wire.py`, and
-  `swift-client/Sources/ParRtDbClient/Wire.swift` are five implementations of
+  `python-client/src/par_rt_db/wire.py`,
+  `swift-client/Sources/ParRtDbClient/Wire.swift`, and `go-client/wire/` are
+  six implementations of
   the same protocol. The casing is deliberately non-uniform and load-bearing.
-  Any server change must be mirrored in **all five** — wire types, DSL
+  Any server change must be mirrored in **all six** — wire types, DSL
   builders, and their tests. If a client doesn't yet cover a changed surface,
   file the gap explicitly in `FEATURE_MATRIX.md` rather than letting it drift.
 - **Errors** — every failure is the `RtDbError` envelope `{code, message}`

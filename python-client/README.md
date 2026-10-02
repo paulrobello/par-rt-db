@@ -43,7 +43,7 @@ Package name: `par-rt-db` → in Python, `import par_rt_db`.
 | Core wire types (`ClientMessage`, `ServerMessage`, `ScheduleWhen`, `FilterExpr`, …) | shipped | `par_rt_db.wire` |
 | Schema DSL (`SchemaDef`, `TableDef`, `t` field constructors, `SchemaBuilder`) | shipped | `par_rt_db.schema` |
 | Query DSL (`Query`, `TableQuery` builder, `Paginated`, `parse_result`) | shipped | `par_rt_db.query` |
-| Mutation DSL (`Mutation` builder, `Transaction`, `StepResult`, 14 step ops) | shipped | `par_rt_db.mutation` |
+| Mutation DSL (`Mutation` builder, `Transaction`, `StepResult`, 15 step ops incl. `adjust_counter`) | shipped | `par_rt_db.mutation` |
 | Cursor codec (`encode_cursor` / `decode_cursor`) | shipped | `par_rt_db.cursor` |
 | Error model (`RtDbError`, `ErrorCode`, `retry_on_precondition`) | shipped | `par_rt_db.errors` |
 | HTTP / admin / storage client (`RtDbHttpClient`, sync `httpx`) | shipped | `par_rt_db.http_client` (`[http]` extra) |
@@ -58,7 +58,9 @@ The DSL layer is feature-complete: every server query terminal
 `collect`/`distinct`/`aggregate`/`filter`/`search`/`vector_search`/`hybrid_search`/`paginate`)
 plus the `fields` projection clause, and every mutation step
 (`insert`/`patch`/`replace`/`delete`/`undelete` (FM-33)/`expectVersion`/
-`expectAbsent`/`upsert`
+`expectAbsent`/`upsert`/`adjust_counter` — atomic bounded counter updates,
+FM-41, see
+[`../docs/atomic-counter.md`](../docs/atomic-counter.md)
 per-id steps, the `patch_by_query`/`delete_by_query` bulk steps, plus the
 `schedule(when, txn)`/`cancel_schedule(id)` scheduling steps and the
 `start_workflow(spec)`/`cancel_workflow(id)` workflow steps (FM-29))

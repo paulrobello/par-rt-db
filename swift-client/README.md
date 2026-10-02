@@ -249,9 +249,12 @@ let titles = try TableQuery("tasks").fields("title", "status").build()
 
 ### Mutation DSL (`MutationBuilder`)
 
-All 14 step ops: `insert`, `patch`, `replace`, `delete`, `undelete`,
-`expectVersion`, `expectAbsent`, `upsert`, `patchByQuery`, `deleteByQuery`,
-`schedule`, `cancelSchedule`, `startWorkflow`, `cancelWorkflow`.
+All 15 step ops: `insert`, `patch`, `replace`, `delete`, `undelete`,
+`expectVersion`, `expectAbsent`, `upsert`, `adjustCounter` (atomic bounded
+counter update — see
+[`../docs/atomic-counter.md`](../docs/atomic-counter.md)), `patchByQuery`,
+`deleteByQuery`, `schedule`, `cancelSchedule`, `startWorkflow`,
+`cancelWorkflow`.
 
 ```swift
 let txn = try MutationBuilder()
@@ -524,7 +527,7 @@ Published reference: https://paulrobello.github.io/par-rt-db/swift/
 | --- | --- |
 | Wire types — fifth implementation of the contract | ✅ (+ `wire-corpus.json` parity runner, ARC-008) |
 | Query DSL — every terminal incl. `search`/`vectorSearch`/`hybridSearch`/`paginate`/`aggregate`/`distinct` | ✅ |
-| Mutation DSL — all 14 step ops, recursive step-cap enforcement | ✅ |
+| Mutation DSL — all 15 step ops (incl. `adjustCounter`), recursive step-cap enforcement | ✅ |
 | Schema DSL — 15 field types, btree/search/vector/unique/partial indexes, `ownerField`/`collaboratorsField`/`authorize`, `ttl`, `updatedAtField`, `autoIncrementField`, `defaults`, `computed`, `softDelete`, `onDelete` | ✅ |
 | HTTP client — query/query-batch/mutate (+ idempotency key, retry helper), schedule ops, workflow ops, change feed (`changes(since:table:limit:)`), full storage surface, `pushSchema`/`previewSchema`, `authMe` | ✅ |
 | WS client — auth/reconnect/heartbeat, shared subscriptions with replay, mutate-over-WS, schedule + workflow ops | ✅ |

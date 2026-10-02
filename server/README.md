@@ -8,12 +8,13 @@ query updates on change. One instance hosts many named databases. There is no
 embedded JS runtime and no per-app server code — this one generic binary serves
 every app.
 
-This directory holds the `rtdb-server` binary. Four client SDKs live
+This directory holds the `rtdb-server` binary. Five client SDKs live
 alongside it: [`../ts-client/`](../ts-client) (browser/Node),
 [`../rust-client/`](../rust-client) (Rust),
 [`../python-client/`](../python-client) (Python — wire + DSL + sync HTTP/admin/storage
-+ reactive WS, all shipped), and [`../swift-client/`](../swift-client)
-(`ParRtDbClient`/`ParRtDbUI`, Darwin-only). An operator dashboard SPA
++ reactive WS, all shipped), [`../swift-client/`](../swift-client)
+(`ParRtDbClient`/`ParRtDbUI`, Darwin-only), and
+[`../go-client/`](../go-client) (Go). An operator dashboard SPA
 ([`../dashboard/`](../dashboard)) is served same-origin by the server when
 `RTDB_STATIC_DIR` is set, and the [`../cli/`](../cli) package wraps
 `par-rt-db-client` as the `rtdb` operator/CI binary. A [`../core/`](../core)
@@ -127,18 +128,20 @@ Paths below are relative to `server/src/` (this directory's `src/`).
 | Schema model + validation | `src/schema/` |
 | Computed-field expression grammar + evaluation (ENH-028) | `src/value_expr.rs` (shared by push validation, the write-path stamp in `src/txn.rs`, push/restore backfill, and migrate re-stamps in `src/migrate.rs`) |
 | Schema → Postgres DDL | `src/ddl.rs` |
-| Write / read paths | `src/txn.rs`, `src/query/` (`mod.rs` compile + dispatch, `filter.rs`, `terminals.rs`, `search.rs`, `row_auth.rs`) |
+| Write / read paths | `src/txn/` (`mod.rs`, `row_ops.rs`, `stamp.rs`, `auth.rs`, `steps.rs`, `cascade.rs`), `src/query/` (`mod.rs` compile + dispatch, `filter.rs`, `terminals.rs`, `search.rs`, `row_auth.rs`) |
 | Pagination (cursor keyset) | `src/pagination.rs` |
 | Wire messages + query/txn DSL types | `src/protocol.rs`, `src/dsl.rs` (pure wire/DSL types shared by protocol/txn/query — zero SQL) |
 | Error envelope | `src/error.rs` |
-| Transports | `src/ws.rs` (reactive), `src/http_api.rs` (one-shot) |
+| Transports | `src/ws.rs` (reactive), `src/http_api/` (one-shot — `mod.rs` router, `data.rs`, `schedule.rs`, `workflow.rs`, `changes.rs`, `storage.rs`) |
+| Durable change feed (FM-27) | `src/change_log.rs` (per-db op log behind `GET /api/db/{db}/changes`; retention via the `change_log_max_rows` hot setting) |
+| Graceful shutdown | `src/shutdown.rs` (bounded drain race, `RTDB_SHUTDOWN_DRAIN_MS`) |
 | Admin control plane | `src/admin/` — `mod.rs` (shared core + assembled router) + fourteen per-domain submodules (`login`, `dbs`, `schema_ops`, `tokens`, `docs`, `schedules`, `storage_ops`, `webhooks`, `backups`, `settings`, `observability`, `sessions`, `merge`, `workflows`); all `/admin/*` routes + `/admin/stream` WS. `sessions` is the active-session management surface (`GET/DELETE /admin/sessions`, per-user + per-token-hash revocation; revocation takes effect on the next op over an already-open connection). |
 | Signed, time-limited storage URLs (ENH-017) | `src/signed_url.rs` (HMAC over `admin_key`, `?exp=&sig=` verified on `GET /storage/{id}`) |
 | Database bootstrap + admin SQL | `src/db.rs` (create/drop database, `storage_index`, the `rtdb_auth` schema) |
 | Cross-replica fan-out (ENH-022) | `src/notify.rs` (`pg_notify` on the `rtdb_ops` channel; per-process LISTEN mirrors peer replicas into the local op-feed ring) |
 | Privacy policy | `src/privacy.rs` (serves `GET /privacy` from `src/static/privacy.html`, the only file `src/static/` holds) |
 | Static SPA serving | `src/lib.rs` (`ServeDir`/`ServeFile` mounted as the router's last-resort fallback, reading `RTDB_STATIC_DIR`; hashed assets get an immutable `Cache-Control`, `index.html` gets `no-cache`) |
-| Auth (six OAuth providers + sessions + machine tokens + anonymous) | `src/auth/` — `mod.rs`, `provider.rs` (trait + dispatcher), `github.rs`, `google.rs`, `gitlab.rs`, `microsoft.rs` (Entra ID/Azure AD v2), `apple.rs` (ES256 JWT `client_secret` + `form_post`), `oidc.rs` (generic), `session.rs`, `tokens.rs`, `cookie.rs`. Anonymous auth (`POST /auth/anonymous`, gated `RTDB_AUTH_ANONYMOUS_ENABLED` default off) mints an ephemeral `Principal::User` (`anonymous = true`, `email = None`) that bypasses the per-db allowlist via its boot gate and owns its own documents via per-row `ownerField`. On a later OAuth sign-in, the anon footprint is merged into the real account (`src/merge.rs` — doc restamps in the committer, storage owner swap, session re-point, guarded anon-row delete); `POST /admin/merge-users` is the operator escape hatch. |
+| Auth (six OAuth providers + sessions + machine tokens + anonymous) | `src/auth/` — `mod.rs`, `provider.rs` (trait + dispatcher), `github.rs`, `google.rs`, `gitlab.rs`, `microsoft.rs` (Entra ID/Azure AD v2), `apple.rs` (ES256 JWT `client_secret` + `form_post`), `oidc.rs` (generic), `session.rs`, `tokens.rs`, `cookie.rs`, `jwks.rs` (JWKS fetch/cache for OIDC discovery). Anonymous auth (`POST /auth/anonymous`, gated `RTDB_AUTH_ANONYMOUS_ENABLED` default off) mints an ephemeral `Principal::User` (`anonymous = true`, `email = None`) that bypasses the per-db allowlist via its boot gate and owns its own documents via per-row `ownerField`. On a later OAuth sign-in, the anon footprint is merged into the real account (`src/merge.rs` — doc restamps in the committer, storage owner swap, session re-point, guarded anon-row delete); `POST /admin/merge-users` is the operator escape hatch. |
 
 The read path compiles a db-side `filter()` predicate DSL to SQL, a full-text
 `search` query terminal backed by a generated tsvector column + GIN index,
@@ -318,21 +321,28 @@ startup (mirrors `mutations`/`scheduled_txns`).
 
 ## Develop
 
-The `make` targets below run **from the repo root** (they coordinate all six
-packages):
+The `make` targets below run **from the repo root** (they coordinate all nine
+packages — see the root `Makefile` for the full target list):
 
 ```sh
 make dev-db-up        # start dev Postgres on 127.0.0.1:55434 (required for tests)
-make test             # dev-db-up, then cargo test
-make checkall         # fmt-check + clippy -D warnings + typecheck + test
+make dev-db-down      # stop it
+make dev-db-clean     # drop leaked test databases (pattern-scoped, safe)
+make test             # dev-db-up, then the full test suite
+make checkall         # the full gate: env-drift-check, dockerfile-stub-check, backup-persistence-check, hostname-leak-check, cli-docs-check, docs-api, fmt-check, lint, typecheck, test, rust-client-check-features
+make fmt              # apply formatting
+make lint             # clippy + biome + ruff + go vet, -D warnings
+make typecheck        # cargo check + tsc + pyright + go vet
 ```
 
 Run cargo directly from this directory: `cargo build`, `cargo clippy --all-targets
 --all-features -- -D warnings`, or a single test by name
-(`cargo test --test txn_test upsert_multiple_matches`). Integration tests live
-one binary per feature area under `tests/` (e.g. `txn_test`, `query_test`,
-`subs_test`, `oauth_test`, `workflows_test`, `cascade_test`) — run one with
-`cargo test --test <name>`; list them all with `ls tests/`.
+(`cargo test --test main txn_test::upsert_multiple_matches`). All integration
+tests are one binary — `tests/main.rs` with `autotests = false` — with the test
+files as modules under `tests/` (e.g. `txn_test`, `query_test`,
+`subs_test`, `oauth_test`, `workflows_test`, `cascade_test`): run one file with
+`cargo test --test main txn_test::`, and a new test file needs a `mod` line in
+`tests/main.rs`.
 
 Tests share one Postgres instance and isolate by creating uniquely-named
 databases (`t<uuid>`) — never assume exclusive access, and never drop a database

@@ -93,7 +93,7 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 ### Technical Excellence
 - **Single serialized committer per database**: all writes flow through one committer task per database and reads run under READ COMMITTED (except `adjustCounter`, which row-locks its counter) — realtime correctness without distributed coordination
 - **Rust on axum/tokio with Postgres 17 storage**: graceful shutdown drains in-flight requests before exiting, bounded by `RTDB_SHUTDOWN_DRAIN_MS`
-- **One wire contract, six implementations**: the server and the ts/rust/python/go clients stay byte-identical, enforced by a shared semantics corpus ([`wire-corpus/`](wire-corpus/README.md)); the Swift client mirrors the same wire types, pinned by the wire-parity corpus
+- **One wire contract, six implementations**: the server and the ts/rust/python/swift/go clients all run the shared semantics corpus, staying byte-identical ([`wire-corpus/`](wire-corpus/README.md) — every top-level section is consumed by all six runners)
 - **Security defaults**: constant-time key comparison, generic client-facing 500 messages (detail only in logs), typed `confirm` guards on destructive operations, path-traversal-guarded downloads
 
 ## Packages
@@ -158,7 +158,7 @@ committer (blobs don't touch document tables). See
 * [Docker](https://www.docker.com/) — for the dev Postgres and for the production `docker compose` deploy path (see [`deploy/README.md`](deploy/README.md))
 * A Rust `stable` toolchain to build the server binary from source ([`rust-toolchain.toml`](rust-toolchain.toml) is the single source of truth)
 * `jq` for the Quickstart walkthrough
-* Per client SDK: bun/node for TypeScript, cargo for Rust, Python 3.12+ (uv) for Python, Xcode with the Swift 6 toolchain for Swift (Darwin only)
+* Per client SDK: bun/node for TypeScript, cargo for Rust, Python 3.12+ (uv) for Python, Xcode with the Swift 6 toolchain for Swift (Darwin only), Go 1.23+ for Go
 
 ## Prerequisites for dev
 * See [CONTRIBUTING's development setup](CONTRIBUTING.md#development-setup) for the full tool list and first-time setup
@@ -362,8 +362,8 @@ loss is `DROP TABLE` for tables absent from the target snapshot, and migrate dat
 | `DELETE /admin/sessions?expired=true` | Bearer admin key | Revokes every EXPIRED session instance-wide (OAuth/anonymous and admin-key login rows alike — expired rows otherwise linger until each is used or individually revoked). Returns `{ok, revoked}` with the count swept; the dashboard's Sessions page exposes this as "remove all expired". |
 | `WS /admin/stream` | Bearer admin key | Live op-feed stream over WebSocket (subprotocol auth for browsers). |
 | `GET /admin/config` | Bearer admin key | Hot config, redacted (`admin_key`/OAuth secrets/`database_url` → configured-bools only). |
-| `PATCH /admin/config` | Bearer admin key | Mutates `allowed_origins`/`session_ttl_days`/`max_file_size`/`idempotency_ttl_ms`/`max_tables_per_db`/`max_storage_bytes_per_db`/`max_subs_per_db`; validates, persists, swaps live (no restart). |
-| `POST /admin/backup` | Bearer admin key | Spawns a manual `pg_dump` of the live DB (409 if one is already running). Enabled when `RTDB_BACKUP_ENABLED=true`. |
+| `PATCH /admin/config` | Bearer admin key | Mutates the eight hot settings — `allowedOrigins`/`sessionTtlDays`/`maxFileSize`/`idempotencyTtlMs`/`maxTablesPerDb`/`maxStorageBytesPerDb`/`maxSubsPerDb`/`changeLogMaxRows` (camelCase wire names; unknown fields are rejected); validates, persists to the `rtdb_config` row, swaps live (no restart). |
+| `POST /admin/backup` | Bearer admin key | Spawns a manual `pg_dump` of the live DB (409 if one is already running). Always available — `RTDB_BACKUP_ENABLED` gates only the scheduled cron backups. |
 | `GET /admin/backups` | Bearer admin key | Lists existing dump files. |
 | `GET /admin/backups/{name}` | Bearer admin key | Downloads a dump file (path-traversal-guarded). |
 | `DELETE /admin/backups/{name}` | Bearer admin key | Deletes a dump file. |
@@ -462,9 +462,13 @@ behind a proxy or runs as more than one replica.
 The hot-reloadable settings (live on `AppState` as `Arc<ArcSwap<HotConfig>>`,
 seeded from env at first boot, persisted in a single-row `rtdb_config` table,
 and swapable via `PATCH /admin/config` without a restart): `allowed_origins`,
-`session_ttl_days`, `max_file_size`, `idempotency_ttl_ms`, and the three
+`session_ttl_days`, `max_file_size`, `idempotency_ttl_ms`, the three
 per-database quota caps `max_tables_per_db` / `max_storage_bytes_per_db` /
-`max_subs_per_db` (`0` = unlimited, ENH-011). The full set of boot-time vars —
+`max_subs_per_db` (`0` = unlimited, ENH-011), and `change_log_max_rows`
+(durable change-feed retention). **Once any `PATCH /admin/config` has been
+applied, the persisted row is overlaid onto env on every boot — env edits to
+these eight settings stop taking effect; change them via `PATCH /admin/config`
+or the dashboard Settings page.** The full set of boot-time vars —
 OAuth, rate limits, scheduling, presence, image transforms, backups, audit,
 webhooks, OTLP tracing, and more — is annotated in [`.env.example`](.env.example). `RTDB_ALLOWED_ORIGINS` is also the
 exact-match CORS allowlist for `/api/*` and `/auth/*` (GET, POST, OPTIONS;
