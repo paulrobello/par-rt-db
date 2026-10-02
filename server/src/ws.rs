@@ -436,6 +436,7 @@ async fn handle_text_frame(
                 fctx.db,
                 fctx.out_tx,
                 schedule_id,
+                &id,
                 scheduler::cancel(&fctx.state.pool, fctx.db, &id),
             )
             .await
@@ -447,6 +448,7 @@ async fn handle_text_frame(
                 fctx.db,
                 fctx.out_tx,
                 schedule_id,
+                &id,
                 scheduler::set_paused(&fctx.state.pool, fctx.db, &id, true),
             )
             .await
@@ -458,6 +460,7 @@ async fn handle_text_frame(
                 fctx.db,
                 fctx.out_tx,
                 schedule_id,
+                &id,
                 scheduler::set_paused(&fctx.state.pool, fctx.db, &id, false),
             )
             .await
@@ -796,12 +799,16 @@ async fn handle_cancel_workflow(fctx: &FrameCtx<'_>, workflow_id: String, id: St
             false,
             Some(RtDbError::forbidden("read-only token cannot mutate")),
         ),
-        // Cold-db guard (the table is ensured only at scheduler startup):
-        // ensure inline so cancel on a db with no spawned tasks is a clean
-        // `ok: false`, not an error.
-        Ok(()) => match workflows::ensure_table(&state.pool, db).await {
-            Ok(()) => match workflows::cancel(&state.pool, db, &id).await {
-                Ok(ok) => (ok, None),
+        // SEC-002: only the creator may cancel a run.
+        Ok(()) => match workflows::check_owner_of(&state.pool, db, &id, principal).await {
+            // Cold-db guard (the table is ensured only at scheduler startup):
+            // ensure inline so cancel on a db with no spawned tasks is a clean
+            // `ok: false`, not an error.
+            Ok(()) => match workflows::ensure_table(&state.pool, db).await {
+                Ok(()) => match workflows::cancel(&state.pool, db, &id).await {
+                    Ok(ok) => (ok, None),
+                    Err(error) => (false, Some(error)),
+                },
                 Err(error) => (false, Some(error)),
             },
             Err(error) => (false, Some(error)),
@@ -840,34 +847,38 @@ async fn handle_signal_workflow(
         // so a waiting run stays parked at the signal boundary until
         // unfreeze (retry then). Runs not waiting on anything keep advancing
         // via the exempt system arm.
-        Ok(()) => match crate::db::is_read_only(&state.pool, db).await {
-            Ok(true) => (false, Some(RtDbError::read_only())),
-            Err(error) => (false, Some(error)),
-            // Cold-db guard (the table is ensured only at scheduler startup):
-            // ensure inline so signal on a db with no spawned tasks is a clean
-            // typed error, not a 500.
-            Ok(false) => match workflows::ensure_table(&state.pool, db).await {
-                Ok(()) => {
-                    match workflows::deliver_signal(&state.pool, db, &id, &name, payload).await {
-                        Ok(workflows::SignalDelivery::Delivered) => (true, None),
-                        Ok(workflows::SignalDelivery::NotFound) => {
-                            (false, Some(RtDbError::not_found("unknown workflow")))
-                        }
-                        Ok(workflows::SignalDelivery::NotWaiting) => (
-                            false,
-                            Some(RtDbError::conflict("workflow is not waiting for a signal")),
-                        ),
-                        Ok(workflows::SignalDelivery::NameMismatch { waiting_on }) => (
-                            false,
-                            Some(RtDbError::conflict(format!(
-                                "workflow waiting on '{waiting_on}', got '{name}'"
-                            ))),
-                        ),
-                        Err(error) => (false, Some(error)),
-                    }
-                }
+        Ok(()) => match workflows::check_owner_of(&state.pool, db, &id, principal).await {
+            Ok(()) => match crate::db::is_read_only(&state.pool, db).await {
+                Ok(true) => (false, Some(RtDbError::read_only())),
                 Err(error) => (false, Some(error)),
+                // Cold-db guard (the table is ensured only at scheduler startup):
+                // ensure inline so signal on a db with no spawned tasks is a clean
+                // typed error, not a 500.
+                Ok(false) => match workflows::ensure_table(&state.pool, db).await {
+                    Ok(()) => {
+                        match workflows::deliver_signal(&state.pool, db, &id, &name, payload).await
+                        {
+                            Ok(workflows::SignalDelivery::Delivered) => (true, None),
+                            Ok(workflows::SignalDelivery::NotFound) => {
+                                (false, Some(RtDbError::not_found("unknown workflow")))
+                            }
+                            Ok(workflows::SignalDelivery::NotWaiting) => (
+                                false,
+                                Some(RtDbError::conflict("workflow is not waiting for a signal")),
+                            ),
+                            Ok(workflows::SignalDelivery::NameMismatch { waiting_on }) => (
+                                false,
+                                Some(RtDbError::conflict(format!(
+                                    "workflow waiting on '{waiting_on}', got '{name}'"
+                                ))),
+                            ),
+                            Err(error) => (false, Some(error)),
+                        }
+                    }
+                    Err(error) => (false, Some(error)),
+                },
             },
+            Err(error) => (false, Some(error)),
         },
         Err(error) => (false, Some(error)),
     };
@@ -1000,6 +1011,7 @@ async fn run_simple_schedule<'a>(
     db: &'a str,
     out_tx: &'a UnboundedSender<ServerMessage>,
     schedule_id: String,
+    id: &'a str,
     action: impl std::future::Future<Output = Result<bool, RtDbError>> + Send + 'a,
 ) -> bool {
     let (ok, error) = match authorize(&state.pool, principal, db).await {
@@ -1007,12 +1019,16 @@ async fn run_simple_schedule<'a>(
             false,
             Some(RtDbError::forbidden("read-only token cannot mutate")),
         ),
-        // Cold-db guard: ensure the side table inline (it is ensured only at
-        // scheduler startup / db creation) so a manage op on a cold db is a
-        // clean `ok:false` no-op instead of an error.
-        Ok(()) => match scheduler::ensure_table(&state.pool, db).await {
-            Ok(()) => match action.await {
-                Ok(ok) => (ok, None),
+        // SEC-002: only the creator may cancel/pause/resume.
+        Ok(()) => match scheduler::check_owner_of(&state.pool, db, id, principal).await {
+            // Cold-db guard: ensure the side table inline (it is ensured only
+            // at scheduler startup / db creation) so a manage op on a cold db
+            // is a clean `ok:false` no-op instead of an error.
+            Ok(()) => match scheduler::ensure_table(&state.pool, db).await {
+                Ok(()) => match action.await {
+                    Ok(ok) => (ok, None),
+                    Err(error) => (false, Some(error)),
+                },
                 Err(error) => (false, Some(error)),
             },
             Err(error) => (false, Some(error)),

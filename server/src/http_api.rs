@@ -572,6 +572,13 @@ async fn claim_schedules_handler(
     if principal.is_read_only() {
         return Err(RtDbError::forbidden("read-only token cannot mutate"));
     }
+    // SEC-002: the external worker is a machine token by design — a user
+    // session cannot claim (or later finalize) external jobs.
+    if matches!(principal, crate::auth::Principal::User { .. }) {
+        return Err(RtDbError::forbidden(
+            "external schedule claims require a machine token",
+        ));
+    }
     check_http_rate_limits(&state, &principal, &body.db).await?;
     // Cold-db guard (claim is direct table access; no scheduler task needed —
     // external jobs are never internally executed).
@@ -622,6 +629,13 @@ async fn run_finalize_op(
     let principal = authed(state, headers, db).await?;
     if principal.is_read_only() {
         return Err(RtDbError::forbidden("read-only token cannot mutate"));
+    }
+    // SEC-002: the external worker is a machine token by design — a user
+    // session cannot finalize (complete/retry/fail) external jobs.
+    if matches!(principal, crate::auth::Principal::User { .. }) {
+        return Err(RtDbError::forbidden(
+            "external schedule claims require a machine token",
+        ));
     }
     check_http_rate_limits(state, &principal, db).await?;
     scheduler::ensure_table(&state.pool, db).await?;
@@ -733,6 +747,8 @@ async fn run_manage_op(
     if principal.is_read_only() {
         return Err(RtDbError::forbidden("read-only token cannot mutate"));
     }
+    // SEC-002: only the creator may cancel/pause/resume.
+    scheduler::check_owner_of(&state.pool, db, id, &principal).await?;
     check_http_rate_limits(state, &principal, db).await?;
     // Cold-db guard (the table is ensured only at scheduler startup for dbs
     // predating the create-time side-table rollout): ensure inline so manage
@@ -878,6 +894,8 @@ async fn cancel_workflow_handler(
     if principal.is_read_only() {
         return Err(RtDbError::forbidden("read-only token cannot mutate"));
     }
+    // SEC-002: only the creator may cancel a run.
+    workflows::check_owner_of(&state.pool, &body.db, &id, &principal).await?;
     check_http_rate_limits(&state, &principal, &body.db).await?;
     // Cold-db guard (the table is ensured only at scheduler startup): ensure
     // inline so cancel on a db with no spawned tasks is a clean `false`, not
@@ -913,6 +931,8 @@ async fn signal_workflow_handler(
     if principal.is_read_only() {
         return Err(RtDbError::forbidden("read-only token cannot mutate"));
     }
+    // SEC-002: only the creator may signal a run.
+    workflows::check_owner_of(&state.pool, &body.db, &id, &principal).await?;
     check_http_rate_limits(&state, &principal, &body.db).await?;
     // A signal injects the trigger for a frozen database's next document
     // write: reject delivery under the per-db read-only freeze so a waiting

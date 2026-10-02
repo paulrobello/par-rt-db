@@ -703,6 +703,40 @@ pub async fn mark_failed(
     Ok(())
 }
 
+/// SEC-002 ownership gate for workflow cancel and signal: only workers
+/// (machine tokens), admins (who bypass this gate at the transport), or the
+/// CREATOR may operate on a run. A `User` principal must match the row's
+/// stored `enqueuer.user_id`; a `NULL` enqueuer (system or machine start) is
+/// forbidden for users. Machine tokens keep today's behavior (no gate). A
+/// missing row is `NOT_FOUND` (so a signal still gets its typed 404).
+pub async fn check_owner_of(
+    pool: &PgPool,
+    db: &str,
+    id: &str,
+    principal: &crate::auth::Principal,
+) -> Result<(), RtDbError> {
+    validate_db_name(db)?;
+    match principal {
+        crate::auth::Principal::Machine { .. } => Ok(()),
+        crate::auth::Principal::User { user_id, .. } => {
+            let schema = pg_schema(db);
+            let row: Option<(Option<String>,)> = sqlx::query_as(&format!(
+                "SELECT enqueuer->>'user_id' FROM \"{schema}\".workflows WHERE id = $1"
+            ))
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+            match row {
+                None => Err(RtDbError::not_found(format!("workflow {id} not found"))),
+                Some(enqueuer_uid) if enqueuer_uid.0.as_deref() == Some(user_id.as_str()) => Ok(()),
+                Some(_) => Err(RtDbError::forbidden(
+                    "only the run's creator may operate on it",
+                )),
+            }
+        }
+    }
+}
+
 /// Cancel: flip a non-terminal row to `cancelled`. Returns false for a
 /// missing or already-terminal run. An in-flight `running` arm notices at
 /// its next step boundary (`status_of`). Waiting rows are cancellable —

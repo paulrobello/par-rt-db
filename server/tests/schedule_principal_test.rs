@@ -528,3 +528,291 @@ async fn user_workflow_fires_with_enqueuer_row_rights() -> anyhow::Result<()> {
     assert_eq!(titles, vec!["alice's secret".to_string()]);
     Ok(())
 }
+
+// ===========================================================================
+// SEC-002: only workers (machine tokens), admins, or the creator may claim,
+// finalize, cancel, pause, resume, or signal.
+// ===========================================================================
+
+/// (s2-a) User B cannot cancel, pause, or resume user A's job — FORBIDDEN.
+/// The creator (A) can cancel it.
+#[tokio::test]
+async fn sec002_user_b_cannot_cancel_or_pause_as_job() -> anyhow::Result<()> {
+    let (addr, state, db, token_a, token_b) = setup_two_users().await;
+
+    let resp = api_post(
+        addr,
+        "/api/schedule",
+        &token_a,
+        json!({
+            "db": db,
+            "when": {"type": "afterMs", "ms": 60_000},
+            "txn": {"steps": []},
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let schedule_id = body["id"].as_str().expect("id").to_string();
+
+    // B's cancel is FORBIDDEN.
+    let resp = api_post(
+        addr,
+        &format!("/api/schedule/{schedule_id}/cancel"),
+        &token_b,
+        json!({"db": db}),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "B cancel A's job"
+    );
+
+    // B's pause and resume too.
+    let resp = api_post(
+        addr,
+        &format!("/api/schedule/{schedule_id}/pause"),
+        &token_b,
+        json!({"db": db}),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "B pause A's job"
+    );
+    let resp = api_post(
+        addr,
+        &format!("/api/schedule/{schedule_id}/resume"),
+        &token_b,
+        json!({"db": db}),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "B resume A's job"
+    );
+
+    // A NULL-enqueuer (machine-created) job is forbidden for users too.
+    let token = mint_token(addr, &db).await;
+    let resp = api_post(
+        addr,
+        "/api/schedule",
+        &token,
+        json!({
+            "db": db,
+            "when": {"type": "afterMs", "ms": 60_000},
+            "txn": {"steps": []},
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let machine_id = body["id"].as_str().expect("id").to_string();
+    let resp = api_post(
+        addr,
+        &format!("/api/schedule/{machine_id}/cancel"),
+        &token_a,
+        json!({"db": db}),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "user cancel machine job"
+    );
+
+    // The creator CAN cancel.
+    let resp = api_post(
+        addr,
+        &format!("/api/schedule/{schedule_id}/cancel"),
+        &token_a,
+        json!({"db": db}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(resp.json::<serde_json::Value>().await?["ok"], json!(true));
+
+    // And the cancelled row is gone.
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            matches!(
+                scheduler::list(&state.pool, &db).await,
+                Ok(listed) if listed.iter().all(|s| s.id != schedule_id)
+            )
+        })
+        .await
+    );
+    Ok(())
+}
+
+/// (s2-b) A user cannot claim; a machine token still can (and finalize).
+#[tokio::test]
+async fn sec002_user_cannot_claim_machine_can() -> anyhow::Result<()> {
+    let (addr, _state, db, _token_a, token_b) = setup_two_users().await;
+    let token = mint_token(addr, &db).await;
+
+    let resp = api_post(
+        addr,
+        "/api/schedule",
+        &token,
+        json!({
+            "db": db,
+            "when": {"type": "afterMs", "ms": 0},
+            "txn": {"steps": []},
+            "external": true,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // A user session cannot claim.
+    let resp = api_post(addr, "/api/schedule/claim", &token_b, json!({"db": db})).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "user claim rejected"
+    );
+
+    // A machine token still can, and can finalize.
+    let resp = api_post(
+        addr,
+        "/api/schedule/claim",
+        &token,
+        json!({"db": db, "leaseMs": 60_000}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let jobs = body["jobs"].as_array().expect("jobs");
+    assert_eq!(jobs.len(), 1);
+    let job_id = jobs[0]["id"].as_str().expect("id").to_string();
+    let lease = jobs[0]["leaseGeneration"].as_i64().expect("gen");
+
+    let resp = api_post(
+        addr,
+        &format!("/api/schedule/{job_id}/complete"),
+        &token,
+        json!({"db": db, "lease": lease}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    Ok(())
+}
+
+/// (s2-c) Workflow variant: B cannot cancel or signal A's run; the creator
+/// can signal.
+#[tokio::test]
+async fn sec002_workflow_cancel_and_signal_owner_gated() -> anyhow::Result<()> {
+    let (addr, state, db, token_a, token_b) = setup_two_users().await;
+
+    // A starts a run that parks on a signal (so cancel and signal both act
+    // on a live, non-terminal row).
+    let resp = api_post(
+        addr,
+        "/api/workflows",
+        &token_a,
+        json!({
+            "db": db,
+            "spec": {"name": "gate", "steps": [
+                {"txn": {"steps": []}},
+                {"awaitSignal": {"name": "approve", "timeoutMs": 60_000}}
+            ]}
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let run_id = body["id"].as_str().expect("id").to_string();
+
+    // Wait for the run to park at the signal step.
+    let parked = wait_until(Duration::from_secs(10), || async {
+        matches!(
+            rtdb_server::workflows::list(&state.pool, &db, None, 100).await,
+            Ok(ref runs) if runs.iter().any(
+                |w| w.id == run_id && w.status == rtdb_server::protocol::WorkflowStatus::Waiting
+            )
+        )
+    })
+    .await;
+    assert!(parked, "run must park at the signal step");
+
+    // B cannot signal it.
+    let resp = api_post(
+        addr,
+        &format!("/api/workflows/{run_id}/signal"),
+        &token_b,
+        json!({"db": db, "name": "approve"}),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "B signal A's run"
+    );
+
+    // B cannot cancel it either.
+    let resp = api_post(
+        addr,
+        &format!("/api/workflows/{run_id}/cancel"),
+        &token_b,
+        json!({"db": db}),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "B cancel A's run"
+    );
+
+    // The creator CAN signal (a second run, so the first stays parked for
+    // the cancel assertions above).
+    let resp = api_post(
+        addr,
+        "/api/workflows",
+        &token_a,
+        json!({
+            "db": db,
+            "spec": {"name": "gate2", "steps": [
+                {"txn": {"steps": []}},
+                {"awaitSignal": {"name": "go", "timeoutMs": 60_000}}
+            ]}
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let run2 = body["id"].as_str().expect("id").to_string();
+    let parked2 = wait_until(Duration::from_secs(10), || async {
+        matches!(
+            rtdb_server::workflows::list(&state.pool, &db, None, 100).await,
+            Ok(ref runs) if runs.iter().any(
+                |w| w.id == run2 && w.status == rtdb_server::protocol::WorkflowStatus::Waiting
+            )
+        )
+    })
+    .await;
+    assert!(parked2, "run2 must park");
+
+    let resp = api_post(
+        addr,
+        &format!("/api/workflows/{run2}/signal"),
+        &token_a,
+        json!({"db": db, "name": "go"}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "creator signal ok");
+    let delivered = wait_until(Duration::from_secs(10), || async {
+        matches!(
+            rtdb_server::workflows::list(&state.pool, &db, None, 100).await,
+            Ok(ref runs) if runs.iter().any(
+                |w| w.id == run2 && w.status == rtdb_server::protocol::WorkflowStatus::Success
+            )
+        )
+    })
+    .await;
+    assert!(delivered, "run2 must complete after the creator's signal");
+    Ok(())
+}

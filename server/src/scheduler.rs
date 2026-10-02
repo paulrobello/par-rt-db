@@ -515,6 +515,38 @@ pub async fn list(pool: &PgPool, db: &str) -> Result<Vec<ScheduleInfo>, RtDbErro
         .collect()
 }
 
+/// SEC-002 ownership gate for schedule manage ops (cancel/pause/resume) and
+/// workflow signals: only workers (machine tokens), admins (who bypass this
+/// gate entirely at the transport), or the CREATOR may operate on a job. A
+/// `User` principal must match the row's stored `enqueuer.user_id`; a `NULL`
+/// enqueuer (system or machine enqueue) is forbidden for users. Machine
+/// tokens keep today's behavior (no gate). A missing row is `NOT_FOUND`.
+pub async fn check_owner_of(
+    pool: &PgPool,
+    db: &str,
+    id: &str,
+    principal: &Principal,
+) -> Result<(), RtDbError> {
+    validate_db_name(db)?;
+    match principal {
+        Principal::Machine { .. } => Ok(()),
+        Principal::User { user_id, .. } => {
+            let schema = pg_schema(db);
+            let row: Option<(Option<String>,)> = sqlx::query_as(&format!(
+                "SELECT enqueuer->>'user_id' FROM \"{schema}\".scheduled_txns WHERE id = $1"
+            ))
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+            match row {
+                None => Err(RtDbError::not_found(format!("schedule {id} not found"))),
+                Some(enqueuer_uid) if enqueuer_uid.0.as_deref() == Some(user_id.as_str()) => Ok(()),
+                Some(_) => Err(RtDbError::forbidden("only the job's creator may manage it")),
+            }
+        }
+    }
+}
+
 pub async fn cancel(pool: &PgPool, db: &str, id: &str) -> Result<bool, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
