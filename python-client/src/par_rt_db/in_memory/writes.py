@@ -8,7 +8,7 @@ verbatim onto ``_InMemoryStoreCore`` via mixin assembly in
 from __future__ import annotations
 
 import math
-from copy import replace
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from ..errors import ErrorCode, RtDbError
