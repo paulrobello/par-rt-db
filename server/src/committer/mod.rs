@@ -668,6 +668,27 @@ impl Committers {
         }
     }
 
+    /// The shared tail of `channel_for`'s two drain-wait arms (ARC-012): the
+    /// caller registers `notified` + `enable()` WHILE STILL HOLDING the
+    /// `channels` lock (the race-safety requirement — see the draining-arm
+    /// comment there), DROPS the guard, and only then calls this, which awaits
+    /// the drain-completion notify bounded by `deadline`. This helper performs
+    /// no `.await` before the guard is gone — it never touches `channels`.
+    async fn wait_drained(
+        &self,
+        notified: std::pin::Pin<&mut tokio::sync::futures::Notified<'_>>,
+        deadline: std::time::Instant,
+    ) -> Result<(), RtDbError> {
+        if std::time::Instant::now() >= deadline {
+            return Err(RtDbError::internal(
+                "committer for database is draining and did not exit in time",
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let _ = tokio::time::timeout(remaining, notified).await;
+        Ok(())
+    }
+
     /// Returns `db`'s committer sender, lazily spawning the task on first use.
     /// No `.await` occurs while `channels` is locked: the cache-hit fast path
     /// checks and releases the lock immediately; on a miss, the lock is dropped
@@ -728,13 +749,7 @@ impl Committers {
                     tokio::pin!(notified);
                     notified.as_mut().enable();
                     drop(guard);
-                    if std::time::Instant::now() >= deadline {
-                        return Err(RtDbError::internal(
-                            "committer for database is draining and did not exit in time",
-                        ));
-                    }
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    let _ = tokio::time::timeout(remaining, notified).await;
+                    self.wait_drained(notified.as_mut(), deadline).await?;
                     continue;
                 } else if upgrade && self.multi_instance && entry.lease.is_none() {
                     // ENH-022 Stage 4/4c upgrade (takeover) path: retire
@@ -750,13 +765,7 @@ impl Committers {
                     notified.as_mut().enable();
                     drop(guard);
                     let _ = sender.send(CommitterRequest::Shutdown).await;
-                    if std::time::Instant::now() >= deadline {
-                        return Err(RtDbError::internal(
-                            "committer for database is draining and did not exit in time",
-                        ));
-                    }
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    let _ = tokio::time::timeout(remaining, notified).await;
+                    self.wait_drained(notified.as_mut(), deadline).await?;
                     continue;
                 } else {
                     entry.last_activity = std::time::Instant::now();
