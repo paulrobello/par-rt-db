@@ -1665,6 +1665,10 @@ export class InMemoryRtDbClient {
     return `memory://${id}`;
   }
 
+  /** Advances time for the harness: fires due non-paused scheduled jobs,
+   * claims due workflows for execution, then reaps expired documents.
+   * Mirrors the server's scheduler/workflow/TTL background tasks; returns the
+   * number of TTL documents reaped. */
   tick(nowMs?: number): number {
     const now = nowMs ?? this.now();
     this.fireDueJobs(now);
