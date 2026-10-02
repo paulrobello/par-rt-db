@@ -222,12 +222,13 @@ services:
       RTDB_SLOW_QUERY_MS: ${RTDB_SLOW_QUERY_MS:-0}
       RTDB_SLOW_QUERY_CAPACITY: ${RTDB_SLOW_QUERY_CAPACITY:-200}
       RTDB_SLOW_QUERY_LOG_PARAMS: ${RTDB_SLOW_QUERY_LOG_PARAMS:-false}
-      # HTTP rate limiting (fixed-window, in-memory). 0 = unlimited (default).
-      # Per-machine-token caps each token; per-db is shared across all principals
-      # of one database. OAuth sessions carry no token id and are rate-limited
-      # per-db only.
-      RTDB_RATE_LIMIT_PER_TOKEN_RPM: ${RTDB_RATE_LIMIT_PER_TOKEN_RPM:-0}
-      RTDB_RATE_LIMIT_PER_DB_RPM: ${RTDB_RATE_LIMIT_PER_DB_RPM:-0}
+      # HTTP rate limiting (fixed-window, in-memory). Per-machine-token caps
+      # each token; per-db is shared across all principals of one database.
+      # 0 is still accepted and means unlimited (the code default) — these
+      # shipped non-zero defaults make the limiters active out-of-the-box.
+      # OAuth sessions carry no token id and are rate-limited per-db only.
+      RTDB_RATE_LIMIT_PER_TOKEN_RPM: ${RTDB_RATE_LIMIT_PER_TOKEN_RPM:-600}
+      RTDB_RATE_LIMIT_PER_DB_RPM: ${RTDB_RATE_LIMIT_PER_DB_RPM:-6000}
       # ARC-007: multi-instance-only. false (default) counts locally per
       # replica and reconciles with Postgres every RTDB_RATE_LIMIT_SYNC_MS
       # instead of a synchronous per-request round trip; true keeps the exact
