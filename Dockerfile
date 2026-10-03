@@ -15,6 +15,12 @@
 # local toolchains, risking green-CI / broken-image divergence.
 FROM rust:bookworm AS builder
 WORKDIR /build
+# aws-lc-rs (reqwest 0.13 `rustls` provider) compiles C sources: cmake drives
+# the build and nasm assembles the x86_64 acceleration paths. Kept above the
+# COPY layers so the apt install caches independently of manifest changes.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake nasm \
+    && rm -rf /var/lib/apt/lists/*
 COPY rust-toolchain.toml ./
 COPY Cargo.toml Cargo.lock ./
 COPY core/Cargo.toml core/Cargo.toml

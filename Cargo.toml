@@ -42,10 +42,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 base64 = "0.23"
-# Both server and rust-client use rustls-tls + json; server additionally needs
+# Both server and rust-client use rustls + json; server additionally needs
 # `cookies` (re-added in server/Cargo.toml). default-features = false is the
-# common baseline so neither pulls in the native-tls backend.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# common baseline so neither pulls in the native-tls backend. reqwest 0.13's
+# `rustls` feature selects the aws-lc-rs provider and OS trust roots
+# (rustls-platform-verifier): the Docker builder stage needs cmake+nasm and
+# the runtime image ca-certificates (both wired in the Dockerfile).
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 tokio = { version = "1" }
 # server wants default (alloc, oid) features; rust-client compiles it without
 # defaults (optional, behind `in_memory`). Base = no defaults so rust-client

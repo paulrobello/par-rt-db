@@ -63,10 +63,10 @@ hex = "0.4"
 rand = "0.10"
 subtle = "2"
 # HMAC-SHA256 backend for signed storage URLs (signed_url module). Already
-# compiled transitively via rustls (sqlx `tls-rustls`, reqwest `rustls-tls`);
+# compiled transitively via rustls (sqlx `tls-rustls`, reqwest `rustls`);
 # naming it directly adds no new native build.
 ring = "0.17"
-reqwest = { workspace = true, features = ["cookies"] }
+reqwest = { workspace = true, features = ["cookies", "form"] }
 base64.workspace = true
 # Sign in with Apple (ENH-001): Apple rejects a static client_secret, so the
 # secret sent to Apple's token endpoint is a short-lived ES256 JWT the server

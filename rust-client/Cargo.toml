@@ -25,7 +25,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 base64.workspace = true
 bytes.workspace = true
-reqwest = { workspace = true, features = ["stream"], optional = true }
+reqwest = { workspace = true, features = ["stream", "query"], optional = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"], optional = true }
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"], optional = true }
 futures-util = { workspace = true }
