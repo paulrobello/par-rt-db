@@ -184,9 +184,9 @@ pub(crate) async fn stamp_auto_increment(
         // `nextval` takes the sequence name as a regclass — a string literal
         // of the double-quoted ident (a bare quoted identifier would be read
         // as a table reference).
-        let next: i64 = sqlx::query_scalar(&format!(
+        let next: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT nextval('\"{pg_schema_name}\".\"{seq_ident}\"'::regclass)"
-        ))
+        )))
         .fetch_one(&mut *conn)
         .await?;
         doc.insert(field.clone(), serde_json::Value::String(next.to_string()));

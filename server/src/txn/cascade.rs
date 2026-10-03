@@ -73,7 +73,7 @@ async fn visible_child_ids(
     } else {
         sql.push_str(&format!(" LIMIT {}", MAX_CASCADE_ROWS + 1));
     }
-    let rows: Vec<(String,)> = sqlx::query_as(&sql)
+    let rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(parent_id)
         .fetch_all(&mut *conn)
         .await?;
@@ -244,9 +244,9 @@ pub(crate) fn delete_row_cascade<'a>(
         }
 
         let table_ident = pg_table(table_name);
-        let result = sqlx::query(&format!(
+        let result = sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1"
-        ))
+        )))
         .bind(id)
         .execute(&mut *conn)
         .await?;

@@ -218,10 +218,10 @@ pub(crate) async fn step_adjust_counter(
     } else {
         ""
     };
-    let row: Option<serde_json::Value> = sqlx::query_scalar(&format!(
+    let row: Option<serde_json::Value> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT \"doc\" FROM \"{}\".\"{}\" WHERE \"id\" = $1{live_only} FOR UPDATE",
         sctx.pg_schema_name, table_ident
-    ))
+    )))
     .bind(id)
     .fetch_optional(&mut *sctx.tx)
     .await?;
@@ -487,7 +487,7 @@ pub(crate) async fn step_patch_by_query(
     } else {
         format!("{base} WHERE {where_sql} ORDER BY \"created_at\", \"id\" LIMIT ${limit_ph}")
     };
-    let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64)>(&sql);
+    let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64)>(sqlx::AssertSqlSafe(sql));
     for bind in binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),
@@ -547,7 +547,7 @@ pub(crate) async fn step_delete_by_query(
     } else {
         format!("{base} WHERE {where_sql} ORDER BY \"created_at\", \"id\" LIMIT ${limit_ph}")
     };
-    let mut query = sqlx::query_as::<_, (String,)>(&sql);
+    let mut query = sqlx::query_as::<_, (String,)>(sqlx::AssertSqlSafe(sql));
     for bind in binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),
@@ -613,10 +613,10 @@ pub(crate) async fn step_undelete(
     let pg_schema_name = sctx.pg_schema_name;
     // Decode liveness as a boolean (`deleted_at IS NULL`) rather than decoding
     // the timestamptz — the stamp's value is never needed, only its presence.
-    let row: Option<(serde_json::Value, i64, bool)> = sqlx::query_as(&format!(
+    let row: Option<(serde_json::Value, i64, bool)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"doc\", \"created_at\", (\"deleted_at\" IS NULL) AS live \
          FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(id)
     .fetch_optional(&mut *sctx.tx)
     .await?;
@@ -637,11 +637,11 @@ pub(crate) async fn step_undelete(
         sctx.results.push(serde_json::Value::Null);
         return Ok(());
     }
-    let result = sqlx::query(&format!(
+    let result = sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE \"{pg_schema_name}\".\"{table_ident}\" \
          SET \"deleted_at\" = NULL, \"version\" = \"version\" + 1 \
          WHERE \"id\" = $1 AND \"deleted_at\" IS NOT NULL"
-    ))
+    )))
     .bind(id)
     .execute(&mut *sctx.tx)
     .await?;

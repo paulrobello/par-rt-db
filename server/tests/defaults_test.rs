@@ -68,9 +68,9 @@ async fn insert(
 }
 
 async fn fetch_doc(pool: &PgPool, db: &str, id: &str) -> anyhow::Result<serde_json::Value> {
-    let (doc,): (serde_json::Value,) = sqlx::query_as(&format!(
+    let (doc,): (serde_json::Value,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"doc\" FROM \"db_{db}\".\"t_tasks\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(id)
     .fetch_one(pool)
     .await?;
@@ -398,9 +398,9 @@ async fn ttl_default_wins_over_defaults_entry() -> anyhow::Result<()> {
     )
     .await?;
     let id = outcome.results[0]["id"].as_str().unwrap().to_string();
-    let (doc,): (serde_json::Value,) = sqlx::query_as(&format!(
+    let (doc,): (serde_json::Value,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"doc\" FROM \"db_{db}\".\"t_sessions\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&pool)
     .await?;

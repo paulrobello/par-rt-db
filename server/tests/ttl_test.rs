@@ -476,9 +476,9 @@ async fn poll_until_reaped(pool: &sqlx::PgPool, db: &str, table: &str, expired_i
     let schema_name = pg_schema(db);
     let table_ident = ddl::pg_table(table);
     let reaped = wait_until(std::time::Duration::from_secs(10), || async {
-        let count: i64 = sqlx::query_scalar(&format!(
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM \"{schema_name}\".\"{table_ident}\" WHERE id = $1"
-        ))
+        )))
         .bind(expired_id)
         .fetch_one(pool)
         .await
@@ -703,9 +703,9 @@ async fn reaper_bypasses_per_row_owner_auth() {
     let schema_name = pg_schema(&db);
     let notes_table = ddl::pg_table("notes");
     wait_until(std::time::Duration::from_secs(10), || async {
-        let count: i64 = sqlx::query_scalar(&format!(
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM \"{schema_name}\".\"{notes_table}\" WHERE id = $1"
-        ))
+        )))
         .bind(&id)
         .fetch_one(&pool)
         .await
@@ -715,9 +715,9 @@ async fn reaper_bypasses_per_row_owner_auth() {
     .await;
     // Confirm the owner-gated row is gone — the reaper deleted it despite
     // ownerField enforcement that would block any non-owner interactive caller.
-    let count: i64 = sqlx::query_scalar(&format!(
+    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM \"{schema_name}\".\"{notes_table}\" WHERE id = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&pool)
     .await
@@ -814,9 +814,9 @@ async fn reaper_ignores_tables_without_ttl() {
     // `ttl` block means the reaper never considered it.
     let schema_name = pg_schema(&db);
     let plain_table = ddl::pg_table("plain");
-    let plain_count: i64 = sqlx::query_scalar(&format!(
+    let plain_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM \"{schema_name}\".\"{plain_table}\" WHERE id = $1"
-    ))
+    )))
     .bind(&id_plain)
     .fetch_one(&pool)
     .await

@@ -5,7 +5,7 @@
 //! `push_schema` + `insert_snapshot_row` path. Distinct from the `pg_dump`-based
 //! backup/restore in `backup` / `admin/backups`.
 
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 
 use crate::db::validate_db_name;
 use crate::ddl::{pg_schema, pg_table, push_schema, reposition_sequence};
@@ -57,9 +57,9 @@ pub async fn export_database(
 
     for table_name in schema.tables.keys() {
         let table_ident = pg_table(table_name);
-        let rows: Vec<(String, serde_json::Value, i64, i64)> = sqlx::query_as(&format!(
+        let rows: Vec<(String, serde_json::Value, i64, i64)> = sqlx::query_as(AssertSqlSafe(format!(
             "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" ORDER BY \"created_at\", \"id\""
-        ))
+        )))
         .fetch_all(pool)
         .await?;
 
@@ -103,7 +103,7 @@ pub async fn ensure_target_empty(pool: &PgPool, db: &str) -> Result<(), RtDbErro
                 "SELECT EXISTS(SELECT 1 FROM \"{schema_name}\".\"{}\" LIMIT 1)",
                 pg_table(table_name)
             );
-            let (has_rows,): (bool,) = sqlx::query_as(&sql).fetch_one(pool).await?;
+            let (has_rows,): (bool,) = sqlx::query_as(AssertSqlSafe(sql)).fetch_one(pool).await?;
             if has_rows {
                 return Err(RtDbError::conflict(
                     "import-db requires an empty database; create a fresh database or use clone-db",

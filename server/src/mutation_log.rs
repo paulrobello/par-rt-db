@@ -6,7 +6,7 @@
 //! writes only this side table — never document tables.
 
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 
 use crate::db::{now_ms, validate_db_name};
 use crate::ddl::pg_schema;
@@ -24,13 +24,13 @@ pub const DEFAULT_DEDUP_TTL_MS: i64 = 5 * 60 * 1000;
 pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "CREATE TABLE IF NOT EXISTS \"{schema}\".mutations (
             mut_id text PRIMARY KEY,
             result jsonb NOT NULL,
             expires_at bigint NOT NULL
         )"
-    ))
+    )))
     .execute(pool)
     .await?;
     Ok(())
@@ -56,9 +56,9 @@ pub async fn check(pool: &PgPool, db: &str, mut_id: &str) -> Result<Option<Vec<V
     validate_db_name(db)?;
     let schema = pg_schema(db);
 
-    let row: Option<(Value,)> = sqlx::query_as(&format!(
+    let row: Option<(Value,)> = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT result FROM \"{schema}\".mutations WHERE mut_id = $1 AND expires_at > $2"
-    ))
+    )))
     .bind(mut_id)
     .bind(now_ms())
     .fetch_optional(pool)
@@ -86,9 +86,9 @@ pub async fn cleanup_expired(pool: &PgPool, db: &str) -> Result<u64, RtDbError> 
     validate_db_name(db)?;
     let schema = pg_schema(db);
     let now = now_ms();
-    let res = sqlx::query(&format!(
+    let res = sqlx::query(AssertSqlSafe(format!(
         "DELETE FROM \"{schema}\".mutations WHERE expires_at < $1"
-    ))
+    )))
     .bind(now)
     .execute(pool)
     .await?;
@@ -206,19 +206,19 @@ pub async fn store_on(
 
     // An expired row is semantically absent to `check`; clear it so the insert
     // below is not blocked by a stale key. Same transaction — atomic.
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "DELETE FROM \"{schema}\".mutations WHERE mut_id = $1 AND expires_at <= $2"
-    ))
+    )))
     .bind(mut_id)
     .bind(now)
     .execute(&mut *conn)
     .await?;
 
-    let row: Option<(String,)> = sqlx::query_as(&format!(
+    let row: Option<(String,)> = sqlx::query_as(AssertSqlSafe(format!(
         "INSERT INTO \"{schema}\".mutations (mut_id, result, expires_at) VALUES ($1, $2, $3)
          ON CONFLICT (mut_id) DO NOTHING
          RETURNING mut_id"
-    ))
+    )))
     .bind(mut_id)
     .bind(value)
     .bind(expires_at)
@@ -246,10 +246,10 @@ pub async fn store(
         RtDbError::internal("failed to cache mutation result")
     })?;
 
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "INSERT INTO \"{schema}\".mutations (mut_id, result, expires_at) VALUES ($1, $2, $3)
          ON CONFLICT (mut_id) DO NOTHING"
-    ))
+    )))
     .bind(mut_id)
     .bind(value)
     .bind(expires_at)

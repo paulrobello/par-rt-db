@@ -361,9 +361,9 @@ async fn count_eq(
 async fn row_exists(pool: &sqlx::PgPool, db: &str, table: &str, id: &str) -> bool {
     let schema_name = ddl::pg_schema(db);
     let table_ident = ddl::pg_table(table);
-    let n: i64 = sqlx::query_scalar(&format!(
+    let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM \"{schema_name}\".\"{table_ident}\" WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_one(pool)
     .await
@@ -381,10 +381,10 @@ async fn soft_row_state(
 ) -> Option<(serde_json::Value, i64, bool)> {
     let schema_name = ddl::pg_schema(db);
     let table_ident = ddl::pg_table(table);
-    sqlx::query_as(&format!(
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"doc\", \"version\", (\"deleted_at\" IS NULL) AS live \
          FROM \"{schema_name}\".\"{table_ident}\" WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_optional(pool)
     .await
@@ -395,9 +395,9 @@ async fn soft_row_state(
 async fn table_count(pool: &sqlx::PgPool, db: &str, table: &str) -> i64 {
     let schema_name = ddl::pg_schema(db);
     let table_ident = ddl::pg_table(table);
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM \"{schema_name}\".\"{table_ident}\""
-    ))
+    )))
     .fetch_one(pool)
     .await
     .expect("table count")
@@ -414,9 +414,9 @@ async fn typed_col_is_null(
     let schema_name = ddl::pg_schema(db);
     let table_ident = ddl::pg_table(table);
     let col = ddl::pg_col(field);
-    let (is_null,): (bool,) = sqlx::query_as(&format!(
+    let (is_null,): (bool,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT (\"{col}\" IS NULL) FROM \"{schema_name}\".\"{table_ident}\" WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_one(pool)
     .await
@@ -2011,11 +2011,11 @@ async fn cascade_over_budget_conflicts_and_rolls_back() {
     let seeded: u64 = 10_001;
     let schema_name = ddl::pg_schema(&db);
     let table_ident = ddl::pg_table("children");
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO \"{schema_name}\".\"{table_ident}\" (\"id\", \"doc\", \"created_at\", \"f_parentid\") \
          SELECT 'bulk-' || g, jsonb_build_object('note', 'bulk', 'parentId', $1), 1, $1 \
          FROM generate_series(1, {seeded}) g"
-    ))
+    )))
     .bind(&parent_id)
     .execute(&pool)
     .await

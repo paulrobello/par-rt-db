@@ -408,7 +408,9 @@ pub(crate) async fn execute_search(
 ) -> Result<QueryResult, RtDbError> {
     let CompiledQuery { sql, binds, .. } = cq;
     if snippet {
-        let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64, String)>(&sql);
+        let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64, String)>(
+            sqlx::AssertSqlSafe(sql),
+        );
         for bind in binds {
             query = match bind {
                 EqBind::Text(v) => query.bind(v),
@@ -428,7 +430,8 @@ pub(crate) async fn execute_search(
             .collect::<Result<Vec<_>, _>>()?;
         return Ok(QueryResult::Docs(docs));
     }
-    let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql);
+    let mut query =
+        sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(sqlx::AssertSqlSafe(sql));
     for bind in binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),
@@ -651,7 +654,8 @@ pub(crate) async fn execute_vector_search(
     pool: &PgPool,
 ) -> Result<QueryResult, RtDbError> {
     let CompiledQuery { sql, binds, .. } = cq;
-    let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql);
+    let mut query =
+        sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(sqlx::AssertSqlSafe(sql));
     for bind in binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),
@@ -922,7 +926,8 @@ pub(crate) async fn execute_hybrid_search(
     pool: &PgPool,
 ) -> Result<QueryResult, RtDbError> {
     let CompiledQuery { sql, binds, .. } = cq;
-    let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql);
+    let mut query =
+        sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(sqlx::AssertSqlSafe(sql));
     for bind in binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),
@@ -963,8 +968,9 @@ pub(crate) async fn execute_ranked_paginated(
     // fetched separately and normalized to one tuple.
     type RankedRow = (String, serde_json::Value, i64, i64, Option<String>, f64);
     let mut rows: Vec<RankedRow> = if snippet {
-        let mut query =
-            sqlx::query_as::<_, (String, serde_json::Value, i64, i64, String, f64)>(&sql);
+        let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64, String, f64)>(
+            sqlx::AssertSqlSafe(sql),
+        );
         for bind in binds {
             query = match bind {
                 EqBind::Text(v) => query.bind(v),
@@ -982,7 +988,9 @@ pub(crate) async fn execute_ranked_paginated(
             })
             .collect()
     } else {
-        let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64, f64)>(&sql);
+        let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64, f64)>(
+            sqlx::AssertSqlSafe(sql),
+        );
         for bind in binds {
             query = match bind {
                 EqBind::Text(v) => query.bind(v),

@@ -1313,10 +1313,10 @@ async fn interval_fires_repeatedly_and_skips_paused_windows() {
 /// so the lease-level assertions below go through the table directly.
 async fn fence_row(pool: &PgPool, db: &str, id: &str) -> (String, i64, Option<i64>) {
     let schema = rtdb_server::ddl::pg_schema(db);
-    sqlx::query_as(&format!(
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT status, claim_generation, lease_deadline_ms
          FROM \"{schema}\".scheduled_txns WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_one(pool)
     .await

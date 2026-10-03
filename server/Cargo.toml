@@ -50,7 +50,7 @@ tower = "0.5"
 tower-http = { version = "0.7", features = ["trace", "cors", "fs"] }
 serde.workspace = true
 serde_json.workspace = true
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "json"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "json"] }
 thiserror.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

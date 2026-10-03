@@ -363,9 +363,11 @@ async fn read_seeds_missing_tables_on_old_dbs() -> anyhow::Result<()> {
     // Simulate a pre-change-feed db: drop the tables the read path needs.
     let schema = rtdb_server::ddl::pg_schema(&db.0);
     for table in ["changes", "change_head"] {
-        sqlx::query(&format!("DROP TABLE \"{schema}\".\"{table}\""))
-            .execute(&state.pool)
-            .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE \"{schema}\".\"{table}\""
+        )))
+        .execute(&state.pool)
+        .await?;
     }
     let resp = get_changes(addr, &db.0, &token, "").await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK, "read re-seeds");

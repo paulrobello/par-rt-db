@@ -90,10 +90,10 @@ pub(in crate::committer) async fn handle_restore_schema(
         RtDbError::internal("failed to serialize schema")
     })?;
     let schema_name = crate::ddl::pg_schema(&ctx.db);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO \"{schema_name}\".meta (key, value) VALUES ('schema', $1) \
          ON CONFLICT (key) DO UPDATE SET value = excluded.value"
-    ))
+    )))
     .bind(schema_json)
     .execute(&mut *tx)
     .await?;

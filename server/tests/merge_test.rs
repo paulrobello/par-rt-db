@@ -64,10 +64,10 @@ fn insert_doc(table: &str, doc: Value) -> Transaction {
 }
 
 async fn count_sql(pool: &sqlx::PgPool, db: &str, where_sql: &str, bind: &str) -> i64 {
-    let (n,): (i64,) = sqlx::query_as(&format!(
+    let (n,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM \"{}\".\"t_docs\" WHERE {where_sql}",
         rtdb_server::ddl::pg_schema(db)
-    ))
+    )))
     .bind(bind)
     .fetch_one(pool)
     .await
@@ -145,10 +145,10 @@ async fn merge_users_restamps_owner_collaborators_and_bumps_version() -> anyhow:
         0
     );
     // Version bumped on the restamped rows (inserts start at version 1).
-    let (v,): (i64,) = sqlx::query_as(&format!(
+    let (v,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"version\" FROM \"{}\".\"t_docs\" WHERE \"doc\"->'title' = to_jsonb('a'::text)",
         rtdb_server::ddl::pg_schema(&db)
-    ))
+    )))
     .fetch_one(&state.pool)
     .await?;
     assert_eq!(v, 2);
@@ -342,11 +342,11 @@ async fn merge_users_restamps_computed_fields_over_principal_fields() -> anyhow:
     // The computed value was re-derived from the REWRITTEN owner, in both the
     // doc body and the typed column.
     let expected = format!("owner:{real}");
-    let (doc, col): (Value, Option<String>) = sqlx::query_as(&format!(
+    let (doc, col): (Value, Option<String>) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"doc\", \"f_ownerlabel\" FROM \"{}\".\"t_docs\" \
          WHERE \"doc\"->'owner' = to_jsonb($1::text)",
         rtdb_server::ddl::pg_schema(&db)
-    ))
+    )))
     .bind(real)
     .fetch_one(&state.pool)
     .await?;
@@ -528,11 +528,11 @@ async fn merge_users_publishes_committed_restamps_when_it_aborts_mid_way() -> an
     // Fault injection for the abort path: a CHECK constraint that only the
     // restamped beta row violates (a non-23505 statement error). The anon
     // inserts pass it; `apply_update` restamping owner to `real` fails it.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE \"{}\".\"t_beta\" ADD CONSTRAINT \"merge_bomb\" \
          CHECK (NOT (\"f_owner\" = '{real}' AND \"doc\"->>'title' = 'bomb'))",
         rtdb_server::ddl::pg_schema(&db)
-    ))
+    )))
     .execute(&state.pool)
     .await?;
     state
@@ -598,28 +598,28 @@ async fn merge_users_publishes_committed_restamps_when_it_aborts_mid_way() -> an
         other => panic!("expected QueryUpdate, got {other:?}"),
     }
     // Durable state: alpha restamped, beta untouched (both rows keep anon).
-    let (alpha_real,): (i64,) = sqlx::query_as(&format!(
+    let (alpha_real,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM \"{}\".\"t_alpha\" WHERE \"doc\"->'owner' = to_jsonb($1::text)",
         rtdb_server::ddl::pg_schema(&db)
-    ))
+    )))
     .bind(real)
     .fetch_one(&state.pool)
     .await?;
     assert_eq!(alpha_real, 1);
     // Beta: the "a" row restamped before the bomb row aborted; the bomb row
     // keeps the anon owner (its UPDATE failed).
-    let (beta_real,): (i64,) = sqlx::query_as(&format!(
+    let (beta_real,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM \"{}\".\"t_beta\" WHERE \"doc\"->'owner' = to_jsonb($1::text)",
         rtdb_server::ddl::pg_schema(&db)
-    ))
+    )))
     .bind(real)
     .fetch_one(&state.pool)
     .await?;
     assert_eq!(beta_real, 1);
-    let (beta_anon,): (i64,) = sqlx::query_as(&format!(
+    let (beta_anon,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM \"{}\".\"t_beta\" WHERE \"doc\"->'owner' = to_jsonb($1::text)",
         rtdb_server::ddl::pg_schema(&db)
-    ))
+    )))
     .bind(anon)
     .fetch_one(&state.pool)
     .await?;
@@ -657,7 +657,7 @@ async fn merge_users_aborts_on_scan_failure_and_publishes_committed_restamps() -
         &trimmed[..trimmed.rfind('/').expect("database url has a path")]
     };
     let base_pool = crate::common::test_pool(&base_url).await?;
-    sqlx::query(&format!("CREATE DATABASE \"{pg_db}\""))
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{pg_db}\"")))
         .execute(&base_pool)
         .await?;
     let mut config = crate::common::test_config();
@@ -731,10 +731,10 @@ async fn merge_users_aborts_on_scan_failure_and_publishes_committed_restamps() -
         // under the schema. The candidate SELECT then fails (undefined_table) while
         // `database_exists` stays true — a db-alive scan failure must abort, not
         // silently skip the table.
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE \"{}\".\"t_beta\" RENAME TO \"t_beta_gone\"",
             rtdb_server::ddl::pg_schema(&db)
-        ))
+        )))
         .execute(&state.pool)
         .await?;
 
@@ -789,18 +789,18 @@ async fn merge_users_aborts_on_scan_failure_and_publishes_committed_restamps() -
         }
         // Durable state: alpha restamped to the real owner; beta untouched (its
         // doc still carries the anon owner under the renamed table).
-        let (alpha_real,): (i64,) = sqlx::query_as(&format!(
+        let (alpha_real,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM \"{}\".\"t_alpha\" WHERE \"doc\"->'owner' = to_jsonb($1::text)",
             rtdb_server::ddl::pg_schema(&db)
-        ))
+        )))
         .bind(real)
         .fetch_one(&state.pool)
         .await?;
         assert_eq!(alpha_real, 1);
-        let (beta_anon,): (i64,) = sqlx::query_as(&format!(
+        let (beta_anon,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM \"{}\".\"t_beta_gone\" WHERE \"doc\"->'owner' = to_jsonb($1::text)",
         rtdb_server::ddl::pg_schema(&db)
-    ))
+    )))
     .bind(anon)
     .fetch_one(&state.pool)
     .await?;
@@ -826,9 +826,11 @@ async fn merge_users_aborts_on_scan_failure_and_publishes_committed_restamps() -
     // background tasks hold connections open), then force-drop the throwaway
     // PG database so nothing leaks into later runs.
     state.pool.close().await;
-    sqlx::query(&format!("DROP DATABASE IF EXISTS \"{pg_db}\" WITH (FORCE)"))
-        .execute(&base_pool)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS \"{pg_db}\" WITH (FORCE)"
+    )))
+    .execute(&base_pool)
+    .await?;
     base_pool.close().await;
     result
 }
@@ -909,10 +911,10 @@ async fn merge_users_orchestrates_sessions_storage_and_guarded_delete() -> anyho
     assert!(report.anon_deleted);
 
     // The blob now belongs to the real user.
-    let (owner,): (Option<String>,) = sqlx::query_as(&format!(
+    let (owner,): (Option<String>,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT owner_id FROM \"{}\".\"storage\" WHERE id = $1",
         rtdb_server::ddl::pg_schema(&db)
-    ))
+    )))
     .bind(&blob_id)
     .fetch_one(&state.pool)
     .await?;
@@ -1009,10 +1011,10 @@ async fn merge_users_swaps_storage_blobs_in_a_schema_less_db() -> anyhow::Result
     assert!(!report.dbs.contains_key(db.as_str()));
     assert_eq!(report.storage_repointed, 1);
     assert!(report.anon_deleted);
-    let (owner,): (Option<String>,) = sqlx::query_as(&format!(
+    let (owner,): (Option<String>,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT owner_id FROM \"{}\".\"storage\" WHERE id = $1",
         rtdb_server::ddl::pg_schema(&db)
-    ))
+    )))
     .bind(&blob_id)
     .fetch_one(&state.pool)
     .await?;
@@ -1171,10 +1173,10 @@ async fn merge_users_treats_missing_storage_table_as_zero_rows() -> anyhow::Resu
     // (committer.rs); the running committer never re-ensures, so dropping the
     // relation makes the merge's owner swap hit 42P01 (undefined_table) —
     // which must be tolerated as zero rows, not fail the merge.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DROP TABLE \"{}\".\"storage\"",
         rtdb_server::ddl::pg_schema(&db)
-    ))
+    )))
     .execute(&state.pool)
     .await?;
 

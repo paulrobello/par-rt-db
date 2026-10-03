@@ -233,15 +233,15 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     // now-populated subject. The partial unique index tolerates the many NULLs
     // of users who signed in through a different provider.
     for column in ["google_sub", "gitlab_id", "oidc_sub"] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE rtdb_auth.users ADD COLUMN IF NOT EXISTS {column} TEXT NULL"
-        ))
+        )))
         .execute(&mut *conn)
         .await?;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE UNIQUE INDEX IF NOT EXISTS rtdb_auth_users_{column}_key \
              ON rtdb_auth.users ({column}) WHERE {column} IS NOT NULL"
-        ))
+        )))
         .execute(&mut *conn)
         .await?;
     }
@@ -569,10 +569,12 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
     }
 
     let schema_name = pg_schema(name);
-    sqlx::query(&format!("CREATE SCHEMA \"{schema_name}\""))
-        .execute(&mut *tx)
-        .await
-        .map_err(map_duplicate_database_error)?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE SCHEMA \"{schema_name}\""
+    )))
+    .execute(&mut *tx)
+    .await
+    .map_err(map_duplicate_database_error)?;
     // Extensions are database-level in Postgres, and every par-rt-db "database" is
     // a schema in the single `rtdb` Postgres database — so this installs `vector`
     // and `pg_trgm` once into `rtdb`, available to all schemas. `IF NOT EXISTS`
@@ -583,42 +585,42 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
     sqlx::query("CREATE EXTENSION IF NOT EXISTS pg_trgm")
         .execute(&mut *tx)
         .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE \"{schema_name}\".meta (key text PRIMARY KEY, value jsonb NOT NULL)"
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE \"{schema_name}\".mutations (
             mut_id text PRIMARY KEY,
             result jsonb NOT NULL,
             expires_at bigint NOT NULL
         )"
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
 
     // The durable change feed (see `change_log`): counter row seeded at 0 so
     // the first write's UPDATE always matches, `log_id` minted once. The
     // ensure_table path covers dbs created before this existed.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE \"{schema_name}\".change_head (
             ok     boolean PRIMARY KEY DEFAULT true,
             seq    bigint NOT NULL DEFAULT 0,
             log_id text   NOT NULL DEFAULT ''
         )"
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO \"{schema_name}\".change_head (ok, seq, log_id)
          VALUES (true, 0, $1) ON CONFLICT (ok) DO NOTHING"
-    ))
+    )))
     .bind(&new_id()[..16])
     .execute(&mut *tx)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE \"{schema_name}\".changes (
             seq        bigint PRIMARY KEY,
             table_name text NOT NULL,
@@ -627,19 +629,19 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
             doc        jsonb,
             ts         bigint NOT NULL
         )"
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         // CREATE INDEX takes no schema qualifier — the index lands in the
         // table's schema automatically.
         "CREATE INDEX changes_table_seq
          ON \"{schema_name}\".changes (table_name, seq)"
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE \"{schema_name}\".scheduled_txns (
             id          text PRIMARY KEY,
             kind        text NOT NULL,
@@ -659,17 +661,17 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
             last_missed_at bigint,
             enqueuer jsonb
         )"
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE INDEX \"{schema_name}_scheduled_due_idx\"
          ON \"{schema_name}\".scheduled_txns (status, due_at)"
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE \"{schema_name}\".storage (
             id           text PRIMARY KEY,
             sha256       text NOT NULL,
@@ -679,15 +681,15 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
             created_at   bigint NOT NULL,
             owner_id     text
         )"
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
     // Content-addressed dedup: one blob per sha256 so re-uploaded bytes reuse
     // the existing id/URL (ENH-008). See `storage::put` / `ensure_table`.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE UNIQUE INDEX \"{schema_name}_storage_sha256_idx\"
          ON \"{schema_name}\".storage (sha256)"
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
     // ENH-021: chunked storage. The streaming upload path writes 1 MiB chunk
@@ -696,14 +698,14 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
     // chunked upload keeps its bytes here and leaves the inline column NULL.
     // `ensure_table` retrofits both changes (DROP NOT NULL + CREATE TABLE IF
     // NOT EXISTS) onto databases created before this shipped.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE \"{schema_name}\".storage_chunks (
             blob_id text NOT NULL,
             seq     int  NOT NULL,
             bytes   bytea NOT NULL,
             PRIMARY KEY (blob_id, seq)
         )"
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
 
@@ -748,9 +750,11 @@ pub async fn drop_database(pool: &PgPool, name: &str) -> Result<(), RtDbError> {
     // or views depending on them, in one statement. The schema identifier is
     // double-quoted because `pg_schema` produces a validated physical name that
     // may contain characters requiring it; the name value itself is bound.
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema_name}\" CASCADE"))
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS \"{schema_name}\" CASCADE"
+    )))
+    .execute(&mut *tx)
+    .await?;
     sqlx::query("DELETE FROM rtdb_auth.databases WHERE name = $1")
         .bind(name)
         .execute(&mut *tx)
@@ -851,9 +855,9 @@ pub async fn load_schema(pool: &PgPool, db: &str) -> Result<Option<SchemaDef>, R
     validate_db_name(db)?;
     let schema_name = pg_schema(db);
 
-    let row: Option<(serde_json::Value,)> = match sqlx::query_as(&format!(
+    let row: Option<(serde_json::Value,)> = match sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT value FROM \"{schema_name}\".meta WHERE key = 'schema'"
-    ))
+    )))
     .fetch_optional(pool)
     .await
     {

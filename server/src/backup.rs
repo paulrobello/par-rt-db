@@ -885,10 +885,11 @@ mod tests {
                         }
                     };
                     for name in names {
-                        if let Err(e) =
-                            sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
-                                .execute(&pool)
-                                .await
+                        if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(format!(
+                            "DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"
+                        )))
+                        .execute(&pool)
+                        .await
                         {
                             eprintln!("backup-test cleanup: drop {name} failed: {e}");
                         }

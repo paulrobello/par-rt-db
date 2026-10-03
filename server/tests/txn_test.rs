@@ -65,9 +65,9 @@ async fn insert_populates_typed_columns() -> anyhow::Result<()> {
         .to_string();
 
     let pg_schema = format!("db_{db}");
-    let row: (String, String, i64) = sqlx::query_as(&format!(
+    let row: (String, String, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_name\", \"f_status\", \"created_at\" FROM \"{pg_schema}\".\"t_projects\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&pool)
     .await?;
@@ -127,9 +127,9 @@ async fn patch_merges_bumps_version_and_updates_indexed_column() -> anyhow::Resu
     assert_eq!(outcome.results, vec![serde_json::Value::Null]);
 
     let pg_schema = format!("db_{db}");
-    let row: (String, i64) = sqlx::query_as(&format!(
+    let row: (String, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_status\", \"version\" FROM \"{pg_schema}\".\"t_projects\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&pool)
     .await?;
@@ -192,9 +192,9 @@ async fn patch_null_clears_optional_field() -> anyhow::Result<()> {
     .await?;
 
     let pg_schema = format!("db_{db}");
-    let row: (serde_json::Value,) = sqlx::query_as(&format!(
+    let row: (serde_json::Value,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"doc\" FROM \"{pg_schema}\".\"t_workitems\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&pool)
     .await?;
@@ -238,9 +238,9 @@ async fn insert_strips_explicit_null_optional_field() -> anyhow::Result<()> {
         .to_string();
 
     let pg_schema = format!("db_{db}");
-    let row: (serde_json::Value,) = sqlx::query_as(&format!(
+    let row: (serde_json::Value,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"doc\" FROM \"{pg_schema}\".\"t_projects\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&pool)
     .await?;
@@ -414,9 +414,9 @@ async fn replace_overwrites_doc_updates_typed_columns_and_bumps_version() -> any
     );
 
     let pg_schema = format!("db_{db}");
-    let row: (String, String, i64, serde_json::Value) = sqlx::query_as(&format!(
+    let row: (String, String, i64, serde_json::Value) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_name\", \"f_status\", \"version\", \"doc\" FROM \"{pg_schema}\".\"t_projects\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&pool)
     .await?;
@@ -572,9 +572,9 @@ async fn replace_rolled_back_by_later_failed_step() -> anyhow::Result<()> {
     assert_eq!(err.code, ErrorCode::NotFound);
 
     let pg_schema = format!("db_{db}");
-    let row: (String, i64) = sqlx::query_as(&format!(
+    let row: (String, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_name\", \"version\" FROM \"{pg_schema}\".\"t_projects\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&pool)
     .await?;
@@ -632,9 +632,9 @@ async fn delete_removes_row() -> anyhow::Result<()> {
     );
 
     let pg_schema = format!("db_{db}");
-    let count: i64 = sqlx::query_scalar(&format!(
+    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT count(*) FROM \"{pg_schema}\".\"t_projects\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&pool)
     .await?;
@@ -698,9 +698,9 @@ async fn failed_step_rolls_back_earlier_steps_in_same_txn() -> anyhow::Result<()
     assert_eq!(err.code, ErrorCode::NotFound);
 
     let pg_schema = format!("db_{db}");
-    let count: i64 = sqlx::query_scalar(&format!(
+    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT count(*) FROM \"{pg_schema}\".\"t_projects\""
-    ))
+    )))
     .fetch_one(&pool)
     .await?;
     assert_eq!(count, 0);
@@ -886,9 +886,9 @@ async fn upsert_inserts_then_patches_on_by_name() -> anyhow::Result<()> {
     assert_eq!(outcome2.results[0]["id"], serde_json::json!(id));
 
     let pg_schema = format!("db_{db}");
-    let status: String = sqlx::query_scalar(&format!(
+    let status: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_status\" FROM \"{pg_schema}\".\"t_projects\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&pool)
     .await?;
@@ -1452,9 +1452,11 @@ async fn duplicate_insert_on_unique_index_is_conflict_and_rolls_back() -> anyhow
 
     // Rollback proof: the table still has exactly 1 row.
     let pg_schema = format!("db_{db}");
-    let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM \"{pg_schema}\".\"t_t\""))
-        .fetch_one(&pool)
-        .await?;
+    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM \"{pg_schema}\".\"t_t\""
+    )))
+    .fetch_one(&pool)
+    .await?;
     assert_eq!(count, 1);
 
     Ok(())
@@ -1947,9 +1949,12 @@ async fn ops_on_schema_less_registered_db_are_not_found() -> anyhow::Result<()> 
     let db = String::from(crate::common::wrap_test_db(name));
     // Torn state: keep the registry row, drop the backing schema (what an
     // aborted run or a manual DROP SCHEMA leaves behind).
-    sqlx::query(&format!("DROP SCHEMA \"{}\" CASCADE", ddl::pg_schema(&db)))
-        .execute(&state.pool)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA \"{}\" CASCADE",
+        ddl::pg_schema(&db)
+    )))
+    .execute(&state.pool)
+    .await?;
 
     // Schema load answers "no schema" — same as a never-pushed db.
     let err = state

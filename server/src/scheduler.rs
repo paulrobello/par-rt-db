@@ -177,7 +177,7 @@ pub(crate) fn resolve_when(when: ScheduleWhen, now: i64) -> Result<ResolvedWhen,
     }
 }
 
-use sqlx::{PgConnection, PgPool};
+use sqlx::{AssertSqlSafe, PgConnection, PgPool};
 
 use crate::ddl::pg_schema;
 use crate::txn::Transaction;
@@ -221,7 +221,7 @@ pub use crate::protocol::ScheduleInfo;
 pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "CREATE TABLE IF NOT EXISTS \"{schema}\".scheduled_txns (
             id          text PRIMARY KEY,
             kind        text NOT NULL,
@@ -240,70 +240,70 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
             missed_count bigint NOT NULL DEFAULT 0,
             last_missed_at bigint
         )"
-    ))
+    )))
     .execute(pool)
     .await?;
     // Databases created before interval jobs lack the column; additive-only,
     // same IF NOT EXISTS discipline as the schema DDL path.
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "ALTER TABLE \"{schema}\".scheduled_txns
          ADD COLUMN IF NOT EXISTS tz text"
-    ))
+    )))
     .execute(pool)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "ALTER TABLE \"{schema}\".scheduled_txns
          ADD COLUMN IF NOT EXISTS every_ms bigint"
-    ))
+    )))
     .execute(pool)
     .await?;
     // External-claim fencing columns (2026-09-09): pre-existing databases gain
     // them via the same additive ALTER discipline.
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "ALTER TABLE \"{schema}\".scheduled_txns
          ADD COLUMN IF NOT EXISTS external boolean NOT NULL DEFAULT false"
-    ))
+    )))
     .execute(pool)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "ALTER TABLE \"{schema}\".scheduled_txns
          ADD COLUMN IF NOT EXISTS claim_generation bigint NOT NULL DEFAULT 0"
-    ))
+    )))
     .execute(pool)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "ALTER TABLE \"{schema}\".scheduled_txns
          ADD COLUMN IF NOT EXISTS lease_deadline_ms bigint"
-    ))
+    )))
     .execute(pool)
     .await?;
     // Missed-window observability columns: pre-existing databases gain them
     // via the same additive ALTER discipline.
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "ALTER TABLE \"{schema}\".scheduled_txns
          ADD COLUMN IF NOT EXISTS missed_count bigint NOT NULL DEFAULT 0"
-    ))
+    )))
     .execute(pool)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "ALTER TABLE \"{schema}\".scheduled_txns
          ADD COLUMN IF NOT EXISTS last_missed_at bigint"
-    ))
+    )))
     .execute(pool)
     .await?;
     // SEC-001 (2026-10-01): the enqueuing user's durable identity. NULL = a
     // system or machine enqueue, which fires as the bypass principal exactly
     // as before; pre-existing rows keep today's behavior.
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "ALTER TABLE \"{schema}\".scheduled_txns
          ADD COLUMN IF NOT EXISTS enqueuer jsonb"
-    ))
+    )))
     .execute(pool)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "CREATE INDEX IF NOT EXISTS \"{schema}_scheduled_due_idx\"
          ON \"{schema}\".scheduled_txns (status, due_at)"
-    ))
+    )))
     .execute(pool)
     .await?;
     Ok(())
@@ -340,11 +340,11 @@ pub(crate) async fn insert_on(
         })?,
         None => serde_json::Value::Null,
     };
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "INSERT INTO \"{schema}\".scheduled_txns
             (id, kind, due_at, txn, cron, tz, every_ms, status, created_at, external, enqueuer)
          VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, $10)"
-    ))
+    )))
     .bind(&id)
     .bind(kind)
     .bind(due_at)
@@ -466,10 +466,10 @@ pub async fn list(pool: &PgPool, db: &str) -> Result<Vec<ScheduleInfo>, RtDbErro
         i64,
         Option<i64>,
     );
-    let rows: Vec<ScheduleRow> = sqlx::query_as(&format!(
+    let rows: Vec<ScheduleRow> = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT id, kind, due_at, cron, tz, every_ms, status, last_error, created_at, fired_count, external, missed_count, last_missed_at
              FROM \"{schema}\".scheduled_txns ORDER BY due_at, created_at"
-    ))
+    )))
     .fetch_all(pool)
     .await?;
     rows.into_iter()
@@ -532,9 +532,9 @@ pub async fn check_owner_of(
         Principal::Machine { .. } => Ok(()),
         Principal::User { user_id, .. } => {
             let schema = pg_schema(db);
-            let row: Option<(Option<String>,)> = sqlx::query_as(&format!(
+            let row: Option<(Option<String>,)> = sqlx::query_as(AssertSqlSafe(format!(
                 "SELECT enqueuer->>'user_id' FROM \"{schema}\".scheduled_txns WHERE id = $1"
-            ))
+            )))
             .bind(id)
             .fetch_optional(pool)
             .await?;
@@ -550,9 +550,9 @@ pub async fn check_owner_of(
 pub async fn cancel(pool: &PgPool, db: &str, id: &str) -> Result<bool, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    let res = sqlx::query(&format!(
+    let res = sqlx::query(AssertSqlSafe(format!(
         "DELETE FROM \"{schema}\".scheduled_txns WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .execute(pool)
     .await?;
@@ -568,9 +568,9 @@ pub(crate) async fn cancel_on(
 ) -> Result<bool, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    let res = sqlx::query(&format!(
+    let res = sqlx::query(AssertSqlSafe(format!(
         "DELETE FROM \"{schema}\".scheduled_txns WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .execute(&mut *conn)
     .await?;
@@ -591,20 +591,20 @@ pub async fn set_paused(
     validate_db_name(db)?;
     let schema = pg_schema(db);
     let res = if paused {
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "UPDATE \"{schema}\".scheduled_txns SET status = 'paused'
              WHERE id = $1 AND status = 'pending'"
-        ))
+        )))
         .bind(id)
         .execute(pool)
         .await?
     } else {
         // Resume: recompute next fire for cron, shift from resume for
         // interval; one-shot keeps its due_at.
-        let row: Option<RecurringRow> = sqlx::query_as(&format!(
+        let row: Option<RecurringRow> = sqlx::query_as(AssertSqlSafe(format!(
             "SELECT kind, cron, tz, every_ms FROM \"{schema}\".scheduled_txns
              WHERE id = $1 AND status = 'paused'"
-        ))
+        )))
         .bind(id)
         .fetch_optional(pool)
         .await?;
@@ -618,21 +618,21 @@ pub async fn set_paused(
         };
         match next {
             Some(next) => {
-                sqlx::query(&format!(
+                sqlx::query(AssertSqlSafe(format!(
                     "UPDATE \"{schema}\".scheduled_txns
                      SET status = 'pending', due_at = $2, last_error = NULL
                      WHERE id = $1"
-                ))
+                )))
                 .bind(id)
                 .bind(next)
                 .execute(pool)
                 .await?
             }
             None => {
-                sqlx::query(&format!(
+                sqlx::query(AssertSqlSafe(format!(
                     "UPDATE \"{schema}\".scheduled_txns SET status = 'pending'
                      WHERE id = $1"
-                ))
+                )))
                 .bind(id)
                 .execute(pool)
                 .await?
@@ -647,10 +647,10 @@ pub async fn set_paused(
 pub async fn reset_running(pool: &PgPool, db: &str) -> Result<u64, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    let res = sqlx::query(&format!(
+    let res = sqlx::query(AssertSqlSafe(format!(
         "UPDATE \"{schema}\".scheduled_txns SET status = 'pending'
          WHERE status = 'running' AND NOT external"
-    ))
+    )))
     .execute(pool)
     .await?;
     Ok(res.rows_affected())
@@ -664,10 +664,10 @@ pub async fn reset_running(pool: &PgPool, db: &str) -> Result<u64, RtDbError> {
 pub async fn next_due(pool: &PgPool, db: &str) -> Result<Option<i64>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    let row: Option<(Option<i64>,)> = sqlx::query_as(&format!(
+    let row: Option<(Option<i64>,)> = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT MIN(due_at) FROM \"{schema}\".scheduled_txns
          WHERE status = 'pending' AND NOT external"
-    ))
+    )))
     .fetch_optional(pool)
     .await?;
     Ok(row.and_then(|(m,)| m))
@@ -697,7 +697,7 @@ pub async fn claim_due(
         i64,
         Option<serde_json::Value>,
     );
-    let rows: Vec<ClaimRow> = sqlx::query_as(&format!(
+    let rows: Vec<ClaimRow> = sqlx::query_as(AssertSqlSafe(format!(
         "WITH candidates AS MATERIALIZED (
              SELECT id FROM \"{schema}\".scheduled_txns
              WHERE status = 'pending' AND due_at <= $1 AND NOT external
@@ -710,7 +710,7 @@ pub async fn claim_due(
          FROM candidates
          WHERE target.id = candidates.id
          RETURNING target.id, target.kind, target.txn, target.cron, target.tz, target.every_ms, target.due_at, target.enqueuer"
-    ))
+    )))
     .bind(now)
     .bind(batch)
     .fetch_all(pool)
@@ -808,7 +808,7 @@ pub async fn claim_external(
         i64,
         i64,
     );
-    let rows: Vec<ClaimRow> = sqlx::query_as(&format!(
+    let rows: Vec<ClaimRow> = sqlx::query_as(AssertSqlSafe(format!(
         "WITH candidates AS MATERIALIZED (
              SELECT id FROM \"{schema}\".scheduled_txns
              WHERE external
@@ -828,7 +828,7 @@ pub async fn claim_external(
          WHERE target.id = candidates.id
          RETURNING target.id, target.kind, target.due_at, target.txn, target.cron,
                    target.tz, target.every_ms, target.claim_generation, target.lease_deadline_ms"
-    ))
+    )))
     .bind(now)
     .bind(limit)
     .bind(now + lease_ms)
@@ -904,11 +904,11 @@ pub async fn finalize_external(
         ExternalOutcome::Complete => {
             // Recurring jobs need their next due instant first (cron recompute
             // / interval shift), exactly like the internal finalize path.
-            let row: Option<RecurringRow> = sqlx::query_as(&format!(
+            let row: Option<RecurringRow> = sqlx::query_as(AssertSqlSafe(format!(
                 "SELECT kind, cron, tz, every_ms FROM \"{schema}\".scheduled_txns
                  WHERE id = $1 AND external
                    AND status = 'running' AND claim_generation = $2"
-            ))
+            )))
             .bind(id)
             .bind(lease_generation)
             .fetch_optional(pool)
@@ -924,14 +924,14 @@ pub async fn finalize_external(
                             )));
                         }
                     };
-                    let res = sqlx::query(&format!(
+                    let res = sqlx::query(AssertSqlSafe(format!(
                         "UPDATE \"{schema}\".scheduled_txns
                          SET status = 'pending', due_at = $3,
                              fired_count = fired_count + 1, last_error = NULL,
                              lease_deadline_ms = NULL
                          WHERE id = $1 AND external
                            AND status = 'running' AND claim_generation = $2"
-                    ))
+                    )))
                     .bind(id)
                     .bind(lease_generation)
                     .bind(next)
@@ -942,11 +942,11 @@ pub async fn finalize_external(
                 Some(_) => {
                     // One-shot complete = same terminal as the internal path:
                     // the row is gone.
-                    sqlx::query(&format!(
+                    sqlx::query(AssertSqlSafe(format!(
                         "DELETE FROM \"{schema}\".scheduled_txns
                          WHERE id = $1 AND external
                            AND status = 'running' AND claim_generation = $2"
-                    ))
+                    )))
                     .bind(id)
                     .bind(lease_generation)
                     .execute(pool)
@@ -957,13 +957,13 @@ pub async fn finalize_external(
             }
         }
         ExternalOutcome::Retry { delay_ms } => {
-            let res = sqlx::query(&format!(
+            let res = sqlx::query(AssertSqlSafe(format!(
                 "UPDATE \"{schema}\".scheduled_txns
                  SET status = 'pending', due_at = $3, last_error = $4,
                      lease_deadline_ms = NULL
                  WHERE id = $1 AND external
                    AND status = 'running' AND claim_generation = $2"
-            ))
+            )))
             .bind(id)
             .bind(lease_generation)
             .bind(now_ms() + delay_ms)
@@ -973,12 +973,12 @@ pub async fn finalize_external(
             res.rows_affected() > 0
         }
         ExternalOutcome::Fail => {
-            let res = sqlx::query(&format!(
+            let res = sqlx::query(AssertSqlSafe(format!(
                 "UPDATE \"{schema}\".scheduled_txns
                  SET status = 'error', last_error = $3, lease_deadline_ms = NULL
                  WHERE id = $1 AND external
                    AND status = 'running' AND claim_generation = $2"
-            ))
+            )))
             .bind(id)
             .bind(lease_generation)
             .bind(error_text.unwrap_or("failed"))
@@ -991,9 +991,9 @@ pub async fn finalize_external(
     if !affected {
         // Distinguish unknown id (404) from a failed fence (409): the id
         // exists only if the fence is what failed.
-        let exists: Option<(i32,)> = sqlx::query_as(&format!(
+        let exists: Option<(i32,)> = sqlx::query_as(AssertSqlSafe(format!(
             "SELECT 1 FROM \"{schema}\".scheduled_txns WHERE id = $1"
-        ))
+        )))
         .bind(id)
         .fetch_optional(pool)
         .await?;
@@ -1012,9 +1012,9 @@ pub async fn finalize_external(
 pub async fn finalize_one_shot_done(pool: &PgPool, db: &str, id: &str) -> Result<(), RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "DELETE FROM \"{schema}\".scheduled_txns WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .execute(pool)
     .await?;
@@ -1038,12 +1038,12 @@ pub async fn finalize_recurring_next(
     validate_db_name(db)?;
     let schema = pg_schema(db);
     if missed > 0 {
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "UPDATE \"{schema}\".scheduled_txns
              SET status = 'pending', due_at = $2, fired_count = fired_count + 1, last_error = NULL,
                  missed_count = missed_count + $3, last_missed_at = $4
              WHERE id = $1"
-        ))
+        )))
         .bind(id)
         .bind(next_due)
         .bind(missed)
@@ -1051,11 +1051,11 @@ pub async fn finalize_recurring_next(
         .execute(pool)
         .await?;
     } else {
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "UPDATE \"{schema}\".scheduled_txns
              SET status = 'pending', due_at = $2, fired_count = fired_count + 1, last_error = NULL
              WHERE id = $1"
-        ))
+        )))
         .bind(id)
         .bind(next_due)
         .execute(pool)
@@ -1067,9 +1067,9 @@ pub async fn finalize_recurring_next(
 pub async fn mark_error(pool: &PgPool, db: &str, id: &str, msg: &str) -> Result<(), RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    if let Err(e) = sqlx::query(&format!(
+    if let Err(e) = sqlx::query(AssertSqlSafe(format!(
         "UPDATE \"{schema}\".scheduled_txns SET status = 'error', last_error = $2 WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .bind(msg)
     .execute(pool)
@@ -1094,11 +1094,11 @@ pub async fn reschedule_recurring_error(
 ) -> Result<(), RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    if let Err(e) = sqlx::query(&format!(
+    if let Err(e) = sqlx::query(AssertSqlSafe(format!(
         "UPDATE \"{schema}\".scheduled_txns
          SET status = 'pending', due_at = $2, last_error = $3
          WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .bind(next_due)
     .bind(msg)

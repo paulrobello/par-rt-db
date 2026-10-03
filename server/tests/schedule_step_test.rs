@@ -981,9 +981,9 @@ async fn admin_schedules_family_serves_cold_db_without_side_table() -> anyhow::R
     let addr = spawn_app(state).await;
 
     let schema_name = rtdb_server::ddl::pg_schema(&db);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DROP TABLE IF EXISTS \"{schema_name}\".scheduled_txns"
-    ))
+    )))
     .execute(&pool)
     .await?;
 

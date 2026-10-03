@@ -263,7 +263,7 @@ pub(super) async fn db_stats(
         // length-capped) table name, so double-quoting via format! is safe — same pattern as
         // mutation_log.rs. COUNT always returns exactly one row.
         let count_sql = format!("SELECT COUNT(*) FROM \"{pg_schema}\".\"{pg_table}\"");
-        let row_count: i64 = sqlx::query_scalar(&count_sql)
+        let row_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count_sql))
             .fetch_one(&state.pool)
             .await?;
         // Size via the injection-safe %I.%I regclass form, names $n-bound.

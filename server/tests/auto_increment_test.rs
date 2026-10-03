@@ -100,9 +100,9 @@ async fn insert(pool: &PgPool, db: &str, schema: &SchemaDef, doc: serde_json::Va
 }
 
 async fn fetch_doc(pool: &PgPool, db: &str, id: &str) -> serde_json::Value {
-    let (doc,): (serde_json::Value,) = sqlx::query_as(&format!(
+    let (doc,): (serde_json::Value,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"doc\" FROM \"db_{db}\".\"t_tickets\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(id)
     .fetch_one(pool)
     .await
@@ -249,10 +249,10 @@ async fn adjust_counter_is_atomic_and_rolls_back_prior_steps_on_a_bound_failure(
         rtdb_server::error::ErrorCode::PreconditionFailed
     );
     assert_eq!(fetch_doc(&state.pool, &db, &id).await["count"], 7);
-    let missing: Option<String> = sqlx::query_scalar(&format!(
+    let missing: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT \"id\" FROM \"db_{}\".\"t_tickets\" WHERE \"doc\"->>'title' = 'must-rollback'",
         db.0
-    ))
+    )))
     .fetch_optional(&state.pool)
     .await
     .unwrap();

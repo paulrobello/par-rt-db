@@ -259,9 +259,9 @@ async fn insert_maintains_vector_column() {
     )
     .await
     .expect("insert vector doc");
-    let row: (Option<String>,) = sqlx::query_as(&format!(
+    let row: (Option<String>,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"v_by_embedding\"::text FROM \"db_{db}\".\"t_docs\""
-    ))
+    )))
     .fetch_one(&state.pool)
     .await
     .expect("read vector column");
@@ -318,9 +318,9 @@ async fn patch_maintains_vector_column() {
     .await
     .expect("patch vector embedding");
 
-    let row: (Option<String>,) = sqlx::query_as(&format!(
+    let row: (Option<String>,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"v_by_embedding\"::text FROM \"db_{db}\".\"t_docs\""
-    ))
+    )))
     .fetch_one(&state.pool)
     .await
     .expect("read vector column after patch");

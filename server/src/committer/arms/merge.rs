@@ -75,7 +75,8 @@ pub(in crate::committer) async fn handle_merge_users(
             "SELECT \"id\", \"doc\", \"created_at\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE {}",
             predicates.join(" OR ")
         );
-        let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64)>(&sql);
+        let mut query =
+            sqlx::query_as::<_, (String, serde_json::Value, i64)>(sqlx::AssertSqlSafe(sql));
         for _ in 0..binds {
             query = query.bind(anon_id);
         }

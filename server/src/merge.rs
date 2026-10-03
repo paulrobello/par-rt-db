@@ -325,9 +325,9 @@ pub async fn merge_users(
         // Storage owner swap. The table is lazy-created; a db with no uploads
         // yet has no relation — treat undefined_table (42P01) as zero rows.
         let schema_name = crate::ddl::pg_schema(&db);
-        let swapped = sqlx::query(&format!(
+        let swapped = sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE \"{schema_name}\".\"storage\" SET \"owner_id\" = $1 WHERE \"owner_id\" = $2"
-        ))
+        )))
         .bind(real_id)
         .bind(anon_id)
         .execute(&state.pool)

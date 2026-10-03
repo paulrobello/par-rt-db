@@ -1004,9 +1004,9 @@ async fn trgm_gin_index_created_backfilled_and_idempotent() {
     assert!(def.contains("f_body"), "missing body column: {def}");
 
     // Simulate a pre-FM-30 deployment: trigram index gone, schema unchanged.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DROP INDEX \"{schema_name}\".\"tg_notes_search_content\""
-    ))
+    )))
     .execute(pool)
     .await
     .expect("drop trigram GIN");

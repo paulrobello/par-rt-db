@@ -439,7 +439,7 @@ pub(crate) async fn execute_count_terminal(
     pool: &PgPool,
 ) -> Result<QueryResult, RtDbError> {
     let CompiledQuery { sql, binds, .. } = cq;
-    let mut query = sqlx::query_scalar::<_, i64>(&sql);
+    let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql));
     for bind in binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),
@@ -523,7 +523,7 @@ pub(crate) async fn execute_distinct_terminal(
     // (`to_jsonb(NULL)` is SQL NULL), which sorts last under the ORDER BY
     // default — but sqlx cannot decode a NULL cell into `serde_json::Value`,
     // so decode as `Option` and surface those rows as JSON null.
-    let mut query = sqlx::query_as::<_, (Option<serde_json::Value>,)>(&sql);
+    let mut query = sqlx::query_as::<_, (Option<serde_json::Value>,)>(sqlx::AssertSqlSafe(sql));
     for bind in binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),
@@ -948,8 +948,9 @@ pub(crate) async fn execute_aggregate_terminal(
         // `Option` and surface that group's key as JSON null (the value is
         // COALESCEd in the SQL; see compile_aggregate_grouped).
         "aggregate" if sql.contains("GROUP BY") => {
-            let mut query =
-                sqlx::query_as::<_, (Option<serde_json::Value>, serde_json::Value)>(&sql);
+            let mut query = sqlx::query_as::<_, (Option<serde_json::Value>, serde_json::Value)>(
+                sqlx::AssertSqlSafe(sql),
+            );
             for bind in binds {
                 query = match bind {
                     EqBind::Text(v) => query.bind(v),
@@ -970,7 +971,7 @@ pub(crate) async fn execute_aggregate_terminal(
         }
         "aggregate" => {
             let _ = terminal; // shape encoded by SQL; tag unused on this path
-            let mut query = sqlx::query_as::<_, (serde_json::Value,)>(&sql);
+            let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sqlx::AssertSqlSafe(sql));
             for bind in binds {
                 query = match bind {
                     EqBind::Text(v) => query.bind(v),
@@ -983,7 +984,7 @@ pub(crate) async fn execute_aggregate_terminal(
             Ok(QueryResult::Aggregate(v))
         }
         "aggregate_multi" => {
-            let mut query = sqlx::query_as::<_, (serde_json::Value,)>(&sql);
+            let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sqlx::AssertSqlSafe(sql));
             for bind in binds {
                 query = match bind {
                     EqBind::Text(v) => query.bind(v),
@@ -1000,7 +1001,7 @@ pub(crate) async fn execute_aggregate_terminal(
         // object. A NULL group decodes as JSON null inside the array, so no
         // Option decoding is needed.
         "aggregate_multi_groups" => {
-            let mut query = sqlx::query_as::<_, (serde_json::Value,)>(&sql);
+            let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sqlx::AssertSqlSafe(sql));
             for bind in binds {
                 query = match bind {
                     EqBind::Text(v) => query.bind(v),
@@ -1193,7 +1194,8 @@ pub(crate) async fn execute_paginate_terminal(
         eq_len,
         num_items,
     } = ctx;
-    let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql);
+    let mut query =
+        sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(sqlx::AssertSqlSafe(sql));
     for bind in binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),
@@ -1343,7 +1345,8 @@ pub(crate) async fn execute_collect_terminal(
         binds,
         terminal,
     } = cq;
-    let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql);
+    let mut query =
+        sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(sqlx::AssertSqlSafe(sql));
     for bind in binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),
@@ -1537,7 +1540,8 @@ pub(crate) async fn point_read(
     let collaborators_field = sctx.collaborators_field;
     let ctx = sctx.ctx;
     let CompiledQuery { sql, binds, .. } = cq;
-    let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&sql);
+    let mut query =
+        sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(sqlx::AssertSqlSafe(sql));
     for bind in binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),

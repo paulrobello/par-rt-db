@@ -79,9 +79,9 @@ async fn insert_doc(db: &Db, table: &str, doc_json: &str) -> String {
 async fn get_doc(db: &Db, table: &str, id: &str) -> serde_json::Value {
     let schema_name = format!("db_{}", db.name);
     let table_ident = format!("t_{}", table.to_lowercase());
-    let (doc,): (serde_json::Value,) = sqlx::query_as(&format!(
+    let (doc,): (serde_json::Value,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT doc FROM \"{schema_name}\".\"{table_ident}\" WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_one(&db.state.pool)
     .await
@@ -94,9 +94,9 @@ async fn get_doc(db: &Db, table: &str, id: &str) -> serde_json::Value {
 async fn query_docs(db: &Db, table: &str) -> Vec<serde_json::Value> {
     let schema_name = format!("db_{}", db.name);
     let table_ident = format!("t_{}", table.to_lowercase());
-    let rows: Vec<(serde_json::Value,)> = sqlx::query_as(&format!(
+    let rows: Vec<(serde_json::Value,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT doc FROM \"{schema_name}\".\"{table_ident}\""
-    ))
+    )))
     .fetch_all(&db.state.pool)
     .await
     .expect("fetch docs");
@@ -201,9 +201,9 @@ async fn rename_field_renames_indexed_column_and_preserves_value() {
     assert_eq!(doc["fullName"], "Ada");
     // The old `f_name` column is gone; `f_fullname` holds the value.
     let schema_name = format!("db_{}", db.name);
-    let (col,): (String,) = sqlx::query_as(&format!(
+    let (col,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_fullname\" FROM \"{schema_name}\".\"t_users\" WHERE id = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&db.state.pool)
     .await
@@ -232,9 +232,9 @@ async fn rename_table_renames_physical_table() {
     assert!(relation_exists(&db, &format!("\"{schema_name}\".\"t_accounts\"")).await);
     assert!(!relation_exists(&db, &format!("\"{schema_name}\".\"t_users\"")).await);
     // The row is unchanged under the new table name.
-    let (doc,): (serde_json::Value,) = sqlx::query_as(&format!(
+    let (doc,): (serde_json::Value,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT doc FROM \"{schema_name}\".\"t_accounts\" WHERE id = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&db.state.pool)
     .await
@@ -445,9 +445,9 @@ async fn set_default_recomputes_indexed_column() {
     let doc = get_doc(&db, "users", &id).await;
     assert_eq!(doc["score"], 0);
     let schema_name = format!("db_{}", db.name);
-    let (typed,): (f64,) = sqlx::query_as(&format!(
+    let (typed,): (f64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_score\" FROM \"{schema_name}\".\"t_users\" WHERE id = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&db.state.pool)
     .await
@@ -478,9 +478,9 @@ async fn change_type_number_to_string_coerces() {
     assert_eq!(doc["age"], "42");
     // The typed column followed the cast: f_age is now text holding "42".
     let schema_name = format!("db_{}", db.name);
-    let (col,): (String,) = sqlx::query_as(&format!(
+    let (col,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_age\" FROM \"{schema_name}\".\"t_users\" WHERE id = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&db.state.pool)
     .await
@@ -558,17 +558,17 @@ async fn change_type_indexed_column_recompute_with_default() {
     assert_eq!(get_doc(&db, "u", &bad).await["v"], 0);
     // The typed column was recast double precision and recomputed from doc.
     let schema_name = format!("db_{}", db.name);
-    let (good_col,): (f64,) = sqlx::query_as(&format!(
+    let (good_col,): (f64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_v\" FROM \"{schema_name}\".\"t_u\" WHERE id = $1"
-    ))
+    )))
     .bind(&good)
     .fetch_one(&db.state.pool)
     .await
     .expect("fetch f_v good");
     assert_eq!(good_col, 42.0);
-    let (bad_col,): (f64,) = sqlx::query_as(&format!(
+    let (bad_col,): (f64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_v\" FROM \"{schema_name}\".\"t_u\" WHERE id = $1"
-    ))
+    )))
     .bind(&bad)
     .fetch_one(&db.state.pool)
     .await
@@ -605,17 +605,17 @@ async fn change_type_indexed_default_bool_recasts_cleanly_to_number() {
     assert_eq!(get_doc(&db, "u", &good).await["v"], 42.0);
     // The indexed column recast cleanly under the coerced default.
     let schema_name = format!("db_{}", db.name);
-    let (good_col,): (f64,) = sqlx::query_as(&format!(
+    let (good_col,): (f64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_v\" FROM \"{schema_name}\".\"t_u\" WHERE id = $1"
-    ))
+    )))
     .bind(&good)
     .fetch_one(&db.state.pool)
     .await
     .expect("fetch f_v good");
     assert_eq!(good_col, 42.0);
-    let (bad_col,): (f64,) = sqlx::query_as(&format!(
+    let (bad_col,): (f64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_v\" FROM \"{schema_name}\".\"t_u\" WHERE id = $1"
-    ))
+    )))
     .bind(&bad)
     .fetch_one(&db.state.pool)
     .await
@@ -695,9 +695,9 @@ async fn eval_expr_recomputes_indexed_column() {
     assert_eq!(get_doc(&db, "u", &id).await["upper"], "ADA");
     // ... and so does the typed `f_upper` column.
     let schema_name = format!("db_{}", db.name);
-    let (typed,): (String,) = sqlx::query_as(&format!(
+    let (typed,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_upper\" FROM \"{schema_name}\".\"t_u\" WHERE id = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&db.state.pool)
     .await
@@ -921,9 +921,9 @@ async fn dependent_batch_operates_on_renamed_table() {
 
     // The table was renamed, then the field renamed on the renamed table.
     let schema_name = format!("db_{}", db.name);
-    let (doc,): (serde_json::Value,) = sqlx::query_as(&format!(
+    let (doc,): (serde_json::Value,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT doc FROM \"{schema_name}\".\"t_accounts\" WHERE id = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&db.state.pool)
     .await
@@ -1461,10 +1461,10 @@ async fn drop_index_then_re_push_does_not_collide() {
     .expect("apply migration");
     // Persist derived schema (same upsert handle_migrate uses).
     let schema_json = serde_json::to_value(&derived).expect("serialize derived schema");
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO \"{schema_name}\".meta (key, value) VALUES ('schema', $1) \
          ON CONFLICT (key) DO UPDATE SET value = excluded.value"
-    ))
+    )))
     .bind(schema_json)
     .execute(&mut *tx)
     .await
@@ -1489,17 +1489,17 @@ async fn drop_index_then_re_push_does_not_collide() {
     // 4. The re-added index works: insert + query by the indexed field, proving
     //    the column is healthy (present, typed, and populated by backfill).
     let id2 = insert_doc(&db, "users", r#"{"name":"Grace"}"#).await;
-    let (col,): (String,) = sqlx::query_as(&format!(
+    let (col,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_name\" FROM \"{schema_name}\".\"t_users\" WHERE id = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&db.state.pool)
     .await
     .expect("fetch f_name for pre-migration row (backfilled)");
     assert_eq!(col, "Ada");
-    let (col2,): (String,) = sqlx::query_as(&format!(
+    let (col2,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_name\" FROM \"{schema_name}\".\"t_users\" WHERE id = $1"
-    ))
+    )))
     .bind(&id2)
     .fetch_one(&db.state.pool)
     .await
@@ -1555,10 +1555,10 @@ async fn drop_index_keeps_shared_column_when_another_index_uses_it() {
     .await
     .expect("apply migration");
     let schema_json = serde_json::to_value(&derived).expect("serialize derived schema");
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO \"{schema_name}\".meta (key, value) VALUES ('schema', $1) \
          ON CONFLICT (key) DO UPDATE SET value = excluded.value"
-    ))
+    )))
     .bind(schema_json)
     .execute(&mut *tx)
     .await
@@ -1587,9 +1587,9 @@ async fn drop_index_keeps_shared_column_when_another_index_uses_it() {
     );
     // The pre-migration row's `f_name` value was preserved through the dropIndex
     // (the column was not dropped, so its data is intact).
-    let (name1,): (String,) = sqlx::query_as(&format!(
+    let (name1,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_name\" FROM \"{schema_name}\".\"t_users\" WHERE id = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&db.state.pool)
     .await
@@ -1604,17 +1604,17 @@ async fn drop_index_keeps_shared_column_when_another_index_uses_it() {
     // 6. The surviving index still WORKS: insert a new row and confirm its
     //    backing typed columns (`f_name`, `f_owner`) are populated by backfill.
     let id2 = insert_doc(&db, "users", r#"{"name":"Grace","owner":"u2"}"#).await;
-    let (name2,): (String,) = sqlx::query_as(&format!(
+    let (name2,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_name\" FROM \"{schema_name}\".\"t_users\" WHERE id = $1"
-    ))
+    )))
     .bind(&id2)
     .fetch_one(&db.state.pool)
     .await
     .expect("fetch f_name for new row (surviving index column)");
     assert_eq!(name2, "Grace");
-    let (owner2,): (String,) = sqlx::query_as(&format!(
+    let (owner2,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_owner\" FROM \"{schema_name}\".\"t_users\" WHERE id = $1"
-    ))
+    )))
     .bind(&id2)
     .fetch_one(&db.state.pool)
     .await
@@ -1717,10 +1717,10 @@ async fn drop_index_drops_search_and_vector_columns() {
     .await
     .expect("apply migration");
     let derived_json = serde_json::to_value(&derived).expect("serialize derived schema");
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO \"{schema_name}\".meta (key, value) VALUES ('schema', $1) \
          ON CONFLICT (key) DO UPDATE SET value = excluded.value"
-    ))
+    )))
     .bind(derived_json)
     .execute(&mut *tx)
     .await

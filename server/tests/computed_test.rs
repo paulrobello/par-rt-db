@@ -130,9 +130,9 @@ async fn fetch_doc(
     table: &str,
     id: &str,
 ) -> anyhow::Result<serde_json::Value> {
-    let (doc,): (serde_json::Value,) = sqlx::query_as(&format!(
+    let (doc,): (serde_json::Value,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"doc\" FROM \"db_{db}\".\"t_{table}\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(id)
     .fetch_one(pool)
     .await?;
@@ -186,9 +186,9 @@ async fn insert_overwrites_client_supplied_computed_value() -> anyhow::Result<()
 
     // the typed column carries the stamped value — that is what makes the
     // computed field indexable
-    let (col,): (Option<String>,) = sqlx::query_as(&format!(
+    let (col,): (Option<String>,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_fullname\" FROM \"db_{db}\".\"t_users\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&pool)
     .await?;
@@ -559,9 +559,9 @@ async fn div_by_zero_fails_write_and_leaves_doc_unchanged() -> anyhow::Result<()
         err.message
     );
 
-    let (doc, version): (serde_json::Value, i64) = sqlx::query_as(&format!(
+    let (doc, version): (serde_json::Value, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"doc\", \"version\" FROM \"db_{db}\".\"t_metrics\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&pool)
     .await?;
@@ -646,9 +646,9 @@ async fn fetch_doc_and_version(
     table: &str,
     id: &str,
 ) -> anyhow::Result<(serde_json::Value, i64)> {
-    let (doc, version): (serde_json::Value, i64) = sqlx::query_as(&format!(
+    let (doc, version): (serde_json::Value, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"doc\", \"version\" FROM \"db_{db}\".\"t_{table}\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(id)
     .fetch_one(pool)
     .await?;
@@ -755,9 +755,9 @@ async fn rename_field_rewrites_expr_and_patch_recomputes() -> anyhow::Result<()>
     assert!(doc.get("first").is_none(), "doc key was renamed");
 
     // the indexed computed column followed the re-stamp
-    let (col,): (Option<String>,) = sqlx::query_as(&format!(
+    let (col,): (Option<String>,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_fullname\" FROM \"db_{db}\".\"t_users\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&pool)
     .await?;
@@ -902,9 +902,9 @@ async fn eval_expr_restamps_computed_same_migrate() -> anyhow::Result<()> {
     assert_eq!(doc["fullName"], "Grace Hopper", "unaffected row untouched");
 
     // the indexed computed column followed the re-stamp
-    let (col,): (Option<String>,) = sqlx::query_as(&format!(
+    let (col,): (Option<String>,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_fullname\" FROM \"db_{db}\".\"t_users\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(&ada)
     .fetch_one(&pool)
     .await?;
@@ -947,9 +947,9 @@ async fn push_backfills_computed_and_pure_push_rewinds_nothing() -> anyhow::Resu
     let (doc, version) = fetch_doc_and_version(&pool, &db, "users", &id).await?;
     assert_eq!(doc["fullName"], "Ada Lovelace", "backfilled on push");
     assert_eq!(version, 1, "a push backfill is not a write");
-    let (col,): (Option<String>,) = sqlx::query_as(&format!(
+    let (col,): (Option<String>,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_fullname\" FROM \"db_{db}\".\"t_users\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&pool)
     .await?;
@@ -1182,9 +1182,9 @@ async fn set_default_restamps_dependent_computed_values() -> anyhow::Result<()> 
         doc["fullName"], "Ada Lovelace",
         "setDefault feeding a computed input re-stamps in the same migrate"
     );
-    let (col,): (Option<String>,) = sqlx::query_as(&format!(
+    let (col,): (Option<String>,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_fullname\" FROM \"db_{db}\".\"t_users\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(&ada)
     .fetch_one(&pool)
     .await?;
@@ -1261,9 +1261,9 @@ async fn change_type_of_input_restamps_dependent_computed_values() -> anyhow::Re
     let doc = fetch_doc(&pool, &db, "users", &flagged).await?;
     assert_eq!(doc["flag"].as_f64(), Some(1.0));
     assert_eq!(doc["label"], "v=1.0");
-    let (col,): (Option<String>,) = sqlx::query_as(&format!(
+    let (col,): (Option<String>,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_label\" FROM \"db_{db}\".\"t_users\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(&flagged)
     .fetch_one(&pool)
     .await?;

@@ -717,11 +717,11 @@ async fn apply_rename_field(
     // the index keeps working. Do NOT recompute the column as text.
     let old_table = table_def(old, table)?;
     if indexed_fields(old_table).contains(from) {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE \"{schema_name}\".\"{t}\" RENAME COLUMN \"{}\" TO \"{}\"",
             pg_col(from),
             pg_col(to)
-        ))
+        )))
         .execute(&mut **tx)
         .await?;
     }
@@ -752,21 +752,21 @@ async fn apply_rename_table(
     require_table_ident(to)?;
     // Physical table rename; docs are untouched -> no DocOps, but the
     // table is recorded as touched so subscriptions re-run.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE \"{schema_name}\".\"{}\" RENAME TO \"{}\"",
         pg_table(from),
         pg_table(to)
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
     // The auto-increment sequence is standalone and named after the table
     // (`seq_<table>`); it must follow the rename or the next insert's
     // `nextval` targets a missing relation.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER SEQUENCE IF EXISTS \"{schema_name}\".\"{}\" RENAME TO \"{}\"",
         pg_sequence(from),
         pg_sequence(to)
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
     fx.touched.insert(to.to_string());
@@ -818,17 +818,17 @@ async fn apply_drop_field(
     // matching the spec's "DocOps for the affected rows" and the other
     // data-bearing directives. The typed-column drop below is table-wide.
     let ids = ids_where(tx, schema_name, &t, &format!("doc ? '{field}'"), &[]).await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE \"{schema_name}\".\"{t}\" SET doc = doc - '{field}' \
          WHERE doc ? '{field}'"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
     // Drop the typed column (no-op if the field was never indexed).
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE \"{schema_name}\".\"{t}\" DROP COLUMN IF EXISTS \"{}\"",
         pg_col(field)
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
     fx.touched.insert(table.to_string());
@@ -849,15 +849,17 @@ async fn apply_drop_table(
     let fx = &mut *ctx.fx;
     let t = pg_table(name);
     let ids = all_ids(tx, schema_name, &t).await?;
-    sqlx::query(&format!("DROP TABLE \"{schema_name}\".\"{t}\""))
-        .execute(&mut **tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TABLE \"{schema_name}\".\"{t}\""
+    )))
+    .execute(&mut **tx)
+    .await?;
     // Standalone auto-increment sequence: nothing cascades to it, so it is
     // dropped explicitly (guarded — tables without a counter are unaffected).
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DROP SEQUENCE IF EXISTS \"{schema_name}\".\"{}\"",
         pg_sequence(name)
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
     fx.touched.insert(name.to_string());
@@ -888,9 +890,11 @@ async fn apply_drop_index(
     // Index ident mirrors ddl::push_schema's `i_{table}_{name}` (both
     // lowercased). No DocOps; the table is touched so subscriptions re-run.
     let idx = format!("i_{}_{}", table.to_lowercase(), name.to_lowercase());
-    sqlx::query(&format!("DROP INDEX IF EXISTS \"{schema_name}\".\"{idx}\""))
-        .execute(&mut **tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP INDEX IF EXISTS \"{schema_name}\".\"{idx}\""
+    )))
+    .execute(&mut **tx)
+    .await?;
     // `old` is the pre-migration schema (still has the dropped index);
     // `derived` is post-migration (the index is gone). Drop the index's
     // generated/maintained columns that no surviving index owns, so a
@@ -907,15 +911,15 @@ async fn apply_drop_index(
         // …and its `tg_` trigram GIN (FM-30), dropped before any column it
         // references.
         let trgm_idx = format!("tg_{}_{}", table.to_lowercase(), name.to_lowercase());
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DROP INDEX IF EXISTS \"{schema_name}\".\"{trgm_idx}\""
-        ))
+        )))
         .execute(&mut **tx)
         .await?;
         let sv_col = pg_search_col(name);
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE \"{schema_name}\".\"{t_ident}\" DROP COLUMN IF EXISTS \"{sv_col}\""
-        ))
+        )))
         .execute(&mut **tx)
         .await?;
     }
@@ -924,9 +928,9 @@ async fn apply_drop_index(
     // `f_` column).
     if dropped_index.and_then(|i| i.vector.as_ref()).is_some() {
         let v_col = pg_vector_col(name);
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE \"{schema_name}\".\"{t_ident}\" DROP COLUMN IF EXISTS \"{v_col}\""
-        ))
+        )))
         .execute(&mut **tx)
         .await?;
     }
@@ -944,9 +948,9 @@ async fn apply_drop_index(
             continue;
         }
         let col = pg_col(&field_name);
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE \"{schema_name}\".\"{t_ident}\" DROP COLUMN IF EXISTS \"{col}\""
-        ))
+        )))
         .execute(&mut **tx)
         .await?;
     }
@@ -978,11 +982,11 @@ async fn apply_set_default(
     // update they have it, so the `WHERE NOT doc ? '{field}'` predicate
     // would no longer match them.
     let ids = ids_where(tx, schema_name, &t, &format!("NOT doc ? '{field}'"), &[]).await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE \"{schema_name}\".\"{t}\" \
          SET doc = jsonb_set(doc, '{{\"{field}\"}}', $1::jsonb, true) \
          WHERE NOT doc ? '{field}'"
-    ))
+    )))
     .bind(&value_json)
     .execute(&mut **tx)
     .await?;
@@ -1064,8 +1068,8 @@ async fn apply_change_type(
     // matching the spec's "DocOps for the affected rows".
     let ids = ids_where(tx, schema_name, &t, &format!("doc ? '{field}'"), &[]).await?;
     for id in &ids {
-        let row: Option<(Option<serde_json::Value>,)> = sqlx::query_as(&format!(
-            "SELECT doc->'{field}' FROM \"{schema_name}\".\"{t}\" WHERE id = $1"
+        let row: Option<(Option<serde_json::Value>,)> = sqlx::query_as(sqlx::AssertSqlSafe(
+            format!("SELECT doc->'{field}' FROM \"{schema_name}\".\"{t}\" WHERE id = $1"),
         ))
         .bind(id)
         .fetch_optional(&mut **tx)
@@ -1088,11 +1092,11 @@ async fn apply_change_type(
             }
         };
         let s = serde_json::to_string(&new_val).map_err(|e| RtDbError::internal(e.to_string()))?;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE \"{schema_name}\".\"{t}\" \
              SET doc = jsonb_set(doc, '{{\"{field}\"}}', $1::jsonb, true) \
              WHERE id = $2"
-        ))
+        )))
         .bind(&s)
         .bind(id)
         .execute(&mut **tx)
@@ -1106,10 +1110,10 @@ async fn apply_change_type(
     if field_indexed {
         let col = pg_col(field);
         let using_expr = backfill_expr(pg_type, field)?;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE \"{schema_name}\".\"{t}\" \
              ALTER COLUMN \"{col}\" TYPE {pg_type} USING ({using_expr})"
-        ))
+        )))
         .execute(&mut **tx)
         .await?;
     }
@@ -1226,11 +1230,11 @@ async fn apply_eval_expr(
                 None => ("true".to_string(), Vec::new()),
             };
             let ids = ids_where(tx, schema_name, &t, &cond_sql, &binds).await?;
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE \"{schema_name}\".\"{t}\" \
                  SET doc = jsonb_set(doc, '{{\"{set}\"}}', to_jsonb(({raw})), true) \
                  WHERE {cond_sql}"
-            ))
+            )))
             .execute(&mut **tx)
             .await?;
             // The legacy rewrite feeds the same computed re-stamp: whichever
@@ -1324,7 +1328,7 @@ async fn restamp_computed_fields(
                  ELSE jsonb_set(doc, '{{\"{field}\"}}', to_jsonb(({expr_sql})), true) END \
              WHERE id = ANY($1)"
         );
-        let mut q = sqlx::query(&sql).bind(ids);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(ids);
         for b in &binds {
             q = match b {
                 MigrateBind::Text(s) => q.bind(s.as_str()),
@@ -1436,9 +1440,9 @@ async fn load_schema_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     schema_name: &str,
 ) -> Result<Option<SchemaDef>, RtDbError> {
-    let row: Option<(serde_json::Value,)> = sqlx::query_as(&format!(
+    let row: Option<(serde_json::Value,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT value FROM \"{schema_name}\".meta WHERE key = 'schema'"
-    ))
+    )))
     .fetch_optional(&mut **tx)
     .await?;
     match row {
@@ -1467,11 +1471,11 @@ async fn rewrite_doc_key(
     // so a future caller can't bypass it (prior site had no backstop).
     require_field_ident(from)?;
     require_field_ident(to)?;
-    let res = sqlx::query(&format!(
+    let res = sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE \"{schema_name}\".\"{table}\" \
          SET doc = jsonb_set(doc - '{from}', '{{\"{to}\"}}', doc->'{from}', true) \
          WHERE doc ? '{from}'"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
     Ok(res.rows_affected() as i64)
@@ -1491,9 +1495,9 @@ async fn recompute_columns_for_ids(
     if ids.is_empty() {
         return Ok(());
     }
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE \"{schema_name}\".\"{table}\" SET \"{col}\" = {cast_expr} WHERE id = ANY($1)"
-    ))
+    )))
     .bind(ids)
     .execute(&mut **tx)
     .await?;
@@ -1544,9 +1548,9 @@ async fn recompute_all_indexed(
         sets.push(format!("\"{col}\" = {cast_expr}"));
     }
     let sets_clause = sets.join(", ");
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE \"{schema_name}\".\"{table_pg}\" SET {sets_clause} WHERE id = ANY($1)"
-    ))
+    )))
     .bind(ids)
     .execute(&mut **tx)
     .await?;
@@ -1575,7 +1579,7 @@ async fn ids_where(
     binds: &[MigrateBind],
 ) -> Result<Vec<String>, RtDbError> {
     let sql = format!("SELECT id FROM \"{schema_name}\".\"{table}\" WHERE {cond}");
-    let mut q = sqlx::query_as::<_, (String,)>(&sql);
+    let mut q = sqlx::query_as::<_, (String,)>(sqlx::AssertSqlSafe(sql));
     for b in binds {
         q = match b {
             MigrateBind::Text(s) => q.bind(s),
@@ -1597,7 +1601,7 @@ async fn bind_execute(
     binds: &[MigrateBind],
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<(), RtDbError> {
-    let mut q = sqlx::query(sql);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.to_owned()));
     for b in binds {
         q = match b {
             MigrateBind::Text(s) => q.bind(s),

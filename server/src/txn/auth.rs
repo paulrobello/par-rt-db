@@ -45,9 +45,9 @@ pub(crate) async fn check_owner(
     } else {
         ""
     };
-    let row: Option<(serde_json::Value,)> = sqlx::query_as(&format!(
+    let row: Option<(serde_json::Value,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"doc\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1{live_only}"
-    ))
+    )))
     .bind(id)
     .fetch_optional(&mut *conn)
     .await?;

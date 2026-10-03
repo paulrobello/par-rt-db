@@ -415,9 +415,9 @@ pub async fn execute_txn_with_side(
         // back to the plain set_config so the combined query is not wasted on
         // subselects they would ignore.
         if preamble.idem_key.is_none() && !preamble.check_freeze {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SET LOCAL statement_timeout = {STATEMENT_TIMEOUT_MS}"
-            ))
+            )))
             .execute(&mut *tx)
             .await?;
         } else {
@@ -427,7 +427,7 @@ pub async fn execute_txn_with_side(
                  (SELECT result FROM \"{pg_schema_name}\".mutations \
                   WHERE mut_id = $3 AND expires_at > $4)"
             );
-            let row: (String, bool, Option<serde_json::Value>) = sqlx::query_as(&combined)
+            let row: (String, bool, Option<serde_json::Value>) = sqlx::query_as(sqlx::AssertSqlSafe(combined))
                 .bind(STATEMENT_TIMEOUT_MS.to_string())
                 .bind(db)
                 .bind(preamble.idem_key)

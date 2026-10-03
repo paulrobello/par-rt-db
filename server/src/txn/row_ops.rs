@@ -301,7 +301,7 @@ pub(crate) async fn do_insert(
     );
 
     let doc_value = serde_json::Value::Object(stripped.clone());
-    let mut query = sqlx::query(&sql)
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(id.clone())
         .bind(doc_value)
         .bind(created_at);
@@ -353,7 +353,7 @@ pub(crate) async fn apply_update(
     );
 
     let doc_value = serde_json::Value::Object(merged.clone());
-    let mut query = sqlx::query(&sql).bind(doc_value);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(doc_value);
     for bind in binds {
         query = match bind {
             ColBind::Text(v) => query.bind(v),
@@ -393,10 +393,10 @@ pub(crate) async fn do_patch(
     } else {
         ""
     };
-    let row: Option<(serde_json::Value, i64)> = sqlx::query_as(&format!(
+    let row: Option<(serde_json::Value, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"doc\", \"created_at\" FROM \"{pg_schema_name}\".\"{table_ident}\"  \
         WHERE \"id\" = $1{live_only}"
-    ))
+    )))
     .bind(id)
     .fetch_optional(&mut *conn)
     .await?;
@@ -446,10 +446,10 @@ pub(crate) async fn do_replace(
     } else {
         ""
     };
-    let row: Option<(serde_json::Value, i64)> = sqlx::query_as(&format!(
+    let row: Option<(serde_json::Value, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"doc\", \"created_at\" FROM \"{pg_schema_name}\".\"{table_ident}\"  \
         WHERE \"id\" = $1{live_only}"
-    ))
+    )))
     .bind(id)
     .fetch_optional(&mut *conn)
     .await?;
@@ -547,7 +547,7 @@ pub(crate) async fn insert_snapshot_row(
     );
 
     let doc_value = serde_json::Value::Object(doc);
-    let mut query = sqlx::query(&sql)
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(id.to_string())
         .bind(doc_value)
         .bind(created_at)
@@ -579,11 +579,11 @@ pub(crate) async fn do_soft_delete(
     id: &str,
 ) -> Result<(), RtDbError> {
     let table_ident = pg_table(table_name);
-    let result = sqlx::query(&format!(
+    let result = sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE \"{pg_schema_name}\".\"{table_ident}\" \
          SET \"deleted_at\" = now(), \"version\" = \"version\" + 1 \
          WHERE \"id\" = $1 AND \"deleted_at\" IS NULL"
-    ))
+    )))
     .bind(id)
     .execute(&mut *conn)
     .await?;
@@ -610,10 +610,10 @@ pub(crate) async fn do_expect_version(
     } else {
         ""
     };
-    let row: Option<(i64, serde_json::Value)> = sqlx::query_as(&format!(
+    let row: Option<(i64, serde_json::Value)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"version\", \"doc\" FROM \"{pg_schema_name}\".\"{table_ident}\"  \
         WHERE \"id\" = $1{live_only}"
-    ))
+    )))
     .bind(id)
     .fetch_optional(&mut *conn)
     .await?;
@@ -675,7 +675,7 @@ pub(crate) async fn eq_lookup(
         conditions.join(" AND ")
     );
 
-    let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64)>(&sql);
+    let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64)>(sqlx::AssertSqlSafe(sql));
     for bind in binds {
         query = match bind {
             EqBind::Text(v) => query.bind(v),

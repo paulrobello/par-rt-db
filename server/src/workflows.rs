@@ -12,7 +12,7 @@ use crate::protocol::{
     StepOutcome, StepRetry, WorkflowInfo, WorkflowInfoFull, WorkflowSpec, WorkflowStatus,
 };
 use crate::txn::{MAX_STEPS, count_steps};
-use sqlx::{PgConnection, PgPool};
+use sqlx::{AssertSqlSafe, PgConnection, PgPool};
 
 /// Max steps in one workflow spec (spec: bounds).
 pub const MAX_WORKFLOW_STEPS: usize = 64;
@@ -119,7 +119,7 @@ pub struct WorkflowRow {
 pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "CREATE TABLE IF NOT EXISTS \"{schema}\".workflows (
             id            text PRIMARY KEY,
             name          text NOT NULL,
@@ -135,32 +135,32 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
             started_at    bigint,
             finished_at   bigint
         )"
-    ))
+    )))
     .execute(pool)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "CREATE INDEX IF NOT EXISTS \"{schema}_workflows_due_idx\"
          ON \"{schema}\".workflows (status, sleep_until)"
-    ))
+    )))
     .execute(pool)
     .await?;
     // Lazy upgrade for databases that predate awaitSignal (CREATE TABLE IF
     // NOT EXISTS does not touch an existing table).
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "ALTER TABLE \"{schema}\".workflows
             ADD COLUMN IF NOT EXISTS wait_name text,
             ADD COLUMN IF NOT EXISTS waited_since bigint,
             ADD COLUMN IF NOT EXISTS signal_payload jsonb"
-    ))
+    )))
     .execute(pool)
     .await?;
     // SEC-001 (2026-10-01): the enqueuing user's durable identity. NULL = a
     // system or machine enqueue, which advances as the bypass principal
     // exactly as before; pre-existing rows keep today's behavior.
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "ALTER TABLE \"{schema}\".workflows
             ADD COLUMN IF NOT EXISTS enqueuer jsonb"
-    ))
+    )))
     .execute(pool)
     .await?;
     Ok(())
@@ -192,11 +192,11 @@ pub(crate) async fn insert_on(
         })?,
         None => serde_json::Value::Null,
     };
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "INSERT INTO \"{schema}\".workflows
             (id, name, status, spec, sleep_until, created_at, updated_at, enqueuer)
          VALUES ($1, $2, 'pending', $3, $4, $5, $5, $6)"
-    ))
+    )))
     .bind(&id)
     .bind(&spec.name)
     .bind(&spec_json)
@@ -320,7 +320,7 @@ pub async fn claim_due(
 ) -> Result<Vec<WorkflowRow>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    let rows: Vec<ClaimRow> = sqlx::query_as(&format!(
+    let rows: Vec<ClaimRow> = sqlx::query_as(AssertSqlSafe(format!(
         "UPDATE \"{schema}\".workflows
              SET status = 'running', started_at = COALESCE(started_at, $2), updated_at = $2
              WHERE id IN (
@@ -331,7 +331,7 @@ pub async fn claim_due(
              )
              RETURNING id, name, spec, current_step, attempts, sleep_until, step_outcomes,
                        wait_name, waited_since, signal_payload, enqueuer"
-    ))
+    )))
     .bind(now)
     .bind(now)
     .bind(batch)
@@ -387,10 +387,10 @@ fn deser_err<'a>(db: &'a str, id: &'a str) -> impl Fn(serde_json::Error) -> RtDb
 pub async fn reset_running(pool: &PgPool, db: &str) -> Result<u64, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    let res = sqlx::query(&format!(
+    let res = sqlx::query(AssertSqlSafe(format!(
         "UPDATE \"{schema}\".workflows SET status = 'pending', updated_at = $1
          WHERE status = 'running'"
-    ))
+    )))
     .bind(now_ms())
     .execute(pool)
     .await?;
@@ -403,10 +403,10 @@ pub async fn reset_running(pool: &PgPool, db: &str) -> Result<u64, RtDbError> {
 pub async fn next_due(pool: &PgPool, db: &str) -> Result<Option<i64>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    let row: Option<(Option<i64>,)> = sqlx::query_as(&format!(
+    let row: Option<(Option<i64>,)> = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT MIN(sleep_until) FROM \"{schema}\".workflows
          WHERE status IN ('pending', 'waiting')"
-    ))
+    )))
     .fetch_optional(pool)
     .await?;
     Ok(row.and_then(|(m,)| m))
@@ -427,12 +427,12 @@ pub async fn record_step_success(
     let schema = pg_schema(db);
     let outcome_json =
         serde_json::to_value(outcome).map_err(|_| RtDbError::internal("serialize outcome"))?;
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "UPDATE \"{schema}\".workflows
          SET current_step = $2, attempts = 0,
              step_outcomes = step_outcomes || $3::jsonb, updated_at = $4
          WHERE id = $1 AND status = 'running'"
-    ))
+    )))
     .bind(id)
     .bind(current_step as i32)
     .bind(&outcome_json)
@@ -453,11 +453,11 @@ pub async fn set_pending(
 ) -> Result<(), RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "UPDATE \"{schema}\".workflows
          SET status = 'pending', sleep_until = $2, updated_at = $3
          WHERE id = $1 AND status = 'running'"
-    ))
+    )))
     .bind(id)
     .bind(sleep_until)
     .bind(now_ms())
@@ -480,11 +480,11 @@ pub async fn schedule_retry(
 ) -> Result<(), RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "UPDATE \"{schema}\".workflows
          SET status = 'pending', attempts = $2, sleep_until = $3, updated_at = $4
          WHERE id = $1 AND status = 'running'"
-    ))
+    )))
     .bind(id)
     .bind(attempts as i32)
     .bind(sleep_until)
@@ -525,13 +525,13 @@ pub async fn park_waiting(
 ) -> Result<(), RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "UPDATE \"{schema}\".workflows
             SET status = 'waiting', attempts = $2, wait_name = $3,
                 waited_since = $4, sleep_until = $5, signal_payload = NULL,
                 updated_at = $4
          WHERE id = $1 AND status = 'running'"
-    ))
+    )))
     .bind(id)
     .bind(attempts as i32)
     .bind(name)
@@ -559,14 +559,14 @@ pub async fn record_signal_success(
         tracing::error!(error = %err, db, "failed to serialize workflow step outcome");
         RtDbError::internal("failed to record workflow step")
     })?;
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "UPDATE \"{schema}\".workflows
             SET current_step = $2, attempts = 0,
                 step_outcomes = step_outcomes || $3::jsonb,
                 wait_name = NULL, waited_since = NULL, signal_payload = NULL,
                 updated_at = $4
          WHERE id = $1 AND status = 'running'"
-    ))
+    )))
     .bind(id)
     .bind(next_step as i32)
     .bind(&outcome_json)
@@ -609,12 +609,12 @@ pub async fn deliver_signal(
     }
     let schema = pg_schema(db);
     let now = now_ms();
-    let res = sqlx::query(&format!(
+    let res = sqlx::query(AssertSqlSafe(format!(
         "UPDATE \"{schema}\".workflows
             SET status = 'pending', sleep_until = $2, signal_payload = $3,
                 updated_at = $2
          WHERE id = $1 AND status IN ('waiting', 'pending') AND wait_name = $4"
-    ))
+    )))
     .bind(id)
     .bind(now)
     .bind(payload.unwrap_or(serde_json::Value::Null))
@@ -624,9 +624,9 @@ pub async fn deliver_signal(
     if res.rows_affected() > 0 {
         return Ok(SignalDelivery::Delivered);
     }
-    let row: Option<(Option<String>, String)> = sqlx::query_as(&format!(
+    let row: Option<(Option<String>, String)> = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT wait_name, status FROM \"{schema}\".workflows WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_optional(pool)
     .await?;
@@ -651,13 +651,13 @@ pub async fn finalize_success(
     let schema = pg_schema(db);
     let outcome_json =
         serde_json::to_value(outcome).map_err(|_| RtDbError::internal("serialize outcome"))?;
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "UPDATE \"{schema}\".workflows
          SET status = 'success', attempts = 0, last_error = NULL,
              step_outcomes = step_outcomes || $2::jsonb, finished_at = $3, updated_at = $3,
              wait_name = NULL, waited_since = NULL, signal_payload = NULL
          WHERE id = $1 AND status = 'running'"
-    ))
+    )))
     .bind(id)
     .bind(&outcome_json)
     .bind(now_ms())
@@ -682,13 +682,13 @@ pub async fn mark_failed(
     let schema = pg_schema(db);
     let outcome_json =
         serde_json::to_value(outcome).map_err(|_| RtDbError::internal("serialize outcome"))?;
-    if let Err(e) = sqlx::query(&format!(
+    if let Err(e) = sqlx::query(AssertSqlSafe(format!(
         "UPDATE \"{schema}\".workflows
          SET status = 'failed', last_error = $2, attempts = $5,
              step_outcomes = step_outcomes || $3::jsonb, finished_at = $4, updated_at = $4,
              wait_name = NULL, waited_since = NULL, signal_payload = NULL
          WHERE id = $1 AND status = 'running'"
-    ))
+    )))
     .bind(id)
     .bind(error)
     .bind(&outcome_json)
@@ -720,9 +720,9 @@ pub async fn check_owner_of(
         crate::auth::Principal::Machine { .. } => Ok(()),
         crate::auth::Principal::User { user_id, .. } => {
             let schema = pg_schema(db);
-            let row: Option<(Option<String>,)> = sqlx::query_as(&format!(
+            let row: Option<(Option<String>,)> = sqlx::query_as(AssertSqlSafe(format!(
                 "SELECT enqueuer->>'user_id' FROM \"{schema}\".workflows WHERE id = $1"
-            ))
+            )))
             .bind(id)
             .fetch_optional(pool)
             .await?;
@@ -744,12 +744,12 @@ pub async fn check_owner_of(
 pub async fn cancel(pool: &PgPool, db: &str, id: &str) -> Result<bool, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    let res = sqlx::query(&format!(
+    let res = sqlx::query(AssertSqlSafe(format!(
         "UPDATE \"{schema}\".workflows
          SET status = 'cancelled', finished_at = $2, updated_at = $2,
              wait_name = NULL, waited_since = NULL, signal_payload = NULL
          WHERE id = $1 AND status IN ('pending', 'running', 'waiting')"
-    ))
+    )))
     .bind(id)
     .bind(now_ms())
     .execute(pool)
@@ -768,12 +768,12 @@ pub(crate) async fn cancel_on(
 ) -> Result<bool, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    let res = sqlx::query(&format!(
+    let res = sqlx::query(AssertSqlSafe(format!(
         "UPDATE \"{schema}\".workflows
          SET status = 'cancelled', finished_at = $2, updated_at = $2,
              wait_name = NULL, waited_since = NULL, signal_payload = NULL
          WHERE id = $1 AND status IN ('pending', 'running', 'waiting')"
-    ))
+    )))
     .bind(id)
     .bind(now_ms())
     .execute(&mut *conn)
@@ -788,9 +788,9 @@ pub async fn status_of(
 ) -> Result<Option<WorkflowStatus>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    let row: Option<(String,)> = sqlx::query_as(&format!(
+    let row: Option<(String,)> = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT status FROM \"{schema}\".workflows WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_optional(pool)
     .await?;
@@ -867,14 +867,14 @@ pub async fn list(
 ) -> Result<Vec<WorkflowInfo>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    let rows: Vec<InfoRow> = sqlx::query_as(&format!(
+    let rows: Vec<InfoRow> = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT id, name, status, current_step, jsonb_array_length(spec->'steps'), attempts,
                 sleep_until, last_error, wait_name, waited_since,
                 created_at, updated_at, started_at, finished_at
          FROM \"{schema}\".workflows
          WHERE ($1::text IS NULL OR status = $1)
          ORDER BY created_at DESC LIMIT $2"
-    ))
+    )))
     .bind(status.map(WorkflowStatus::as_wire_str))
     .bind(limit as i64)
     .fetch_all(pool)
@@ -907,13 +907,13 @@ type FullRow = (
 pub async fn get(pool: &PgPool, db: &str, id: &str) -> Result<Option<WorkflowInfoFull>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    let row: Option<FullRow> = sqlx::query_as(&format!(
+    let row: Option<FullRow> = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT id, name, status, current_step, jsonb_array_length(spec->'steps'), attempts,
                 sleep_until, last_error, wait_name, waited_since,
                 created_at, updated_at, started_at, finished_at,
                 step_outcomes
          FROM \"{schema}\".workflows WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_optional(pool)
     .await?;
@@ -965,10 +965,12 @@ pub async fn get(pool: &PgPool, db: &str, id: &str) -> Result<Option<WorkflowInf
 pub async fn delete(pool: &PgPool, db: &str, id: &str) -> Result<bool, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    let res = sqlx::query(&format!("DELETE FROM \"{schema}\".workflows WHERE id = $1"))
-        .bind(id)
-        .execute(pool)
-        .await?;
+    let res = sqlx::query(AssertSqlSafe(format!(
+        "DELETE FROM \"{schema}\".workflows WHERE id = $1"
+    )))
+    .bind(id)
+    .execute(pool)
+    .await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -980,9 +982,9 @@ pub async fn count_by_status(
 ) -> Result<Vec<(WorkflowStatus, i64)>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
+    let rows: Vec<(String, i64)> = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT status, COUNT(*) FROM \"{schema}\".workflows GROUP BY status"
-    ))
+    )))
     .fetch_all(pool)
     .await?;
     rows.into_iter()

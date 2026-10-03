@@ -55,26 +55,26 @@ pub(crate) fn kind_str(kind: OpKind) -> &'static str {
 pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE IF NOT EXISTS \"{schema}\".change_head (
             ok     boolean PRIMARY KEY DEFAULT true,
             seq    bigint NOT NULL DEFAULT 0,
             log_id text   NOT NULL DEFAULT ''
         )"
-    ))
+    )))
     .execute(pool)
     .await?;
     // Seed the singleton row (idempotent) so the counter UPDATE always
     // matches. `log_id` mints only on the inserting call — the ON CONFLICT
     // keeps the original mint for the life of the database.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO \"{schema}\".change_head (ok, seq, log_id)
          VALUES (true, 0, $1) ON CONFLICT (ok) DO NOTHING"
-    ))
+    )))
     .bind(&new_id()[..16])
     .execute(pool)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE IF NOT EXISTS \"{schema}\".changes (
             seq        bigint PRIMARY KEY,
             table_name text NOT NULL,
@@ -83,17 +83,17 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
             doc        jsonb,
             ts         bigint NOT NULL
         )"
-    ))
+    )))
     .execute(pool)
     .await?;
     // The table=-filtered poll walks (table_name, seq) — without this index
     // every filtered read scans up to the whole retained window.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         // CREATE INDEX takes no schema qualifier — the index lands in the
         // table's schema automatically.
         "CREATE INDEX IF NOT EXISTS changes_table_seq
          ON \"{schema}\".changes (table_name, seq)"
-    ))
+    )))
     .execute(pool)
     .await?;
     Ok(())
@@ -109,9 +109,9 @@ pub struct Head {
 
 pub async fn head(pool: &PgPool, db: &str) -> Result<Head, RtDbError> {
     let schema = pg_schema(db);
-    let row: (i64, String) = sqlx::query_as(&format!(
+    let row: (i64, String) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT seq, log_id FROM \"{schema}\".change_head WHERE ok"
-    ))
+    )))
     .fetch_optional(pool)
     .await?
     .ok_or_else(|| RtDbError::internal("change head row missing — ensure_table was not called"))?;
@@ -127,10 +127,11 @@ pub async fn head(pool: &PgPool, db: &str) -> Result<Head, RtDbError> {
 /// unfiltered rows still sit between the cursor and the window.
 pub async fn min_seq(pool: &PgPool, db: &str) -> Result<Option<i64>, RtDbError> {
     let schema = pg_schema(db);
-    let row: Option<(Option<i64>,)> =
-        sqlx::query_as(&format!("SELECT min(seq) FROM \"{schema}\".changes"))
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<(Option<i64>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT min(seq) FROM \"{schema}\".changes"
+    )))
+    .fetch_optional(pool)
+    .await?;
     Ok(row.and_then(|(min,)| min))
 }
 
@@ -153,9 +154,9 @@ pub(crate) async fn append(
         return Ok(());
     }
     let count = write_set.docs.len() as i64;
-    let base: (i64,) = sqlx::query_as(&format!(
+    let base: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "UPDATE \"{pg_schema_name}\".change_head SET seq = seq + $1 WHERE ok RETURNING seq"
-    ))
+    )))
     .bind(count)
     .fetch_one(&mut *tx)
     .await?;
@@ -209,7 +210,7 @@ pub(crate) async fn append(
             })
             .collect(),
     );
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         // The CASE matters: a missing doc key or a JSON null must land as SQL
         // NULL (no post-image), never as jsonb `null` — the consumer contract
         // is `doc IS NULL`.
@@ -219,7 +220,7 @@ pub(crate) async fn append(
                       THEN r->'doc' END),
                 (r->>'ts')::bigint
          FROM jsonb_array_elements($1::jsonb) AS r"
-    ))
+    )))
     .bind(rows)
     .execute(&mut *tx)
     .await?;
@@ -273,8 +274,10 @@ pub async fn read_page(
              ORDER BY seq LIMIT $2"
         ),
     };
-    let mut q =
-        sqlx::query_as::<_, (i64, String, String, String, Option<Value>, i64)>(&query).bind(since);
+    let mut q = sqlx::query_as::<_, (i64, String, String, String, Option<Value>, i64)>(
+        sqlx::AssertSqlSafe(query),
+    )
+    .bind(since);
     if let Some(table) = table {
         q = q.bind(table);
     }
@@ -307,10 +310,12 @@ pub async fn trim_expired(pool: &PgPool, db: &str, max_rows: i64) -> Result<u64,
         return Ok(0);
     }
     let schema = pg_schema(db);
-    let res = sqlx::query(&format!("DELETE FROM \"{schema}\".changes WHERE seq <= $1"))
-        .bind(head - max_rows)
-        .execute(pool)
-        .await?;
+    let res = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM \"{schema}\".changes WHERE seq <= $1"
+    )))
+    .bind(head - max_rows)
+    .execute(pool)
+    .await?;
     Ok(res.rows_affected())
 }
 

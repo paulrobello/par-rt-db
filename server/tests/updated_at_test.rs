@@ -80,9 +80,9 @@ async fn insert(pool: &PgPool, db: &str, schema: &SchemaDef, doc: serde_json::Va
 }
 
 async fn fetch_doc(pool: &PgPool, db: &str, id: &str) -> serde_json::Value {
-    let (doc,): (serde_json::Value,) = sqlx::query_as(&format!(
+    let (doc,): (serde_json::Value,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"doc\" FROM \"db_{db}\".\"t_tasks\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(id)
     .fetch_one(pool)
     .await
@@ -236,9 +236,9 @@ async fn insert_stamps_int64_field_as_decimal_string() -> anyhow::Result<()> {
     assert!(stamped > ANCIENT, "stamped with epoch-ms: {stamped}");
 
     // the typed bigint column agrees with the doc body
-    let (col,): (i64,) = sqlx::query_as(&format!(
+    let (col,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"f_updatedat\" FROM \"db_{db}\".\"t_tasks\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&pool)
     .await?;
@@ -451,9 +451,9 @@ async fn cascade_set_null_restamps_child() -> anyhow::Result<()> {
         .await?;
         outcome.results[0]["id"].as_str().unwrap().to_string()
     };
-    let (first,): (i64,) = sqlx::query_as(&format!(
+    let (first,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT (\"doc\"->>'updatedAt')::bigint FROM \"db_{db}\".\"t_children\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(&child)
     .fetch_one(&pool)
     .await?;
@@ -469,9 +469,9 @@ async fn cascade_set_null_restamps_child() -> anyhow::Result<()> {
         }],
     )
     .await?;
-    let (doc,): (serde_json::Value,) = sqlx::query_as(&format!(
+    let (doc,): (serde_json::Value,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"doc\" FROM \"db_{db}\".\"t_children\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(&child)
     .fetch_one(&pool)
     .await?;
@@ -526,9 +526,9 @@ async fn snapshot_export_import_preserves_stamped_value() -> anyhow::Result<()> 
         "schema line carries the declaration"
     );
 
-    let (doc,): (serde_json::Value,) = sqlx::query_as(&format!(
+    let (doc,): (serde_json::Value,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"doc\" FROM \"db_{target}\".\"t_tasks\" WHERE \"id\" = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&pool)
     .await?;

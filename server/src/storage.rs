@@ -17,7 +17,7 @@
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 
 use crate::db::{new_id, now_ms, validate_db_name};
 use crate::ddl::pg_schema;
@@ -42,7 +42,7 @@ pub const STORAGE_CHUNK_BYTES: usize = 1024 * 1024;
 pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "CREATE TABLE IF NOT EXISTS \"{schema}\".storage (
             id           text PRIMARY KEY,
             sha256       text NOT NULL,
@@ -52,14 +52,14 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
             created_at   bigint NOT NULL,
             owner_id     text
         )"
-    ))
+    )))
     .execute(pool)
     .await?;
     // SEC-118: retrofit `owner_id` onto tables created before the column
     // existed. Idempotent — Postgres >= 9.6 supports ADD COLUMN IF NOT EXISTS.
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "ALTER TABLE \"{schema}\".storage ADD COLUMN IF NOT EXISTS owner_id text"
-    ))
+    )))
     .execute(pool)
     .await?;
     // ENH-021: chunked uploads keep their bytes in `storage_chunks` and leave
@@ -67,32 +67,32 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
     // be dropped. Idempotent — re-running on an already-nullable column is a
     // no-op. A legacy row written via the buffer-accepting path still carries
     // inline bytes; the read path falls back to it when no chunk rows exist.
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "ALTER TABLE \"{schema}\".storage ALTER COLUMN bytes DROP NOT NULL"
-    ))
+    )))
     .execute(pool)
     .await?;
     // ENH-021: per-db chunk table. Additive — never alters the legacy `storage`
     // row shape. The composite PRIMARY KEY (blob_id, seq) gives the ordered
     // scan the read path streams over; there is no secondary index because
     // every chunk read is a point lookup on that PK.
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "CREATE TABLE IF NOT EXISTS \"{schema}\".storage_chunks (
             blob_id text NOT NULL,
             seq     int  NOT NULL,
             bytes   bytea NOT NULL,
             PRIMARY KEY (blob_id, seq)
         )"
-    ))
+    )))
     .execute(pool)
     .await?;
     // Best-effort: a database that predates dedup and already holds duplicate
     // hashes cannot build the index, so dedup stays off for it (uploads keep
     // working, `put` simply stores a copy) until an operator clears the dupes.
-    if let Err(e) = sqlx::query(&format!(
+    if let Err(e) = sqlx::query(AssertSqlSafe(format!(
         "CREATE UNIQUE INDEX IF NOT EXISTS \"{schema}_storage_sha256_idx\"
          ON \"{schema}\".storage (sha256)"
-    ))
+    )))
     .execute(pool)
     .await
     {
@@ -168,12 +168,12 @@ pub async fn put(
     let schema = pg_schema(db);
     let id = new_id();
     let mut tx = pool.begin().await?;
-    let inserted: Option<(String,)> = sqlx::query_as(&format!(
+    let inserted: Option<(String,)> = sqlx::query_as(AssertSqlSafe(format!(
         "INSERT INTO \"{schema}\".storage (id, sha256, size, content_type, bytes, created_at, owner_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT DO NOTHING
          RETURNING id"
-    ))
+    )))
     .bind(&id)
     .bind(sha256)
     .bind(size)
@@ -195,9 +195,9 @@ pub async fn put(
         }
         // A blob with this sha256 already exists — reuse its id (dedup hit).
         None => {
-            let (existing,): (String,) = sqlx::query_as(&format!(
+            let (existing,): (String,) = sqlx::query_as(AssertSqlSafe(format!(
                 "SELECT id FROM \"{schema}\".storage WHERE sha256 = $1"
-            ))
+            )))
             .bind(sha256)
             .fetch_one(&mut *tx)
             .await?;
@@ -285,10 +285,10 @@ where
         // Flush full chunks as they form.
         while buf.len() >= STORAGE_CHUNK_BYTES {
             let split: Vec<u8> = buf.drain(..STORAGE_CHUNK_BYTES).collect();
-            sqlx::query(&format!(
+            sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO \"{schema}\".storage_chunks (blob_id, seq, bytes)
                  VALUES ($1, $2, $3)"
-            ))
+            )))
             .bind(&provisional_id)
             .bind(seq)
             .bind(&split)
@@ -301,10 +301,10 @@ where
     // produces a blob with zero chunk rows — the metadata row still carries the
     // authoritative size, and the read path returns an empty body.
     if !buf.is_empty() {
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO \"{schema}\".storage_chunks (blob_id, seq, bytes)
              VALUES ($1, $2, $3)"
-        ))
+        )))
         .bind(&provisional_id)
         .bind(seq)
         .bind(&buf)
@@ -318,12 +318,12 @@ where
     // is absent the insert always lands and dedup is simply off (no target).
     // On a dedup hit we drop the provisional chunks and return the existing id
     // — orphaned chunk rows would bill against the storage quota.
-    let inserted: Option<(String,)> = sqlx::query_as(&format!(
+    let inserted: Option<(String,)> = sqlx::query_as(AssertSqlSafe(format!(
         "INSERT INTO \"{schema}\".storage (id, sha256, size, content_type, bytes, created_at, owner_id)
          VALUES ($1, $2, $3, $4, NULL, $5, $6)
          ON CONFLICT (sha256) DO NOTHING
          RETURNING id"
-    ))
+    )))
     .bind(&provisional_id)
     .bind(&sha256)
     .bind(size)
@@ -345,15 +345,15 @@ where
             // Dedup hit: a blob with this sha256 already exists. Drop the
             // provisional chunks so they don't leak (orphans would bill against
             // the storage quota via `pg_total_relation_size`).
-            sqlx::query(&format!(
+            sqlx::query(AssertSqlSafe(format!(
                 "DELETE FROM \"{schema}\".storage_chunks WHERE blob_id = $1"
-            ))
+            )))
             .bind(&provisional_id)
             .execute(&mut *tx)
             .await?;
-            let (existing,): (String,) = sqlx::query_as(&format!(
+            let (existing,): (String,) = sqlx::query_as(AssertSqlSafe(format!(
                 "SELECT id FROM \"{schema}\".storage WHERE sha256 = $1"
-            ))
+            )))
             .bind(&sha256)
             .fetch_one(&mut *tx)
             .await?;
@@ -400,9 +400,9 @@ pub async fn get(
     // Read metadata + inline bytes in one round-trip. `bytes` is nullable now
     // (chunked uploads leave it NULL); a NULL inline bytea means "look in
     // storage_chunks".
-    let row: Option<(Option<Vec<u8>>, Option<String>)> = sqlx::query_as(&format!(
+    let row: Option<(Option<Vec<u8>>, Option<String>)> = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT bytes, content_type FROM \"{schema}\".storage WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_optional(pool)
     .await?;
@@ -414,9 +414,9 @@ pub async fn get(
         Some(bytes) => Ok(Some((Bytes::from(bytes), content_type))),
         // Chunked blob — reassemble from storage_chunks ordered by seq.
         None => {
-            let chunks: Vec<(Vec<u8>,)> = sqlx::query_as(&format!(
+            let chunks: Vec<(Vec<u8>,)> = sqlx::query_as(AssertSqlSafe(format!(
                 "SELECT bytes FROM \"{schema}\".storage_chunks WHERE blob_id = $1 ORDER BY seq"
-            ))
+            )))
             .bind(id)
             .fetch_all(pool)
             .await?;
@@ -445,9 +445,9 @@ pub async fn get(
 pub async fn total_bytes(pool: &PgPool, db: &str, id: &str) -> Result<Option<u64>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    let row: Option<(i64,)> = sqlx::query_as(&format!(
+    let row: Option<(i64,)> = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT size FROM \"{schema}\".storage WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_optional(pool)
     .await?;
@@ -475,9 +475,9 @@ pub async fn probe_layout(
 ) -> Result<Option<(BlobLayout, Option<String>)>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    let row: Option<(Option<Vec<u8>>, Option<String>)> = sqlx::query_as(&format!(
+    let row: Option<(Option<Vec<u8>>, Option<String>)> = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT bytes, content_type FROM \"{schema}\".storage WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_optional(pool)
     .await?;
@@ -531,7 +531,7 @@ pub fn stream_chunks(
             "SELECT bytes FROM \"{schema}\".storage_chunks WHERE blob_id = $1 ORDER BY seq"
         );
         use futures::stream::StreamExt as _;
-        let mut rows = sqlx::query_as::<_, (Vec<u8>,)>(&query)
+        let mut rows = sqlx::query_as::<_, (Vec<u8>,)>(AssertSqlSafe(query))
             .bind(&id)
             .fetch(&pool);
         while let Some(row_res) = rows.next().await {
@@ -573,9 +573,9 @@ pub async fn get_range(
     let schema = pg_schema(db);
     // Resolve layout: a NULL inline bytes column means chunked. The metadata
     // row's content_type rides along either way.
-    let row: Option<(Option<Vec<u8>>, Option<String>)> = sqlx::query_as(&format!(
+    let row: Option<(Option<Vec<u8>>, Option<String>)> = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT bytes, content_type FROM \"{schema}\".storage WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_optional(pool)
     .await?;
@@ -589,10 +589,10 @@ pub async fn get_range(
             // favor of a cheap NULL check; the `substring` path keeps memory
             // bounded on legacy blobs too — SEC-123).
             let len = end.saturating_sub(start).saturating_add(1);
-            let slice_row: Option<(Vec<u8>,)> = sqlx::query_as(&format!(
+            let slice_row: Option<(Vec<u8>,)> = sqlx::query_as(AssertSqlSafe(format!(
                 "SELECT substring(bytes FROM $1::int FOR $2::int)
                  FROM \"{schema}\".storage WHERE id = $3"
-            ))
+            )))
             .bind((start as i64) + 1)
             .bind(len as i64)
             .bind(id)
@@ -605,11 +605,11 @@ pub async fn get_range(
             let chunk_size = STORAGE_CHUNK_BYTES as u64;
             let seq_lo = (start / chunk_size) as i32;
             let seq_hi = (end / chunk_size) as i32;
-            let rows: Vec<(i32, Vec<u8>)> = sqlx::query_as(&format!(
+            let rows: Vec<(i32, Vec<u8>)> = sqlx::query_as(AssertSqlSafe(format!(
                 "SELECT seq, bytes FROM \"{schema}\".storage_chunks
                  WHERE blob_id = $1 AND seq BETWEEN $2 AND $3
                  ORDER BY seq"
-            ))
+            )))
             .bind(id)
             .bind(seq_lo)
             .bind(seq_hi)
@@ -646,10 +646,10 @@ pub async fn get_range(
 pub async fn get_meta(pool: &PgPool, db: &str, id: &str) -> Result<Option<FileMeta>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    let row: Option<StorageMetaRow> = sqlx::query_as(&format!(
+    let row: Option<StorageMetaRow> = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT id, sha256, size, content_type, created_at, owner_id
          FROM \"{schema}\".storage WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_optional(pool)
     .await?;
@@ -663,12 +663,12 @@ pub async fn get_meta(pool: &PgPool, db: &str, id: &str) -> Result<Option<FileMe
 pub async fn list(pool: &PgPool, db: &str) -> Result<Vec<FileMeta>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
-    let rows: Vec<StorageMetaRow> = sqlx::query_as(&format!(
+    let rows: Vec<StorageMetaRow> = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT id, sha256, size, content_type, created_at, owner_id
          FROM \"{schema}\".storage
          ORDER BY created_at DESC
          LIMIT 1000"
-    ))
+    )))
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(storage_meta_to_file_meta).collect())
@@ -702,15 +702,17 @@ pub async fn delete(pool: &PgPool, db: &str, id: &str) -> Result<bool, RtDbError
     // the global index delete are one transaction, so a failure between them
     // can't leave orphan chunk rows or an index row pointing at a gone blob.
     let mut tx = pool.begin().await?;
-    let res = sqlx::query(&format!("DELETE FROM \"{schema}\".storage WHERE id = $1"))
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
+    let res = sqlx::query(AssertSqlSafe(format!(
+        "DELETE FROM \"{schema}\".storage WHERE id = $1"
+    )))
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
     let removed = res.rows_affected() > 0;
     if removed {
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "DELETE FROM \"{schema}\".storage_chunks WHERE blob_id = $1"
-        ))
+        )))
         .bind(id)
         .execute(&mut *tx)
         .await?;

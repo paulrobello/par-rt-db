@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 
 use crate::db::{database_exists, load_schema, validate_db_name};
 use crate::error::RtDbError;
@@ -72,9 +72,9 @@ async fn apply_sequence(
         return Ok(());
     }
     let seq_ident = pg_sequence(table_name);
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "CREATE SEQUENCE IF NOT EXISTS \"{pg_schema_name}\".\"{seq_ident}\""
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
     reposition_sequence(tx, pg_schema_name, table_name, field).await?;
@@ -108,7 +108,7 @@ pub(crate) async fn reposition_sequence(
               FROM \"{pg_schema_name}\".\"{seq_ident}\") \
          ), false)"
     );
-    sqlx::query(&sql).execute(&mut **tx).await?;
+    sqlx::query(AssertSqlSafe(sql)).execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -263,10 +263,10 @@ pub async fn push_schema(
         tracing::error!(error = %err, db, "failed to serialize schema for storage");
         RtDbError::internal("failed to store schema")
     })?;
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "INSERT INTO \"{pg_schema_name}\".meta (key, value) VALUES ('schema', $1) \
          ON CONFLICT (key) DO UPDATE SET value = excluded.value"
-    ))
+    )))
     .bind(schema_json)
     .execute(&mut *tx)
     .await?;
@@ -362,16 +362,16 @@ async fn add_missing_columns(
         let (pg_type, _nullable) = indexed_column_type(ty)?;
         let col = pg_col(field_name);
 
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" ADD COLUMN IF NOT EXISTS \"{col}\" {pg_type}"
-        ))
+        )))
         .execute(&mut **tx)
         .await?;
 
         let expr = backfill_expr(pg_type, field_name)?;
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "UPDATE \"{pg_schema_name}\".\"{table_ident}\" SET \"{col}\" = {expr} WHERE doc ? '{field_name}'"
-        ))
+        )))
         .execute(&mut **tx)
         .await?;
     }
@@ -396,10 +396,10 @@ async fn ensure_soft_delete_column(
     };
     if new.soft_delete && !old_table.soft_delete {
         let table_ident = pg_table(table_name);
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" \
              ADD COLUMN IF NOT EXISTS \"deleted_at\" timestamptz"
-        ))
+        )))
         .execute(&mut **tx)
         .await?;
     }
@@ -487,10 +487,10 @@ async fn create_indexes(
                 .map(|field_name| format!("\"{}\" gin_trgm_ops", pg_col(field_name)))
                 .collect::<Vec<_>>()
                 .join(", ");
-            sqlx::query(&format!(
+            sqlx::query(AssertSqlSafe(format!(
                 "CREATE INDEX IF NOT EXISTS \"{trgm_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" \
                  USING GIN ({trgm_cols})"
-            ))
+            )))
             .execute(&mut **tx)
             .await?;
         }
@@ -512,9 +512,9 @@ async fn create_indexes(
             index.name.to_lowercase()
         );
         if rebuild_for_soft_delete {
-            sqlx::query(&format!(
+            sqlx::query(AssertSqlSafe(format!(
                 "DROP INDEX IF EXISTS \"{pg_schema_name}\".\"{index_ident}\""
-            ))
+            )))
             .execute(&mut **tx)
             .await?;
         }
@@ -536,18 +536,18 @@ async fn create_indexes(
                 .iter()
                 .map(|field_name| format!("coalesce(\"{}\", '')", pg_col(field_name)))
                 .collect();
-            sqlx::query(&format!(
+            sqlx::query(AssertSqlSafe(format!(
                 "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" \
                  ADD COLUMN \"{sv_col}\" tsvector GENERATED ALWAYS AS \
                  (to_tsvector('{regconfig}'::regconfig, {})) STORED",
                 terms.join(" || ' ' || ")
-            ))
+            )))
             .execute(&mut **tx)
             .await?;
-            sqlx::query(&format!(
+            sqlx::query(AssertSqlSafe(format!(
                 "CREATE INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" \
                  USING GIN (\"{sv_col}\")"
-            ))
+            )))
             .execute(&mut **tx)
             .await?;
         } else if let Some(vec_spec) = &index.vector {
@@ -562,27 +562,27 @@ async fn create_indexes(
                 .fields
                 .first()
                 .ok_or_else(|| RtDbError::internal("vector index missing its field"))?;
-            sqlx::query(&format!(
+            sqlx::query(AssertSqlSafe(format!(
                 "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" \
                  ADD COLUMN \"{v_col}\" vector({dim})"
-            ))
+            )))
             .execute(&mut **tx)
             .await?;
             // Backfill from existing rows (no-op on a brand-new table).
             // `vfield` is a doc field name validated by is_valid_identifier
             // in Task 3, and lives in a string literal here, not an identifier.
-            sqlx::query(&format!(
+            sqlx::query(AssertSqlSafe(format!(
                 "UPDATE \"{pg_schema_name}\".\"{table_ident}\" \
                  SET \"{v_col}\" = (doc->>'{vfield}')::vector \
                  WHERE doc ? '{vfield}'"
-            ))
+            )))
             .execute(&mut **tx)
             .await?;
             let opclass = vec_spec.metric.opclass();
-            sqlx::query(&format!(
+            sqlx::query(AssertSqlSafe(format!(
                 "CREATE INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" \
                  USING hnsw (\"{v_col}\" {opclass})"
-            ))
+            )))
             .execute(&mut **tx)
             .await?;
         } else {
@@ -628,7 +628,7 @@ async fn create_indexes(
                     "SELECT {grouped} FROM \"{pg_schema_name}\".\"{table_ident}\"{where_sql} \
                      GROUP BY {grouped} HAVING count(*) > 1 LIMIT 5"
                 );
-                match sqlx::query(&sql).fetch_all(&mut **tx).await {
+                match sqlx::query(AssertSqlSafe(sql)).fetch_all(&mut **tx).await {
                     Ok(rows) if !rows.is_empty() => {
                         return Err(RtDbError::conflict(format!(
                             "unique index '{}' cannot be created: {} existing row(s) duplicate its key",
@@ -659,9 +659,9 @@ async fn create_indexes(
             } else {
                 format!("{}, \"created_at\"", cols.join(", "))
             };
-            sqlx::query(&format!(
+            sqlx::query(AssertSqlSafe(format!(
                 "CREATE {unique_kw}INDEX \"{index_ident}\" ON \"{pg_schema_name}\".\"{table_ident}\" ({index_cols}){where_sql}"
-            ))
+            )))
             .execute(&mut **tx)
             .await?;
         }
@@ -694,12 +694,12 @@ async fn backfill_ttl_default(
     let table_ident = pg_table(table_name);
     let col = pg_col(&ttl.field);
     let field = &ttl.field;
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "UPDATE \"{pg_schema_name}\".\"{table_ident}\" \
          SET \"{col}\" = created_at + $1, \
              doc = doc || jsonb_build_object('{field}', created_at + $1) \
          WHERE \"{col}\" IS NULL"
-    ))
+    )))
     .bind(d)
     .execute(&mut **tx)
     .await?;
@@ -728,7 +728,7 @@ async fn apply_schema_additive(
         match old_table {
             None => {
                 for stmt in create_table_ddl(pg_schema_name, table_name, new_table)? {
-                    sqlx::query(&stmt).execute(&mut **tx).await?;
+                    sqlx::query(AssertSqlSafe(stmt)).execute(&mut **tx).await?;
                 }
             }
             Some(_) => {
@@ -860,9 +860,9 @@ pub async fn reconcile_schema_destructive(
     // Standalone sequences (no column dependency), so they can go first.
     for table in &diff.drop_sequences {
         let seq_ident = pg_sequence(table);
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "DROP SEQUENCE IF EXISTS \"{pg_schema_name}\".\"{seq_ident}\""
-        ))
+        )))
         .execute(&mut **tx)
         .await?;
         touched.insert(table.clone());
@@ -870,18 +870,18 @@ pub async fn reconcile_schema_destructive(
 
     for (table, index_name) in &diff.drop_indexes {
         let index_ident = format!("i_{}_{}", table.to_lowercase(), index_name.to_lowercase());
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "DROP INDEX IF EXISTS \"{pg_schema_name}\".\"{index_ident}\""
-        ))
+        )))
         .execute(&mut **tx)
         .await?;
         // A search index also owns a trigram GIN (FM-30) beside its tsvector
         // GIN; btree/vector indexes have no `tg_` twin and the guarded drop is
         // a no-op for them.
         let trgm_ident = format!("tg_{}_{}", table.to_lowercase(), index_name.to_lowercase());
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "DROP INDEX IF EXISTS \"{pg_schema_name}\".\"{trgm_ident}\""
-        ))
+        )))
         .execute(&mut **tx)
         .await?;
         touched.insert(table.clone());
@@ -889,9 +889,9 @@ pub async fn reconcile_schema_destructive(
     for (table, index_name) in &diff.drop_search_cols {
         let table_ident = pg_table(table);
         let sv_col = pg_search_col(index_name);
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" DROP COLUMN IF EXISTS \"{sv_col}\""
-        ))
+        )))
         .execute(&mut **tx)
         .await?;
         touched.insert(table.clone());
@@ -899,9 +899,9 @@ pub async fn reconcile_schema_destructive(
     for (table, index_name) in &diff.drop_vector_cols {
         let table_ident = pg_table(table);
         let v_col = pg_vector_col(index_name);
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" DROP COLUMN IF EXISTS \"{v_col}\""
-        ))
+        )))
         .execute(&mut **tx)
         .await?;
         touched.insert(table.clone());
@@ -909,18 +909,18 @@ pub async fn reconcile_schema_destructive(
     for (table, field) in &diff.drop_columns {
         let table_ident = pg_table(table);
         let col = pg_col(field);
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "ALTER TABLE \"{pg_schema_name}\".\"{table_ident}\" DROP COLUMN IF EXISTS \"{col}\""
-        ))
+        )))
         .execute(&mut **tx)
         .await?;
         touched.insert(table.clone());
     }
     for table in &diff.drop_tables {
         let table_ident = pg_table(table);
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "DROP TABLE IF EXISTS \"{pg_schema_name}\".\"{table_ident}\""
-        ))
+        )))
         .execute(&mut **tx)
         .await?;
         touched.insert(table.clone());

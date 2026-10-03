@@ -99,9 +99,9 @@ async fn same_mut_id_dedups_and_replays_cached_result() -> anyhow::Result<()> {
     assert_eq!(first.results, second.results);
 
     let pg_schema = format!("db_{db}");
-    let count: (i64,) = sqlx::query_as(&format!(
+    let count: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM \"{pg_schema}\".\"t_projects\""
-    ))
+    )))
     .fetch_one(&state.pool)
     .await?;
     assert_eq!(count.0, 1);
@@ -133,9 +133,9 @@ async fn no_mut_id_does_not_dedup() -> anyhow::Result<()> {
         .await?;
 
     let pg_schema = format!("db_{db}");
-    let count: (i64,) = sqlx::query_as(&format!(
+    let count: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM \"{pg_schema}\".\"t_projects\""
-    ))
+    )))
     .fetch_one(&state.pool)
     .await?;
     assert_eq!(count.0, 2);
@@ -177,9 +177,9 @@ async fn empty_string_idempotency_key_is_treated_as_absent() -> anyhow::Result<(
         .await?;
 
     let pg_schema = format!("db_{db}");
-    let count: (i64,) = sqlx::query_as(&format!(
+    let count: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM \"{pg_schema}\".\"t_projects\""
-    ))
+    )))
     .fetch_one(&state.pool)
     .await?;
     assert_eq!(count.0, 2);
@@ -214,9 +214,9 @@ async fn expired_mut_id_re_executes() -> anyhow::Result<()> {
         .await?;
 
     let pg_schema = format!("db_{db}");
-    let count: (i64,) = sqlx::query_as(&format!(
+    let count: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM \"{pg_schema}\".\"t_projects\""
-    ))
+    )))
     .fetch_one(&state.pool)
     .await?;
     assert_eq!(count.0, 1);
@@ -254,9 +254,9 @@ async fn dedup_row_commits_atomically_with_the_write() -> anyhow::Result<()> {
     // No delay, no cleanup tick: the row must already be committed alongside
     // the document write.
     let pg_schema = format!("db_{db}");
-    let row: (serde_json::Value, i64) = sqlx::query_as(&format!(
+    let row: (serde_json::Value, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT result, expires_at FROM \"{pg_schema}\".mutations WHERE mut_id = 'atomic-key'"
-    ))
+    )))
     .fetch_one(&state.pool)
     .await?;
     assert_eq!(row.0, serde_json::to_value(&first.results)?);
@@ -274,9 +274,9 @@ async fn dedup_row_commits_atomically_with_the_write() -> anyhow::Result<()> {
         )
         .await?;
     assert_eq!(first.results, second.results);
-    let count: (i64,) = sqlx::query_as(&format!(
+    let count: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM \"{pg_schema}\".\"t_projects\""
-    ))
+    )))
     .fetch_one(&state.pool)
     .await?;
     assert_eq!(count.0, 1);
@@ -334,9 +334,9 @@ async fn pre_existing_key_row_replays_instead_of_double_applying() -> anyhow::Re
     // The second execution's write rolled back: still zero documents, and the
     // sentinel row is untouched.
     let pg_schema = format!("db_{db}");
-    let count: (i64,) = sqlx::query_as(&format!(
+    let count: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM \"{pg_schema}\".\"t_projects\""
-    ))
+    )))
     .fetch_one(&state.pool)
     .await?;
     assert_eq!(count.0, 0);

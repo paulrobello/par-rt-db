@@ -4653,7 +4653,9 @@ async fn fetch_raw_compiled_docs(
     pool: &PgPool,
     compiled: rtdb_server::query::CompiledQuery,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
-    let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(&compiled.sql);
+    let mut query = sqlx::query_as::<_, (String, serde_json::Value, i64, i64)>(
+        sqlx::AssertSqlSafe(compiled.sql.clone()),
+    );
     for bind in compiled.binds {
         query = match bind {
             EqBind::Text(value) => query.bind(value),
@@ -4968,11 +4970,11 @@ async fn projection_collect_sql_returns_only_requested_fields() -> anyhow::Resul
         )
         .await?;
     }
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE \"{}\".\"{}\" SET \"doc\" = jsonb_set(\"doc\", '{{completedAt}}', 'null'::jsonb, true) WHERE \"doc\"->>'title' = $1",
         rtdb_server::ddl::pg_schema(&db),
         rtdb_server::ddl::pg_table("workItems")
-    ))
+    )))
     .bind(&large_title)
     .execute(&pool)
     .await?;

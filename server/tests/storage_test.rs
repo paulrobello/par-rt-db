@@ -46,9 +46,11 @@ async fn ensure_table_is_idempotent_and_revives_dropped_table() -> anyhow::Resul
     let schema = format!("db_{db}");
 
     // Simulate a database that predates the feature: drop storage, then ensure.
-    sqlx::query(&format!("DROP TABLE \"{schema}\".storage"))
-        .execute(&state.pool)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TABLE \"{schema}\".storage"
+    )))
+    .execute(&state.pool)
+    .await?;
     rtdb_server::storage::ensure_table(&state.pool, &db).await?;
 
     let exists: bool = sqlx::query_scalar(
@@ -585,9 +587,9 @@ async fn revoked_token_cannot_delete() -> anyhow::Result<()> {
 /// Counts blob rows for a sha256 in a database's storage table.
 async fn sha256_count(state: &Arc<AppState>, db: &str, sha: &str) -> i64 {
     let schema = format!("db_{db}");
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM \"{schema}\".storage WHERE sha256 = $1"
-    ))
+    )))
     .bind(sha)
     .fetch_one(&state.pool)
     .await
@@ -1106,9 +1108,9 @@ async fn sec118_public_serve_unaffected_by_owner() -> anyhow::Result<()> {
 /// Count `storage_chunks` rows for `blob_id` in `db`'s schema.
 async fn chunk_row_count(state: &Arc<AppState>, db: &str, blob_id: &str) -> i64 {
     let schema = format!("db_{db}");
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM \"{schema}\".storage_chunks WHERE blob_id = $1"
-    ))
+    )))
     .bind(blob_id)
     .fetch_one(&state.pool)
     .await
@@ -1119,9 +1121,9 @@ async fn chunk_row_count(state: &Arc<AppState>, db: &str, blob_id: &str) -> i64 
 /// Panics if the row is missing — test code, the blob was just uploaded.
 async fn inline_bytes(state: &Arc<AppState>, db: &str, blob_id: &str) -> Option<Vec<u8>> {
     let schema = format!("db_{db}");
-    let row: (Option<Vec<u8>>,) = sqlx::query_as(&format!(
+    let row: (Option<Vec<u8>>,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT bytes FROM \"{schema}\".storage WHERE id = $1"
-    ))
+    )))
     .bind(blob_id)
     .fetch_one(&state.pool)
     .await
@@ -1378,18 +1380,21 @@ async fn enh021_oversize_upload_commits_no_chunks() -> anyhow::Result<()> {
     // whole schema (no blob_id predicate) so we catch any leaked provisional
     // rows regardless of id.
     let schema = format!("db_{db}");
-    let total_chunks: i64 =
-        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"{schema}\".storage_chunks"))
-            .fetch_one(&state.pool)
-            .await?;
+    let total_chunks: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM \"{schema}\".storage_chunks"
+    )))
+    .fetch_one(&state.pool)
+    .await?;
     assert_eq!(
         total_chunks, 0,
         "rejected over-size upload must not leave any chunk rows behind"
     );
     // And no metadata row.
-    let total_meta: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"{schema}\".storage"))
-        .fetch_one(&state.pool)
-        .await?;
+    let total_meta: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM \"{schema}\".storage"
+    )))
+    .fetch_one(&state.pool)
+    .await?;
     assert_eq!(
         total_meta, 0,
         "rejected over-size upload commits no metadata"
@@ -1432,13 +1437,16 @@ async fn enh021_overquota_upload_returns_507_and_commits_nothing() -> anyhow::Re
 
     // Nothing committed.
     let schema = format!("db_{db}");
-    let total_chunks: i64 =
-        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"{schema}\".storage_chunks"))
-            .fetch_one(&state.pool)
-            .await?;
-    let total_meta: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"{schema}\".storage"))
-        .fetch_one(&state.pool)
-        .await?;
+    let total_chunks: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM \"{schema}\".storage_chunks"
+    )))
+    .fetch_one(&state.pool)
+    .await?;
+    let total_meta: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM \"{schema}\".storage"
+    )))
+    .fetch_one(&state.pool)
+    .await?;
     assert_eq!(total_chunks, 0, "over-quota upload commits no chunk rows");
     assert_eq!(total_meta, 0, "over-quota upload commits no metadata row");
     Ok(())

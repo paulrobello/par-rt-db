@@ -4,7 +4,7 @@
 //! present when a revert is needed. Best-effort like the audit tap — a capture
 //! failure is warned, never propagated (the schema change already committed).
 
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 
 use crate::db::{now_ms, validate_db_name};
 use crate::ddl::pg_schema;
@@ -39,7 +39,7 @@ pub struct HistoryEntry {
 pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
     validate_db_name(db)?;
     let schema_name = pg_schema(db);
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "CREATE TABLE IF NOT EXISTS \"{schema_name}\".schema_history (\
             version     BIGSERIAL PRIMARY KEY,\
             captured_at BIGINT NOT NULL,\
@@ -47,7 +47,7 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
             principal   TEXT,\
             schema      JSONB NOT NULL\
         )"
-    ))
+    )))
     .execute(pool)
     .await?;
     Ok(())
@@ -68,20 +68,20 @@ pub async fn capture(
         tracing::error!(error = %e, db, "failed to serialize schema for schema_history");
         RtDbError::internal("failed to serialize schema")
     })?;
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "INSERT INTO \"{schema_name}\".schema_history (captured_at, source, principal, schema) \
          VALUES ($1, $2, $3, $4)"
-    ))
+    )))
     .bind(now_ms())
     .bind(source)
     .bind(principal)
     .bind(value)
     .execute(pool)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "DELETE FROM \"{schema_name}\".schema_history WHERE version NOT IN \
          (SELECT version FROM \"{schema_name}\".schema_history ORDER BY version DESC LIMIT $1)"
-    ))
+    )))
     .bind(MAX_VERSIONS)
     .execute(pool)
     .await?;
@@ -96,10 +96,10 @@ pub async fn list(
 ) -> Result<Vec<HistorySummary>, RtDbError> {
     ensure_table(pool, db).await?;
     let schema_name = pg_schema(db);
-    let rows: Vec<(i64, i64, String, Option<String>)> = sqlx::query_as(&format!(
+    let rows: Vec<(i64, i64, String, Option<String>)> = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT version, captured_at, source, principal \
          FROM \"{schema_name}\".schema_history ORDER BY version DESC LIMIT $1 OFFSET $2"
-    ))
+    )))
     .bind(limit)
     .bind(offset)
     .fetch_all(pool)
@@ -119,10 +119,10 @@ pub async fn get(pool: &PgPool, db: &str, version: i64) -> Result<Option<History
     ensure_table(pool, db).await?;
     let schema_name = pg_schema(db);
     let row: Option<(i64, i64, String, Option<String>, serde_json::Value)> =
-        sqlx::query_as(&format!(
+        sqlx::query_as(AssertSqlSafe(format!(
             "SELECT version, captured_at, source, principal, schema \
              FROM \"{schema_name}\".schema_history WHERE version = $1"
-        ))
+        )))
         .bind(version)
         .fetch_optional(pool)
         .await?;

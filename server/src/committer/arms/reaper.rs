@@ -31,11 +31,11 @@ pub(in crate::committer) async fn handle_reaper(ctx: &CommitterCtx) -> Result<()
         // cascade with `force_hard = true` — TTL expiry is a real delete even
         // on a softDelete table; the reaper is the collector of last resort.
         if crate::txn::has_on_delete_children(&schema, table_name) {
-            let ids: Vec<(String,)> = match sqlx::query_as(&format!(
+            let ids: Vec<(String,)> = match sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT id FROM \"{pg_schema_name}\".\"{table_ident}\" \
                  WHERE \"{col}\" IS NOT NULL AND \"{col}\" < $1 \
                  ORDER BY \"{col}\" LIMIT $2"
-            ))
+            )))
             .bind(now)
             .bind(ctx.ttl_batch)
             .fetch_all(&ctx.pool)
@@ -106,13 +106,13 @@ pub(in crate::committer) async fn handle_reaper(ctx: &CommitterCtx) -> Result<()
         let Ok(mut tx) = ctx.pool.begin().await else {
             continue;
         };
-        let rows: Vec<(String,)> = match sqlx::query_as(&format!(
+        let rows: Vec<(String,)> = match sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "DELETE FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE id IN (
                  SELECT id FROM \"{pg_schema_name}\".\"{table_ident}\"
                  WHERE \"{col}\" IS NOT NULL AND \"{col}\" < $1
                  ORDER BY \"{col}\" LIMIT $2
              ) RETURNING id"
-        ))
+        )))
         .bind(now)
         .bind(ctx.ttl_batch)
         .fetch_all(&mut *tx)

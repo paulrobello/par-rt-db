@@ -272,10 +272,12 @@ async fn await_status(
 /// step in these tests. Uses `ddl::pg_table` for the physical table name.
 async fn projects_count(pool: &sqlx::PgPool, db: &str) -> i64 {
     let table = rtdb_server::ddl::pg_table("projects");
-    sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM \"db_{db}\".\"{table}\""))
-        .fetch_one(pool)
-        .await
-        .expect("count projects")
+    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM \"db_{db}\".\"{table}\""
+    )))
+    .fetch_one(pool)
+    .await
+    .expect("count projects")
 }
 
 /// (1) Happy path: a 3-step no-sleep chain advances to `success` in one
@@ -1479,9 +1481,9 @@ async fn await_signal_payloadless_delivery_consumes_gate() -> anyhow::Result<()>
     // (deserialize null → None, re-serialize → omitted), so present-vs-absent
     // is asserted on the raw jsonb column (a missing key would parse to Null
     // too — `.get` is what distinguishes them).
-    let stored: serde_json::Value = sqlx::query_scalar(&format!(
+    let stored: serde_json::Value = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT step_outcomes FROM \"db_{db}\".workflows WHERE id = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&pool)
     .await?;
@@ -2141,9 +2143,9 @@ async fn await_signal_payload_cap_rejects_without_consuming() -> anyhow::Result<
     let full = workflows::get(&pool, &db, &id).await?.expect("row");
     assert_eq!(full.info.status, WorkflowStatus::Waiting);
     assert_eq!(full.info.waiting_for.as_deref(), Some("approve"));
-    let slot: Option<serde_json::Value> = sqlx::query_scalar(&format!(
+    let slot: Option<serde_json::Value> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT signal_payload FROM \"db_{db}\".workflows WHERE id = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(&pool)
     .await?;

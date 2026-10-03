@@ -4716,7 +4716,7 @@ async fn sec117_seed_without_flag(
         "INSERT INTO \"{pg_schema}\".\"{pg_table}\" (id, doc, created_at, version) \
          VALUES ($1, $2, $3, 1)"
     );
-    sqlx::query(&sql)
+    sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(&id)
         .bind(serde_json::Value::Object(serde_json::Map::new()))
         .bind(now)

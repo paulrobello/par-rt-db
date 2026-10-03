@@ -590,26 +590,26 @@ async fn export_then_import_round_trips_docs_indexes_and_schema() -> anyhow::Res
         .expect("target schema");
     assert_eq!(source_schema, target_schema);
 
-    let source_projects: Vec<(String, serde_json::Value, i64, i64)> = sqlx::query_as(&format!(
+    let source_projects: Vec<(String, serde_json::Value, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"db_{source_db}\".\"t_projects\" ORDER BY \"id\""
-    ))
+    )))
     .fetch_all(&pool)
     .await?;
-    let target_projects: Vec<(String, serde_json::Value, i64, i64)> = sqlx::query_as(&format!(
+    let target_projects: Vec<(String, serde_json::Value, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"db_{target_db}\".\"t_projects\" ORDER BY \"id\""
-    ))
+    )))
     .fetch_all(&pool)
     .await?;
     assert_eq!(source_projects, target_projects);
 
-    let source_items: Vec<(String, serde_json::Value, i64, i64)> = sqlx::query_as(&format!(
+    let source_items: Vec<(String, serde_json::Value, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"db_{source_db}\".\"t_workitems\" ORDER BY \"id\""
-    ))
+    )))
     .fetch_all(&pool)
     .await?;
-    let target_items: Vec<(String, serde_json::Value, i64, i64)> = sqlx::query_as(&format!(
+    let target_items: Vec<(String, serde_json::Value, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"db_{target_db}\".\"t_workitems\" ORDER BY \"id\""
-    ))
+    )))
     .fetch_all(&pool)
     .await?;
     assert_eq!(source_items, target_items);
@@ -706,14 +706,14 @@ async fn clone_db_round_trips_schema_and_documents() -> anyhow::Result<()> {
     assert_eq!(source_schema, target_schema);
 
     for (table, phys) in [("projects", "t_projects"), ("workItems", "t_workitems")] {
-        let src: Vec<(String, serde_json::Value, i64, i64)> = sqlx::query_as(&format!(
+        let src: Vec<(String, serde_json::Value, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"db_{source_name}\".\"{phys}\" ORDER BY \"id\""
-        ))
+        )))
         .fetch_all(&pool)
         .await?;
-        let dst: Vec<(String, serde_json::Value, i64, i64)> = sqlx::query_as(&format!(
+        let dst: Vec<(String, serde_json::Value, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"db_{target}\".\"{phys}\" ORDER BY \"id\""
-        ))
+        )))
         .fetch_all(&pool)
         .await?;
         assert_eq!(src, dst, "table {table} should match after clone");

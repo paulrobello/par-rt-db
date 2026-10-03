@@ -165,9 +165,11 @@ async fn ownership_lease_forwarding_and_failover_on_death() -> anyhow::Result<()
     .await?;
 
     // Exactly-once: three writes, three rows, no duplicates from retries.
-    let (n,): (i64,) = sqlx::query_as(&format!("SELECT count(*) FROM \"db_{db}\".\"t_items\""))
-        .fetch_one(&pool)
-        .await?;
+    let (n,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM \"db_{db}\".\"t_items\""
+    )))
+    .fetch_one(&pool)
+    .await?;
     assert_eq!(n, 3, "two forwarded/owner writes + one post-failover write");
 
     // ENH-049: after failover, survivor B re-acquired — its acquired counter
@@ -231,9 +233,11 @@ async fn forward_timeout_conflicts_then_takes_over_when_lease_frees() -> anyhow:
         .await
         .expect_err("no owner answers and the lease is held");
     assert_eq!(err.code, ErrorCode::Conflict, "got: {err}");
-    let (n,): (i64,) = sqlx::query_as(&format!("SELECT count(*) FROM \"db_{db}\".\"t_items\""))
-        .fetch_one(&pool)
-        .await?;
+    let (n,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM \"db_{db}\".\"t_items\""
+    )))
+    .fetch_one(&pool)
+    .await?;
     assert_eq!(n, 0, "the conflicted write must not land");
 
     // The ghost session releases — the next write's takeover acquires.
@@ -251,9 +255,11 @@ async fn forward_timeout_conflicts_then_takes_over_when_lease_frees() -> anyhow:
         PrincipalCtx::bypass(),
     )
     .await?;
-    let (n,): (i64,) = sqlx::query_as(&format!("SELECT count(*) FROM \"db_{db}\".\"t_items\""))
-        .fetch_one(&pool)
-        .await?;
+    let (n,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM \"db_{db}\".\"t_items\""
+    )))
+    .fetch_one(&pool)
+    .await?;
     assert_eq!(n, 1, "the post-release write lands exactly once");
     Ok(())
 }
@@ -277,9 +283,9 @@ async fn forwarded_write_preserves_principal_on_owner() -> anyhow::Result<()> {
     let outcome = mutate_until_landed(&b, &db, insert_item("owned-doc"), principal).await?;
     assert_eq!(outcome.results.len(), 1, "one step, one result");
 
-    let (owner,): (String,) = sqlx::query_as(&format!(
+    let (owner,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT doc->>'owner' FROM \"db_{db}\".\"t_items\" WHERE doc->>'title' = 'owned-doc'"
-    ))
+    )))
     .fetch_one(&pool)
     .await?;
     assert_eq!(
@@ -311,9 +317,9 @@ async fn forwarded_mutate_larger_than_notify_cap_round_trips() -> anyhow::Result
 
     mutate_until_landed(&b, &db, txn, PrincipalCtx::bypass()).await?;
 
-    let (stored,): (String,) = sqlx::query_as(&format!(
+    let (stored,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT doc->>'title' FROM \"db_{db}\".\"t_items\""
-    ))
+    )))
     .fetch_one(&pool)
     .await?;
     assert_eq!(stored.len(), big_title.len(), "the whole body forwarded");
@@ -549,18 +555,20 @@ async fn forwarded_mutate_is_deduped_by_a_server_minted_key() -> anyhow::Result<
             PrincipalCtx::bypass(),
         )
         .await?;
-    let (local_rows,): (i64,) =
-        sqlx::query_as(&format!("SELECT count(*) FROM \"db_{db}\".mutations"))
-            .fetch_one(&pool)
-            .await?;
+    let (local_rows,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM \"db_{db}\".mutations"
+    )))
+    .fetch_one(&pool)
+    .await?;
     assert_eq!(local_rows, 0, "an owner-side write mints no key");
 
     // The forwarded one is keyed by the server.
     mutate_until_landed(&b, &db, insert_item("forwarded"), PrincipalCtx::bypass()).await?;
-    let (keyed_rows,): (i64,) =
-        sqlx::query_as(&format!("SELECT count(*) FROM \"db_{db}\".mutations"))
-            .fetch_one(&pool)
-            .await?;
+    let (keyed_rows,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM \"db_{db}\".mutations"
+    )))
+    .fetch_one(&pool)
+    .await?;
     assert_eq!(
         keyed_rows, 1,
         "the forwarded mutate recorded a dedup row under the minted key"
@@ -568,9 +576,11 @@ async fn forwarded_mutate_is_deduped_by_a_server_minted_key() -> anyhow::Result<
 
     // Replaying that exact key returns the recorded outcome instead of
     // writing again — the property the takeover path relies on.
-    let (mut_id,): (String,) = sqlx::query_as(&format!("SELECT mut_id FROM \"db_{db}\".mutations"))
-        .fetch_one(&pool)
-        .await?;
+    let (mut_id,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT mut_id FROM \"db_{db}\".mutations"
+    )))
+    .fetch_one(&pool)
+    .await?;
     a.realtime
         .committers
         .mutate(
@@ -580,9 +590,11 @@ async fn forwarded_mutate_is_deduped_by_a_server_minted_key() -> anyhow::Result<
             PrincipalCtx::bypass(),
         )
         .await?;
-    let (rows,): (i64,) = sqlx::query_as(&format!("SELECT count(*) FROM \"db_{db}\".\"t_items\""))
-        .fetch_one(&pool)
-        .await?;
+    let (rows,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM \"db_{db}\".\"t_items\""
+    )))
+    .fetch_one(&pool)
+    .await?;
     assert_eq!(rows, 2, "the replay wrote nothing new");
     Ok(())
 }
@@ -664,10 +676,11 @@ async fn forward_concurrency_cap_rate_limits_excess_requests() -> anyhow::Result
     );
     assert!(landed >= 1, "at least one write should still land");
 
-    let (n_rows,): (i64,) =
-        sqlx::query_as(&format!("SELECT count(*) FROM \"db_{db}\".\"t_items\""))
-            .fetch_one(&pool)
-            .await?;
+    let (n_rows,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM \"db_{db}\".\"t_items\""
+    )))
+    .fetch_one(&pool)
+    .await?;
     assert_eq!(
         n_rows, landed as i64,
         "row count matches the writes that actually landed — no phantom commit behind a \
@@ -762,9 +775,11 @@ async fn lease_backend_termination_demotes_owner() -> anyhow::Result<()> {
         h.await??;
     }
 
-    let (n,): (i64,) = sqlx::query_as(&format!("SELECT count(*) FROM \"db_{db}\".\"t_items\""))
-        .fetch_one(&pool)
-        .await?;
+    let (n,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM \"db_{db}\".\"t_items\""
+    )))
+    .fetch_one(&pool)
+    .await?;
     // 1 pre-kill + 1 B failover + 4 interleaved = 6 rows, every id distinct
     // (count(*) over unique titles) — exactly-once semantics held throughout.
     assert_eq!(n, 6, "each write landed exactly once, no lost updates");
@@ -772,9 +787,9 @@ async fn lease_backend_termination_demotes_owner() -> anyhow::Result<()> {
     // Every row starts at version 1 on insert; single-writer integrity here is
     // proven by the exactly-once row count above (six distinct ids, no lost or
     // duplicated inserts) plus the id-distinctness check below.
-    let (distinct,): (i64,) = sqlx::query_as(&format!(
+    let (distinct,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT count(DISTINCT id) FROM \"db_{db}\".\"t_items\""
-    ))
+    )))
     .fetch_one(&pool)
     .await?;
     assert_eq!(

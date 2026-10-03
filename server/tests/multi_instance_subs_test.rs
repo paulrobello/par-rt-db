@@ -105,9 +105,11 @@ async fn ws_mutate_reply(ws: &mut WsClient, mut_id: &str, within: Duration) -> S
 }
 
 async fn items_count(pool: &PgPool, db: &str) -> anyhow::Result<i64> {
-    let (n,): (i64,) = sqlx::query_as(&format!("SELECT count(*) FROM \"db_{db}\".\"t_items\""))
-        .fetch_one(pool)
-        .await?;
+    let (n,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM \"db_{db}\".\"t_items\""
+    )))
+    .fetch_one(pool)
+    .await?;
     Ok(n)
 }
 
@@ -233,9 +235,9 @@ async fn large_forwarded_mutate_and_reply_round_trip() -> anyhow::Result<()> {
         "forwarded 20 KB mutate succeeded"
     );
 
-    let (stored,): (String,) = sqlx::query_as(&format!(
+    let (stored,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT doc->>'title' FROM \"db_{db}\".\"t_items\""
-    ))
+    )))
     .fetch_one(&pool)
     .await?;
     assert_eq!(stored.len(), big_title.len(), "the whole body forwarded");

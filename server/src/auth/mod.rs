@@ -655,7 +655,7 @@ pub async fn resolve_user(pool: &PgPool, id: ProviderIdentity<'_>) -> Result<Str
         "SELECT id FROM rtdb_auth.users WHERE {col} = $1{cast}",
         col = id.provider_id_column,
     );
-    if let Some((row_id,)) = sqlx::query_as::<_, (String,)>(&select_sql)
+    if let Some((row_id,)) = sqlx::query_as::<_, (String,)>(sqlx::AssertSqlSafe(select_sql))
         .bind(id.provider_id)
         .fetch_optional(&mut *tx)
         .await?
@@ -685,7 +685,7 @@ pub async fn resolve_user(pool: &PgPool, id: ProviderIdentity<'_>) -> Result<Str
              RETURNING id",
             col = id.provider_id_column,
         );
-        if let Some((row_id,)) = sqlx::query_as::<_, (String,)>(&link_sql)
+        if let Some((row_id,)) = sqlx::query_as::<_, (String,)>(sqlx::AssertSqlSafe(link_sql))
             .bind(id.provider_id)
             .bind(id.login)
             .bind(id.display_name)
@@ -706,7 +706,7 @@ pub async fn resolve_user(pool: &PgPool, id: ProviderIdentity<'_>) -> Result<Str
          VALUES ($1, $2{cast}, $3, $4, $5, $6)",
         col = id.provider_id_column,
     );
-    sqlx::query(&insert_sql)
+    sqlx::query(sqlx::AssertSqlSafe(insert_sql))
         .bind(&row_id)
         .bind(id.provider_id)
         .bind(id.login)
@@ -1054,9 +1054,9 @@ mod resolve_user_tests {
     }
 
     async fn subject_of(pool: &PgPool, id: &str, column: &str) -> Option<String> {
-        let (value,): (Option<String>,) = sqlx::query_as(&format!(
+        let (value,): (Option<String>,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {column} FROM rtdb_auth.users WHERE id = $1"
-        ))
+        )))
         .bind(id)
         .fetch_one(pool)
         .await
