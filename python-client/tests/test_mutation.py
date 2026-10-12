@@ -22,6 +22,7 @@ Wire shapes (load-bearing — match the server exactly):
 """
 
 import json
+from typing import Any
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
@@ -118,7 +119,7 @@ def test_transaction_model_validate_round_trips():
 
 def test_step_result_variants():
     # StepResult is a Union alias; validate via TypeAdapter.
-    sr = TypeAdapter(StepResult)
+    sr = TypeAdapter[Any](StepResult)
     # Insert shape: {"id"} only.
     assert sr.validate_python({"id": "x"}).model_dump(by_alias=True, mode="json") == {"id": "x"}
     # Upsert shape: {"id", "inserted"} — must win over Insert (richer-first order).
@@ -132,7 +133,7 @@ def test_step_result_variants():
 def test_step_result_upsert_beats_insert_when_both_could_match():
     # Belt-and-suspenders: even if pydantic's smart union would do the right
     # thing, lock in the declaration-order contract: {"id","inserted"} -> upsert.
-    out = TypeAdapter(StepResult).validate_python({"id": "x", "inserted": False})
+    out = TypeAdapter[Any](StepResult).validate_python({"id": "x", "inserted": False})
     # The deserialized object must carry `inserted` (i.e. it became _StepUpsert,
     # not _StepInsert which would have dropped the field under extra="forbid").
     assert hasattr(out, "inserted")
@@ -279,7 +280,7 @@ def test_delete_by_query_rejects_unknown_field():
 
 
 def test_step_result_patch_by_query_and_delete_by_query():
-    sr = TypeAdapter(StepResult)
+    sr = TypeAdapter[Any](StepResult)
     assert sr.validate_python({"patched": 3, "truncated": False}).model_dump(
         by_alias=True, mode="json"
     ) == {"patched": 3, "truncated": False}
@@ -316,7 +317,7 @@ def test_schedule_external_step_wire_shape():
 
 
 def test_step_result_schedule_and_cancel_schedule():
-    sr = TypeAdapter(StepResult)
+    sr = TypeAdapter[Any](StepResult)
     assert sr.validate_python({"scheduleId": "s1"}).model_dump(by_alias=True, mode="json") == {
         "scheduleId": "s1"
     }
@@ -372,7 +373,7 @@ def test_await_signal_helper_builds_wait_declaration():
 
 
 def test_step_result_start_and_cancel_workflow():
-    sr = TypeAdapter(StepResult)
+    sr = TypeAdapter[Any](StepResult)
     assert sr.validate_python({"workflowId": "wf1"}).model_dump(by_alias=True, mode="json") == {
         "workflowId": "wf1"
     }

@@ -7,6 +7,7 @@ agree on (server ``protocol.rs`` is the source of truth).
 
 import asyncio
 import json
+from typing import Any
 
 import pytest
 from pydantic import TypeAdapter
@@ -108,7 +109,7 @@ def test_leave_presence_is_room_only() -> None:
 
 def test_presence_snapshot_round_trips_members() -> None:
     """`presenceSnapshot` carries `members: PresenceMember[]` (camelCase)."""
-    adapter = TypeAdapter(ServerMessage)
+    adapter = TypeAdapter[Any](ServerMessage)
     raw = {
         "type": "presenceSnapshot",
         "room": "doc:1",
@@ -143,7 +144,7 @@ def test_presence_snapshot_round_trips_members() -> None:
 
 
 def test_presence_err_round_trips_envelope() -> None:
-    adapter = TypeAdapter(ServerMessage)
+    adapter = TypeAdapter[Any](ServerMessage)
     msg = adapter.validate_python(
         {
             "type": "presenceErr",
@@ -919,7 +920,7 @@ def _raw_member(connection_id: str, state: object) -> dict:
 def test_presence_delta_all_empty_omits_bucket_arrays() -> None:
     """The all-empty delta serializes as type/room/seq only — the corpus pins
     this shape (mirrors the server's ``skip_serializing_if = "Vec::is_empty"``)."""
-    adapter = TypeAdapter(ServerMessage)
+    adapter = TypeAdapter[Any](ServerMessage)
     msg = adapter.validate_python({"type": "presenceDelta", "room": "doc:1", "seq": 1})
     assert json.loads(msg.model_dump_json(by_alias=True)) == {
         "type": "presenceDelta",
@@ -929,7 +930,7 @@ def test_presence_delta_all_empty_omits_bucket_arrays() -> None:
 
 
 def test_presence_delta_round_trips_buckets() -> None:
-    adapter = TypeAdapter(ServerMessage)
+    adapter = TypeAdapter[Any](ServerMessage)
     raw = {
         "type": "presenceDelta",
         "room": "doc:1",

@@ -76,7 +76,7 @@ def _backoff_delay(attempt: int, base: float, max_delay: float, rand: float) -> 
 
 # --- Connection core: driver, handshake, reconnect, heartbeat -----------------
 
-_SERVER = TypeAdapter(ServerMessage)
+_SERVER = TypeAdapter[Any](ServerMessage)
 _STEP_RESULT_ADAPTER = TypeAdapter(StepResult)
 
 _AUTH_FAILED_CODE = 4401

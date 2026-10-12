@@ -10,6 +10,8 @@ Discriminator field names are load-bearing: FilterExpr is tagged by ``op`` (not
 ``SearchQuery.filter`` is (omitted on the wire when ``None``).
 """
 
+from typing import Any
+
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
@@ -357,7 +359,7 @@ def test_hybrid_search_query_round_trips_optionals() -> None:
 # through a ``TypeAdapter`` (same pattern as ScheduleWhen/FilterExpr above) — the
 # alias itself has no ``model_validate``.
 
-_client_adapter = TypeAdapter(ClientMessage)
+_client_adapter = TypeAdapter[Any](ClientMessage)
 
 
 def _model(d):
