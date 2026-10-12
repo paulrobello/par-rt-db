@@ -161,7 +161,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.23"
+          go-version: "1.27"
           cache-dependency-path: go-client/go.sum
 
       # --- First-time installs ---------------------------------------------
@@ -208,7 +208,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.23"
+          go-version: "1.27"
           cache-dependency-path: go-client/go.sum
 
       - name: Install go-client deps
@@ -270,7 +270,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.23"
+          go-version: "1.27"
           cache-dependency-path: go-client/go.sum
 
       - name: Install go-client deps
@@ -490,7 +490,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.23"
+          go-version: "1.27"
           cache-dependency-path: go-client/go.sum
       - name: Install go-client deps
         run: make go-client-install
@@ -546,7 +546,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.23"
+          go-version: "1.27"
           cache-dependency-path: go-client/go.sum
       # SEC-138: pinned to an immutable commit SHA. The action ref above pins
       # the installer; this pins the audit scanner itself so a weekly run
