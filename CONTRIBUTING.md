@@ -149,6 +149,24 @@ Live-server tests are opt-in and `#[ignore]` by default:
 need `RTDB_TEST_SERVER_URL` + `RTDB_TEST_ADMIN_KEY` and run with `--ignored`.
 The rust-client one needs no dev Postgres.
 
+## Coverage
+
+`make coverage` measures line coverage for every package, report-only — no
+thresholds, and it is never part of `make checkall`. Each leg prints a summary
+and leaves a machine-readable report: `target/coverage/rust.lcov`,
+`target/coverage/python.lcov`, `target/coverage/go.out`, and `lcov.info` under
+`ts-client/coverage/` and `dashboard/coverage/`. CI runs only the fast legs
+(`make coverage-fast`: ts-client, dashboard, python, go) on the weekly schedule
+and uploads the reports as the `coverage-reports` artifact — CI carries no
+long-running suites, so the instrumented Rust leg is local-only.
+
+The Rust leg runs the whole workspace suite under instrumentation, so it needs
+the dev Postgres (`make dev-db-up`, a prerequisite of the target) and excludes
+one test: merge_test's stale-registry guard, whose 3-second differential
+timing budget cannot hold under instrumentation. Run a single leg with
+`make coverage-rust`, `coverage-ts`, `coverage-dashboard`, `coverage-python`,
+or `coverage-go`.
+
 ## Benchmarks
 
 ENH-033 adds a two-layer benchmark harness, deliberately excluded from

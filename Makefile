@@ -40,6 +40,7 @@ SWIFT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(1),$(SW
 	swift-client-build swift-client-test swift-client-lint swift-client-fmt \
 	swift-client-fmt-check swift-client-typecheck swift-client-checkall \
 	swift-client-deps audit-deps \
+	coverage coverage-fast coverage-rust coverage-ts coverage-dashboard coverage-python coverage-go \
 	bench-micro bench bench-baseline \
 	grind-start grind-start-anthropic grind-start-zai grind-start-grok grind-start-codex \
 	grind-start-omp grind-stop grind-clean-logs
@@ -178,6 +179,52 @@ endif
 	cd python-client && uv run pytest -q
 	cd go-client && go test ./...
 	$(call SWIFT_IF_DARWIN,swift test)
+
+# ENH-050: measured line coverage, report-only — no thresholds, and never part
+# of `checkall`. `make coverage` runs every package's suite under its coverage
+# tool and leaves machine-readable reports at:
+#   target/coverage/rust.lcov  target/coverage/python.lcov  target/coverage/go.out
+#   ts-client/coverage/lcov.info  dashboard/coverage/lcov.info
+# The Rust leg runs the server integration suite, so it needs the dev Postgres
+# (dev-db-up prerequisite), and mirrors `test:`'s nextest branch. `cargo
+# llvm-cov report --summary-only` re-prints the summary from the run's
+# profiling data without re-executing anything.
+coverage: coverage-rust coverage-ts coverage-dashboard coverage-python coverage-go
+
+# The CI-lean set (coverage-weekly job): no Rust, no dev Postgres — every leg
+# finishes in seconds. The instrumented Rust leg is local-only by policy: CI
+# carries no long-running suites (Paul, 2026-10-12).
+coverage-fast: coverage-ts coverage-dashboard coverage-python coverage-go
+
+coverage-rust: dev-db-up
+	@mkdir -p target/coverage
+# ENH-050: one exclusion, deliberate. merge_test's stale-registry regression
+# guard is a DIFFERENTIAL wall-clock assert (with_stale < baseline + 3s);
+# instrumentation multiplies each merge_users pass into minutes, so a 3-second
+# delta can never hold under llvm-cov (820s try, 2026-10-12). The guard stays
+# fully active in `make test` / checkall.
+ifeq ($(NEXTEST),yes)
+	cargo llvm-cov nextest --workspace --all-features -E 'not test(merge_users_skips_stale_registry_rows_without_paying_a_committer_spawn)' --lcov --output-path target/coverage/rust.lcov
+else
+	cargo llvm-cov --workspace --all-features --lcov --output-path target/coverage/rust.lcov -- --skip merge_users_skips_stale_registry_rows_without_paying_a_committer_spawn
+endif
+	cargo llvm-cov report --summary-only
+
+coverage-ts:
+	cd ts-client && bun run coverage
+
+coverage-dashboard:
+	cd dashboard && bun run coverage
+
+coverage-python:
+	@mkdir -p target/coverage
+	cd python-client && uv run pytest --cov=par_rt_db --cov-report=lcov:../target/coverage/python.lcov --cov-report=term
+
+coverage-go:
+	@mkdir -p target/coverage
+	cd go-client && go test -coverprofile=../target/coverage/go.out ./...
+	cd go-client && go tool cover -func=../target/coverage/go.out > ../target/coverage/go-func.txt
+	@tail -1 target/coverage/go-func.txt
 
 go-client-install:
 	cd go-client && go mod download

@@ -465,6 +465,53 @@ jobs:
       - name: Run property tests
         run: cargo test --manifest-path server/Cargo.toml --all-features --test main proptest_parity
 
+  # ENH-050: weekly coverage artifact, report-only. Runs the FAST legs only
+  # (ts-client, dashboard, python, go — seconds each, no Rust, no dev
+  # Postgres); the instrumented Rust leg is local-only by policy: CI carries
+  # no long-running suites (Paul, 2026-10-12). No thresholds, never part of
+  # `make checkall`. Dispatch keeps the same os-scope gate as the other jobs.
+  coverage-weekly:
+    name: coverage (fast legs, report-only)
+    needs: [scope]
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && contains(fromJSON(needs.scope.outputs.os-matrix), 'ubuntu-latest'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2.2.0
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.23"
+          cache-dependency-path: go-client/go.sum
+      - name: Install go-client deps
+        run: make go-client-install
+      - name: Install ts-client deps
+        run: make ts-client-install
+      - name: Install dashboard deps
+        run: make dashboard-install
+      - name: Install python-client deps
+        run: make python-client-install
+      - name: Run make coverage-fast
+        run: make coverage-fast
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: coverage-reports
+          path: |
+            target/coverage/
+            ts-client/coverage/
+            dashboard/coverage/
+          if-no-files-found: error
+
   # ENH-051: weekly supply-chain audit across all six ecosystems
   # (`make audit-deps`: cargo audit, bun audit for both bun workspaces,
   # pip-audit, govulncheck, plus a SwiftPM dependency listing). Network-bound

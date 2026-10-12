@@ -15,7 +15,8 @@
     "fmt": "biome format --write src",
     "fmt-check": "biome format src",
     "test": "vitest run --passWithNoTests",
-    "prepare": "bun run build:sdk"
+    "prepare": "bun run build:sdk",
+    "coverage": "vitest run --coverage --coverage.reporter=lcov --coverage.reporter=text-summary --passWithNoTests"
   },
   "dependencies": {
     "@par-rt-db/client": "workspace:*",
@@ -34,6 +35,7 @@
     "jsdom": "^30.1.2",
     "typescript": "^7.0.2",
     "vite": "^8.3.4",
-    "vitest": "^5.0.4"
+    "vitest": "^5.0.4",
+    "@vitest/coverage-v8": "^5.0.4"
   }
 }

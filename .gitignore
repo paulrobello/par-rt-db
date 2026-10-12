@@ -74,3 +74,6 @@ bench/results/
 
 # SEC-007: local hostname-leak patterns (never commit; see Makefile hostname-leak-check)
 .hostname-leak-patterns
+
+# pytest-cov data file (python-client)
+.coverage

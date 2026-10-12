@@ -15,7 +15,9 @@
       "import": "./dist/react.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "sideEffects": false,
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -26,13 +28,16 @@
     "lint": "biome lint src tests",
     "fmt": "biome format --write src tests",
     "fmt-check": "biome format src tests",
-    "doc": "cd docs-toolchain && bun run typedoc --options ../typedoc.json"
+    "doc": "cd docs-toolchain && bun run typedoc --options ../typedoc.json",
+    "coverage": "vitest run --coverage --coverage.reporter=lcov --coverage.reporter=text-summary --exclude 'tests/integration/**'"
   },
   "peerDependencies": {
     "react": ">=18"
   },
   "peerDependenciesMeta": {
-    "react": { "optional": true }
+    "react": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.15",
@@ -44,6 +49,7 @@
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.4"
+    "vitest": "^5.0.4",
+    "@vitest/coverage-v8": "^5.0.4"
   }
 }
