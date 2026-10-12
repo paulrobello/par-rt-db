@@ -513,7 +513,9 @@ pub async fn is_admin(pool: &PgPool, principal: &Principal) -> bool {
 
 /// Wire-facing identity for a resolved principal (see `protocol::AuthedUser`).
 /// A machine token's name is not an identity, so `name` is always `None` for
-/// `Machine`.
+/// `Machine`. A user's stable opaque `user_id` (the `rtdb_auth.users.id` that
+/// survives provider-side email/name changes) is exposed for every user
+/// principal, user or anonymous; machines carry no identity and omit it.
 pub fn authed_user(p: &Principal) -> AuthedUser {
     match p {
         Principal::Machine { .. } => AuthedUser {
@@ -522,8 +524,10 @@ pub fn authed_user(p: &Principal) -> AuthedUser {
             name: None,
             github_login: None,
             github_id: None,
+            user_id: None,
         },
         Principal::User {
+            user_id,
             email,
             name,
             github_id,
@@ -535,6 +539,7 @@ pub fn authed_user(p: &Principal) -> AuthedUser {
             name: name.clone(),
             github_login: github_login.clone(),
             github_id: *github_id,
+            user_id: Some(user_id.clone()),
         },
     }
 }
@@ -767,6 +772,7 @@ mod tests {
         assert_eq!(user.kind, UserKind::Machine);
         assert_eq!(user.email, None);
         assert_eq!(user.name, None);
+        assert_eq!(user.user_id, None);
     }
 
     #[test]
@@ -787,6 +793,7 @@ mod tests {
         assert_eq!(user.name, Some("Alice".to_string()));
         assert_eq!(user.github_id, None);
         assert_eq!(user.github_login, None);
+        assert_eq!(user.user_id, Some("u".to_string()));
     }
 
     #[test]
@@ -804,6 +811,7 @@ mod tests {
         let user = authed_user(&principal);
         assert_eq!(user.github_id, Some(42));
         assert_eq!(user.github_login, Some("alice".to_string()));
+        assert_eq!(user.user_id, Some("u".to_string()));
     }
 }
 

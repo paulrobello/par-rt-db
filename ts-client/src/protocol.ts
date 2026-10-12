@@ -613,6 +613,8 @@ export interface AuthedUser {
   githubLogin?: string | null;
   /** GitHub numeric id, paired with `githubLogin`. */
   githubId?: number | null;
+  /** Stable opaque identity of a validated user principal (rtdb_auth.users.id). Absent on the wire for machine tokens. Never the raw provider subject. */
+  userId?: string | null;
 }
 
 /** One entry in a presence room's member list. Mirrors server

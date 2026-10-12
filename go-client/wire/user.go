@@ -15,7 +15,7 @@ const (
 )
 
 // Mirrors server/src/protocol.rs::AuthedUser. email and name serialize as
-// JSON null when absent (no skip_serializing_if); githubLogin/githubId are
+// JSON null when absent (no skip_serializing_if); githubLogin/githubId/userId are
 // omitted entirely — same struct, two behaviors.
 type AuthedUser struct {
 	Kind        UserKind `json:"kind"`
@@ -23,6 +23,8 @@ type AuthedUser struct {
 	Name        *string  `json:"name"`
 	GithubLogin *string  `json:"githubLogin,omitempty"`
 	GithubID    *int64   `json:"githubId,omitempty"`
+	// Stable opaque identity of a validated user principal; omitted for machine tokens.
+	UserID *string `json:"userId,omitempty"`
 }
 
 // Mirrors server/src/protocol.rs::RtDbError — the wire error envelope

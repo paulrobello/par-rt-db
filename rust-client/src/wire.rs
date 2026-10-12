@@ -389,6 +389,12 @@ pub struct AuthedUser {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// GitHub numeric id when the login was via GitHub.
     pub github_id: Option<i64>,
+    /// Stable opaque identity of a validated user principal (the server's
+    /// rtdb_auth.users.id). Absent on the wire for machine tokens; serde
+    /// defaults a missing field to `None` so this stays backward-compatible
+    /// with older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
 }
 
 /// One entry in a presence room's member list. Mirrors
@@ -779,6 +785,7 @@ mod tests {
                 name: None,
                 github_login: None,
                 github_id: None,
+                user_id: None,
             },
             protocol_version: None,
         })
@@ -793,6 +800,7 @@ mod tests {
                 name: None,
                 github_login: None,
                 github_id: None,
+                user_id: None,
             },
             protocol_version: Some(PROTOCOL_VERSION),
         })
@@ -960,6 +968,33 @@ mod tests {
     }
 
     #[test]
+    fn authed_user_user_id_wire_shape() {
+        let user = AuthedUser {
+            kind: UserKind::User,
+            email: None,
+            name: None,
+            github_login: None,
+            github_id: None,
+            user_id: Some("u_123".into()),
+        };
+        let v = serde_json::to_value(&user).unwrap();
+        assert_eq!(v["userId"], json!("u_123"));
+        let back: AuthedUser = serde_json::from_value(v).unwrap();
+        assert_eq!(back.user_id.as_deref(), Some("u_123"));
+
+        let machine = AuthedUser {
+            kind: UserKind::Machine,
+            email: None,
+            name: None,
+            github_login: None,
+            github_id: None,
+            user_id: None,
+        };
+        let v = serde_json::to_value(&machine).unwrap();
+        assert!(v.get("userId").is_none());
+    }
+
+    #[test]
     fn presence_server_message_wire_tags() {
         let member = PresenceMember {
             connection_id: "42".to_string(),
@@ -969,6 +1004,7 @@ mod tests {
                 name: None,
                 github_login: None,
                 github_id: None,
+                user_id: None,
             },
             state: json!({"x": 1}),
         };

@@ -320,6 +320,13 @@ pub struct AuthedUser {
     /// GitHub numeric id, paired with `github_login`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github_id: Option<i64>,
+    /// Stable opaque identity of a validated user principal — the
+    /// `rtdb_auth.users.id` that `resolve_user` keys on the per-provider
+    /// subject, so it survives provider-side email/name changes. Machine
+    /// tokens (and any absent id) omit the key entirely. Never the raw
+    /// provider subject (`google_sub` stays server-side).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
 }
 
 /// One entry in a presence room's member list. `connectionId` is the opaque,
@@ -584,7 +591,8 @@ mod tests {
                     email: Some("a@b.com".to_string()),
                     name: None,
                     github_login: None,
-                    github_id: None
+                    github_id: None,
+                    user_id: None,
                 },
                 protocol_version: None,
             })
@@ -600,7 +608,8 @@ mod tests {
                     email: Some("a@b.com".to_string()),
                     name: None,
                     github_login: None,
-                    github_id: None
+                    github_id: None,
+                    user_id: None,
                 },
                 protocol_version: None,
             })
@@ -615,7 +624,8 @@ mod tests {
                     email: Some("a@b.com".to_string()),
                     name: None,
                     github_login: None,
-                    github_id: None
+                    github_id: None,
+                    user_id: None,
                 },
                 protocol_version: Some(PROTOCOL_VERSION),
             })
@@ -814,6 +824,7 @@ mod tests {
                 name: None,
                 github_login: None,
                 github_id: None,
+                user_id: None,
             },
             state: serde_json::json!({"x": 1}),
         };
@@ -843,6 +854,42 @@ mod tests {
             })
             .unwrap()["type"],
             serde_json::json!("presenceErr")
+        );
+    }
+
+    #[test]
+    fn authed_user_user_id_wire_shape() {
+        // Additive identity contract: a validated user principal exposes the
+        // stable opaque `userId` (rtdb_auth.users.id); a machine token omits
+        // the key entirely. Never the raw provider subject.
+        let user = AuthedUser {
+            kind: UserKind::User,
+            email: Some("a@b.com".to_string()),
+            name: None,
+            github_login: None,
+            github_id: None,
+            user_id: Some("u_123".to_string()),
+        };
+        assert_eq!(
+            serde_json::to_value(&user).unwrap(),
+            serde_json::json!({
+                "kind": "user",
+                "email": "a@b.com",
+                "name": null,
+                "userId": "u_123"
+            })
+        );
+        let machine = AuthedUser {
+            kind: UserKind::Machine,
+            email: None,
+            name: None,
+            github_login: None,
+            github_id: None,
+            user_id: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&machine).unwrap(),
+            serde_json::json!({"kind": "machine", "email": null, "name": null})
         );
     }
 

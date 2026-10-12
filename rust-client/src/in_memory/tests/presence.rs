@@ -17,6 +17,7 @@ fn new_presence_client(conn: &str, rooms: Arc<Mutex<PresenceRooms>>) -> InMemory
                 name: None,
                 github_login: None,
                 github_id: None,
+                user_id: None,
             })
             .presence_rooms(rooms),
     )
@@ -156,6 +157,7 @@ fn presence_member(conn: &str, state: Value) -> PresenceMember {
             name: None,
             github_login: None,
             github_id: None,
+            user_id: None,
         },
         state,
     }
@@ -272,6 +274,7 @@ async fn presence_ttl_client_expire_presence_helper() {
                     name: None,
                     github_login: None,
                     github_id: None,
+                    user_id: None,
                 })
                 .presence_rooms(rooms),
         )

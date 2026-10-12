@@ -2613,6 +2613,7 @@ mod tests {
                 name: None,
                 github_login: None,
                 github_id: None,
+                user_id: None,
             },
             state: json!({}),
         }

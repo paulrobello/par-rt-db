@@ -55,7 +55,7 @@ class AuthedUser(_Camel):
     """Authenticated principal.
 
     ``email``/``name`` serialize as JSON ``null`` when absent; ``githubLogin``/
-    ``githubId`` are omitted entirely on the wire when ``None`` (mirrors the
+    ``githubId``/``userId`` are omitted entirely on the wire when ``None`` (mirrors the
     server's ``#[serde(skip_serializing_if = "Option::is_none")]``).
 
     ``kind`` is narrowed to ``Literal["user", "machine"]`` (ARC-004/QA-008) so a
@@ -67,11 +67,12 @@ class AuthedUser(_Camel):
     name: str | None = None
     github_login: str | None = None
     github_id: int | None = None
+    user_id: str | None = None
 
     @model_serializer(mode="wrap")
     def _drop_none_github(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         out = handler(self)
-        for alias in ("githubLogin", "githubId"):
+        for alias in ("githubLogin", "githubId", "userId"):
             if out.get(alias) is None:
                 out.pop(alias, None)
         return out

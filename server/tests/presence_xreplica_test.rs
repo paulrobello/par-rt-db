@@ -56,6 +56,7 @@ fn user(email: &str) -> AuthedUser {
         name: None,
         github_login: None,
         github_id: None,
+        user_id: Some(format!("u-{email}")),
     }
 }
 

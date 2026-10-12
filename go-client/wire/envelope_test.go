@@ -42,6 +42,31 @@ func TestAuthedUserNameNullVsGithubOmitted(t *testing.T) {
 	}
 }
 
+func TestAuthedUserUserID(t *testing.T) {
+	id := "u_123"
+	b, err := json.Marshal(AuthedUser{Kind: UserKindUser, UserID: &id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytesHas(b, `"userId":"u_123"`) {
+		t.Fatalf("userId missing: %s", b)
+	}
+	var back AuthedUser
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.UserID == nil || *back.UserID != id {
+		t.Fatalf("userId not round-tripped: %+v", back)
+	}
+	m, err := json.Marshal(AuthedUser{Kind: UserKindMachine})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytesHas(m, "userId") {
+		t.Fatalf("userId must be omitted for machines: %s", m)
+	}
+}
+
 func TestQueryUpdateDecode(t *testing.T) {
 	frame := []byte(`{"type":"queryUpdate","queryId":"q1","result":{"docs":[{"_id":"i1"}]}}`)
 	msg, err := UnmarshalServerMessage(frame)

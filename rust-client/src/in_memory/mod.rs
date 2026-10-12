@@ -459,6 +459,7 @@ impl InMemoryRtDbClient {
                 name: None,
                 github_login: None,
                 github_id: None,
+                user_id: None,
             }),
             connection_id,
             joined_rooms: BTreeSet::new(),

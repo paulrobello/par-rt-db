@@ -538,6 +538,7 @@ async fn presence_manager_is_wired_and_disabled_by_default() {
                 name: None,
                 github_login: None,
                 github_id: None,
+                user_id: None,
             },
             t,
             Some(3),

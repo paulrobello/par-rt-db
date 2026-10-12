@@ -69,7 +69,7 @@ public enum UserKind: String, Codable, Sendable {
 
 /// Mirrors server/src/protocol.rs::AuthedUser — camelCase keys. `email`/`name`
 /// are plain Options (JSON `null` on the wire when absent, never omitted);
-/// `githubLogin`/`githubId` are omitted entirely when absent. No unknown-field
+/// `githubLogin`/`githubId`/`userId` are omitted entirely when absent. No unknown-field
 /// rejection: the server and rust-client AuthedUser carry no
 /// `deny_unknown_fields`.
 public struct AuthedUser: Equatable, Codable, Sendable {
@@ -83,20 +83,24 @@ public struct AuthedUser: Equatable, Codable, Sendable {
     public var githubLogin: String?
     /// GitHub numeric user id, present only for GitHub-authenticated sessions.
     public var githubId: Int64?
+    /// Stable opaque identity of a validated user principal (the server's
+    /// users.id). Absent on the wire for machine tokens.
+    public var userId: String?
 
     public init(
         kind: UserKind, email: String? = nil, name: String? = nil,
-        githubLogin: String? = nil, githubId: Int64? = nil
+        githubLogin: String? = nil, githubId: Int64? = nil, userId: String? = nil
     ) {
         self.kind = kind
         self.email = email
         self.name = name
         self.githubLogin = githubLogin
         self.githubId = githubId
+        self.userId = userId
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
-        case kind, email, name, githubLogin, githubId
+        case kind, email, name, githubLogin, githubId, userId
     }
 
     public init(from decoder: Decoder) throws {
@@ -106,6 +110,7 @@ public struct AuthedUser: Equatable, Codable, Sendable {
         name = try container.decodeIfPresent(String.self, forKey: .name)
         githubLogin = try container.decodeIfPresent(String.self, forKey: .githubLogin)
         githubId = try container.decodeIfPresent(Int64.self, forKey: .githubId)
+        userId = try container.decodeIfPresent(String.self, forKey: .userId)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -115,6 +120,7 @@ public struct AuthedUser: Equatable, Codable, Sendable {
         try container.encode(name, forKey: .name) // plain Option: nil -> null
         try container.encodeIfPresent(githubLogin, forKey: .githubLogin)
         try container.encodeIfPresent(githubId, forKey: .githubId)
+        try container.encodeIfPresent(userId, forKey: .userId)
     }
 }
 

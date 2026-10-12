@@ -222,6 +222,7 @@ fn arc004_enums_serialize_byte_identical_to_prior_strings() {
         name: None,
         github_login: None,
         github_id: None,
+        user_id: None,
     };
     assert_eq!(serde_json::to_value(&u).unwrap()["kind"], json!("user"));
 

@@ -63,6 +63,16 @@ def test_authed_user_full() -> None:
     }
 
 
+def test_authed_user_user_id_present_for_user_absent_for_machine() -> None:
+    u = AuthedUser.model_validate({"kind": "user", "userId": "u_123"})
+    assert u.user_id == "u_123"
+    dumped = u.model_dump(by_alias=True, exclude_none=False)
+    assert dumped["userId"] == "u_123"
+    m = AuthedUser.model_validate({"kind": "machine"})
+    assert m.user_id is None
+    assert "userId" not in m.model_dump(by_alias=True, exclude_none=False)
+
+
 def test_authed_user_rejects_unknown() -> None:
     with pytest.raises(ValidationError):
         AuthedUser.model_validate({"kind": "user", "bogus": 1})

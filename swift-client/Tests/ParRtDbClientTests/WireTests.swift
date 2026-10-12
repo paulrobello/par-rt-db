@@ -548,6 +548,19 @@ struct WireDslTests {
         #expect(user.name == nil)
     }
 
+    @Test func authedUserUserIdRoundTripsAndIsOmittedWhenNil() throws {
+        let user = AuthedUser(kind: .user, email: "a@b.com", name: nil, userId: "u_123")
+        let userOut = try encodedText(user)
+        #expect(userOut.contains(#""userId":"u_123""#))
+        #expect(userOut.contains(#""name":null"#))
+        #expect(try decode(AuthedUser.self, userOut).userId == "u_123")
+
+        let machine = AuthedUser(kind: .machine)
+        let machineOut = try encodedText(machine)
+        #expect(!machineOut.contains("userId"))
+        #expect(try decode(AuthedUser.self, machineOut).userId == nil)
+    }
+
     @Test func authedUserRejectsUnknownKind() {
         expectDecodingThrows(AuthedUser.self, #"{"kind":"robot","email":null,"name":null}"#)
     }

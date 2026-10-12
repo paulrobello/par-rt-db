@@ -383,6 +383,26 @@ describe("RtDbHttpClient", () => {
     expect(user.kind).toBe("machine");
     expect(user.githubLogin).toBeUndefined();
     expect(user.githubId).toBeUndefined();
+    expect(user.userId).toBeUndefined();
+    expect("userId" in user).toBe(false);
+  });
+
+  it("validateSessionToken preserves the additive userId field", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        user: { kind: "user", email: "player@example.com", name: null, userId: "u_123" },
+      }),
+    );
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+
+    const user = await client.validateSessionToken("player-session-token");
+
+    expect(user.userId).toBe("u_123");
   });
 
   it("authMe GETs /auth/me with the client's own bearer and returns the user", async () => {
