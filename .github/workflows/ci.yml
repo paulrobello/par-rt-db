@@ -1,75 +1,122 @@
 name: CI
 
-# ARC-003: gate every change. `make checkall` is the single source of truth for
-# the project's definition-of-done (fmt-check + clippy -D warnings + typecheck +
-# tests across server, ts-client, rust-client, python-client, dashboard, cli).
+# ARC-003: gate every change. Restructured 2026-10-12 to the standard CI shape
+# (job-per-concern + scoped dispatch): one job per gate concern, each composing
+# the same `make` targets `make checkall` does — so the local gate and CI stay
+# in parity and "re-run failed jobs" re-executes exactly the failed concern
+# (a lint typo is distinguishable from a test failure at the job level).
+#
+#   scope       resolver: turns the workflow_dispatch `os-scope` choice into the
+#               runner matrix every other job gates on (scoped dispatch — one
+#               OS's legs re-trigger with a single dispatch, no push)
+#   drift       env/dockerfile/backup/hostname/cli-docs drift checks
+#   lint        make fmt-check lint
+#   typecheck   make typecheck
+#   test        make test (ubuntu — the platform-sensitive concern; the macOS
+#               leg is the `swift` job below)
+#   features    make rust-client-check-features (ARC-110)
+#   docs        API references (rust/ts/python) — dispatch/tag only (heavy
+#               artifact tiering; pages consumes them on tags)
+#   swift       make swift-client-checkall (macOS leg)
+#   proptest    weekly 1000-case property tests
+#   deps-audit  weekly make audit-deps (ENH-051)
+#   pages       tag-only publish of the API references
+#
 # The Swift client's gate stays off the ubuntu image — swiftformat/swiftlint
 # are brew-only there (recent ubuntu images may carry a Swift toolchain, but
 # the lint pair is the decisive gap). Its Makefile lines are Darwin-guarded
-# (skipped loudly here) and gated by the macOS `swift` job below instead.
+# (skipped loudly here) and gated by the macOS `swift` job instead.
 on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      os-scope:
+        description: >-
+          Runner scope to re-trigger; 'all' runs every leg. Use a single
+          dispatch to verify a platform-scoped fix instead of a full run.
+        type: choice
+        default: all
+        options: [all, ubuntu-latest, macos-latest]
 
   schedule:
     - cron: '17 4 * * 1'
-# Cancel superseded runs on the same ref AND event: branch pushes and PR
-# updates still supersede their own in-flight runs, but the weekly scheduled
-# run (schedule event on the default branch) can no longer be cancelled by —
-# nor cancel — a concurrent push run on that same ref.
+
+# Cancel superseded runs on PR updates only. Push and scheduled runs go to
+# completion: the weekly scheduled run (schedule event on the default branch)
+# can neither be cancelled by — nor cancel — a concurrent push run on the same
+# ref, because the group includes the event name.
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Least-privilege: CI only reads the repo. Add write tokens only if a step needs them.
 permissions:
   contents: read
 
 jobs:
-  checkall:
-    name: make checkall
+  scope:
+    name: Resolve runner scope
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
+    outputs:
+      os-matrix: ${{ steps.resolve.outputs.os-matrix }}
+    steps:
+      - name: Resolve os scope
+        id: resolve
+        run: |
+          case "${{ inputs.os-scope }}" in
+            all)           MATRIX='["ubuntu-latest", "macos-latest"]' ;;
+            ubuntu-latest) MATRIX='["ubuntu-latest"]' ;;
+            macos-latest)  MATRIX='["macos-latest"]' ;;
+            # Non-dispatch events carry no input: every leg runs.
+            "")            MATRIX='["ubuntu-latest", "macos-latest"]' ;;
+            *) echo "unknown os-scope: ${{ inputs.os-scope }}" >&2; exit 1 ;;
+          esac
+          echo "os-matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "os-matrix=$MATRIX"
 
-    env:
-      # The server integration tests read RTDB_TEST_DATABASE_URL
-      # (server/tests/common/mod.rs, server/tests/healthz_test.rs). The Makefile
-      # exports this same default (line 2); we set it explicitly so the CI is
-      # self-documenting and independent of that Makefile default. The value
-      # matches what `make dev-db-up` brings up (pgvector on 127.0.0.1:55434).
-      RTDB_TEST_DATABASE_URL: postgres://rtdb:rtdb@127.0.0.1:55434/rtdb
+  drift:
+    name: drift checks (env, dockerfile, backup, hostname, cli-docs)
+    needs: [scope]
+    if: contains(fromJSON(needs.scope.outputs.os-matrix), 'ubuntu-latest')
+    runs-on: ubuntu-latest
+    # Per-job ceilings. Bump only with the incident run-id in a comment when a
+    # ceiling has killed a real run.
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Rust (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: stable
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2.9.2
+
+      # cli-docs-check builds the cli (workspace deps included); the other four
+      # checks are pure shell over committed files.
+      - name: Free runner disk space
+        uses: ./.github/actions/free-runner-disk
+
+      - name: Run drift checks
+        run: make env-drift-check dockerfile-stub-check backup-persistence-check hostname-leak-check cli-docs-check
+
+  lint:
+    name: make fmt-check lint
+    needs: [scope]
+    if: contains(fromJSON(needs.scope.outputs.os-matrix), 'ubuntu-latest')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7.0.1
 
-      # Reclaim runner disk before the build. The full debug build of the
-      # server + rust-client test graph (hundreds of `target/debug/deps`
-      # artifacts) plus the `pgvector/pgvector:pg17` Docker pull exhausts the
-      # ubuntu-latest root FS — observed as `rustc-LLVM ERROR: IO failure on
-      # output stream: No space left on device` mid-compile (three consecutive
-      # failures, 2026-08-11). ubuntu-latest ships ~5–7 GB of SDK/toolchain
-      # cruft this workflow never uses (Android, .NET, CodeQL, Haskell, the
-      # apt cache, stale Docker images); removing it head-of-queue prevents
-      # the disk-fill. Manual `rm` (not a third-party action) to keep the
-      # workflow's pinned-action discipline. `df -h` proves the reclamation.
       - name: Free runner disk space
-        run: |
-          set -x
-          df -h /
-          sudo rm -rf \
-            /usr/local/lib/android \
-            /usr/share/dotnet \
-            /usr/local/share/powershell \
-            /opt/ghc \
-            /usr/local/.ghcup \
-            /usr/local/share/edge_driver \
-            /usr/local/share/gecko_driver \
-            /usr/local/share/chrome_driver
-          sudo apt-get clean
-          sudo docker system prune -af --volumes || true
-          df -h /
+        uses: ./.github/actions/free-runner-disk
 
       # --- Rust (server + rust-client) -------------------------------------
       # edition = "2024" in both Cargo.tomls ⇒ requires stable ≥ 1.85.
@@ -108,8 +155,6 @@ jobs:
           enable-cache: true
 
       # --- Go (go-client) ---------------------------------------------------
-      # `go vet` is the typecheck analog; the module's only dependency is
-      # coder/websocket, so `go mod download` is the only warmup needed.
       # SEC-138: setup-go pinned to an immutable commit SHA
       # (f111f3307d8850f501ac008e886eec1fd1932a34 = v5.3.0, verified to resolve).
       - name: Set up Go
@@ -119,10 +164,9 @@ jobs:
           cache-dependency-path: go-client/go.sum
 
       # --- First-time installs ---------------------------------------------
-      # A fresh CI checkout has no node_modules, no .venv, no Go module cache,
-      # and no ts-client/dist. These targets are NOT prerequisites of
-      # `make checkall` — the Makefile assumes they have already been run once
-      # (see CLAUDE.md).
+      # A fresh CI checkout has no node_modules, no .venv, and no Go module
+      # cache. These targets are NOT prerequisites of the make gate — the
+      # Makefile assumes they have already been run once (see CLAUDE.md).
       - name: Install go-client deps
         run: make go-client-install
 
@@ -135,24 +179,121 @@ jobs:
       - name: Install python-client deps
         run: make python-client-install
 
-      # --- The gate ---------------------------------------------------------
-      # `make checkall` = fmt-check + lint + typecheck + test.
-      #
+      - name: Run make fmt-check lint
+        run: make fmt-check lint
+
+  typecheck:
+    name: make typecheck
+    needs: [scope]
+    if: contains(fromJSON(needs.scope.outputs.os-matrix), 'ubuntu-latest')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      # No Rust toolchain here by design (ARC-014): `make typecheck` carries the
+      # non-Rust typecheckers only — clippy in the lint job already fails on
+      # everything cargo check would.
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2.2.0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@227a0f6bea25cde3444f52decccf4a18de6635f4
+        with:
+          enable-cache: true
+
+      - name: Set up Go
+        uses: actions/setup-go@90ad2b35f69faf97585ad74d28fa006d2739b7af
+        with:
+          go-version: "1.23"
+          cache-dependency-path: go-client/go.sum
+
+      - name: Install go-client deps
+        run: make go-client-install
+
+      - name: Install ts-client deps
+        run: make ts-client-install
+
+      - name: Install dashboard deps
+        run: make dashboard-install
+
+      - name: Install python-client deps
+        run: make python-client-install
+
+      # `make typecheck` depends on `ts-client-build`, so the dashboard's
+      # `@par-rt-db/client` resolution from ts-client/dist is satisfied
+      # automatically (gate-needs-ts-client-dist-built gotcha).
+      - name: Run make typecheck
+        run: make typecheck
+
+  test:
+    name: make test
+    needs: [scope]
+    if: contains(fromJSON(needs.scope.outputs.os-matrix), 'ubuntu-latest')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # The server integration tests read RTDB_TEST_DATABASE_URL
+      # (server/tests/common/mod.rs, server/tests/healthz_test.rs). The Makefile
+      # exports this same default (line 2); we set it explicitly so the CI is
+      # self-documenting and independent of that Makefile default. The value
+      # matches what `make dev-db-up` brings up (pgvector on 127.0.0.1:55434).
+      RTDB_TEST_DATABASE_URL: postgres://rtdb:rtdb@127.0.0.1:55434/rtdb
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Free runner disk space
+        uses: ./.github/actions/free-runner-disk
+
+      - name: Set up Rust (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: stable
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2.9.2
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2.2.0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@227a0f6bea25cde3444f52decccf4a18de6635f4
+        with:
+          enable-cache: true
+
+      - name: Set up Go
+        uses: actions/setup-go@90ad2b35f69faf97585ad74d28fa006d2739b7af
+        with:
+          go-version: "1.23"
+          cache-dependency-path: go-client/go.sum
+
+      - name: Install go-client deps
+        run: make go-client-install
+
+      - name: Install ts-client deps
+        run: make ts-client-install
+
+      - name: Install dashboard deps
+        run: make dashboard-install
+
+      - name: Install python-client deps
+        run: make python-client-install
+
       # Database strategy: we deliberately do NOT use a `services:` Postgres
-      # container. Instead `make checkall` → `make test` → `make dev-db-up`
-      # brings up `pgvector/pgvector:pg17` on 127.0.0.1:55434 via docker compose.
-      # Reasons:
+      # container. Instead `make test` has `dev-db-up` as a hard Make
+      # prerequisite, bringing up `pgvector/pgvector:pg17` on 127.0.0.1:55434
+      # via docker compose. Reasons:
       #   1. The server uses pgvector for vector search; a plain `postgres:17`
       #      service container would fail vector-search tests.
-      #   2. `make test` has `dev-db-up` as a hard Make prerequisite, so the DB
-      #      is started automatically and tuned (max_connections=300 for the
-      #      ~20 concurrent test binaries).
-      #   3. `docker compose` v2 is preinstalled on ubuntu-latest, and the
-      #      dev compose file's `--wait` flag blocks until the pg_isready
-      #      healthcheck passes.
-      # `make typecheck` (inside checkall) depends on `ts-client-build`, so the
-      # dashboard's `@par-rt-db/client` resolution from ts-client/dist is
-      # satisfied automatically (gate-needs-ts-client-dist-built gotcha).
+      #   2. The dev compose file tunes the instance (max_connections=300 for
+      #      the ~20 concurrent test binaries) and `--wait` blocks until the
+      #      pg_isready healthcheck passes.
+      #   3. `docker compose` v2 is preinstalled on ubuntu-latest.
       # nextest: `make test` prefers `cargo nextest run` (per-test processes +
       # retry quotas, .config/nextest.toml) and falls back to `cargo test` when
       # absent — this step is what makes the nextest branch the one CI takes.
@@ -163,8 +304,82 @@ jobs:
         with:
           tool: cargo-nextest
 
-      - name: Run make checkall
-        run: make checkall
+      - name: Run make test
+        run: make test
+
+  features:
+    name: make rust-client-check-features
+    needs: [scope]
+    if: contains(fromJSON(needs.scope.outputs.os-matrix), 'ubuntu-latest')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Free runner disk space
+        uses: ./.github/actions/free-runner-disk
+
+      - name: Set up Rust (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: stable
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2.9.2
+
+      # ARC-110: `make checkall` exercises rust-client only under
+      # `--all-features`. This extra gate checks the library AND every test
+      # target across meaningful feature combinations, so an ungated feature
+      # import in a test (which would compile under --all-features and break
+      # every other combo) is caught. The [[test]] required-features in
+      # rust-client/Cargo.toml make the per-test gating declarative.
+      - name: rust-client feature-combination gate (ARC-110)
+        run: make rust-client-check-features
+
+  docs:
+    # Heavy artifact tiering: the API references are needed only when they are
+    # consumed (the tag-triggered pages publish) or explicitly requested via
+    # workflow_dispatch — not on every push.
+    name: API references (rust, ts, python)
+    needs: [scope]
+    if: >-
+      contains(fromJSON(needs.scope.outputs.os-matrix), 'ubuntu-latest') &&
+      (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Rust (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: stable
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2.9.2
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2.2.0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@227a0f6bea25cde3444f52decccf4a18de6635f4
+        with:
+          enable-cache: true
+
+      - name: Install ts-client deps
+        run: make ts-client-install
+
+      - name: Install python-client deps
+        run: make python-client-install
+
+      # On ubuntu the Makefile's `docs-api` reduces to exactly these three
+      # targets (swift-client-doc is Darwin-guarded and built in the swift job).
+      - name: Build API references
+        run: make rust-client-doc ts-client-doc python-client-doc
 
       - name: Upload Rust API reference
         uses: actions/upload-artifact@v7.0.1
@@ -184,19 +399,52 @@ jobs:
           name: python-api-reference
           path: python-client/docs-api
 
+  # --- Swift client (macOS runner) ----------------------------------------
+  # `swift build`/`swift test` need the Swift 6 toolchain, which ships with the
+  # Xcode on macos-latest; swiftformat/swiftlint come from Homebrew (the runner
+  # image usually carries both — `brew install` is a fast no-op when it does).
+  # Same pinned checkout ref as the ubuntu jobs (SEC-138 discipline: no
+  # floating tags).
+  swift:
+    name: make swift-client-checkall
+    needs: [scope]
+    if: contains(fromJSON(needs.scope.outputs.os-matrix), 'macos-latest')
+    runs-on: macos-latest
+    timeout-minutes: 30
 
-      # ARC-110: `make checkall` exercises rust-client only under
-      # `--all-features`. This extra gate checks the library AND every test
-      # target across meaningful feature combinations, so an ungated feature
-      # import in a test (which would compile under --all-features and break
-      # every other combo) is caught. The [[test]] required-features in
-      # rust-client/Cargo.toml make the per-test gating declarative.
-      - name: rust-client feature-combination gate (ARC-110)
-        run: make rust-client-check-features
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Install swiftformat & swiftlint
+        run: brew install swiftformat swiftlint
+
+      - name: Run make swift-client-checkall
+        run: make swift-client-checkall
+
+      # Same artifact tiering as the docs job: DocC + upload only when the
+      # reference is consumed (tags) or explicitly requested.
+      - name: Generate Swift API reference
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+        run: make swift-client-doc
+
+      - name: Package Swift API reference
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+        run: tar -czf swift-api-reference.tar.gz -C swift-client/docs-api ParRtDbClient.doccarchive
+
+      - name: Upload Swift API reference
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: swift-api-reference
+          path: swift-api-reference.tar.gz
 
   proptest-weekly:
     name: property tests (1000 cases)
-    if: github.event_name == 'schedule'
+    needs: [scope]
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && contains(fromJSON(needs.scope.outputs.os-matrix), 'ubuntu-latest'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -224,7 +472,10 @@ jobs:
   # is inherent: SwiftPM has no advisory database, so Swift gets a listing only.
   deps-audit-weekly:
     name: dependency audit (make audit-deps)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: [scope]
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && contains(fromJSON(needs.scope.outputs.os-matrix), 'ubuntu-latest'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -259,43 +510,12 @@ jobs:
       - name: Run dependency audit
         run: make audit-deps
 
-  # --- Swift client (macOS runner) --------------------------------------
-  # `swift build`/`swift test` need the Swift 6 toolchain, which ships with the
-  # Xcode on macos-latest; swiftformat/swiftlint come from Homebrew (the runner
-  # image usually carries both — `brew install` is a fast no-op when it does).
-  # Same pinned checkout ref as the ubuntu job (SEC-138 discipline: no
-  # floating tags).
-  swift:
-    name: make swift-client-checkall
-    runs-on: macos-latest
-    timeout-minutes: 30
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7.0.1
-
-      - name: Install swiftformat & swiftlint
-        run: brew install swiftformat swiftlint
-
-      - name: Run make swift-client-checkall
-        run: make swift-client-checkall
-      - name: Generate Swift API reference
-        run: make swift-client-doc
-
-      - name: Package Swift API reference
-        run: tar -czf swift-api-reference.tar.gz -C swift-client/docs-api ParRtDbClient.doccarchive
-
-      - name: Upload Swift API reference
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: swift-api-reference
-          path: swift-api-reference.tar.gz
-
   pages:
     name: Publish API references
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    needs: [checkall, swift]
+    needs: [drift, lint, typecheck, test, features, docs, swift]
+    timeout-minutes: 15
     permissions:
       contents: read
       pages: write

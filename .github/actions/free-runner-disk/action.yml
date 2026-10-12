@@ -1,0 +1,27 @@
+name: 'Free runner disk space'
+description: >-
+  Reclaim ubuntu-latest SDK cruft before a heavy Rust build. The full debug
+  build graph (hundreds of target/debug/deps artifacts) plus the pgvector
+  Docker pull exhausts the ubuntu-latest root FS — observed as
+  `rustc-LLVM ERROR: IO failure on output stream: No space left on device`
+  mid-compile (three consecutive failures, 2026-08-11). Manual rm, not a
+  third-party action, to keep the workflow's pinned-action discipline.
+runs:
+  using: composite
+  steps:
+    - run: |
+        set -x
+        df -h /
+        sudo rm -rf \
+          /usr/local/lib/android \
+          /usr/share/dotnet \
+          /usr/local/share/powershell \
+          /opt/ghc \
+          /usr/local/.ghcup \
+          /usr/local/share/edge_driver \
+          /usr/local/share/gecko_driver \
+          /usr/local/share/chrome_driver
+        sudo apt-get clean
+        sudo docker system prune -af --volumes || true
+        df -h /
+      shell: bash
