@@ -54,9 +54,10 @@ steps, and is constrained to four CPUs with `cpu-quota=400000` and
 to the Docker Engine used by Compose. The existing builder is reused so
 deploys retain its cache and do not recreate a running builder.
 
-These limits protect the host-local `cloudflared` connector while Rust and
-dashboard build steps run. They limit both BuildKit solver concurrency and the
-builder container's CPU share. A Docker Compose service `deploy.resources`
+These limits reserve CPU capacity for the host-local `cloudflared` connector
+while Rust and dashboard build steps run. Verify availability under the current
+build and host workload with the monitoring procedure below. The limits bound
+both BuildKit solver concurrency and the builder container's CPU share. A Docker Compose service `deploy.resources`
 limit would not provide this protection because it applies only after an image
 has been built.
 

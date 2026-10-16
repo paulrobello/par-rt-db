@@ -1,6 +1,6 @@
 # Transaction deadlines
 
-Implementation status: full repository verification and actual-source review passed. Not pushed or deployed. No authentication policy, credential or live database configuration changes are included.
+The implementation has passed full repository verification and actual-source review. Deployment and consuming-application acceptance require target-runtime verification. This capability does not change authentication policies or credentials.
 
 `{"op":"expectBefore","deadlineMs":2000}` requires the authoritative clock to be strictly less than an absolute epoch-millisecond deadline. The step returns `null` and touches no document. A missing, negative, fractional, nonnumeric or unsafe-integer deadline fails with `BAD_REQUEST`. Equality or expiry fails with `PRECONDITION_FAILED` and rolls back the whole transaction.
 
