@@ -212,6 +212,12 @@ export class TxnBuilder<S extends SchemaDefinition<any> = SchemaDefinition<any>>
     return this;
   }
 
+  /** Require execution and the final commit decision to precede an absolute server-clock epoch-ms deadline. */
+  expectBefore(deadlineMs: number): this {
+    this.steps.push({ op: "expectBefore", deadlineMs });
+    return this;
+  }
+
   /**
    * Adds a check to expect a document is absent for a given key.
    */

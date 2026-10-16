@@ -430,8 +430,21 @@ pub async fn run_case(pool: &sqlx::PgPool, case_name: &str, case: &Value) {
     // nextCursor, then run the real query with it. `expect` describes the
     // SECOND page.
     let op_result: Value = if let Some(txn_json) = case.pointer("/op/txn") {
-        let txn: Transaction = serde_json::from_value(substitute(txn_json, &ids, case_name))
-            .unwrap_or_else(|e| panic!("{case_name}: op.txn does not parse: {e}"));
+        let txn: Transaction = match serde_json::from_value(substitute(txn_json, &ids, case_name)) {
+            Ok(txn) => txn,
+            Err(error) => {
+                assert!(
+                    expects_error,
+                    "{case_name}: unexpected malformed transaction: {error}"
+                );
+                assert_error_code(
+                    &RtDbError::bad_request(error.to_string()),
+                    expect,
+                    case_name,
+                );
+                return;
+            }
+        };
         if frozen && db::is_read_only(pool, &db_name).await.unwrap_or(false) {
             let e = RtDbError::read_only();
             assert_error_code(&e, expect, case_name);
@@ -625,8 +638,16 @@ pub async fn capture_case_expect(
     let error_envelope = |e: &RtDbError| serde_json::json!({"error": {"code": serde_json::to_value(e.code).expect("serialize error code")}});
     let (op_result, derived): (Result<Value, RtDbError>, Option<SchemaDef>) =
         if let Some(txn_json) = case.pointer("/op/txn") {
-            let txn: Transaction = serde_json::from_value(substitute(txn_json, &ids, case_name))
-                .unwrap_or_else(|e| panic!("{case_name}: op.txn does not parse: {e}"));
+            let txn: Transaction =
+                match serde_json::from_value(substitute(txn_json, &ids, case_name)) {
+                    Ok(txn) => txn,
+                    Err(error) => {
+                        return CapturedServerExpect {
+                            op: error_envelope(&RtDbError::bad_request(error.to_string())),
+                            then: None,
+                        };
+                    }
+                };
             match execute_txn(pool, &db_name, &schema, &txn, &PrincipalCtx::bypass(), None).await {
                 Ok(outcome) => (Ok(Value::Array(outcome.results)), None),
                 Err(e) => (Err(e), None),

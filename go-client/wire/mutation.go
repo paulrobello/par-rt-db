@@ -1,7 +1,7 @@
 // go-client/wire/mutation.go
 package wire
 
-// Mirrors core/src/mutation.rs — Transaction, Step (15 variants; the plan
+// Mirrors core/src/mutation.rs — Transaction, Step (16 variants; the plan
 // listed 14 but the server's AdjustCounter wins — ledger R10a),
 // ScheduleWhen, and the untagged StepResult decode shape. Tag key "op"
 // for Step (camelCase), "type" for ScheduleWhen. Strict decode; variants
@@ -237,6 +237,32 @@ type StepExpectVersion struct {
 	Table   string `json:"table"`
 	ID      string `json:"id"`
 	Version int64  `json:"version"`
+}
+
+// StepExpectBefore requires execution and the final commit decision before an epoch-ms deadline.
+type StepExpectBefore struct {
+	DeadlineMs int64 `json:"deadlineMs"`
+}
+
+func (StepExpectBefore) isStep() {}
+
+func (v StepExpectBefore) MarshalJSON() ([]byte, error) {
+	type alias StepExpectBefore
+	return MarshalTagged("op", "expectBefore", alias(v))
+}
+
+func (v *StepExpectBefore) UnmarshalJSON(b []byte) error {
+	r, err := StrictUnmarshal[struct {
+		DeadlineMs *int64 `json:"deadlineMs"`
+	}](b)
+	if err != nil {
+		return err
+	}
+	if r.DeadlineMs == nil {
+		return fmt.Errorf("deadlineMs is required")
+	}
+	v.DeadlineMs = *r.DeadlineMs
+	return nil
 }
 
 func (StepExpectVersion) isStep() {}
@@ -694,6 +720,8 @@ func UnmarshalStep(data []byte) (Step, error) {
 		return DecodeTagged[StepUndelete](data, "op")
 	case "expectVersion":
 		return DecodeTagged[StepExpectVersion](data, "op")
+	case "expectBefore":
+		return DecodeTagged[StepExpectBefore](data, "op")
 	case "expectAbsent":
 		return DecodeTagged[StepExpectAbsent](data, "op")
 	case "upsert":

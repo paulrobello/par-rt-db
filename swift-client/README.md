@@ -21,6 +21,7 @@ Design and scope:
   - [Durable workflows](#durable-workflows)
   - [Schema DSL (`SchemaBuilder`)](#schema-dsl-schemabuilder)
     - [Computed fields (`ValueExpr`)](#computed-fields-valueexpr)
+- [Transaction deadlines](#transaction-deadlines)
 - [Storage](#storage)
 - [Admin client](#admin-client)
 - [Error handling](#error-handling)
@@ -387,6 +388,10 @@ travels as a decimal string on the wire). An evaluation error (division by
 zero, a bad cast) fails the write with BAD_REQUEST naming the field. A
 `renameField` migration rewrites the expression's references with the field.
 
+## Transaction deadlines
+
+Transactions support `.expectBefore(deadlineMs)` to require the authoritative clock to precede an exclusive epoch-ms deadline at execution and the final commit decision. Expiry rolls back all effects with `PRECONDITION_FAILED`. Pair a stored lease deadline with version/ownership guards. The in-memory engine uses its injected clock. See [transaction deadlines](../docs/transaction-deadlines.md).
+
 ## Storage
 
 `RtDbHttpClient` carries the full file-storage surface (HTTP-only, like the
@@ -529,7 +534,7 @@ Published reference: https://paulrobello.github.io/par-rt-db/swift/
 | --- | --- |
 | Wire types — fifth implementation of the contract | ✅ (+ `wire-corpus.json` parity runner, ARC-008) |
 | Query DSL — every terminal incl. `search`/`vectorSearch`/`hybridSearch`/`paginate`/`aggregate`/`distinct` | ✅ |
-| Mutation DSL — all 15 step ops (incl. `adjustCounter`), recursive step-cap enforcement | ✅ |
+| Mutation DSL — all 16 step ops (incl. `adjustCounter`), recursive step-cap enforcement | ✅ |
 | Schema DSL — 15 field types, btree/search/vector/unique/partial indexes, `ownerField`/`collaboratorsField`/`authorize`, `ttl`, `updatedAtField`, `autoIncrementField`, `defaults`, `computed`, `softDelete`, `onDelete` | ✅ |
 | HTTP client — query/query-batch/mutate (+ idempotency key, retry helper), schedule ops, workflow ops, change feed (`changes(since:table:limit:)`), full storage surface, `pushSchema`/`previewSchema`, `authMe` | ✅ |
 | WS client — auth/reconnect/heartbeat, shared subscriptions with replay, mutate-over-WS, schedule + workflow ops | ✅ |

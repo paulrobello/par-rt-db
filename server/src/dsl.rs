@@ -206,7 +206,8 @@ impl StepTableExt for Step {
             | Step::PatchByQuery { table, .. }
             | Step::DeleteByQuery { table, .. }
             | Step::Undelete { table, .. } => Some(table),
-            Step::Schedule { .. }
+            Step::ExpectBefore { .. }
+            | Step::Schedule { .. }
             | Step::CancelSchedule { .. }
             | Step::StartWorkflow { .. }
             | Step::CancelWorkflow { .. } => None,

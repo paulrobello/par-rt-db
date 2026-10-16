@@ -74,6 +74,8 @@ def project(
 
     Pure: no I/O, no clock, no mutation of ``last_value`` or ``txn_steps``.
     """
+    if any(step.get("op") == "expectBefore" for step in txn_steps):
+        return (None, False)
     if query_dict.get("get") is not None:
         return _project_get(query_dict, last_value, txn_steps)
     if not _is_array_query(query_dict):

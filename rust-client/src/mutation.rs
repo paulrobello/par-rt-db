@@ -180,6 +180,11 @@ impl Mutation {
         });
         self
     }
+    /// Require execution and the final commit decision to precede an absolute epoch-ms deadline.
+    pub fn expect_before(mut self, deadline_ms: i64) -> Self {
+        self.steps.push(Step::ExpectBefore { deadline_ms });
+        self
+    }
     /// Queue an index-absence precondition step.
     pub fn expect_absent(mut self, table: &str, index: &str, eq: &[Value]) -> Self {
         self.steps.push(Step::ExpectAbsent {

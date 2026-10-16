@@ -359,6 +359,8 @@ pub async fn execute_txn_with_side(
         // only the uid, so derive the legacy `owner: Option<&str>` view once and
         // thread it unchanged — byte-identical ownerField/collaboratorsField behavior.
         let owner = ctx.user_id.as_deref();
+        let deadline = par_rt_db_core::engine::transaction_deadline(txn)
+            .map_err(RtDbError::bad_request)?;
 
         if count_steps(txn) > MAX_STEPS {
             return Err(RtDbError::bad_request(format!(
@@ -461,6 +463,9 @@ pub async fn execute_txn_with_side(
             write_set: &mut write_set,
             results: &mut results,
         };
+        if deadline.is_some_and(|value| now_ms() >= value) {
+            return Err(RtDbError::precondition("transaction deadline expired"));
+        }
         for step in &txn.steps {
             // ENH-005 Task 4: gate each step against the machine-token table
             // allowlist BEFORE any work. A scoped token cannot write a forbidden
@@ -505,6 +510,7 @@ pub async fn execute_txn_with_side(
                 Step::ExpectVersion { table, id, version } => {
                     step_expect_version(&mut sctx, table, id, *version).await?
                 }
+                Step::ExpectBefore { .. } => sctx.results.push(serde_json::Value::Null),
                 Step::ExpectAbsent { table, index, eq } => {
                     step_expect_absent(&mut sctx, table, index, eq).await?
                 }
@@ -575,6 +581,10 @@ pub async fn execute_txn_with_side(
 
         crate::change_log::append(&mut tx, pg_schema_name.as_str(), &write_set).await?;
 
+        // All asynchronous document, dedup and outbox work is still rollbackable here.
+        if deadline.is_some_and(|value| now_ms() >= value) {
+            return Err(RtDbError::precondition("transaction deadline expired"));
+        }
         tx.commit().await?;
         Ok(TxnOutcome { results, write_set })
     }

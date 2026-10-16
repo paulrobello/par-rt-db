@@ -401,6 +401,7 @@ export type StepJson =
   | { op: "delete"; table: string; id: string }
   | { op: "undelete"; table: string; id: string }
   | { op: "expectVersion"; table: string; id: string; version: number }
+  | { op: "expectBefore"; deadlineMs: number }
   | { op: "expectAbsent"; table: string; index: string; eq: unknown[] }
   | {
       op: "upsert";

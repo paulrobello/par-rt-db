@@ -21,7 +21,14 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 from pydantic_core.core_schema import SerializerFunctionWrapHandler
 
 
@@ -685,6 +692,14 @@ class _ClientMutate(_Camel):
     mut_id: str
     idempotency_key: str | None = None
     txn: dict[str, Any]
+
+    @field_validator("txn")
+    @classmethod
+    def _validate_transaction(cls, value: dict[str, Any]) -> dict[str, Any]:
+        from .mutation import Transaction
+
+        Transaction.model_validate(value)
+        return value
 
     @model_serializer(mode="wrap")
     def _drop_idempotency_when_none(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:

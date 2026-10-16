@@ -29,6 +29,8 @@ from ..mutation import (
     _CancelSchedule,
     _CancelWorkflow,
     _DeleteByQuery,
+    _ExpectBefore,
+    _is_safe_counter_integer,
     _PatchByQuery,
     _Schedule,
     _StartWorkflow,
@@ -152,7 +154,9 @@ def worst_case_affected(txn: Transaction) -> int:
         if isinstance(step, (_PatchByQuery, _DeleteByQuery)):
             limit_opt = step.limit
             total += MAX_BY_QUERY_ROWS if limit_opt is None else min(limit_opt, MAX_BY_QUERY_ROWS)
-        elif isinstance(step, (_Schedule, _CancelSchedule, _StartWorkflow, _CancelWorkflow)):
+        elif isinstance(
+            step, (_ExpectBefore, _Schedule, _CancelSchedule, _StartWorkflow, _CancelWorkflow)
+        ):
             # Control-flow steps touch no documents (server counts 0) —
             # workflow steps included (txn::worst_case_affected).
             continue
@@ -1499,6 +1503,10 @@ class _InMemoryStoreCore:
         return results
 
     def _execute_transaction(self, txn: Transaction) -> list[StepResult]:
+        deadlines = [step.deadline_ms for step in txn.steps if isinstance(step, _ExpectBefore)]
+        if any(not _is_safe_counter_integer(value) or value < 0 for value in deadlines):
+            raise RtDbError(ErrorCode.BAD_REQUEST, "deadlineMs must be a nonnegative safe integer")
+        deadline = min(deadlines) if deadlines else None
         # FM-28: count recursively — a schedule step contributes its nested
         # txn's steps too, mirroring the server's recursive MAX_STEPS ruling.
         if _count_steps(txn) > MAX_STEPS:
@@ -1522,6 +1530,8 @@ class _InMemoryStoreCore:
                 f"transaction could affect up to {worst} documents, exceeding the limit "
                 f"of {MAX_AFFECTED_ROWS_PER_TXN}",
             )
+        if deadline is not None and self._now() >= deadline:
+            raise RtDbError(ErrorCode.PRECONDITION_FAILED, "transaction deadline expired")
         snapshot = deepcopy(self._docs)
         # FM-28: schedule/cancelSchedule steps mutate the pending-jobs store, so
         # it joins the rollback snapshot — a failed later step must not leave a
@@ -1548,6 +1558,11 @@ class _InMemoryStoreCore:
                 raise
             results.append(result)
             write_set.update(written_tables)
+        if deadline is not None and self._now() >= deadline:
+            self._docs = snapshot
+            self._schedules = schedules_snapshot
+            self._workflows = workflows_snapshot
+            raise RtDbError(ErrorCode.PRECONDITION_FAILED, "transaction deadline expired")
         self._notify_subs(write_set)
         return results
 

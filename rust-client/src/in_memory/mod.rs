@@ -677,6 +677,8 @@ impl InMemoryRtDbClient {
     /// (`ts-client/src/in_memory.ts:545-567`); the notify seam lives here so
     /// both mutate- and `tick`-driven writes fire subscription updates.
     fn execute_transaction(&mut self, txn: &Transaction) -> Result<Vec<StepResult>, RtDbError> {
+        let deadline = par_rt_db_core::engine::transaction_deadline(txn)
+            .map_err(|message| RtDbError::new(ErrorCode::BadRequest, message))?;
         if count_steps(txn) > MAX_STEPS {
             return Err(RtDbError::new(
                 ErrorCode::BadRequest,
@@ -707,6 +709,12 @@ impl InMemoryRtDbClient {
                 ),
             ));
         }
+        if deadline.is_some_and(|value| (self.now)() >= value) {
+            return Err(RtDbError::new(
+                ErrorCode::PreconditionFailed,
+                "transaction deadline expired",
+            ));
+        }
         let snapshot = self.snapshot_docs();
         // FM-28: a schedule/cancelSchedule step mutates the schedule store, so
         // a failed txn must roll it back with the docs (the server inserts/
@@ -732,6 +740,14 @@ impl InMemoryRtDbClient {
                     return Err(error);
                 }
             }
+        }
+        if deadline.is_some_and(|value| (self.now)() >= value) {
+            self.restore_docs(snapshot);
+            self.schedules = schedules_snapshot;
+            return Err(RtDbError::new(
+                ErrorCode::PreconditionFailed,
+                "transaction deadline expired",
+            ));
         }
         self.notify_subs(&write_set);
         Ok(results)
@@ -762,6 +778,7 @@ impl InMemoryRtDbClient {
                 self.step_expect_version(table, id, *version)
             }
             Step::ExpectAbsent { table, index, eq } => self.step_expect_absent(table, index, eq),
+            Step::ExpectBefore { .. } => Ok((StepResult::Null, vec![])),
             Step::Upsert {
                 table,
                 index,

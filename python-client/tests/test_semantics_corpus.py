@@ -351,7 +351,12 @@ def _run_case(case: dict[str, Any]) -> None:
     # (fail loudly if there is none), then run the real query with it —
     # `expect` describes the SECOND page.
     if "txn" in op:
-        txn = Mutation.model_validate(_substitute(op["txn"], ids, name))
+        try:
+            txn = Mutation.model_validate(_substitute(op["txn"], ids, name))
+        except ValidationError as err:
+            if not expects_error or expect["error"]["code"] != "BAD_REQUEST":
+                raise AssertionError(f"{name}: unexpected malformed transaction: {err}") from err
+            return
         try:
             results = client.mutate(txn)
         except RtDbError as err:

@@ -491,6 +491,18 @@
           }
         ]
       }
+    },
+    {
+      "type": "mutate",
+      "mutId": "deadline-step",
+      "txn": {
+        "steps": [
+          {
+            "op": "expectBefore",
+            "deadlineMs": 9007199254740991
+          }
+        ]
+      }
     }
   ],
   "server_messages": [
@@ -1631,6 +1643,19 @@
       "type": "unsubscribe",
       "queryId": "q1",
       "extra": 1
+    },
+    {
+      "type": "mutate",
+      "mutId": "deadline-extra",
+      "txn": {
+        "steps": [
+          {
+            "op": "expectBefore",
+            "deadlineMs": 2000,
+            "extra": true
+          }
+        ]
+      }
     }
   ],
   "rejects_schedule_when_unknown_field": [

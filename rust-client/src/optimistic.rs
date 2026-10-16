@@ -55,6 +55,13 @@ pub fn project_optimistic_update(
     txn: &Transaction,
     now: i64,
 ) -> OptimisticProjection {
+    if txn
+        .steps
+        .iter()
+        .any(|step| matches!(step, Step::ExpectBefore { .. }))
+    {
+        return OptimisticProjection::Skip;
+    }
     if query.get.is_some() {
         return project_get(query, last, txn);
     }
@@ -137,7 +144,7 @@ fn project_unfiltered_array(
             // restored row. Same fallthrough as the ts-client's switch.
             Step::Undelete { .. } => {}
             Step::Upsert { .. } | Step::AdjustCounter { .. } => return OptimisticProjection::Skip,
-            Step::ExpectVersion { .. } | Step::ExpectAbsent { .. } => {}
+            Step::ExpectVersion { .. } | Step::ExpectAbsent { .. } | Step::ExpectBefore { .. } => {}
             // By-query steps match an unbounded set of rows by a filter this
             // projection can't evaluate (no table store, no schema) — the effect
             // on the cached result is membership-ambiguous, so decline.
@@ -177,7 +184,7 @@ fn project_filtered_array(query: &Query, last: &Value, txn: &Transaction) -> Opt
             | Step::Replace { .. }
             | Step::Upsert { .. }
             | Step::AdjustCounter { .. } => return OptimisticProjection::Skip,
-            Step::ExpectVersion { .. } | Step::ExpectAbsent { .. } => {}
+            Step::ExpectVersion { .. } | Step::ExpectAbsent { .. } | Step::ExpectBefore { .. } => {}
             // By-query steps match rows by a filter we can't evaluate here —
             // the effect on the filtered result is ambiguous, so decline.
             Step::PatchByQuery { .. } | Step::DeleteByQuery { .. } => {
@@ -273,7 +280,8 @@ impl OptimisticStepTable for Step {
             | Step::AdjustCounter { table, .. }
             | Step::PatchByQuery { table, .. }
             | Step::DeleteByQuery { table, .. } => Some(table.as_str()),
-            Step::ExpectAbsent { .. }
+            Step::ExpectBefore { .. }
+            | Step::ExpectAbsent { .. }
             | Step::Schedule { .. }
             | Step::CancelSchedule { .. }
             | Step::StartWorkflow { .. }

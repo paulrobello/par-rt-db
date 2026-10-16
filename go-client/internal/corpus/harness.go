@@ -412,7 +412,7 @@ func executeOp(tb caseTB, client *inmemory.Client, store *inmemory.Store, name s
 		}
 		var txn wire.Transaction
 		if err := json.Unmarshal([]byte(Canonical(tv)), &txn); err != nil {
-			tb.Fatalf("%s: op.txn does not parse: %v", name, err)
+			return nil, rtdberrors.New(rtdberrors.CodeBadRequest, fmt.Sprintf("%s: malformed transaction: %v", name, err))
 		}
 		results, err := client.Mutate(nil, txn, "")
 		if err != nil {

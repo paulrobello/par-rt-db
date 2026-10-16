@@ -40,7 +40,7 @@ use par_rt_db_client::in_memory::InMemoryRtDbClientOptions;
 use par_rt_db_client::mutation::Step;
 use par_rt_db_client::schema::SchemaDef;
 use par_rt_db_client::wire::admin::MigrateRequestOwned;
-use par_rt_db_client::{ErrorCode, InMemoryRtDbClient, Query, StepResult, Transaction};
+use par_rt_db_client::{ErrorCode, InMemoryRtDbClient, Query, RtDbError, StepResult, Transaction};
 use serde_json::{Map, Value};
 
 /// System fields minted at run time and projected out of both sides unless a
@@ -387,8 +387,21 @@ async fn run_case(case_name: &str, case: &Value) {
 
     // Execute the op. Error cases assert the code and stop (no `then`).
     let op_result: Value = if let Some(txn_json) = case.pointer("/op/txn") {
-        let txn: Transaction = serde_json::from_value(substitute(txn_json, &ids, case_name))
-            .unwrap_or_else(|e| panic!("{case_name}: op.txn does not parse: {e}"));
+        let txn: Transaction = match serde_json::from_value(substitute(txn_json, &ids, case_name)) {
+            Ok(txn) => txn,
+            Err(error) => {
+                assert!(
+                    expects_error,
+                    "{case_name}: unexpected malformed transaction: {error}"
+                );
+                assert_error_code(
+                    &RtDbError::new(ErrorCode::BadRequest, error.to_string()),
+                    expect,
+                    case_name,
+                );
+                return;
+            }
+        };
         match client.mutate(&txn, None).await {
             Ok(results) => serde_json::to_value(&results).expect("serialize step results"),
             Err(e) => {

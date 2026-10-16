@@ -39,6 +39,11 @@ func syntheticID() string {
 // one of three shapes — unfiltered array, filtered array (delete-only), or
 // get point-read — or Skip when the shape makes the effect ambiguous.
 func Project(query wire.Query, last wire.JSONValue, txn wire.Transaction, now int64) Projection {
+	for _, step := range txn.Steps {
+		if _, ok := step.(wire.StepExpectBefore); ok {
+			return Projection{Kind: ProjectionSkip}
+		}
+	}
 	if query.Get != nil {
 		return projectGet(query, last, txn)
 	}

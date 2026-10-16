@@ -52,6 +52,13 @@ public func projectOptimisticUpdate(
     txn: Transaction,
     now: Int64
 ) -> OptimisticProjection {
+    if txn.steps.contains(where: {
+        if case .expectBefore = $0 {
+            return true
+        }; return false
+    }) {
+        return .skip
+    }
     if query.get != nil {
         return projectGet(query, last, txn)
     }
@@ -136,7 +143,7 @@ private func projectUnfilteredArray(
             continue
         case .upsert, .adjustCounter:
             return .skip
-        case .expectVersion, .expectAbsent:
+        case .expectVersion, .expectAbsent, .expectBefore:
             continue
         case .patchByQuery, .deleteByQuery:
             // By-query steps match an unbounded set of rows by a filter this
@@ -178,7 +185,7 @@ private func projectFilteredArray(
         case .insert, .patch, .replace, .upsert, .adjustCounter:
             // Membership-ambiguous under a filter.
             return .skip
-        case .expectVersion, .expectAbsent:
+        case .expectVersion, .expectAbsent, .expectBefore:
             continue
         case .patchByQuery, .deleteByQuery:
             return .skip
@@ -230,7 +237,7 @@ private func projectGet(
             // A by-query step may patch/delete the target row, but the filter
             // is unevaluable here — decline rather than guess.
             return .skip
-        case .insert, .expectVersion, .expectAbsent, .undelete,
+        case .insert, .expectVersion, .expectAbsent, .expectBefore, .undelete,
              .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
             // Insert (fresh id never matches a pre-existing get target),
             // Expect*/preconditions (no data effect), undelete (the restored
@@ -265,7 +272,7 @@ private extension Step {
              let .patchByQuery(table, _, _, _),
              let .deleteByQuery(table, _, _):
             table
-        case .expectAbsent, .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
+        case .expectBefore, .expectAbsent, .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
             nil
         }
     }

@@ -29,6 +29,21 @@ use crate::mutation::{Step, Transaction};
 use crate::schema::{SchemaDef, is_widening_of, strip_on_delete};
 use crate::wire::{FilterExpr, ValueExpr};
 
+/// Validates this transaction's deadline guards and returns the earliest one.
+/// Scheduled/workflow child transactions have independent execution boundaries.
+pub fn transaction_deadline(txn: &Transaction) -> Result<Option<i64>, String> {
+    let mut earliest: Option<i64> = None;
+    for step in &txn.steps {
+        if let Step::ExpectBefore { deadline_ms } = step {
+            if !(0..=9_007_199_254_740_991).contains(deadline_ms) {
+                return Err("deadlineMs must be a nonnegative safe integer".into());
+            }
+            earliest = Some(earliest.map_or(*deadline_ms, |value| value.min(*deadline_ms)));
+        }
+    }
+    Ok(earliest)
+}
+
 /// Compares `old` to `new` and rejects any destructive change: a removed
 /// table, a removed field, a changed field type (except a safe literal-union
 /// widening — see [`is_widening_of`]), a removed index, or a changed index
@@ -263,11 +278,73 @@ pub fn worst_case_affected(txn: &Transaction, max_by_query_rows: u32) -> usize {
             Step::PatchByQuery { limit, .. } | Step::DeleteByQuery { limit, .. } => {
                 (*limit).unwrap_or(max_by_query_rows).min(max_by_query_rows) as usize
             }
-            Step::Schedule { .. }
+            Step::ExpectBefore { .. }
+            | Step::Schedule { .. }
             | Step::CancelSchedule { .. }
             | Step::StartWorkflow { .. }
             | Step::CancelWorkflow { .. } => 0,
             _ => 1,
         })
         .sum()
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[test]
+    fn deadlines_are_safe_exclusive_epoch_milliseconds_and_touch_no_documents() {
+        let txn = Transaction {
+            steps: vec![Step::ExpectBefore { deadline_ms: 1001 }],
+        };
+        assert_eq!(transaction_deadline(&txn).unwrap(), Some(1001));
+        assert_eq!(worst_case_affected(&txn, 1000), 0);
+        for deadline_ms in [-1, 9_007_199_254_740_992, i64::MAX] {
+            assert!(
+                transaction_deadline(&Transaction {
+                    steps: vec![Step::ExpectBefore { deadline_ms }]
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn only_this_execution_boundary_contributes_deadlines() {
+        let child = Transaction {
+            steps: vec![Step::ExpectBefore { deadline_ms: 1 }],
+        };
+        let txn = Transaction {
+            steps: vec![
+                Step::ExpectBefore { deadline_ms: 1002 },
+                Step::ExpectBefore { deadline_ms: 1001 },
+                Step::Schedule {
+                    when: crate::mutation::ScheduleWhen::AfterMs { ms: 1 },
+                    txn: Box::new(child),
+                    external: None,
+                },
+            ],
+        };
+        assert_eq!(transaction_deadline(&txn).unwrap(), Some(1001));
+        assert_eq!(
+            transaction_deadline(&Transaction { steps: vec![] }).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn deadline_step_round_trips_with_exact_field_names_and_rejects_unknown_fields() {
+        let value = serde_json::json!({ "op": "expectBefore", "deadlineMs": 1001 });
+        let step: Step = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(step).unwrap(), value);
+        assert!(
+            serde_json::from_value::<Step>(
+                serde_json::json!({ "op": "expectBefore", "deadlineMs": 1001, "extra": true })
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<Step>(serde_json::json!({ "op": "expectBefore" })).is_err()
+        );
+    }
 }

@@ -244,7 +244,7 @@ since browsers cannot set headers on a WS handshake.
 | `GET /sync` | first WS frame | WebSocket upgrade. Speaks the realtime protocol (auth, subscribe, mutate, schedule, ping). |
 | `POST /api/query` | Bearer token | One-shot query against a database; see [Query shape](#query-shape). |
 | `POST /api/query-batch` | Bearer token | Fans out N queries in one round trip (per-query error isolation); each slot returns `{ok, result}` or `{ok:false, error}`. |
-| `POST /api/mutate` | Bearer token | One-shot transaction (`insert`/`patch`/`replace`/`delete`/`undelete`/`expectVersion`/`expectAbsent`/`upsert`/`adjustCounter` + `patchByQuery`/`deleteByQuery` + `schedule`/`cancelSchedule` + `startWorkflow`/`cancelWorkflow` steps). |
+| `POST /api/mutate` | Bearer token | One-shot transaction (`insert`/`patch`/`replace`/`delete`/`undelete`/`expectVersion`/`expectAbsent`/`expectBefore`/`upsert`/`adjustCounter` + `patchByQuery`/`deleteByQuery` + `schedule`/`cancelSchedule` + `startWorkflow`/`cancelWorkflow` steps). |
 | `POST /api/mutate-batch` | Bearer token | Fans out N independent transactions in one round trip (per-entry error isolation, deliberately not atomic); each positional slot returns `{ok, results}` or `{ok:false, error}`. Entries may carry their own `idempotencyKey` (per-entry dedup/replay). |
 | `POST /api/schedule` | Bearer token | Schedules a transaction: `afterMs`/`runAt` one-shot, `cron` (5-field, min-first, UTC unless `tz` is given), or `interval` (fixed `everyMs`); returns `{id}`. Pass `"external": true` to create an external-claim job (never internally executed; claimed by an app worker via `/api/schedule/claim` with a fencing token). |
 | `POST /api/schedule/claim` | Bearer token | Atomically claims up to `limit` due external jobs (`leaseMs` lease each), returning `ClaimedSchedule[]` with per-job monotonic `leaseGeneration` fencing tokens. |
@@ -500,7 +500,7 @@ mirrored as the HTTP `Retry-After` header); every other code omits it:
 | `FORBIDDEN`           | 403         | Per-row `ownerField`/`authorize` denial; anonymous auth disabled; signed-URL verification failure. |
 | `NOT_FOUND`           | 404         | Unknown document/file/route; cross-db storage mismatch is reported as 404 (no existence disclosure). |
 | `CONFLICT`            | 409         | `UNIQUE` index violation (`unique_violation`, SQLSTATE 23505) at `CREATE UNIQUE INDEX` time or on a colliding write. |
-| `PRECONDITION_FAILED` | 409         | `expectVersion` / `expectAbsent` guard failed. |
+| `PRECONDITION_FAILED` | 409         | `expectVersion` / `expectAbsent` / `expectBefore` guard failed. |
 | `SCHEMA_VIOLATION`    | 422         | Schema push / type-coercion rejection. |
 | `RATE_LIMITED`        | 429         | Per-token or per-db rate limit hit (HTTP and WS frames). Carries `retryAfter`. The WS connection stays open for this error; the separate per-connection frame-rate limit below closes it instead. |
 | `INTERNAL`            | 500         | Unexpected server error (generic message; detail logged via `tracing`). |
@@ -583,6 +583,8 @@ run row on the open sqlx transaction — atomic with the enclosing writes; step
 result `{"workflowId": "<id>"}`; the spec's tables are allowlist-checked at
 submit time) and `cancelWorkflow` (`{"cancelled": <bool>}`, `false` on a
 missing/terminal run — a no-op, not an error) — see `server/src/txn.rs`.
+
+The `expectBefore` step adds an exclusive server-clock epoch-ms deadline. The earliest guard is checked after queue wait and at the final commit decision, after asynchronous work. Expiry rolls back the complete transaction with `PRECONDITION_FAILED`; malformed deadlines fail with `BAD_REQUEST`. Combine the stored lease deadline with room-version and ownership guards when fencing a lease. See [transaction deadlines](docs/transaction-deadlines.md) for scheduling, replay and SDK semantics.
 
 A by-query `filter` additionally accepts the execution-time-relative
 `olderThan` op — `{"op": "olderThan", "field": "completedAt", "ms": 604800000}` —

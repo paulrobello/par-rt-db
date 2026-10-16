@@ -60,6 +60,8 @@ public enum Step: Equatable, Codable, Sendable {
     case delete(table: String, id: String)
     /// Precondition: the row must be at exactly `version`.
     case expectVersion(table: String, id: String, version: Int64)
+    /// Require execution and the final commit decision before an exclusive epoch-ms deadline.
+    case expectBefore(deadlineMs: Int64)
     /// Precondition: no row may match the index eq-prefix.
     case expectAbsent(table: String, index: String, eq: [JSONValue])
     /// Insert-or-patch keyed by an index eq-prefix match.
@@ -88,7 +90,7 @@ public enum Step: Equatable, Codable, Sendable {
 
     enum CodingKeys: String, CodingKey, CaseIterable {
         case op, table, doc, id, fields, field, delta, min, max, expected, version, index, eq, insert, patch
-        case filter, limit, when, txn, spec, external
+        case filter, limit, when, txn, spec, external, deadlineMs
     }
 
     // swiftlint:disable:next cyclomatic_complexity function_body_length
@@ -158,6 +160,12 @@ public enum Step: Equatable, Codable, Sendable {
                 id: container.decode(String.self, forKey: .id),
                 version: container.decode(Int64.self, forKey: .version)
             )
+        case "expectBefore":
+            try rejectUnknownVariantFields(
+                "Step", variant: payload.tag, keys: payload.keys,
+                allowed: ["op", "deadlineMs"]
+            )
+            self = try .expectBefore(deadlineMs: container.decode(Int64.self, forKey: .deadlineMs))
         case "expectAbsent":
             try rejectUnknownVariantFields(
                 "Step", variant: payload.tag, keys: payload.keys,
@@ -284,6 +292,9 @@ public enum Step: Equatable, Codable, Sendable {
             try container.encode(table, forKey: .table)
             try container.encode(id, forKey: .id)
             try container.encode(version, forKey: .version)
+        case let .expectBefore(deadlineMs):
+            try container.encode("expectBefore", forKey: .op)
+            try container.encode(deadlineMs, forKey: .deadlineMs)
         case let .expectAbsent(table, index, eq):
             try container.encode("expectAbsent", forKey: .op)
             try container.encode(table, forKey: .table)

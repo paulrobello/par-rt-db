@@ -13,6 +13,7 @@ inferred types.
   - [Authentication & token storage](#authentication-token-storage)
 - [Node / CLI](#node-cli)
 - [React Native / Expo](#react-native-expo)
+- [Transaction deadlines](#transaction-deadlines)
 - [Scheduling](#scheduling)
 - [Durable workflows](#durable-workflows)
 - [Cascade delete & soft delete](#cascade-delete-soft-delete)
@@ -344,6 +345,10 @@ The `react` entry (`useQuery` / `useMutation` / `usePresence` /
 `usePaginatedQuery` hooks) imports clean under RN (it depends only on `react`),
 so the hooks are usable in an Expo app; only the popup-based OAuth helpers
 within it are browser-only, per the auth bullet above.
+
+## Transaction deadlines
+
+Transactions support `.expectBefore(deadlineMs)` to require the authoritative clock to precede an exclusive epoch-ms deadline at execution and the final commit decision. Expiry rolls back all effects with `PRECONDITION_FAILED`. Pair a stored lease deadline with version/ownership guards. The in-memory engine uses its injected clock. See [transaction deadlines](../docs/transaction-deadlines.md).
 
 ## Scheduling
 

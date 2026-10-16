@@ -14,6 +14,7 @@ Crate name: `par-rt-db-client` → in Rust, `use par_rt_db_client::...`.
 - [Status / features](#status-features)
 - [Install](#install)
 - [Quick start (HTTP)](#quick-start-http)
+- [Transaction deadlines](#transaction-deadlines)
 - [Scheduling](#scheduling)
 - [Durable workflows](#durable-workflows)
 - [Cascade delete + soft delete (FM-33)](#cascade-delete-soft-delete-fm-33)
@@ -194,6 +195,10 @@ one round trip, `batch_query(&[Query])` fans out via `POST /api/query-batch` and
 returns a length-aligned `Vec<BatchQueryOutcome>` (each slot's `result` is a raw
 `serde_json::Value` because a batch spans terminals; a per-query error is that
 slot's `{ok:false,error}` and never fails the call).
+
+## Transaction deadlines
+
+Transactions support `.expect_before(deadline_ms)` to require the authoritative clock to precede an exclusive epoch-ms deadline at execution and the final commit decision. Expiry rolls back all effects with `PRECONDITION_FAILED`. Pair a stored lease deadline with version/ownership guards. The in-memory engine uses its injected clock. See [transaction deadlines](../docs/transaction-deadlines.md).
 
 ## Scheduling
 

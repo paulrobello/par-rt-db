@@ -69,7 +69,7 @@ public func worstCaseAffected(_ txn: Transaction) -> Int {
         switch step {
         case let .patchByQuery(_, _, _, limit), let .deleteByQuery(_, _, limit):
             total += min(Int(limit ?? UInt32(InMemoryLimits.maxByQueryRows)), InMemoryLimits.maxByQueryRows)
-        case .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
+        case .expectBefore, .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
             continue // control-flow: touches no documents
         default:
             total += 1
@@ -1013,6 +1013,7 @@ public final class InMemoryRtDbClient: MigrationStore {
                     + "limit of \(InMemoryLimits.maxAffectedRowsPerTxn)"
             )
         }
+        try checkDeadlineGuards(txn)
         let snapshot = snapshotTables()
         // FM-28/FM-29: a schedule/workflow control step mutates its store, so
         // a failed txn must roll it back with the docs. The snapshots are
@@ -1035,6 +1036,7 @@ public final class InMemoryRtDbClient: MigrationStore {
                     writeSet.insert(extra)
                 }
             }
+            try checkDeadlineGuards(txn)
         } catch {
             // Atomicity: any step's error rolls back everything already
             // applied.
@@ -1049,6 +1051,25 @@ public final class InMemoryRtDbClient: MigrationStore {
     }
 
     // swiftlint:enable function_body_length
+
+    private func checkDeadlineGuards(_ txn: Transaction) throws {
+        let deadlines: [Int64] = txn.steps.compactMap { step in
+            if case let .expectBefore(value) = step {
+                return value
+            }
+            return nil
+        }
+        guard !deadlines.isEmpty else { return }
+        for deadline in deadlines {
+            guard (0 ... 9_007_199_254_740_991).contains(deadline) else {
+                throw RtDbError(code: .badRequest, message: "deadlineMs must be a nonnegative safe integer")
+            }
+        }
+        let now = nowFn()
+        if deadlines.contains(where: { now >= $0 }) {
+            throw RtDbError(code: .preconditionFailed, message: "transaction deadline expired")
+        }
+    }
 
     // MARK: Subscriptions
 
@@ -1608,7 +1629,7 @@ public final class InMemoryRtDbClient: MigrationStore {
         // The control-flow steps target the schedule/workflow stores, not a
         // table; everything else dispatches through the table-op layer.
         switch step {
-        case .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
+        case .expectBefore, .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
             try executeControlFlowStep(step)
         case .insert, .patch, .adjustCounter, .replace, .delete, .undelete,
              .expectVersion, .expectAbsent, .upsert, .patchByQuery, .deleteByQuery:
@@ -1619,6 +1640,8 @@ public final class InMemoryRtDbClient: MigrationStore {
     /// The schedule/workflow control-flow half of `executeStep`.
     private func executeControlFlowStep(_ step: Step) throws -> StepExecution {
         switch step {
+        case .expectBefore:
+            return StepExecution(result: .null, table: nil, extraTables: [])
         case let .schedule(when, txn, external):
             return try stepSchedule(when, txn, external ?? false)
         case let .cancelSchedule(id):
@@ -1653,7 +1676,7 @@ public final class InMemoryRtDbClient: MigrationStore {
             return try stepUndelete(table, id)
         case .expectVersion, .expectAbsent, .upsert, .patchByQuery, .deleteByQuery:
             return try executeLookupStep(step)
-        case .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
+        case .expectBefore, .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
             throw RtDbError(code: .internal, message: "control-flow steps handled above")
         }
     }

@@ -81,6 +81,11 @@ public struct MutationBuilder: Sendable {
         adding(.expectVersion(table: table, id: id, version: Int64(version)))
     }
 
+    /// Require execution and the final commit decision before an exclusive server-clock epoch-ms deadline.
+    public func expectBefore(_ deadlineMs: Int64) -> MutationBuilder {
+        adding(.expectBefore(deadlineMs: deadlineMs))
+    }
+
     /// Queue an index-absence precondition step (no row may match the eq prefix).
     public func expectAbsent(_ table: String, _ index: String, _ eq: [JSONValue]) -> MutationBuilder {
         adding(.expectAbsent(table: table, index: index, eq: eq))
@@ -185,6 +190,8 @@ public struct MutationBuilder: Sendable {
             .undelete(table: table, id: id)
         case let .expectVersion(table, id, version):
             .expectVersion(table: table, id: id, version: version)
+        case let .expectBefore(deadlineMs):
+            .expectBefore(deadlineMs: deadlineMs)
         case let .expectAbsent(table, index, eq):
             .expectAbsent(table: table, index: index, eq: eq)
         case let .upsert(table, index, eq, insert, patch):
@@ -228,6 +235,7 @@ private enum PendingStep: Sendable {
     case delete(table: String, id: String)
     case undelete(table: String, id: String)
     case expectVersion(table: String, id: String, version: Int64)
+    case expectBefore(deadlineMs: Int64)
     case expectAbsent(table: String, index: String, eq: [JSONValue])
     case upsert(
         table: String,

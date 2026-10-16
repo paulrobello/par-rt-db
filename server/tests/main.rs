@@ -23,6 +23,7 @@ mod change_feed_test;
 mod computed_test;
 mod dashboard_test;
 mod db_cleanup_test;
+mod deadline_test;
 mod defaults_test;
 mod golden_vector_test;
 mod healthz_test;

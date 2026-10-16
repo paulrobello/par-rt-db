@@ -98,7 +98,7 @@ func worstCaseAffected(txn wire.Transaction) int {
 				limit = *t.Limit
 			}
 			total += limit
-		case wire.StepSchedule, wire.StepCancelSchedule,
+		case wire.StepExpectBefore, wire.StepSchedule, wire.StepCancelSchedule,
 			wire.StepStartWorkflow, wire.StepCancelWorkflow:
 			// Control-flow steps touch no documents.
 		default:
@@ -109,6 +109,18 @@ func worstCaseAffected(txn wire.Transaction) int {
 }
 
 func executeTransaction(s *Store, txn wire.Transaction) ([]wire.StepResult, error) {
+	var deadline *int64
+	for _, step := range txn.Steps {
+		if guard, ok := step.(wire.StepExpectBefore); ok {
+			value := guard.DeadlineMs
+			if value < 0 || value > 9_007_199_254_740_991 {
+				return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "deadlineMs must be a nonnegative safe integer")
+			}
+			if deadline == nil || value < *deadline {
+				deadline = &value
+			}
+		}
+	}
 	if countSteps(txn) > maxSteps {
 		return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
 			"transaction exceeds maximum of "+formatI64(maxSteps)+" steps")
@@ -131,6 +143,9 @@ func executeTransaction(s *Store, txn wire.Transaction) ([]wire.StepResult, erro
 			"transaction could affect up to "+formatI64(int64(worst))+
 				" documents, exceeding the limit of "+formatI64(maxAffectedRowsPerTxn))
 	}
+	if deadline != nil && s.now() >= *deadline {
+		return nil, rtdberrors.New(rtdberrors.CodePreconditionFailed, "transaction deadline expired")
+	}
 	snapshot := snapshotDocs(s)
 	schedulesSnapshot := cloneSchedules(s.scheduledJobs)
 	results := make([]wire.StepResult, 0, len(txn.Steps))
@@ -147,6 +162,11 @@ func executeTransaction(s *Store, txn wire.Transaction) ([]wire.StepResult, erro
 		for _, t := range written {
 			writeSet[t] = true
 		}
+	}
+	if deadline != nil && s.now() >= *deadline {
+		s.docs = snapshot
+		s.scheduledJobs = schedulesSnapshot
+		return nil, rtdberrors.New(rtdberrors.CodePreconditionFailed, "transaction deadline expired")
 	}
 	notifySubs(s, writeSet)
 	return results, nil
@@ -237,6 +257,8 @@ func executeStep(s *Store, step wire.Step) (wire.StepResult, []string, error) {
 		return stepUndelete(s, t)
 	case wire.StepExpectVersion:
 		return stepExpectVersion(s, t)
+	case wire.StepExpectBefore:
+		return wire.StepResult{}, nil, nil
 	case wire.StepExpectAbsent:
 		return stepExpectAbsent(s, t)
 	case wire.StepUpsert:

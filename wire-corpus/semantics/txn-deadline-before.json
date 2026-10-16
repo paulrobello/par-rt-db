@@ -1,0 +1,54 @@
+{
+  "name": "txn-deadline-before",
+  "$comment": "Exclusive authoritative execution/commit-decision deadline; clock-independent past/future margins for all six engines.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "indexes": []
+      }
+    }
+  },
+  "seed": [],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "expectBefore",
+          "deadlineMs": 9007199254740991
+        },
+        {
+          "op": "insert",
+          "table": "tasks",
+          "doc": {
+            "name": "accepted"
+          }
+        }
+      ]
+    }
+  },
+  "expect": [
+    null,
+    {}
+  ],
+  "then": {
+    "query": {
+      "table": "tasks"
+    },
+    "expect": [
+      {
+        "name": "accepted"
+      }
+    ]
+  },
+  "normalize": [
+    "_id",
+    "_creationTime",
+    "_version",
+    "id"
+  ]
+}

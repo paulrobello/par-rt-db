@@ -61,6 +61,12 @@ func (m Mutation) ExpectVersion(table, id string, version int64) Mutation {
 	return m
 }
 
+// ExpectBefore requires execution and the final commit decision before an exclusive server-clock epoch-ms deadline.
+func (m Mutation) ExpectBefore(deadlineMs int64) Mutation {
+	m.t.Steps = append(m.t.Steps, wire.StepExpectBefore{DeadlineMs: deadlineMs})
+	return m
+}
+
 // ExpectAbsent queues the no-matching-row precondition on an index prefix.
 func (m Mutation) ExpectAbsent(table, index string, eq ...wire.JSONValue) Mutation {
 	m.t.Steps = append(m.t.Steps, wire.StepExpectAbsent{Table: table, Index: index, Eq: eq})

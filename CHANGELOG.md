@@ -122,6 +122,8 @@ alter observable behavior on upgrade.
 
 ### Added
 
+- `expectBefore` transaction guards use an exclusive authoritative epoch-ms deadline, checked after queue wait and after asynchronous work at the final commit decision. Expired transactions roll back documents, dedup results and outbox effects. All five SDKs, in-memory engines and shared parity fixtures support the additive step. See [transaction deadlines](docs/transaction-deadlines.md).
+
 - **Multi-instance lease observability on `/metrics` (ENH-049).** Six
   Prometheus-only series make write ownership visible per replica:
   `rtdb_multi_instance`, `rtdb_leases_owned` (gauge), and counters

@@ -1,4 +1,4 @@
-"""Transaction DSL: ``Step`` (15 ops), ``StepResult``, ``Transaction``,
+"""Transaction DSL: ``Step`` (16 ops), ``StepResult``, ``Transaction``,
 and the ``Mutation`` builder.
 
 Mirrors ``server/src/txn.rs`` (the ``Step`` enum + ``Transaction`` struct +
@@ -124,6 +124,11 @@ class _ExpectVersion(_Step):
     version: int
 
 
+class _ExpectBefore(_Step):
+    op: Literal["expectBefore"] = "expectBefore"
+    deadline_ms: int = Field(strict=True)
+
+
 class _ExpectAbsent(_Step):
     op: Literal["expectAbsent"] = "expectAbsent"
     table: str
@@ -223,7 +228,7 @@ class _CancelWorkflow(_Step):
     id: str
 
 
-#: Discriminated union of all 15 step ops. The ``op`` literal drives dispatch;
+#: Discriminated union of all 16 step ops. The ``op`` literal drives dispatch;
 #: ``deny_unknown_fields`` is per-variant via ``extra="forbid"`` on ``_Step``.
 Step = Annotated[
     (
@@ -234,6 +239,7 @@ Step = Annotated[
         | _Delete
         | _Undelete
         | _ExpectVersion
+        | _ExpectBefore
         | _ExpectAbsent
         | _Upsert
         | _PatchByQuery
@@ -466,6 +472,11 @@ class _MutationBuilder:
         """Expect-absent precondition: the transaction aborts unless no document
         matches the ``index``/``eq`` equality prefix."""
         self._steps.append(_ExpectAbsent(table=table, index=index, eq=eq))
+        return self
+
+    def expect_before(self, deadline_ms: int) -> _MutationBuilder:
+        """Require execution and the final commit decision before an exclusive epoch-ms deadline."""
+        self._steps.append(_ExpectBefore(deadline_ms=deadline_ms))
         return self
 
     def upsert(

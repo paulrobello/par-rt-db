@@ -91,6 +91,12 @@ pub enum Step {
         /// The required current version.
         version: i64,
     },
+    /// Precondition: execution and the final commit decision must precede an absolute epoch-ms deadline.
+    ExpectBefore {
+        /// Exclusive deadline, within the nonnegative JavaScript safe-integer range.
+        #[serde(rename = "deadlineMs")]
+        deadline_ms: i64,
+    },
     /// Precondition: no row may match the index eq-prefix.
     ExpectAbsent {
         /// Target table.

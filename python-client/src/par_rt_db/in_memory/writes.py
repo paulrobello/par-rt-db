@@ -21,6 +21,7 @@ from ..mutation import (
     _Delete,
     _DeleteByQuery,
     _ExpectAbsent,
+    _ExpectBefore,
     _ExpectVersion,
     _Insert,
     _is_safe_counter_integer,
@@ -140,6 +141,8 @@ class _WritesEngine(_Core):
         includes every child table its ``onDelete`` cascade touched, so
         subscribers on those tables re-run."""
         match step:
+            case _ExpectBefore():
+                return None, set()
             case _Insert(table=table, doc=doc):
                 table_def = self._require_table(table)
                 new_id = self._do_insert(table, table_def, doc)

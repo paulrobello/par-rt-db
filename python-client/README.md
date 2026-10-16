@@ -27,6 +27,7 @@ Package name: `par-rt-db` → in Python, `import par_rt_db`.
   - [Schema migration (`[http]` extra)](#schema-migration-http-extra)
   - [Durable workflows (FM-29)](#durable-workflows-fm-29)
   - [Cascade delete + soft delete (FM-33)](#cascade-delete-soft-delete-fm-33)
+- [Transaction deadlines](#transaction-deadlines)
 - [Errors](#errors)
 - [API reference](#api-reference)
 - [Wire contract](#wire-contract)
@@ -562,6 +563,10 @@ On the wire, `onDelete` rides the id variant (omitted when unset) and
 and atomic with the txn. The in-memory harness mirrors all of it — including
 push-time validation with the server's exact messages — in
 `tests/test_cascade.py`.
+
+## Transaction deadlines
+
+Transactions support `.expect_before(deadline_ms)` to require the authoritative clock to precede an exclusive epoch-ms deadline at execution and the final commit decision. Expiry rolls back all effects with `PRECONDITION_FAILED`. Pair a stored lease deadline with version/ownership guards. The in-memory engine uses its injected clock. See [transaction deadlines](../docs/transaction-deadlines.md).
 
 ## Errors
 

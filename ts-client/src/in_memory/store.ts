@@ -156,6 +156,7 @@ export function worstCaseAffected(txn: TransactionJson): number {
   let total = 0;
   for (const step of txn.steps) {
     if (
+      step.op === "expectBefore" ||
       step.op === "schedule" ||
       step.op === "cancelSchedule" ||
       step.op === "startWorkflow" ||
@@ -1210,7 +1211,17 @@ export class InMemoryRtDbClient {
     // SEC-104: bound the worst-case row count before any step applies so an
     // over-budget txn rolls back nothing. Mirrors server `execute_txn`.
     let byQuerySteps = 0;
+    let deadline: number | undefined;
     for (const step of txn.steps) {
+      if (step.op === "expectBefore") {
+        if (
+          Object.keys(step).sort().join(",") !== "deadlineMs,op" ||
+          !Number.isSafeInteger(step.deadlineMs) ||
+          step.deadlineMs < 0
+        )
+          throw new RtDbError("BAD_REQUEST", "deadlineMs must be a nonnegative safe integer");
+        deadline = deadline === undefined ? step.deadlineMs : Math.min(deadline, step.deadlineMs);
+      }
       if (step.op === "patchByQuery" || step.op === "deleteByQuery") byQuerySteps += 1;
     }
     if (byQuerySteps > MAX_BY_QUERY_STEPS_PER_TXN) {
@@ -1226,6 +1237,8 @@ export class InMemoryRtDbClient {
         `transaction could affect up to ${worst} documents, exceeding the limit of ${MAX_AFFECTED_ROWS_PER_TXN}`,
       );
     }
+    if (deadline !== undefined && this.now() >= deadline)
+      throw new RtDbError("PRECONDITION_FAILED", "transaction deadline expired");
     const snapshot = this.snapshotTables();
     // FM-28: a schedule/cancelSchedule step mutates the schedule store, so a
     // failed txn must roll it back with the docs (the server inserts/deletes
@@ -1248,6 +1261,8 @@ export class InMemoryRtDbClient {
           writeSet.add(extra);
         }
       }
+      if (deadline !== undefined && this.now() >= deadline)
+        throw new RtDbError("PRECONDITION_FAILED", "transaction deadline expired");
     } catch (error) {
       // Atomicity: any step's error rolls back everything already applied.
       this.restoreTables(snapshot);
@@ -2000,6 +2015,7 @@ export class InMemoryRtDbClient {
     table?: string;
     extraTables?: string[];
   } {
+    if (step.op === "expectBefore") return { result: null };
     // The schedule control-flow steps (FM-28) target the scheduler, not a
     // table. Cancel mirrors the server's standalone op: `cancelled: false`
     // (not an error) when the id is missing or already fired/cancelled.

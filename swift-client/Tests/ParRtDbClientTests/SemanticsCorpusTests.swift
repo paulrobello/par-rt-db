@@ -606,9 +606,13 @@ private func executeOp(
 ) throws -> Result<JSONValue, RtDbError> {
     let caseName = corpusCase.stem
     if let txnJson = corpusCase.opTxn {
-        let txn = try decodeWire(
-            Transaction.self, substitute(txnJson, ids, caseName), "\(caseName): op.txn"
-        )
+        let substituted = try substitute(txnJson, ids, caseName)
+        let txn: Transaction
+        do {
+            txn = try decodeWire(Transaction.self, substituted, "\(caseName): op.txn")
+        } catch {
+            return .failure(RtDbError(code: .badRequest, message: "malformed transaction: \(error)"))
+        }
         do {
             return try .success(stepResultsJSON(client.mutate(txn)))
         } catch let error as RtDbError {

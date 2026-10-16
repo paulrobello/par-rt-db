@@ -119,6 +119,10 @@ c.Mutate(ctx, txn, "idem-1")
 rows, _ := c.Query(ctx, dsl.NewTableQuery("items"))
 ```
 
+## Transaction deadlines
+
+Transactions support `.ExpectBefore(deadlineMs)` to require the authoritative clock to precede an exclusive epoch-ms deadline at execution and the final commit decision. Expiry rolls back all effects with `PRECONDITION_FAILED`. Pair a stored lease deadline with version/ownership guards. The in-memory engine uses its injected clock. See [transaction deadlines](../docs/transaction-deadlines.md).
+
 ## Wire contract
 
 `wire/` is one of the six implementations of the par-rt-db protocol and must

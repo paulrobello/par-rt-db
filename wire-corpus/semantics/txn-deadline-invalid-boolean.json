@@ -1,0 +1,32 @@
+{
+  "name": "txn-deadline-invalid-boolean",
+  "$comment": "Exclusive authoritative execution/commit-decision deadline; clock-independent past/future margins for all six engines.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "indexes": []
+      }
+    }
+  },
+  "seed": [],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "expectBefore",
+          "deadlineMs": true
+        }
+      ]
+    }
+  },
+  "expect": {
+    "error": {
+      "code": "BAD_REQUEST"
+    }
+  }
+}
