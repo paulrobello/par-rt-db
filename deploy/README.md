@@ -127,7 +127,9 @@ label: it skips `checkall`, and unless you export `RTDB_BUILD_COMMIT` yourself,
 the gate intentionally. It mirrors the `Makefile`'s `deploy` target exactly:
 rsync excludes everything `.gitignore` excludes (`--filter=':- .gitignore'`),
 which already covers `target/`, `node_modules/`, and gitignored `.env*` files,
-plus an explicit `.git/` exclude.
+plus explicit `.git` and `.claude/` excludes. The `.git` rule protects both
+ordinary checkout directories and linked-worktree pointer files. The `.claude/`
+rule preserves the deploy host's agent metadata.
 
 Source is synced to `/docker/par-rt-db` on the deploy host and built there (the
 host is x86_64; do not `docker save` an arm64 image from a Mac).
@@ -137,7 +139,7 @@ host is x86_64; do not `docker save` an arm64 image from a Mac).
 # .gitignore already excludes target/, node_modules/, and .env/.env.* (which
 # hold the live secrets on the deploy host) — --delete without that filter
 # would wipe them out.
-rsync -az --delete --filter=':- .gitignore' --exclude .git/ \
+rsync -az --delete --filter=':- .gitignore' --exclude .git --exclude .claude/ \
   ./ root@docker-host.example.com:/docker/par-rt-db/
 # on docker-host (the .env there holds the secrets, mode 600):
 cd /docker/par-rt-db
