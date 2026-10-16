@@ -39,7 +39,7 @@ expect_used = "warn"
 par-rt-db-core = { path = "core" }
 # Shared by server + rust-client (+ cli for serde_json/anyhow).
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror = "2"
 base64 = "0.23"
 # Both server and rust-client use rustls + json; server additionally needs

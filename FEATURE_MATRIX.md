@@ -15,6 +15,12 @@ time the row shipped; the Go client (2026-09-19) mirrors the wire contract, the
 query/txn/mutation DSL, the admin control plane, and the in-memory engine, and
 executes the corpus with zero skips (`go-client/wire/`, `go-client/inmemory/`).
 
+Finite fractional JSON values use the shared Rust parser's `float_roundtrip`
+feature. The `number-json-roundtrip` semantics case covers typed number fields
+and nested payloads across the engines. A separate core regression asserts IEEE
+bits because a corpus parser could otherwise round both its input and expected
+value identically.
+
 ## Legend
 
 | Symbol | Meaning |

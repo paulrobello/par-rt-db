@@ -91,6 +91,7 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 - **Operator surfaces**: op feed, audit log, webhooks, Prometheus `/metrics` with optional OTLP tracing, backup/restore, schema migration with snapshot history and restore, hot-reloaded config, per-database quotas, slow-query ring, and query explain
 
 ### Technical Excellence
+- **Round-trip JSON float parsing**: the shared Rust JSON parser preserves finite `f64` values when decoding their serialized representation. Exact-bit tests guard fractional values that otherwise move by one floating-point unit, including values nested in document payloads.
 - **Single serialized committer per database**: all writes flow through one committer task per database and reads run under READ COMMITTED (except `adjustCounter`, which row-locks its counter) — realtime correctness without distributed coordination
 - **Rust on axum/tokio with Postgres 17 storage**: graceful shutdown drains in-flight requests before exiting, bounded by `RTDB_SHUTDOWN_DRAIN_MS`
 - **One wire contract, six implementations**: the server and the ts/rust/python/swift/go clients all run the shared semantics corpus, staying byte-identical ([`wire-corpus/`](wire-corpus/README.md) — every top-level section is consumed by all six runners)

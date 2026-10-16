@@ -1,0 +1,27 @@
+{
+  "name": "number-json-roundtrip",
+  "$comment": "Preserve finite fractional values in number fields and nested JSON payloads. The core exact-IEEE-bit regression separately guards against the fixture parser rounding both seed and expectation identically.",
+  "schema": {
+    "tables": {
+      "samples": {
+        "fields": {
+          "order": { "type": "number" },
+          "value": { "type": "number" },
+          "payload": { "type": "any" }
+        },
+        "indexes": [{ "name": "by_order", "fields": ["order"] }]
+      }
+    }
+  },
+  "seed": [
+    { "order": 1, "value": 0.9199979180470109, "payload": { "center": { "y": 0.9199979180470109 } } },
+    { "order": 2, "value": -0.9199979180470109, "payload": { "center": { "y": -0.9199979180470109 } } }
+  ],
+  "op": {
+    "query": { "table": "samples", "index": "by_order", "order": "asc", "take": 2 }
+  },
+  "expect": [
+    { "order": 1, "value": 0.9199979180470109, "payload": { "center": { "y": 0.9199979180470109 } } },
+    { "order": 2, "value": -0.9199979180470109, "payload": { "center": { "y": -0.9199979180470109 } } }
+  ]
+}
