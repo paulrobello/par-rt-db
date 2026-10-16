@@ -1495,16 +1495,12 @@ async fn schema_preview_does_not_apply() -> anyhow::Result<()> {
 // running) does not pollute the default `./backups` and break the parallel
 // `admin_list_backups_returns_empty_when_dir_missing` test. It does NOT assert
 // a dump file appears — the dev `rtdb` DB is heavily polluted and pg_dump may
-// fail; that is fine, the flag still flips. The assertions below depend only on
-// the in-memory flag, which is set before the spawn and read synchronously by
-// the next request's handler.
+// fail; that is fine, the flag still flips. A backup can finish between HTTP
+// requests, so the busy-state assertions use a separate fixture with its flag
+// explicitly held and no background backup task.
 
-// POST /admin/backup → 202; the in-progress flag is set synchronously in the
-// handler before the spawned pg_dump task, so an immediate GET /admin/backups
-// observes `running: true`. A second POST while the flag is still set returns
-// 409 Conflict.
 #[tokio::test]
-async fn backup_trigger_returns_accepted_then_conflict() -> anyhow::Result<()> {
+async fn backup_trigger_accepts_idle_and_rejects_busy() -> anyhow::Result<()> {
     let dir = tempfile::tempdir().expect("temp backup dir");
     let dir_path = dir.path().to_str().unwrap().to_string();
     let state = test_state_with_backup_dir(dir_path).await;
@@ -1514,16 +1510,29 @@ async fn backup_trigger_returns_accepted_then_conflict() -> anyhow::Result<()> {
     let r1 = admin_post(addr, "/admin/backup", serde_json::Value::Null).await;
     assert_eq!(r1.status(), reqwest::StatusCode::ACCEPTED);
 
-    // The flag is set synchronously in the handler before the spawn, so an
-    // immediate GET observes it.
-    let listing: serde_json::Value = admin_get(addr, "/admin/backups").await.json().await?;
+    let busy_dir = tempfile::tempdir().expect("temp busy backup dir");
+    let busy_state: std::sync::Arc<AppState> =
+        test_state_with_backup_dir(busy_dir.path().to_str().unwrap().to_string()).await;
+    busy_state
+        .runtime
+        .backup_running
+        .store(true, std::sync::atomic::Ordering::Release);
+    let busy_addr: SocketAddr = spawn_app(busy_state.clone()).await;
+    let listing: serde_json::Value = admin_get(busy_addr, "/admin/backups").await.json().await?;
     assert_eq!(listing["running"], serde_json::json!(true));
 
-    // Second trigger while the flag is set → 409 Conflict.
-    let r2 = admin_post(addr, "/admin/backup", serde_json::Value::Null).await;
+    // A trigger while the flag is set → 409 Conflict.
+    let r2 = admin_post(busy_addr, "/admin/backup", serde_json::Value::Null).await;
     assert_eq!(r2.status(), reqwest::StatusCode::CONFLICT);
     let body: serde_json::Value = r2.json().await?;
     assert_eq!(body["code"], "CONFLICT");
+    assert!(
+        busy_state
+            .runtime
+            .backup_running
+            .load(std::sync::atomic::Ordering::Acquire),
+        "refusing a duplicate backup must preserve the running backup flag"
+    );
     Ok(())
 }
 
