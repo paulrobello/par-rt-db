@@ -482,7 +482,7 @@ pre-commit-update:
 	pre-commit autoupdate
 
 deploy: checkall-cached
-	rsync -az --delete --filter=':- .gitignore' --exclude .git/ \
+	rsync -az --delete --filter=':- .gitignore' --exclude .git --exclude .claude/ \
 		./ $(DEPLOY_HOST):$(DEPLOY_PATH)/
 	ssh $(DEPLOY_HOST) 'cd $(DEPLOY_PATH) && BUILDER=par-rt-db-builder && if ! docker buildx inspect "$$BUILDER" >/dev/null 2>&1; then docker buildx create --name "$$BUILDER" --driver docker-container --driver-opt default-load=true --driver-opt cpu-quota=400000 --driver-opt cpu-period=100000 --buildkitd-config "$(DEPLOY_PATH)/deploy/buildkitd.toml"; fi && docker buildx use "$$BUILDER" && RTDB_BUILD_COMMIT=$(DEPLOY_COMMIT) BUILDX_BUILDER="$$BUILDER" docker compose up -d --build && docker compose ps'
 	ssh $(DEPLOY_HOST) 'curl -fsS http://127.0.0.1:8300/healthz'
