@@ -1,4 +1,4 @@
-"""Transaction DSL: ``Step`` (16 ops), ``StepResult``, ``Transaction``,
+"""Transaction DSL: ``Step`` (17 ops), ``StepResult``, ``Transaction``,
 and the ``Mutation`` builder.
 
 Mirrors ``server/src/txn.rs`` (the ``Step`` enum + ``Transaction`` struct +
@@ -7,8 +7,8 @@ untagged ``StepResult``) and the builder ergonomics of
 
 Wire shapes (load-bearing — match the server exactly):
 
-* ``Step`` is tagged by ``op`` (camelCase variants: ``insert``/``patch``/
-  ``replace``/``delete``/``undelete``/``expectVersion``/``expectAbsent``/
+* ``Step`` is tagged by ``op`` (camelCase variants: ``insert``/``patch``/``adjustCounter``/
+  ``replace``/``delete``/``undelete``/``expectVersion``/``expectFields``/``expectBefore``/``expectAbsent``/
   ``upsert``/``patchByQuery``/``deleteByQuery``/``schedule``/
   ``cancelSchedule``/``startWorkflow``/``cancelWorkflow``) with
   ``deny_unknown_fields`` mirrored via ``extra="forbid"``.
@@ -129,6 +129,29 @@ class _ExpectBefore(_Step):
     deadline_ms: int = Field(strict=True)
 
 
+class FieldExpectation(BaseModel):
+    """Exact value assertion at an object-key path from a declared root field."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: list[str]
+    value: Any
+
+    @model_serializer(mode="wrap")
+    def _preserve_null_value(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if self.value is None:
+            out["value"] = None
+        return out
+
+
+class _ExpectFields(_Step):
+    op: Literal["expectFields"] = "expectFields"
+    table: str
+    id: str
+    expected: list[FieldExpectation]
+
+
 class _ExpectAbsent(_Step):
     op: Literal["expectAbsent"] = "expectAbsent"
     table: str
@@ -228,7 +251,7 @@ class _CancelWorkflow(_Step):
     id: str
 
 
-#: Discriminated union of all 16 step ops. The ``op`` literal drives dispatch;
+#: Discriminated union of all 17 step ops. The ``op`` literal drives dispatch;
 #: ``deny_unknown_fields`` is per-variant via ``extra="forbid"`` on ``_Step``.
 Step = Annotated[
     (
@@ -239,6 +262,7 @@ Step = Annotated[
         | _Delete
         | _Undelete
         | _ExpectVersion
+        | _ExpectFields
         | _ExpectBefore
         | _ExpectAbsent
         | _Upsert
@@ -472,6 +496,13 @@ class _MutationBuilder:
         """Expect-absent precondition: the transaction aborts unless no document
         matches the ``index``/``eq`` equality prefix."""
         self._steps.append(_ExpectAbsent(table=table, index=index, eq=eq))
+        return self
+
+    def expect_fields(
+        self, table: str, id: str, expected: list[FieldExpectation]
+    ) -> _MutationBuilder:
+        """Require exact field values on a visible live row without writing it."""
+        self._steps.append(_ExpectFields(table=table, id=id, expected=expected))
         return self
 
     def expect_before(self, deadline_ms: int) -> _MutationBuilder:

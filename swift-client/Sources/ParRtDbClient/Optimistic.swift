@@ -143,7 +143,7 @@ private func projectUnfilteredArray(
             continue
         case .upsert, .adjustCounter:
             return .skip
-        case .expectVersion, .expectAbsent, .expectBefore:
+        case .expectVersion, .expectFields, .expectAbsent, .expectBefore:
             continue
         case .patchByQuery, .deleteByQuery:
             // By-query steps match an unbounded set of rows by a filter this
@@ -185,7 +185,7 @@ private func projectFilteredArray(
         case .insert, .patch, .replace, .upsert, .adjustCounter:
             // Membership-ambiguous under a filter.
             return .skip
-        case .expectVersion, .expectAbsent, .expectBefore:
+        case .expectVersion, .expectFields, .expectAbsent, .expectBefore:
             continue
         case .patchByQuery, .deleteByQuery:
             return .skip
@@ -237,7 +237,7 @@ private func projectGet(
             // A by-query step may patch/delete the target row, but the filter
             // is unevaluable here — decline rather than guess.
             return .skip
-        case .insert, .expectVersion, .expectAbsent, .expectBefore, .undelete,
+        case .insert, .expectVersion, .expectFields, .expectAbsent, .expectBefore, .undelete,
              .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
             // Insert (fresh id never matches a pre-existing get target),
             // Expect*/preconditions (no data effect), undelete (the restored
@@ -268,6 +268,7 @@ private extension Step {
              let .delete(table, _),
              let .undelete(table, _),
              let .expectVersion(table, _, _),
+             let .expectFields(table, _, _),
              let .upsert(table, _, _, _, _),
              let .patchByQuery(table, _, _, _),
              let .deleteByQuery(table, _, _):

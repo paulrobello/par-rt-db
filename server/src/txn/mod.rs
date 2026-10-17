@@ -510,6 +510,9 @@ pub async fn execute_txn_with_side(
                 Step::ExpectVersion { table, id, version } => {
                     step_expect_version(&mut sctx, table, id, *version).await?
                 }
+                Step::ExpectFields { table, id, expected } => {
+                    step_expect_fields(&mut sctx, table, id, expected).await?
+                }
                 Step::ExpectBefore { .. } => sctx.results.push(serde_json::Value::Null),
                 Step::ExpectAbsent { table, index, eq } => {
                     step_expect_absent(&mut sctx, table, index, eq).await?
@@ -643,6 +646,6 @@ pub(crate) use stamp::{
 };
 pub(crate) use steps::{
     StepCtx, step_adjust_counter, step_delete, step_delete_by_query, step_expect_absent,
-    step_expect_version, step_insert, step_patch, step_patch_by_query, step_replace, step_undelete,
-    step_upsert,
+    step_expect_fields, step_expect_version, step_insert, step_patch, step_patch_by_query,
+    step_replace, step_undelete, step_upsert,
 };

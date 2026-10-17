@@ -119,6 +119,10 @@ c.Mutate(ctx, txn, "idem-1")
 rows, _ := c.Query(ctx, dsl.NewTableQuery("items"))
 ```
 
+## Row-field guards
+
+Transactions support `.ExpectFields(table, id, expected...)` with `FieldExpectation` assertions. The guard checks selected values without writing the live row or advancing its version. Unasserted fields may change. See [the shared contract](../docs/transaction-field-guards.md) for paths, bounds, visibility, deadlines and replay behavior.
+
 ## Transaction deadlines
 
 Transactions support `.ExpectBefore(deadlineMs)` to require the authoritative clock to precede an exclusive epoch-ms deadline at execution and the final commit decision. Expiry rolls back all effects with `PRECONDITION_FAILED`. Pair a stored lease deadline with version/ownership guards. The in-memory engine uses its injected clock. See [transaction deadlines](../docs/transaction-deadlines.md).
@@ -128,7 +132,7 @@ Transactions support `.ExpectBefore(deadlineMs)` to require the authoritative cl
 `wire/` is one of the six implementations of the par-rt-db protocol and must
 stay byte-identical with the server (and the other clients' wire files).
 The [`wire-corpus/`](../wire-corpus/README.md) fixtures pin the envelope
-shapes, the error codes, the golden query vectors, and 175 semantics cases —
+shapes, the error codes, the golden query vectors, and every semantics case —
 all executed by this repo's `make test` via the Go runners.
 
 ## Develop

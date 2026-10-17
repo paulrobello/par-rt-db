@@ -61,6 +61,12 @@ func (m Mutation) ExpectVersion(table, id string, version int64) Mutation {
 	return m
 }
 
+// ExpectFields queues exact field assertions without writing the live row.
+func (m Mutation) ExpectFields(table, id string, expected ...wire.FieldExpectation) Mutation {
+	m.t.Steps = append(m.t.Steps, wire.StepExpectFields{Table: table, ID: id, Expected: expected})
+	return m
+}
+
 // ExpectBefore requires execution and the final commit decision before an exclusive server-clock epoch-ms deadline.
 func (m Mutation) ExpectBefore(deadlineMs int64) Mutation {
 	m.t.Steps = append(m.t.Steps, wire.StepExpectBefore{DeadlineMs: deadlineMs})

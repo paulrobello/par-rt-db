@@ -37,7 +37,7 @@ from .cursor import decode_cursor, encode_cursor
 from .errors import ErrorCode, RtDbError
 from .in_memory import InMemoryRtDbClient
 from .migration import Migration
-from .mutation import Mutation, StepResult, Transaction, await_signal
+from .mutation import FieldExpectation, Mutation, StepResult, Transaction, await_signal
 from .query import Paginated, Query, TableQuery
 from .schema import Schema, SchemaDef, TableDef, t
 from .value_expr import CaseWhen, Cast, ValueExpr, ve
@@ -90,6 +90,7 @@ if "pdoc" in sys.modules:
 
 __all__ = [
     "Mutation",
+    "FieldExpectation",
     "Migration",
     "Cast",
     "CaseWhen",

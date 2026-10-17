@@ -162,6 +162,8 @@ let _results = db.mutate(&txn, None).await?; // idempotency key is optional
 let _one: Option<Item> = db.get("items", "i1").await?;
 ```
 
+`Mutation::expect_fields(table, id, &expected)` takes `FieldExpectation` values and checks selected fields without writing the live row or advancing its version. See [row-field guards](../docs/transaction-field-guards.md) for the shared path, bounds, visibility and replay contract.
+
 The by-query steps — `patch_by_query(table, filter, patch, limit)` /
 `delete_by_query(table, filter, limit)` — additionally accept the
 execution-time-relative `olderThan` filter op:

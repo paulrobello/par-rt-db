@@ -60,6 +60,8 @@ public enum Step: Equatable, Codable, Sendable {
     case delete(table: String, id: String)
     /// Precondition: the row must be at exactly `version`.
     case expectVersion(table: String, id: String, version: Int64)
+    /// Require selected field values without writing the live row.
+    case expectFields(table: String, id: String, expected: [FieldExpectation])
     /// Require execution and the final commit decision before an exclusive epoch-ms deadline.
     case expectBefore(deadlineMs: Int64)
     /// Precondition: no row may match the index eq-prefix.
@@ -159,6 +161,16 @@ public enum Step: Equatable, Codable, Sendable {
                 table: container.decode(String.self, forKey: .table),
                 id: container.decode(String.self, forKey: .id),
                 version: container.decode(Int64.self, forKey: .version)
+            )
+        case "expectFields":
+            try rejectUnknownVariantFields(
+                "Step", variant: payload.tag, keys: payload.keys,
+                allowed: ["op", "table", "id", "expected"]
+            )
+            self = try .expectFields(
+                table: container.decode(String.self, forKey: .table),
+                id: container.decode(String.self, forKey: .id),
+                expected: container.decode([FieldExpectation].self, forKey: .expected)
             )
         case "expectBefore":
             try rejectUnknownVariantFields(
@@ -292,6 +304,11 @@ public enum Step: Equatable, Codable, Sendable {
             try container.encode(table, forKey: .table)
             try container.encode(id, forKey: .id)
             try container.encode(version, forKey: .version)
+        case let .expectFields(table, id, expected):
+            try container.encode("expectFields", forKey: .op)
+            try container.encode(table, forKey: .table)
+            try container.encode(id, forKey: .id)
+            try container.encode(expected, forKey: .expected)
         case let .expectBefore(deadlineMs):
             try container.encode("expectBefore", forKey: .op)
             try container.encode(deadlineMs, forKey: .deadlineMs)

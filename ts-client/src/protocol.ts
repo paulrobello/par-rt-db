@@ -381,6 +381,14 @@ export type BatchQueryOutcomeJson =
  * `schema::OnDeleteAction` (camelCase wire values). */
 export type OnDeleteAction = "cascade" | "restrict" | "setNull";
 
+/** Exact equality assertion on one document field, using literal object keys. */
+export interface FieldExpectationJson {
+  /** Object keys from a declared root field. Array indexing is not supported. */
+  path: string[];
+  /** Exact required value. Missing fields never match, including when this is null. */
+  value: unknown;
+}
+
 /** Mirrors server `txn::Step` (tag `op`, camelCase; document steps carry
  * `table`, the control-flow steps — `schedule`/`cancelSchedule` (FM-28) and
  * `startWorkflow`/`cancelWorkflow` (FM-29) — do not). */
@@ -401,6 +409,7 @@ export type StepJson =
   | { op: "delete"; table: string; id: string }
   | { op: "undelete"; table: string; id: string }
   | { op: "expectVersion"; table: string; id: string; version: number }
+  | { op: "expectFields"; table: string; id: string; expected: FieldExpectationJson[] }
   | { op: "expectBefore"; deadlineMs: number }
   | { op: "expectAbsent"; table: string; index: string; eq: unknown[] }
   | {

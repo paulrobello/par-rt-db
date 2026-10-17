@@ -22,6 +22,7 @@ from ..mutation import (
     _DeleteByQuery,
     _ExpectAbsent,
     _ExpectBefore,
+    _ExpectFields,
     _ExpectVersion,
     _Insert,
     _is_safe_counter_integer,
@@ -35,6 +36,7 @@ from ..mutation import (
 )
 from ..schema import TableDef, _FNumber, _FOptional
 from . import store as _store
+from .field_guard import check_field_expectations
 from .migrate import (
     _on_delete_ref as _on_delete_ref,
 )
@@ -199,6 +201,13 @@ class _WritesEngine(_Core):
             case _ExpectVersion(table=table, id=sid, version=version):
                 table_def = self._require_table(table)
                 self._do_expect_version(table_def, table, sid, version)
+                return None, set()
+            case _ExpectFields(table=table, id=sid, expected=expected):
+                table_def = self._require_table(table)
+                row = self._docs.get((table, sid))
+                if row is None or not _is_live(row):
+                    raise RtDbError(ErrorCode.NOT_FOUND, f"document '{sid}' not found")
+                check_field_expectations(table_def, row.doc, expected)
                 return None, set()
             case _ExpectAbsent(table=table, index=index, eq=eq_vals):
                 table_def = self._require_table(table)

@@ -250,8 +250,8 @@ let titles = try TableQuery("tasks").fields("title", "status").build()
 
 ### Mutation DSL (`MutationBuilder`)
 
-All 15 step ops: `insert`, `patch`, `replace`, `delete`, `undelete`,
-`expectVersion`, `expectAbsent`, `upsert`, `adjustCounter` (atomic bounded
+All 17 step ops: `insert`, `patch`, `replace`, `delete`, `undelete`,
+`expectVersion`, `expectFields`, `expectBefore`, `expectAbsent`, `upsert`, `adjustCounter` (atomic bounded
 counter update — see
 [`../docs/atomic-counter.md`](../docs/atomic-counter.md)), `patchByQuery`,
 `deleteByQuery`, `schedule`, `cancelSchedule`, `startWorkflow`,
@@ -387,6 +387,10 @@ feeding an `int64` field in `.cast(value: expr, to: .toString)`, since int64
 travels as a decimal string on the wire). An evaluation error (division by
 zero, a bad cast) fails the write with BAD_REQUEST naming the field. A
 `renameField` migration rewrites the expression's references with the field.
+
+## Row-field guards
+
+Transactions support `.expectFields(table, id, expected)` with `FieldExpectation` assertions. The guard checks selected values without writing the live row or advancing its version. Unasserted fields may change. See [the shared contract](../docs/transaction-field-guards.md) for paths, bounds, visibility, deadlines and replay behavior.
 
 ## Transaction deadlines
 
@@ -534,7 +538,7 @@ Published reference: https://paulrobello.github.io/par-rt-db/swift/
 | --- | --- |
 | Wire types — fifth implementation of the contract | ✅ (+ `wire-corpus.json` parity runner, ARC-008) |
 | Query DSL — every terminal incl. `search`/`vectorSearch`/`hybridSearch`/`paginate`/`aggregate`/`distinct` | ✅ |
-| Mutation DSL — all 16 step ops (incl. `adjustCounter`), recursive step-cap enforcement | ✅ |
+| Mutation DSL — all 17 step ops (incl. `adjustCounter`), recursive step-cap enforcement | ✅ |
 | Schema DSL — 15 field types, btree/search/vector/unique/partial indexes, `ownerField`/`collaboratorsField`/`authorize`, `ttl`, `updatedAtField`, `autoIncrementField`, `defaults`, `computed`, `softDelete`, `onDelete` | ✅ |
 | HTTP client — query/query-batch/mutate (+ idempotency key, retry helper), schedule ops, workflow ops, change feed (`changes(since:table:limit:)`), full storage surface, `pushSchema`/`previewSchema`, `authMe` | ✅ |
 | WS client — auth/reconnect/heartbeat, shared subscriptions with replay, mutate-over-WS, schedule + workflow ops | ✅ |

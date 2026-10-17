@@ -1632,7 +1632,7 @@ public final class InMemoryRtDbClient: MigrationStore {
         case .expectBefore, .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
             try executeControlFlowStep(step)
         case .insert, .patch, .adjustCounter, .replace, .delete, .undelete,
-             .expectVersion, .expectAbsent, .upsert, .patchByQuery, .deleteByQuery:
+             .expectVersion, .expectFields, .expectAbsent, .upsert, .patchByQuery, .deleteByQuery:
             try executeTableStep(step)
         }
     }
@@ -1651,7 +1651,7 @@ public final class InMemoryRtDbClient: MigrationStore {
         case let .cancelWorkflow(id):
             return stepCancelWorkflow(id)
         case .insert, .patch, .adjustCounter, .replace, .delete, .undelete,
-             .expectVersion, .expectAbsent, .upsert, .patchByQuery, .deleteByQuery:
+             .expectVersion, .expectFields, .expectAbsent, .upsert, .patchByQuery, .deleteByQuery:
             throw RtDbError(code: .internal, message: "table steps handled by executeTableStep")
         }
     }
@@ -1674,7 +1674,7 @@ public final class InMemoryRtDbClient: MigrationStore {
             return try stepDelete(table, id)
         case let .undelete(table, id):
             return try stepUndelete(table, id)
-        case .expectVersion, .expectAbsent, .upsert, .patchByQuery, .deleteByQuery:
+        case .expectVersion, .expectFields, .expectAbsent, .upsert, .patchByQuery, .deleteByQuery:
             return try executeLookupStep(step)
         case .expectBefore, .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
             throw RtDbError(code: .internal, message: "control-flow steps handled above")
@@ -1687,6 +1687,11 @@ public final class InMemoryRtDbClient: MigrationStore {
         switch step {
         case let .expectVersion(table, id, version):
             return try stepExpectVersion(table, id, version)
+        case let .expectFields(table, id, expected):
+            let definition = try requireTable(table)
+            let row = try requireRow(table, id)
+            try checkFieldExpectations(definition, row.doc, expected)
+            return StepExecution(result: .null, table: nil, extraTables: [])
         case let .expectAbsent(table, index, eq):
             return try stepExpectAbsent(table, index, eq)
         case let .upsert(table, index, eq, insert, patch):

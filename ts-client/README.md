@@ -346,6 +346,10 @@ The `react` entry (`useQuery` / `useMutation` / `usePresence` /
 so the hooks are usable in an Expo app; only the popup-based OAuth helpers
 within it are browser-only, per the auth bullet above.
 
+## Row-field guards
+
+Transactions support `.expectFields(table, id, expected)` with `FieldExpectationJson` assertions. The guard checks selected values without writing the live row or advancing its version. Unasserted fields may change. See [the shared contract](../docs/transaction-field-guards.md) for paths, bounds, visibility, deadlines and replay behavior.
+
 ## Transaction deadlines
 
 Transactions support `.expectBefore(deadlineMs)` to require the authoritative clock to precede an exclusive epoch-ms deadline at execution and the final commit decision. Expiry rolls back all effects with `PRECONDITION_FAILED`. Pair a stored lease deadline with version/ownership guards. The in-memory engine uses its injected clock. See [transaction deadlines](../docs/transaction-deadlines.md).

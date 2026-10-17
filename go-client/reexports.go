@@ -115,6 +115,8 @@ type (
 	StepDelete         = wire.StepDelete
 	StepUndelete       = wire.StepUndelete
 	StepExpectVersion  = wire.StepExpectVersion
+	FieldExpectation   = wire.FieldExpectation
+	StepExpectFields   = wire.StepExpectFields
 	StepExpectAbsent   = wire.StepExpectAbsent
 	StepUpsert         = wire.StepUpsert
 	StepPatchByQuery   = wire.StepPatchByQuery

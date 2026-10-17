@@ -144,7 +144,10 @@ fn project_unfiltered_array(
             // restored row. Same fallthrough as the ts-client's switch.
             Step::Undelete { .. } => {}
             Step::Upsert { .. } | Step::AdjustCounter { .. } => return OptimisticProjection::Skip,
-            Step::ExpectVersion { .. } | Step::ExpectAbsent { .. } | Step::ExpectBefore { .. } => {}
+            Step::ExpectVersion { .. }
+            | Step::ExpectFields { .. }
+            | Step::ExpectAbsent { .. }
+            | Step::ExpectBefore { .. } => {}
             // By-query steps match an unbounded set of rows by a filter this
             // projection can't evaluate (no table store, no schema) — the effect
             // on the cached result is membership-ambiguous, so decline.
@@ -184,7 +187,10 @@ fn project_filtered_array(query: &Query, last: &Value, txn: &Transaction) -> Opt
             | Step::Replace { .. }
             | Step::Upsert { .. }
             | Step::AdjustCounter { .. } => return OptimisticProjection::Skip,
-            Step::ExpectVersion { .. } | Step::ExpectAbsent { .. } | Step::ExpectBefore { .. } => {}
+            Step::ExpectVersion { .. }
+            | Step::ExpectFields { .. }
+            | Step::ExpectAbsent { .. }
+            | Step::ExpectBefore { .. } => {}
             // By-query steps match rows by a filter we can't evaluate here —
             // the effect on the filtered result is ambiguous, so decline.
             Step::PatchByQuery { .. } | Step::DeleteByQuery { .. } => {
@@ -276,6 +282,7 @@ impl OptimisticStepTable for Step {
             | Step::Delete { table, .. }
             | Step::Undelete { table, .. }
             | Step::ExpectVersion { table, .. }
+            | Step::ExpectFields { table, .. }
             | Step::Upsert { table, .. }
             | Step::AdjustCounter { table, .. }
             | Step::PatchByQuery { table, .. }

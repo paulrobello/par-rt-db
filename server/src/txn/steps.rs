@@ -2,6 +2,10 @@
 
 use std::collections::HashSet;
 
+use par_rt_db_core::field_guard::{
+    FieldGuardError, expectations_match, json_eq as expected_json_eq, validate_expectations,
+};
+use par_rt_db_core::mutation::FieldExpectation;
 use sqlx::PgConnection;
 
 use crate::auth::PrincipalCtx;
@@ -103,41 +107,6 @@ pub(crate) async fn step_patch(
 }
 
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
-
-fn expected_json_eq(left: &serde_json::Value, right: &serde_json::Value) -> bool {
-    match (left, right) {
-        (serde_json::Value::Number(a), serde_json::Value::Number(b)) => {
-            let integer = |number: &serde_json::Number| {
-                number
-                    .as_i64()
-                    .map(i128::from)
-                    .or_else(|| number.as_u64().map(i128::from))
-                    .or_else(|| {
-                        let value = number.as_f64()?;
-                        (value.is_finite()
-                            && value.fract() == 0.0
-                            && value.abs() < 2.0_f64.powi(127))
-                        .then_some(value as i128)
-                    })
-            };
-            match (integer(a), integer(b)) {
-                (Some(a), Some(b)) => a == b,
-                _ => a.as_f64() == b.as_f64(),
-            }
-        }
-        (serde_json::Value::Array(a), serde_json::Value::Array(b)) => {
-            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| expected_json_eq(a, b))
-        }
-        (serde_json::Value::Object(a), serde_json::Value::Object(b)) => {
-            a.len() == b.len()
-                && a.iter().all(|(key, value)| {
-                    b.get(key)
-                        .is_some_and(|other| expected_json_eq(value, other))
-                })
-        }
-        _ => left == right,
-    }
-}
 
 fn counter_value(
     field_type: &FieldType,
@@ -366,6 +335,43 @@ pub(crate) async fn step_expect_version(
         sctx.ctx,
     )
     .await?;
+    sctx.results.push(serde_json::Value::Null);
+    Ok(())
+}
+
+pub(crate) async fn step_expect_fields(
+    sctx: &mut StepCtx<'_>,
+    table: &str,
+    id: &str,
+    expected: &[FieldExpectation],
+) -> Result<(), RtDbError> {
+    let table_def = sctx.schema.table(table)?;
+    let table_ident = pg_table(table);
+    let live_only = if table_def.soft_delete {
+        " AND \"deleted_at\" IS NULL"
+    } else {
+        ""
+    };
+    let doc: Option<serde_json::Value> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT \"doc\" FROM \"{}\".\"{}\" WHERE \"id\" = $1{live_only}",
+        sctx.pg_schema_name, table_ident
+    )))
+    .bind(id)
+    .fetch_optional(&mut *sctx.tx)
+    .await?;
+    let doc = doc
+        .filter(|doc| doc_visible_to(doc, table_def, sctx.ctx))
+        .ok_or_else(|| RtDbError::not_found(format!("document '{id}' not found")))?;
+    validate_expectations(table_def, expected).map_err(|error| match error {
+        FieldGuardError::InvalidRequest(message) => RtDbError::bad_request(message),
+        FieldGuardError::UnknownPath => RtDbError::schema("expected field path is not declared"),
+    })?;
+    let doc = doc
+        .as_object()
+        .ok_or_else(|| RtDbError::internal("stored doc is not a JSON object"))?;
+    if !expectations_match(doc, expected) {
+        return Err(RtDbError::precondition("expected fields did not match"));
+    }
     sctx.results.push(serde_json::Value::Null);
     Ok(())
 }

@@ -1,5 +1,6 @@
 import { RtDbError } from "./errors.js";
 import type {
+  FieldExpectationJson,
   FilterExpr,
   ScheduleWhen,
   StepJson,
@@ -209,6 +210,16 @@ export class TxnBuilder<S extends SchemaDefinition<any> = SchemaDefinition<any>>
    */
   expectVersion<T extends TableNames<S>>(table: T, id: string, version: number): this {
     this.steps.push({ op: "expectVersion", table, id, version });
+    return this;
+  }
+
+  /** Require exact field values on a visible live row without writing it. */
+  expectFields<T extends TableNames<S>>(
+    table: T,
+    id: string,
+    expected: FieldExpectationJson[],
+  ): this {
+    this.steps.push({ op: "expectFields", table, id, expected });
     return this;
   }
 

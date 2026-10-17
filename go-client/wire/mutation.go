@@ -1,8 +1,7 @@
 // go-client/wire/mutation.go
 package wire
 
-// Mirrors core/src/mutation.rs — Transaction, Step (16 variants; the plan
-// listed 14 but the server's AdjustCounter wins — ledger R10a),
+// Mirrors core/src/mutation.rs — Transaction, Step (17 variants),
 // ScheduleWhen, and the untagged StepResult decode shape. Tag key "op"
 // for Step (camelCase), "type" for ScheduleWhen. Strict decode; variants
 // marshal through methodless aliases (see filter.go).
@@ -39,7 +38,7 @@ func (t *Transaction) UnmarshalJSON(b []byte) error {
 }
 
 // Step is one write/control step. Variants: StepInsert/StepPatch/
-// StepAdjustCounter/StepReplace/StepDelete/StepExpectVersion/
+// StepAdjustCounter/StepReplace/StepDelete/StepExpectVersion/StepExpectFields/
 // StepExpectAbsent/StepUpsert/StepPatchByQuery/StepDeleteByQuery/
 // StepSchedule/StepCancelSchedule/StepStartWorkflow/StepCancelWorkflow/
 // StepUndelete.
@@ -237,6 +236,90 @@ type StepExpectVersion struct {
 	Table   string `json:"table"`
 	ID      string `json:"id"`
 	Version int64  `json:"version"`
+}
+
+// FieldExpectation asserts an exact JSON value at an object-key path.
+type FieldExpectation struct {
+	Path  []string  `json:"path"`
+	Value JSONValue `json:"value"`
+}
+
+func (v FieldExpectation) MarshalJSON() ([]byte, error) {
+	type alias FieldExpectation
+	if v.Path == nil {
+		v.Path = []string{}
+	}
+	return json.Marshal(alias(v))
+}
+
+func (v *FieldExpectation) UnmarshalJSON(b []byte) error {
+	r, err := StrictUnmarshal[struct {
+		Path  json.RawMessage `json:"path"`
+		Value json.RawMessage `json:"value"`
+	}](b)
+	if err != nil {
+		return err
+	}
+	if len(r.Path) == 0 || string(r.Path) == "null" || len(r.Value) == 0 {
+		return fmt.Errorf("field assertion requires path and value")
+	}
+	var parts []json.RawMessage
+	if err := json.Unmarshal(r.Path, &parts); err != nil {
+		return err
+	}
+	if parts == nil {
+		return fmt.Errorf("field path must be an array")
+	}
+	path := make([]string, len(parts))
+	for i, part := range parts {
+		var key *string
+		if err := json.Unmarshal(part, &key); err != nil {
+			return err
+		}
+		if key == nil {
+			return fmt.Errorf("field path keys must be strings")
+		}
+		path[i] = *key
+	}
+	value, err := UnmarshalJSON(r.Value)
+	if err != nil {
+		return err
+	}
+	v.Path, v.Value = path, value
+	return nil
+}
+
+// StepExpectFields checks selected values without writing the live row.
+type StepExpectFields struct {
+	Table    string             `json:"table"`
+	ID       string             `json:"id"`
+	Expected []FieldExpectation `json:"expected"`
+}
+
+func (StepExpectFields) isStep() {}
+
+func (v StepExpectFields) MarshalJSON() ([]byte, error) {
+	type alias StepExpectFields
+	if v.Expected == nil {
+		v.Expected = []FieldExpectation{}
+	}
+	return MarshalTagged("op", "expectFields", alias(v))
+}
+
+func (v *StepExpectFields) UnmarshalJSON(b []byte) error {
+	r, err := StrictUnmarshal[struct {
+		Table    *string             `json:"table"`
+		ID       *string             `json:"id"`
+		Expected *[]FieldExpectation `json:"expected"`
+	}](b)
+	if err != nil {
+		return err
+	}
+	if r.Table == nil || r.ID == nil || r.Expected == nil {
+		return fmt.Errorf("expectFields requires table, id and expected")
+	}
+	v.Table, v.ID, v.Expected = *r.Table, *r.ID, *r.Expected
+	return nil
 }
 
 // StepExpectBefore requires execution and the final commit decision before an epoch-ms deadline.
@@ -699,7 +782,7 @@ func UnmarshalScheduleWhen(data []byte) (ScheduleWhen, error) {
 	}
 }
 
-// UnmarshalStep routes a tagged step to its variant across all 15 ops.
+// UnmarshalStep routes a tagged step to its variant across all 17 ops.
 func UnmarshalStep(data []byte) (Step, error) {
 	tag, err := PeekTag(data, "op")
 	if err != nil {
@@ -720,6 +803,8 @@ func UnmarshalStep(data []byte) (Step, error) {
 		return DecodeTagged[StepUndelete](data, "op")
 	case "expectVersion":
 		return DecodeTagged[StepExpectVersion](data, "op")
+	case "expectFields":
+		return DecodeTagged[StepExpectFields](data, "op")
 	case "expectBefore":
 		return DecodeTagged[StepExpectBefore](data, "op")
 	case "expectAbsent":

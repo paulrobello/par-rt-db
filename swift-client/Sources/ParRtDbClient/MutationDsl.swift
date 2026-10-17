@@ -86,6 +86,11 @@ public struct MutationBuilder: Sendable {
         adding(.expectBefore(deadlineMs: deadlineMs))
     }
 
+    /// Require selected field values without writing the live row.
+    public func expectFields(_ table: String, _ id: String, _ expected: [FieldExpectation]) -> MutationBuilder {
+        adding(.expectFields(table: table, id: id, expected: expected))
+    }
+
     /// Queue an index-absence precondition step (no row may match the eq prefix).
     public func expectAbsent(_ table: String, _ index: String, _ eq: [JSONValue]) -> MutationBuilder {
         adding(.expectAbsent(table: table, index: index, eq: eq))
@@ -190,6 +195,8 @@ public struct MutationBuilder: Sendable {
             .undelete(table: table, id: id)
         case let .expectVersion(table, id, version):
             .expectVersion(table: table, id: id, version: version)
+        case let .expectFields(table, id, expected):
+            .expectFields(table: table, id: id, expected: expected)
         case let .expectBefore(deadlineMs):
             .expectBefore(deadlineMs: deadlineMs)
         case let .expectAbsent(table, index, eq):
@@ -235,6 +242,7 @@ private enum PendingStep: Sendable {
     case delete(table: String, id: String)
     case undelete(table: String, id: String)
     case expectVersion(table: String, id: String, version: Int64)
+    case expectFields(table: String, id: String, expected: [FieldExpectation])
     case expectBefore(deadlineMs: Int64)
     case expectAbsent(table: String, index: String, eq: [JSONValue])
     case upsert(

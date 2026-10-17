@@ -1,0 +1,601 @@
+{
+  "name": "txn-field-guard-count-over",
+  "schema": {
+    "tables": {
+      "rooms": {
+        "fields": {
+          "generation": {
+            "type": "number"
+          },
+          "metadata": {
+            "type": "optional",
+            "inner": {
+              "type": "any"
+            }
+          },
+          "typed": {
+            "type": "object",
+            "fields": {
+              "base": {
+                "type": "number"
+              }
+            }
+          },
+          "records": {
+            "type": "record",
+            "value": {
+              "type": "object",
+              "fields": {
+                "base": {
+                  "type": "number"
+                }
+              }
+            }
+          },
+          "variants": {
+            "type": "union",
+            "variants": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "object",
+                "fields": {
+                  "base": {
+                    "type": "number"
+                  }
+                }
+              }
+            ]
+          },
+          "array": {
+            "type": "array",
+            "element": {
+              "type": "number"
+            }
+          },
+          "maybe": {
+            "type": "optional",
+            "inner": {
+              "type": "object",
+              "fields": {
+                "base": {
+                  "type": "number"
+                }
+              }
+            }
+          },
+          "explicitNull": {
+            "type": "null"
+          }
+        },
+        "indexes": [],
+        "softDelete": true
+      },
+      "chunks": {
+        "fields": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "indexes": []
+      }
+    }
+  },
+  "seed": [
+    {
+      "table": "rooms",
+      "doc": {
+        "generation": 1,
+        "metadata": {
+          "base": 1,
+          "tail": 1,
+          "scope": {
+            "backend": "wasm",
+            "version": 1
+          },
+          "nil": null,
+          "array": [
+            10
+          ],
+          "text": "\u00e9",
+          "\u00e9": 1
+        },
+        "typed": {
+          "base": 1
+        },
+        "records": {
+          "dynamic.key": {
+            "base": 1
+          }
+        },
+        "variants": {
+          "base": 1
+        },
+        "array": [
+          10
+        ],
+        "maybe": {
+          "base": 1
+        },
+        "explicitNull": null
+      },
+      "$id": "room"
+    }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "expectFields",
+          "table": "rooms",
+          "id": {
+            "$idRef": "room"
+          },
+          "expected": [
+            {
+              "path": [
+                "metadata",
+                "0"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "1"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "2"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "3"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "4"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "5"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "6"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "7"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "8"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "9"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "10"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "11"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "12"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "13"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "14"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "15"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "16"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "17"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "18"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "19"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "20"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "21"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "22"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "23"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "24"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "25"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "26"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "27"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "28"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "29"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "30"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "31"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "32"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "33"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "34"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "35"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "36"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "37"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "38"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "39"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "40"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "41"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "42"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "43"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "44"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "45"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "46"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "47"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "48"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "49"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "50"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "51"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "52"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "53"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "54"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "55"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "56"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "57"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "58"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "59"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "60"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "61"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "62"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "63"
+              ],
+              "value": null
+            },
+            {
+              "path": [
+                "metadata",
+                "64"
+              ],
+              "value": null
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "expect": {
+    "error": {
+      "code": "BAD_REQUEST"
+    }
+  }
+}

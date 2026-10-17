@@ -1,4 +1,4 @@
-"""Tests for ``par_rt_db.mutation``: ``Step`` (15 ops), ``StepResult``, ``Transaction``,
+"""Tests for ``par_rt_db.mutation``: ``Step`` (17 ops), ``StepResult``, ``Transaction``,
 and the ``Mutation`` builder.
 
 Mirrors ``server/src/txn.rs`` (the ``Step`` enum + ``Transaction`` struct +
@@ -7,8 +7,8 @@ untagged ``StepResult``) and the builder ergonomics of
 
 Wire shapes (load-bearing — match the server exactly):
 
-* ``Step`` is tagged by ``op`` (camelCase variants: ``insert``/``patch``/
-  ``replace``/``delete``/``undelete``/``expectVersion``/``expectAbsent``/
+* ``Step`` is tagged by ``op`` (camelCase variants: ``insert``/``patch``/``adjustCounter``/
+  ``replace``/``delete``/``undelete``/``expectVersion``/``expectFields``/``expectBefore``/``expectAbsent``/
   ``upsert``/``patchByQuery``/``deleteByQuery``/``schedule``/``cancelSchedule``/
   ``startWorkflow``/``cancelWorkflow``).
 * ``Transaction`` is ``{"steps": Step[]}``; the server caps at 1024 steps.

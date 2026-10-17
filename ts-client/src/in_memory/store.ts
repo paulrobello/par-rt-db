@@ -33,6 +33,7 @@ import type {
 } from "../admin.js";
 import { canonical } from "../canonical.js";
 import { RtDbError } from "../errors.js";
+import { checkFieldExpectations, validateFieldGuardShapes } from "./field-guard.js";
 import type { FileMetadata, UploadInput, UploadResult } from "../http.js";
 import { parseStepResults, type StepResult } from "../mutation.js";
 import type {
@@ -1208,6 +1209,7 @@ export class InMemoryRtDbClient {
     if (countSteps(txn) > MAX_STEPS) {
       throw new RtDbError("BAD_REQUEST", `transaction exceeds maximum of ${MAX_STEPS} steps`);
     }
+    validateFieldGuardShapes(txn);
     // SEC-104: bound the worst-case row count before any step applies so an
     // over-budget txn rolls back nothing. Mirrors server `execute_txn`.
     let byQuerySteps = 0;
@@ -2083,6 +2085,12 @@ export class InMemoryRtDbClient {
       case "expectVersion": {
         this.requireTable(table);
         this.doExpectVersion(table, step.id, step.version);
+        return { result: null };
+      }
+      case "expectFields": {
+        const tableDef = this.requireTable(table);
+        const row = this.requireRow(table, step.id);
+        checkFieldExpectations(tableDef, row.doc, step.expected);
         return { result: null };
       }
       case "expectAbsent": {

@@ -9,7 +9,7 @@ use crate::wire::{FilterExpr, ScheduleWhen, WorkflowSpec, WorkflowStepSpec};
 /// follow-up), re-exported here at their historical path so every existing
 /// `crate::mutation::{Transaction, Step}` call site keeps resolving. See
 /// `server/src/dsl.rs` for the server's mirror of this same re-export.
-pub use par_rt_db_core::mutation::{Step, Transaction};
+pub use par_rt_db_core::mutation::{FieldExpectation, Step, Transaction};
 
 /// One entry of `mutateOk.results`, positionally aligned with `steps`.
 ///
@@ -177,6 +177,15 @@ impl Mutation {
             table: table.into(),
             id: id.into(),
             version,
+        });
+        self
+    }
+    /// Queue exact field preconditions on a visible live row, without writing it.
+    pub fn expect_fields(mut self, table: &str, id: &str, expected: &[FieldExpectation]) -> Self {
+        self.steps.push(Step::ExpectFields {
+            table: table.into(),
+            id: id.into(),
+            expected: expected.to_vec(),
         });
         self
     }

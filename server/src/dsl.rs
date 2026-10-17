@@ -201,6 +201,7 @@ impl StepTableExt for Step {
             | Step::Replace { table, .. }
             | Step::Delete { table, .. }
             | Step::ExpectVersion { table, .. }
+            | Step::ExpectFields { table, .. }
             | Step::ExpectAbsent { table, .. }
             | Step::Upsert { table, .. }
             | Step::PatchByQuery { table, .. }

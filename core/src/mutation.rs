@@ -26,6 +26,16 @@
 
 use crate::wire::FilterExpr;
 
+/// An exact equality assertion on one document field, with unambiguous object keys.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FieldExpectation {
+    /// Object keys from a declared root field. Array indexing is not supported.
+    pub path: Vec<String>,
+    /// Required value. A missing field never matches, including when this is null.
+    pub value: serde_json::Value,
+}
+
 /// One write/control step (tagged `{"op": "..."}`, camelCase).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]
@@ -90,6 +100,15 @@ pub enum Step {
         id: String,
         /// The required current version.
         version: i64,
+    },
+    /// Precondition: selected fields on a visible live row must match exactly, without writing it.
+    ExpectFields {
+        /// Target table.
+        table: String,
+        /// Physical document id.
+        id: String,
+        /// Bounded, nonempty equality assertions with distinct paths.
+        expected: Vec<FieldExpectation>,
     },
     /// Precondition: execution and the final commit decision must precede an absolute epoch-ms deadline.
     ExpectBefore {

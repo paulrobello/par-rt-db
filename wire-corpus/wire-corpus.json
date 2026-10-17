@@ -503,6 +503,38 @@
           }
         ]
       }
+    },
+    {
+      "type": "mutate",
+      "mutId": "m-field-guard",
+      "txn": {
+        "steps": [
+          {
+            "op": "expectFields",
+            "table": "rooms",
+            "id": "row-id",
+            "expected": [
+              {
+                "path": [
+                  "metadata",
+                  "nil"
+                ],
+                "value": null
+              },
+              {
+                "path": [
+                  "metadata",
+                  "scope"
+                ],
+                "value": {
+                  "backend": "wasm",
+                  "version": 1
+                }
+              }
+            ]
+          }
+        ]
+      }
     }
   ],
   "server_messages": [

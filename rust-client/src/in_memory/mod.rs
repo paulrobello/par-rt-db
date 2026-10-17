@@ -37,41 +37,10 @@ use crate::wire::{
     AggregateOp, AuthedUser, FilterExpr, PresenceMember, ScheduleInfo, ScheduleKind,
     ScheduleStatus, ScheduleWhen,
 };
-
-fn expected_json_eq(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Number(a), Value::Number(b)) => {
-            let integer = |number: &serde_json::Number| {
-                number
-                    .as_i64()
-                    .map(i128::from)
-                    .or_else(|| number.as_u64().map(i128::from))
-                    .or_else(|| {
-                        let value = number.as_f64()?;
-                        (value.is_finite()
-                            && value.fract() == 0.0
-                            && value.abs() < 2.0_f64.powi(127))
-                        .then_some(value as i128)
-                    })
-            };
-            match (integer(a), integer(b)) {
-                (Some(a), Some(b)) => a == b,
-                _ => a.as_f64() == b.as_f64(),
-            }
-        }
-        (Value::Array(a), Value::Array(b)) => {
-            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| expected_json_eq(a, b))
-        }
-        (Value::Object(a), Value::Object(b)) => {
-            a.len() == b.len()
-                && a.iter().all(|(key, value)| {
-                    b.get(key)
-                        .is_some_and(|other| expected_json_eq(value, other))
-                })
-        }
-        _ => left == right,
-    }
-}
+use par_rt_db_core::field_guard::{
+    FieldGuardError, expectations_match, json_eq as expected_json_eq, validate_expectations,
+};
+use par_rt_db_core::mutation::FieldExpectation;
 
 /// Maximum number of steps in a single transaction (mirrors the server cap).
 pub const MAX_STEPS: usize = 1024;
@@ -777,6 +746,11 @@ impl InMemoryRtDbClient {
             Step::ExpectVersion { table, id, version } => {
                 self.step_expect_version(table, id, *version)
             }
+            Step::ExpectFields {
+                table,
+                id,
+                expected,
+            } => self.step_expect_fields(table, id, expected),
             Step::ExpectAbsent { table, index, eq } => self.step_expect_absent(table, index, eq),
             Step::ExpectBefore { .. } => Ok((StepResult::Null, vec![])),
             Step::Upsert {
@@ -1029,6 +1003,41 @@ impl InMemoryRtDbClient {
     ) -> Result<(StepResult, Vec<String>), RtDbError> {
         self.require_table(table)?;
         self.do_expect_version(table, id, version)?;
+        Ok((StepResult::Null, Vec::new()))
+    }
+
+    fn step_expect_fields(
+        &self,
+        table: &str,
+        id: &str,
+        expected: &[FieldExpectation],
+    ) -> Result<(StepResult, Vec<String>), RtDbError> {
+        let table_def = self.require_table(table)?;
+        let row = self
+            .docs
+            .get(&(table.to_string(), id.to_string()))
+            .filter(|row| row.deleted_at.is_none())
+            .ok_or_else(|| {
+                RtDbError::new(ErrorCode::NotFound, format!("document '{id}' not found"))
+            })?;
+        validate_expectations(table_def, expected).map_err(|error| match error {
+            FieldGuardError::InvalidRequest(message) => {
+                RtDbError::new(ErrorCode::BadRequest, message)
+            }
+            FieldGuardError::UnknownPath => RtDbError::new(
+                ErrorCode::SchemaViolation,
+                "expected field path is not declared",
+            ),
+        })?;
+        let doc = row.doc.as_object().ok_or_else(|| {
+            RtDbError::new(ErrorCode::Internal, "stored doc is not a JSON object")
+        })?;
+        if !expectations_match(doc, expected) {
+            return Err(RtDbError::new(
+                ErrorCode::PreconditionFailed,
+                "expected fields did not match",
+            ));
+        }
         Ok((StepResult::Null, Vec::new()))
     }
 

@@ -257,6 +257,8 @@ func executeStep(s *Store, step wire.Step) (wire.StepResult, []string, error) {
 		return stepUndelete(s, t)
 	case wire.StepExpectVersion:
 		return stepExpectVersion(s, t)
+	case wire.StepExpectFields:
+		return stepExpectFields(s, t)
 	case wire.StepExpectBefore:
 		return wire.StepResult{}, nil, nil
 	case wire.StepExpectAbsent:
