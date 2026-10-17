@@ -10,9 +10,10 @@
  * - `FORBIDDEN` (403) — authenticated but not allowed (per-row `ownerField`,
  *   `collaboratorsField`, or `authorize` predicate denied the write/read).
  * - `NOT_FOUND` (404) — `get(id)` miss or unknown route.
- * - `SCHEMA_VIOLATION` (400) — push-schema rejected (destructive change,
+ * - `SCHEMA_VIOLATION` (422) — push-schema rejected (destructive change,
  *   type mismatch, quota over-cap on tables).
- * - `PRECONDITION_FAILED` (412) — `expectVersion`/`expectAbsent` step failed.
+ * - `PRECONDITION_FAILED` (409) — an `expectVersion`, `expectAbsent`,
+ *   `expectFields` or `expectBefore` guard failed.
  * - `CONFLICT` (409) — `unique` (or partial-`where` unique) index violation.
  * - `BAD_REQUEST` (400) — malformed DSL, bad cast, bad cursor.
  * - `INTERNAL` (500) — server-side failure (generic message; details in logs).
