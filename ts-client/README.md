@@ -350,6 +350,20 @@ within it are browser-only, per the auth bullet above.
 
 Transactions support `.expectFields(table, id, expected)` with `FieldExpectationJson` assertions. The guard checks selected values without writing the live row or advancing its version. Unasserted fields may change. See [the shared contract](../docs/transaction-field-guards.md) for paths, bounds, visibility, deadlines and replay behavior.
 
+## Index-guard equality arity
+
+`.expectAbsent(table, index, eq)` and `.upsert({ index, eq, ... })` require **full-index equality**: `eq` carries exactly one value per declared index field, in declaration order. Unlike `.withIndex()` queries, an `eq` prefix is not accepted — the server rejects an arity mismatch with `BAD_REQUEST` before any step runs:
+
+```ts
+// schema: .index("by_room_actor", ["roomKey", "epoch", "actorId"]) — nonunique
+mutation().expectAbsent("messages", "by_room_actor", ["room-7", 3, "u-42"]); // ok
+mutation().expectAbsent("messages", "by_room_actor", ["room-7", 3]);
+// BAD_REQUEST: index 'by_room_actor' expects 3 eq value(s), got 2
+```
+
+To guard on a shorter key, declare a second nonunique index over exactly those
+fields and pass all of its values.
+
 ## Transaction deadlines
 
 Transactions support `.expectBefore(deadlineMs)` to require the authoritative clock to precede an exclusive epoch-ms deadline at execution and the final commit decision. Expiry rolls back all effects with `PRECONDITION_FAILED`. Pair a stored lease deadline with version/ownership guards. The in-memory engine uses its injected clock. See [transaction deadlines](../docs/transaction-deadlines.md).

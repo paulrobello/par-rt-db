@@ -231,6 +231,11 @@ export class TxnBuilder<S extends SchemaDefinition<any> = SchemaDefinition<any>>
 
   /**
    * Adds a check to expect a document is absent for a given key.
+   *
+   * `eq` requires full-index equality: exactly one value per declared index
+   * field, in declaration order. Unlike queries, an `eq` prefix is not
+   * accepted — an arity mismatch is rejected `BAD_REQUEST` before any step
+   * runs (e.g. "index 'by_room_actor' expects 3 eq value(s), got 2").
    */
   expectAbsent<T extends TableNames<S>>(table: T, index: IndexNamesOf<S, T>, eq: unknown[]): this {
     this.steps.push({ op: "expectAbsent", table, index, eq });
@@ -239,6 +244,10 @@ export class TxnBuilder<S extends SchemaDefinition<any> = SchemaDefinition<any>>
 
   /**
    * Adds an upsert step to the transaction.
+   *
+   * `eq` follows the same full-index rule as {@link TxnBuilder.expectAbsent}:
+   * exactly one value per declared index field — an arity mismatch is
+   * rejected `BAD_REQUEST`.
    */
   upsert<T extends TableNames<S>>(
     table: T,

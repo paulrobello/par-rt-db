@@ -587,6 +587,8 @@ missing/terminal run — a no-op, not an error) — see `server/src/txn.rs`.
 
 `expectFields(table, id, expected)` checks exact values at selected object-key paths without writing the live row or advancing its version. Unasserted fields may change. Missing and null remain distinct, selected objects compare in full, and existing visibility/table scopes apply. See [row-field guards](docs/transaction-field-guards.md) for bounds, ordering, retries and SDK methods.
 
+`expectAbsent` and `upsert` resolve rows through the named index and require **full-index equality**: `eq` carries exactly one value per declared index field, in declaration order. Unlike queries — whose `eq` prefix binds may be followed by range predicates — a prefix is not accepted, and an arity mismatch fails with `BAD_REQUEST` (e.g. "index 'by_room_actor' expects 3 eq value(s), got 2") before any step executes. To guard on a shorter key, declare a second nonunique index over exactly those fields.
+
 The `expectBefore` step adds an exclusive server-clock epoch-ms deadline. The earliest guard is checked after queue wait and at the final commit decision, after asynchronous work. Expiry rolls back the complete transaction with `PRECONDITION_FAILED`; malformed deadlines fail with `BAD_REQUEST`. Combine the stored lease deadline with room-version and ownership guards when fencing a lease. See [transaction deadlines](docs/transaction-deadlines.md) for scheduling, replay and SDK semantics.
 
 A by-query `filter` additionally accepts the execution-time-relative
