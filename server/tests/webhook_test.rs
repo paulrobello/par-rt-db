@@ -908,6 +908,57 @@ async fn webhook_delete_and_deliveries_are_scoped_per_db() -> anyhow::Result<()>
     Ok(())
 }
 
+// Regression guard (40P01): the shared-schema bootstrap and seed writes
+// deadlocked across nextest processes — Postgres takes ALTER TABLE/CREATE INDEX
+// locks BEFORE evaluating IF NOT EXISTS, so a warm no-op bootstrap flashed ACCESS
+// EXCLUSIVE on rtdb.webhooks against a seed INSERT's FK KEY SHARE check. The
+// version-gated bootstrap fast path keeps warm runs lock-free; concurrent
+// bootstrap+seed churn here stays clean, and a future regression to lock-flashing
+// no-op DDL will surface as a 40P01 under this churn.
+#[tokio::test]
+#[serial_test::serial]
+async fn bootstrap_and_seed_writes_do_not_deadlock() -> anyhow::Result<()> {
+    let state = test_state_with_webhooks().await;
+    let mut tasks = tokio::task::JoinSet::new();
+    for i in 0..4 {
+        let pool = state.pool.clone();
+        tasks.spawn(async move {
+            for _ in 0..25 {
+                if i % 2 == 0 {
+                    rtdb_server::db::ensure_webhooks_tables(&pool).await?;
+                } else {
+                    let id: i64 = sqlx::query_scalar(
+                        "INSERT INTO rtdb.webhooks (db, tbl, url, events, created_at) \
+                         VALUES ('bootstrap-stress', NULL, 'http://x', '{\"*\"}', 0) RETURNING id",
+                    )
+                    .fetch_one(&pool)
+                    .await?;
+                    sqlx::query(
+                        "INSERT INTO rtdb.webhook_deliveries (webhook_id, payload, attempts, next_attempt, status) \
+                         VALUES ($1, '{}', 0, 0, 'pending')",
+                    )
+                    .bind(id)
+                    .execute(&pool)
+                    .await?;
+                    sqlx::query("DELETE FROM rtdb.webhook_deliveries WHERE webhook_id = $1")
+                        .bind(id)
+                        .execute(&pool)
+                        .await?;
+                    sqlx::query("DELETE FROM rtdb.webhooks WHERE id = $1")
+                        .bind(id)
+                        .execute(&pool)
+                        .await?;
+                }
+            }
+            anyhow::Ok(())
+        });
+    }
+    while let Some(res) = tasks.join_next().await {
+        res??;
+    }
+    Ok(())
+}
+
 // (f) SEC-115: each delivery carries `X-Rtdb-Signature: t=<ts>,v1=<hmac>` and
 // the tag verifies against the webhook's secret over the exact body bytes the
 // receiver observed. Also asserts the secret is generated server-side on

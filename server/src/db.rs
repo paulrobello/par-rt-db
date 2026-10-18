@@ -38,11 +38,80 @@ pub(crate) fn validate_db_name(name: &str) -> Result<(), RtDbError> {
 /// against the same shared dev Postgres.
 const BOOTSTRAP_LOCK_KEY: i64 = 727_001;
 
+/// Per-component bootstrap versions gating the shared-schema DDL fast path.
+/// Postgres takes an `ALTER TABLE`/`CREATE INDEX` lock BEFORE evaluating `IF
+/// NOT EXISTS`, so a warm no-op bootstrap still flashes `ACCESS EXCLUSIVE`/
+/// `SHARE` locks on the shared registry tables — which deadlocks (40P01)
+/// against a concurrent seed `INSERT`'s FK check across nextest's
+/// process-per-test model, where `serial_test` cannot serialize. The version
+/// check returns before opening any transaction on a current schema, so the
+/// DDL (and its locks) only ever runs on a genuinely stale or fresh cluster.
+/// Bump the version when changing the DDL of its bootstrap fn, or the new
+/// statements will be skipped on already-bootstrapped clusters.
+const RTDB_AUTH_BOOTSTRAP_VERSION: &str = "1";
+const AUDIT_LOG_BOOTSTRAP_VERSION: &str = "1";
+const WEBHOOKS_BOOTSTRAP_VERSION: &str = "1";
+
+/// Reads a stamped bootstrap version; `None` when the marker table (or its
+/// schema) does not exist yet — the first-boot case.
+async fn read_bootstrap_version(pool: &PgPool, key: &str) -> Result<Option<String>, RtDbError> {
+    match sqlx::query_scalar::<_, String>(
+        "SELECT value FROM rtdb_auth.bootstrap_meta WHERE key = $1",
+    )
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(v) => Ok(v),
+        // 42P01 = undefined table/schema: nothing bootstrapped yet.
+        Err(e)
+            if e.as_database_error()
+                .map(|d| d.code().as_deref() == Some("42P01"))
+                .unwrap_or(false) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Stamps a bootstrap version inside the open DDL transaction, creating the
+/// marker table on first use.
+async fn stamp_bootstrap_version(
+    conn: &mut PgConnection,
+    key: &str,
+    version: &str,
+) -> Result<(), RtDbError> {
+    sqlx::query("CREATE SCHEMA IF NOT EXISTS rtdb_auth")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS rtdb_auth.bootstrap_meta \
+         (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    )
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "INSERT INTO rtdb_auth.bootstrap_meta (key, value) VALUES ($1, $2) \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(key)
+    .bind(version)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 /// Creates the `rtdb_auth` schema and its tables if they do not already exist.
 /// Safe to call on every startup and in every test setup, including
 /// concurrently: `pg_advisory_xact_lock` serializes the DDL and is released
-/// automatically on commit or rollback.
+/// automatically on commit or rollback. A current schema short-circuits before
+/// any transaction (see the bootstrap-version consts above).
 pub async fn bootstrap(pool: &PgPool) -> Result<(), RtDbError> {
+    if read_bootstrap_version(pool, "rtdb_auth").await? == Some(RTDB_AUTH_BOOTSTRAP_VERSION.into())
+    {
+        return Ok(());
+    }
     let mut tx = pool.begin().await?;
 
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
@@ -51,6 +120,7 @@ pub async fn bootstrap(pool: &PgPool) -> Result<(), RtDbError> {
         .await?;
 
     bootstrap_ddl(&mut tx).await?;
+    stamp_bootstrap_version(&mut tx, "rtdb_auth", RTDB_AUTH_BOOTSTRAP_VERSION).await?;
 
     tx.commit().await?;
     Ok(())
@@ -418,6 +488,10 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
 /// ephemeral `OpFeed` ring. The `(db, ts_ms DESC)` index backs the
 /// `GET /admin/audit?db=...` newest-first scan without a full-table sort.
 pub async fn ensure_audit_table(pool: &PgPool) -> Result<(), RtDbError> {
+    if read_bootstrap_version(pool, "audit_log").await? == Some(AUDIT_LOG_BOOTSTRAP_VERSION.into())
+    {
+        return Ok(());
+    }
     let mut tx = pool.begin().await?;
 
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
@@ -451,6 +525,8 @@ pub async fn ensure_audit_table(pool: &PgPool) -> Result<(), RtDbError> {
     .execute(&mut *tx)
     .await?;
 
+    stamp_bootstrap_version(&mut tx, "audit_log", AUDIT_LOG_BOOTSTRAP_VERSION).await?;
+
     tx.commit().await?;
     Ok(())
 }
@@ -465,6 +541,9 @@ pub async fn ensure_audit_table(pool: &PgPool) -> Result<(), RtDbError> {
 /// contains op names (`insert`/`patch`/`replace`/`delete`/`upsert`) or the
 /// single element `*` to match every event.
 pub async fn ensure_webhooks_tables(pool: &PgPool) -> Result<(), RtDbError> {
+    if read_bootstrap_version(pool, "webhooks").await? == Some(WEBHOOKS_BOOTSTRAP_VERSION.into()) {
+        return Ok(());
+    }
     let mut tx = pool.begin().await?;
 
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
@@ -532,6 +611,8 @@ pub async fn ensure_webhooks_tables(pool: &PgPool) -> Result<(), RtDbError> {
     )
     .execute(&mut *tx)
     .await?;
+
+    stamp_bootstrap_version(&mut tx, "webhooks", WEBHOOKS_BOOTSTRAP_VERSION).await?;
 
     tx.commit().await?;
     Ok(())
