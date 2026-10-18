@@ -500,7 +500,7 @@ export class RtDbHttpClient {
     }
     const parsed: unknown = await response.json().catch(() => null);
     if (RtDbError.isEnvelope(parsed)) {
-      throw RtDbError.fromEnvelope(parsed);
+      throw RtDbError.fromEnvelope(parsed, response.status);
     }
     throw new RtDbError("INTERNAL", `request failed with status ${response.status}`);
   }
@@ -510,7 +510,7 @@ export class RtDbHttpClient {
     const parsed: unknown = await response.json().catch(() => null);
     if (!response.ok) {
       if (RtDbError.isEnvelope(parsed)) {
-        throw RtDbError.fromEnvelope(parsed);
+        throw RtDbError.fromEnvelope(parsed, response.status);
       }
       throw new RtDbError("INTERNAL", `request failed with status ${response.status}`);
     }

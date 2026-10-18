@@ -106,6 +106,28 @@ describe("in-memory storage", () => {
     });
   });
 
+  it("deleteFile surfaces a typed envelope carrying the response status (requireOk path)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ code: "NOT_FOUND", message: "no such file" }), {
+        status: 404,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const http = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+
+    await expect(http.deleteFile("f1")).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "NOT_FOUND",
+      message: "no such file",
+      status: 404,
+    });
+  });
+
   it("forwards a ReadableStream body to fetch verbatim (ENH-021)", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ id: "f1", sha256: "abc", size: 3 }), {

@@ -277,6 +277,46 @@ describe("RtDbHttpClient", () => {
     await expect(client.mutate(mutation().build())).rejects.toBeInstanceOf(RtDbError);
   });
 
+  it("preserves response.status on a typed 4xx envelope from mutate", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse({ code: "PRECONDITION_FAILED", message: "transaction deadline expired" }, 409),
+      );
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+
+    await expect(client.mutate(mutation().build())).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "PRECONDITION_FAILED",
+      message: "transaction deadline expired",
+      status: 409,
+    });
+  });
+
+  it("preserves response.status on a typed 5xx envelope from query", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ code: "INTERNAL", message: "boom" }, 500));
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+
+    await expect(client.query({ json: { table: "items" } })).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "INTERNAL",
+      message: "boom",
+      status: 500,
+    });
+  });
+
   it("throws RtDbError INTERNAL when a 2xx body is not valid JSON", async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response("not-json", { status: 200 }));
     const client = new RtDbHttpClient({
