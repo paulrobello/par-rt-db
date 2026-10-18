@@ -637,3 +637,13 @@ running server (`RTDB_TEST_SERVER_URL` + `RTDB_TEST_ADMIN_KEY`):
 # from ts-client/
 make test-integration
 ```
+
+A separate manual gate runs the reactive client under the **bun** runtime —
+the cookie-less `setToken()` + `connect()` shape used by scripts and CLIs —
+provisioning its own database and performing one `mutate()` round trip over
+the live socket (the regression gate for the cookie-mode dial fix):
+
+```sh
+# from ts-client/ — needs a running server
+RTDB_TEST_SERVER_URL=http://127.0.0.1:8300 RTDB_TEST_ADMIN_KEY=... make test-bun
+```

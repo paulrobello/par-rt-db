@@ -490,6 +490,58 @@ describe("RtDbClient", () => {
     expect(client.getAuthState()).toBe("unauthenticated");
   });
 
+  it("setToken() credentials are dialed even without a getToken option (bun/CLI path)", () => {
+    const sockets: FakeSocket[] = [];
+    const client = new RtDbClient({
+      url: "ws://h:8300",
+      db: "kanban",
+      webSocketFactory: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s;
+      },
+      heartbeatMs: 0,
+    });
+
+    client.setToken("tok");
+    expect(sockets.length).toBe(1);
+    sockets[0].open();
+
+    expect(frames(sockets[0])).toContainEqual({
+      type: "auth",
+      token: "tok",
+      db: "kanban",
+      protocolVersion: PROTOCOL_VERSION,
+    });
+    sockets[0].deliver({ type: "authOk", user: { kind: "machine", email: null, name: null } });
+    expect(client.getAuthState()).toBe("authenticated");
+    expect(client.getConnectionState()).toBe("connected");
+  });
+
+  it("cookie mode (no getToken, no setToken) still dials a tokenless auth", () => {
+    const sockets: FakeSocket[] = [];
+    const client = new RtDbClient({
+      url: "ws://h:8300",
+      db: "kanban",
+      webSocketFactory: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s;
+      },
+      heartbeatMs: 0,
+    });
+
+    client.connect();
+    expect(sockets.length).toBe(1);
+    sockets[0].open();
+
+    expect(frames(sockets[0])).toContainEqual({
+      type: "auth",
+      db: "kanban",
+      protocolVersion: PROTOCOL_VERSION,
+    });
+  });
+
   it("treats a rejected getToken() as no credential instead of hanging in connecting", async () => {
     const sockets: FakeSocket[] = [];
     const client = new RtDbClient({

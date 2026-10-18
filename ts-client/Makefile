@@ -1,4 +1,4 @@
-.PHONY: build test test-integration lint fmt fmt-check typecheck checkall install
+.PHONY: build test test-integration test-bun lint fmt fmt-check typecheck checkall install
 
 install:
 	bun install
@@ -23,5 +23,11 @@ test:
 
 test-integration:
 	bun run test:integration
+
+# Manual, opt-in gate: the reactive client under the bun runtime (no cookie
+# jar) — setToken + connect + one mutate against a real server. Needs
+# RTDB_TEST_SERVER_URL + RTDB_TEST_ADMIN_KEY; provisions and deletes its own db.
+test-bun:
+	bun scripts/bun-ws-smoke.ts
 
 checkall: fmt-check lint typecheck test build

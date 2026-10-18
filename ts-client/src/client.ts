@@ -910,10 +910,13 @@ export class RtDbClient {
     // tokenless Auth; the browser's HttpOnly `rtdb_session` cookie authenticates
     // the WS upgrade. Testing `getToken` here rather than the `cookieMode` field
     // (which the constructor derives from this same immutable option) is what
-    // narrows it to defined below.
+    // narrows it to defined below. An explicit `setToken()` credential overrides
+    // the tokenless dial: bun/CLI callers have no cookie jar, so dialing
+    // tokenless there could never authenticate (the server answers 4401 and the
+    // client lands idle while holding a perfectly good token).
     const getToken = this.options.getToken;
     if (getToken === undefined) {
-      this.openWithToken(null);
+      this.openWithToken(this.hasToken ? this.token : null);
       return;
     }
     const provided = this.hasToken ? this.token : getToken();
