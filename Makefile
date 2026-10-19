@@ -481,10 +481,15 @@ pre-commit:
 pre-commit-update:
 	pre-commit autoupdate
 
+# Cold builds under the builder's full four-CPU quota saturated the deploy
+# host (load 59.6 with shared-endpoint 502s, 2026-10-16); the identical cold
+# build under a two-CPU quota held load <= 11.4 with every shared endpoint
+# serving. The build window therefore runs at cpu-quota 200000 and the
+# four-CPU steady state is restored afterwards, even when the build fails.
 deploy: checkall-cached
 	rsync -az --delete --filter=':- .gitignore' --exclude .git --exclude .claude/ \
 		./ $(DEPLOY_HOST):$(DEPLOY_PATH)/
-	ssh $(DEPLOY_HOST) 'cd $(DEPLOY_PATH) && BUILDER=par-rt-db-builder && if ! docker buildx inspect "$$BUILDER" >/dev/null 2>&1; then docker buildx create --name "$$BUILDER" --driver docker-container --driver-opt default-load=true --driver-opt cpu-quota=400000 --driver-opt cpu-period=100000 --buildkitd-config "$(DEPLOY_PATH)/deploy/buildkitd.toml"; fi && docker buildx use "$$BUILDER" && RTDB_BUILD_COMMIT=$(DEPLOY_COMMIT) BUILDX_BUILDER="$$BUILDER" docker compose up -d --build && docker compose ps'
+	ssh $(DEPLOY_HOST) 'cd $(DEPLOY_PATH) && BUILDER=par-rt-db-builder && if ! docker buildx inspect "$$BUILDER" >/dev/null 2>&1; then docker buildx create --name "$$BUILDER" --driver docker-container --driver-opt default-load=true --driver-opt cpu-quota=400000 --driver-opt cpu-period=100000 --buildkitd-config "$(DEPLOY_PATH)/deploy/buildkitd.toml"; fi && docker buildx use "$$BUILDER" && docker buildx inspect --bootstrap "$$BUILDER" >/dev/null && BK=$$(docker ps --format "{{.Names}}" | grep "^buildx_buildkit_$${BUILDER}" | head -1) && [ -n "$$BK" ] && docker update --cpu-period 100000 --cpu-quota 200000 "$$BK" && { RTDB_BUILD_COMMIT=$(DEPLOY_COMMIT) BUILDX_BUILDER="$$BUILDER" docker compose up -d --build && docker compose ps; EC=$$?; docker update --cpu-period 100000 --cpu-quota 400000 "$$BK" >/dev/null; exit $$EC; }'
 	ssh $(DEPLOY_HOST) 'curl -fsS http://127.0.0.1:8300/healthz'
 	@echo
 	curl -fsS $(DEPLOY_PUBLIC_URL)

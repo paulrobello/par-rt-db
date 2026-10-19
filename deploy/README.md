@@ -50,9 +50,19 @@ The deploy target bootstraps the named `par-rt-db-builder` BuildKit
 `docker-container` builder if it does not already exist. The builder reads
 [`buildkitd.toml`](./buildkitd.toml), which limits solver parallelism to two
 steps, and is constrained to four CPUs with `cpu-quota=400000` and
-`cpu-period=100000`. `default-load=true` makes the resulting image available
-to the Docker Engine used by Compose. The existing builder is reused so
-deploys retain its cache and do not recreate a running builder.
+`cpu-period=100000` in its steady state. `default-load=true` makes the
+resulting image available to the Docker Engine used by Compose. The existing
+builder is reused so deploys retain its cache and do not recreate a running
+builder.
+
+Before the image build starts, the deploy target constrains the builder
+container to two CPUs (`docker update --cpu-quota 200000`) and restores the
+four-CPU steady state as soon as the build exits, including on failure. A cold
+Rust build at the full four-CPU quota coincided with host load 59.6 and
+shared-endpoint 502s (2026-10-16); the identical cold build under the two-CPU
+build window held host load at or below 11.4 with every sampled endpoint
+serving. The deploy aborts before building if the builder container cannot be
+resolved or constrained — it never builds unconstrained.
 
 These limits reserve CPU capacity for the host-local `cloudflared` connector
 while Rust and dashboard build steps run. Verify availability under the current
@@ -110,8 +120,8 @@ threshold is load below 16 on every sample and HTTP 200 from
 hostnames must remain healthy too. Do not mark the mitigation verified from a
 local `docker compose config` check alone.
 
-The manual path below must use the same builder bootstrap before
-`docker compose up`:
+The manual path below must use the same builder bootstrap and two-CPU build
+window before `docker compose up`:
 
 The host and path are `DEPLOY_HOST` (default `root@docker-host.example.com`)
 and `DEPLOY_PATH` (`/docker/par-rt-db`) — both are `Makefile` variables;
@@ -152,8 +162,14 @@ if ! docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
     --buildkitd-config /docker/par-rt-db/deploy/buildkitd.toml
 fi
 docker buildx use "$BUILDER"
+docker buildx inspect --bootstrap "$BUILDER" >/dev/null
+BK=$(docker ps --format '{{.Names}}' | grep "^buildx_buildkit_${BUILDER}" | head -1)
+# Two-CPU build window (see the deploy target comment above): constrain the
+# builder container before the build, restore the four-CPU steady state after.
+docker update --cpu-period 100000 --cpu-quota 200000 "$BK"
 BUILDX_BUILDER="$BUILDER" docker compose up -d --build
 docker compose ps
+docker update --cpu-period 100000 --cpu-quota 400000 "$BK"
 curl -fsS http://127.0.0.1:8300/healthz | jq .
 # -> {"status":"ok","started_at":..,"uptime_seconds":..,"postgres":true}
 # The build fingerprint ("version"/"git_commit"/"build_timestamp") is
