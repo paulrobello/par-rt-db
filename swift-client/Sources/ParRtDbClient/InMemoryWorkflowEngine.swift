@@ -24,8 +24,8 @@ extension InMemoryRtDbClient {
             // Per-boundary liveness check: a cancel (or terminal transition)
             // between steps ends the pass — the server re-checks the row each
             // boundary.
-            guard workflows[run.id] === run, run.status == .running else { return }
-            guard run.currentStep < run.spec.steps.count else { return }
+            guard workflows[run.id] === run, run.status == .running, run.currentStep < run.spec.steps.count
+            else { return }
             let step = run.spec.steps[run.currentStep]
             if let signal = step.awaitSignal {
                 if advanceAwaitSignal(run, signal, step, now: now) {

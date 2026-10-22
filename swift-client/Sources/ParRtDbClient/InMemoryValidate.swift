@@ -491,8 +491,7 @@ public func evalFilterExpr(
 private func olderThanMatches(
     _ field: String, _ ms: Int64, _ doc: [String: JSONValue], _ fields: FieldMap, _ now: Int64?
 ) -> Bool {
-    guard let now else { return false }
-    guard let docVal = doc[field], docVal != .null else { return false }
+    guard let now, let docVal = doc[field], docVal != .null else { return false }
     if isInt64Field(fields[field]) {
         guard let lhs = i64DocValue(docVal) else { return false }
         return lhs < now - ms
@@ -531,18 +530,15 @@ private func compareLeaf(
         // The server binds a string filter value on an int64 field as a typed
         // bigint, so any legal comparison is numeric. Parse both sides exactly
         // as i64; an unparseable value never matches.
-        guard case let .string(docString) = docVal, let lhs = parseI64(docString) else {
-            return false
-        }
-        guard let rhs = parseI64(stringValue) else { return false }
+        guard case let .string(docString) = docVal, let lhs = parseI64(docString), let rhs = parseI64(stringValue)
+        else { return false }
         return compareValues(op, lhs, rhs)
     }
     if case let .string(stringValue) = filterValue {
         return compareValues(op, docToText(docVal), stringValue)
     }
     if isJSONNumber(filterValue) {
-        guard let lhs = docToNumber(docVal) else { return false }
-        guard let rhs = filterValue.doubleValue else { return false }
+        guard let lhs = docToNumber(docVal), let rhs = filterValue.doubleValue else { return false }
         return compareValues(op, lhs, rhs)
     }
     if case let .bool(docBool) = docVal, case let .bool(filterBool) = filterValue {

@@ -1407,8 +1407,7 @@ public actor RtDbClient {
     /// replays again.
     private func replayPresenceRooms(on transport: any WebSocketTransport) async -> Bool {
         for room in presenceOrder {
-            guard let entry = presenceRooms[room] else { continue }
-            guard sentPresenceRooms.insert(room).inserted else { continue }
+            guard let entry = presenceRooms[room], sentPresenceRooms.insert(room).inserted else { continue }
             do {
                 try await transport.send(Self.frame(.presence(room: room, state: entry.state)))
             } catch {
@@ -1422,8 +1421,8 @@ public actor RtDbClient {
     /// is registered as pending BEFORE its send; on a failed send it stays at
     /// the queue head (order preserved) for the next session.
     private func flushQueuedOps(on transport: any WebSocketTransport) async -> Bool {
-        guard await flushFamily(mutations, on: transport) else { return false }
-        guard await flushFamily(schedules, on: transport) else { return false }
+        guard await flushFamily(mutations, on: transport), await flushFamily(schedules, on: transport)
+        else { return false }
         return await flushFamily(workflows, on: transport)
     }
 
@@ -1485,8 +1484,9 @@ public actor RtDbClient {
         case let .subscribeErr(queryId, error):
             // The shape is rejected and removed: every handle sees the error,
             // a fresh subscribe to the same shape mints a new queryId.
-            guard let key = queryIdToKey.removeValue(forKey: queryId) else { return }
-            guard let entry = subscriptionsByKey.removeValue(forKey: key) else { return }
+            guard let key = queryIdToKey.removeValue(forKey: queryId),
+                  let entry = subscriptionsByKey.removeValue(forKey: key)
+            else { return }
             subscriptionOrder.removeAll { $0 == key }
             for sink in entry.sinks {
                 sink.deliver(.failed(error))
@@ -1623,8 +1623,7 @@ public actor RtDbClient {
         room: String, seq: UInt64, joined: [PresenceMember], left: [String],
         stateChanged: [PresenceMember]
     ) {
-        guard var presenceRoom = presenceRooms[room] else { return }
-        guard case var .members(members) = presenceRoom.latest else { return }
+        guard var presenceRoom = presenceRooms[room], case var .members(members) = presenceRoom.latest else { return }
         if let last = presenceRoom.lastSeq {
             if seq <= last {
                 return
@@ -1714,8 +1713,9 @@ public actor RtDbClient {
     /// sinks and clear `optimisticActive`. No-op when no overlay is active
     /// (e.g. a `queryUpdate` already reconciled).
     private func revertOverlay(queryId: String) {
-        guard let key = queryIdToKey[queryId], var entry = subscriptionsByKey[key] else { return }
-        guard entry.optimisticActive, let base = entry.serverLast else { return }
+        guard let key = queryIdToKey[queryId], var entry = subscriptionsByKey[key],
+              entry.optimisticActive, let base = entry.serverLast
+        else { return }
         entry.optimisticActive = false
         entry.latest = .value(base)
         subscriptionsByKey[key] = entry

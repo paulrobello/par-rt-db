@@ -978,8 +978,8 @@ private func executeSearchTerminal(
         return first.row.id > second.row.id
     }
     func resultDoc(_ scored: Scored) -> JSONValue {
-        guard let snippetText = scored.snippet else { return mergeDoc(scored.row) }
-        guard case var .object(doc) = mergeDoc(scored.row) else { return mergeDoc(scored.row) }
+        guard let snippetText = scored.snippet, case var .object(doc) = mergeDoc(scored.row)
+        else { return mergeDoc(scored.row) }
         doc["_searchSnippet"] = .string(snippetText)
         return .object(doc)
     }

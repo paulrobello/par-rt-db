@@ -576,10 +576,9 @@ func validateDoc(_ table: TableDef, _ doc: [String: JSONValue]) throws {
 func stripUnsetOptionals(_ table: TableDef, _ doc: [String: JSONValue]) -> [String: JSONValue] {
     var out: [String: JSONValue] = [:]
     for (key, value) in doc {
-        if case .null = value, let fieldTy = table.fields[key] {
-            if case let .optional(inner) = fieldTy, !validateValue(inner, .null) {
-                continue
-            }
+        if case .null = value, let fieldTy = table.fields[key], case let .optional(inner) = fieldTy,
+           !validateValue(inner, .null) {
+            continue
         }
         out[key] = value
     }
@@ -695,11 +694,9 @@ func applyPatch(
         guard let fieldTy = table.fields[field] else {
             throw RtDbError(code: .schemaViolation, message: "unknown field '\(field)'")
         }
-        if case .null = value, case let .optional(inner) = fieldTy {
-            if !validateValue(inner, .null) {
-                merged.removeValue(forKey: field)
-                continue
-            }
+        if case .null = value, case let .optional(inner) = fieldTy, !validateValue(inner, .null) {
+            merged.removeValue(forKey: field)
+            continue
         }
         if !validateValue(fieldTy, value) {
             throw RtDbError(
@@ -879,10 +876,8 @@ public final class InMemoryRtDbClient: MigrationStore {
                   let store = tables[name] else { continue }
             var maxStored: Int64 = 0
             for row in store.rows.values {
-                if case let .string(text)? = row.doc[field] {
-                    if let value = Int64(text), value > maxStored {
-                        maxStored = value
-                    }
+                if case let .string(text)? = row.doc[field], let value = Int64(text), value > maxStored {
+                    maxStored = value
                 }
             }
             store.autoIncrementNext = max(store.autoIncrementNext, maxStored + 1)
@@ -949,10 +944,8 @@ public final class InMemoryRtDbClient: MigrationStore {
     public func mutate(
         _ txn: Transaction, idempotencyKey: String? = nil
     ) throws -> [StepResult] {
-        if let idempotencyKey {
-            if let cached = idempotency[idempotencyKey] {
-                return try cached.map(parseStepResult)
-            }
+        if let idempotencyKey, let cached = idempotency[idempotencyKey] {
+            return try cached.map(parseStepResult)
         }
         if readOnly {
             throw RtDbError(
@@ -1104,8 +1097,8 @@ public final class InMemoryRtDbClient: MigrationStore {
     /// strips the volatile `_version` first; pushed payloads still carry it.
     private func notifySubs(_ writeSet: Set<String>) {
         for sub in subs {
-            guard writeSet.contains(sub.table), sub.onUpdate != nil else { continue }
-            guard let next = try? executeQuery(sub.query, requireTable(sub.table), rowsFor)
+            guard writeSet.contains(sub.table), sub.onUpdate != nil,
+                  let next = try? executeQuery(sub.query, requireTable(sub.table), rowsFor)
             else { continue }
             if sub.hasValue, let last = sub.last, diffCanonical(sub.query, next) == diffCanonical(sub.query, last) {
                 continue

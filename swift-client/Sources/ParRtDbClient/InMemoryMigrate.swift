@@ -771,8 +771,7 @@ func coerceValue(_ cast: Cast, _ value: JSONValue) -> JSONValue? {
         case let .int(int):
             return .string(String(int))
         case let .double(double):
-            guard double == double.rounded(), double.isFinite else { return nil }
-            guard let int = Int64(exactly: double) else { return nil }
+            guard double == double.rounded(), double.isFinite, let int = Int64(exactly: double) else { return nil }
             return .string(String(int))
         default: return nil
         }
@@ -923,11 +922,9 @@ private func applyRenameFieldDirective(
     // QA-002: `defaults` is keyed by field name the same way `computed` is —
     // the entry moves to the new key. Missed here previously (the comment
     // above referenced this move, but the code never did it).
-    if var defaults = planned.tables[table]?.defaults {
-        if let keyed = defaults.removeValue(forKey: from) {
-            defaults[to] = keyed
-            planned.tables[table]?.defaults = defaults
-        }
+    if var defaults = planned.tables[table]?.defaults, let keyed = defaults.removeValue(forKey: from) {
+        defaults[to] = keyed
+        planned.tables[table]?.defaults = defaults
     }
     var affected: Int64 = 0
     for row in store.rowsFor(table).values {

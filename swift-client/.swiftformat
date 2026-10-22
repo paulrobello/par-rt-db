@@ -1,3 +1,8 @@
 --swiftversion 6.0
 --indent 4
 --disable trailingCommas
+
+# wrapMultilineStatementBraces (new in swiftformat 0.64.x) puts a wrapped statement's opening
+# brace on its own line, which swiftlint --strict's opening_brace rule then rejects; the tree
+# and the rest of the gate use K&R braces, so the rule stays off.
+--disable wrapMultilineStatementBraces
