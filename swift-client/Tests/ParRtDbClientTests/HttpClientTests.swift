@@ -591,6 +591,42 @@ struct HttpClientTests {
         #expect(user.kind == .machine)
     }
 
+    /// The redemption route is public and lives on the data-plane client —
+    /// constructible with no admin key (F3): no Authorization header is sent
+    /// (the grant is the credential), and the body carries ONLY the grant
+    /// (the server denies unknown fields).
+    @Test func enrollSendsGrantOnlyWithoutBearer() async throws {
+        StubProtocol.handler = { request in
+            try demand(request.httpMethod == "POST", "expected POST")
+            try demand(request.url?.path == "/auth/enroll", "expected /auth/enroll")
+            try demand(
+                request.value(forHTTPHeaderField: "Authorization") == nil,
+                "enroll must not send an Authorization header"
+            )
+            try demand(
+                request.value(forHTTPHeaderField: "X-Rtdb-Protocol")
+                    == String(WireProtocol.version),
+                "missing X-Rtdb-Protocol header"
+            )
+            let body = try jsonObjectBody(request)
+            try demand(
+                Set(body.keys) == ["grant"], "only the grant is sent: \(body.keys.sorted())"
+            )
+            try demand(body["grant"] as? String == "grt_secret", "grant mismatch: \(body)")
+            let enrolled = """
+            {"tokenId":"t1","token":"tok_abc","db":"app",
+             "capability":{"type":"parMeshV1","host":"macdaddy"}}
+            """
+            return (200, Data(enrolled.utf8))
+        }
+        // `RtDbHttpClient` takes no admin credential — only url/db/token.
+        let result = try await makeClient().enroll("grt_secret")
+        #expect(result.tokenId == "t1")
+        #expect(result.token == "tok_abc")
+        #expect(result.db == "app")
+        #expect(result.capability == .parMeshV1(host: "macdaddy"))
+    }
+
     @Test func pushSchemaPostsDbAndSchema() async throws {
         StubProtocol.handler = { request in
             try demand(request.httpMethod == "POST", "expected POST")

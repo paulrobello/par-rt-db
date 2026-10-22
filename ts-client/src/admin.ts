@@ -1,6 +1,6 @@
 import type { WebSocketLike } from "./client.js";
 import { RtDbError } from "./errors.js";
-import type { FileMetadata } from "./http.js";
+import { enrollRequest, type FileMetadata } from "./http.js";
 import { PROTOCOL_VERSION } from "./protocol.js";
 import type {
   MigrateRequestJson,
@@ -102,6 +102,17 @@ export interface DbStats {
   subsUsed: number;
 }
 /**
+ * A versioned, host-scoped capability attached to a machine token, tagged with
+ * a camelCase `"type"` — currently `{"type":"parMeshV1","host":"macdaddy"}`.
+ * `host` is lowercase `[a-z0-9][a-z0-9-_]{0,31}`. The server rejects unknown
+ * capability types and extra fields; pass the shape through verbatim.
+ */
+export interface HostCapability {
+  type: "parMeshV1";
+  host: string;
+}
+
+/**
  * Metadata representing information about an administrative token.
  */
 export interface TokenInfo {
@@ -125,6 +136,10 @@ export interface TokenInfo {
   expiresAt: number | null;
   readOnly: boolean;
   tables: string[] | null;
+  /** Host machine authorization: the token's capability, when it carries one.
+   *  The server omits the key entirely (`skip_serializing_if`) for legacy
+   *  tokens — absent, never `null`. */
+  hostCapability?: HostCapability;
 }
 /** One active interactive session from `GET /admin/sessions`. `tokenHash` is a
  *  non-reversible sha256 digest (the plaintext token is never stored), safe to
@@ -170,6 +185,38 @@ export interface MintTokenOptions {
   expiresAt?: number;
   readOnly?: boolean;
   tables?: string[];
+  /** Host machine authorization: attach a host capability to the minted
+   *  token. Absence mints legacy semantics unchanged. */
+  hostCapability?: HostCapability;
+}
+
+/** Request body for `createEnrollmentGrant` (POST /admin/enrollment-grants).
+ *  `db`, `name`, `capability`, and `expiresAt` are required; `tokenExpiresAt`
+ *  (ms epoch) is optional. */
+export interface CreateEnrollmentGrantOptions {
+  db: string;
+  name: string;
+  capability: HostCapability;
+  expiresAt: number;
+  tokenExpiresAt?: number;
+}
+
+/** Response from `createEnrollmentGrant`. `grant` is the one-time plaintext —
+ *  shown once, never persisted in plaintext server-side. */
+export interface EnrollmentGrant {
+  grantId: string;
+  grant: string;
+  db: string;
+  capability: HostCapability;
+  expiresAt: number;
+}
+
+/** Response from `enroll` (POST /auth/enroll) after redeeming a grant. */
+export interface EnrollResult {
+  tokenId: string;
+  token: string;
+  db: string;
+  capability: HostCapability;
 }
 /**
  * Percentile latency measurements for server operations.
@@ -743,6 +790,35 @@ export class RtDbAdminClient {
   /** Revokes a machine token by id, invalidating it immediately. */
   async revokeToken(tokenId: string): Promise<void> {
     await this.request("POST", "/admin/revoke-token", { tokenId });
+  }
+
+  /** Creates a one-time enrollment grant binding a host capability to `db`
+   *  (POST /admin/enrollment-grants). `expiresAt` is the grant's absolute
+   *  expiry (ms epoch); the optional `tokenExpiresAt` caps the minted token's
+   *  lifetime. The returned `grant` is the one-time plaintext — shown once,
+   *  never persisted in plaintext server-side. Only the provided keys are
+   *  sent; the server denies unknown fields. */
+  async createEnrollmentGrant(opts: CreateEnrollmentGrantOptions): Promise<EnrollmentGrant> {
+    const body = await this.request("POST", "/admin/enrollment-grants", pickDefined(opts));
+    return body as EnrollmentGrant;
+  }
+
+  /** Revokes a pending enrollment grant by id (POST /admin/revoke-enrollment-grant). */
+  async revokeEnrollmentGrant(grantId: string): Promise<void> {
+    await this.request("POST", "/admin/revoke-enrollment-grant", { grantId });
+  }
+
+  /** Redeems a one-time enrollment grant for a machine token
+   *  (POST /auth/enroll). Public and unauthenticated — the grant string itself
+   *  is the credential, so no Authorization header is ever attached. This is a
+   *  thin delegating compatibility alias for {@link RtDbHttpClient.enroll},
+   *  the primary placement (final-review F3): redemption is reachable from the
+   *  data-plane client, which needs no admin credential. The server accepts
+   *  ONLY `{grant}` (deny_unknown_fields), rejecting any attempt to override
+   *  the db or capability the grant fixes. An invalid/expired/revoked/used
+   *  grant surfaces as the standard `RtDbError` UNAUTHORIZED envelope. */
+  async enroll(grant: string): Promise<EnrollResult> {
+    return (await enrollRequest(this.fetchImpl, this.url, grant)) as EnrollResult;
   }
 
   /** Adds `email` to `db`'s OAuth sign-in allowlist. */

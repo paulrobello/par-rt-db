@@ -6,9 +6,11 @@
 
 pub mod apple;
 pub mod cookie;
+pub mod enrollment;
 pub mod github;
 pub mod gitlab;
 pub mod google;
+pub mod host_policy;
 pub mod jwks;
 pub mod microsoft;
 pub mod oidc;
@@ -17,6 +19,9 @@ pub mod session;
 pub mod tokens;
 
 use sqlx::PgPool;
+use sqlx::types::Json;
+
+use par_rt_db_core::host_capability::HostCapability;
 
 use crate::db::{new_id, now_ms, sha256_hex};
 use crate::error::RtDbError;
@@ -35,6 +40,10 @@ pub enum Principal {
         /// ENH-005: when `Some`, the token is scoped to exactly these tables;
         /// `None` means all tables. Captured once at resolution.
         tables: Option<Vec<String>>,
+        /// Host machine authorization: the token's optional host capability.
+        /// `None` means legacy semantics (no host restriction). Captured once
+        /// at resolution; enforcement is Task 2 (`host_policy`).
+        host_capability: Option<HostCapability>,
     },
     User {
         user_id: String,
@@ -143,6 +152,7 @@ pub async fn resolve_enqueuer(
                 user_id: Some(enqueuer.user_id.clone()),
                 email: None,
                 tables: None,
+                host_capability: None,
                 enqueuer: Some(enqueuer.clone()),
             });
         }
@@ -160,6 +170,7 @@ pub async fn resolve_enqueuer(
             user_id: Some(enqueuer.user_id.clone()),
             email: Some(email.clone()),
             tables: None,
+            host_capability: None,
             enqueuer: Some(enqueuer.clone()),
         })
     } else {
@@ -210,24 +221,35 @@ pub async fn db_email_allowlisted(pool: &PgPool, db: &str, email: &str) -> Resul
 pub async fn resolve_bearer(pool: &PgPool, token: &str) -> Result<Principal, RtDbError> {
     let hash = sha256_hex(token);
 
-    // `(id, db_name, read_only, tables, expires_at)`. `expires_at` is read
-    // here only so the row shape matches the SELECT — it is NOT threaded onto
-    // the Principal; `authorize` re-queries it live per-op.
-    type MachineRow = (String, String, bool, Option<Vec<String>>, Option<i64>);
+    // `(id, db_name, read_only, tables, capability, expires_at)`. `expires_at`
+    // is read here only so the row shape matches the SELECT — it is NOT
+    // threaded onto the Principal; `authorize` re-queries it live per-op.
+    // `capability` decodes through the strict `HostCapability` deserializer
+    // (the `Json` wrapper bridges JSONB ⇄ serde): a malformed stored value
+    // fails closed rather than resolving as legacy.
+    type MachineRow = (
+        String,
+        String,
+        bool,
+        Option<Vec<String>>,
+        Option<Json<HostCapability>>,
+        Option<i64>,
+    );
     let machine: Option<MachineRow> = sqlx::query_as(
-        "SELECT id, db_name, read_only, tables, expires_at \
+        "SELECT id, db_name, read_only, tables, capability, expires_at \
              FROM rtdb_auth.machine_tokens WHERE token_hash = $1 AND NOT revoked",
     )
     .bind(&hash)
     .fetch_optional(pool)
     .await?;
 
-    if let Some((token_id, db, read_only, tables, _expires_at)) = machine {
+    if let Some((token_id, db, read_only, tables, capability, _expires_at)) = machine {
         return Ok(Principal::Machine {
             db,
             token_id,
             read_only,
             tables,
+            host_capability: capability.map(|Json(cap)| cap),
         });
     }
 
@@ -375,6 +397,15 @@ pub struct PrincipalCtx {
     pub user_id: Option<String>,
     pub email: Option<String>,
     pub tables: Option<Vec<String>>,
+    /// Host machine authorization (host-machine-auth Task 1): the machine
+    /// token's capability, threaded so enforcement (Task 2) and forwarded
+    /// execution evaluate against the SAME restriction that authorized the
+    /// request at the edge. `None` for legacy/`User`/system contexts.
+    /// Absent fields decode as legacy. Restricted credentials require all
+    /// replicas upgraded before cutover: old owners ignore this restriction
+    /// (see `forward`'s rollout prerequisite).
+    #[serde(default)]
+    pub host_capability: Option<HostCapability>,
     /// SEC-001: the durable enqueuer identity carried on a fire context so a
     /// `Schedule`/`StartWorkflow` step inside a user's mutate enqueues the
     /// background row AS THAT USER. `None` for bypass/machine contexts (and
@@ -403,6 +434,7 @@ impl PrincipalCtx {
             user_id: None,
             email: None,
             tables: None,
+            host_capability: None,
             enqueuer: None,
         }
     }
@@ -419,12 +451,18 @@ impl Principal {
                 user_id: Some(user_id.clone()),
                 email: email.clone(),
                 tables: None,
+                host_capability: None,
                 enqueuer: self.enqueuer(),
             },
-            Principal::Machine { tables, .. } => PrincipalCtx {
+            Principal::Machine {
+                tables,
+                host_capability,
+                ..
+            } => PrincipalCtx {
                 user_id: None,
                 email: None,
                 tables: tables.clone(),
+                host_capability: host_capability.clone(),
                 enqueuer: None,
             },
         }
@@ -441,6 +479,7 @@ impl Principal {
 /// `Forbidden`. A pure read-only gate — writes nothing, leaves the single-writer
 /// invariant untouched.
 pub fn authorize_table(ctx: &PrincipalCtx, table: &str) -> Result<(), RtDbError> {
+    host_policy::document_table(ctx, table)?;
     if let Some(list) = &ctx.tables
         && !list.is_empty()
         && !list.iter().any(|t| t == table)
@@ -767,6 +806,7 @@ mod tests {
             token_id: "t".to_string(),
             read_only: false,
             tables: None,
+            host_capability: None,
         };
         let user = authed_user(&principal);
         assert_eq!(user.kind, UserKind::Machine);

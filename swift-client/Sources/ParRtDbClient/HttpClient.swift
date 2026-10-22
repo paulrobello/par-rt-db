@@ -446,6 +446,30 @@ public actor RtDbHttpClient {
         return response.user
     }
 
+    /// Redeems a one-time enrollment grant for a machine token
+    /// (`POST /auth/enroll` `{grant}` → `{tokenId, token, db, capability}`).
+    /// Public and unauthenticated: the request carries no Authorization
+    /// header — the grant string itself is the credential. The server accepts
+    /// ONLY `{grant}` (deny_unknown_fields), rejecting any attempt to
+    /// override the db or capability the grant fixes. An invalid, expired,
+    /// revoked, or already-used grant surfaces as the standard `RtDbError`
+    /// UNAUTHORIZED envelope. The returned `db`/`capability` are the ones the
+    /// grant fixed — pass them to a fresh `RtDbHttpClient` for the data
+    /// plane.
+    public func enroll(_ grant: String) async throws -> EnrollResult {
+        let data: Data
+        do {
+            data = try JSONEncoder().encode(EnrollRequest(grant: grant))
+        } catch {
+            throw RtDbError(code: .internal, message: "invalid enroll request body: \(error)")
+        }
+        let (status, body) = try await execute(
+            "enroll", method: "POST", path: "/auth/enroll", body: data,
+            contentType: "application/json", authenticated: false
+        )
+        return try decode(status, body, as: EnrollResult.self)
+    }
+
     /// Push a schema to this client's database (`POST /admin/push-schema`
     /// `{db, schema}` → `{ok: true}`) — the admin route with the same token.
     public func pushSchema(_ schema: SchemaDef) async throws {
@@ -681,7 +705,8 @@ extension RtDbHttpClient {
         body: Data? = nil,
         contentType: String? = nil,
         query: [URLQueryItem] = [],
-        overrideAuth: String? = nil
+        overrideAuth: String? = nil,
+        authenticated: Bool = true
     ) async throws -> (status: Int, data: Data) {
         var components = URLComponents(string: baseUrl + path)
         if !query.isEmpty {
@@ -692,7 +717,9 @@ extension RtDbHttpClient {
         }
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.setValue("Bearer \(overrideAuth ?? token)", forHTTPHeaderField: "Authorization")
+        if authenticated {
+            request.setValue("Bearer \(overrideAuth ?? token)", forHTTPHeaderField: "Authorization")
+        }
         // ARC-013: lets the server diagnose/reject a version mismatch instead
         // of a generic 400 from `deny_unknown_fields`.
         request.setValue(String(WireProtocol.version), forHTTPHeaderField: "X-Rtdb-Protocol")
@@ -770,6 +797,16 @@ private struct ClaimSchedulesRequest: Encodable {
     let db: String
     let limit: Int64?
     let leaseMs: Int64?
+}
+
+/// `POST /auth/enroll` request — the server accepts ONLY this field
+/// (`deny_unknown_fields`); the grant is the whole credential.
+private struct EnrollRequest: Encodable {
+    let grant: String
+
+    enum CodingKeys: String, CodingKey {
+        case grant
+    }
 }
 
 private struct FinalizeScheduleRequest: Encodable {

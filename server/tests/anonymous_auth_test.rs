@@ -360,6 +360,7 @@ async fn anonymous_owns_its_inserted_docs() -> anyhow::Result<()> {
         user_id: Some("someone-else".to_string()),
         email: None,
         tables: None,
+        host_capability: None,
         enqueuer: None,
     };
     match execute_query(

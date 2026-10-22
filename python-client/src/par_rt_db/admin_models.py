@@ -52,6 +52,48 @@ class MintedToken(_Wire):
     token: str
 
 
+class HostCapability(_Wire):
+    """A versioned, host-scoped capability carried on a machine token —
+    serialized with a camelCase ``"type"`` tag, e.g.
+    ``{"type":"parMeshV1","host":"macdaddy"}`` (the shared vocabulary of
+    ``core/src/host_capability.rs``).
+
+    Strict on parse, mirroring the server's hand-written serde
+    ``Deserialize``: an unknown tag, an unknown property, a missing ``host``,
+    or a malformed ``host`` is rejected rather than silently dropped — the
+    client never normalizes a host name. The ``type`` tag is required, exactly
+    as the server requires it on the wire.
+    """
+
+    type: Literal["parMeshV1"]
+    host: str = Field(pattern=r"^[a-z0-9][a-z0-9-_]{0,31}$")
+
+
+class EnrollmentGrant(_Wire):
+    """``POST /admin/enrollment-grants`` response. ``grant`` is the one-time
+    plaintext secret — shown exactly once, never stored in plaintext
+    server-side (only its sha256 digest is persisted). ``expiresAt`` is
+    epoch-millis and at most 15 minutes out."""
+
+    grant_id: str
+    grant: str
+    db: str
+    capability: HostCapability
+    expires_at: int
+
+
+class EnrollResult(_Wire):
+    """``POST /auth/enroll`` response — the machine credential minted by
+    redeeming an enrollment grant, plus the grant's fixed scope (``db`` and
+    ``capability`` are whatever the admin fixed at grant creation; the
+    request carries only the grant secret)."""
+
+    token_id: str
+    token: str
+    db: str
+    capability: HostCapability
+
+
 class AdminMember(_Wire):
     """``GET /admin/admins`` row — ``{email, githubId?}``."""
 
@@ -61,13 +103,16 @@ class AdminMember(_Wire):
 
 class TokenInfo(_Wire):
     """``GET /admin/tokens`` row — ``{id, name, createdAt, revoked, expiresAt,
-    readOnly, tables}``.
+    readOnly, tables, hostCapability?}``.
 
     The last three fields default so an older server that omits them still
     deserializes (matches the server's ``#[serde(default)]`` on
     ``TokenRow``); a current server always sends them. ``expiresAt``/``tables``
     are ``None`` for a full-access token; ``readOnly`` is ``False`` for a
-    read-write token.
+    read-write token. ``hostCapability`` mirrors the server's
+    ``skip_serializing_if``: ABSENT (never ``null``) on rows minted without a
+    capability, so it defaults to ``None`` and a legacy caller dumping the
+    row with ``exclude_none`` never sees the new key.
     """
 
     id: str
@@ -77,6 +122,7 @@ class TokenInfo(_Wire):
     expires_at: int | None = None
     read_only: bool = False
     tables: list[str] | None = None
+    host_capability: HostCapability | None = None
 
 
 class SessionInfo(_Wire):

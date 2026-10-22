@@ -145,6 +145,68 @@ fn insert_work_item(status: &str, order: f64) -> Transaction {
 }
 
 #[tokio::test]
+async fn mutation_cache_growth_does_not_consume_storage_quota() -> anyhow::Result<()> {
+    let state = crate::common::test_state().await;
+    let db = crate::common::fresh_db(&state).await;
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 1.0),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    let before = rtdb_server::quota::UsageCache::measure(&state.pool, &db).await?;
+    let cap = before + 65536;
+    state.runtime.hot.store(Arc::new(HotConfig {
+        max_storage_bytes_per_db: cap,
+        ..crate::common::test_hot()
+    }));
+    // Large, low-compressibility cached results exceed the available headroom.
+    for i in 0..128 {
+        let payload = (0..32)
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect::<String>();
+        rtdb_server::mutation_log::store(
+            &state.pool,
+            &db,
+            &format!("cache-{i}"),
+            &[serde_json::json!(payload)],
+            300000,
+        )
+        .await?;
+    }
+    let after = rtdb_server::quota::UsageCache::measure(&state.pool, &db).await?;
+    let cache_bytes: i64 = sqlx::query_scalar("SELECT pg_total_relation_size($1::regclass)")
+        .bind(format!("\"db_{db}\".mutation_cache_v2"))
+        .fetch_one(&state.pool)
+        .await?;
+    assert!(
+        cache_bytes as u64 > cap - before,
+        "cache must exceed quota headroom"
+    );
+    // Other background bookkeeping can allocate a page during the fill.
+    assert!(
+        after < cap,
+        "replay cache must not consume quota headroom: {before} -> {after}, cap {cap}"
+    );
+    state.limits.quotas.evict(&db);
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            Some("legacy-write-after-cache".into()),
+            insert_work_item("backlog", 2.0),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn mutate_over_storage_cap_is_rejected() -> anyhow::Result<()> {
     let state = crate::common::test_state().await;
     let db = crate::common::fresh_db(&state).await;

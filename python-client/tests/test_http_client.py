@@ -28,7 +28,13 @@ from par_rt_db import (
     TableQuery,
     t,
 )
-from par_rt_db.http_client import FileMetadata, MintedToken, UploadResult
+from par_rt_db.http_client import (
+    EnrollResult,
+    FileMetadata,
+    HostCapability,
+    MintedToken,
+    UploadResult,
+)
 from par_rt_db.schema import Schema
 
 BEARER = "Bearer machine-token"
@@ -1674,6 +1680,38 @@ def test_auth_validate_invalid_token_surfaces_the_envelope() -> None:
     with pytest.raises(RtDbError) as exc:
         _client(handler).auth_validate("stale")
     assert exc.value.code is ErrorCode.UNAUTHORIZED
+
+
+# --- auth: enrollment (POST /auth/enroll) -----------------------------------
+
+
+def test_enroll_posts_only_the_grant_and_parses_response() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "tokenId": "tid",
+                "token": "minted-secret",
+                "db": "app",
+                "capability": {"type": "parMeshV1", "host": "macdaddy"},
+            },
+        )
+
+    result = _client(handler).enroll("one-time-secret")
+    assert isinstance(result, EnrollResult)
+    assert seen["method"] == "POST"
+    assert seen["path"] == "/auth/enroll"
+    # The strict server DTO accepts ONLY the grant — no db/host override.
+    assert seen["body"] == {"grant": "one-time-secret"}
+    assert result.token_id == "tid"
+    assert result.token == "minted-secret"
+    assert result.db == "app"
+    assert result.capability == HostCapability(type="parMeshV1", host="macdaddy")
 
 
 # --- data plane: workflows (FM-29) ------------------------------------------

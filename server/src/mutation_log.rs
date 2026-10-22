@@ -4,6 +4,13 @@
 //! `run_cleanup` is the per-db background task that trims old rows; like the
 //! scheduler and reaper it self-terminates when its database is deleted, and it
 //! writes only this side table — never document tables.
+//!
+//! `mutation_cache_v2` starts a new transient-cache generation for structured
+//! authorization identities. Never import old `mutations` raw keys: arbitrary
+//! old keys could equal new encoded tuples. Deploy all replicas together and
+//! quiesce retries across upgrade, or accept possible retry double-application
+//! during the configured TTL window (five minutes by default). Old cache rows
+//! are not read by this generation; the legacy table is left untouched.
 
 use serde_json::Value;
 use sqlx::{AssertSqlSafe, PgPool};
@@ -25,7 +32,7 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
     sqlx::query(AssertSqlSafe(format!(
-        "CREATE TABLE IF NOT EXISTS \"{schema}\".mutations (
+        "CREATE TABLE IF NOT EXISTS \"{schema}\".mutation_cache_v2 (
             mut_id text PRIMARY KEY,
             result jsonb NOT NULL,
             expires_at bigint NOT NULL
@@ -57,7 +64,7 @@ pub async fn check(pool: &PgPool, db: &str, mut_id: &str) -> Result<Option<Vec<V
     let schema = pg_schema(db);
 
     let row: Option<(Value,)> = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT result FROM \"{schema}\".mutations WHERE mut_id = $1 AND expires_at > $2"
+        "SELECT result FROM \"{schema}\".mutation_cache_v2 WHERE mut_id = $1 AND expires_at > $2"
     )))
     .bind(mut_id)
     .bind(now_ms())
@@ -87,7 +94,7 @@ pub async fn cleanup_expired(pool: &PgPool, db: &str) -> Result<u64, RtDbError> 
     let schema = pg_schema(db);
     let now = now_ms();
     let res = sqlx::query(AssertSqlSafe(format!(
-        "DELETE FROM \"{schema}\".mutations WHERE expires_at < $1"
+        "DELETE FROM \"{schema}\".mutation_cache_v2 WHERE expires_at < $1"
     )))
     .bind(now)
     .execute(pool)
@@ -207,7 +214,7 @@ pub async fn store_on(
     // An expired row is semantically absent to `check`; clear it so the insert
     // below is not blocked by a stale key. Same transaction — atomic.
     sqlx::query(AssertSqlSafe(format!(
-        "DELETE FROM \"{schema}\".mutations WHERE mut_id = $1 AND expires_at <= $2"
+        "DELETE FROM \"{schema}\".mutation_cache_v2 WHERE mut_id = $1 AND expires_at <= $2"
     )))
     .bind(mut_id)
     .bind(now)
@@ -215,7 +222,7 @@ pub async fn store_on(
     .await?;
 
     let row: Option<(String,)> = sqlx::query_as(AssertSqlSafe(format!(
-        "INSERT INTO \"{schema}\".mutations (mut_id, result, expires_at) VALUES ($1, $2, $3)
+        "INSERT INTO \"{schema}\".mutation_cache_v2 (mut_id, result, expires_at) VALUES ($1, $2, $3)
          ON CONFLICT (mut_id) DO NOTHING
          RETURNING mut_id"
     )))
@@ -247,7 +254,7 @@ pub async fn store(
     })?;
 
     sqlx::query(AssertSqlSafe(format!(
-        "INSERT INTO \"{schema}\".mutations (mut_id, result, expires_at) VALUES ($1, $2, $3)
+        "INSERT INTO \"{schema}\".mutation_cache_v2 (mut_id, result, expires_at) VALUES ($1, $2, $3)
          ON CONFLICT (mut_id) DO NOTHING"
     )))
     .bind(mut_id)

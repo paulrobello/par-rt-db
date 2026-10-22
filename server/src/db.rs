@@ -48,7 +48,7 @@ const BOOTSTRAP_LOCK_KEY: i64 = 727_001;
 /// DDL (and its locks) only ever runs on a genuinely stale or fresh cluster.
 /// Bump the version when changing the DDL of its bootstrap fn, or the new
 /// statements will be skipped on already-bootstrapped clusters.
-const RTDB_AUTH_BOOTSTRAP_VERSION: &str = "1";
+const RTDB_AUTH_BOOTSTRAP_VERSION: &str = "3";
 const AUDIT_LOG_BOOTSTRAP_VERSION: &str = "1";
 const WEBHOOKS_BOOTSTRAP_VERSION: &str = "1";
 
@@ -405,6 +405,52 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
         .execute(&mut *conn)
         .await?;
 
+    // Host machine authorization (Task 1): the token's optional host
+    // capability as JSONB. NULL means legacy full-access semantics — every
+    // pre-existing row reads back exactly as before, and legacy mint callers
+    // store NULL. JSONB (not TEXT) so the stored capability stays queryable;
+    // it is written only from a validated `HostCapability` and parsed back
+    // with the same strict deserializer.
+    sqlx::query(
+        "ALTER TABLE rtdb_auth.machine_tokens ADD COLUMN IF NOT EXISTS capability JSONB NULL",
+    )
+    .execute(&mut *conn)
+    .await?;
+
+    // Enrollment grants (host-machine-auth Task 1): single-use, short-TTL
+    // grants whose `token_hash` is the sha256 digest of the one-time grant
+    // secret (the plaintext is returned once at creation and never stored).
+    // Redemption claims the row with a conditional UPDATE inside the same
+    // transaction that inserts the machine token, so concurrent redemptions
+    // yield exactly one success.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS rtdb_auth.enrollment_grants (
+            id text PRIMARY KEY,
+            db_name text NOT NULL,
+            name text NOT NULL,
+            token_hash text UNIQUE NOT NULL,
+            capability jsonb NOT NULL,
+            expires_at bigint NOT NULL,
+            token_expires_at bigint,
+            redeemed_at bigint,
+            revoked boolean NOT NULL DEFAULT false,
+            created_at bigint NOT NULL
+        )",
+    )
+    .execute(&mut *conn)
+    .await?;
+
+    // Old grants are digest-only and carry no useful authority without their
+    // parent database. Remove orphans before validating the lifecycle FK.
+    sqlx::query("DELETE FROM rtdb_auth.enrollment_grants g WHERE NOT EXISTS (SELECT 1 FROM rtdb_auth.databases d WHERE d.name = g.db_name)")
+        .execute(&mut *conn).await?;
+    sqlx::query("DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'rtdb_auth.enrollment_grants'::regclass AND conname = 'enrollment_grants_database_fk') THEN
+            ALTER TABLE rtdb_auth.enrollment_grants ADD CONSTRAINT enrollment_grants_database_fk FOREIGN KEY (db_name) REFERENCES rtdb_auth.databases(name) ON DELETE CASCADE;
+        END IF;
+    END $$")
+        .execute(&mut *conn).await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS rtdb_auth.admins (
             email text PRIMARY KEY,
@@ -673,7 +719,7 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
     .await?;
 
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE TABLE \"{schema_name}\".mutations (
+        "CREATE TABLE \"{schema_name}\".mutation_cache_v2 (
             mut_id text PRIMARY KEY,
             result jsonb NOT NULL,
             expires_at bigint NOT NULL
@@ -803,7 +849,7 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
 
 /// Drops a tenant database: validates `name`, requires it exists, then in one
 /// transaction `DROP SCHEMA ... CASCADE`s the per-db Postgres schema (removing
-/// `meta`, `mutations`, `scheduled_txns`, `storage`, and every document table
+/// `meta`, `mutation_cache_v2`, legacy `mutations`, `scheduled_txns`, `storage`, and every document table
 /// `push_schema` created) and deletes its row in `rtdb_auth.databases` plus
 /// its per-db rows in `rtdb_auth.machine_tokens`, `rtdb_auth.allowlist`, and
 /// `rtdb.storage_index`. `IF EXISTS` on the schema drop keeps a partially-
@@ -817,7 +863,7 @@ pub async fn drop_database(pool: &PgPool, name: &str) -> Result<(), RtDbError> {
     let mut tx = pool.begin().await?;
 
     let existing: Option<(String,)> =
-        sqlx::query_as("SELECT name FROM rtdb_auth.databases WHERE name = $1")
+        sqlx::query_as("SELECT name FROM rtdb_auth.databases WHERE name = $1 FOR UPDATE")
             .bind(name)
             .fetch_optional(&mut *tx)
             .await?;
@@ -826,7 +872,7 @@ pub async fn drop_database(pool: &PgPool, name: &str) -> Result<(), RtDbError> {
     }
 
     let schema_name = pg_schema(name);
-    // CASCADE drops the schema's tables (`meta`, `mutations`, `scheduled_txns`,
+    // CASCADE drops the schema's tables (`meta`, `mutation_cache_v2`, legacy `mutations`, `scheduled_txns`,
     // `storage`, plus any document tables `push_schema` created) and any indexes
     // or views depending on them, in one statement. The schema identifier is
     // double-quoted because `pg_schema` produces a validated physical name that

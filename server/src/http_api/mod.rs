@@ -105,7 +105,7 @@ where
 
 /// HTTP one-shot routes, authorized via `Authorization: Bearer <token>`
 /// (machine token or user session) resolved and checked per-request.
-pub fn http_api_routes() -> Router<Arc<AppState>> {
+pub fn http_api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/query", post(query_handler))
         .route("/api/query-batch", post(batch_query_handler))
@@ -155,6 +155,40 @@ pub fn http_api_routes() -> Router<Arc<AppState>> {
         // server, by design. The opaque id resolves to its owning db via the
         // global index.
         .route("/storage/{id}", get(serve_public_handler))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state,
+            host_surface_guard,
+        ))
+}
+
+async fn host_surface_guard(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, RtDbError> {
+    if request.uri().path().starts_with("/storage/") {
+        // Public URLs are credential-independent. Only an explicit, resolvable
+        // restricted bearer narrows access; ambient cookies never authenticate here.
+        if let Some(token) = request
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            && let Ok(principal) = resolve_bearer(&state.pool, token).await
+        {
+            crate::auth::host_policy::non_document(&principal.row_ctx())?;
+        }
+        return Ok(next.run(request).await);
+    }
+    if !matches!(
+        request.uri().path(),
+        "/api/query" | "/api/query-batch" | "/api/mutate" | "/api/mutate-batch"
+    ) && let Ok(token) = bearer_token(request.headers())
+    {
+        let principal = resolve_bearer(&state.pool, token).await?;
+        crate::auth::host_policy::non_document(&principal.row_ctx())?;
+    }
+    Ok(next.run(request).await)
 }
 
 async fn db_schema_handler(

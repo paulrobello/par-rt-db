@@ -26,6 +26,9 @@ pub(in crate::committer) async fn handle_subscribe(
         RtDbError::internal("failed to serialize initial query result")
     })?;
 
+    ctx.subs
+        .authorize_host_push(&ctx.pool, &ctx.db, conn, &principal_ctx)
+        .await?;
     if tx
         .send(ServerMessage::QueryUpdate {
             query_id: query_id.clone(),

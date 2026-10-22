@@ -622,6 +622,7 @@ async fn spec_bounds_and_allowlist_rejected() -> anyhow::Result<()> {
         user_id: None,
         email: None,
         tables: Some(vec!["projects".to_string()]),
+        host_capability: None,
         enqueuer: None,
     };
 

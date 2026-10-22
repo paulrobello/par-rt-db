@@ -97,6 +97,7 @@ pub fn compile_query(
     authorize_table(ctx, &q.table)?;
     let owner = ctx.user_id.as_deref();
     let table_def = schema.table(&q.table)?;
+    crate::auth::host_policy::schema_contract(ctx, &q.table, table_def)?;
     // Projection validation runs before every early return so all terminals
     // (including `get`) reject unknown field names at compile time — the same
     // shapes fail for the same reasons on the /explain path.
@@ -384,6 +385,11 @@ pub(crate) fn compile_query_window<'a>(
     // not shift `filter_start`-based placeholder numbering.
     if table_def.soft_delete && !include_deleted {
         where_conditions.push("\"deleted_at\" IS NULL".to_string());
+    }
+    if let Some(fragment) =
+        crate::auth::host_policy::sql_visibility(&q.table, ctx, filter_start, &mut filter_binds)?
+    {
+        where_conditions.push(fragment);
     }
     let limit_placeholder = filter_start + filter_binds.len();
 
@@ -1519,12 +1525,17 @@ fn compile_point_read(sctx: &CompileSearchCtx<'_>, id: &str) -> Result<CompiledQ
     } else {
         ""
     };
+    let mut binds = vec![EqBind::Text(id.to_string())];
+    let host_filter =
+        crate::auth::host_policy::sql_visibility(table_name, sctx.ctx, 1, &mut binds)?
+            .map(|fragment| format!(" AND {fragment}"))
+            .unwrap_or_default();
     let sql = format!(
-        "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1{soft_filter}"
+        "SELECT \"id\", \"doc\", \"created_at\", \"version\" FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1{soft_filter}{host_filter}"
     );
     Ok(CompiledQuery {
         sql,
-        binds: vec![EqBind::Text(id.to_string())],
+        binds,
         terminal: "get",
     })
 }

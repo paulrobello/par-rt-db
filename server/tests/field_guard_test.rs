@@ -143,6 +143,7 @@ fn user(id: &str) -> PrincipalCtx {
         user_id: Some(id.into()),
         email: None,
         tables: None,
+        host_capability: None,
         enqueuer: None,
     }
 }

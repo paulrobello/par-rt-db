@@ -43,6 +43,12 @@
 //! Rate limits stay checked at the origin (the client-facing edge); the
 //! owner's committer enforces quotas inside its turn as always.
 //!
+//! Host-capability rollout requires ALL replicas (including every possible
+//! lease owner) to run host-policy enforcement BEFORE minting or accepting
+//! restricted credentials. Older owners ignore unknown PrincipalCtx fields and
+//! would execute as legacy bypass. There is deliberately no version negotiation.
+//! Updated owners deserialize `host_capability` and enforce it in execute_txn.
+//!
 //! ## Gating
 //!
 //! The listener task is spawned only under `RTDB_MULTI_INSTANCE`, and the
@@ -857,6 +863,7 @@ mod tests {
                     user_id: Some("u1".into()),
                     email: Some("u1@example.com".into()),
                     tables: None,
+                    host_capability: None,
                     enqueuer: None,
                 },
             },

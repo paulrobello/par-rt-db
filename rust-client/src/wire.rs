@@ -646,6 +646,19 @@ pub struct BatchMutateRequest<'a> {
 /// can drift from the other because there is only one definition.
 pub use par_rt_db_core::wire::FilterExpr;
 
+/// A versioned host capability carried on a machine token. Defined once in
+/// `par-rt-db-core` (`host_capability`) and re-exported here for the same
+/// single-definition reason as [`FilterExpr`]: the server validates it, the
+/// Rust client carries it, and neither can drift from the other.
+pub use par_rt_db_core::host_capability::HostCapability;
+
+/// HTTP request/response bodies for the public enrollment surface
+/// (`POST /auth/enroll`) — the redemption side of host machine
+/// authorization. Admin-side grant shapes live in [`admin`]; these are
+/// unconditional because redemption needs no admin key. Mirrors server
+/// `auth::enrollment` field-for-field (camelCase).
+pub mod enrollment;
+
 /// One slot of a `POST /api/query-batch` response. Mirrors server
 /// `http_api::BatchQueryOutcome` byte-for-byte (camelCase, omit-when-None). The
 /// `result` field is the raw untagged `QueryResult` value (the server serializes

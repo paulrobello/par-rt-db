@@ -101,7 +101,12 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 }
 
 // doWithAuth is do() with a caller-supplied bearer — for AuthValidate, whose
-// bearer is the token being validated rather than the client's own.
+// bearer is the token being validated rather than the client's own. The
+// header is ALWAYS set exactly as the caller asked; this seam never drops
+// or substitutes a credential (dropping it would let the server fall back
+// to the ambient rtdb_session cookie — audit F7). Empty tokens are the
+// caller's to reject locally (see AuthValidate): there is no honest wire
+// form for an empty bearer over Go's OWS-trimming HTTP layer.
 func (c *Client) doWithAuth(ctx context.Context, method, path string, body, out any, token string) error {
 	var rdr io.Reader
 	if body != nil {

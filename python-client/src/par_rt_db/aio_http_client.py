@@ -80,6 +80,7 @@ from .http_client import (
     AdminMember,
     ConfigResponse,
     DbStats,
+    EnrollResult,
     FileMetadata,
     HotConfigPatch,
     MetricsSnapshot,
@@ -535,6 +536,19 @@ class RtDbAsyncHttpClient:
             "GET", "/auth/validate", headers={"Authorization": f"Bearer {token}"}
         )
         return AuthedUser.model_validate(resp.json()["user"])
+
+    async def enroll(self, grant: str) -> EnrollResult:
+        """``POST /auth/enroll`` ``{grant}`` → :class:`EnrollResult` (async).
+
+        Redeems a one-time enrollment grant (host-machine-auth): the ONLY body
+        field is ``grant`` — the server's strict DTO rejects any db/host/capability
+        override, so the returned ``db``/``capability`` are exactly what the
+        admin fixed at grant creation. The route is public and unauthenticated;
+        invalid/expired/revoked/used grants surface as the generic 401
+        :class:`RtDbError` envelope.
+        """
+        resp = await self._send("POST", "/auth/enroll", json={"grant": grant})
+        return EnrollResult.model_validate(resp.json())
 
     # --- storage (machine token; HTTP-only, bypasses the committer) ---
 

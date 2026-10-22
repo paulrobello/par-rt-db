@@ -79,6 +79,22 @@ so a deliberate semantic flip turns exactly the cases that pinned the old
 behavior red until the fixture is updated. Never delete a case to make a runner
 green; either the client is wrong or the fixture is stale.
 
+**Documented decision — host machine authorization (2026-10-22).** The host
+machine authorization surface (commits `809edd2`…`c277fd3` on the
+`worktree-host-machine-auth` branch: optional `hostCapability` on
+`POST /admin/mint-token`, admin `POST /admin/enrollment-grants` /
+`POST /admin/revoke-enrollment-grant`, and public `POST /auth/enroll`) is
+HTTP-only admin/auth vocabulary with **no DSL or WS wire-frame change**, so it
+ships **without** an executable corpus case: the same-behavior-in-same-change
+rule is met by the server transport/integration tests
+(`server/tests/host_auth_test.rs`) plus per-client admin-surface tests (e.g.
+`ts-client/tests/host-capability.test.ts`) in each mirror commit instead.
+Because no query result, step result, error code, or document visibility in
+the DSL corpus vocabulary changes — restricted visibility rides the server's
+existing wire vocabulary — there is no corpus fixture to flip. Should a future
+capability version add public wire vocabulary, this decision is revisited per
+the authoring rule above.
+
 ## Every wire section must be consumed
 
 Every top-level section in `wire-corpus.json` must be consumed by all six

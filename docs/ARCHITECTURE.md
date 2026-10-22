@@ -358,7 +358,7 @@ graph LR
         WFS["workflows — durable runs (snapshotted spec + step outcomes)"]
         STOR["storage — blob rows (sha256/size/content_type,<br />inline bytes for legacy blobs)"]
         CHUNK["storage_chunks — 1 MiB bytea chunks (streamed uploads, ENH-021)"]
-        MUT["mutations — idempotency-key replay log"]
+        MUT["mutation_cache_v2 — transient idempotency replay cache"]
         HIST["schema_history — captured schema versions (push/migrate/restore)"]
         CHG["changes — durable change-feed rows (per written (table,id))"]
         CHGH["change_head — per-db seq counter (transactional with the append)"]
@@ -843,6 +843,56 @@ stale-auth window). The admin dashboard mirrors this at `/sessions`;
 `list_sessions`/`revoke_session`/`revoke_user_sessions`/`revoke_expired_sessions`
 mirror into all client SDKs and the `rtdb sessions list|revoke` CLI.
 
+### Host machine authorization
+
+An optional, versioned **host capability** rides on a machine-token row as
+nullable JSON (`rtdb_auth.machine_tokens.capability`; NULL preserves the exact
+legacy authority — no behavior change for existing credentials). Its shape is
+`{"type":"parMeshV1","host":"<host>"}` (`core/src/host_capability.rs`),
+deserialized by hand so an unknown type tag, an unknown property, or a
+malformed host fails closed. The host follows par-mesh's component grammar
+`^[a-z0-9][a-z0-9-_]{0,31}$`. The capability is carried from bearer resolution
+into `Principal::Machine`, `PrincipalCtx`, forwarded transactions, and stored
+subscription contexts; a restricted token cannot become an admin, and
+`readOnly`/`tables` scoping composes without broadening it.
+
+`auth/host_policy.rs` is the single, pure policy module — given a
+`PrincipalCtx`, a table, and document values it decides visibility and
+mutation rights, with no I/O of its own. Read visibility is compiled into SQL
+(`host_policy::sql_visibility` returns a WHERE fragment for `messages`
+describing well-formed routing plus recipient/sender-host visibility; the
+`agents` directory is visible to every scoped host) **before** limits,
+aggregation, distinct, search, and ranking — the server never fetches
+unscoped rows and filters results afterward. Point reads and transaction
+preconditions (`expectFields`/`expectVersion`/`expectAbsent`) run the
+equivalent check, so an invisible row is indistinguishable from absent.
+Write rules run **inside the serialized transaction** against the actual
+current row and the candidate resulting row (`host_policy::insert`/`patch`),
+so a denial rolls back all earlier steps. A `parMeshV1` token reaches only the
+`agents`/`messages` contract (missing or incompatible schema fields fail
+closed); every non-document surface — schedules, workflows (nested and
+standalone), presence, storage, change feeds — is denied at the surface gate.
+
+Live revocation reuses the existing machine-token revocation/expiry gate on
+every REST and WS operation; for subscriptions, a restricted credential's
+liveness is re-checked on the push path (`subs.rs`'s `host_may_push` /
+`authorize_host_push`), so a revoked or expired token stops receiving data
+pushes, not just new-request acceptance. Under `RTDB_MULTI_INSTANCE`,
+forwarded writes carry the capability and the lease owner enforces the same
+policy in `execute_txn` — which is why **all replicas must run this version
+before restricted credentials are issued**: an older owner would deserialize
+and ignore the unknown field, executing forwarded writes unrestricted (see
+"Forwarding a write to the owner" and `deploy/README.md`).
+
+The mutation replay cache is now **generation v2** (`mutation_cache_v2`):
+identities encode the structured authorization identity
+(`[host_capability, tables, key]`) rather than the legacy raw `mut_id` string,
+so a credential's restriction set is part of the idempotency identity. Old
+cache rows are never read by this generation; upgrade all replicas in one
+window and quiesce client retries across it, or accept possible one-time
+double-application of in-flight legacy retries within the configured TTL
+(default five minutes).
+
 ## File storage
 
 HTTP-only and bypasses the committer (`storage.rs`, `http_api.rs`): per-db
@@ -895,7 +945,7 @@ a shared instance.
 - **Storage**: a per-db usage cache (`quota::UsageCache`,
   `Arc<RwLock<HashMap>>` on `AppState` + cloned into `CommitterCtx`) measured
   by a `SUM(pg_total_relation_size)` query (heap + indexes + TOAST + the
-  `storage` blob table; framework side-tables `meta`/`mutations`/
+  `storage` blob table; framework side-tables `meta`/`mutation_cache_v2`/legacy `mutations`/
   `scheduled_txns`/`schema_history` excluded; `RTDB_QUOTA_CACHE_TTL_SECS`
   default 60 doubles as the warmer interval). Enforced at
   `handle_mutate`/`handle_scheduled`/`handle_migrate`/`handle_workflow_advance`

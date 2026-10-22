@@ -336,6 +336,11 @@ pub fn admin_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/admin/dbs", get(list_dbs))
         .route("/admin/mint-token", post(mint_token))
         .route("/admin/revoke-token", post(revoke_token))
+        .route("/admin/enrollment-grants", post(create_enrollment_grant))
+        .route(
+            "/admin/revoke-enrollment-grant",
+            post(revoke_enrollment_grant),
+        )
         .route(
             "/admin/allowlist",
             get(allowlist_list).post(allowlist_write),

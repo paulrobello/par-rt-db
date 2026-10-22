@@ -62,8 +62,10 @@ pub(crate) async fn step_insert(
     let doc = stamp_authorize(table_def, doc, sctx.ctx);
     let doc = stamp_auto_increment(sctx.tx, sctx.pg_schema_name, table_def, table, doc).await?;
     verify_authorize_doc(table_def, &doc, sctx.ctx)?;
+    crate::auth::host_policy::insert(sctx.ctx, table, &doc)?;
     let (id, stored, created_at) =
         do_insert(sctx.tx, sctx.pg_schema_name, table_def, table, &doc).await?;
+    crate::auth::host_policy::insert(sctx.ctx, table, &stored)?;
     sctx.write_set.touch(table, &id, OpKind::Insert);
     // Created in this txn: before = None (created), after = stored doc.
     sctx.write_set.capture_doc(
@@ -91,6 +93,13 @@ pub(crate) async fn step_patch(
     let (pre_doc, merged, created_at) =
         do_patch(sctx.tx, sctx.pg_schema_name, table_def, table, id, &fields).await?;
     verify_authorize_doc(table_def, &merged, sctx.ctx)?;
+    crate::auth::host_policy::patch(
+        sctx.ctx,
+        table,
+        &serde_json::Value::Object(pre_doc.clone()),
+        &merged,
+        &fields,
+    )?;
     sctx.write_set.touch(table, id, OpKind::Patch);
     // `before` = pre-merge body (frozen on first touch by the helper
     // so a doc inserted earlier this txn stays `before = None`);
@@ -360,7 +369,7 @@ pub(crate) async fn step_expect_fields(
     .fetch_optional(&mut *sctx.tx)
     .await?;
     let doc = doc
-        .filter(|doc| doc_visible_to(doc, table_def, sctx.ctx))
+        .filter(|doc| doc_visible_to(doc, table_def, sctx.ctx, table))
         .ok_or_else(|| RtDbError::not_found(format!("document '{id}' not found")))?;
     validate_expectations(table_def, expected).map_err(|error| match error {
         FieldGuardError::InvalidRequest(message) => RtDbError::bad_request(message),
@@ -389,7 +398,7 @@ pub(crate) async fn step_expect_absent(
     // from the caller's view, so it does not fail the precondition.
     let present = rows
         .iter()
-        .any(|(_id, doc, _created_at)| doc_visible_to(doc, table_def, sctx.ctx));
+        .any(|(_id, doc, _created_at)| doc_visible_to(doc, table_def, sctx.ctx, table));
     if present {
         return Err(RtDbError::precondition(format!(
             "index '{index}' already has a matching document"

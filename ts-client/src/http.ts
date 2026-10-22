@@ -15,6 +15,41 @@ import type {
 } from "./protocol.js";
 import { PROTOCOL_VERSION } from "./protocol.js";
 import type { RtQuery } from "./query.js";
+import type { EnrollResult } from "./admin.js";
+
+/**
+ * Shared no-auth redemption request for both the HTTP client's `enroll` and the
+ * admin client's compatibility alias. The grant string itself is the
+ * credential, so no Authorization header is attached and the server's public
+ * `/auth/enroll` route never sees one. Envelope-aware on errors.
+ */
+export async function enrollRequest(
+  fetchImpl: typeof fetch,
+  baseUrl: string,
+  grant: string,
+): Promise<unknown> {
+  const response = await fetchImpl(`${baseUrl}/auth/enroll`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      // ARC-013: lets the server diagnose/reject a version mismatch instead
+      // of a generic 400 from `deny_unknown_fields`.
+      "X-Rtdb-Protocol": String(PROTOCOL_VERSION),
+    },
+    body: JSON.stringify({ grant }),
+  });
+  const parsed: unknown = await response.json().catch(() => null);
+  if (!response.ok) {
+    if (RtDbError.isEnvelope(parsed)) {
+      throw RtDbError.fromEnvelope(parsed, response.status);
+    }
+    throw new RtDbError("INTERNAL", `request failed with status ${response.status}`);
+  }
+  if (parsed === null || typeof parsed !== "object") {
+    throw new RtDbError("INTERNAL", "/auth/enroll returned 2xx with no JSON object body");
+  }
+  return parsed;
+}
 
 /**
  * Options for configuring the `RtDbHttpClient`.
@@ -105,6 +140,20 @@ export class RtDbHttpClient {
     // Bind the global: browsers require Window as fetch's receiver, and a
     // stored-unbound reference throws "Illegal invocation" when called.
     this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
+  }
+
+  /**
+   * Redeems a one-time enrollment grant for a machine token
+   * (`POST /auth/enroll`). Public and unauthenticated: this method
+   * deliberately sends no Authorization header — the grant string is the
+   * credential, and the client's own token is unused, so redemption works
+   * during credential-free bootstrap (pass any placeholder token when
+   * constructing the client for this call). The server accepts ONLY `{grant}`
+   * (`deny_unknown_fields`). An invalid/expired/revoked/used grant surfaces
+   * as the standard `RtDbError` UNAUTHORIZED envelope.
+   */
+  async enroll(grant: string): Promise<EnrollResult> {
+    return (await enrollRequest(this.fetchImpl, this.url, grant)) as EnrollResult;
   }
 
   /**
@@ -364,8 +413,18 @@ export class RtDbHttpClient {
    * configured token, the token to validate is passed as an argument and may
    * be either a session or a machine token. An invalid/expired token surfaces
    * as the standard `RtDbError` auth envelope.
+   *
+   * An empty (or whitespace-only) token is rejected locally, BEFORE any fetch:
+   * fetch/undici trims a `"Bearer "` header's value to `"Bearer"`, the server's
+   * prefix check then fails, and the request would fall back to ambient
+   * `rtdb_session` cookie identity — validating an unintended session. The
+   * caller asked to validate an explicit credential; there is no honest wire
+   * form for an empty one (mirrors the go client's AuthValidate guard).
    */
   async validateSessionToken(token: string): Promise<AuthedUser> {
+    if (token.trim().length === 0) {
+      throw new RtDbError("BAD_REQUEST", "auth validate requires a non-empty token");
+    }
     const body = await this.get("/auth/validate", token);
     return (body as { user: AuthedUser }).user;
   }

@@ -81,11 +81,13 @@ pub use schema::{
     VectorIndexSpec,
 };
 pub use value_expr::{CaseWhen, Cast, ValueExpr};
+#[cfg(feature = "http")]
+pub use wire::enrollment::RedeemedGrant;
 pub use wire::{
     AggregateGroup, AggregateOp, AggregateSpec, AuthedUser, AwaitSignalSpec, ChangeFeedResponse,
-    ChangeOp, ClaimedSchedule, ClientMessage, FilterExpr, OutcomeStatus, PresenceMember,
-    ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen, SearchMode, SearchQuery,
-    ServerMessage, StepOutcome, StepRetry, UserKind, VectorSearchQuery, WorkflowInfo,
+    ChangeOp, ClaimedSchedule, ClientMessage, FilterExpr, HostCapability, OutcomeStatus,
+    PresenceMember, ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen, SearchMode,
+    SearchQuery, ServerMessage, StepOutcome, StepRetry, UserKind, VectorSearchQuery, WorkflowInfo,
     WorkflowInfoFull, WorkflowSpec, WorkflowStatus, WorkflowStepSpec,
 };
 
@@ -112,13 +114,13 @@ pub use ws::{
 #[cfg(feature = "admin")]
 pub use wire::admin::{
     AdminMember, AdminStreamFrame, AuditEntry, AuditQuery, BackupsListResponse, CastFailure,
-    ConfigResponse, CreateWebhookOptions, DbStats, Directive, DirectiveReport, HotConfig,
-    HotConfigPatch, LatencyStats, ListDeliveriesOptions, MergeConflict, MergeDbResult, MergeReport,
-    MetricsSnapshot, MigrateRequest, MigrateRequestOwned, MigrateResult, MintTokenOptions,
-    MintedToken, OpEvent, SampleChange, SchemaPreviewColumnAdd, SchemaPreviewDiff,
-    SchemaPreviewIndexAdd, SchemaPreviewRejection, SchemaPreviewTableAdd, SessionInfo,
-    SessionListOptions, TableStat, TokenInfo, Webhook, WebhookDelivery, WebhookEditOptions,
-    WorkflowListOptions,
+    ConfigResponse, CreateWebhookOptions, DbStats, Directive, DirectiveReport, EnrollmentGrant,
+    EnrollmentGrantOptions, HotConfig, HotConfigPatch, LatencyStats, ListDeliveriesOptions,
+    MergeConflict, MergeDbResult, MergeReport, MetricsSnapshot, MigrateRequest,
+    MigrateRequestOwned, MigrateResult, MintTokenOptions, MintedToken, OpEvent, SampleChange,
+    SchemaPreviewColumnAdd, SchemaPreviewDiff, SchemaPreviewIndexAdd, SchemaPreviewRejection,
+    SchemaPreviewTableAdd, SessionInfo, SessionListOptions, TableStat, TokenInfo, Webhook,
+    WebhookDelivery, WebhookEditOptions, WorkflowListOptions,
 };
 // `Cast` (like `ValueExpr`/`CaseWhen`) is re-exported unconditionally from
 // `value_expr` above — the same type `wire::admin` re-exports — so the root

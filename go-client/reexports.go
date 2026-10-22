@@ -33,6 +33,18 @@ func ParseInt64(v Int64) (int64, error) { return wire.ParseInt64(v) }
 // PROTOCOL_VERSION mirrors the server's protocol version.
 const PROTOCOL_VERSION = wire.PROTOCOL_VERSION
 
+// --- wire: host-machine authorization vocabulary ---
+type (
+	HostCapability = wire.HostCapability
+	EnrollResult   = wire.EnrollResult
+)
+
+// HostCapabilityTypeParMeshV1 is the host capability's type tag.
+const HostCapabilityTypeParMeshV1 = wire.HostCapabilityTypeParMeshV1
+
+// ValidateHost checks a host name against par-mesh's component grammar.
+func ValidateHost(host string) error { return wire.ValidateHost(host) }
+
 // --- wire: query vocabulary ---
 // (wire.Query is deliberately NOT aliased here: the root name Query is the
 // generic run-a-query function below, matching the spec's usage example.

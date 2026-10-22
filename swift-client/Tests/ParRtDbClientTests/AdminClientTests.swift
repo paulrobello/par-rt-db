@@ -407,6 +407,112 @@ struct AdminClientTests {
         try await makeAdminClient().revokeToken("t1")
     }
 
+    // MARK: enrollment grants (host machine authorization, frozen 7460912)
+
+    @Test func mintTokenWithHostCapabilityPostsCapability() async throws {
+        StubProtocol.handler = { request in
+            try demand(request.url?.path == "/admin/mint-token", "expected /admin/mint-token")
+            let body = try jsonObjectBody(request)
+            try demand(body["hostCapability"] != nil, "hostCapability missing: \(body)")
+            let capability = body["hostCapability"] as? [String: Any]
+            try demand(capability?["type"] as? String == "parMeshV1", "type mismatch: \(body)")
+            try demand(
+                capability?["host"] as? String == "macdaddy", "host mismatch: \(body)"
+            )
+            return (200, Data(#"{"tokenId":"t1","token":"tok_abc"}"#.utf8))
+        }
+        _ = try await makeAdminClient().mintToken(
+            "app", name: "h",
+            options: MintTokenOptions(hostCapability: .parMeshV1(host: "macdaddy"))
+        )
+    }
+
+    /// Legacy regression proof: a mint with scoped options but no capability
+    /// must NOT carry the new key (absent optionals stay absent).
+    @Test func mintTokenLegacyBodyOmitsHostCapability() async throws {
+        StubProtocol.handler = { request in
+            let body = try jsonObjectBody(request)
+            try demand(
+                Set(body.keys) == ["db", "name", "expiresAt"],
+                "legacy mint must not send hostCapability, got \(body.keys.sorted())"
+            )
+            return (200, Data(#"{"tokenId":"t1","token":"tok"}"#.utf8))
+        }
+        _ = try await makeAdminClient().mintToken(
+            "app", name: "ci", options: MintTokenOptions(expiresAt: 99)
+        )
+    }
+
+    @Test func createEnrollmentGrantPostsGrantShape() async throws {
+        StubProtocol.handler = { request in
+            try demand(
+                request.url?.path == "/admin/enrollment-grants",
+                "expected /admin/enrollment-grants"
+            )
+            let body = try jsonObjectBody(request)
+            try demand(body["db"] as? String == "app", "db mismatch: \(body)")
+            try demand(body["name"] as? String == "macdaddy-enroll", "name mismatch: \(body)")
+            let capability = body["capability"] as? [String: Any]
+            try demand(capability?["type"] as? String == "parMeshV1", "type mismatch: \(body)")
+            try demand(capability?["host"] as? String == "macdaddy", "host mismatch: \(body)")
+            try demand(
+                (body["expiresAt"] as? Int) == 1_761_100_000, "expiresAt mismatch: \(body)"
+            )
+            try demand(
+                body["tokenExpiresAt"] == nil,
+                "nil tokenExpiresAt must be omitted: \(body)"
+            )
+            let grant = """
+            {"grantId":"g1","grant":"grt_secret","db":"app",
+             "capability":{"type":"parMeshV1","host":"macdaddy"},"expiresAt":1761100000000}
+            """
+            return (200, Data(grant.utf8))
+        }
+        let grant = try await makeAdminClient().createEnrollmentGrant(
+            CreateEnrollmentGrantOptions(
+                db: "app", name: "macdaddy-enroll",
+                capability: .parMeshV1(host: "macdaddy"), expiresAt: 1_761_100_000
+            )
+        )
+        #expect(grant.grantId == "g1")
+        #expect(grant.grant == "grt_secret")
+        #expect(grant.capability == .parMeshV1(host: "macdaddy"))
+    }
+
+    @Test func revokeEnrollmentGrantPostsGrantId() async throws {
+        StubProtocol.handler = { request in
+            try demand(
+                request.url?.path == "/admin/revoke-enrollment-grant",
+                "expected /admin/revoke-enrollment-grant"
+            )
+            let body = try jsonObjectBody(request)
+            try demand(body["grantId"] as? String == "g1", "grantId mismatch: \(body)")
+            return (200, Data(#"{"ok":true}"#.utf8))
+        }
+        try await makeAdminClient().revokeEnrollmentGrant("g1")
+    }
+
+    /// List rows tolerate the absent-optional (`skip_serializing_if`): a
+    /// legacy row without `hostCapability` decodes with nil, a row carrying
+    /// one decodes the value.
+    @Test func listTokensToleratesAbsentHostCapability() async throws {
+        StubProtocol.handler = { request in
+            try demand(request.url?.path == "/admin/tokens", "expected /admin/tokens")
+            try demand(request.url?.query == "db=app", "query mismatch")
+            let tokens = """
+            {"tokens":[
+              {"id":"t1","name":"host","createdAt":5,"revoked":false,"readOnly":true,
+               "hostCapability":{"type":"parMeshV1","host":"macdaddy"}},
+              {"id":"t2","name":"legacy","createdAt":6,"revoked":false,"readOnly":false}]}
+            """
+            return (200, Data(tokens.utf8))
+        }
+        let tokens = try await makeAdminClient().listTokens("app")
+        #expect(tokens.count == 2)
+        #expect(tokens[0].hostCapability == .parMeshV1(host: "macdaddy"))
+        #expect(tokens[1].hostCapability == nil)
+    }
+
     @Test func allowlistAddPostsActionAndListUsesQuery() async throws {
         let client = makeAdminClient()
         StubProtocol.handler = { request in

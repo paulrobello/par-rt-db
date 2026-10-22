@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 
 use crate::schema::SchemaDef;
+use crate::wire::HostCapability;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]
@@ -49,6 +50,12 @@ pub(crate) struct MintTokenRequest<'a> {
     pub(crate) read_only: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tables: Option<&'a [String]>,
+    /// Host machine authorization: absent (`skip_serializing_if`) when
+    /// `None`, minting legacy semantics unchanged. The server's
+    /// `#[serde(default)]` accepts the field's absence; set only when
+    /// minting a host-scoped token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) host_capability: Option<&'a HostCapability>,
 }
 
 /// Optional capabilities for [`crate::http::RtDbHttpClient::mint_token_with_options`].
@@ -63,6 +70,65 @@ pub struct MintTokenOptions {
     pub read_only: Option<bool>,
     /// `tables` allowlist on the wire. `None` = all tables (server default).
     pub tables: Option<Vec<String>>,
+    /// Host machine authorization: the `hostCapability` the token carries.
+    /// `None` mints legacy semantics unchanged (the field stays off the
+    /// wire so the server default applies). Mirrors server
+    /// `admin::tokens::MintTokenRequest`.
+    pub host_capability: Option<HostCapability>,
+}
+
+/// Optional fields for
+/// [`crate::admin::RtDbAdminClient::create_enrollment_grant`]. `expires_at`
+/// (the grant's own expiry) is a required method argument; this struct
+/// carries the one optional knob: the minted token's separate lifetime.
+#[derive(Debug, Clone, Default)]
+pub struct EnrollmentGrantOptions {
+    /// Unix-millis expiry for the token minted on redemption
+    /// (`tokenExpiresAt` on the wire). `None` = the token inherits the
+    /// server's default (no independent expiry).
+    pub token_expires_at: Option<i64>,
+}
+
+/// Borrowed HTTP body for `POST /admin/enrollment-grants`. Mirrors server
+/// `admin::tokens::CreateEnrollmentGrantRequest` (camelCase;
+/// `tokenExpiresAt` is omitted when `None` — the server denies unknown
+/// fields, so absence must be absence, not `null`).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CreateEnrollmentGrantRequest<'a> {
+    pub(crate) db: &'a str,
+    pub(crate) name: &'a str,
+    pub(crate) capability: &'a HostCapability,
+    pub(crate) expires_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) token_expires_at: Option<i64>,
+}
+
+/// Borrowed HTTP body for `POST /admin/revoke-enrollment-grant`. Mirrors
+/// server `RevokeEnrollmentGrantRequest` (`deny_unknown_fields`).
+#[derive(Serialize)]
+pub(crate) struct RevokeEnrollmentGrantRequest<'a> {
+    #[serde(rename = "grantId")]
+    pub(crate) grant_id: &'a str,
+}
+
+/// `POST /admin/enrollment-grants` response. Mirrors server
+/// `EnrollmentGrantResponse` (camelCase). `grant` is the one-time plaintext
+/// secret — shown once, never persisted in plaintext server-side.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct EnrollmentGrant {
+    /// Stable grant id (the revoke target).
+    pub grant_id: String,
+    /// The one-time plaintext grant secret shown exactly once.
+    pub grant: String,
+    /// The database the redeemed token will be scoped to.
+    pub db: String,
+    /// The capability the grant fixes (an override at redemption is rejected).
+    pub capability: HostCapability,
+    /// Grant expiry, epoch ms.
+    pub expires_at: i64,
 }
 
 #[derive(Serialize)]
@@ -181,6 +247,12 @@ pub struct TokenInfo {
     /// omit the field.
     #[serde(default)]
     pub tables: Option<Vec<String>>,
+    /// Host machine authorization: the token's capability, when it is a
+    /// host-scoped token. The server emits the field only when set
+    /// (`skip_serializing_if` — ABSENT, not null, for legacy tokens), so
+    /// `#[serde(default)]` parses the absent case as `None`.
+    #[serde(default)]
+    pub host_capability: Option<HostCapability>,
 }
 
 // ---- interactive sessions (GET/DELETE /admin/sessions) ------------------

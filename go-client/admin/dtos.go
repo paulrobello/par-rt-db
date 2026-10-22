@@ -16,10 +16,13 @@ import (
 
 // MintTokenOptions carries the optional mint capabilities; every omitted
 // field lets the server default apply (no expiry, read-write, all tables).
+// HostCapability nil omits the hostCapability key entirely — the legacy
+// wire form; a set pointer attaches host-machine authorization.
 type MintTokenOptions struct {
-	ExpiresAt *int64   `json:"expiresAt,omitempty"`
-	ReadOnly  *bool    `json:"readOnly,omitempty"`
-	Tables    []string `json:"tables,omitempty"`
+	ExpiresAt      *int64               `json:"expiresAt,omitempty"`
+	ReadOnly       *bool                `json:"readOnly,omitempty"`
+	Tables         []string             `json:"tables,omitempty"`
+	HostCapability *wire.HostCapability `json:"hostCapability,omitempty"`
 }
 
 // SessionListOptions filters ListSessions; both fields optional.
@@ -123,15 +126,18 @@ type DbStats struct {
 	SubsUsed          int64       `json:"subsUsed"`
 }
 
-// TokenInfo is one row of ListTokens.
+// TokenInfo is one row of ListTokens. HostCapability is absent-optional on
+// the wire (the server skip-serializes it for legacy tokens): nil here means
+// the token carries no host capability.
 type TokenInfo struct {
-	ID        string   `json:"id"`
-	Name      string   `json:"name"`
-	CreatedAt int64    `json:"createdAt"`
-	Revoked   bool     `json:"revoked"`
-	ExpiresAt *int64   `json:"expiresAt"`
-	ReadOnly  bool     `json:"readOnly"`
-	Tables    []string `json:"tables"`
+	ID             string               `json:"id"`
+	Name           string               `json:"name"`
+	CreatedAt      int64                `json:"createdAt"`
+	Revoked        bool                 `json:"revoked"`
+	ExpiresAt      *int64               `json:"expiresAt"`
+	ReadOnly       bool                 `json:"readOnly"`
+	Tables         []string             `json:"tables"`
+	HostCapability *wire.HostCapability `json:"hostCapability,omitempty"`
 }
 
 // SessionInfo is one active interactive session from ListSessions.

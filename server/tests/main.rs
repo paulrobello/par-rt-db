@@ -28,6 +28,7 @@ mod defaults_test;
 mod field_guard_test;
 mod golden_vector_test;
 mod healthz_test;
+mod host_auth_test;
 mod hot_config_test;
 mod http_api_test;
 mod idle_reclaim_test;

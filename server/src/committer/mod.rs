@@ -555,7 +555,7 @@ impl Committers {
         // the timeout is dropped, and the origin then takes over and RESUBMITS
         // the same write, which without a key executes it a second time. The
         // minted key is stamped on both the request and the forwarded payload,
-        // so the owner logs it in the shared `mutations` dedup table and the
+        // so the owner logs it in the shared `mutation_cache_v2` dedup table and the
         // takeover's resubmission comes back as a replay of the first outcome
         // instead of a duplicate write. Only `Mutate` needs this: migrate,
         // push, merge, and restore are idempotent by construction. The key is
@@ -1257,7 +1257,7 @@ struct CommitterCtx {
 /// signature and the second copy of the field list that used to live here.
 async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterRequest>) {
     if let Err(err) = mutation_log::ensure_table(&ctx.pool, &ctx.db).await {
-        tracing::error!(db = %ctx.db, error = %err, "failed to ensure mutations dedup table");
+        tracing::error!(db = %ctx.db, error = %err, "failed to ensure mutation_cache_v2 dedup table");
     }
     if let Err(err) = crate::storage::ensure_table(&ctx.pool, &ctx.db).await {
         tracing::error!(db = %ctx.db, error = %err, "committer: storage::ensure_table failed");

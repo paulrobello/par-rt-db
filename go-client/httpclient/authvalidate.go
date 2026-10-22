@@ -7,6 +7,7 @@ package httpclient
 import (
 	"context"
 
+	rtdberrors "github.com/paulrobello/par-rt-db/go-client/errors"
 	"github.com/paulrobello/par-rt-db/go-client/wire"
 )
 
@@ -16,7 +17,18 @@ import (
 // an argument and accepts both token kinds — for a trusted backend
 // validating a player's credential. An invalid/expired token surfaces as
 // the standard RtDbError auth envelope.
+//
+// An EMPTY token is rejected locally (BAD_REQUEST, no HTTP request): Go's
+// HTTP layer trims trailing OWS, so `Bearer ` would arrive at the server as
+// `Bearer`, fail the server's `"Bearer "` prefix check, and fall through to
+// ambient rtdb_session cookie resolution — validating an unintended session
+// (audit F7). The caller asked to validate an explicit credential; there is
+// no honest wire form for an empty one, so it fails before any request.
 func (c *Client) AuthValidate(ctx context.Context, token string) (*wire.AuthedUser, error) {
+	if token == "" {
+		return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+			"auth validate requires a non-empty token")
+	}
 	var resp struct {
 		User wire.AuthedUser `json:"user"`
 	}

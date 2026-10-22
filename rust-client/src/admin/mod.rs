@@ -182,6 +182,7 @@ impl RtDbAdminClient {
                     expires_at: opts.expires_at,
                     read_only: opts.read_only,
                     tables: opts.tables.as_deref(),
+                    host_capability: opts.host_capability.as_ref(),
                 },
             )
             .await?;
@@ -194,6 +195,50 @@ impl RtDbAdminClient {
             .post_json(
                 "/admin/revoke-token",
                 &crate::wire::admin::RevokeTokenRequest { token_id },
+            )
+            .await?;
+        self.expect_ok(resp).await
+    }
+
+    /// `POST /admin/enrollment-grants` `{db, name, capability, expiresAt,
+    /// tokenExpiresAt?}` → the one-time enrollment grant.
+    ///
+    /// The returned [`EnrollmentGrant`](crate::wire::admin::EnrollmentGrant)'s
+    /// `grant` field is the one-time plaintext secret — deliver it to the
+    /// enrolling host out-of-band and treat it like a password: shown once,
+    /// never persisted in plaintext server-side, revocable via
+    /// [`revoke_enrollment_grant`](Self::revoke_enrollment_grant) before
+    /// use. Redemption (`POST /auth/enroll`) is public and accepts only the
+    /// grant string.
+    pub async fn create_enrollment_grant(
+        &self,
+        db: &str,
+        name: &str,
+        capability: &crate::wire::HostCapability,
+        expires_at: i64,
+        opts: &crate::wire::admin::EnrollmentGrantOptions,
+    ) -> Result<crate::wire::admin::EnrollmentGrant, RtDbError> {
+        let resp = self
+            .post_json(
+                "/admin/enrollment-grants",
+                &crate::wire::admin::CreateEnrollmentGrantRequest {
+                    db,
+                    name,
+                    capability,
+                    expires_at,
+                    token_expires_at: opts.token_expires_at,
+                },
+            )
+            .await?;
+        crate::http_common::deserialize::<crate::wire::admin::EnrollmentGrant>(resp).await
+    }
+
+    /// `POST /admin/revoke-enrollment-grant` `{grantId}` → `{ok:true}`.
+    pub async fn revoke_enrollment_grant(&self, grant_id: &str) -> Result<(), RtDbError> {
+        let resp = self
+            .post_json(
+                "/admin/revoke-enrollment-grant",
+                &crate::wire::admin::RevokeEnrollmentGrantRequest { grant_id },
             )
             .await?;
         self.expect_ok(resp).await

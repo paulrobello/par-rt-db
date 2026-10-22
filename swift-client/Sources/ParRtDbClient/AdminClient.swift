@@ -212,7 +212,8 @@ public actor RtDbAdminClient {
             "mint token", "/admin/mint-token",
             MintTokenRequest(
                 db: db, name: name, expiresAt: options.expiresAt,
-                readOnly: options.readOnly, tables: options.tables
+                readOnly: options.readOnly, tables: options.tables,
+                hostCapability: options.hostCapability
             )
         )
     }
@@ -221,6 +222,29 @@ public actor RtDbAdminClient {
     public func revokeToken(_ tokenId: String) async throws {
         try await postForOk(
             "revoke token", "/admin/revoke-token", RevokeTokenRequest(tokenId: tokenId)
+        )
+    }
+
+    /// Creates a one-time enrollment grant binding a host capability to `db`
+    /// (`POST /admin/enrollment-grants`). `expiresAt` is the grant's absolute
+    /// expiry (ms epoch); the optional `tokenExpiresAt` caps the minted
+    /// token's lifetime. The returned `grant` is the one-time plaintext —
+    /// shown once, never persisted in plaintext server-side. Only the
+    /// provided keys are sent; the server denies unknown fields.
+    public func createEnrollmentGrant(
+        _ options: CreateEnrollmentGrantOptions
+    ) async throws -> EnrollmentGrant {
+        try await postJson(
+            "create enrollment grant", "/admin/enrollment-grants", options
+        )
+    }
+
+    /// Revokes a pending enrollment grant by id
+    /// (`POST /admin/revoke-enrollment-grant` `{grantId}` → `{ok:true}`).
+    public func revokeEnrollmentGrant(_ grantId: String) async throws {
+        try await postForOk(
+            "revoke enrollment grant", "/admin/revoke-enrollment-grant",
+            RevokeEnrollmentGrantRequest(grantId: grantId)
         )
     }
 
@@ -1044,9 +1068,10 @@ private struct MintTokenRequest: Encodable {
     let expiresAt: Int64?
     let readOnly: Bool?
     let tables: [String]?
+    let hostCapability: HostCapability?
 
     enum CodingKeys: String, CodingKey {
-        case db, name, expiresAt, readOnly, tables
+        case db, name, expiresAt, readOnly, tables, hostCapability
     }
 
     func encode(to encoder: Encoder) throws {
@@ -1056,6 +1081,7 @@ private struct MintTokenRequest: Encodable {
         try container.encodeIfPresent(expiresAt, forKey: .expiresAt)
         try container.encodeIfPresent(readOnly, forKey: .readOnly)
         try container.encodeIfPresent(tables, forKey: .tables)
+        try container.encodeIfPresent(hostCapability, forKey: .hostCapability)
     }
 }
 
@@ -1064,6 +1090,14 @@ private struct RevokeTokenRequest: Encodable {
 
     enum CodingKeys: String, CodingKey {
         case tokenId
+    }
+}
+
+private struct RevokeEnrollmentGrantRequest: Encodable {
+    let grantId: String
+
+    enum CodingKeys: String, CodingKey {
+        case grantId
     }
 }
 

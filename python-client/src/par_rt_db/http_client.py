@@ -88,7 +88,9 @@ from .admin_models import (
     DbStats,
     DbSubCounters,
     DirectiveReport,
+    EnrollResult,
     FileMetadata,
+    HostCapability,
     HotConfig,
     HotConfigPatch,
     LatencyStats,
@@ -154,8 +156,10 @@ __all__ = [
     "DbStats",
     "DbSubCounters",
     "DirectiveReport",
+    "EnrollResult",
     "HotConfig",
     "HotConfigPatch",
+    "HostCapability",
     "LatencyStats",
     "MetricsSnapshot",
     "MigrateResult",
@@ -648,6 +652,19 @@ class RtDbHttpClient:
         """
         resp = self._send("GET", "/auth/validate", headers={"Authorization": f"Bearer {token}"})
         return AuthedUser.model_validate(resp.json()["user"])
+
+    def enroll(self, grant: str) -> EnrollResult:
+        """``POST /auth/enroll`` ``{grant}`` → :class:`EnrollResult`.
+
+        Redeems a one-time enrollment grant (host-machine-auth): the ONLY body
+        field is ``grant`` — the server's strict DTO rejects any db/host/capability
+        override, so the returned ``db``/``capability`` are exactly what the
+        admin fixed at grant creation. The route is public and unauthenticated;
+        invalid/expired/revoked/used grants surface as the generic 401
+        :class:`RtDbError` envelope.
+        """
+        resp = self._send("POST", "/auth/enroll", json={"grant": grant})
+        return EnrollResult.model_validate(resp.json())
 
     # --- storage (machine token; HTTP-only, bypasses the committer) ---
 

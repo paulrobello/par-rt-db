@@ -436,6 +436,7 @@ async fn mint_token_with_options_posts_capabilities() {
                 expires_at: Some(1700000000000),
                 read_only: Some(true),
                 tables: Some(vec!["users".to_string()]),
+                host_capability: None,
             },
         )
         .await
@@ -549,6 +550,7 @@ fn mint_token_request_serializes_wire_shape() {
         expires_at: None,
         read_only: None,
         tables: None,
+        host_capability: None,
     };
     assert_eq!(
         serde_json::to_value(&full).unwrap(),
@@ -563,6 +565,7 @@ fn mint_token_request_serializes_wire_shape() {
         expires_at: Some(1700000000000),
         read_only: Some(true),
         tables: Some(&tables),
+        host_capability: None,
     };
     assert_eq!(
         serde_json::to_value(&scoped).unwrap(),
@@ -582,10 +585,33 @@ fn mint_token_request_serializes_wire_shape() {
         expires_at: None,
         read_only: Some(true),
         tables: None,
+        host_capability: None,
     };
     assert_eq!(
         serde_json::to_value(&partial).unwrap(),
         json!({"db": "dbx", "name": "reader", "readOnly": true}),
+    );
+
+    // Host-scoped: hostCapability rides camelCase; a None hostCapability is
+    // ABSENT (legacy mint — exact-shape equality proves the key never leaks).
+    let cap = crate::wire::HostCapability::ParMeshV1 {
+        host: "macdaddy".to_string(),
+    };
+    let host_scoped = MintTokenRequest {
+        db: "dbx",
+        name: "macdaddy",
+        expires_at: None,
+        read_only: None,
+        tables: None,
+        host_capability: Some(&cap),
+    };
+    assert_eq!(
+        serde_json::to_value(&host_scoped).unwrap(),
+        json!({
+            "db": "dbx",
+            "name": "macdaddy",
+            "hostCapability": {"type": "parMeshV1", "host": "macdaddy"},
+        }),
     );
 }
 
@@ -605,11 +631,18 @@ fn token_info_deserializes_wire_shapes() {
         "expiresAt": 1700000000000_i64,
         "readOnly": true,
         "tables": ["users"],
+        "hostCapability": {"type": "parMeshV1", "host": "macdaddy"},
     }))
     .unwrap();
     assert_eq!(restricted.expires_at, Some(1700000000000));
     assert!(restricted.read_only);
     assert_eq!(restricted.tables, Some(vec!["users".to_string()]));
+    assert_eq!(
+        restricted.host_capability,
+        Some(crate::wire::HostCapability::ParMeshV1 {
+            host: "macdaddy".to_string()
+        })
+    );
 
     let full: TokenInfo = serde_json::from_value(json!({
         "id": "t1",
@@ -624,6 +657,7 @@ fn token_info_deserializes_wire_shapes() {
     assert_eq!(full.expires_at, None);
     assert!(!full.read_only);
     assert_eq!(full.tables, None);
+    assert_eq!(full.host_capability, None);
 
     let legacy: TokenInfo = serde_json::from_value(json!({
         "id": "old",
@@ -635,6 +669,7 @@ fn token_info_deserializes_wire_shapes() {
     assert_eq!(legacy.expires_at, None);
     assert!(!legacy.read_only);
     assert_eq!(legacy.tables, None);
+    assert_eq!(legacy.host_capability, None);
 }
 
 #[tokio::test]
@@ -2612,4 +2647,226 @@ async fn every_admin_request_carries_the_protocol_header() {
             req.url.path()
         );
     }
+}
+
+// ---- host machine authorization (hostCapability + enrollment grants) -----
+//
+// Frozen wire surface (task-3-wire-surface.md): `hostCapability` rides
+// camelCase on the mint request and is ABSENT (not null) on listed token
+// rows when unset; enrollment grants are created/revoked under /admin/*
+// and redeemed at the public POST /auth/enroll, which accepts only the
+// grant string.
+
+#[test]
+fn host_capability_round_trips_via_the_client_reexport() {
+    use crate::wire::HostCapability;
+
+    let cap = HostCapability::ParMeshV1 {
+        host: "macdaddy".to_string(),
+    };
+    let text = serde_json::to_string(&cap).unwrap();
+    assert_eq!(text, r#"{"type":"parMeshV1","host":"macdaddy"}"#);
+    let back: HostCapability = serde_json::from_str(&text).unwrap();
+    assert_eq!(back, cap);
+
+    // Strict mirror of the server: unknown capability types are rejected,
+    // never silently passed through.
+    let err = serde_json::from_value::<HostCapability>(json!({
+        "type": "parMeshV2",
+        "host": "macdaddy"
+    }))
+    .unwrap_err();
+    assert!(err.to_string().contains("unknown capability type"));
+}
+
+#[tokio::test]
+async fn mint_token_with_host_capability_posts_wire_shape() {
+    let (server, client) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/admin/mint-token"))
+        .and(body_partial_json(json!({
+            "db": "kanban",
+            "name": "macdaddy",
+            "hostCapability": {"type": "parMeshV1", "host": "macdaddy"},
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"tokenId": "id3", "token": "s3"})),
+        )
+        .mount(&server)
+        .await;
+    let minted = client
+        .mint_token_with_options(
+            "kanban",
+            "macdaddy",
+            &crate::wire::admin::MintTokenOptions {
+                host_capability: Some(crate::wire::HostCapability::ParMeshV1 {
+                    host: "macdaddy".to_string(),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(minted.token_id, "id3");
+    assert_eq!(minted.token, "s3");
+}
+
+#[tokio::test]
+async fn list_tokens_returns_host_capability() {
+    let (server, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/admin/tokens"))
+        .and(query_param("db", "kanban"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tokens": [
+                {
+                    "id": "t1",
+                    "name": "hosted",
+                    "createdAt": 1,
+                    "revoked": false,
+                    "hostCapability": {"type": "parMeshV1", "host": "macdaddy"}
+                },
+                {"id": "t2", "name": "legacy", "createdAt": 2, "revoked": false}
+            ]
+        })))
+        .mount(&server)
+        .await;
+    let tokens = client.list_tokens("kanban").await.unwrap();
+    assert_eq!(tokens.len(), 2);
+    assert_eq!(
+        tokens[0].host_capability,
+        Some(crate::wire::HostCapability::ParMeshV1 {
+            host: "macdaddy".to_string()
+        })
+    );
+    // Legacy row: the server omits the field entirely; the client defaults
+    // it to None rather than failing (strict-tolerant absent-optional).
+    assert_eq!(tokens[1].host_capability, None);
+}
+
+#[test]
+fn create_enrollment_grant_request_serializes_wire_shape() {
+    use crate::wire::admin::CreateEnrollmentGrantRequest;
+
+    let cap = crate::wire::HostCapability::ParMeshV1 {
+        host: "macdaddy".to_string(),
+    };
+    // Required fields only: tokenExpiresAt stays off the wire.
+    let bare = CreateEnrollmentGrantRequest {
+        db: "app",
+        name: "macdaddy-enroll",
+        capability: &cap,
+        expires_at: 1761100000000,
+        token_expires_at: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&bare).unwrap(),
+        json!({
+            "db": "app",
+            "name": "macdaddy-enroll",
+            "capability": {"type": "parMeshV1", "host": "macdaddy"},
+            "expiresAt": 1761100000000_i64,
+        }),
+    );
+
+    // Optional token expiry rides camelCase when set.
+    let full = CreateEnrollmentGrantRequest {
+        db: "app",
+        name: "macdaddy-enroll",
+        capability: &cap,
+        expires_at: 1761100000000,
+        token_expires_at: Some(1761100900000),
+    };
+    assert_eq!(
+        serde_json::to_value(&full).unwrap(),
+        json!({
+            "db": "app",
+            "name": "macdaddy-enroll",
+            "capability": {"type": "parMeshV1", "host": "macdaddy"},
+            "expiresAt": 1761100000000_i64,
+            "tokenExpiresAt": 1761100900000_i64,
+        }),
+    );
+}
+
+#[test]
+fn enrollment_grant_deserializes_wire_shape() {
+    use crate::wire::admin::EnrollmentGrant;
+
+    let grant: EnrollmentGrant = serde_json::from_value(json!({
+        "grantId": "g1",
+        "grant": "rtdb_enroll_secret",
+        "db": "app",
+        "capability": {"type": "parMeshV1", "host": "macdaddy"},
+        "expiresAt": 1761100000000_i64,
+    }))
+    .unwrap();
+    assert_eq!(grant.grant_id, "g1");
+    assert_eq!(grant.grant, "rtdb_enroll_secret");
+    assert_eq!(grant.db, "app");
+    assert_eq!(
+        grant.capability,
+        crate::wire::HostCapability::ParMeshV1 {
+            host: "macdaddy".to_string()
+        }
+    );
+    assert_eq!(grant.expires_at, 1761100000000);
+}
+
+#[tokio::test]
+async fn create_enrollment_grant_posts_required_fields() {
+    let (server, client) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/admin/enrollment-grants"))
+        .and(header("authorization", BEARER))
+        .and(body_partial_json(json!({
+            "db": "app",
+            "name": "macdaddy-enroll",
+            "capability": {"type": "parMeshV1", "host": "macdaddy"},
+            "expiresAt": 1761100000000_i64,
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "grantId": "g1",
+            "grant": "rtdb_enroll_secret",
+            "db": "app",
+            "capability": {"type": "parMeshV1", "host": "macdaddy"},
+            "expiresAt": 1761100000000_i64,
+        })))
+        .mount(&server)
+        .await;
+    let grant = client
+        .create_enrollment_grant(
+            "app",
+            "macdaddy-enroll",
+            &crate::wire::HostCapability::ParMeshV1 {
+                host: "macdaddy".to_string(),
+            },
+            1761100000000,
+            &crate::wire::admin::EnrollmentGrantOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(grant.grant_id, "g1");
+    assert_eq!(grant.grant, "rtdb_enroll_secret");
+    assert_eq!(grant.db, "app");
+    assert_eq!(grant.expires_at, 1761100000000);
+
+    // tokenExpiresAt is absent from the request body when the option is
+    // None (the server denies unknown fields; absence keeps it strict).
+    let requests = server.received_requests().await.unwrap();
+    let body = String::from_utf8(requests[0].body.clone()).unwrap();
+    assert!(!body.contains("tokenExpiresAt"));
+}
+
+#[tokio::test]
+async fn revoke_enrollment_grant_posts_grant_id() {
+    let (server, client) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/admin/revoke-enrollment-grant"))
+        .and(header("authorization", BEARER))
+        .and(body_partial_json(json!({"grantId": "g1"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&server)
+        .await;
+    client.revoke_enrollment_grant("g1").await.unwrap();
 }

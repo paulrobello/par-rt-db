@@ -33,7 +33,10 @@ pub(crate) async fn check_owner(
     let authorize = table_def.authorize.as_ref();
     let user_is_some = ctx.user_id.is_some();
     // Neither gate applies (bypass caller, or table declares nothing) → no-op.
-    if owner_uid.is_none() && !(authorize.is_some() && user_is_some) {
+    if ctx.host_capability.is_none()
+        && owner_uid.is_none()
+        && !(authorize.is_some() && user_is_some)
+    {
         return Ok(());
     }
     let table_ident = pg_table(table_name);
@@ -54,6 +57,9 @@ pub(crate) async fn check_owner(
     let Some((doc,)) = row else {
         return Ok(());
     };
+    if !crate::auth::host_policy::host_visible(&doc, ctx.host_capability.as_ref(), table_name) {
+        return Err(RtDbError::not_found(format!("document '{id}' not found")));
+    }
     if let Some(uid) = owner_uid
         && !row_visible_to(
             &doc,
@@ -133,7 +139,11 @@ pub(crate) fn doc_visible_to(
     doc: &serde_json::Value,
     table_def: &TableDef,
     ctx: &PrincipalCtx,
+    table: &str,
 ) -> bool {
+    if !crate::auth::host_policy::host_visible(doc, ctx.host_capability.as_ref(), table) {
+        return false;
+    }
     let owner_uid = row_auth_enforced_uid(table_def, ctx.user_id.as_deref());
     let authorize = table_def.authorize.as_ref();
     let user_is_some = ctx.user_id.is_some();
@@ -183,6 +193,7 @@ fn row_auth_enforced_uid<'a>(table_def: &'a TableDef, owner: Option<&'a str>) ->
 /// documented behavior, see the FM-28 spec).
 pub(crate) fn authorize_txn_tables(ctx: &PrincipalCtx, txn: &Transaction) -> Result<(), RtDbError> {
     for step in &txn.steps {
+        crate::auth::host_policy::operation(ctx, step)?;
         if let Some(table) = step.table() {
             authorize_table(ctx, table)?;
         }

@@ -22,7 +22,11 @@ Surface covered:
 * owner-bypass data access — ``/admin/db/{db}/query|mutate``
 * managed backups — ``backup`` / ``backups`` / ``restore``
 * token management (ENH-005) — ``mint-token`` / ``revoke-token`` / ``tokens``
-  with the capability fields (``expiresAt``, ``readOnly``, ``tables``)
+  with the capability fields (``expiresAt``, ``readOnly``, ``tables``) plus the
+  optional ``hostCapability`` mint field (host-machine-auth)
+* enrollment grants (host-machine-auth) — ``POST /admin/enrollment-grants``
+  (create) and ``POST /admin/revoke-enrollment-grant``; public redemption
+  (``POST /auth/enroll``) lives on the data-plane HTTP clients
 * interactive sessions — ``GET/DELETE /admin/sessions`` (list / revoke-one /
   revoke-user)
 * user merge — ``POST /admin/merge-users`` (anon→real account merge, typed
@@ -94,8 +98,10 @@ from .admin_models import (
     AuditEntry,
     ConfigResponse,
     DbStats,
+    EnrollmentGrant,
     ExplainResult,
     FileMetadata,
+    HostCapability,
     HotConfigPatch,
     MergeReport,
     MetricsSnapshot,
@@ -697,12 +703,15 @@ def _op_mint_token(
     expires_at: int | None = None,
     read_only: bool = False,
     tables: list[str] | None = None,
+    host_capability: HostCapability | None = None,
 ) -> _AdminRequest:
     body: dict[str, Any] = {"db": db, "name": name, "readOnly": read_only}
     if expires_at is not None:
         body["expiresAt"] = expires_at
     if tables is not None:
         body["tables"] = list(tables)
+    if host_capability is not None:
+        body["hostCapability"] = host_capability.model_dump(by_alias=True, mode="json")
     return _AdminRequest("POST", "/admin/mint-token", {"json": body}, _parse_model(MintedToken))
 
 
@@ -711,6 +720,47 @@ def _op_revoke_token(token_id: str) -> _AdminRequest:
         "POST",
         "/admin/revoke-token",
         {"json": {"tokenId": token_id}},
+        _parse_expect_ok,
+    )
+
+
+# --- enrollment grants (host-machine-auth) ----------------------------------
+#
+# POST /admin/enrollment-grants (create, admin bearer) +
+# POST /admin/revoke-enrollment-grant (revoke, admin bearer). The public
+# redemption route, POST /auth/enroll, is NOT an admin route — it lives on the
+# data-plane HTTP clients next to /auth/me (see par_rt_db.http_client).
+
+
+def _op_create_enrollment_grant(
+    db: str,
+    name: str,
+    capability: HostCapability,
+    expires_at: int,
+    *,
+    token_expires_at: int | None = None,
+) -> _AdminRequest:
+    body: dict[str, Any] = {
+        "db": db,
+        "name": name,
+        "capability": capability.model_dump(by_alias=True, mode="json"),
+        "expiresAt": expires_at,
+    }
+    if token_expires_at is not None:
+        body["tokenExpiresAt"] = token_expires_at
+    return _AdminRequest(
+        "POST",
+        "/admin/enrollment-grants",
+        {"json": body},
+        _parse_model(EnrollmentGrant),
+    )
+
+
+def _op_revoke_enrollment_grant(grant_id: str) -> _AdminRequest:
+    return _AdminRequest(
+        "POST",
+        "/admin/revoke-enrollment-grant",
+        {"json": {"grantId": grant_id}},
         _parse_expect_ok,
     )
 
@@ -1699,6 +1749,7 @@ class RtDbAdminClient:
         expires_at: int | None = None,
         read_only: bool = False,
         tables: list[str] | None = None,
+        host_capability: HostCapability | None = None,
     ) -> MintedToken:
         """``POST /admin/mint-token`` → :class:`MintedToken`.
 
@@ -1706,6 +1757,8 @@ class RtDbAdminClient:
         the server applies its defaults (no expiry, all tables). ``readOnly`` is
         always sent — the server's ``#[serde(default)]`` treats absent as
         ``false``, so sending it explicitly is harmless and clearer.
+        ``hostCapability`` is omitted when ``None`` — the field's absence mints
+        legacy semantics unchanged (host-machine-auth).
         """
         return self._executor.run(
             _op_mint_token(
@@ -1714,6 +1767,7 @@ class RtDbAdminClient:
                 expires_at=expires_at,
                 read_only=read_only,
                 tables=tables,
+                host_capability=host_capability,
             )
         )
 
@@ -1722,8 +1776,52 @@ class RtDbAdminClient:
         self._executor.run(_op_revoke_token(token_id))
 
     def list_tokens(self, db: str) -> list[TokenInfo]:
-        """``GET /admin/tokens?db=<db>`` → ``[TokenInfo, ...]``."""
+        """``GET /admin/tokens?db=<db>`` → ``[TokenInfo, ...]``.
+
+        Each row carries ``hostCapability`` only when the token was minted
+        with one (``host_capability is None`` otherwise) — the server omits
+        the key rather than sending ``null``.
+        """
         return self._executor.run(_op_list_tokens(db))
+
+    # --- enrollment grants (host-machine-auth) -------------------------------
+
+    def create_enrollment_grant(
+        self,
+        db: str,
+        name: str,
+        capability: HostCapability,
+        expires_at: int,
+        *,
+        token_expires_at: int | None = None,
+    ) -> EnrollmentGrant:
+        """``POST /admin/enrollment-grants`` → :class:`EnrollmentGrant`.
+
+        Creates a short-TTL (max 15 minutes), single-use grant that mints one
+        host-scoped machine credential for ``db`` when redeemed via
+        :meth:`par_rt_db.http_client.RtDbHttpClient.enroll`. ``capability`` is
+        currently the ``parMeshV1`` variant (``HostCapability(type="parMeshV1", host=...)``);
+        ``expiresAt`` is epoch-millis and must be in the future; the optional
+        ``token_expires_at`` bounds the lifetime of the credential the grant
+        mints. The returned ``grant`` plaintext is shown exactly once.
+        """
+        return self._executor.run(
+            _op_create_enrollment_grant(
+                db,
+                name,
+                capability,
+                expires_at,
+                token_expires_at=token_expires_at,
+            )
+        )
+
+    def revoke_enrollment_grant(self, grant_id: str) -> None:
+        """``POST /admin/revoke-enrollment-grant`` ``{grantId}`` → ``{ok:true}``.
+
+        Marks a grant revoked so redemption fails closed with the same generic
+        unauthorized envelope as any other unclaimable grant.
+        """
+        self._executor.run(_op_revoke_enrollment_grant(grant_id))
 
     # --- interactive sessions (GET/DELETE /admin/sessions) ---
 
@@ -2432,6 +2530,7 @@ class AsyncRtDbAdminClient:
         expires_at: int | None = None,
         read_only: bool = False,
         tables: list[str] | None = None,
+        host_capability: HostCapability | None = None,
     ) -> MintedToken:
         """``POST /admin/mint-token`` → :class:`MintedToken` (async).
 
@@ -2444,6 +2543,7 @@ class AsyncRtDbAdminClient:
                 expires_at=expires_at,
                 read_only=read_only,
                 tables=tables,
+                host_capability=host_capability,
             )
         )
 
@@ -2454,6 +2554,38 @@ class AsyncRtDbAdminClient:
     async def list_tokens(self, db: str) -> list[TokenInfo]:
         """``GET /admin/tokens?db=<db>`` → ``[TokenInfo, ...]`` (async)."""
         return await self._executor.run(_op_list_tokens(db))
+
+    # --- enrollment grants (host-machine-auth) -------------------------------
+
+    async def create_enrollment_grant(
+        self,
+        db: str,
+        name: str,
+        capability: HostCapability,
+        expires_at: int,
+        *,
+        token_expires_at: int | None = None,
+    ) -> EnrollmentGrant:
+        """``POST /admin/enrollment-grants`` → :class:`EnrollmentGrant` (async).
+
+        See :meth:`RtDbAdminClient.create_enrollment_grant` for semantics.
+        """
+        return await self._executor.run(
+            _op_create_enrollment_grant(
+                db,
+                name,
+                capability,
+                expires_at,
+                token_expires_at=token_expires_at,
+            )
+        )
+
+    async def revoke_enrollment_grant(self, grant_id: str) -> None:
+        """``POST /admin/revoke-enrollment-grant`` ``{grantId}`` → ``{ok:true}`` (async).
+
+        See :meth:`RtDbAdminClient.revoke_enrollment_grant`.
+        """
+        await self._executor.run(_op_revoke_enrollment_grant(grant_id))
 
     # --- interactive sessions (GET/DELETE /admin/sessions) ---
 

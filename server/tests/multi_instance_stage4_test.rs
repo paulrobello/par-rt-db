@@ -61,6 +61,7 @@ async fn rate_budget_is_shared_across_replicas() -> anyhow::Result<()> {
         token_id: "stage4-rate-token".to_string(),
         read_only: false,
         tables: None,
+        host_capability: None,
     };
     // Two through A, two through B — all allowed (budget 4 shared).
     for state in [&a, &a, &b, &b] {
@@ -556,7 +557,7 @@ async fn forwarded_mutate_is_deduped_by_a_server_minted_key() -> anyhow::Result<
         )
         .await?;
     let (local_rows,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT count(*) FROM \"db_{db}\".mutations"
+        "SELECT count(*) FROM \"db_{db}\".mutation_cache_v2"
     )))
     .fetch_one(&pool)
     .await?;
@@ -565,7 +566,7 @@ async fn forwarded_mutate_is_deduped_by_a_server_minted_key() -> anyhow::Result<
     // The forwarded one is keyed by the server.
     mutate_until_landed(&b, &db, insert_item("forwarded"), PrincipalCtx::bypass()).await?;
     let (keyed_rows,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT count(*) FROM \"db_{db}\".mutations"
+        "SELECT count(*) FROM \"db_{db}\".mutation_cache_v2"
     )))
     .fetch_one(&pool)
     .await?;
@@ -577,7 +578,7 @@ async fn forwarded_mutate_is_deduped_by_a_server_minted_key() -> anyhow::Result<
     // Replaying that exact key returns the recorded outcome instead of
     // writing again — the property the takeover path relies on.
     let (mut_id,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT mut_id FROM \"db_{db}\".mutations"
+        "SELECT mut_id FROM \"db_{db}\".mutation_cache_v2"
     )))
     .fetch_one(&pool)
     .await?;
@@ -585,7 +586,12 @@ async fn forwarded_mutate_is_deduped_by_a_server_minted_key() -> anyhow::Result<
         .committers
         .mutate(
             &db,
-            Some(mut_id),
+            Some(
+                serde_json::from_str::<serde_json::Value>(&mut_id)?[2]
+                    .as_str()
+                    .expect("encoded raw key")
+                    .to_owned(),
+            ),
             insert_item("forwarded"),
             PrincipalCtx::bypass(),
         )

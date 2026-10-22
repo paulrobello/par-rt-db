@@ -87,7 +87,7 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 - **Computed fields**: a table may declare `computed`, a map of field name → typed expression (`concat`/arithmetic/`coalesce`/`lower`/`upper`/`trim`/casts/`case`/`now`), re-derived by the server on every write and stored in the doc body **and** the typed column — client-supplied values never survive, `null` results leave the key absent, the field stays indexable, and pushes backfill existing rows (see [Computed fields](#computed-fields))
 - **Realtime presence**: transient room membership and state ("who is online", cursors, typing) over the existing `/sync` socket — no extra infrastructure
 - **File storage**: opaque unauthenticated public URLs, signed time-limited URLs, HTTP `Range` support, and read-time image transforms
-- **Auth**: six optional OAuth providers (GitHub, Google, GitLab, Microsoft, Apple, generic OIDC), per-database machine tokens, optional anonymous access with anon→real account merge, and per-row `ownerField`/`authorize` rules
+- **Auth**: six optional OAuth providers (GitHub, Google, GitLab, Microsoft, Apple, generic OIDC), per-database machine tokens plus optional host-scoped machine credentials with enrollment grants, optional anonymous access with anon→real account merge, and per-row `ownerField`/`authorize` rules
 - **Operator surfaces**: op feed, audit log, webhooks, Prometheus `/metrics` with optional OTLP tracing, backup/restore, schema migration with snapshot history and restore, hot-reloaded config, per-database quotas, slow-query ring, and query explain
 
 ### Technical Excellence
@@ -290,9 +290,11 @@ Both serve routes honor HTTP `Range` requests: `Range: bytes=...` → `206 Parti
 | `GET /admin/db/{db}/schema/history` | Bearer admin key | Lists schema-change snapshots newest-first (`?limit=`/`?offset=`). See [Schema change history](#schema-change-history). |
 | `GET /admin/db/{db}/schema/history/{version}` | Bearer admin key | Returns one full schema snapshot by version. |
 | `POST /admin/db/{db}/schema/restore` | Bearer admin key | Reconciles the db to a prior snapshot's shape. Body `{ version, confirm }`, `confirm` = db name. |
-| `POST /admin/mint-token` | Bearer admin key | Mints a machine token scoped to one database. |
+| `POST /admin/mint-token` | Bearer admin key | Mints a machine token scoped to one database. An optional `hostCapability` (e.g. `{"type":"parMeshV1","host":"macdaddy"}`) mints a host-restricted credential instead of an unrestricted one; omitting it keeps legacy semantics. See [Host machine authorization](#host-machine-authorization). |
 | `POST /admin/revoke-token` | Bearer admin key | Revokes a machine token by its id. |
-| `GET /admin/tokens?db=` | Bearer admin key | Lists machine tokens for a database (no secrets). |
+| `GET /admin/tokens?db=` | Bearer admin key | Lists machine tokens for a database (no secrets); each row carries `hostCapability` when the token has one. |
+| `POST /admin/enrollment-grants` | Bearer admin key | Creates a host machine authorization enrollment grant. Body `{db, name, capability, expiresAt, tokenExpiresAt?}` — `expiresAt` must be in the future and at most 15 minutes out. The response `{grantId, grant, db, capability, expiresAt}` returns the plaintext grant **exactly once**; only its SHA-256 digest is stored. Redeemed by the host via the public `POST /auth/enroll`. |
+| `POST /admin/revoke-enrollment-grant` | Bearer admin key | Revokes a pending enrollment grant by id (`{grantId}`); 404 for an unknown id. |
 | `GET /admin/allowlist?db=` | Bearer admin key | Lists the emails allowlisted for a database. |
 | `POST /admin/allowlist` | Bearer admin key | Adds or removes an email from a database's allowlist. |
 | `GET /admin/admins` | Bearer admin key | Lists the server-wide OAuth admin allowlist (`rtdb_auth.admins`). |
@@ -392,6 +394,7 @@ setup (callback URLs, scopes, env-var pairs).
 | `GET /auth/me` | Bearer session | Returns the authenticated user. 401 for a machine token (session only). |
 | `GET /auth/validate` | Bearer token | Validates a presented session or machine token; returns the `AuthedUser`. Used by backends to check a player-supplied token. |
 | `POST /auth/anonymous` | none | Mints an ephemeral anonymous user + session for a credential-less guest (gated by `RTDB_AUTH_ANONYMOUS_ENABLED`, default off ⇒ `403 FORBIDDEN`; a per-db toggle — `GET|PATCH /admin/db/{db}/anonymous-access`, SEC-103 — must also allow it). Sets the `HttpOnly` session cookie (browser path) **and** returns the plaintext session token in the body (SDK/bearer path — pass it as the WS/HTTP bearer, exactly like a machine token). Per-IP rate-limited; an anonymous user is authorized for any database via that boot gate (no allowlist entry) and owns its own documents via per-row `ownerField` (the anon `user_id`). On a later OAuth sign-in with that session's bearer presented at `/begin`, the anon footprint is merged into the real account — owned docs across all databases restamped, storage blob ownership swapped, the live session re-pointed — via `merge::merge_users` (`rtdb_merge_docs_total` counts restamped docs); `POST /admin/merge-users` is the operator escape hatch. |
+| `POST /auth/enroll` | none (grant) | Redeems a one-time enrollment grant for a host-scoped machine credential — see [Host machine authorization](#host-machine-authorization). |
 
 The live login flow (SEC-012): the browser hits `GET /auth/{provider}/begin` →
 opens the provider authorize URL in a `noopener,noreferrer` popup (reverse-tabnabbing
@@ -410,11 +413,77 @@ provider's stable subject (`github_id`, `apple_sub`, `microsoft_sub`,
 `google_sub`, `gitlab_id`, `oidc_sub`), with the verified email linking an
 account across providers on a first login.
 
-Bearer tokens are either a per-database **machine token** (minted via `/admin/mint-token`)
-or a **session token** (minted by completing an OAuth flow). Both resolve through the same
+Bearer tokens are either a per-database **machine token** (minted via `/admin/mint-token`,
+optionally carrying a host capability) or a **session token** (minted by completing an OAuth
+flow). Both resolve through the same
 `Authorization: Bearer <token>` header on `/api/*`, `/auth/*`, and the WS `auth` frame. The
 WS handler and admin re-auth paths re-run on every op (revocation and expiry take effect on
 open connections — see [Known MVP limitations](#known-mvp-limitations)).
+
+#### Host machine authorization
+
+An optional, versioned **host capability** on a machine token —
+`hostCapability: {"type":"parMeshV1","host":"macdaddy"}` — turns the credential into a
+representation of one authenticated host: agents on the same host intentionally trust each
+other, and the token's document access is restricted to the par-mesh `agents`/`messages`
+contract below. The host follows par-mesh's component grammar
+(`^[a-z0-9][a-z0-9-_]{0,31}$` — lowercase ASCII letters/digits, then lowercase
+letters/digits/hyphens/underscores, at most 32 characters); unknown capability types and
+extra capability properties fail validation. The database binding stays the token's existing
+per-database scope: a restricted token cannot become an admin, and `readOnly`/`tables`
+scoping still composes on top without broadening the capability. Legacy tokens (no
+capability) keep their exact existing semantics. Spec:
+[`docs/superpowers/specs/2026-10-21-host-machine-auth-design.md`](docs/superpowers/specs/2026-10-21-host-machine-auth-design.md).
+
+**Enrollment.** `POST /admin/enrollment-grants` creates a grant fixed to a database, token
+name, and capability, with an explicit `expiresAt` no more than 15 minutes out; the response
+returns the plaintext `grant` exactly once and only its SHA-256 digest is stored — the same
+one-time-plaintext contract as machine tokens. The host redeems it with the public,
+unauthenticated `POST /auth/enroll`, whose body accepts **only** `{"grant": "..."}` (no
+host, database, capability, or scope override). In one SQL transaction the server claims one
+unexpired/unrevoked/unredeemed grant and inserts exactly one restricted machine credential,
+returning `{tokenId, token, db, capability}` after commit. Concurrent redemptions of one
+grant yield at most one success; an unknown, expired, revoked, or already-redeemed grant all
+get the same generic 401. The grant plaintext and the minted token are never logged. If the
+successful response is lost, the plaintext is unrecoverable by design: the admin issues
+another grant and revokes the orphaned token via the existing `/admin/revoke-token` API.
+
+**Restricted surface — `agents` and `messages` only, failing closed** when the pushed
+schema lacks the expected fields:
+
+- **Directory (`agents`)**: every scoped host can read the whole directory — scans,
+  aggregates, direct-ID queries, and subscriptions. Insert and patch are own-host only: both
+  the previous and the resulting row must belong to the authenticated host, `addr` must
+  parse as `name@host:project` whose host exactly matches both the credential and the row's
+  `host` (with `name`/`project` matching the row's declared values), and wildcard agent
+  names are rejected. A patch cannot transfer an agent between hosts. All other agent
+  mutation forms — replace, delete, undelete, upsert, counters, bulk operations — are
+  denied.
+- **Messages**: a message is readable by the recipient host (`host`) or the host parsed from
+  `from_addr`; invalid or inconsistent routing rows are invisible to restricted readers.
+  Insert (cross-host sends are explicitly permitted) requires a concrete, valid `from_addr`
+  belonging to the authenticated host; a concrete, valid `target` whose parsed host equals
+  the row's `host`; a valid `to_addr` (concrete or wildcard) whose host and project match
+  the target; `state = "queued"`, `delivered_ms = 0`, `acked_ms = 0`, `ack_note = ""`; and a
+  valid priority (`next-turn` or `interrupt`). Routing, content, sender, message identity,
+  trace, and `_creationTime` become immutable to restricted tokens after insertion. Only the
+  recipient host may patch a message, with exactly one of two receipt shapes: queued →
+  delivered (`state = "delivered"` plus a finite positive `delivered_ms`) or queued/delivered
+  → acked (`state = "acked"` plus a finite positive `acked_ms` and string `ack_note`).
+  Rewriting a completed receipt, extra fields, arbitrary state transitions, and sender-side
+  forged receipts are rejected. Every other message mutation variant is denied.
+- **Everything else is denied** for a `parMeshV1` credential: schedules and workflows (nested
+  and standalone), presence, storage/blob operations, change feeds, and all other
+  non-document surfaces. `expectFields`/`expectVersion`/`expectAbsent` preconditions enforce
+  the same read visibility (an invisible row is indistinguishable from absent) without
+  conferring mutation rights. The existing live machine-token revocation/expiry gate covers
+  every REST and WS operation **including pushes into already-open subscriptions** — a
+  restricted subscription whose token is revoked or expired stops receiving data, not just
+  losing the ability to issue new requests.
+
+Deployment rollout constraints (legacy-token bypass, the all-replicas-upgraded
+prerequisite, and the mutation replay-cache generation bump): see
+[deploy/README.md](deploy/README.md#host-machine-authorization-rollout).
 
 ## Configuration
 
@@ -1474,7 +1543,7 @@ plus an operator SPA and a CLI built on top of them:
 * **Core**: realtime live queries, atomic multi-step transactions, typed schemas compiled to Postgres DDL, WebSocket + HTTP transports, many databases per instance
 * **Query terminals**: `get`/`index`/`count`/`unique`/`first`/`take`, `filter` predicate DSL, full-text `search` (`ts_rank` + `trgm` mode), `vectorSearch` (pgvector), `hybridSearch` (RRF), `paginate` keyset pagination, `distinct`, `aggregate`
 * **Beyond documents**: scheduling (`afterMs`/`runAt`/`cron`/`interval`), durable workflows, realtime presence, file storage with signed URLs and image transforms
-* **Auth**: six optional OAuth providers, per-db machine tokens, optional anonymous with anon→real merge, per-row `ownerField`/`authorize` rules
+* **Auth**: six optional OAuth providers, per-db machine tokens plus optional host-scoped machine credentials with enrollment grants, optional anonymous with anon→real merge, per-row `ownerField`/`authorize` rules
 * **Operations**: operator dashboard, `rtdb` CLI, op feed, audit log, webhooks, Prometheus metrics + optional OTLP tracing, backup/restore, schema migration with snapshot history, hot config, per-db quotas
 * [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) is the authoritative Convex-parity contract
 

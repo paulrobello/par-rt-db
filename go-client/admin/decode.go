@@ -520,6 +520,17 @@ func (d *WebhookDelivery) UnmarshalJSON(bts []byte) error {
 }
 
 // UnmarshalJSON rejects unknown fields.
+func (g *EnrollmentGrant) UnmarshalJSON(bts []byte) error {
+	type alias EnrollmentGrant
+	v, err := wire.StrictUnmarshal[alias](bts)
+	if err != nil {
+		return err
+	}
+	*g = EnrollmentGrant(v)
+	return nil
+}
+
+// UnmarshalJSON rejects unknown fields.
 func (m *MetricsSnapshot) UnmarshalJSON(bts []byte) error {
 	type alias MetricsSnapshot
 	v, err := wire.StrictUnmarshal[alias](bts)

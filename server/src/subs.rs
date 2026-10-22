@@ -827,10 +827,83 @@ struct SubEntry {
     /// `Some` = re-run this subscription's query filtered to that user's rows,
     /// and (Task 6+) resolve `$email` markers against this identity.
     principal_ctx: PrincipalCtx,
+    live_host_principal: Option<crate::auth::Principal>,
 }
 
 /// One database's subscriptions, keyed by `(connection, queryId)`.
 type DbSubs = HashMap<(ConnId, String), SubEntry>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostLive {
+    Live,
+    Dead,
+    Transient,
+}
+
+fn host_token(entry: &SubEntry) -> Option<&str> {
+    match entry.live_host_principal.as_ref()? {
+        crate::auth::Principal::Machine { token_id, .. } => Some(token_id),
+        _ => None,
+    }
+}
+
+async fn host_liveness<F, Fut>(
+    entries: &DbSubs,
+    _db: &str,
+    mut check: F,
+) -> HashMap<String, HostLive>
+where
+    F: FnMut(crate::auth::Principal) -> Fut,
+    Fut: std::future::Future<Output = Result<(), RtDbError>>,
+{
+    let principals: HashMap<_, _> = entries
+        .values()
+        .filter_map(|entry| {
+            Some((
+                host_token(entry)?.to_owned(),
+                entry.live_host_principal.clone()?,
+            ))
+        })
+        .collect();
+    futures::stream::iter(principals)
+        .map(|(id, principal)| {
+            let future = check(principal);
+            async move {
+                let live = match future.await {
+                    Ok(()) => HostLive::Live,
+                    Err(error)
+                        if matches!(
+                            error.code,
+                            crate::error::ErrorCode::Unauthorized
+                                | crate::error::ErrorCode::Forbidden
+                        ) =>
+                    {
+                        HostLive::Dead
+                    }
+                    Err(_) => HostLive::Transient,
+                };
+                (id, live)
+            }
+        })
+        .buffer_unordered(FAN_OUT_CONCURRENCY)
+        .collect()
+        .await
+}
+
+fn apply_host_liveness(entries: &mut DbSubs, states: &HashMap<String, HostLive>) {
+    // Definitive revocation/expiry is terminal. Database failures only suppress
+    // this pass's pushes; retain subscriptions so a transient outage can recover.
+    entries.retain(|_, entry| {
+        host_token(entry).is_none_or(|id| states.get(id) != Some(&HostLive::Dead))
+    });
+}
+
+fn host_may_push(entry: &SubEntry, states: &HashMap<String, HostLive>) -> bool {
+    if entry.principal_ctx.host_capability.is_none() {
+        return true;
+    }
+    host_token(entry).is_some_and(|id| states.get(id) == Some(&HostLive::Live))
+}
 
 /// Registered live-query subscriptions, sharded per database. Each database's
 /// subscriptions live behind its own `Arc<Mutex<DbSubs>>`, so a per-db
@@ -856,6 +929,7 @@ type DbSubs = HashMap<(ConnId, String), SubEntry>;
 /// them costs nothing measurable.
 pub struct SubscriptionManager {
     subs: Mutex<HashMap<String, Arc<Mutex<DbSubs>>>>,
+    host_principals: Mutex<HashMap<ConnId, crate::auth::Principal>>,
     /// Where `fan_out` records skip/re-run effectiveness and verification
     /// outcomes. `None` = don't record (the bare `new()` used by tests that
     /// assert nothing about instrumentation).
@@ -917,6 +991,7 @@ impl SubscriptionManager {
     ) -> Arc<Self> {
         Arc::new(Self {
             subs: Mutex::new(HashMap::new()),
+            host_principals: Mutex::new(HashMap::new()),
             metrics,
             verify_skip_every,
             skip_seq: AtomicU64::new(0),
@@ -970,7 +1045,41 @@ impl SubscriptionManager {
         // would orphan a concurrently-registered subscription.
     }
 
+    pub(crate) async fn authorize_host_push(
+        &self,
+        pool: &PgPool,
+        db: &str,
+        conn: ConnId,
+        ctx: &PrincipalCtx,
+    ) -> Result<(), RtDbError> {
+        if ctx.host_capability.is_none() {
+            return Ok(());
+        }
+        let principal = self
+            .host_principals
+            .lock()
+            .await
+            .get(&conn)
+            .cloned()
+            .ok_or_else(|| RtDbError::forbidden("host subscription requires live identity"))?;
+        crate::auth::authorize(pool, &principal, db).await
+    }
+
+    pub(crate) async fn bind_host_principal(
+        &self,
+        conn: ConnId,
+        principal: &crate::auth::Principal,
+    ) {
+        if principal.row_ctx().host_capability.is_some() {
+            self.host_principals
+                .lock()
+                .await
+                .insert(conn, principal.clone());
+        }
+    }
+
     pub async fn remove_conn(&self, db: &str, conn: ConnId) {
+        self.host_principals.lock().await.remove(&conn);
         let Some(shard) = self.shard_get(db).await else {
             return;
         };
@@ -1100,6 +1209,12 @@ impl SubscriptionManager {
         initial: &QueryResult,
     ) -> Result<(), RtDbError> {
         authorize_table(&principal_ctx, &query.table)?;
+        let live_host_principal = self.host_principals.lock().await.get(&conn).cloned();
+        if principal_ctx.host_capability.is_some() && live_host_principal.is_none() {
+            return Err(RtDbError::forbidden(
+                "host subscription requires live identity",
+            ));
+        }
         let mut read_set = ReadSet::from_query(&query, table_def);
         if let ReadSet::Ordered(ordered) = &mut read_set {
             ordered.boundary = ordered.boundary_from_result(initial);
@@ -1114,6 +1229,7 @@ impl SubscriptionManager {
                 last,
                 read_set,
                 principal_ctx,
+                live_host_principal,
             },
         );
         Ok(())
@@ -1252,6 +1368,14 @@ impl SubscriptionManager {
             .collect()
             .await;
 
+        // One bounded-concurrency live lookup per credential, after queries and
+        // before publication. No awaited lookups remain in the apply pass.
+        let host_states = host_liveness(&db_subs, db, |principal| async move {
+            crate::auth::authorize(pool, &principal, db).await
+        })
+        .await;
+        apply_host_liveness(&mut db_subs, &host_states);
+
         // Apply pass: identical bookkeeping to the former sequential loop,
         // just driven from the collected results instead of an in-place
         // iteration.
@@ -1327,6 +1451,9 @@ impl SubscriptionManager {
                 }
             };
 
+            if !host_may_push(entry, &host_states) {
+                continue;
+            }
             entry.last = canon;
             let _ = entry.tx.send(ServerMessage::QueryUpdate {
                 query_id: query_id.to_string(),
@@ -1341,6 +1468,52 @@ mod tests {
     use super::*;
     use crate::schema::IndexDef;
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn revoked_host_subscriptions_are_removed_but_transient_errors_retained() {
+        let manager = SubscriptionManager::new();
+        let schema = q(serde_json::json!({"table":"agents"}));
+        let principal = crate::auth::Principal::Machine {
+            db: "test".into(),
+            token_id: "revoked".into(),
+            read_only: false,
+            tables: None,
+            host_capability: Some(crate::auth::host_policy::HostCapability::ParMeshV1 {
+                host: "testhost".into(),
+            }),
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let entry = || SubEntry {
+            query: schema.clone(),
+            tx: tx.clone(),
+            last: "[]".into(),
+            read_set: ReadSet::Table,
+            principal_ctx: principal.row_ctx(),
+            live_host_principal: Some(principal.clone()),
+        };
+        let mut entries = HashMap::from([((1, "a".into()), entry()), ((1, "b".into()), entry())]);
+        let mut checks = 0;
+        let states = host_liveness(&entries, "test", |_| {
+            checks += 1;
+            std::future::ready(Err(RtDbError::internal("temporary")))
+        })
+        .await;
+        assert_eq!(checks, 1);
+        apply_host_liveness(&mut entries, &states);
+        assert_eq!(
+            entries.len(),
+            2,
+            "transient failure must retain subscriptions"
+        );
+        assert!(entries.values().all(|entry| !host_may_push(entry, &states)));
+        let states = host_liveness(&entries, "test", |_| {
+            std::future::ready(Err(RtDbError::unauthorized("revoked")))
+        })
+        .await;
+        apply_host_liveness(&mut entries, &states);
+        assert!(entries.is_empty());
+        drop(manager);
+    }
 
     fn q(value: serde_json::Value) -> Query {
         serde_json::from_value(value).expect("parse query")

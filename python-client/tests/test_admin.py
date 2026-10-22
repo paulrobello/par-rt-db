@@ -19,6 +19,7 @@ from typing import Any
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from par_rt_db import AfterMs, Cron, Mutation, TableQuery, t
 from par_rt_db.admin import (
@@ -44,7 +45,12 @@ from par_rt_db.admin import (
     Webhook,
     WebhookDelivery,
 )
-from par_rt_db.admin_models import MergeConflict, MergeDbResult
+from par_rt_db.admin_models import (
+    EnrollmentGrant,
+    HostCapability,
+    MergeConflict,
+    MergeDbResult,
+)
 from par_rt_db.errors import ErrorCode, RtDbError
 from par_rt_db.http_client import FileMetadata, SubscriptionInfo
 from par_rt_db.schema import Schema
@@ -210,6 +216,150 @@ def test_mint_token_omits_expiresat_and_tables_when_none() -> None:
     assert captured["body"] == {"db": "dbx", "name": "ci", "readOnly": False}
     assert "expiresAt" not in captured["body"]
     assert "tables" not in captured["body"]
+
+
+# --- host machine authorization (hostCapability + enrollment grants) ------
+
+
+CAPABILITY: dict[str, Any] = {"type": "parMeshV1", "host": "macdaddy"}
+
+
+def test_host_capability_round_trip() -> None:
+    cap = HostCapability.model_validate(CAPABILITY)
+    assert cap.type == "parMeshV1"
+    assert cap.host == "macdaddy"
+    assert cap.model_dump(by_alias=True) == CAPABILITY
+    # construction carries the tag verbatim; serialization always does too
+    assert HostCapability(type="parMeshV1", host="macdaddy").model_dump(by_alias=True) == CAPABILITY
+
+
+def test_host_capability_strict_parse_rejects_unknown_type_field_and_host() -> None:
+    with pytest.raises(ValidationError):
+        HostCapability.model_validate({"type": "parMeshV0", "host": "macdaddy"})
+    with pytest.raises(ValidationError):
+        HostCapability.model_validate({"type": "parMeshV1", "host": "macdaddy", "extra": True})
+    with pytest.raises(ValidationError):
+        HostCapability.model_validate({"type": "parMeshV1", "host": "Bad Host"})
+    with pytest.raises(ValidationError):
+        HostCapability.model_validate({"host": "macdaddy"})
+
+
+def test_token_info_host_capability_is_absent_optional() -> None:
+    legacy = {
+        "id": "t1",
+        "name": "scraper",
+        "createdAt": 500,
+        "revoked": False,
+    }
+    info = TokenInfo.model_validate(legacy)
+    assert info.host_capability is None
+    # a legacy caller dumping the row never sees the new key
+    assert "hostCapability" not in info.model_dump(by_alias=True, exclude_none=True)
+    hosted = TokenInfo.model_validate({**legacy, "hostCapability": CAPABILITY})
+    assert hosted.host_capability == HostCapability(type="parMeshV1", host="macdaddy")
+    assert hosted.model_dump(by_alias=True, exclude_none=True)["hostCapability"] == CAPABILITY
+
+
+def test_mint_token_posts_host_capability_only_when_set() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"tokenId": "id3", "token": "t"})
+
+    with _sync_client(handler) as c:
+        c.mint_token("dbx", "h", host_capability=HostCapability(type="parMeshV1", host="macdaddy"))
+    assert captured["body"]["hostCapability"] == CAPABILITY
+    # legacy regression: absence serializes WITHOUT the new key
+    with _sync_client(handler) as c:
+        c.mint_token("dbx", "h")
+    assert "hostCapability" not in captured["body"]
+
+
+def test_create_enrollment_grant_posts_and_parses_response() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "grantId": "g1",
+                "grant": "one-time-secret",
+                "db": "app",
+                "capability": CAPABILITY,
+                "expiresAt": 1761100000000,
+            },
+        )
+
+    with _sync_client(handler) as c:
+        grant = c.create_enrollment_grant(
+            "app",
+            "macdaddy-enroll",
+            HostCapability(type="parMeshV1", host="macdaddy"),
+            expires_at=1761100000000,
+            token_expires_at=1761100900000,
+        )
+    assert isinstance(grant, EnrollmentGrant)
+    assert grant.grant_id == "g1"
+    assert grant.grant == "one-time-secret"
+    assert grant.db == "app"
+    assert grant.capability == HostCapability(type="parMeshV1", host="macdaddy")
+    assert grant.expires_at == 1761100000000
+    assert captured["request"].method == "POST"
+    assert captured["request"].url.path == "/admin/enrollment-grants"
+    assert captured["request"].headers["authorization"] == ADMIN_BEARER
+    assert captured["request"].headers["x-rtdb-protocol"] == str(PROTOCOL_VERSION)
+    assert captured["body"] == {
+        "db": "app",
+        "name": "macdaddy-enroll",
+        "capability": CAPABILITY,
+        "expiresAt": 1761100000000,
+        "tokenExpiresAt": 1761100900000,
+    }
+
+
+def test_create_enrollment_grant_omits_token_expires_at_when_none() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "grantId": "g1",
+                "grant": "s",
+                "db": "app",
+                "capability": CAPABILITY,
+                "expiresAt": 1761100000000,
+            },
+        )
+
+    with _sync_client(handler) as c:
+        c.create_enrollment_grant(
+            "app",
+            "macdaddy-enroll",
+            HostCapability(type="parMeshV1", host="macdaddy"),
+            expires_at=1761100000000,
+        )
+    assert "tokenExpiresAt" not in captured["body"]
+
+
+def test_revoke_enrollment_grant_posts_grant_id() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    with _sync_client(handler) as c:
+        c.revoke_enrollment_grant("g1")
+    assert captured["request"].method == "POST"
+    assert captured["request"].url.path == "/admin/revoke-enrollment-grant"
+    assert captured["request"].headers["authorization"] == ADMIN_BEARER
+    assert captured["body"] == {"grantId": "g1"}
 
 
 # --- sync: revoke_token ---------------------------------------------------
@@ -542,6 +692,55 @@ async def test_async_revoke_token_posts_token_id() -> None:
     async with _async_client(handler) as c:
         await c.revoke_token("tid")
     assert captured["body"] == {"tokenId": "tid"}
+
+
+async def test_async_create_enrollment_grant_mirrors_sync() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        captured["auth"] = request.headers["authorization"]
+        return httpx.Response(
+            200,
+            json={
+                "grantId": "g1",
+                "grant": "one-time-secret",
+                "db": "app",
+                "capability": CAPABILITY,
+                "expiresAt": 1761100000000,
+            },
+        )
+
+    async with _async_client(handler) as c:
+        grant = await c.create_enrollment_grant(
+            "app",
+            "macdaddy-enroll",
+            HostCapability(type="parMeshV1", host="macdaddy"),
+            expires_at=1761100000000,
+        )
+    assert isinstance(grant, EnrollmentGrant)
+    assert grant.grant_id == "g1"
+    assert grant.grant == "one-time-secret"
+    assert grant.capability == HostCapability(type="parMeshV1", host="macdaddy")
+    assert captured["auth"] == ADMIN_BEARER
+    assert captured["body"] == {
+        "db": "app",
+        "name": "macdaddy-enroll",
+        "capability": CAPABILITY,
+        "expiresAt": 1761100000000,
+    }
+
+
+async def test_async_revoke_enrollment_grant_mirrors_sync() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    async with _async_client(handler) as c:
+        await c.revoke_enrollment_grant("g1")
+    assert captured["body"] == {"grantId": "g1"}
 
 
 async def test_async_list_tokens_parses_rows() -> None:

@@ -27,6 +27,7 @@ use crate::ddl::pg_schema;
 use crate::dsl::StepTableExt;
 use crate::error::{ErrorCode, RtDbError};
 use crate::schema::SchemaDef;
+use crate::schema::SchemaDefExt;
 
 // ARC-202: the wire types this module used to define live in `dsl.rs` now;
 // re-exported so every `crate::txn::` path (and the integration tests'
@@ -426,7 +427,7 @@ pub async fn execute_txn_with_side(
             let combined = format!(
                 "SELECT set_config('statement_timeout', $1, true), \
                  COALESCE((SELECT read_only FROM rtdb_auth.databases WHERE name = $2), FALSE), \
-                 (SELECT result FROM \"{pg_schema_name}\".mutations \
+                 (SELECT result FROM \"{pg_schema_name}\".mutation_cache_v2 \
                   WHERE mut_id = $3 AND expires_at > $4)"
             );
             let row: (String, bool, Option<serde_json::Value>) = sqlx::query_as(sqlx::AssertSqlSafe(combined))
@@ -467,6 +468,10 @@ pub async fn execute_txn_with_side(
             return Err(RtDbError::precondition("transaction deadline expired"));
         }
         for step in &txn.steps {
+            crate::auth::host_policy::operation(sctx.ctx, step)?;
+            if let Some(table) = step.table() {
+                crate::auth::host_policy::schema_contract(sctx.ctx, table, sctx.schema.table(table)?)?;
+            }
             // ENH-005 Task 4: gate each step against the machine-token table
             // allowlist BEFORE any work. A scoped token cannot write a forbidden
             // table via any step variant. `tables = None` (admin/scheduled/`User`/

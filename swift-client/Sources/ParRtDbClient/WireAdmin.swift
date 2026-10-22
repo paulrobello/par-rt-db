@@ -122,11 +122,18 @@ public struct MintTokenOptions: Equatable, Sendable {
     public var readOnly: Bool?
     /// `tables` allowlist on the wire. nil = all tables (server default).
     public var tables: [String]?
+    /// Host machine authorization: attach a host capability to the minted
+    /// token. nil mints legacy semantics unchanged (the key stays absent).
+    public var hostCapability: HostCapability?
 
-    public init(expiresAt: Int64? = nil, readOnly: Bool? = nil, tables: [String]? = nil) {
+    public init(
+        expiresAt: Int64? = nil, readOnly: Bool? = nil, tables: [String]? = nil,
+        hostCapability: HostCapability? = nil
+    ) {
         self.expiresAt = expiresAt
         self.readOnly = readOnly
         self.tables = tables
+        self.hostCapability = hostCapability
     }
 }
 
@@ -148,6 +155,10 @@ public struct TokenInfo: Equatable, Codable, Sendable {
     public var readOnly: Bool
     /// nil = all tables (defaults nil for older servers).
     public var tables: [String]?
+    /// Host machine authorization: the token's capability, when it carries
+    /// one. The server omits the key entirely (`skip_serializing_if`) for
+    /// legacy tokens — absent, never `null`.
+    public var hostCapability: HostCapability?
 
     public init(
         id: String,
@@ -156,7 +167,8 @@ public struct TokenInfo: Equatable, Codable, Sendable {
         revoked: Bool,
         expiresAt: Int64? = nil,
         readOnly: Bool = false,
-        tables: [String]? = nil
+        tables: [String]? = nil,
+        hostCapability: HostCapability? = nil
     ) {
         self.id = id
         self.name = name
@@ -165,10 +177,12 @@ public struct TokenInfo: Equatable, Codable, Sendable {
         self.expiresAt = expiresAt
         self.readOnly = readOnly
         self.tables = tables
+        self.hostCapability = hostCapability
     }
 
     enum CodingKeys: String, CodingKey {
         case id, name, createdAt, revoked, expiresAt, readOnly, tables
+        case hostCapability
     }
 
     public init(from decoder: Decoder) throws {
@@ -180,6 +194,186 @@ public struct TokenInfo: Equatable, Codable, Sendable {
         expiresAt = try container.decodeIfPresent(Int64.self, forKey: .expiresAt)
         readOnly = try container.decodeIfPresent(Bool.self, forKey: .readOnly) ?? false
         tables = try container.decodeIfPresent([String].self, forKey: .tables)
+        hostCapability = try container.decodeIfPresent(
+            HostCapability.self, forKey: .hostCapability
+        )
+    }
+}
+
+// MARK: - Host machine authorization
+
+/// A versioned, host-scoped capability attached to a machine token, tagged
+/// with a camelCase `"type"` — currently `{"type":"parMeshV1","host":"macdaddy"}`.
+/// `host` is lowercase `[a-z0-9][a-z0-9-_]{0,31}`. Decode is strict — an
+/// unknown type, an extra field, or a malformed host throws — and nothing is
+/// normalized: the host string passes through verbatim. Mirrors
+/// `core/src/host_capability.rs`.
+public enum HostCapability: Equatable, Sendable, Codable {
+    /// The par-mesh host capability: the token represents exactly one
+    /// authenticated host.
+    case parMeshV1(host: String)
+
+    enum CodingKeys: String, CodingKey {
+        case type, host
+    }
+
+    public init(from decoder: Decoder) throws {
+        // Per-variant deny_unknown_fields via the same raw-key pass the WS
+        // protocol types use (Wire.swift's serde-parity helpers).
+        let payload = try taggedEnumPayload("HostCapability", tagKey: "type", from: decoder)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch payload.tag {
+        case "parMeshV1":
+            try rejectUnknownVariantFields(
+                "HostCapability", variant: payload.tag, keys: payload.keys,
+                allowed: ["type", "host"]
+            )
+            let host = try container.decode(String.self, forKey: .host)
+            if let reason = HostCapability.invalidHostReason(host) {
+                throw DecodingError.dataCorrupted(
+                    DecodingError.Context(
+                        codingPath: decoder.codingPath,
+                        debugDescription: reason
+                    )
+                )
+            }
+            self = .parMeshV1(host: host)
+        case let other:
+            throw DecodingError.dataCorrupted(
+                DecodingError.Context(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "HostCapability: unknown capability type '\(other)'"
+                )
+            )
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case let .parMeshV1(host):
+            try container.encode("parMeshV1", forKey: .type)
+            try container.encode(host, forKey: .host)
+        }
+    }
+
+    /// The par-mesh host component grammar `^[a-z0-9][a-z0-9-_]{0,31}$` —
+    /// a lowercase ASCII letter or digit first, then
+    /// lowercase/digit/hyphen/underscore, at most 32 chars total. Returns the
+    /// rejection reason, or nil when valid. Mirrors core's `validate_host`.
+    /// Membership is checked per Unicode scalar, not per `Character` (an
+    /// extended grapheme cluster like `"b\u{0301}"` survives Character-range
+    /// comparisons while being non-ASCII and server-rejected).
+    public static func invalidHostReason(_ host: String) -> String? {
+        func alnum(_ scalar: Unicode.Scalar) -> Bool {
+            (0x61 ... 0x7A).contains(scalar.value) || (0x30 ... 0x39).contains(scalar.value)
+        }
+
+        func rest(_ scalar: Unicode.Scalar) -> Bool {
+            alnum(scalar) || scalar == "-" || scalar == "_"
+        }
+        guard let first = host.unicodeScalars.first, alnum(first),
+              host.unicodeScalars.count <= 32,
+              host.unicodeScalars.dropFirst().allSatisfy(rest)
+        else {
+            return "invalid host '\(host)': expected ^[a-z0-9][a-z0-9-_]{0,31}$"
+        }
+        return nil
+    }
+}
+
+/// Request body for `RtDbAdminClient.createEnrollmentGrant`
+/// (`POST /admin/enrollment-grants`). `db`, `name`, `capability`, and
+/// `expiresAt` are required; `tokenExpiresAt` (ms epoch) is optional and
+/// omitted from the body when nil — the server denies unknown fields.
+public struct CreateEnrollmentGrantOptions: Equatable, Encodable, Sendable {
+    /// The database the minted token is bound to.
+    public var db: String
+    /// Operator-assigned label.
+    public var name: String
+    /// The host capability the minted token carries.
+    public var capability: HostCapability
+    /// Grant expiry, epoch ms (absolute).
+    public var expiresAt: Int64
+    /// Optional cap on the minted token's lifetime, epoch ms.
+    public var tokenExpiresAt: Int64?
+
+    public init(
+        db: String, name: String, capability: HostCapability,
+        expiresAt: Int64, tokenExpiresAt: Int64? = nil
+    ) {
+        self.db = db
+        self.name = name
+        self.capability = capability
+        self.expiresAt = expiresAt
+        self.tokenExpiresAt = tokenExpiresAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case db, name, capability, expiresAt, tokenExpiresAt
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(db, forKey: .db)
+        try container.encode(name, forKey: .name)
+        try container.encode(capability, forKey: .capability)
+        try container.encode(expiresAt, forKey: .expiresAt)
+        try container.encodeIfPresent(tokenExpiresAt, forKey: .tokenExpiresAt)
+    }
+}
+
+/// Response from `createEnrollmentGrant`. `grant` is the one-time plaintext —
+/// shown once, never persisted in plaintext server-side.
+public struct EnrollmentGrant: Equatable, Codable, Sendable {
+    /// The grant's stable id (for revoke).
+    public var grantId: String
+    /// The one-time plaintext grant secret.
+    public var grant: String
+    /// The database the minted token is bound to.
+    public var db: String
+    /// The capability the minted token carries.
+    public var capability: HostCapability
+    /// Grant expiry, epoch ms.
+    public var expiresAt: Int64
+
+    public init(
+        grantId: String, grant: String, db: String,
+        capability: HostCapability, expiresAt: Int64
+    ) {
+        self.grantId = grantId
+        self.grant = grant
+        self.db = db
+        self.capability = capability
+        self.expiresAt = expiresAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case grantId, grant, db, capability, expiresAt
+    }
+}
+
+/// Response from `RtDbAdminClient.enroll` (`POST /auth/enroll`) after
+/// redeeming a one-time grant.
+public struct EnrollResult: Equatable, Codable, Sendable {
+    /// The minted token's stable id.
+    public var tokenId: String
+    /// The plaintext bearer token.
+    public var token: String
+    /// The database the token is bound to.
+    public var db: String
+    /// The capability the token carries.
+    public var capability: HostCapability
+
+    public init(tokenId: String, token: String, db: String, capability: HostCapability) {
+        self.tokenId = tokenId
+        self.token = token
+        self.db = db
+        self.capability = capability
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case tokenId, token, db, capability
     }
 }
 

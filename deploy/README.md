@@ -14,6 +14,7 @@ VPS and no reverse proxy is needed — TLS is terminated at Cloudflare's edge.
 - [One-time DNS/tunnel wiring (already done 2026-07-21)](#one-time-dnstunnel-wiring)
 - [Deploy / update](#deploy--update)
 - [Topology: single instance by default; multi-instance is opt-in](#topology-single-instance-by-default-multi-instance-is-opt-in)
+- [Host machine authorization rollout](#host-machine-authorization-rollout)
 - [Postgres image](#postgres-image)
 - [Collation](#collation)
 - [Subscription-invalidation observability](#subscription-invalidation-observability)
@@ -210,6 +211,32 @@ When `RTDB_MULTI_INSTANCE=true`, also set `RTDB_INSTANCE_ID` to a stable,
 distinct value per replica (e.g. `rtdb-a`, `rtdb-b`): NOTIFY self-dedupe works
 with an auto-generated id, but a stable id makes logs and diagnostics easier to
 correlate across replicas.
+
+## Host machine authorization rollout
+
+Host-scoped machine credentials (`hostCapability`, e.g.
+`{"type":"parMeshV1","host":"macdaddy"}`; surface documented in the main
+[README](../README.md#host-machine-authorization)) carry three operational
+constraints:
+
+1. **Legacy machine tokens bypass all row restrictions until you cut them
+   over.** A token minted without a capability keeps its exact legacy
+   unrestricted semantics — there is no automatic cutover, rotation, or
+   retirement. Deploying this version enables the capability; moving consumers
+   onto restricted credentials (mint with `hostCapability`, or enroll via a
+   grant) and retiring the legacy tokens is an explicit operator action.
+2. **All replicas must run this version before restricted credentials are
+   issued.** Under `RTDB_MULTI_INSTANCE`, an older lease owner would deserialize
+   a forwarded write's capability and ignore it, executing the write
+   unrestricted. Upgrade every replica first; only then mint or accept
+   restricted credentials.
+3. **The mutation replay cache is now generation v2.** Idempotency identities
+   encode the structured authorization identity (`[host_capability, tables,
+   key]`) instead of the legacy raw key, so old cache rows are never read by
+   this generation. Upgrade all replicas in one window and quiesce client
+   retries during it, or accept possible one-time double-application of
+   in-flight legacy retries across the upgrade (bounded by the dedup TTL,
+   five minutes by default).
 
 ## Postgres image
 

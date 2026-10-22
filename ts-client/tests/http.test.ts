@@ -407,6 +407,27 @@ describe("RtDbHttpClient", () => {
     });
   });
 
+  it("validateSessionToken rejects an empty token locally WITHOUT calling fetch (F8)", async () => {
+    // An empty bearer trims to "Bearer" on the wire; the server's prefix check
+    // then fails and the request falls back to ambient cookie identity — the
+    // caller asked to validate an explicit credential, so fail before any
+    // request instead. The mock FAILS the test if it is ever called.
+    const fetchMock = vi.fn().mockRejectedValue(new Error("fetch must not be called"));
+    const client = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+
+    await expect(client.validateSessionToken("")).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "BAD_REQUEST",
+      message: "auth validate requires a non-empty token",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("validateSessionToken tolerates a response omitting the github fields", async () => {
     const fetchMock = vi
       .fn()

@@ -73,7 +73,7 @@ impl UsageCache {
              FROM pg_class c \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE n.nspname = $1 AND c.relkind = 'r' \
-               AND c.relname NOT IN ('meta','mutations','scheduled_txns','schema_history')",
+               AND c.relname NOT IN ('meta','mutations','mutation_cache_v2','scheduled_txns','schema_history')",
         )
         .bind(&schema)
         .fetch_one(pool)

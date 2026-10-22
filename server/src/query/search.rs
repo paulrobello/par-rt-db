@@ -299,6 +299,12 @@ pub(crate) fn compile_search(
         extra.push_str(" AND ");
         extra.push_str(&frag);
     }
+    if let Some(frag) =
+        crate::auth::host_policy::sql_visibility(sctx.table_name, ctx, start, &mut binds)?
+    {
+        extra.push_str(" AND ");
+        extra.push_str(&frag);
+    }
     // FM-33: hide soft-deleted rows from ranked search unless the admin
     // `includeDeleted` pass-through is set. Bindless literal — `limit_ph`
     // below is unaffected.
@@ -564,6 +570,12 @@ pub(crate) fn compile_vector_search(
         extra.push_str(" AND ");
         extra.push_str(&frag);
     }
+    if let Some(frag) =
+        crate::auth::host_policy::sql_visibility(sctx.table_name, ctx, start, &mut binds)?
+    {
+        extra.push_str(" AND ");
+        extra.push_str(&frag);
+    }
     // FM-33: hide soft-deleted rows from vector ranking unless the admin
     // `includeDeleted` pass-through is set. Bindless literal — `qvec_ph`/`
     // `limit_ph` below are unaffected.
@@ -815,6 +827,12 @@ pub(crate) fn compile_hybrid_search(
         auth_binds.push(EqBind::Text(uid.to_string()));
     }
     if let Some(frag) = authorize_predicate_body(table_def, ctx, auth_start, &mut auth_binds)? {
+        auth_clause.push_str(" AND ");
+        auth_clause.push_str(&frag);
+    }
+    if let Some(frag) =
+        crate::auth::host_policy::sql_visibility(sctx.table_name, ctx, auth_start, &mut auth_binds)?
+    {
         auth_clause.push_str(" AND ");
         auth_clause.push_str(&frag);
     }

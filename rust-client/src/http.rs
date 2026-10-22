@@ -1010,6 +1010,30 @@ impl RtDbHttpClient {
         Ok(parsed.user)
     }
 
+    /// Redeem a one-time enrollment grant via `POST /auth/enroll` — the
+    /// public, unauthenticated redemption side of host machine
+    /// authorization. Takes ONLY the grant string: the server denies unknown
+    /// fields, so the database and capability are fixed at grant-creation
+    /// time and cannot be overridden here. Returns the minted machine
+    /// token (`tokenId`/`token` — shown once), its database, and the
+    /// capability the grant fixed. An invalid/expired/revoked/used grant
+    /// surfaces as the generic `UNAUTHORIZED` envelope.
+    pub async fn enroll(
+        &self,
+        grant: &str,
+    ) -> Result<crate::wire::enrollment::RedeemedGrant, RtDbError> {
+        let resp = self
+            .client
+            .post(format!("{}/auth/enroll", self.url))
+            .json(&crate::wire::enrollment::EnrollRequest {
+                grant: grant.to_string(),
+            })
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("enroll request failed: {e}")))?;
+        crate::http_common::deserialize::<crate::wire::enrollment::RedeemedGrant>(resp).await
+    }
+
     /// Poll the durable per-db change feed via
     /// `GET /api/db/{db}/changes` — every committed document op strictly
     /// after `since`, oldest first, with post-image payloads. Machine-token
@@ -2130,6 +2154,64 @@ mod tests {
         assert_eq!(user.kind, UserKind::Machine);
         assert_eq!(user.github_login, None);
         assert_eq!(user.github_id, None);
+    }
+
+    // ---- host machine authorization (public /auth/enroll) -----------------
+
+    #[test]
+    fn enroll_request_serializes_only_the_grant_field() {
+        // The server denies unknown fields on /auth/enroll — the request DTO
+        // must serialize to exactly {grant} with no db/host/capability keys.
+        let body = crate::wire::enrollment::EnrollRequest {
+            grant: "rtdb_enroll_secret".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            json!({"grant": "rtdb_enroll_secret"}),
+        );
+    }
+
+    #[tokio::test]
+    async fn enroll_posts_grant_and_parses_redeemed_grant() {
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/enroll"))
+            .and(body_partial_json(json!({"grant": "rtdb_enroll_secret"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tokenId": "t1",
+                "token": "mach-secret",
+                "db": "app",
+                "capability": {"type": "parMeshV1", "host": "macdaddy"},
+            })))
+            .mount(&server)
+            .await;
+        let redeemed = client.enroll("rtdb_enroll_secret").await.unwrap();
+        assert_eq!(redeemed.token_id, "t1");
+        assert_eq!(redeemed.token, "mach-secret");
+        assert_eq!(redeemed.db, "app");
+        assert_eq!(
+            redeemed.capability,
+            crate::wire::HostCapability::ParMeshV1 {
+                host: "macdaddy".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn enroll_surfaces_unauthorized_envelope() {
+        // Invalid/expired/revoked/used grants all surface as the generic
+        // 401 UNAUTHORIZED envelope, not a leaked reason.
+        let (server, client) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/enroll"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "code": "UNAUTHORIZED",
+                "message": "unauthorized"
+            })))
+            .mount(&server)
+            .await;
+        let err = client.enroll("stale-grant").await.unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Unauthorized);
     }
 
     // `mutate_with_retry` reuses `retry_on_precondition`, so these tests focus on

@@ -472,6 +472,7 @@ async fn scoped_token_cannot_enqueue_forbidden_table() -> anyhow::Result<()> {
         user_id: None,
         email: None,
         tables: Some(vec!["projects".to_string()]),
+        host_capability: None,
         enqueuer: None,
     };
 

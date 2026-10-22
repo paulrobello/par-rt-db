@@ -879,10 +879,15 @@ async fn validate(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
     };
 
     match resolve_bearer(&state.pool, token).await {
-        Ok(principal) => Json(MeResponse {
-            user: authed_user(&principal),
-        })
-        .into_response(),
+        Ok(principal) => {
+            if let Err(error) = crate::auth::host_policy::non_document(&principal.row_ctx()) {
+                return error.into_response();
+            }
+            Json(MeResponse {
+                user: authed_user(&principal),
+            })
+            .into_response()
+        }
         Err(err) => err.into_response(),
     }
 }
@@ -1032,6 +1037,7 @@ pub fn auth_routes() -> Router<Arc<AppState>> {
         .route("/auth/apple/begin", get(provider_begin::<AppleProvider>))
         .route("/auth/apple/callback", post(apple_callback))
         .route("/auth/anonymous", post(anonymous))
+        .route("/auth/enroll", post(crate::auth::enrollment::enroll))
         .route("/auth/state", get(auth_state))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))

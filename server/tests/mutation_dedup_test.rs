@@ -255,7 +255,7 @@ async fn dedup_row_commits_atomically_with_the_write() -> anyhow::Result<()> {
     // the document write.
     let pg_schema = format!("db_{db}");
     let row: (serde_json::Value, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT result, expires_at FROM \"{pg_schema}\".mutations WHERE mut_id = 'atomic-key'"
+        "SELECT result, expires_at FROM \"{pg_schema}\".mutation_cache_v2 WHERE mut_id = '[null,null,\"atomic-key\"]'"
     )))
     .fetch_one(&state.pool)
     .await?;

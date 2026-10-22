@@ -11,6 +11,7 @@
 pub mod engine;
 pub mod field_guard;
 pub mod fields;
+pub mod host_capability;
 pub mod mutation;
 pub mod query;
 pub mod query_combinations;

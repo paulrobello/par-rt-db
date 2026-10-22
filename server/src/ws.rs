@@ -398,6 +398,22 @@ async fn handle_text_frame(
         }
     };
 
+    if fctx.principal.row_ctx().host_capability.is_some()
+        && !matches!(
+            &client_msg,
+            ClientMessage::Subscribe { .. }
+                | ClientMessage::Mutate { .. }
+                | ClientMessage::Unsubscribe { .. }
+                | ClientMessage::Ping
+        )
+    {
+        fail_and_close(
+            socket,
+            RtDbError::forbidden("operation is not permitted by host capability"),
+        )
+        .await;
+        return true;
+    }
     match client_msg {
         ClientMessage::Auth { .. } => {
             fail_and_close(socket, RtDbError::bad_request("unexpected message type")).await;
@@ -563,6 +579,11 @@ async fn handle_subscribe(
 
     match authorize_op(&state.pool, principal, db).await {
         Ok((principal_ctx, _)) => {
+            state
+                .realtime
+                .subs
+                .bind_host_principal(fctx.conn_id, principal)
+                .await;
             if let Err(retry_after_secs) = check_rate_limit(state, principal, db).await {
                 let _ = out_tx.send(ServerMessage::SubscribeErr {
                     query_id,

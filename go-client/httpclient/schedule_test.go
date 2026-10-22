@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	rtdberrors "github.com/paulrobello/par-rt-db/go-client/errors"
 	"github.com/paulrobello/par-rt-db/go-client/wire"
 )
 
@@ -134,5 +135,28 @@ func TestAuthValidateBearsTheTokenBeingValidated(t *testing.T) {
 	}
 	if u.Kind != wire.UserKindUser || u.Email == nil || *u.Email != "a@b.com" {
 		t.Fatalf("user %+v", u)
+	}
+}
+
+// Regression (audit F7, round 2): Go's HTTP layer trims trailing OWS, so a
+// sent `Bearer ` arrives as `Bearer`, fails the server's `"Bearer "` prefix
+// check, and falls through to ambient rtdb_session cookie resolution. An
+// empty token is therefore rejected LOCALLY — no HTTP request at all.
+func TestAuthValidateEmptyTokenFailsLocally(t *testing.T) {
+	contacted := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		contacted <- struct{}{}
+		w.Write([]byte(`{"user":{"kind":"user","email":null,"name":null}}`))
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "d1", "tk")
+	_, err := c.AuthValidate(context.Background(), "")
+	if err == nil || !rtdberrors.IsCode(err, rtdberrors.CodeBadRequest) {
+		t.Fatalf("want local BAD_REQUEST, got %v", err)
+	}
+	select {
+	case <-contacted:
+		t.Fatal("server was contacted for an empty token; must fail locally")
+	default:
 	}
 }

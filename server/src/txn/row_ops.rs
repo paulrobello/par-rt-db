@@ -622,7 +622,7 @@ pub(crate) async fn do_expect_version(
     };
     // Side-channel closure: a doc the caller cannot see is indistinguishable
     // from absent — same not_found outcome, so no version is ever leaked.
-    if !doc_visible_to(&doc, table_def, ctx) {
+    if !doc_visible_to(&doc, table_def, ctx, table_name) {
         return Err(RtDbError::not_found(format!("document '{id}' not found")));
     }
     if actual != expected {

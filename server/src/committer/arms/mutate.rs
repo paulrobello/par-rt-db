@@ -14,6 +14,15 @@ pub(in crate::committer) async fn handle_mutate(
     // An empty string is not a meaningful key (it would be one shared dedup
     // slot for the whole db) — treat it the same as no key at all.
     let idempotency_key = idempotency_key.filter(|key| !key.is_empty());
+    if principal_ctx.host_capability.is_some() {
+        crate::txn::authorize_txn_tables(&principal_ctx, &txn)?;
+    }
+    // Encode EVERY caller class, not just hosts: arbitrary legacy keys cannot
+    // address the host tuple. The cache is transient (default TTL five minutes).
+    // Upgrade all replicas together; old raw cache keys are not retry identities.
+    let idempotency_key = idempotency_key.map(|key| {
+        serde_json::json!([principal_ctx.host_capability, principal_ctx.tables, key]).to_string()
+    });
 
     // Per-database read-only freeze: after the idempotency replay (a retry of
     // an already-committed write returns its cached result, not an error) and
