@@ -514,6 +514,21 @@ limiter also covers inbound WS `Mutate`/`Subscribe` frames (after the per-op
 per-connection WS frame cap (200 msgs/10s, closes the socket) is a separate
 coarse flood valve).
 
+Capacity semantics worth knowing when sizing a bursty consumer: the window is
+a shared wall-clock minute, not a rolling one — `Retry-After` is the seconds
+left in that minute, and a burst is measured against the whole calendar
+minute. The per-token bucket aggregates every connection one machine token
+opens across both transports, so concurrent jobs sharing a token share one
+budget. Measured against the shipped defaults, a recovery-style client
+(fixture replay plus a 100 ms lease poll) peaks near 500 requests in one
+minute — under the 600 default but with little headroom, which is why
+concurrent activity on the same token, not the solo run, is what tips a
+minute into denial. Note one ordering: the WS `Mutate` arm checks the
+limiter before the committer's idempotency-key dedup, so a replayed unacked
+mutation consumes budget even when it dedups to a no-op — a recovery loop
+that retries under load should pace its polling or stagger concurrent work
+rather than expect replays to be free.
+
 ## Multi-instance coordination
 
 Under `RTDB_MULTI_INSTANCE` (default false) several server processes share one
