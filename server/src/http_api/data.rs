@@ -17,7 +17,7 @@ use crate::error::RtDbError;
 use crate::http_api::{ApiJson, authed};
 use crate::metrics::SlowQueryRecord;
 use crate::query::{Query, QueryResult, compile_query, execute_query};
-use crate::rate_limit::check_http_rate_limits;
+use crate::rate_limit::{check_http_rate_limits, check_http_rate_limits_mutate};
 use crate::txn::Transaction;
 
 #[derive(Deserialize)]
@@ -261,7 +261,13 @@ pub(crate) async fn mutate_handler(
     if principal.is_read_only() {
         return Err(RtDbError::forbidden("read-only token cannot mutate"));
     }
-    check_http_rate_limits(&state, &principal, &body.db).await?;
+    check_http_rate_limits_mutate(
+        &state,
+        &principal,
+        &body.db,
+        body.idempotency_key.as_deref(),
+    )
+    .await?;
 
     let t = Instant::now();
     let outcome = state

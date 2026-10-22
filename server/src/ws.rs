@@ -25,7 +25,7 @@ use crate::auth::{
 };
 use crate::error::{ErrorCode, RtDbError};
 use crate::protocol::{ClientMessage, ScheduleWhen, ServerMessage, WorkflowSpec, WorkflowStatus};
-use crate::rate_limit::{RateDecision, evaluate};
+use crate::rate_limit::{RateDecision, evaluate, evaluate_mutate};
 use crate::scheduler;
 use crate::subs::{ConnId, next_conn_id};
 use crate::workflows;
@@ -561,6 +561,26 @@ async fn check_rate_limit(state: &AppState, principal: &Principal, db: &str) -> 
     }
 }
 
+/// The [`handle_mutate`] gate: [`evaluate_mutate`] exempts a replayed
+/// idempotency key from the per-token bucket (the committer dedups it to a
+/// no-op, so re-charging it only punishes a recovering client for retrying);
+/// the per-db aggregate still charges it. Same denial reply as
+/// [`check_rate_limit`].
+async fn check_rate_limit_mutate(
+    state: &AppState,
+    principal: &Principal,
+    db: &str,
+    idem_key: Option<&str>,
+) -> Result<(), u32> {
+    if let RateDecision::Denied { retry_after_secs } =
+        evaluate_mutate(state, principal, db, idem_key).await
+    {
+        Err(retry_after_secs)
+    } else {
+        Ok(())
+    }
+}
+
 /// `Subscribe` arm: re-run [`authorize_op`] (SEC-004), check the RPM limiter,
 /// then register the subscription via the committer. The initial-query
 /// duration is timed end to end (channel enqueue → committer queue →
@@ -648,7 +668,9 @@ async fn handle_mutate(
                 });
                 return false;
             }
-            if let Err(retry_after_secs) = check_rate_limit(state, principal, db).await {
+            if let Err(retry_after_secs) =
+                check_rate_limit_mutate(state, principal, db, idempotency_key.as_deref()).await
+            {
                 let _ = out_tx.send(ServerMessage::MutateErr {
                     mut_id,
                     error: RtDbError::rate_limited(retry_after_secs),

@@ -125,6 +125,11 @@ pub struct RateLimiter {
     /// into a `Vec` and releases it *before* the Postgres round trip so the
     /// lock is never held across an `.await`.
     approx: StdMutex<HashMap<RateKey, ApproxEntry>>,
+    /// `(token id, idempotency key) -> minute bucket` of the current window's
+    /// already-submitted mutates, backing [`RateLimiter::mark_idempotent`] /
+    /// [`evaluate_mutate`]. Synchronous uses only, like `approx`; same
+    /// one-bucket lifetime and SEC-112 eviction discipline as the counters.
+    seen_idem: StdMutex<HashMap<(String, String), u64>>,
 }
 
 impl RateLimiter {
@@ -198,6 +203,37 @@ impl RateLimiter {
                 RateDecision::Allowed
             }
         }
+    }
+
+    /// Marks `(token id, idempotency key)` as submitted within the current
+    /// wall-clock minute and returns whether it was already submitted this
+    /// minute — i.e. this mutate is a replay of something this token recently
+    /// sent (see [`evaluate_mutate`]). Entries live for one bucket like the
+    /// counters; on insert at `MAX_BUCKETS`, expired entries are reclaimed
+    /// first and an arbitrary entry is evicted if still at the cap (same
+    /// SEC-112 reasoning as `check`: the key space is caller-controlled, so
+    /// memory must stay bounded under a varying-key flood).
+    pub fn mark_idempotent(&self, token_id: &str, idem_key: &str) -> bool {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let current_bucket = now_secs / 60;
+        let pair = (token_id.to_string(), idem_key.to_string());
+        let mut map = self.seen_idem.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(map.get(&pair), Some(bucket) if *bucket == current_bucket) {
+            return true;
+        }
+        if !map.contains_key(&pair) && map.len() >= MAX_BUCKETS {
+            map.retain(|_, bucket| *bucket >= current_bucket);
+            if map.len() >= MAX_BUCKETS
+                && let Some(stale_key) = map.keys().next().cloned()
+            {
+                map.remove(&stale_key);
+            }
+        }
+        map.insert(pair, current_bucket);
+        false
     }
 
     /// ARC-007 approximate path: deny once `local_delta + last_seen_shared`
@@ -459,7 +495,13 @@ pub async fn evaluate(state: &AppState, principal: &Principal, db: &str) -> Rate
     {
         return RateDecision::Denied { retry_after_secs };
     }
+    evaluate_db(state, db).await
+}
 
+/// The per-db aggregate bucket alone — the ceiling shared by every principal
+/// against one database. The mutate-arm replay exemption in
+/// [`evaluate_mutate`] skips only the per-token bucket, never this one.
+async fn evaluate_db(state: &AppState, db: &str) -> RateDecision {
     let db_limit = state.config.limits.per_db_rpm;
     if db_limit > 0
         && let RateDecision::Denied { retry_after_secs } = state
@@ -470,8 +512,40 @@ pub async fn evaluate(state: &AppState, principal: &Principal, db: &str) -> Rate
     {
         return RateDecision::Denied { retry_after_secs };
     }
-
     RateDecision::Allowed
+}
+
+/// Mutate-arm gate: a replay of an idempotency key this machine token already
+/// submitted within the current minute skips the per-token bucket — the
+/// committer dedups it to a no-op, so charging it again only punishes a
+/// recovering client for retrying (the measured co-op-journal recovery burst
+/// peaks near the 600/min default; see docs/ARCHITECTURE.md). The per-db
+/// aggregate still charges every replay, so a replay flood stays bounded by
+/// the shared ceiling. Marking happens before the checks: even a denied fresh
+/// submit marks its key, so the client's Retry-After-conformant retry of that
+/// same key converges instead of re-denying — that is the bounded loosening
+/// this gate adds (one extra admission per key per window, and only when the
+/// client actually retries with the same key). Multi-instance note: the
+/// seen-key map is per-replica like the local counters — a replay landing on
+/// another replica is charged, never exempted (over-charge, never
+/// under-protect).
+pub async fn evaluate_mutate(
+    state: &AppState,
+    principal: &Principal,
+    db: &str,
+    idem_key: Option<&str>,
+) -> RateDecision {
+    let replay = match (principal, idem_key) {
+        (Principal::Machine { token_id, .. }, Some(key)) if !key.is_empty() => {
+            state.limits.rate_limiter.mark_idempotent(token_id, key)
+        }
+        _ => false,
+    };
+    if replay {
+        evaluate_db(state, db).await
+    } else {
+        evaluate(state, principal, db).await
+    }
 }
 
 /// Per-request HTTP rate-limit gate. Runs after `authorize` so an unauthorized
@@ -486,6 +560,23 @@ pub async fn check_http_rate_limits(
     db: &str,
 ) -> Result<(), RtDbError> {
     match evaluate(state, principal, db).await {
+        RateDecision::Denied { retry_after_secs } => Err(RtDbError::rate_limited(retry_after_secs)),
+        RateDecision::Allowed => Ok(()),
+    }
+}
+
+/// The mutate-arm HTTP gate: same envelope as [`check_http_rate_limits`] but
+/// with the replay exemption (see [`evaluate_mutate`]). Only the single
+/// `/api/mutate` route uses this today — a retried `/api/mutate-batch`
+/// re-pays one token slot per request (the batch gates once per request, not
+/// per entry), which is bounded and left unchanged.
+pub async fn check_http_rate_limits_mutate(
+    state: &AppState,
+    principal: &Principal,
+    db: &str,
+    idem_key: Option<&str>,
+) -> Result<(), RtDbError> {
+    match evaluate_mutate(state, principal, db, idem_key).await {
         RateDecision::Denied { retry_after_secs } => Err(RtDbError::rate_limited(retry_after_secs)),
         RateDecision::Allowed => Ok(()),
     }
@@ -530,6 +621,35 @@ pub async fn check_storage_public_rate_limit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // mark_idempotent backs the mutate-arm replay exemption: the FIRST submit
+    // of a (token, key) pair in a window returns false (fresh, fully charged),
+    // repeats return true (replay, per-token exempt), and the scoping is
+    // per-token and per-key. Minute rollover re-arms — not directly assertable
+    // without waiting a wall-clock minute, so the bucket test below pins the
+    // stored bucket instead.
+    #[test]
+    fn mark_idempotent_first_submit_fresh_then_replay_scoped_to_token_and_key() {
+        let limiter = RateLimiter::default();
+        assert!(!limiter.mark_idempotent("tok", "k"));
+        assert!(limiter.mark_idempotent("tok", "k"));
+        // A second key from the same token, and the same key from a second
+        // token, are both fresh: the exemption is scoped to the pair.
+        assert!(!limiter.mark_idempotent("tok", "k2"));
+        assert!(!limiter.mark_idempotent("other", "k"));
+        // The entry is stored under the current wall-clock minute bucket, so
+        // it expires exactly like a counter bucket on rollover.
+        let now_bucket = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            / 60;
+        let map = limiter.seen_idem.lock().unwrap();
+        assert_eq!(
+            map.get(&("tok".to_string(), "k".to_string())),
+            Some(&now_bucket)
+        );
+    }
 
     // ARC-007: the approximate merge/deny math, isolated from the lock and
     // wall-clock plumbing in `check_approx`.

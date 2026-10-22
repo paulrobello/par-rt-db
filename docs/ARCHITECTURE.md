@@ -523,11 +523,13 @@ budget. Measured against the shipped defaults, a recovery-style client
 (fixture replay plus a 100 ms lease poll) peaks near 500 requests in one
 minute — under the 600 default but with little headroom, which is why
 concurrent activity on the same token, not the solo run, is what tips a
-minute into denial. Note one ordering: the WS `Mutate` arm checks the
-limiter before the committer's idempotency-key dedup, so a replayed unacked
-mutation consumes budget even when it dedups to a no-op — a recovery loop
-that retries under load should pace its polling or stagger concurrent work
-rather than expect replays to be free.
+minute into denial. One ordering the mutate arms add on top: a replay of an
+idempotency key this machine token already submitted within the current
+minute skips the per-token bucket (the committer dedups it to a no-op, so
+re-charging it only punishes a recovering client for retrying), while the
+per-db aggregate still charges it — a replay flood stays bounded by the
+shared ceiling, and a bursty consumer should still pace its polling or
+stagger concurrent work rather than rely on the exemption's headroom.
 
 ## Multi-instance coordination
 

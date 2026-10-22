@@ -345,3 +345,113 @@ async fn per_db_budget_does_not_leak_across_dbs() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// (e) The mutate-arm replay exemption: with the per-token budget exhausted, a
+// replayed IDEMPOTENCY KEY this token already submitted skips the per-token
+// check and reaches the dedup (200 with the recorded outcome), while a fresh
+// key still denies. Scoping is per-token: another token resubmitting the same
+// key string is fresh for it and still denied once its own budget is gone.
+// Mirrors the recovery shape that motivated the exemption (see
+// docs/ARCHITECTURE.md "Transports and rate limiting").
+fn insert_work_item_txn() -> serde_json::Value {
+    json!({"steps": [{"op": "insert", "table": "workItems", "doc": {
+        "projectId": "0".repeat(32),
+        "title": "item",
+        "status": "backlog",
+        "order": 1.0,
+        "completedAt": null
+    }}]})
+}
+
+#[tokio::test]
+async fn replayed_idempotent_mutate_skips_the_per_token_budget() -> anyhow::Result<()> {
+    let state = test_state_with_rate_limits(2, 0).await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let (_, token_a) = mint_token(addr, &name).await;
+    let (_, token_b) = mint_token(addr, &name).await;
+
+    // Token A: first submit charges; the replay of the same key is exempt.
+    let body_a =
+        json!({"db": name, "txn": insert_work_item_txn(), "idempotencyKey": "retry-key-a"});
+    let resp = api_post(addr, "/api/mutate", &token_a, body_a.clone()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let first: serde_json::Value = resp.json().await?;
+    let resp = api_post(addr, "/api/mutate", &token_a, body_a).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let replayed: serde_json::Value = resp.json().await?;
+    assert_eq!(first, replayed, "the replay returns the recorded outcome");
+
+    // One more unique key fills the token's last slot; the next fresh key is
+    // denied — the plain per-token ceiling is intact for fresh writes.
+    let resp = api_post(
+        addr,
+        "/api/mutate",
+        &token_a,
+        json!({"db": name, "txn": insert_work_item_txn(), "idempotencyKey": "unique-1"}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let resp = api_post(
+        addr,
+        "/api/mutate",
+        &token_a,
+        json!({"db": name, "txn": insert_work_item_txn(), "idempotencyKey": "unique-2"}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    let denied: serde_json::Value = resp.json().await?;
+    assert_eq!(denied["code"], json!("RATE_LIMITED"));
+
+    // The denied fresh write's OWN key was marked before the denial, so its
+    // Retry-After-conformant retry converges: same key, admitted, and the
+    // first actual execution of that txn.
+    let resp = api_post(
+        addr,
+        "/api/mutate",
+        &token_a,
+        json!({"db": name, "txn": insert_work_item_txn(), "idempotencyKey": "unique-2"}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // Per-token scoping: token B has its own budget and its own seen keys.
+    let body_b1 = json!({"db": name, "txn": insert_work_item_txn(), "idempotencyKey": "b-1"});
+    let resp = api_post(addr, "/api/mutate", &token_b, body_b1.clone()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let resp = api_post(addr, "/api/mutate", &token_b, body_b1).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "token B replays its own key"
+    );
+    let resp = api_post(
+        addr,
+        "/api/mutate",
+        &token_b,
+        json!({"db": name, "txn": insert_work_item_txn(), "idempotencyKey": "b-2"}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let resp = api_post(
+        addr,
+        "/api/mutate",
+        &token_b,
+        json!({"db": name, "txn": insert_work_item_txn(), "idempotencyKey": "b-3"}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+
+    // Resubmitting token A's key with token B is fresh for B, and B's budget
+    // is already exhausted, so it denies.
+    let resp = api_post(
+        addr,
+        "/api/mutate",
+        &token_b,
+        json!({"db": name, "txn": insert_work_item_txn(), "idempotencyKey": "retry-key-a"}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+
+    Ok(())
+}
