@@ -400,6 +400,8 @@ loss is `DROP TABLE` for tables absent from the target snapshot, and migrate dat
 | `PUT /admin/db/{db}/webhooks/{id}` | Bearer admin key | Edits a webhook. |
 | `DELETE /admin/db/{db}/webhooks/{id}` | Bearer admin key | Deletes a webhook. |
 | `GET /admin/db/{db}/webhooks/{id}/deliveries` | Bearer admin key | Lists recent delivery attempts (outbox drain) for a webhook. |
+| `POST /admin/db/{db}/webhooks/{id}/deliveries/{delivery_id}/redeliver` | Bearer admin key | Re-enqueues a failed (attempts-exhausted) delivery: resets attempts and re-pends it for the outbox drain. A pending/retrying/delivered delivery is `409 CONFLICT` (never double-fired); unknown id `404`. Returns the updated delivery row. |
+| `POST /admin/db/{db}/webhooks/{id}/deliveries/redeliver-failed` | Bearer admin key | Bulk form: re-enqueues every failed delivery of the webhook, returning the reset rows in delivery-id order (empty array when none). |
 | `GET /admin/metrics` | Bearer admin key | Live gauges and throughput. |
 | `GET /admin/ops/recent` | Bearer admin key | Recent document-mutation op feed (durable). |
 | `GET /admin/audit?db=&limit=&offset=` | Bearer admin key | Audit log entries (`ts_ms, db, table, op, doc_id, principal, source`) — only when `RTDB_AUDIT_LOG_ENABLED=true`; 404 otherwise. |
@@ -1649,7 +1651,7 @@ plus an operator SPA and a CLI built on top of them:
 - [`swift-client/`](swift-client/README.md) — `ParRtDbClient`/`ParRtDbUI` (Swift 6, iOS 17+/macOS 14): wire + query/mutation/schema DSL + HTTP + reactive WS + SwiftUI `LiveQuery`, plus the admin client, presence, optimistic updates, and the in-memory engine (see its README's coverage table).
 - [`go-client/`](go-client/README.md) — `github.com/paulrobello/par-rt-db/go-client` (Go 1.23+): wire + schema DSL + typed HTTP queries + reactive WS + admin client + the in-memory engine, stdlib-only outside `coder/websocket`.
 - [`dashboard/`](dashboard/README.md) — the operator console SPA (admin/operator UI served same-origin at `RTDB_STATIC_DIR`; consumes `ts-client`).
-- [`cli/`](cli/README.md) — `rtdb` operator/CI binary (wraps `par-rt-db-client`).
+- [`cli/`](cli/README.md) — `rtdb` operator/CI binary (wraps `par-rt-db-client`). `rtdb changes --db <db> [--since <seq>] [--limit <n>] [--follow]` prints one page of durable change ops as compact NDJSON, with the `nextSeq` cursor on stderr. Omit `--since` to start at the current head, or pass `--since 0` for the oldest retained ops. `--follow` polls every two seconds until Ctrl-C; `CURSOR_EXPIRED` exits non-zero without silently resyncing. Supply `RTDB_URL` and `RTDB_TOKEN` (machine token).
 
 [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) tracks parity vs. Convex, with per-row notes on which clients mirror each feature.
 

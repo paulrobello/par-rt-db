@@ -122,6 +122,31 @@ alter observable behavior on upgrade.
 
 ### Added
 
+- **Webhook delivery redelivery.** `POST /admin/db/{db}/webhooks/{id}/deliveries/{delivery_id}/redeliver`
+  re-enqueues a failed (attempts-exhausted) delivery — one conditional UPDATE,
+  so pending/retrying/delivered rows are a typed `CONFLICT` and concurrent
+  redelivers can never double-fire — plus a bulk `POST …/deliveries/redeliver-failed`.
+  Mirrored in all five admin clients and the dashboard deliveries panel.
+
+- **`rtdb changes` CLI subcommand** (FEATURE_MATRIX #40). Tails the durable
+  per-db change feed as NDJSON: one compact JSON line per op on stdout, the
+  `nextSeq` cursor on stderr, `--since`/`--limit`/`--follow` (bounded 2s poll,
+  resumes strictly after the last printed seq), and `CURSOR_EXPIRED`/`logId`
+  change as terminal errors.
+
+- **Swift-client offline mutation queue** (FEATURE_MATRIX #4). The ts-client's
+  opt-in `offlineQueue` mirrored on `RtDbClientConfig` (default off, TTL
+  300,000 ms): call-order replay with original or minted idempotency keys,
+  sent-but-unacked mutations re-queued on a reconnectable drop, lazy TTL
+  pruning, `getOfflineQueueStatus()`, and a drain confined to the session task.
+
+- **Dashboard operator tooling**: named saved queries and a recent-query
+  history (last 20 distinct, localStorage) on the query console; CSV/JSON
+  export of result grids (console + data browser); a per-document history
+  viewer over the durable change feed with field-level diff and
+  `expectVersion` + `replace` restore (operator supplies a machine token
+  in-memory; the change feed is machine-principal-only).
+
 - `expectBefore` transaction guards use an exclusive authoritative epoch-ms deadline, checked after queue wait and after asynchronous work at the final commit decision. Expired transactions roll back documents, dedup results and outbox effects. All five SDKs, in-memory engines and shared parity fixtures support the additive step. See [transaction deadlines](docs/transaction-deadlines.md).
 
 - **Multi-instance lease observability on `/metrics` (ENH-049).** Six
