@@ -590,6 +590,35 @@ class AggregateMultiGroup(_Camel):
     values: dict[str, Any]
 
 
+class LookupSpec(BaseModel):
+    """One entry of ``Query.lookups``: a server-side lookup expansion spec.
+
+    Mirrors ``server/src/query/lookup.rs``'s ``LookupSpec`` byte-for-byte
+    (camelCase, ``deny_unknown_fields``; ``as`` renamed from the Rust keyword —
+    the wire key is the raw ``as``, the Python attribute is ``as_`` via the
+    alias). ``cap`` is omitted on the wire when ``None`` (mirrors the server's
+    ``skip_serializing_if = "Option::is_none"``). ``field`` must be declared
+    ``Id``/``Optional<Id>``/``Array<Id>`` with ``Id.table == table`` — enforced
+    at query compile time (engine side), not parse time, so a bad ``cap`` or
+    table keeps its wire shape until the engine rejects it with the corpus-pinned
+    error code.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    field: str
+    table: str
+    as_: str = Field(alias="as")
+    cap: int | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_none_cap(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("cap") is None:
+            out.pop("cap", None)
+        return out
+
+
 class VectorSearchQuery(_Camel):
     """Vector-similarity terminal: ``{index, vector, limit, filter?}``.
 

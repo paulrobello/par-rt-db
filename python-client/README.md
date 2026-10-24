@@ -55,7 +55,13 @@ Package name: `par-rt-db` → in Python, `import par_rt_db`.
 The DSL layer is feature-complete: every server query terminal
 (`get`/`index`+`eq`/`gt`/`gte`/`lt`/`lte`/`order`/`take`/`unique`/`first`/`count`/
 `collect`/`distinct`/`aggregate`/`filter`/`search`/`vector_search`/`hybrid_search`/`paginate`)
-plus the `fields` projection clause, and every mutation step
+plus the `fields` projection clause and the `lookups` list (`.lookup(field,
+table, as_, cap=None)` — server-side lookup expansion: the declared
+`Id`/`Optional<Id>`/`Array<Id>` field is resolved into the referenced
+document(s) under the alias key on each result doc, N+1-free joins in one
+round trip; legal with every doc-returning terminal,
+`count`/`distinct`/`aggregate` reject it, and `.fields()` may name the alias),
+and every mutation step
 (`insert`/`patch`/`replace`/`delete`/`undelete` (FM-33)/`expectVersion`/
 `expectFields`/`expectBefore`/`expectAbsent`/`upsert`/`adjust_counter` — atomic bounded counter updates,
 FM-41, see

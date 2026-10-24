@@ -316,6 +316,11 @@ def _run_case(case: dict[str, Any]) -> None:
     ids: dict[str, str] = {}
     for i, entry in enumerate(seed):
         table, doc, label = _parse_seed_entry(entry, single_table, name)
+        # `$idRef` substitution applies to seed docs too: a seed may reference
+        # the minted id of any EARLIER `$id`-labeled seed (lookups need real
+        # cross-doc id references, which no other placeholder expresses).
+        # Forward references stay an authoring error (unknown label).
+        doc = _substitute(doc, ids, name)
         results = client.mutate(Mutation.builder().insert(table, doc).build())
         if label is not None:
             first = _step_result_json(results[0])

@@ -19,6 +19,11 @@ Wire shapes (load-bearing — match the server exactly):
   default) is omitted from the wire — full docs; ``[]`` is meaningful (a
   system-fields-only, ids-only view) and serializes as an empty list, never as
   absence.
+* ``Query.lookups`` is the server-side lookup-expansion list
+  (:class:`~par_rt_db.wire.LookupSpec` entries). Omitted on the wire when
+  ``None``/empty — mirrors the server's ``skip_serializing_if =
+  "Vec::is_empty"``. Legal with every doc-returning terminal; rejected with
+  ``count``/``distinct``/``aggregate``.
 
 ``QueryResult`` arrives untagged (the server's ``#[serde(untagged)]``); this
 module re-attaches a shape via the terminal (``get``/``collect``/``first``/
@@ -40,6 +45,7 @@ from .wire import (
     AggregateSpec,
     FilterExpr,
     HybridSearchQuery,
+    LookupSpec,
     SearchMode,
     SearchQuery,
     VectorSearchQuery,
@@ -103,6 +109,7 @@ class Query(BaseModel):
     hybrid_search: HybridSearchQuery | None = Field(default=None, alias="hybridSearch")
     paginate: _Paginate | None = None
     fields: list[str] | None = None
+    lookups: list[LookupSpec] | None = None
 
     def model_dump(self, **kw: Any) -> dict[str, Any]:
         out = super().model_dump(**kw)
@@ -149,6 +156,7 @@ class TableQuery:
         self._hybrid: HybridSearchQuery | None = None
         self._paginate: _Paginate | None = None
         self._fields: list[str] | None = None
+        self._lookups: list[LookupSpec] | None = None
 
     # --- builder methods (return self) ---
 
@@ -221,6 +229,25 @@ class TableQuery:
         []`` on the wire — meaningful, never dropped); never calling it keeps
         full docs (the key is omitted entirely)."""
         self._fields = list(names)
+        return self
+
+    def lookup(self, field: str, table: str, as_: str, cap: int | None = None) -> TableQuery:
+        """Server-side lookup expansion: resolves ``field`` (an ``Id`` /
+        ``Optional<Id>`` / ``Array<Id>`` declared field whose ``Id.table``
+        equals ``table``) on each result doc into the referenced document(s),
+        exposed under ``as_`` on the same doc. Depth-1 only; id-equality only.
+        ``cap`` is the per-parent joined-row cap for an id-ARRAY lookup
+        (default 100, hard max 1000). Legal with every doc-returning terminal,
+        rejected ``BAD_REQUEST`` with ``count``/``distinct``/``aggregate``; the
+        projection (:meth:`fields`) may name ``as_``. The trailing underscore
+        mirrors ``filter_``'s — ``as`` is a Python keyword, the wire key is the
+        raw ``as``."""
+        spec: dict[str, Any] = {"field": field, "table": table, "as": as_}
+        if cap is not None:
+            spec["cap"] = cap
+        if self._lookups is None:
+            self._lookups = []
+        self._lookups.append(LookupSpec.model_validate(spec))
         return self
 
     def search(
@@ -427,6 +454,8 @@ class TableQuery:
             payload["paginate"] = self._paginate
         if self._fields is not None:
             payload["fields"] = self._fields
+        if self._lookups:
+            payload["lookups"] = self._lookups
         return Query.model_validate(payload)
 
     # test affordances mirroring rust's typed terminals

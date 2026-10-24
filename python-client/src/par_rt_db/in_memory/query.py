@@ -24,6 +24,8 @@ from ..query import Query
 from ..schema import (
     IndexDef,
     TableDef,
+    _FArray,
+    _FOptional,
 )
 from ..wire import (
     AggregateOp,
@@ -114,6 +116,7 @@ def _query_clauses(q: Query) -> set[str]:
         "vectorSearch": q.vector_search is not None,
         "hybridSearch": q.hybrid_search is not None,
         "get": q.get is not None,
+        "lookups": bool(q.lookups),
     }
     return {name for name, present in clauses.items() if present}
 
@@ -159,18 +162,183 @@ def _check_query_combinations(q: Query) -> None:
 _PROJECTION_SYSTEM_FIELDS = ("_id", "_creationTime", "_version")
 
 
-def _validate_projection(table_def: TableDef, fields: list[str]) -> None:
+def _validate_projection(
+    table_def: TableDef, fields: list[str], lookup_aliases: list[str] | None = None
+) -> None:
     """Validate a ``Query.fields`` projection against the table: every name
-    must be a declared field or one of the system fields (``_id``/
+    must be a declared field, one of the system fields (``_id``/
     ``_creationTime``/``_version`` — always included, so listing them is an
-    allowed no-op). Anything else — including typo'd system names and other
+    allowed no-op), or a lookup alias (admitted only when the query carries
+    lookups — aliases are synthetic result fields, the same class as
+    ``_searchSnippet``). Anything else — including typo'd system names and other
     ``_``-prefixed names — is ``BAD_REQUEST`` at query time, the same gate the
-    server's compile-time ``validate_projection`` runs. ``[]`` (system fields
-    only) validates trivially."""
+    server's compile-time ``validate_lookups``-admitted alias list feeds.
+    ``[]`` (system fields only) validates trivially."""
     for name in fields:
         if name in _PROJECTION_SYSTEM_FIELDS or name in table_def.fields:
             continue
+        if lookup_aliases is not None and name in lookup_aliases:
+            continue
         raise RtDbError(ErrorCode.BAD_REQUEST, f"unknown projection field '{name}'")
+
+
+#: At most 4 lookups per query; a fifth is ``BAD_REQUEST``. Mirrors server
+#: ``query::lookup``'s ``MAX_LOOKUPS``.
+_MAX_LOOKUPS = 4
+#: Hard max of a ``LookupSpec.cap``; above is ``BAD_REQUEST`` at compile time.
+_MAX_LOOKUP_CAP = 1000
+#: Default per-parent joined-row cap for an id-ARRAY lookup.
+_DEFAULT_LOOKUP_CAP = 100
+#: Ceiling on total joined rows per execution; truncation proceeds in
+#: parent-result order.
+_MAX_JOINED_ROWS = 8192
+
+
+def _validate_lookups(q: Query, table_for: Callable[[str], TableDef]) -> list[str]:
+    """Compile-time lookup validation (mirrors server ``validate_lookups`` and
+    the ts reference port ``validateLookups``): unknown lookup table →
+    ``NOT_FOUND``; field not declared or not ``Id``/``Optional<Id>``/
+    ``Array<Id>`` → ``BAD_REQUEST``; declared ``Id.table`` ≠ lookup ``table``
+    → ``BAD_REQUEST``; ``as`` collisions (declared field, ``_``-prefixed name,
+    another alias) → ``BAD_REQUEST``; ``cap`` > 1000 → ``BAD_REQUEST``; more
+    than 4 lookups → ``BAD_REQUEST``. Returns the aliases the projection gate
+    admits."""
+    if not q.lookups:
+        return []
+    if len(q.lookups) > _MAX_LOOKUPS:
+        raise RtDbError(ErrorCode.BAD_REQUEST, f"at most {_MAX_LOOKUPS} lookups per query")
+    parent_def = table_for(q.table)
+    aliases: list[str] = []
+    for lk in q.lookups:
+        table_for(lk.table)
+        ty = parent_def.fields.get(lk.field)
+        if ty is None:
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"lookup field '{lk.field}' is not declared on table '{q.table}'",
+            )
+        if ty.type == "optional":
+            inner = ty.inner
+        elif ty.type == "array":
+            inner = ty.element
+        else:
+            inner = ty
+        if inner.type != "id":
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"lookup field '{lk.field}' must be declared Id, Optional<Id>, or Array<Id>",
+            )
+        if inner.table != lk.table:
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"lookup field '{lk.field}' declares Id table '{inner.table}' "
+                f"but the lookup names '{lk.table}'",
+            )
+        if lk.as_.startswith("_"):
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST, f"lookup alias '{lk.as_}' must not start with '_'"
+            )
+        if lk.as_ in parent_def.fields:
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST, f"lookup alias '{lk.as_}' collides with a declared field"
+            )
+        if lk.as_ in aliases:
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST,
+                f"lookup alias '{lk.as_}' collides with another lookup alias",
+            )
+        if lk.cap is not None and lk.cap > _MAX_LOOKUP_CAP:
+            raise RtDbError(
+                ErrorCode.BAD_REQUEST, f"lookup cap exceeds maximum of {_MAX_LOOKUP_CAP}"
+            )
+        aliases.append(lk.as_)
+    return aliases
+
+
+def _is_array_lookup(parent_def: TableDef, field: str) -> bool:
+    """Whether the lookup's declared field type makes it array-form. Validation
+    has already pinned the field to one of the three accepted shapes."""
+    ty = parent_def.fields.get(field)
+    if ty is None:
+        return False
+    if isinstance(ty, _FOptional):
+        ty = ty.inner
+    return isinstance(ty, _FArray)
+
+
+def _expand_lookups(
+    result: Any,
+    q: Query,
+    table_for: Callable[[str], TableDef],
+    rows_for: Callable[[str], dict[str, dict[str, Any]]],
+) -> Any:
+    """Execute-time lookup expansion (mirrors server ``expand_lookups`` and the
+    ts reference port ``expandLookups``): per lookup, collect the distinct ids
+    across the result docs, fetch the visible child rows once (FM-33: stamped
+    rows are invisible), then fan out in memory — declared id-array order,
+    dangling ids dropped, ``cap`` truncation, and a deterministic
+    ``MAX_JOINED_ROWS`` ceiling in parent-result order. The in-memory harness
+    models no principal, so joined rows carry no per-row authorization
+    predicates (the server appends them to its batched fetch).
+
+    Doc references are routed by the query's terminal (never sniffed from the
+    value): a ``paginate`` page envelope's ``docs``, nothing for the doc-less
+    ``count``/``distinct``/``aggregate`` terminals, the single doc of
+    ``get``/``unique``/``first``, and the docs list of the collect/search
+    family. Mutating docs in place keeps result identity, so the caller's
+    object changes."""
+    if q.paginate is not None and isinstance(result, dict) and isinstance(result.get("docs"), list):
+        docs = result["docs"]
+    elif q.count or q.distinct or q.aggregate is not None:
+        docs = []
+    elif q.get is not None or q.unique or q.first:
+        docs = [result] if isinstance(result, dict) else []
+    else:
+        docs = list(result) if isinstance(result, list) else []
+    parent_def = table_for(q.table)
+    budget = _MAX_JOINED_ROWS
+    for lk in q.lookups or []:
+        table_for(lk.table)
+        array_form = _is_array_lookup(parent_def, lk.field)
+        # Distinct ids across the result set, first-seen order.
+        ids: list[str] = []
+        seen: set[str] = set()
+        for doc in docs:
+            v = doc.get(lk.field)
+            if isinstance(v, str):
+                if v not in seen:
+                    seen.add(v)
+                    ids.append(v)
+            elif isinstance(v, list):
+                for id_ in v:
+                    if isinstance(id_, str) and id_ not in seen:
+                        seen.add(id_)
+                        ids.append(id_)
+        # One in-memory fetch: live (non-stamped) child rows by id.
+        child_rows = rows_for(lk.table)
+        fetched = {id_: child_rows[id_] for id_ in ids if id_ in child_rows}
+        cap = lk.cap if lk.cap is not None else _DEFAULT_LOOKUP_CAP
+        for doc in docs:
+            v = doc.get(lk.field)
+            if isinstance(v, str):
+                joined = fetched.get(v) if budget > 0 else None
+                if joined is not None:
+                    budget -= 1
+                doc[lk.as_] = joined if joined is not None else None
+            elif isinstance(v, list):
+                out: list[dict[str, Any]] = []
+                for id_ in v:
+                    if len(out) >= cap or budget == 0:
+                        break
+                    if isinstance(id_, str):
+                        joined = fetched.get(id_)
+                        if joined is not None:
+                            out.append(joined)
+                            budget -= 1
+                doc[lk.as_] = out
+            else:
+                doc[lk.as_] = [] if array_form else None
+    return result
 
 
 def _project_doc(doc: dict[str, Any] | None, fields: list[str] | None) -> dict[str, Any] | None:
@@ -739,31 +907,42 @@ class _QueryEngine(_Core):
         unimplemented terminals.
         """
         table_def = self._require_table(q.table)
+        # Lookup validation runs before projection validation (mirrors ts
+        # executeQuery): it resolves the alias list the projection gate admits.
+        lookup_aliases = _validate_lookups(q, self._require_table)
         # Projection validation runs before every terminal dispatch so all
         # shapes (including `get`) reject unknown field names — the same gate
         # the server's compile_query applies before its early returns.
         if q.fields is not None:
-            _validate_projection(table_def, q.fields)
+            _validate_projection(table_def, q.fields, lookup_aliases)
         fields = q.fields
         eq = q.eq or []
         has_range = q.gt is not None or q.gte is not None or q.lt is not None or q.lte is not None
 
+        def _expand(result: Any) -> Any:
+            """Lookup expansion at the dispatcher seam — before the projection,
+            so joined keys participate in it (mirrors server ``execute_query``,
+            which expands immediately before ``project_result``)."""
+            if not q.lookups:
+                return result
+            return _expand_lookups(result, q, self._require_table, self._lookup_rows)
+
         if q.get is not None:
-            return _project_doc(self._execute_get_terminal(q, eq, has_range), fields)
+            return _project_doc(_expand(self._execute_get_terminal(q, eq, has_range)), fields)
 
         _check_query_combinations(q)
 
         if q.vector_search is not None:
             return _project_ranked_result(
-                self._execute_vector_search_terminal(q, table_def, eq, has_range), fields
+                _expand(self._execute_vector_search_terminal(q, table_def, eq, has_range)), fields
             )
         if q.search is not None:
             return _project_ranked_result(
-                self._execute_search_terminal(q, table_def, eq, has_range), fields
+                _expand(self._execute_search_terminal(q, table_def, eq, has_range)), fields
             )
         if q.hybrid_search is not None:
             return _project_ranked_result(
-                self._execute_hybrid_search_terminal(q, eq, has_range), fields
+                _expand(self._execute_hybrid_search_terminal(q, eq, has_range)), fields
             )
 
         plan = _prepare_scan(q, table_def, eq, has_range)
@@ -789,11 +968,13 @@ class _QueryEngine(_Core):
             page: Any = self._execute_paginate_terminal(
                 q.paginate, table_def, filtered, plan.index_def, plan.typed_eq, direction
             )
+            page = _expand(page)
             if fields is not None:
                 page["docs"] = _project_docs(page["docs"], fields)
             return page
 
         result: Any = self._execute_collect_terminal(q, filtered)
+        result = _expand(result)
         if fields is not None:
             result = (
                 _project_docs(result, fields)
@@ -836,6 +1017,18 @@ class _QueryEngine(_Core):
             )
         assert q.get is not None  # caller dispatches only when get is set
         return self.get(q.table, q.get)
+
+    def _lookup_rows(self, table: str) -> dict[str, dict[str, Any]]:
+        """Live (non-stamped) rows of ``table`` merged with system fields —
+        the batched child fetch a lookup expansion fans out from (FM-33:
+        stamped rows are invisible). The in-memory harness models no
+        principal, so joined rows carry no per-row authorization predicates
+        (the server appends them to its batched SELECT)."""
+        return {
+            row.id: _merge_doc(row)
+            for (_t, _), row in self._docs.items()
+            if _t == table and _is_live(row)
+        }
 
     def _execute_vector_search_terminal(
         self, q: Query, table_def: TableDef, eq: list[Any], has_range: bool
