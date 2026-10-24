@@ -6,21 +6,15 @@ import type { FileMeta } from "../lib/types";
 // StoragePage lists a database's stored files and wires upload/delete to
 // AdminClient. The list must render on db load; delete must confirm first then
 // call deleteFile; upload must call uploadFile with the chosen file's bytes.
+// Copy-URL mints a signed, expiring link via GET /api/storage/{db}/{id}/
+// signed-url (same-origin session cookie) — never copies a bare /storage link,
+// which 403s once the server requires signed URLs — and disables the row's
+// copy button with an inline reason when minting fails.
 
 const adminClientMock = vi.hoisted(() => ({
   listFiles: vi.fn(),
   uploadFile: vi.fn(),
   deleteFile: vi.fn(),
-}));
-
-// Mock the runtime export from @par-rt-db/client (added in ENH-014). The
-// dashboard imports `appendImageParams` to compose image-transform URLs; the
-// stub records the call and produces a `?w=` URL the copy path can write.
-const appendImageParamsMock = vi.hoisted(() =>
-  vi.fn((url: string, opts: { w?: number }) => `${url}?w=${opts.w ?? 0}`),
-);
-vi.mock("@par-rt-db/client", () => ({
-  appendImageParams: (url: string, opts: { w?: number }) => appendImageParamsMock(url, opts),
 }));
 
 vi.mock("../lib/admin", () => ({
@@ -40,6 +34,15 @@ const fileRow: FileMeta = {
   creationTime: 1_750_000_000_000,
 };
 
+const SIGNED_URL = `https://rtdb.example/storage/${fileRow.id}?exp=1750003600000&sig=abc123`;
+
+function stubFetchSignedUrl(url: string = SIGNED_URL) {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => Response.json({ url, expiresAt: 1_750_003_600_000 }, { status: 200 })),
+  );
+}
+
 describe("StoragePage", () => {
   beforeEach(() => {
     for (const fn of Object.values(adminClientMock)) fn.mockReset();
@@ -48,10 +51,9 @@ describe("StoragePage", () => {
     adminClientMock.uploadFile.mockResolvedValue({ id: "newid001-aaaa" });
   });
   afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
     vi.useRealTimers();
-    // mockClear (not mockReset): preserves the default impl set in the hoisted
-    // factory so the next test still gets a `?w=` URL when copy runs.
-    appendImageParamsMock.mockClear();
   });
 
   it("lists files for the selected database", async () => {
@@ -112,8 +114,10 @@ describe("StoragePage", () => {
     expect(select).toBeInTheDocument();
   });
 
-  it("applies an image transform to the copied URL when a size is chosen", async () => {
+  it("mints a signed URL with the selected image transform before copying", async () => {
     adminClientMock.listFiles.mockResolvedValue([fileRow]);
+    const signedTransformed = `https://rtdb.example/storage/${fileRow.id}?w=512&fit=contain&exp=1750003600000&sig=def456`;
+    stubFetchSignedUrl(signedTransformed);
     const user = userEvent.setup();
     render(<StoragePage />);
     const row = (await screen.findByText("file0001")).closest("tr");
@@ -122,26 +126,23 @@ describe("StoragePage", () => {
     const writeText = vi.fn<(text: string) => Promise<void>>().mockResolvedValue(undefined);
     vi.spyOn(navigator, "clipboard", "get").mockReturnValue({ writeText } as never);
 
-    // Choose medium size — should map to { w: 512, fit: "contain" }.
+    // Transform params must be in the mint request so the server binds them
+    // into the signature — never append them locally to the signed URL.
     await user.selectOptions(screen.getByRole("combobox", { name: /size/i }), "md");
-    await user.click(within(row).getByRole("button", { name: "copy URL" }));
+    await user.click(within(row).getByRole("button", { name: "copy signed URL" }));
 
     await waitFor(() => {
-      expect(appendImageParamsMock).toHaveBeenCalledWith(
-        `${window.location.origin}/storage/${fileRow.id}`,
-        { w: 512, fit: "contain" },
+      expect(fetch).toHaveBeenCalledWith(
+        `${window.location.origin}/api/storage/db1/${fileRow.id}/signed-url?w=512&fit=contain`,
+        { credentials: "include" },
       );
+      expect(writeText).toHaveBeenCalledWith(signedTransformed);
     });
-    expect(writeText).toHaveBeenCalled();
-    const copied = writeText.mock.calls[0][0];
-    expect(copied).toContain("?w=");
-    expect(copied).toContain("w=512");
-
-    vi.restoreAllMocks();
   });
 
-  it("copies the bare URL when size is original", async () => {
+  it("copies the minted signed URL, not a bare link, when size is original", async () => {
     adminClientMock.listFiles.mockResolvedValue([fileRow]);
+    stubFetchSignedUrl();
     const user = userEvent.setup();
     render(<StoragePage />);
     const row = (await screen.findByText("file0001")).closest("tr");
@@ -150,13 +151,43 @@ describe("StoragePage", () => {
     const writeText = vi.fn<(text: string) => Promise<void>>().mockResolvedValue(undefined);
     vi.spyOn(navigator, "clipboard", "get").mockReturnValue({ writeText } as never);
 
-    // Original is the default — no transform should be applied.
-    await user.click(within(row).getByRole("button", { name: "copy URL" }));
+    const copy = within(row).getByRole("button", { name: "copy signed URL" });
+    expect(copy).toHaveAttribute("title", "copies a signed, time-limited URL (it expires)");
+    await user.click(copy);
     await waitFor(() => {
-      expect(writeText).toHaveBeenCalledWith(`${window.location.origin}/storage/${fileRow.id}`);
+      expect(fetch).toHaveBeenCalledWith(
+        `${window.location.origin}/api/storage/db1/${fileRow.id}/signed-url`,
+        { credentials: "include" },
+      );
+      expect(writeText).toHaveBeenCalledWith(SIGNED_URL);
     });
-    expect(appendImageParamsMock).not.toHaveBeenCalled();
+    expect(writeText).not.toHaveBeenCalledWith(`${window.location.origin}/storage/${fileRow.id}`);
+  });
 
-    vi.restoreAllMocks();
+  it("disables copy with an inline reason if signed-URL mint fails", async () => {
+    adminClientMock.listFiles.mockResolvedValue([fileRow]);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json({ code: "FORBIDDEN", message: "denied" }, { status: 403 })),
+    );
+    const user = userEvent.setup();
+    render(<StoragePage />);
+    const row = (await screen.findByText("file0001")).closest("tr");
+    if (!row) throw new Error("row not found");
+
+    const writeText = vi.fn<(text: string) => Promise<void>>().mockResolvedValue(undefined);
+    vi.spyOn(navigator, "clipboard", "get").mockReturnValue({ writeText } as never);
+
+    await user.click(within(row).getByRole("button", { name: "copy signed URL" }));
+    const disabled = await within(row).findByRole("button", { name: "copy disabled" });
+    expect(disabled).toBeDisabled();
+    expect(disabled).toHaveAttribute(
+      "title",
+      expect.stringContaining("signed-URL mint failed (HTTP 403)"),
+    );
+    expect(within(row).getByRole("alert")).toHaveTextContent(
+      "copy disabled — signed-URL mint failed (HTTP 403)",
+    );
+    expect(writeText).not.toHaveBeenCalled();
   });
 });

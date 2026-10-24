@@ -1,6 +1,6 @@
 /** File storage browser — list blobs, inspect metadata, and preview on-the-fly image transforms. */
 
-import { appendImageParams, type TransformOpts } from "@par-rt-db/client";
+import type { TransformOpts } from "@par-rt-db/client";
 import { useEffect, useRef, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { useAdmin } from "../lib/admin";
@@ -38,6 +38,12 @@ export function StoragePage() {
   const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Mint-failure state per blob id: a row whose signed-URL mint failed has its
+  // copy button disabled — under RTDB_STORAGE_REQUIRE_SIGNED_URLS a bare
+  // /storage/{id} link 403s for the receiver, so no link is copied at all.
+  const [copyErrors, setCopyErrors] = useState<Record<string, string>>({});
+  // Blob id currently minting (button shows a busy label while in flight).
+  const [copyingId, setCopyingId] = useState<string | null>(null);
 
   // Image-transform size applied to "copy URL" outputs (ENH-014). Page-scoped:
   // a single control in the actions column header sets it, and every row's
@@ -65,6 +71,7 @@ export function StoragePage() {
     setFiles([]);
     setActionError(null);
     setConfirmingDelete(null);
+    setCopyErrors({});
   }, [db, setFiles]);
 
   useEffect(() => {
@@ -90,18 +97,67 @@ export function StoragePage() {
     }
   }
 
+  /** Mint a signed, time-limited URL for `id` in `db` via the server's
+   *  GET /api/storage/{db}/{id}/signed-url. The same-origin HttpOnly session
+   *  cookie authenticates the mint (the server's SEC-001 dashboard path); the
+   *  admin client has no mint surface, and per ARC-106 this is the dashboard's
+   *  one narrow call rather than a parallel HTTP client.
+   *  Returns the signed URL string, or throws with a message. */
+  async function mintSignedUrl(db: string, id: string, transform: TransformOpts | null) {
+    const params = new URLSearchParams();
+    if (transform) {
+      if (transform.w !== undefined) params.set("w", String(transform.w));
+      if (transform.h !== undefined) params.set("h", String(transform.h));
+      if (transform.fit !== undefined) params.set("fit", transform.fit);
+      if (transform.q !== undefined) params.set("q", String(transform.q));
+      if (transform.format !== undefined && transform.format !== "auto")
+        params.set("format", transform.format);
+    }
+    const qs = [...params.keys()].length > 0 ? `?${params.toString()}` : "";
+    const response = await fetch(
+      `${window.location.origin}/api/storage/${encodeURIComponent(db)}/${encodeURIComponent(id)}/signed-url${qs}`,
+      { credentials: "include" },
+    );
+    const body: unknown = await response.json().catch(() => null);
+    if (
+      !response.ok ||
+      body === null ||
+      typeof body !== "object" ||
+      !("url" in body) ||
+      typeof (body as { url: unknown }).url !== "string"
+    ) {
+      throw new Error(`signed-URL mint failed (HTTP ${response.status})`);
+    }
+    return (body as { url: string }).url;
+  }
+
   async function copyPublicUrl(file: FileMeta) {
+    if (!db) return;
+    setActionError(null);
+    setCopyErrors((prev) => {
+      if (!(file.id in prev)) return prev;
+      const next = { ...prev };
+      delete next[file.id];
+      return next;
+    });
+    setCopyingId(file.id);
     try {
-      const base = `${window.location.origin}/storage/${file.id}`;
-      const opts = size === "orig" ? null : SIZE_OPTS[size];
-      const url = opts ? appendImageParams(base, opts) : base;
+      // Mint server-side; never copy a hand-built bare link. Under
+      // RTDB_STORAGE_REQUIRE_SIGNED_URLS=true a bare /storage/{id} link 403s
+      // for the receiver. Transform opts ride the mint so the server binds
+      // them into the signature (SEC-003) — appending them client-side to a
+      // signed URL fails verification.
+      const url = await mintSignedUrl(db, file.id, size === "orig" ? null : SIZE_OPTS[size]);
       await navigator.clipboard.writeText(url);
       setCopiedId(file.id);
       if (copiedTimer.current) clearTimeout(copiedTimer.current);
       copiedTimer.current = setTimeout(() => setCopiedId(null), 1500);
-    } catch {
-      // clipboard may be unavailable (insecure context) — surface quietly
-      setActionError("clipboard unavailable");
+    } catch (e) {
+      // Mint or clipboard failed: disable this row's copy with the reason
+      // rather than copying a link that may 403 at the receiver.
+      setCopyErrors((prev) => ({ ...prev, [file.id]: toErrorMessage(e) }));
+    } finally {
+      setCopyingId(null);
     }
   }
 
@@ -192,6 +248,8 @@ export function StoragePage() {
                 const confirming = confirmingDelete === file.id;
                 const busy = pendingId === file.id;
                 const copied = copiedId === file.id;
+                const copyError = copyErrors[file.id];
+                const copying = copyingId === file.id;
                 return (
                   <tr key={file.id}>
                     <td className={s.idCell} title={file.id}>
@@ -205,9 +263,28 @@ export function StoragePage() {
                     </td>
                     <td>
                       <div className={s.rowActions}>
-                        <Button onClick={() => void copyPublicUrl(file)} disabled={busy}>
-                          {copied ? "copied!" : "copy URL"}
+                        <Button
+                          onClick={() => void copyPublicUrl(file)}
+                          disabled={busy || copying || copyError !== undefined}
+                          title={
+                            copyError !== undefined
+                              ? `copy disabled: ${copyError} — no dead bare link is copied`
+                              : "copies a signed, time-limited URL (it expires)"
+                          }
+                        >
+                          {copying
+                            ? "…"
+                            : copyError !== undefined
+                              ? "copy disabled"
+                              : copied
+                                ? "copied!"
+                                : "copy signed URL"}
                         </Button>
+                        {copyError && (
+                          <span className={s.confirmInline} role="alert" title={copyError}>
+                            <span className={s.confirmLabel}>copy disabled — {copyError}</span>
+                          </span>
+                        )}
                         {confirming ? (
                           <span className={s.confirmInline}>
                             <span className={s.confirmLabel}>delete?</span>

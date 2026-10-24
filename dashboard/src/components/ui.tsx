@@ -73,6 +73,9 @@ type ButtonProps = {
   type?: "button" | "submit";
   onClick?: () => void;
   disabled?: boolean;
+  /** Native tooltip; used to explain a disabled state (e.g. copy disabled
+   *  because signed-URL minting failed). */
+  title?: string;
   children: ReactNode;
 };
 
@@ -81,6 +84,7 @@ export function Button({
   type = "button",
   onClick,
   disabled,
+  title,
   children,
 }: ButtonProps) {
   const variantClass =
@@ -90,6 +94,7 @@ export function Button({
       type={type}
       onClick={onClick}
       disabled={disabled}
+      title={title}
       className={`${styles.btn} ${variantClass}`}
     >
       {children}
