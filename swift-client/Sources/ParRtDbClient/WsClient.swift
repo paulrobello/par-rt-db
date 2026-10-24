@@ -36,8 +36,24 @@ public struct RtDbClientConfig: Sendable {
     /// byte-for-byte the pre-optimistic behavior (rust `Config::
     /// optimistic_updates`).
     public var optimisticUpdates: Bool = false
+    /// Opt in to ordered replay of offline and sent-but-unacknowledged
+    /// mutations. Every call retains its original idempotency key (a UUID
+    /// key is minted when omitted). Close/authentication failure rejects the
+    /// queue; server mutation errors are never retried. Off by default.
+    public var offlineQueue: Bool = false
+    /// Lazy queue expiry, measured from the original call, in milliseconds.
+    /// Matches the server's default idempotency dedup TTL (five minutes).
+    /// Pruned on enqueue, status reads, disconnect, and replay, without timers.
+    public var offlineQueueTtlMs: UInt64 = 300_000
 
     public init() {}
+}
+
+/// Snapshot of mutations waiting for offline replay (excludes in-flight calls).
+public struct OfflineQueueStatus: Equatable, Sendable {
+    public let depth: Int
+    /// Age from the original call, in milliseconds, or nil for an empty queue.
+    public let oldestAgeMs: UInt64?
 }
 
 /// Coarse connection state surfaced through `ClientStatus`.
@@ -461,6 +477,10 @@ public actor RtDbClient {
         let idempotencyKey: String?
         let txn: Transaction
         let continuation: AsyncStream<Result<[JSONValue], RtDbError>>.Continuation
+        /// Scheduler-clock time of the original `mutate` call. Seed of the
+        /// offline queue's TTL and age observability — measured from the call,
+        /// across reconnects (not from the send).
+        let queuedAtMs: UInt64
 
         func message() -> ClientMessage {
             .mutate(mutId: id, idempotencyKey: idempotencyKey, txn: txn)
@@ -473,6 +493,19 @@ public actor RtDbClient {
     }
 
     private let mutations = OpFamily<MutationCall>(prefix: "mut-")
+
+    /// Opt-in offline mutation queue (ts `offlineQueue`), in replay order.
+    /// Invariant: every entry carries an idempotency key (caller-supplied or
+    /// client-minted), so a replayed entry can never double-apply against the
+    /// server's dedup table. `MutationCall.queuedAtMs` (the original call's
+    /// clock reading) seeds the TTL and age observability across reconnects.
+    private var offlineQueue: [MutationCall] = []
+    /// True while the post-authOk replay is draining `offlineQueue`. The ts
+    /// client's flush is synchronous so a `mutate()` issued during replay can
+    /// never overtake the queue on the wire; here each send is an `await`, so
+    /// new calls append to the queue behind the drain until it finishes —
+    /// strict call order survives the actor's interleaving.
+    private var drainingOfflineQueue = false
 
     /// The typed success payload of a schedule-family reply (rust
     /// `ScheduleOutcome`).
@@ -766,6 +799,16 @@ public actor RtDbClient {
             // Task 14 (rust Reconnect arm): sent-but-unacked ops are rejected
             // (at-most-once, never auto-resent); queued ones survive for the
             // next session's flush.
+            if config.offlineQueue {
+                // Correlation IDs are minted in actor call order. Dictionary
+                // iteration is unordered, so explicitly restore that order.
+                let pending = mutations.pending.values.sorted {
+                    (Int($0.id.dropFirst(4)) ?? 0) < (Int($1.id.dropFirst(4)) ?? 0)
+                }
+                offlineQueue.insert(contentsOf: pending, at: 0)
+                mutations.pending.removeAll()
+                pruneOfflineQueue()
+            }
             rejectInflightOperations(reason: "connection closed before acknowledgment")
             setState(.reconnecting)
             await scheduler.sleep(backoffDelay(attempt: attempt))
@@ -807,7 +850,10 @@ public actor RtDbClient {
         }
         let transport = transportFactory(url)
         currentTransport = transport
-        defer { currentTransport = nil }
+        defer {
+            currentTransport = nil
+            drainingOfflineQueue = false
+        }
 
         guard await dial(transport, url: url) else { return .reconnect }
 
@@ -838,6 +884,7 @@ public actor RtDbClient {
             // racing the replays may send its own frame first — the replay's
             // set-insert then dedups it.
             sentPresenceRooms.removeAll()
+            drainingOfflineQueue = config.offlineQueue
             setState(.connected)
             // Task 14 (rust run_session post-authOk): re-establish every live
             // subscription, then replay joined presence rooms, then flush the
@@ -1206,10 +1253,18 @@ public actor RtDbClient {
     // MARK: Task 14 — mutations
 
     /// Submit a transaction, resolving to one `StepResult` per step. Pass
-    /// `idempotencyKey` to safely retry a mutation whose reply was lost. While
-    /// disconnected the call queues and fires on the next auth; it is rejected
-    /// only if the connection drops after it was sent but before
-    /// acknowledgment (at-most-once, never auto-resent).
+    /// `idempotencyKey` to safely retry a mutation whose reply was lost.
+    ///
+    /// With the opt-in `offlineQueue` config enabled, a call made while the
+    /// client cannot dispatch (not connected) queues — with an idempotency
+    /// key that is ALWAYS present (the caller's, or a client-minted one) —
+    /// and replays on the next successful auth, in original call order,
+    /// under its original key; an in-flight call whose connection drops
+    /// before acknowledgment re-queues the same way. The `mutate` call stays
+    /// pending while queued and resolves with the replayed commit's step
+    /// results; it rejects only on queue-TTL expiry, terminal teardown
+    /// (`close()`), or auth failure. Server-side `mutateErr` rejections are
+    /// never re-queued — the server already evaluated and refused them.
     public func mutate(_ txn: Transaction, idempotencyKey: String? = nil) async throws -> [StepResult] {
         try await Self.parseStepResults(submitMutation(txn, idempotencyKey: idempotencyKey))
     }
@@ -1228,8 +1283,17 @@ public actor RtDbClient {
         if config.optimisticUpdates {
             applyOptimistic(mutId: id, txn: txn)
         }
-        return try await submitOp(mutations, id: id) { id, continuation in
-            MutationCall(id: id, idempotencyKey: idempotencyKey, txn: txn, continuation: continuation)
+        // With the offline queue enabled a key is ALWAYS present — the
+        // caller's when supplied, otherwise a client-minted one — so a
+        // replayed entry can never double-apply against the server's dedup
+        // table (ts ARC-133 invariant).
+        let effectiveKey = idempotencyKey ?? (config.offlineQueue ? "off-\(UUID().uuidString)" : nil)
+        let queuedAtMs = scheduler.now()
+        return try await submitOp(mutations, id: id, offlineQueueable: true) { id, continuation in
+            MutationCall(
+                id: id, idempotencyKey: effectiveKey, txn: txn,
+                continuation: continuation, queuedAtMs: queuedAtMs
+            )
         }
     }
 
@@ -1242,6 +1306,7 @@ public actor RtDbClient {
     private func submitOp<Reply: Sendable, Call: OpCall>(
         _ family: OpFamily<Call>,
         id preMintedId: String? = nil,
+        offlineQueueable: Bool = false,
         makeCall: (String, AsyncStream<Result<Reply, RtDbError>>.Continuation) -> Call
     ) async throws -> Reply {
         guard !terminal else {
@@ -1252,7 +1317,8 @@ public actor RtDbClient {
             of: Result<Reply, RtDbError>.self, bufferingPolicy: .unbounded
         )
         let call = makeCall(id, continuation)
-        if let transport = currentTransport, state == .connected {
+        if let transport = currentTransport, state == .connected,
+           !(offlineQueueable && config.offlineQueue && drainingOfflineQueue) {
             // Registered BEFORE the send: a reply that races the send's return
             // finds its entry and is buffered, never dropped.
             family.pending[id] = call
@@ -1265,13 +1331,90 @@ public actor RtDbClient {
                 // existence check keeps this a no-op.
                 if family.pending[id] != nil {
                     family.pending.removeValue(forKey: id)
-                    family.queued.append(call)
+                    if offlineQueueable, let mutation = call as? MutationCall, config.offlineQueue {
+                        // Only the mutation family is ever offlineQueueable.
+                        offlineQueue.append(mutation)
+                    } else {
+                        family.queued.append(call)
+                    }
                 }
+            }
+        } else if offlineQueueable, config.offlineQueue {
+            // Opt-in offline queue: the call waits for the next successful
+            // auth — or the in-progress replay's drain — replaying in call
+            // order under its original idempotency key. Enqueue is a prune
+            // point.
+            if let mutation = call as? MutationCall, config.offlineQueue {
+                // Only the mutation family is ever offlineQueueable.
+                pruneOfflineQueue()
+                offlineQueue.append(mutation)
+            } else {
+                family.queued.append(call)
             }
         } else {
             family.queued.append(call)
         }
         return try await Self.park(stream)
+    }
+
+    /// Snapshot of the opt-in offline mutation queue: how many mutations are
+    /// queued for replay and the age (ms, on the scheduler clock) of the
+    /// oldest entry, or nil when the queue is empty (ts
+    /// `getOfflineQueueStatus`). Reading is itself a prune point: entries
+    /// older than `offlineQueueTtlMs` are rejected (and removed) here, so
+    /// polling the getter surfaces expiry without any background timer.
+    public func getOfflineQueueStatus() -> OfflineQueueStatus {
+        pruneOfflineQueue()
+        let now = scheduler.now()
+        let oldest = offlineQueue.map(\.queuedAtMs).min()
+        return OfflineQueueStatus(
+            depth: offlineQueue.count,
+            oldestAgeMs: oldest.map { now >= $0 ? now - $0 : 0 }
+        )
+    }
+
+    /// Lazy TTL pruning (ts parity: no background timer) at the enqueue,
+    /// status-read, disconnect, and replay prune points. Expired entries
+    /// reject with the ts error text.
+    private func pruneOfflineQueue() {
+        let now = scheduler.now()
+        offlineQueue.removeAll { entry in
+            guard now >= entry.queuedAtMs,
+                  now - entry.queuedAtMs >= config.offlineQueueTtlMs
+            else { return false }
+            revertOverlays(forMutId: entry.id)
+            entry.fail(RtDbError(code: .internal, message: "offline mutation queue TTL expired"))
+            return true
+        }
+    }
+
+    /// Drain the offline queue, in call order, registering each call as
+    /// pending BEFORE its send. On a failed send the entry stays registered —
+    /// the session dies (the send failure closes it) and the reconnect arm
+    /// re-queues it at the front with its original key. Runs only in the
+    /// session task (post-authOk), so it can never outlive its transport; the
+    /// `generation` guard additionally stops a late actor wakeup from
+    /// continuing a superseded session's drain.
+    private func flushOfflineQueue(on transport: any WebSocketTransport) async -> Bool {
+        guard !drainingOfflineQueue else { return true }
+        drainingOfflineQueue = true
+        defer { drainingOfflineQueue = false }
+        let gen = generation
+        while !terminal, generation == gen, state == .connected {
+            pruneOfflineQueue()
+            guard !offlineQueue.isEmpty else { return true }
+            let entry = offlineQueue.removeFirst()
+            mutations.pending[entry.id] = entry
+            do {
+                try await transport.send(Self.frame(entry.message()))
+            } catch {
+                // A failed async send may already have applied on the server.
+                // Keep it pending for the reconnect arm to requeue with its key.
+                await transport.close(code: 4000)
+                return false
+            }
+        }
+        return false
     }
 
     // MARK: Task 14 — scheduler ops
@@ -1421,7 +1564,9 @@ public actor RtDbClient {
     /// is registered as pending BEFORE its send; on a failed send it stays at
     /// the queue head (order preserved) for the next session.
     private func flushQueuedOps(on transport: any WebSocketTransport) async -> Bool {
-        guard await flushFamily(mutations, on: transport), await flushFamily(schedules, on: transport)
+        drainingOfflineQueue = false
+        guard await flushOfflineQueue(on: transport),
+              await flushFamily(mutations, on: transport), await flushFamily(schedules, on: transport)
         else { return false }
         return await flushFamily(workflows, on: transport)
     }
@@ -1764,6 +1909,11 @@ public actor RtDbClient {
             call.fail(error)
         }
         mutations.queued.removeAll()
+        for call in offlineQueue {
+            revertOverlays(forMutId: call.id)
+            call.fail(error)
+        }
+        offlineQueue.removeAll()
         schedules.rejectQueued(error: error)
         workflows.rejectQueued(error: error)
         for entry in subscriptionsByKey.values {

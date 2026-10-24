@@ -201,6 +201,35 @@ the last server value on `mutateErr`, a disconnect-reject, or `close()`. The
 projection is conservative — only unambiguous `collect`/`take`/`get`/filter-
 delete shapes overlay; everything else waits for server truth.
 
+Offline mutation replay is opt-in (`RtDbClientConfig.offlineQueue`, default
+`false`). Enable it on the WebSocket client:
+
+```swift
+var config = RtDbClientConfig()
+config.offlineQueue = true
+// config.offlineQueueTtlMs = 300_000 // five-minute default
+let client = RtDbClient(
+    url: "https://rtdb.example.com", db: "myapp",
+    getToken: { await TokenStore.shared.rtdbToken() },
+    config: config,
+    transportFactory: { _ in URLSessionWebSocketTransport() }
+)
+let queue = await client.getOfflineQueueStatus()
+print(queue.depth, queue.oldestAgeMs as Any) // nil age when empty
+```
+
+Offline calls and sent-but-unacknowledged mutations replay in original call
+order after authentication. Each retains its original idempotency key, with a
+UUID-based key minted when omitted, so the server can deduplicate retries.
+Calls remain suspended until acknowledged, rejected by the server, expired, or
+the client closes or authentication fails. Expiry is lazy on enqueue, status
+reads, disconnect, and replay. Age is measured from the original call, not the
+last replay. The default TTL matches the server's five-minute dedup TTL. If you
+customize either TTL, keep the queue TTL no longer than the server's dedup TTL.
+The queue is memory-only and is lost with the client process. HTTP mutations
+are unchanged. When disabled, the existing pre-auth buffer remains, but dropped
+in-flight mutations are not automatically replayed and no keys are minted.
+
 ## DSL examples
 
 Numeric convention: the query and mutation builders take `Int` for numeric
