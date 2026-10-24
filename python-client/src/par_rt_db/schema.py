@@ -256,12 +256,36 @@ class TtlDef(_S):
         return out
 
 
+class FieldConstraints(_S):
+    """One field's declared write constraints (see :attr:`TableDef.constraints`).
+    All keys optional; an empty object is legal but a no-op. Bounds are JSON
+    numbers (integer-valued on int64 fields — exact i64 compare server-side).
+    Mirrors ``server/src/schema.rs::FieldConstraints`` (``deny_unknown_fields``,
+    each key ``skip_serializing_if = "Option::is_none"``); ``None`` values are
+    omitted on the wire."""
+
+    min: float | None = None
+    max: float | None = None
+    min_length: int | None = None
+    max_length: int | None = None
+    pattern: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_absent(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        for key in ("min", "max", "minLength", "maxLength", "pattern"):
+            if out.get(key) is None:
+                out.pop(key, None)
+        return out
+
+
 class TableDef(_S):
     """One table: typed fields, indexes, optional per-row ``owner_field`` and
     ``collaborators_field``, an optional ``ttl`` policy, an optional
     ``updated_at_field`` stamp policy (FM-36), an optional ``authorize``
     per-row predicate (Model C), optional field-level ``defaults`` (FM-32),
-    and an optional ``soft_delete`` flag (FM-33)."""
+    optional per-field write ``constraints``, and an optional ``soft_delete``
+    flag (FM-33)."""
 
     fields: dict[str, FieldType]
     indexes: list[IndexDef] = Field(default_factory=list)
@@ -286,6 +310,14 @@ class TableDef(_S):
     # document (insert/replace/upsert-insert) that omits the key. Wire name is
     # `defaults`, omitted when empty (server `BTreeMap::is_empty` skip rule).
     defaults: dict[str, Any] = Field(default_factory=dict)
+    # Declarative per-field write constraints: field name → FieldConstraints.
+    # Enforced on the write path only — every write that stores or patches a
+    # constrained field (insert, patch, replace, upsert both branches,
+    # patchByQuery) fails with SCHEMA_VIOLATION when a non-null value violates
+    # one. Push-time validated (a misapplied constraint or an invalid regex
+    # fails the push naming the field). Wire name is `constraints`, omitted
+    # when empty (server `BTreeMap::is_empty` skip rule).
+    constraints: dict[str, FieldConstraints] = Field(default_factory=dict)
     # FM-33: `delete` steps stamp a tombstone instead of removing the row (see
     # the harness / server txn docs). Wire key `softDelete`, omitted when false
     # (server `skip_serializing_if = "is_false"`).
@@ -331,6 +363,10 @@ class TableDef(_S):
         # skip_serializing_if = "BTreeMap::is_empty").
         if not out.get("computed"):
             out.pop("computed", None)
+        # `constraints` is omitted on the wire when empty (server
+        # skip_serializing_if = "BTreeMap::is_empty").
+        if not out.get("constraints"):
+            out.pop("constraints", None)
         return out
 
 
@@ -363,6 +399,7 @@ class TableBuilder:
         self._updated_at: str | None = None
         self._auto_increment: str | None = None
         self._computed: dict[str, Any] | None = None
+        self._constraints: dict[str, Any] | None = None
 
     def field(self, name: str, ft: Any) -> TableBuilder:
         """Declare a typed field ``name`` of type ``ft`` (a ``t.*`` constructor dict)."""
@@ -521,6 +558,19 @@ class TableBuilder:
         self._auto_increment = name
         return self
 
+    def constraints(self, values: dict[str, Any]) -> TableBuilder:
+        """Declare per-field write constraints: every key names a declared
+        field whose stored values must satisfy the given ``min``/``max``
+        (number/int64, inclusive) and/or ``minLength``/``maxLength``/``pattern``
+        (string; unanchored regex search) on every write — insert, patch,
+        replace, upsert (both branches), and patchByQuery. Null and absent
+        values never violate. Enforced server-side AND by this SDK's in-memory
+        engine; push-time validated server-side (a misapplied constraint or an
+        invalid regex fails the push naming the field). Round-trips on the wire
+        as ``constraints``, omitted when the table declares none."""
+        self._constraints = dict(values)
+        return self
+
     def computed(self, name: str, expr: Any) -> TableBuilder:
         """Declare a computed field (ENH-028): ``name`` must be a declared
         field (not the table's ``ownerField``/``collaboratorsField``/
@@ -556,6 +606,8 @@ class TableBuilder:
             out["autoIncrementField"] = self._auto_increment
         if self._computed:
             out["computed"] = self._computed
+        if self._constraints:
+            out["constraints"] = self._constraints
         return out
 
 

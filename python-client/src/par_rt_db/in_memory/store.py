@@ -13,10 +13,12 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import time
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
+from functools import cache
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import TypeAdapter
@@ -851,6 +853,7 @@ def validate_doc(table: TableDef, doc: dict[str, Any]) -> None:
         if field in doc:
             if not validate_value(field_ty, doc[field]):
                 raise RtDbError(ErrorCode.SCHEMA_VIOLATION, f"field '{field}' has an invalid value")
+            _check_constraints_for_field(table, field, doc[field])
         elif field_ty.type != "optional":
             raise RtDbError(ErrorCode.SCHEMA_VIOLATION, f"field '{field}' is required")
 
@@ -913,6 +916,59 @@ def _optional_rejects_null(ty: Any) -> bool:
             return not validate_value(inner, None)
         case _:
             return False
+
+
+@cache
+def _compiled_pattern(pattern: str) -> re.Pattern[str]:
+    """Compile and cache a constraints ``pattern`` for unanchored
+    ``re.search`` matching (the server's regex-crate ``is_match`` semantics).
+    Callers validate compilability at push time (``_validate_constraints``),
+    so a push-validated pattern never raises here."""
+    return re.compile(pattern)
+
+
+def _check_constraints_for_field(table: TableDef, field: str, value: Any) -> None:
+    """Write-path constraint check for one present field value — a port of
+    server ``schema::value::check_constraints_for_field``. Null never
+    violates; bounds compare inclusively (the int64 decimal string parses to
+    a float for the compare); ``pattern`` is an unanchored ``re.search``.
+    Violations are SCHEMA_VIOLATION naming the field and constraint."""
+    fc = table.constraints.get(field)
+    if fc is None or value is None:
+        return
+
+    def violate(label: str) -> RtDbError:
+        return RtDbError(
+            ErrorCode.SCHEMA_VIOLATION, f"field '{field}' violates its '{label}' constraint"
+        )
+
+    base: Any = table.fields.get(field)
+    while isinstance(base, _FOptional):
+        base = base.inner
+    if isinstance(base, _FNumber):
+        v = value if isinstance(value, int | float) and not isinstance(value, bool) else math.nan
+        if fc.min is not None and v < fc.min:
+            raise violate("min")
+        if fc.max is not None and v > fc.max:
+            raise violate("max")
+    elif isinstance(base, _FInt64):
+        try:
+            v = float(value) if isinstance(value, str) else math.nan
+        except ValueError:
+            v = math.nan
+        if fc.min is not None and v < fc.min:
+            raise violate("min")
+        if fc.max is not None and v > fc.max:
+            raise violate("max")
+    elif isinstance(base, _FString):
+        if not isinstance(value, str):
+            return
+        if fc.min_length is not None and len(value) < fc.min_length:
+            raise violate("minLength")
+        if fc.max_length is not None and len(value) > fc.max_length:
+            raise violate("maxLength")
+        if fc.pattern is not None and _compiled_pattern(fc.pattern).search(value) is None:
+            raise violate("pattern")
 
 
 def _strip_unset_optionals(table: TableDef, doc: dict[str, Any]) -> dict[str, Any]:
@@ -1008,6 +1064,57 @@ def _index_column_type(ty: Any) -> _IndexedType:
             raise RtDbError(ErrorCode.SCHEMA_VIOLATION, f"field type '{ty.type}' is not indexable")
 
 
+def _validate_constraints(schema: SchemaDef) -> None:
+    """Push-time constraint validation — a port of server ``schema::validate``'s
+    ``validate_constraints``: each key names a declared field, ``min``/``max``
+    sit only on number/int64 (integer bounds on int64),
+    ``minLength``/``maxLength``/``pattern`` only on string, bounds don't cross,
+    and ``pattern`` compiles under ``re.compile`` (unanchored search).
+    Violations are SCHEMA_VIOLATION naming the field, matching the server's
+    typed push error."""
+    for table_name, table in schema.tables.items():
+        for field, fc in table.constraints.items():
+
+            def violate(detail: str, _field: str = field) -> RtDbError:
+                return RtDbError(
+                    ErrorCode.SCHEMA_VIOLATION, f"constraints on field '{_field}': {detail}"
+                )
+
+            field_ty: Any = table.fields.get(field)
+            if field_ty is None:
+                raise RtDbError(
+                    ErrorCode.SCHEMA_VIOLATION,
+                    f"constraints key '{field}' is not a declared field of table '{table_name}'",
+                )
+            while isinstance(field_ty, _FOptional):
+                field_ty = field_ty.inner
+            if fc.min is not None or fc.max is not None:
+                if not isinstance(field_ty, _FNumber | _FInt64):
+                    raise violate("'min'/'max' is legal only on number/int64 fields")
+                if isinstance(field_ty, _FInt64) and any(
+                    b is not None and not float(b).is_integer() for b in (fc.min, fc.max)
+                ):
+                    raise violate("'min'/'max' bound must be an integer on an int64 field")
+            if (
+                fc.min_length is not None or fc.max_length is not None or fc.pattern is not None
+            ) and not isinstance(field_ty, _FString):
+                raise violate("'minLength'/'maxLength'/'pattern' is legal only on string fields")
+            if fc.min is not None and fc.max is not None and fc.min > fc.max:
+                raise violate("'min' exceeds 'max'")
+            if (
+                fc.min_length is not None
+                and fc.max_length is not None
+                and fc.min_length > fc.max_length
+            ):
+                raise violate("'minLength' exceeds 'maxLength'")
+            if fc.pattern is not None:
+                try:
+                    # Validate compile only (same check the server runs at push time).
+                    re.compile(fc.pattern)
+                except re.error:
+                    raise violate(f"invalid pattern: '{fc.pattern}'") from None
+
+
 def _validate_schema(schema: SchemaDef) -> None:
     """Push-time schema validation — the TTL, ``updatedAtField``, and
     index-field rules of server ``schema.rs::validate`` (``validate_indexes`` +
@@ -1019,6 +1126,11 @@ def _validate_schema(schema: SchemaDef) -> None:
     field distinct from ``ttl.field``. Deliberately a subset — identifier
     formats, owner/collaborator fields, defaults, and ``onDelete`` shapes stay
     server-side (the last has its own ``_validate_on_delete`` pass)."""
+    # Per-field write-constraints validation (server
+    # `schema::validate::validate_constraints`): each key names a declared
+    # field, `min`/`max` sit only on number/int64, string rules only on
+    # string, bounds don't cross, and `pattern` compiles.
+    _validate_constraints(schema)
     for table_name, table in schema.tables.items():
         # `authorize` predicates reject `olderThan` at push (server
         # `validate_structure`: the op is by-query-only and authorize runs on
