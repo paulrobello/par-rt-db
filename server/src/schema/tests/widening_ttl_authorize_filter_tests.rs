@@ -85,6 +85,7 @@ fn table_with_ttl(ttl: Option<TtlDef>) -> TableDef {
     let mut fields = BTreeMap::new();
     fields.insert("expiresAt".to_string(), FieldType::Number);
     TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields,
@@ -234,6 +235,7 @@ fn table_with_string_fields(field_names: &[&str]) -> TableDef {
     );
     fields.insert("count".to_string(), FieldType::Number);
     TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields,

@@ -20,6 +20,7 @@ fn owner_schema() -> SchemaDef {
     tables.insert(
         "notes".to_string(),
         TableDef {
+            constraints: std::collections::BTreeMap::new(),
             defaults: std::collections::BTreeMap::new(),
             computed: std::collections::BTreeMap::new(),
             fields,

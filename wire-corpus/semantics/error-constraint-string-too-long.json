@@ -1,0 +1,24 @@
+{
+  "name": "error-constraint-string-too-long",
+  "$comment": "Write-path constraint enforcement: a string longer than maxLength fails with SCHEMA_VIOLATION.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }],
+        "constraints": { "name": { "minLength": 2, "maxLength": 5 } }
+      }
+    }
+  },
+  "seed": [],
+  "op": {
+    "txn": {
+      "steps": [
+        { "op": "insert", "table": "tasks", "doc": { "name": "abcdef" } }
+      ]
+    }
+  },
+  "expect": { "error": { "code": "SCHEMA_VIOLATION" } }
+}

@@ -1,0 +1,64 @@
+{
+  "name": "error-constraint-patch-by-query-violated",
+  "$comment": "patchByQuery enforces constraints on every mutated row: the update would push the matched row above max, failing the txn with SCHEMA_VIOLATION.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": {
+            "type": "string"
+          },
+          "score": {
+            "type": "number"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_name",
+            "fields": [
+              "name"
+            ]
+          }
+        ],
+        "constraints": {
+          "score": {
+            "min": 1,
+            "max": 10
+          }
+        }
+      }
+    }
+  },
+  "seed": [
+    {
+      "$id": "t1",
+      "doc": {
+        "name": "ok",
+        "score": 5
+      }
+    }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "patchByQuery",
+          "table": "tasks",
+          "filter": {
+            "field": "name",
+            "op": "eq",
+            "value": "ok"
+          },
+          "patch": {
+            "score": 99
+          }
+        }
+      ]
+    }
+  },
+  "expect": {
+    "error": {
+      "code": "SCHEMA_VIOLATION"
+    }
+  }
+}

@@ -31,6 +31,7 @@ pub fn kanban_schema_json() -> serde_json::Value {
 
 fn simple_table() -> TableDef {
     TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
@@ -69,6 +70,7 @@ fn rejects_table_name_starting_with_digit() {
 #[test]
 fn rejects_field_name_with_invalid_chars() {
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([("a-b".to_string(), FieldType::String)]),
@@ -110,6 +112,7 @@ fn rejects_table_name_over_max_length_30() {
 fn accepts_field_name_at_max_length_60() {
     let field_name = "a".repeat(60);
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([(field_name, FieldType::String)]),
@@ -133,6 +136,7 @@ fn accepts_field_name_at_max_length_60() {
 fn rejects_field_name_over_max_length_60() {
     let field_name = "a".repeat(61);
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([(field_name, FieldType::String)]),
@@ -156,6 +160,7 @@ fn rejects_field_name_over_max_length_60() {
 fn accepts_index_name_at_max_length_30() {
     let index_name = "a".repeat(30);
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
@@ -188,6 +193,7 @@ fn accepts_index_name_at_max_length_30() {
 fn rejects_index_name_over_max_length_30() {
     let index_name = "a".repeat(31);
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
@@ -219,6 +225,7 @@ fn rejects_index_name_over_max_length_30() {
 #[test]
 fn rejects_case_insensitive_field_name_collision() {
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([
@@ -244,6 +251,7 @@ fn rejects_case_insensitive_field_name_collision() {
 #[test]
 fn rejects_case_insensitive_index_name_collision() {
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
@@ -287,6 +295,7 @@ fn rejects_case_insensitive_index_name_collision() {
 #[test]
 fn rejects_field_name_starting_with_underscore() {
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([("_secret".to_string(), FieldType::String)]),
@@ -322,6 +331,7 @@ fn rejects_case_insensitive_table_name_collision() {
 #[test]
 fn rejects_index_over_array_field() {
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([(
@@ -358,6 +368,7 @@ fn rejects_index_over_array_field() {
 #[test]
 fn rejects_index_with_empty_fields() {
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
@@ -389,6 +400,7 @@ fn rejects_index_with_empty_fields() {
 #[test]
 fn rejects_index_with_duplicate_fields() {
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
@@ -420,6 +432,7 @@ fn rejects_index_with_duplicate_fields() {
 #[test]
 fn rejects_duplicate_index_names() {
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
@@ -463,6 +476,7 @@ fn rejects_duplicate_index_names() {
 #[test]
 fn rejects_index_name_with_invalid_chars() {
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([("name".to_string(), FieldType::String)]),

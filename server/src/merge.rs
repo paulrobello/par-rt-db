@@ -386,6 +386,7 @@ mod tests {
             map.insert((*name).to_string(), ty.clone());
         }
         TableDef {
+            constraints: std::collections::BTreeMap::new(),
             defaults: std::collections::BTreeMap::new(),
             computed: std::collections::BTreeMap::new(),
             fields: map,

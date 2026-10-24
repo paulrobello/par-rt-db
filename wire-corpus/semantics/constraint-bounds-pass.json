@@ -1,0 +1,31 @@
+{
+  "name": "constraint-bounds-pass",
+  "$comment": "Declarative field constraints, inclusive boundaries: min/max on number AND int64 (decimal-string wire form) and minLength/maxLength/pattern on string all PASS exactly at the edge — min <= v <= max is inclusive on both ends, length counts are inclusive, and the pattern is an unanchored search (^...$ here makes it effectively full-match; the anchors are part of the declared pattern, not engine behavior). Values at every boundary seed cleanly and the read path is unchanged (constraints are write-path only).",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "score": { "type": "number" },
+          "counter": { "type": "int64" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }],
+        "constraints": {
+          "score": { "min": 1, "max": 10 },
+          "counter": { "min": 1, "max": 100 },
+          "name": { "minLength": 2, "maxLength": 5, "pattern": "^[a-z]+$" }
+        }
+      }
+    }
+  },
+  "seed": [
+    { "$id": "lo", "doc": { "name": "aa", "score": 1, "counter": "1" } },
+    { "$id": "hi", "doc": { "name": "abcde", "score": 10, "counter": "100" } }
+  ],
+  "op": { "query": { "table": "tasks" } },
+  "expect": [
+    { "name": "aa", "score": 1, "counter": "1" },
+    { "name": "abcde", "score": 10, "counter": "100" }
+  ],
+  "unordered": true
+}

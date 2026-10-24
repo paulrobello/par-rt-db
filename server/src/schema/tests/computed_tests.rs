@@ -6,6 +6,7 @@ use crate::value_expr::ValueExpr;
 
 fn simple_table() -> TableDef {
     TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
@@ -39,6 +40,7 @@ fn literal(value: serde_json::Value) -> ValueExpr {
 /// the entries it exercises.
 fn computed_table() -> TableDef {
     TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: BTreeMap::new(),
         fields: BTreeMap::from([
             ("first".to_string(), FieldType::String),

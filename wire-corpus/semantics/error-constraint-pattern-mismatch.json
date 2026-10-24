@@ -1,0 +1,24 @@
+{
+  "name": "error-constraint-pattern-mismatch",
+  "$comment": "Write-path constraint enforcement: pattern is an UNANCHORED regex search over the value — the declared anchors here (^...$) make it effectively full-match, so 'ABC' passes the length rules but fails the pattern with SCHEMA_VIOLATION.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }],
+        "constraints": { "name": { "minLength": 2, "maxLength": 5, "pattern": "^[a-z]+$" } }
+      }
+    }
+  },
+  "seed": [],
+  "op": {
+    "txn": {
+      "steps": [
+        { "op": "insert", "table": "tasks", "doc": { "name": "ABC" } }
+      ]
+    }
+  },
+  "expect": { "error": { "code": "SCHEMA_VIOLATION" } }
+}

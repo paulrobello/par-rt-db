@@ -27,6 +27,7 @@
 * [Durable workflows](#durable-workflows)
 * [Change feed](#change-feed)
 * [Computed fields](#computed-fields)
+* [Field constraints](#field-constraints)
 * [Realtime presence](#realtime-presence)
 * [Make targets](#make-targets)
    * [Verification gates](#verification-gates)
@@ -85,6 +86,7 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 - **Server-stamped `updatedAt`**: a table may declare `updatedAtField` naming a `number`/`int64` field the server stamps with epoch-ms on every version-bumping write (insert/patch/replace/upsert/patchByQuery/cascade setNull), overwriting client-supplied values — no more hand-rolled timestamps in every mutation, and orderable with a declared index
 - **Auto-increment counters**: a table may declare `autoIncrementField` naming an `int64` field the server assigns from a per-table Postgres sequence on insert (overwriting client-supplied values, immutable afterward, unique-indexable) — ticket/issue numbers with zero races; snapshot import continues numbering past the imported max, and gaps from rolled-back transactions are documented behavior
 - **Computed fields**: a table may declare `computed`, a map of field name → typed expression (`concat`/arithmetic/`coalesce`/`lower`/`upper`/`trim`/casts/`case`/`now`), re-derived by the server on every write and stored in the doc body **and** the typed column — client-supplied values never survive, `null` results leave the key absent, the field stays indexable, and pushes backfill existing rows (see [Computed fields](#computed-fields))
+- **Declarative field constraints**: a table may declare `constraints`, a map of field name → `min`/`max` (number/int64, inclusive) and/or `minLength`/`maxLength`/`pattern` (string; regex validated at push time), enforced on every write — a violating insert/patch/replace/upsert/patchByQuery fails with `SCHEMA_VIOLATION` and rolls back (see [Field constraints](#field-constraints))
 - **Realtime presence**: transient room membership and state ("who is online", cursors, typing) over the existing `/sync` socket — no extra infrastructure
 - **File storage**: opaque unauthenticated public URLs, signed time-limited URLs, HTTP `Range` support, and read-time image transforms
 - **Auth**: six optional OAuth providers (GitHub, Google, GitLab, Microsoft, Apple, generic OIDC), per-database machine tokens plus optional host-scoped machine credentials with enrollment grants, optional anonymous access with anon→real account merge, and per-row `ownerField`/`authorize` rules
@@ -1181,6 +1183,60 @@ The consumer contract:
 
 All five client SDKs expose the feed (`listChanges` in TS, `changes()` in
 Rust/Python/Swift/Go).
+
+## Field constraints
+
+A table may declare `constraints`, a map of field name → constraint set, and
+the server enforces it on the **write path only** — every write that stores or
+merges a constrained field (insert, patch, replace, upsert both branches,
+`patchByQuery`, and snapshot import) fails with `SCHEMA_VIOLATION` and rolls
+back the transaction when a non-null value violates one. Reads, indexes, and
+query results are unchanged: constraints type nothing, they only gate writes
+(the read/write index-value typing is untouched).
+
+Per type:
+
+- `number`/`int64` accept `min`/`max` — **inclusive** bounds (`v >= min &&
+  v <= max`; a value exactly at either boundary passes). `int64` values are
+  decimal strings on the wire; bound compares are exact i64, and the declared
+  bounds must be integers (a fractional bound is a push error).
+- `string` accepts `minLength`/`maxLength` (inclusive, counted in Unicode
+  scalar values) and `pattern` — an **unanchored** regex search (`is_match` /
+  `RegExp.test` semantics; declare `^…$` anchors in the pattern itself when
+  you want a full match).
+
+`Optional` fields check their non-null values; `null` and absent keys never
+violate. Push-time validation rejects a **misapplied** constraint (e.g. `min`
+on a string, `maxLength` on a number) and an **invalid regex** with
+`SCHEMA_VIOLATION` naming the field, crossed bounds (`min > max`,
+`minLength > maxLength`), and a constraint key naming an undeclared field. A
+`defaults` entry must also satisfy its field's constraints, so a default can
+never invalidate new documents. Migrate stays consistent: `renameField` re-keys
+the entry, `dropField` removes it, and `changeType` re-validates — a retype
+that would leave the entry misapplied is rejected at plan time, and every
+coerced row value is re-checked at apply time.
+
+Constraints are **write-path only**: they change no stored shape, are not
+compared by destructive-change detection (adding or removing one is an
+additive push), and mirror across all six implementations (enforced in every
+client's in-memory engine). See the `constraint-*` / `error-constraint-*`
+cases in [`wire-corpus/semantics/`](wire-corpus/semantics/) for the pinned
+cross-engine semantics and [FEATURE_MATRIX #43](FEATURE_MATRIX.md).
+
+```bash
+# Declare constraints: score 1..10 inclusive, counter 1..100, name 2..5 chars matching ^[a-z]+$.
+curl -s -X POST http://localhost:8300/admin/push-schema \
+  -H "Authorization: Bearer $RTDB_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"db":"myapp","schema":{"tables":{"tasks":{"fields":{"name":{"type":"string"},"score":{"type":"number"},"counter":{"type":"int64"}},"indexes":[{"name":"by_name","fields":["name"]}],"constraints":{"score":{"min":1,"max":10},"counter":{"min":1,"max":100},"name":{"minLength":2,"maxLength":5,"pattern":"^[a-z]+$"}}}}}}'
+
+# A violating write fails atomically with SCHEMA_VIOLATION naming the field.
+curl -s -X POST http://localhost:8300/api/mutate \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"db":"myapp","txn":{"steps":[{"op":"insert","table":"tasks","doc":{"name":"ok","score":11,"counter":"1"}}]}}'
+# {"error":{"code":"SCHEMA_VIOLATION","message":"field 'score' violates its 'max' constraint"}}
+```
 
 ## Computed fields
 

@@ -52,6 +52,7 @@ fn valid_work_item_doc() -> serde_json::Map<String, serde_json::Value> {
 #[test]
 fn rejects_index_referencing_unknown_field() {
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([("name".to_string(), FieldType::String)]),
@@ -83,6 +84,7 @@ fn rejects_index_referencing_unknown_field() {
 #[test]
 fn rejects_literal_with_non_scalar_value() {
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([(
@@ -110,6 +112,7 @@ fn rejects_literal_with_non_scalar_value() {
 #[test]
 fn rejects_empty_union() {
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([("x".to_string(), FieldType::Union { variants: vec![] })]),
@@ -132,6 +135,7 @@ fn rejects_empty_union() {
 #[test]
 fn rejects_optional_wrapping_optional() {
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([(
@@ -346,6 +350,7 @@ fn new_variants_serialize_with_expected_wire_tags() {
 #[test]
 fn record_field_validates_structurally_and_recurses() {
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([(
@@ -445,6 +450,7 @@ fn indexed_column_type_rejects_new_non_indexable_types() {
 #[test]
 fn rejects_index_over_record_field() {
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([(
@@ -516,6 +522,7 @@ fn search_index_round_trips_and_validates() {
 #[test]
 fn rejects_search_index_over_non_text_field() {
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([("count".to_string(), FieldType::Number)]),
@@ -547,6 +554,7 @@ fn rejects_search_index_over_non_text_field() {
 #[test]
 fn accepts_search_index_over_optional_text_field() {
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields: BTreeMap::from([(

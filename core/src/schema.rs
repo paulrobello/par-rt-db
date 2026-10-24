@@ -283,6 +283,36 @@ pub struct TtlDef {
     pub default_duration_ms: Option<i64>,
 }
 
+/// Declarative per-field write constraints. Carried on `TableDef::constraints`
+/// keyed by field name (the FM-32 table-level-map pattern — inline-per-field
+/// would have required a `FieldDef` envelope through every `FieldType` site).
+/// `min`/`max` are legal only on `number`/`int64` fields and compare
+/// INCLUSIVELY (`v >= min && v <= max`); `minLength`/`maxLength`/`pattern` are
+/// legal only on `string` fields (`pattern` is an unanchored search). Null and
+/// absent values never violate a constraint. Bounds are JSON numbers — on an
+/// `int64` field they must be integers so the i64 comparison stays exact.
+/// Constraints are write-path only: they change no stored shape and are not
+/// compared by `detect_destructive_changes` (like `softDelete`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FieldConstraints {
+    /// Inclusive lower bound (number/int64).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<serde_json::Number>,
+    /// Inclusive upper bound (number/int64).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<serde_json::Number>,
+    /// Inclusive minimum string length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<u64>,
+    /// Inclusive maximum string length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<u64>,
+    /// Unanchored regex the value must match (search, not full match).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+}
+
 /// One table: fields, indexes, and opt-in per-row rules / TTL / defaults.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TableDef {
@@ -367,6 +397,18 @@ pub struct TableDef {
     /// without it deserialize unchanged.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub defaults: BTreeMap<String, serde_json::Value>,
+    /// Declarative per-field write constraints: field name →
+    /// [`FieldConstraints`]. Enforced on the write path only — every write
+    /// that stores or patches a constrained field (insert, patch, replace,
+    /// upsert both branches, patchByQuery, snapshot import, and the migrate
+    /// `changeType` re-validation) fails with `SCHEMA_VIOLATION` when a
+    /// non-null value violates one. Push-time validated: each key names a
+    /// declared field, `min`/`max` sit only on `number`/`int64` fields,
+    /// `minLength`/`maxLength`/`pattern` only on `string` (an invalid regex
+    /// is a push error naming the field). Additive — schemas without it
+    /// deserialize unchanged.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub constraints: BTreeMap<String, FieldConstraints>,
     /// Computed fields (ENH-028): field name → expression. The server
     /// re-evaluates each expression on every write and stores the result in
     /// the doc (overwriting any client-supplied value — the `ownerField`

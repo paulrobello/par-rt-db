@@ -852,6 +852,15 @@ export interface TableJson {
    * clients only declare it. Omitted on the wire when the table declares
    * none. */
   defaults?: Record<string, unknown>;
+  /** Declarative per-field write constraints: field name → constraint set.
+   *  `min`/`max` are legal only on number/int64 fields and compare
+   *  INCLUSIVELY; `minLength`/`maxLength`/`pattern` only on string
+   *  (`pattern` is an unanchored search). Null and absent values never
+   *  violate. Enforced on the write path only (server + in-memory engine);
+   *  push-time-validated server-side (a misapplied constraint or an invalid
+   *  regex fails the push naming the field). Omitted on the wire when the
+   *  table declares none. */
+  constraints?: Record<string, FieldConstraintsJson>;
   /** Computed fields (ENH-028): declared field name → {@link ValueExprJson}.
    * The server re-evaluates each expression on every write and stores the
    * result in the doc (overwriting any client-supplied value — the
@@ -867,6 +876,22 @@ export interface TableJson {
    * restores it. `true` only; omitted on the wire when false. Server-enforced;
    * clients only declare it. */
   softDelete?: boolean;
+}
+
+/** One field's declared write constraints (see {@link TableJson.constraints}).
+ *  All keys optional; an empty object is legal but a no-op. Bounds are JSON
+ *  numbers (integer-valued on int64 fields — exact i64 compare server-side). */
+export interface FieldConstraintsJson {
+  /** Inclusive lower bound (number/int64). */
+  min?: number;
+  /** Inclusive upper bound (number/int64). */
+  max?: number;
+  /** Inclusive minimum string length. */
+  minLength?: number;
+  /** Inclusive maximum string length. */
+  maxLength?: number;
+  /** Unanchored regex the value must match (search, not full match). */
+  pattern?: string;
 }
 
 /**

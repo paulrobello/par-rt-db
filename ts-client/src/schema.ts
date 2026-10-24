@@ -2,6 +2,7 @@ import type {
   CaseWhenJson,
   Cast,
   DistanceMetric,
+  FieldConstraintsJson,
   FieldTypeJson,
   FilterExpr,
   IndexJson,
@@ -205,6 +206,7 @@ export class TableDefinition<
     readonly updatedAtFieldName?: string,
     readonly autoIncrementFieldName?: string,
     readonly computedMap?: Record<string, ValueExprJson>,
+    readonly constraintsMap?: Record<string, FieldConstraintsJson>,
   ) {}
 
   /**
@@ -226,6 +228,7 @@ export class TableDefinition<
       this.updatedAtFieldName,
       this.autoIncrementFieldName,
       this.computedMap,
+      this.constraintsMap,
     );
   }
 
@@ -278,6 +281,7 @@ export class TableDefinition<
       this.updatedAtFieldName,
       this.autoIncrementFieldName,
       this.computedMap,
+      this.constraintsMap,
     );
   }
 
@@ -307,6 +311,7 @@ export class TableDefinition<
       this.updatedAtFieldName,
       this.autoIncrementFieldName,
       this.computedMap,
+      this.constraintsMap,
     );
   }
 
@@ -348,6 +353,7 @@ export class TableDefinition<
       this.updatedAtFieldName,
       this.autoIncrementFieldName,
       this.computedMap,
+      this.constraintsMap,
     );
   }
 
@@ -367,6 +373,7 @@ export class TableDefinition<
       this.updatedAtFieldName,
       this.autoIncrementFieldName,
       this.computedMap,
+      this.constraintsMap,
     );
   }
 
@@ -387,6 +394,7 @@ export class TableDefinition<
       this.updatedAtFieldName,
       this.autoIncrementFieldName,
       this.computedMap,
+      this.constraintsMap,
     );
   }
 
@@ -412,6 +420,7 @@ export class TableDefinition<
       this.updatedAtFieldName,
       this.autoIncrementFieldName,
       this.computedMap,
+      this.constraintsMap,
     );
   }
 
@@ -435,6 +444,7 @@ export class TableDefinition<
       this.updatedAtFieldName,
       this.autoIncrementFieldName,
       this.computedMap,
+      this.constraintsMap,
     );
   }
 
@@ -459,6 +469,35 @@ export class TableDefinition<
       this.updatedAtFieldName,
       this.autoIncrementFieldName,
       this.computedMap,
+      this.constraintsMap,
+    );
+  }
+
+  /** Declare per-field write constraints: every key names a declared field
+   * whose stored values must satisfy the given `min`/`max` (number/int64,
+   * inclusive) and/or `minLength`/`maxLength`/`pattern` (string; unanchored
+   * regex search) on every write — insert, patch, replace, upsert (both
+   * branches), and patchByQuery. Null and absent values never violate.
+   * Enforced server-side AND by this SDK's in-memory engine; push-time
+   * validated server-side (a misapplied constraint or an invalid regex fails
+   * the push naming the field). Round-trips on the wire as `constraints`,
+   * omitted when the table declares none. */
+  constraints(
+    map: Record<string, FieldConstraintsJson>,
+  ): TableDefinition<Fields, Indexes, Stamped> {
+    return new TableDefinition(
+      this.fields,
+      this.indexes,
+      this.ownerFieldName,
+      this.collaboratorsFieldName,
+      this.ttlDef,
+      this.authorizeDef,
+      this.defaultsMap,
+      this.softDeleteFlag,
+      this.updatedAtFieldName,
+      this.autoIncrementFieldName,
+      this.computedMap,
+      map,
     );
   }
 
@@ -481,6 +520,7 @@ export class TableDefinition<
       this.updatedAtFieldName,
       this.autoIncrementFieldName,
       this.computedMap,
+      this.constraintsMap,
     );
   }
 
@@ -509,6 +549,7 @@ export class TableDefinition<
       field,
       this.autoIncrementFieldName,
       this.computedMap,
+      this.constraintsMap,
     );
   }
 
@@ -569,6 +610,7 @@ export class TableDefinition<
       this.updatedAtFieldName,
       this.autoIncrementFieldName,
       { ...this.computedMap, [field]: expr },
+      this.constraintsMap,
     );
   }
 
@@ -603,6 +645,9 @@ export class TableDefinition<
     }
     if (this.computedMap && Object.keys(this.computedMap).length > 0) {
       json.computed = this.computedMap;
+    }
+    if (this.constraintsMap && Object.keys(this.constraintsMap).length > 0) {
+      json.constraints = this.constraintsMap;
     }
     if (this.softDeleteFlag) {
       json.softDelete = true;

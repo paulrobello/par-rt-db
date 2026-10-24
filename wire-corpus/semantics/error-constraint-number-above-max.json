@@ -1,0 +1,25 @@
+{
+  "name": "error-constraint-number-above-max",
+  "$comment": "Write-path constraint enforcement: a number insert above the declared inclusive max fails the txn with SCHEMA_VIOLATION.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "score": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }],
+        "constraints": { "score": { "min": 1, "max": 10 } }
+      }
+    }
+  },
+  "seed": [],
+  "op": {
+    "txn": {
+      "steps": [
+        { "op": "insert", "table": "tasks", "doc": { "name": "ok", "score": 11 } }
+      ]
+    }
+  },
+  "expect": { "error": { "code": "SCHEMA_VIOLATION" } }
+}

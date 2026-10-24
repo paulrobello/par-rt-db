@@ -8,7 +8,8 @@ use crate::ddl::{
 use crate::error::RtDbError;
 use crate::schema::{
     FieldType, MAX_FIELD_NAME_LEN, MAX_INDEX_NAME_LEN, MAX_TABLE_NAME_LEN, SchemaDef, TableDef,
-    indexed_column_type, is_valid_identifier,
+    TableDefExt, check_constraints_for_field, indexed_column_type, is_valid_identifier,
+    validate_constraints_entry,
 };
 use crate::txn::{DocOp, OpKind};
 use std::collections::BTreeSet;
@@ -184,6 +185,12 @@ pub fn plan_migration(old: &SchemaDef, directives: &[Directive]) -> Result<Schem
     // plan fails before any DB work; the committer's `derived.validate()`
     // backstop covers the same rules through `validate_structure`.
     crate::schema::validate_computed(&schema)?;
+    // Same discipline for the constraints maps: directive folding must not be
+    // able to invalidate an entry (a backstop — each applicable rule already
+    // fires in the per-directive planners above).
+    for (table_name, table_def) in &schema.tables {
+        table_def.validate_constraints(table_name)?;
+    }
     Ok(schema)
 }
 
@@ -283,6 +290,11 @@ fn plan_rename_field(
     if let Some(value) = t.defaults.remove(from) {
         t.defaults.insert(to.to_string(), value);
     }
+    // The constraints map follows the rename the same way `defaults` does:
+    // an entry KEYED on the renamed field moves to the new name.
+    if let Some(fc) = t.constraints.remove(from) {
+        t.constraints.insert(to.to_string(), fc);
+    }
     rename_field_refs(t, from, to);
     Ok(())
 }
@@ -342,6 +354,13 @@ fn plan_change_type(
     // longer accept it, so the entry goes rather than risking a
     // push-time-invalid derived schema (re-declare it on a later push).
     t.defaults.remove(field);
+    // Constraints re-validation: the entry (if any) must still apply to the
+    // NEW type — a `changeType` that would leave `min` on a string field, or
+    // a `pattern` on a number, is rejected here at plan time with the same
+    // typed error the push path produces.
+    if let Some(fc) = t.constraints.get(field) {
+        validate_constraints_entry(field, new_ty, fc)?;
+    }
     Ok(())
 }
 
@@ -412,6 +431,7 @@ fn plan_drop_field(schema: &mut SchemaDef, table: &str, field: &str) -> Result<(
     // on the derived schema.
     t.computed.remove(field);
     t.defaults.remove(field);
+    t.constraints.remove(field);
     Ok(())
 }
 
@@ -1091,6 +1111,11 @@ async fn apply_change_type(
                 )));
             }
         };
+        // Constraint re-validation on the coerced value: the retyped field's
+        // declared constraints (if any) must hold in every migrated row, so a
+        // `changeType` cannot push existing data outside its declared bounds
+        // (the whole migrate txn fails and rolls back, naming the field).
+        check_constraints_for_field(table_def(derived, table)?, field, &new_val)?;
         let s = serde_json::to_string(&new_val).map_err(|e| RtDbError::internal(e.to_string()))?;
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE \"{schema_name}\".\"{t}\" \
@@ -1764,6 +1789,7 @@ mod tests {
         tables.insert(
             "users".into(),
             TableDef {
+                constraints: std::collections::BTreeMap::new(),
                 defaults: std::collections::BTreeMap::new(),
                 computed: std::collections::BTreeMap::new(),
                 fields,
@@ -1896,6 +1922,7 @@ mod tests {
         tables.insert(
             "things".into(),
             TableDef {
+                constraints: std::collections::BTreeMap::new(),
                 defaults: std::collections::BTreeMap::new(),
                 computed: std::collections::BTreeMap::new(),
                 fields,
@@ -1972,6 +1999,7 @@ mod tests {
         tables.insert(
             "users".into(),
             TableDef {
+                constraints: std::collections::BTreeMap::new(),
                 defaults: std::collections::BTreeMap::new(),
                 computed: std::collections::BTreeMap::new(),
                 fields,
@@ -2296,6 +2324,7 @@ mod tests {
         tables.insert(
             "node".into(),
             TableDef {
+                constraints: std::collections::BTreeMap::new(),
                 defaults: std::collections::BTreeMap::new(),
                 computed: std::collections::BTreeMap::new(),
                 fields,
@@ -2345,6 +2374,7 @@ mod tests {
         tables.insert(
             "user".into(),
             TableDef {
+                constraints: std::collections::BTreeMap::new(),
                 defaults: std::collections::BTreeMap::new(),
                 computed: std::collections::BTreeMap::new(),
                 fields: user_fields,
@@ -2362,6 +2392,7 @@ mod tests {
         tables.insert(
             "account".into(),
             TableDef {
+                constraints: std::collections::BTreeMap::new(),
                 defaults: std::collections::BTreeMap::new(),
                 computed: std::collections::BTreeMap::new(),
                 fields: account_fields,

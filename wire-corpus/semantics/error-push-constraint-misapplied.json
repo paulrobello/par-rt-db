@@ -1,0 +1,16 @@
+{
+  "name": "error-push-constraint-misapplied",
+  "$comment": "Push-time constraint validation: a `min` bound declared on a STRING field is a misapplied constraint — the push itself fails with SCHEMA_VIOLATION naming the field (code-only assertion). Same rule for minLength/maxLength/pattern on non-string fields and min/max on non-numeric fields.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }],
+        "constraints": { "name": { "min": 1 } }
+      }
+    }
+  },
+  "pushError": { "code": "SCHEMA_VIOLATION" }
+}

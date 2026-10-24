@@ -33,6 +33,7 @@ fn priority_schema(variants: &[&str]) -> SchemaDef {
     tables.insert(
         "items".to_string(),
         TableDef {
+            constraints: std::collections::BTreeMap::new(),
             defaults: std::collections::BTreeMap::new(),
             computed: std::collections::BTreeMap::new(),
             fields,
@@ -127,6 +128,7 @@ fn email_index_schema(unique: bool, where_clause: Option<FilterExpr>) -> SchemaD
     tables.insert(
         "users".to_string(),
         TableDef {
+            constraints: std::collections::BTreeMap::new(),
             defaults: std::collections::BTreeMap::new(),
             computed: std::collections::BTreeMap::new(),
             fields,

@@ -12,8 +12,8 @@
 //! site keeps resolving unchanged.
 
 pub use par_rt_db_core::schema::{
-    DistanceMetric, FieldType, IndexDef, OnDeleteAction, SchemaDef, TableDef, TtlDef,
-    VectorIndexSpec, is_widening_of, literal_set, strip_on_delete,
+    DistanceMetric, FieldConstraints, FieldType, IndexDef, OnDeleteAction, SchemaDef, TableDef,
+    TtlDef, VectorIndexSpec, is_widening_of, literal_set, strip_on_delete,
 };
 pub(crate) use par_rt_db_core::schema::{
     MAX_FIELD_NAME_LEN, MAX_INDEX_NAME_LEN, MAX_TABLE_NAME_LEN,

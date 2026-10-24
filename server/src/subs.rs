@@ -1524,6 +1524,7 @@ mod tests {
     /// and `in_window` typing across all three indexable scalar types.
     fn test_table_def() -> TableDef {
         TableDef {
+            constraints: std::collections::BTreeMap::new(),
             defaults: std::collections::BTreeMap::new(),
             computed: std::collections::BTreeMap::new(),
             fields: BTreeMap::from([

@@ -16,7 +16,10 @@ use super::types::{
     FieldType, IndexDef, MAX_FIELD_NAME_LEN, MAX_INDEX_NAME_LEN, MAX_TABLE_NAME_LEN,
     OnDeleteAction, SchemaDef, TableDef,
 };
-use super::value::{indexed_column_type, is_string_array_field, validate_value};
+use super::value::{
+    check_constraints_for_field, indexed_column_type, is_string_array_field,
+    validate_constraints_entry, validate_value,
+};
 
 pub(crate) fn is_valid_identifier(s: &str, max_len: usize) -> bool {
     if s.is_empty() || s.len() > max_len {
@@ -114,6 +117,7 @@ pub trait TableDefExt {
     fn validate_updated_at(&self) -> Result<(), RtDbError>;
     fn validate_auto_increment(&self) -> Result<(), RtDbError>;
     fn validate_defaults(&self, table_name: &str) -> Result<(), RtDbError>;
+    fn validate_constraints(&self, table_name: &str) -> Result<(), RtDbError>;
     fn validate_computed(&self, table_name: &str) -> Result<(), RtDbError>;
     fn validate_on_delete(&self, table_name: &str) -> Result<(), RtDbError>;
     fn field_has_nested_on_delete(&self, ty: &FieldType) -> bool;
@@ -138,6 +142,7 @@ impl TableDefExt for TableDef {
         self.validate_updated_at()?;
         self.validate_auto_increment()?;
         self.validate_defaults(table_name)?;
+        self.validate_constraints(table_name)?;
         self.validate_computed(table_name)?;
         self.validate_on_delete(table_name)?;
         Ok(())
@@ -465,6 +470,27 @@ impl TableDefExt for TableDef {
         Ok(())
     }
 
+    /// Per-field write-constraint push validation: every key names a declared
+    /// field, `min`/`max` sit only on `number`/`int64` fields,
+    /// `minLength`/`maxLength`/`pattern` only on `string`, `pattern` compiles
+    /// under the `regex` crate (unanchored search), and `min <= max` /
+    /// `minLength <= maxLength` when both ends are declared. Delegates the
+    /// per-entry rules to [`validate_constraints_entry`], which migrate's
+    /// `plan_change_type` reuses to re-validate the entry against the NEW
+    /// field type (a `changeType` that would leave the entry misapplied is
+    /// rejected at plan time).
+    fn validate_constraints(&self, table_name: &str) -> Result<(), RtDbError> {
+        for (field, fc) in &self.constraints {
+            let fty = self.fields.get(field).ok_or_else(|| {
+                RtDbError::schema(format!(
+                    "constraints key '{field}' is not a declared field of table '{table_name}'"
+                ))
+            })?;
+            validate_constraints_entry(field, fty, fc)?;
+        }
+        Ok(())
+    }
+
     fn validate_defaults(&self, table_name: &str) -> Result<(), RtDbError> {
         for (field, value) in &self.defaults {
             let fty = self.fields.get(field).ok_or_else(|| {
@@ -482,6 +508,10 @@ impl TableDefExt for TableDef {
                     "defaults value for '{table_name}.{field}' does not match the field type"
                 )));
             }
+            // A default is stamped onto new documents, so it must also satisfy
+            // the field's declared constraints — a violating default would
+            // fail every insert that applies it.
+            check_constraints_for_field(self, field, value)?;
         }
         Ok(())
     }

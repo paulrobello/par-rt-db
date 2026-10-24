@@ -422,6 +422,7 @@ mod tests {
         let mut fields = BTreeMap::new();
         fields.insert(field.to_string(), ft);
         TableDef {
+            constraints: std::collections::BTreeMap::new(),
             defaults: std::collections::BTreeMap::new(),
             computed: std::collections::BTreeMap::new(),
             fields,
@@ -454,6 +455,7 @@ mod tests {
             fields_map.insert(field.to_string(), FieldType::String);
         }
         TableDef {
+            constraints: std::collections::BTreeMap::new(),
             defaults: std::collections::BTreeMap::new(),
             computed: std::collections::BTreeMap::new(),
             fields: fields_map,
@@ -539,6 +541,7 @@ mod tests {
         );
         fields_map.insert("archivedat".to_string(), FieldType::String);
         let table = TableDef {
+            constraints: std::collections::BTreeMap::new(),
             defaults: std::collections::BTreeMap::new(),
             computed: std::collections::BTreeMap::new(),
             fields: fields_map,

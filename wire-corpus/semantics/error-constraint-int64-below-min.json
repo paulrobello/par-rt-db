@@ -1,0 +1,25 @@
+{
+  "name": "error-constraint-int64-below-min",
+  "$comment": "Write-path constraint enforcement on int64: the wire value is a decimal string; the bound compare is exact i64 (bounds must be integers at push time). Below min fails with SCHEMA_VIOLATION.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "counter": { "type": "int64" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }],
+        "constraints": { "counter": { "min": 1, "max": 100 } }
+      }
+    }
+  },
+  "seed": [],
+  "op": {
+    "txn": {
+      "steps": [
+        { "op": "insert", "table": "tasks", "doc": { "name": "ok", "counter": "0" } }
+      ]
+    }
+  },
+  "expect": { "error": { "code": "SCHEMA_VIOLATION" } }
+}

@@ -235,6 +235,7 @@ mod tests {
 
     fn table(fields: &[(&str, FieldType)], indexes: &[IndexDef]) -> TableDef {
         TableDef {
+            constraints: std::collections::BTreeMap::new(),
             defaults: std::collections::BTreeMap::new(),
             computed: std::collections::BTreeMap::new(),
             fields: fields

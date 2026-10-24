@@ -31,6 +31,7 @@ pub struct TableBuilder {
     auto_increment_field: Option<String>,
     authorize: Option<FilterExpr>,
     defaults: BTreeMap<String, serde_json::Value>,
+    constraints: BTreeMap<String, par_rt_db_core::schema::FieldConstraints>,
     computed: BTreeMap<String, ValueExpr>,
     soft_delete: bool,
     /// Index of the most recently pushed [`IndexDef`] in [`Self::indexes`], so
@@ -53,6 +54,7 @@ impl TableBuilder {
             auto_increment_field: None,
             authorize: None,
             defaults: BTreeMap::new(),
+            constraints: BTreeMap::new(),
             computed: BTreeMap::new(),
             soft_delete: false,
             last_index: None,
@@ -277,6 +279,21 @@ impl TableBuilder {
         self.soft_delete = true;
         self
     }
+    /// Declare per-field write constraints (see
+    /// `par_rt_db_core::schema::FieldConstraints`): a map of field name →
+    /// constraint set. Compile-maintenance mirror only — write-path
+    /// enforcement in this client's in-memory engine ships with the rust
+    /// mirror wave.
+    pub fn constraints(
+        mut self,
+        entries: &[(&str, par_rt_db_core::schema::FieldConstraints)],
+    ) -> Self {
+        for (name, fc) in entries {
+            self.constraints.insert((*name).into(), fc.clone());
+        }
+        self
+    }
+
     fn finish(self) -> TableDef {
         TableDef {
             fields: self.fields,
@@ -288,6 +305,7 @@ impl TableBuilder {
             auto_increment_field: self.auto_increment_field,
             authorize: self.authorize,
             defaults: self.defaults,
+            constraints: self.constraints,
             computed: self.computed,
             soft_delete: self.soft_delete,
         }

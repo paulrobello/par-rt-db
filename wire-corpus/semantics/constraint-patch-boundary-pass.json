@@ -1,0 +1,32 @@
+{
+  "name": "constraint-patch-boundary-pass",
+  "$comment": "Patch TO the inclusive max boundary succeeds (patching an untouched field is unaffected). The follow-up read pins the merged doc.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "score": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }],
+        "constraints": { "score": { "min": 1, "max": 10 } }
+      }
+    }
+  },
+  "seed": [
+    { "$id": "t1", "doc": { "name": "ok", "score": 5 } }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        { "op": "patch", "table": "tasks", "id": { "$idRef": "t1" }, "fields": { "score": 10 } }
+      ]
+    }
+  },
+  "expect": [null],
+  "then": {
+    "query": { "table": "tasks" },
+    "expect": [{ "name": "ok", "score": 10 }],
+    "unordered": true
+  }
+}

@@ -42,6 +42,7 @@ fn owner_schema() -> SchemaDef {
     tables.insert(
         "notes".to_string(),
         TableDef {
+            constraints: std::collections::BTreeMap::new(),
             defaults: std::collections::BTreeMap::new(),
             computed: std::collections::BTreeMap::new(),
             fields: notes_fields,
@@ -60,6 +61,7 @@ fn owner_schema() -> SchemaDef {
     tables.insert(
         "open".to_string(),
         TableDef {
+            constraints: std::collections::BTreeMap::new(),
             defaults: std::collections::BTreeMap::new(),
             computed: std::collections::BTreeMap::new(),
             fields: open_fields,
@@ -551,6 +553,7 @@ async fn search_filters_to_own_rows() -> anyhow::Result<()> {
     tables.insert(
         "notes".to_string(),
         TableDef {
+            constraints: std::collections::BTreeMap::new(),
             defaults: std::collections::BTreeMap::new(),
             computed: std::collections::BTreeMap::new(),
             fields: notes_fields,
@@ -676,6 +679,7 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
     tables.insert(
         "docs".to_string(),
         TableDef {
+            constraints: std::collections::BTreeMap::new(),
             defaults: std::collections::BTreeMap::new(),
             computed: std::collections::BTreeMap::new(),
             fields: docs_fields,
@@ -814,6 +818,7 @@ async fn vector_search_composes_filter_fields_with_owner() -> anyhow::Result<()>
     tables.insert(
         "docs".to_string(),
         TableDef {
+            constraints: std::collections::BTreeMap::new(),
             defaults: std::collections::BTreeMap::new(),
             computed: std::collections::BTreeMap::new(),
             fields: docs_fields,
@@ -1786,6 +1791,7 @@ fn collab_schema() -> SchemaDef {
     tables.insert(
         "notes".to_string(),
         TableDef {
+            constraints: std::collections::BTreeMap::new(),
             defaults: std::collections::BTreeMap::new(),
             computed: std::collections::BTreeMap::new(),
             fields: notes_fields,
@@ -2451,6 +2457,7 @@ fn authorize_schema() -> SchemaDef {
     tables.insert(
         "posts".to_string(),
         TableDef {
+            constraints: std::collections::BTreeMap::new(),
             defaults: std::collections::BTreeMap::new(),
             computed: std::collections::BTreeMap::new(),
             fields: posts_fields,
@@ -3144,6 +3151,7 @@ fn insert_stamp_schema() -> SchemaDef {
     let mk_table = |fields: Vec<(String, FieldType)>, authorize: Option<FilterExpr>| -> TableDef {
         let fields: BTreeMap<String, FieldType> = fields.into_iter().collect();
         TableDef {
+            constraints: std::collections::BTreeMap::new(),
             defaults: std::collections::BTreeMap::new(),
             computed: std::collections::BTreeMap::new(),
             fields,
@@ -4010,6 +4018,7 @@ fn composed_schema() -> SchemaDef {
     tables.insert(
         "docs".to_string(),
         TableDef {
+            constraints: std::collections::BTreeMap::new(),
             defaults: std::collections::BTreeMap::new(),
             computed: std::collections::BTreeMap::new(),
             fields,
@@ -4668,6 +4677,7 @@ fn sec117_schema(authorize: FilterExpr) -> SchemaDef {
     tables.insert(
         "items".to_string(),
         TableDef {
+            constraints: std::collections::BTreeMap::new(),
             defaults: std::collections::BTreeMap::new(),
             computed: std::collections::BTreeMap::new(),
             fields,

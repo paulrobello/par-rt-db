@@ -25,6 +25,7 @@ mod dashboard_test;
 mod db_cleanup_test;
 mod deadline_test;
 mod defaults_test;
+mod field_constraints_test;
 mod field_guard_test;
 mod golden_vector_test;
 mod healthz_test;

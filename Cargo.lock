@@ -2995,6 +2995,7 @@ dependencies = [
  "percent-encoding",
  "proptest",
  "rand 0.10.3",
+ "regex",
  "reqwest",
  "ring",
  "rsa",

@@ -45,6 +45,7 @@ fn vector_schema_with_metric(dim: u32, with_filter: bool, metric: DistanceMetric
     tables.insert(
         "docs".to_string(),
         TableDef {
+            constraints: std::collections::BTreeMap::new(),
             defaults: std::collections::BTreeMap::new(),
             computed: std::collections::BTreeMap::new(),
             fields,

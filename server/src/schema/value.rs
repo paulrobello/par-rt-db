@@ -6,10 +6,11 @@
 //! in `schema::validate`.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use regex::Regex;
 
 use crate::error::RtDbError;
 
-use super::types::{FieldType, TableDef};
+use super::types::{FieldConstraints, FieldType, TableDef};
 
 /// Short tag naming a field type's kind, for error messages.
 fn type_tag(ty: &FieldType) -> &'static str {
@@ -159,6 +160,10 @@ pub fn validate_value(ty: &FieldType, value: &serde_json::Value) -> bool {
 
 /// Full-document validation: every schema field present-and-valid (Optional may be absent),
 /// no unknown fields, no "_"-prefixed fields. Errors are SchemaViolation naming the field path.
+/// Constraints are checked per PRESENT field (null skips — see
+/// `check_constraints_for_field`), so insert/replace/upsert/snapshot-import
+/// (the full-doc paths) and the patch paths' merged-doc re-validation all
+/// enforce them through this one seam.
 pub fn validate_doc(
     table: &TableDef,
     doc: &serde_json::Map<String, serde_json::Value>,
@@ -180,6 +185,7 @@ pub fn validate_doc(
                         "field '{field_name}' has an invalid value"
                     )));
                 }
+                check_constraints_for_field(table, field_name, value)?;
             }
             None => {
                 if !matches!(field_type, FieldType::Optional { .. }) {
@@ -191,5 +197,164 @@ pub fn validate_doc(
         }
     }
 
+    Ok(())
+}
+
+/// Unwraps `Optional` layers to the base type (constraints apply to the
+/// non-null values of an optional field; null itself never violates).
+pub(crate) fn strip_optional(mut ty: &FieldType) -> &FieldType {
+    while let FieldType::Optional { inner } = ty {
+        ty = inner;
+    }
+    ty
+}
+
+/// Push-time validation of ONE constraints entry against its field's type:
+/// the base type (after `Optional` unwrapping) must be `number`/`int64` for
+/// `min`/`max`, `string` for `minLength`/`maxLength`/`pattern`; a misapplied
+/// constraint is a `SCHEMA_VIOLATION` naming the field. `pattern` must
+/// compile under the `regex` crate (unanchored-search semantics) — an
+/// invalid regex is a push error naming the field. Also enforces
+/// `min <= max` and `minLength <= maxLength` when both ends are declared.
+pub fn validate_constraints_entry(
+    field_name: &str,
+    field_type: &FieldType,
+    fc: &FieldConstraints,
+) -> Result<(), RtDbError> {
+    let base = strip_optional(field_type);
+    let bounds_ok = matches!(base, FieldType::Number | FieldType::Int64);
+    for (label, bound) in [("min", fc.min.as_ref()), ("max", fc.max.as_ref())] {
+        let Some(bound) = bound else { continue };
+        if !bounds_ok {
+            return Err(RtDbError::schema(format!(
+                "constraints on field '{field_name}': '{label}' is legal only on number/int64 fields"
+            )));
+        }
+        if matches!(base, FieldType::Int64) && bound.is_f64() {
+            return Err(RtDbError::schema(format!(
+                "constraints on field '{field_name}': '{label}' bound must be an integer on an int64 field"
+            )));
+        }
+    }
+    let string_ok = matches!(base, FieldType::String);
+    for (label, present) in [
+        ("minLength", fc.min_length.is_some()),
+        ("maxLength", fc.max_length.is_some()),
+        ("pattern", fc.pattern.is_some()),
+    ] {
+        if present && !string_ok {
+            return Err(RtDbError::schema(format!(
+                "constraints on field '{field_name}': '{label}' is legal only on string fields"
+            )));
+        }
+    }
+    if let (Some(lo), Some(hi)) = (&fc.min, &fc.max) {
+        let lo = lo.as_f64().unwrap_or(f64::NEG_INFINITY);
+        let hi = hi.as_f64().unwrap_or(f64::INFINITY);
+        if lo > hi {
+            return Err(RtDbError::schema(format!(
+                "constraints on field '{field_name}': 'min' exceeds 'max'"
+            )));
+        }
+    }
+    if let (Some(lo), Some(hi)) = (fc.min_length, fc.max_length)
+        && lo > hi
+    {
+        return Err(RtDbError::schema(format!(
+            "constraints on field '{field_name}': 'minLength' exceeds 'maxLength'"
+        )));
+    }
+    if let Some(pattern) = &fc.pattern
+        && let Err(err) = Regex::new(pattern)
+    {
+        return Err(RtDbError::schema(format!(
+            "constraints on field '{field_name}': invalid pattern: {err}"
+        )));
+    }
+    Ok(())
+}
+
+/// Write-path constraint check for one present field value. Null never
+/// violates; a missing `constraints` entry is a no-op. `min`/`max` compare
+/// inclusively (`v >= min && v <= max`) — f64 compare on `number`, exact i64
+/// compare on `int64` (the decimal-string wire form parses to i64; integer
+/// bounds are guaranteed by push validation). `minLength`/`maxLength` count
+/// Unicode scalar values; `pattern` is an unanchored `regex` search.
+/// Violations are `SCHEMA_VIOLATION` naming the field and constraint.
+pub fn check_constraints_for_field(
+    table: &TableDef,
+    field_name: &str,
+    value: &serde_json::Value,
+) -> Result<(), RtDbError> {
+    let Some(fc) = table.constraints.get(field_name) else {
+        return Ok(());
+    };
+    if value.is_null() {
+        return Ok(());
+    }
+    let field_type = table.fields.get(field_name);
+    let base = field_type.map(strip_optional);
+    let violate = |label: &str| {
+        RtDbError::schema(format!(
+            "field '{field_name}' violates its '{label}' constraint"
+        ))
+    };
+    match base {
+        Some(FieldType::Number) => {
+            let v = value.as_f64().unwrap_or(f64::NAN);
+            if let Some(min) = fc.min.as_ref().and_then(|n| n.as_f64())
+                && v < min
+            {
+                return Err(violate("min"));
+            }
+            if let Some(max) = fc.max.as_ref().and_then(|n| n.as_f64())
+                && v > max
+            {
+                return Err(violate("max"));
+            }
+        }
+        Some(FieldType::Int64) => {
+            let v = value.as_str().and_then(|s| s.parse::<i64>().ok());
+            let Some(v) = v else {
+                return Ok(());
+            };
+            let bound = |n: &serde_json::Number| {
+                n.as_i64()
+                    .or_else(|| n.as_f64().map(|f| f as i64))
+                    .unwrap_or(i64::MAX)
+            };
+            if let Some(min) = fc.min.as_ref().map(bound)
+                && v < min
+            {
+                return Err(violate("min"));
+            }
+            if let Some(max) = fc.max.as_ref().map(bound)
+                && v > max
+            {
+                return Err(violate("max"));
+            }
+        }
+        Some(FieldType::String) => {
+            let s = value.as_str().unwrap_or_default();
+            let len = s.chars().count() as u64;
+            if let Some(lo) = fc.min_length
+                && len < lo
+            {
+                return Err(violate("minLength"));
+            }
+            if let Some(hi) = fc.max_length
+                && len > hi
+            {
+                return Err(violate("maxLength"));
+            }
+            if let Some(pattern) = &fc.pattern {
+                let ok = Regex::new(pattern).is_ok_and(|re| re.is_match(s));
+                if !ok {
+                    return Err(violate("pattern"));
+                }
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }

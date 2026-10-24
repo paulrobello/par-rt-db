@@ -625,6 +625,54 @@ function validateValue(ty: FieldTypeJson, value: unknown): boolean {
   }
 }
 
+/** Write-path constraint check for one present field value — a port of server
+ *  `schema::value::check_constraints_for_field`. Null never violates; bounds
+ *  compare inclusively (exact i64 compare on int64 decimal strings);
+ *  `pattern` is an unanchored `RegExp` search. Violations are
+ *  SCHEMA_VIOLATION naming the field and constraint. */
+function checkConstraintsForField(table: TableJson, field: string, value: unknown): void {
+  const fc = table.constraints?.[field];
+  if (fc === undefined || value === null) {
+    return;
+  }
+  const violate = (label: string): RtDbError =>
+    new RtDbError("SCHEMA_VIOLATION", `field '${field}' violates its '${label}' constraint`);
+  const base = (() => {
+    let ty = table.fields[field];
+    while (ty?.type === "optional") {
+      ty = ty.inner;
+    }
+    return ty?.type;
+  })();
+  if (base === "number") {
+    const v = typeof value === "number" ? value : NaN;
+    if (fc.min !== undefined && v < fc.min) {
+      throw violate("min");
+    }
+    if (fc.max !== undefined && v > fc.max) {
+      throw violate("max");
+    }
+  } else if (base === "int64") {
+    const v = typeof value === "string" ? Number(value) : NaN;
+    if (fc.min !== undefined && v < fc.min) {
+      throw violate("min");
+    }
+    if (fc.max !== undefined && v > fc.max) {
+      throw violate("max");
+    }
+  } else if (base === "string" && typeof value === "string") {
+    if (fc.minLength !== undefined && value.length < fc.minLength) {
+      throw violate("minLength");
+    }
+    if (fc.maxLength !== undefined && value.length > fc.maxLength) {
+      throw violate("maxLength");
+    }
+    if (fc.pattern !== undefined && !new RegExp(fc.pattern).test(value)) {
+      throw violate("pattern");
+    }
+  }
+}
+
 /** Full-document validation — a port of server `schema::validate_doc`. */
 function validateDoc(table: TableJson, doc: Record<string, unknown>): void {
   for (const key of Object.keys(doc)) {
@@ -640,6 +688,7 @@ function validateDoc(table: TableJson, doc: Record<string, unknown>): void {
       if (!validateValue(fieldTy, doc[field])) {
         throw new RtDbError("SCHEMA_VIOLATION", `field '${field}' has an invalid value`);
       }
+      checkConstraintsForField(table, field, doc[field]);
     } else if (fieldTy.type !== "optional") {
       throw new RtDbError("SCHEMA_VIOLATION", `field '${field}' is required`);
     }
@@ -833,6 +882,62 @@ function inferStaticKind(expr: ValueExprJson): StaticKind | undefined {
  *    yields JSON numbers);
  * 6. the table's `authorize` predicate references no computed field.
  * Every failure is BAD_REQUEST, like the server. */
+/** Push-time constraint validation — a port of server `schema::validate`'s
+ *  `validate_constraints`: each key names a declared field, `min`/`max` sit
+ *  only on number/int64 (integer bounds on int64), `minLength`/`maxLength`/
+ *  `pattern` only on string, bounds don't cross, and `pattern` compiles under
+ *  `RegExp` (unanchored search). Violations are SCHEMA_VIOLATION naming the
+ *  field, matching the server's typed push error. */
+function validateConstraints(schema: SchemaJson): void {
+  for (const [tableName, table] of Object.entries(schema.tables)) {
+    for (const [field, fc] of Object.entries(table.constraints ?? {})) {
+      const violate = (detail: string): RtDbError =>
+        new RtDbError("SCHEMA_VIOLATION", `constraints on field '${field}': ${detail}`);
+      let fieldTy = table.fields[field];
+      if (fieldTy === undefined) {
+        throw new RtDbError(
+          "SCHEMA_VIOLATION",
+          `constraints key '${field}' is not a declared field of table '${tableName}'`,
+        );
+      }
+      while (fieldTy.type === "optional") {
+        fieldTy = fieldTy.inner;
+      }
+      if (fc.min !== undefined || fc.max !== undefined) {
+        if (fieldTy.type !== "number" && fieldTy.type !== "int64") {
+          throw violate(`'min'/'max' is legal only on number/int64 fields`);
+        }
+        if (
+          fieldTy.type === "int64" &&
+          [fc.min, fc.max].some((b) => b !== undefined && !Number.isInteger(b))
+        ) {
+          throw violate(`'min'/'max' bound must be an integer on an int64 field`);
+        }
+      }
+      if (
+        (fc.minLength !== undefined || fc.maxLength !== undefined || fc.pattern !== undefined) &&
+        fieldTy.type !== "string"
+      ) {
+        throw violate(`'minLength'/'maxLength'/'pattern' is legal only on string fields`);
+      }
+      if (fc.min !== undefined && fc.max !== undefined && fc.min > fc.max) {
+        throw violate(`'min' exceeds 'max'`);
+      }
+      if (fc.minLength !== undefined && fc.maxLength !== undefined && fc.minLength > fc.maxLength) {
+        throw violate(`'minLength' exceeds 'maxLength'`);
+      }
+      if (fc.pattern !== undefined) {
+        try {
+          // Validate compile only (same check the server runs at push time).
+          new RegExp(fc.pattern);
+        } catch {
+          throw violate(`invalid pattern: '${fc.pattern}'`);
+        }
+      }
+    }
+  }
+}
+
 function validateComputed(schema: SchemaJson): void {
   for (const [tableName, table] of Object.entries(schema.tables)) {
     const computed = table.computed;
@@ -1090,6 +1195,7 @@ export class InMemoryRtDbClient {
     validateSchema(next);
     validateOnDelete(next);
     validateComputed(next);
+    validateConstraints(next);
     // FM-30: mirrors server `ddl::push_schema` — grandfather `trgm` on a
     // search index that already existed before this push declared it,
     // before the (deliberately trgm-blind) destructive-change check.

@@ -1,0 +1,16 @@
+{
+  "name": "error-push-constraint-invalid-regex",
+  "$comment": "Push-time constraint validation: `pattern` is validated AT PUSH TIME — a regex that does not compile fails the push with SCHEMA_VIOLATION naming the field, before any write can reference it.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }],
+        "constraints": { "name": { "pattern": "([a-z" } }
+      }
+    }
+  },
+  "pushError": { "code": "SCHEMA_VIOLATION" }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "error-constraint-string-too-short",
+  "$comment": "Write-path constraint enforcement: a string shorter than minLength (lengths are inclusive, counted in Unicode scalar values; ASCII here) fails with SCHEMA_VIOLATION.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }],
+        "constraints": { "name": { "minLength": 2, "maxLength": 5 } }
+      }
+    }
+  },
+  "seed": [],
+  "op": {
+    "txn": {
+      "steps": [
+        { "op": "insert", "table": "tasks", "doc": { "name": "a" } }
+      ]
+    }
+  },
+  "expect": { "error": { "code": "SCHEMA_VIOLATION" } }
+}

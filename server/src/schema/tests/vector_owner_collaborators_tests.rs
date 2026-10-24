@@ -76,6 +76,7 @@ fn vector_index_rejects_dimension_mismatch() {
     let mut fields = BTreeMap::new();
     fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 4 });
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields,
@@ -111,6 +112,7 @@ fn vector_index_accepts_matching_dims_and_filter_fields() {
     fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 4 });
     fields.insert("userId".to_string(), FieldType::String);
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields,
@@ -145,6 +147,7 @@ fn vector_index_rejects_search_and_vector_both_set() {
     let mut fields = BTreeMap::new();
     fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 4 });
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields,
@@ -181,6 +184,7 @@ fn vector_index_rejects_zero_dimensions() {
     let mut fields = BTreeMap::new();
     fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 0 });
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields,
@@ -216,6 +220,7 @@ fn vector_index_rejects_two_fields() {
     fields.insert("a".to_string(), FieldType::Vector { dimensions: 4 });
     fields.insert("b".to_string(), FieldType::Vector { dimensions: 4 });
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields,
@@ -250,6 +255,7 @@ fn vector_index_rejects_non_vector_field() {
     let mut fields = BTreeMap::new();
     fields.insert("title".to_string(), FieldType::String);
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields,
@@ -284,6 +290,7 @@ fn vector_index_rejects_unknown_filter_field() {
     let mut fields = BTreeMap::new();
     fields.insert("embedding".to_string(), FieldType::Vector { dimensions: 4 });
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields,
@@ -324,6 +331,7 @@ fn vector_index_rejects_non_scalar_filter_field() {
         },
     );
     let table = TableDef {
+        constraints: std::collections::BTreeMap::new(),
         defaults: std::collections::BTreeMap::new(),
         computed: std::collections::BTreeMap::new(),
         fields,
