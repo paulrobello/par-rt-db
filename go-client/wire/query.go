@@ -48,6 +48,7 @@ type Query struct {
 	Fields       []string           `json:"fields,omitempty"`
 	VectorSearch *VectorSearchQuery `json:"vectorSearch,omitempty"`
 	HybridSearch *HybridSearchQuery `json:"hybridSearch,omitempty"`
+	Lookups      []LookupSpec       `json:"lookups,omitempty"`
 }
 
 // UnmarshalJSON decodes a Query with interface-typed fields converted
@@ -76,6 +77,7 @@ func (q *Query) UnmarshalJSON(b []byte) error {
 		Fields       []string           `json:"fields,omitempty"`
 		VectorSearch *VectorSearchQuery `json:"vectorSearch,omitempty"`
 		HybridSearch *HybridSearchQuery `json:"hybridSearch,omitempty"`
+		Lookups      []LookupSpec       `json:"lookups,omitempty"`
 	}](b)
 	if err != nil {
 		return err
@@ -96,6 +98,7 @@ func (q *Query) UnmarshalJSON(b []byte) error {
 		Fields:       r.Fields,
 		VectorSearch: r.VectorSearch,
 		HybridSearch: r.HybridSearch,
+		Lookups:      r.Lookups,
 	}
 	if len(r.Eq) > 0 {
 		eq := make([]JSONValue, len(r.Eq))
@@ -129,6 +132,29 @@ func (q *Query) UnmarshalJSON(b []byte) error {
 		}
 		q.Filter = f
 	}
+	return nil
+}
+
+// Mirrors server `query::LookupSpec` (camelCase, `as` rename,
+// deny-unknown-fields). Field must be declared Id, Optional<Id>, or
+// Array<Id> whose Id.table equals Table; As is the output key on each
+// parent doc; Cap is the per-parent joined-row cap for an id-ARRAY lookup
+// (default 100, hard max 1000 — values above are BAD_REQUEST).
+type LookupSpec struct {
+	Field string `json:"field"`
+	Table string `json:"table"`
+	As    string `json:"as"`
+	Cap   *int   `json:"cap,omitempty"`
+}
+
+// UnmarshalJSON rejects unknown fields.
+func (l *LookupSpec) UnmarshalJSON(b []byte) error {
+	type alias LookupSpec
+	v, err := StrictUnmarshal[alias](b)
+	if err != nil {
+		return err
+	}
+	*l = LookupSpec(v)
 	return nil
 }
 

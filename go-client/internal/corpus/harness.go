@@ -335,6 +335,14 @@ func seedCase(client *inmemory.Client, name string, seedRaw json.RawMessage, sin
 		if err != nil {
 			return nil, fmt.Errorf("seed #%d: %w", i, err)
 		}
+		// `$idRef` substitution applies to seed docs too: a seed may reference
+		// the minted id of any EARLIER `$id`-labeled seed (lookups need real
+		// cross-doc id references, which no other placeholder expresses).
+		// Forward references stay an authoring error.
+		doc, err = Substitute(doc, ids, "")
+		if err != nil {
+			return nil, fmt.Errorf("seed #%d: %v", i, err)
+		}
 		results, err := client.Mutate(nil, wire.Transaction{Steps: []wire.Step{wire.StepInsert{
 			Table: table,
 			Doc:   doc,

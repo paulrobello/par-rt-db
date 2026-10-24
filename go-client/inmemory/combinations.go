@@ -126,6 +126,9 @@ func queryClauses(q *wire.Query) map[string]bool {
 	if q.HybridSearch != nil {
 		set["hybridSearch"] = true
 	}
+	if len(q.Lookups) > 0 {
+		set["lookups"] = true
+	}
 	return set
 }
 

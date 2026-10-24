@@ -27,16 +27,27 @@ func evalQueryLocked(s *Store, q wire.Query) (wire.JSONValue, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Lookup validation runs before every early return (the same compile-time
+	// gate the server runs in compile_query); the aliases it returns admit the
+	// projection gate. Expansion runs on the executed result, immediately
+	// before projection — the same seam the server's execute_query uses.
+	aliases, err := validateLookups(s, &q, table)
+	if err != nil {
+		return nil, err
+	}
 	// Projection validation runs before every early return — the same
 	// compile-time gate the server runs in compile_query.
 	if q.Fields != nil {
-		if err := validateProjection(table, q.Fields); err != nil {
+		if err := validateProjection(table, q.Fields, aliases); err != nil {
 			return nil, err
 		}
 	}
 	result, err := executeQuery(s, &q, table)
 	if err != nil {
 		return nil, err
+	}
+	if len(q.Lookups) > 0 {
+		result = expandLookups(s, &q, result)
 	}
 	if q.Fields != nil {
 		result = projectResult(result, &q)
@@ -439,7 +450,11 @@ func compareIndexValues(a, b wire.JSONValue, pg PgType) compareOrder {
 // projectionSystemFields are always included; listing one is a no-op.
 var projectionSystemFields = [3]string{"_id", "_creationTime", "_version"}
 
-func validateProjection(table *TableDef, fields []string) error {
+// validateProjection gates a `fields` list: system fields and declared
+// fields are always legal, and a lookup alias is legal when lookups are
+// present (server validate_projection admits the aliases validate_lookups
+// returns).
+func validateProjection(table *TableDef, fields []string, lookupAliases []string) error {
 	for _, name := range fields {
 		if name == "_id" || name == "_creationTime" || name == "_version" {
 			continue
@@ -447,9 +462,22 @@ func validateProjection(table *TableDef, fields []string) error {
 		if _, declared := table.Fields[name]; declared {
 			continue
 		}
+		if containsString(lookupAliases, name) {
+			continue
+		}
 		return rtdberrors.New(rtdberrors.CodeBadRequest, "unknown projection field '"+name+"'")
 	}
 	return nil
+}
+
+// containsString is a linear membership test (kept dependency-free).
+func containsString(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
 
 // mapResultDocs applies f to every doc-bearing result shape, per the query's
@@ -508,6 +536,85 @@ func projectResult(result wire.JSONValue, q *wire.Query) wire.JSONValue {
 
 func stringsHasPrefix(s, prefix string) bool {
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
+// ====== Lookup expansion (mirrors server `query::lookup`) ======
+
+// At most 4 lookups per query; a fifth is BAD_REQUEST.
+const maxLookups = 4
+
+// Hard max of a LookupSpec.cap; above is BAD_REQUEST at compile time (D3 —
+// the caller made a static mistake; clamping would hide it).
+const maxLookupCap = 1000
+
+// Default per-parent joined-row cap for an id-ARRAY lookup (D2 — truncate).
+const defaultLookupCap = 100
+
+// Ceiling on total joined rows materialized per execution; on exceed,
+// truncation proceeds in parent-result order (deterministic).
+const maxJoinedRows = 8192
+
+// validateLookups is the compile-time lookup validation (mirror of server
+// `validate_lookups` / ts `validateLookups`): unknown lookup table →
+// NOT_FOUND; field not declared, or not Id/Optional<Id>/Array<Id> →
+// BAD_REQUEST; declared Id.table ≠ lookup table → BAD_REQUEST; `as`
+// collisions (a `_`-prefixed alias, a declared field name, or another
+// lookup's alias) → BAD_REQUEST; cap > 1000 → BAD_REQUEST; > 4 lookups →
+// BAD_REQUEST. Returns the aliases the projection gate admits.
+func validateLookups(s *Store, q *wire.Query, table *TableDef) ([]string, error) {
+	if len(q.Lookups) == 0 {
+		return nil, nil
+	}
+	if len(q.Lookups) > maxLookups {
+		return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+			"at most "+strconv.Itoa(maxLookups)+" lookups per query")
+	}
+	aliases := make([]string, 0, len(q.Lookups))
+	for i := range q.Lookups {
+		lk := &q.Lookups[i]
+		if _, err := requireTable(s, lk.Table); err != nil {
+			return nil, err
+		}
+		ty, declared := table.Fields[lk.Field]
+		if !declared {
+			return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+				"lookup field '"+lk.Field+"' is not declared on table '"+q.Table+"'")
+		}
+		inner := &ty
+		if inner.Kind == "optional" {
+			inner = inner.Inner
+		}
+		if inner.Kind == "array" {
+			inner = inner.Inner
+		}
+		if inner.Kind != "id" {
+			return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+				"lookup field '"+lk.Field+"' must be declared Id, Optional<Id>, or Array<Id>")
+		}
+		if inner.Table != lk.Table {
+			return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+				"lookup field '"+lk.Field+"' declares Id table '"+inner.Table+
+					"' but the lookup names '"+lk.Table+"'")
+		}
+		if stringsHasPrefix(lk.As, "_") {
+			return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+				"lookup alias '"+lk.As+"' must not start with '_'")
+		}
+		if _, collides := table.Fields[lk.As]; collides {
+			return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+				"lookup alias '"+lk.As+"' collides with a declared field")
+		}
+		if containsString(aliases, lk.As) {
+			return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+				"lookup alias '"+lk.As+"' collides with another lookup alias")
+		}
+		if lk.Cap != nil && *lk.Cap > maxLookupCap {
+			return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+				"lookup cap exceeds maximum of "+strconv.Itoa(maxLookupCap))
+		}
+		aliases = append(aliases, lk.As)
+	}
+	return aliases, nil
 }
 
 func executeDistinctTerminal(table *TableDef, plan *scanPlan, filtered []*StoredRow) (wire.JSONValue, error) {
@@ -901,4 +1008,155 @@ func numericValue(v wire.JSONValue, pg PgType) float64 {
 		return 0
 	}
 	return jsonNumberF64(n)
+}
+
+// isArrayLookup reports whether the declared field type makes the lookup
+// array-form (Array<Id>) rather than single-form (Id / Optional<Id>).
+// Validation has already pinned the field to one of the three accepted
+// shapes.
+func isArrayLookup(ty *FieldType) bool {
+	inner := ty
+	if inner.Kind == "optional" {
+		inner = inner.Inner
+	}
+	return inner.Kind == "array"
+}
+
+// expandLookups is the execute-time expansion (mirror of server
+// `expand_lookups` / ts `expandLookups`): per lookup, collect the distinct
+// ids across the result docs, fetch the visible (non-soft-deleted) child
+// rows once, then fan out in memory — declared id-array order, dangling ids
+// dropped, `cap` truncation, and a deterministic maxJoinedRows ceiling in
+// parent-result order. The in-memory harness models no principal, so joined
+// rows carry no per-row authorization predicates (the server appends them to
+// its batched fetch). Caller holds s.mu.
+func expandLookups(s *Store, q *wire.Query, result wire.JSONValue) wire.JSONValue {
+	docs := lookupResultDocs(q, result)
+	for i := range q.Lookups {
+		lk := &q.Lookups[i]
+		table := s.tables[q.Table]
+		ty, declared := table.Fields[lk.Field]
+		if !declared {
+			return result
+		}
+		arrayForm := isArrayLookup(&ty)
+		// Distinct ids across the result set, first-seen order.
+		var ids []string
+		seen := map[string]bool{}
+		for _, doc := range docs {
+			collectFieldIDs(doc[lk.Field], &ids, seen)
+		}
+		// One in-memory fetch: visible child rows by id (FM-33: stamped rows
+		// are invisible, exactly as to the parent terminals).
+		fetched := map[string]wire.Object{}
+		for _, id := range ids {
+			row, ok := s.docs[rowKey{Table: lk.Table, ID: id}]
+			if ok && row.DeletedAt == nil {
+				fetched[id] = mergeDoc(row)
+			}
+		}
+		cap := defaultLookupCap
+		if lk.Cap != nil {
+			cap = *lk.Cap
+		}
+		budget := maxJoinedRows
+		for _, doc := range docs {
+			switch v := doc[lk.Field].(type) {
+			case wire.String:
+				var joined wire.Object
+				if budget > 0 {
+					joined = fetched[string(v)]
+				}
+				if joined != nil {
+					budget--
+				}
+				if joined != nil {
+					doc[lk.As] = joined
+				} else {
+					doc[lk.As] = wire.Null{}
+				}
+			case wire.Array:
+				out := wire.Array{}
+				for _, idv := range v {
+					if len(out) >= cap || budget == 0 {
+						break
+					}
+					id, ok := idv.(wire.String)
+					if !ok {
+						continue
+					}
+					if joined, ok := fetched[string(id)]; ok {
+						out = append(out, joined)
+						budget--
+					}
+				}
+				doc[lk.As] = out
+			default:
+				// Absent/null field on the parent: single form reads as null;
+				// array form reads as an empty array (no ids).
+				if arrayForm {
+					doc[lk.As] = wire.Array{}
+				} else {
+					doc[lk.As] = wire.Null{}
+				}
+			}
+		}
+	}
+	return result
+}
+
+// lookupResultDocs routes the result shape by the query's terminal (never
+// sniffed from the value alone — mirrors the ts routing: paginate's docs
+// array, count/distinct/aggregate are doc-less, get/unique/first a single
+// doc, everything else an array of docs).
+func lookupResultDocs(q *wire.Query, result wire.JSONValue) []wire.Object {
+	if obj, ok := result.(wire.Object); ok {
+		if docs, ok := obj["docs"].(wire.Array); ok {
+			out := make([]wire.Object, 0, len(docs))
+			for _, doc := range docs {
+				if m, ok := doc.(wire.Object); ok {
+					out = append(out, m)
+				}
+			}
+			return out
+		}
+	}
+	if q.Count || q.Distinct || q.Aggregate != nil {
+		return nil
+	}
+	if q.Get != nil || q.Unique || q.First {
+		if m, ok := result.(wire.Object); ok {
+			return []wire.Object{m}
+		}
+		return nil
+	}
+	if arr, ok := result.(wire.Array); ok {
+		out := make([]wire.Object, 0, len(arr))
+		for _, doc := range arr {
+			if m, ok := doc.(wire.Object); ok {
+				out = append(out, m)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// collectFieldIDs pushes every id string in value (a bare id string or an id
+// array) not already in seen onto ids, preserving first-seen order.
+func collectFieldIDs(value wire.JSONValue, ids *[]string, seen map[string]bool) {
+	switch t := value.(type) {
+	case wire.String:
+		if !seen[string(t)] {
+			seen[string(t)] = true
+			*ids = append(*ids, string(t))
+		}
+	case wire.Array:
+		for _, idv := range t {
+			if id, ok := idv.(wire.String); ok && !seen[string(id)] {
+				seen[string(id)] = true
+				*ids = append(*ids, string(id))
+			}
+		}
+	}
 }

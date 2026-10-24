@@ -115,6 +115,45 @@ func TestStrictDecodePins(t *testing.T) {
 	}
 }
 
+// LookupSpec mirrors server query::LookupSpec byte-for-byte: camelCase with
+// the raw `as` rename, cap omitted when unset, unknown fields rejected.
+func TestLookupSpecWirePins(t *testing.T) {
+	capN := 20
+	b, err := json.Marshal(Query{Table: "posts", Lookups: []LookupSpec{
+		{Field: "authorId", Table: "users", As: "author"},
+		{Field: "tagIds", Table: "tags", As: "tags", Cap: &capN},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"table":"posts","lookups":[{"field":"authorId","table":"users","as":"author"},` +
+		`{"field":"tagIds","table":"tags","as":"tags","cap":20}]}`
+	if string(b) != want {
+		t.Fatalf("lookup wire spelling drifted:\n%s\n%s", b, want)
+	}
+	var out Query
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
+	}
+	rb, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(rb) != want {
+		t.Fatalf("lookup round trip drifted:\n%s\n%s", rb, want)
+	}
+	var bare Query
+	if err := json.Unmarshal([]byte(`{"table":"items"}`), &bare); err != nil {
+		t.Fatal(err)
+	}
+	if len(bare.Lookups) != 0 {
+		t.Fatalf("absent lookups must decode to an empty slice, got %+v", bare.Lookups)
+	}
+	if err := json.Unmarshal([]byte(`{"field":"f","table":"t","as":"a","bogus":1}`), &LookupSpec{}); err == nil {
+		t.Fatal("LookupSpec must reject unknown fields")
+	}
+}
+
 func strptr(s string) *string { return &s }
 func intptr(i int) *int       { return &i }
 func bytesContains(b []byte, s string) bool {
