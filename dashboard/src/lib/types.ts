@@ -144,6 +144,10 @@ export interface HotConfig {
   maxStorageBytesPerDb: number;
   maxSubsPerDb: number;
   changeLogMaxRows: number;
+  /** Rate-limit ceilings (requests/minute; 0 = unlimited). Optional so an
+   * older server response still type-checks. */
+  perTokenRpm?: number;
+  perDbRpm?: number;
 }
 
 export interface ConfigResponse {
@@ -210,4 +214,6 @@ export interface HotConfigPatch {
   maxStorageBytesPerDb?: number;
   maxSubsPerDb?: number;
   changeLogMaxRows?: number;
+  perTokenRpm?: number;
+  perDbRpm?: number;
 }

@@ -359,6 +359,11 @@ export interface HotConfig {
    * default 100000; a patch value `> 0` clamps to `>= 1000`, `0` restores
    * the default). */
   changeLogMaxRows: number;
+  /** Per-token rate-limit ceiling (requests/minute, fixed window); 0 =
+   * unlimited. Hot-mutable via patchConfig. */
+  perTokenRpm: number;
+  /** Per-db aggregate rate-limit ceiling (requests/minute); 0 = unlimited. */
+  perDbRpm: number;
 }
 /**
  * The full configuration profile response returned by the server.
@@ -394,6 +399,10 @@ export interface HotConfigPatch {
   /** Change-feed retention rows; `0` restores the server default, `> 0`
    * clamps to `>= 1000`. Omit to leave unchanged. */
   changeLogMaxRows?: number;
+  /** Per-token rate-limit ceiling (requests/minute); 0 = unlimited. */
+  perTokenRpm?: number;
+  /** Per-db rate-limit ceiling (requests/minute); 0 = unlimited. */
+  perDbRpm?: number;
 }
 /**
  * Union of valid operation event kinds recorded by the mutation/change log.

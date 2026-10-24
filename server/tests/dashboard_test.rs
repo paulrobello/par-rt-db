@@ -893,6 +893,8 @@ async fn hot_config_round_trips_through_rtdb_config() -> anyhow::Result<()> {
         max_storage_bytes_per_db: 0,
         max_subs_per_db: 0,
         change_log_max_rows: rtdb_server::change_log::DEFAULT_MAX_ROWS,
+        per_token_rpm: 0,
+        per_db_rpm: 0,
     };
     rtdb_server::config::save_hot(&state.pool, &hot).await?;
     let loaded = rtdb_server::config::load_hot(&state.pool, &crate::common::test_hot())

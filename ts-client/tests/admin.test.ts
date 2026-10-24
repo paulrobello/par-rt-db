@@ -367,6 +367,8 @@ describe("RtDbAdminClient — new endpoints", () => {
         sessionTtlDays: 30,
         maxFileSize: 5242880,
         idempotencyTtlMs: 300000,
+        perTokenRpm: 600,
+        perDbRpm: 6000,
       },
       version: "0.1.0",
       gitCommit: "abc",
@@ -394,6 +396,8 @@ describe("RtDbAdminClient — new endpoints", () => {
         sessionTtlDays: 30,
         maxFileSize: 5242880,
         idempotencyTtlMs: 300000,
+        perTokenRpm: 600,
+        perDbRpm: 6000,
       },
       version: "0.1.0",
       gitCommit: "abc",
@@ -1348,6 +1352,8 @@ describe("HotConfig quota fields (ENH-011)", () => {
       maxStorageBytesPerDb: 104_857_600,
       maxSubsPerDb: 500,
       changeLogMaxRows: 100_000,
+      perTokenRpm: 0,
+      perDbRpm: 0,
     };
     expect(hot.maxTablesPerDb).toBe(25);
     expect(hot.maxStorageBytesPerDb).toBe(104_857_600);
@@ -1364,6 +1370,8 @@ describe("HotConfig quota fields (ENH-011)", () => {
       maxStorageBytesPerDb: 0,
       maxSubsPerDb: 0,
       changeLogMaxRows: 100_000,
+      perTokenRpm: 0,
+      perDbRpm: 0,
     };
     expect(hot.changeLogMaxRows).toBe(100_000);
     const patchRetention: HotConfigPatch = { changeLogMaxRows: 5_000 };
@@ -1666,5 +1674,30 @@ describe("RtDbAdminClient default fetch binding", () => {
 
     await expect(admin.listDbs()).resolves.toEqual(["db1"]);
     expect(fetchMock).toHaveBeenCalledOnce();
+  });
+});
+
+describe("HotConfig rate-limit fields (hot-configurable ceilings)", () => {
+  it("HotConfig carries perTokenRpm / perDbRpm", () => {
+    const hot: HotConfig = {
+      allowedOrigins: [],
+      sessionTtlDays: 30,
+      maxFileSize: 5_242_880,
+      idempotencyTtlMs: 300_000,
+      maxTablesPerDb: 0,
+      maxStorageBytesPerDb: 0,
+      maxSubsPerDb: 0,
+      changeLogMaxRows: 100_000,
+      perTokenRpm: 600,
+      perDbRpm: 6000,
+    };
+    expect(hot.perTokenRpm).toBe(600);
+    expect(hot.perDbRpm).toBe(6000);
+  });
+
+  it("HotConfigPatch accepts perTokenRpm / perDbRpm (0 = unlimited)", () => {
+    const patch: HotConfigPatch = { perTokenRpm: 0, perDbRpm: 1200 };
+    expect(patch.perTokenRpm).toBe(0);
+    expect(patch.perDbRpm).toBe(1200);
   });
 });

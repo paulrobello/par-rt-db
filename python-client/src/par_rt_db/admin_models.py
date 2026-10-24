@@ -333,6 +333,10 @@ class HotConfig(_Wire):
     # client built against this model still parses an older server's response
     # (``extra="forbid"`` would otherwise reject the live one).
     change_log_max_rows: int = 100000
+    # HTTP rate-limit ceilings (requests/minute; 0 = unlimited). Defaults so a
+    # client built against this model still parses an older server's response.
+    per_token_rpm: int = 0
+    per_db_rpm: int = 0
 
 
 class ConfigResponse(_Wire):
@@ -371,6 +375,8 @@ class HotConfigPatch(_Wire):
     max_storage_bytes_per_db: int | None = None
     max_subs_per_db: int | None = None
     change_log_max_rows: int | None = None
+    per_token_rpm: int | None = None
+    per_db_rpm: int | None = None
 
 
 class OpEvent(_Wire):

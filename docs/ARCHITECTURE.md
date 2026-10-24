@@ -502,7 +502,9 @@ transport wrote.
 
 HTTP requests are optionally rate-limited per machine-token and per-db
 (`RTDB_RATE_LIMIT_PER_TOKEN_RPM` / `RTDB_RATE_LIMIT_PER_DB_RPM`, 0 =
-off/default; over-limit → 429 `RATE_LIMITED` + `Retry-After`; a fixed-window
+off/default; both ceilings are hot config on `HotConfig` — resize them live
+via `PATCH /admin/config` with no restart, while the per-IP abuse guards
+below stay boot-pinned; over-limit → 429 `RATE_LIMITED` + `Retry-After`; a fixed-window
 `RateLimiter` on `AppState`, checked after `authorize` — in-memory when
 single-instance, Postgres-backed under `RTDB_MULTI_INSTANCE`; the per-IP keys
 on the unauthenticated routes (public storage serve, admin login, anonymous

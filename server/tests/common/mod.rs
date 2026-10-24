@@ -161,8 +161,6 @@ pub fn test_config() -> Config {
         otel_service_name: String::new(),
         otel_sample_ratio: 0.0,
         limits: rtdb_server::config::LimitsConfig {
-            per_token_rpm: 0,
-            per_db_rpm: 0,
             exact: false,
             sync_ms: 1000,
             storage_per_ip_rpm: 0,
@@ -212,6 +210,8 @@ pub fn test_hot() -> HotConfig {
         max_storage_bytes_per_db: 0,
         max_subs_per_db: 0,
         change_log_max_rows: rtdb_server::change_log::DEFAULT_MAX_ROWS,
+        per_token_rpm: 0,
+        per_db_rpm: 0,
     }
 }
 
@@ -225,19 +225,18 @@ pub async fn test_state() -> Arc<AppState> {
 
 /// Like `test_state` but with non-zero HTTP rate-limit ceilings. Used by
 /// `tests/rate_limit_test.rs` to exercise the per-token and per-db fixed-window
-/// limiter without touching env vars: the limiter reads
-/// `state.config.rate_limit_per_{token,db}_rpm`, so we set them on the Config
-/// before constructing AppState. This is the cleanest override path the
-/// codebase exposes — `test_config()` is already a public helper.
+/// limiter without touching env vars: the limiter reads `state.runtime.hot`,
+/// so the ceilings are set on the hot seed before constructing AppState.
 pub async fn test_state_with_rate_limits(per_token_rpm: u32, per_db_rpm: u32) -> Arc<AppState> {
-    let mut config = test_config();
-    config.limits.per_token_rpm = per_token_rpm;
-    config.limits.per_db_rpm = per_db_rpm;
+    let config = test_config();
+    let mut hot = test_hot();
+    hot.per_token_rpm = per_token_rpm;
+    hot.per_db_rpm = per_db_rpm;
     let pool = test_pool(&config.database_url)
         .await
         .expect("connect to test postgres");
     db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
-    AppState::new(pool, config, test_hot())
+    AppState::new(pool, config, hot)
 }
 
 /// Like `test_state` but with `audit_log_enabled = true` and the

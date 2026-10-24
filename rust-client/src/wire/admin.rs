@@ -705,6 +705,10 @@ pub struct HotConfig {
     pub max_subs_per_db: i64,
     /// Durable change-feed retention (rows kept per db).
     pub change_log_max_rows: i64,
+    /// Per-token rate-limit ceiling (requests/minute); 0 = unlimited.
+    pub per_token_rpm: i64,
+    /// Per-db aggregate rate-limit ceiling (requests/minute); 0 = unlimited.
+    pub per_db_rpm: i64,
 }
 
 /// `GET /admin/config` response — redacted boot config + hot config + build
@@ -773,6 +777,12 @@ pub struct HotConfigPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// New value; `None` leaves it unchanged.
     pub change_log_max_rows: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// New value; `None` leaves it unchanged.
+    pub per_token_rpm: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// New value; `None` leaves it unchanged.
+    pub per_db_rpm: Option<i64>,
 }
 
 /// One row of `OpEvent` returned by `GET /admin/ops/recent`. `kind` is a

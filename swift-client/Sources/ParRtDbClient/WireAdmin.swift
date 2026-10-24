@@ -1075,6 +1075,10 @@ public struct HotConfig: Equatable, Codable, Sendable {
     public var maxSubsPerDb: Int64
     /// Change-feed retention per db in rows (server default 100 000).
     public var changeLogMaxRows: Int64
+    /// Per-token rate-limit ceiling (requests/minute); 0 = unlimited.
+    public var perTokenRpm: Int64
+    /// Per-db aggregate rate-limit ceiling (requests/minute); 0 = unlimited.
+    public var perDbRpm: Int64
 
     public init(
         allowedOrigins: [String],
@@ -1084,7 +1088,9 @@ public struct HotConfig: Equatable, Codable, Sendable {
         maxTablesPerDb: Int64,
         maxStorageBytesPerDb: Int64,
         maxSubsPerDb: Int64,
-        changeLogMaxRows: Int64
+        changeLogMaxRows: Int64,
+        perTokenRpm: Int64,
+        perDbRpm: Int64
     ) {
         self.allowedOrigins = allowedOrigins
         self.sessionTtlDays = sessionTtlDays
@@ -1094,11 +1100,14 @@ public struct HotConfig: Equatable, Codable, Sendable {
         self.maxStorageBytesPerDb = maxStorageBytesPerDb
         self.maxSubsPerDb = maxSubsPerDb
         self.changeLogMaxRows = changeLogMaxRows
+        self.perTokenRpm = perTokenRpm
+        self.perDbRpm = perDbRpm
     }
 
     enum CodingKeys: String, CodingKey {
         case allowedOrigins, sessionTtlDays, maxFileSize, idempotencyTtlMs
         case maxTablesPerDb, maxStorageBytesPerDb, maxSubsPerDb, changeLogMaxRows
+        case perTokenRpm, perDbRpm
     }
 }
 
@@ -1193,6 +1202,10 @@ public struct HotConfigPatch: Equatable, Encodable, Sendable {
     public var maxSubsPerDb: Int64?
     /// New value; nil leaves it unchanged.
     public var changeLogMaxRows: Int64?
+    /// New value; nil leaves it unchanged.
+    public var perTokenRpm: Int64?
+    /// New value; nil leaves it unchanged.
+    public var perDbRpm: Int64?
 
     public init(
         allowedOrigins: [String]? = nil,
@@ -1202,7 +1215,9 @@ public struct HotConfigPatch: Equatable, Encodable, Sendable {
         maxTablesPerDb: Int64? = nil,
         maxStorageBytesPerDb: Int64? = nil,
         maxSubsPerDb: Int64? = nil,
-        changeLogMaxRows: Int64? = nil
+        changeLogMaxRows: Int64? = nil,
+        perTokenRpm: Int64? = nil,
+        perDbRpm: Int64? = nil
     ) {
         self.allowedOrigins = allowedOrigins
         self.sessionTtlDays = sessionTtlDays
@@ -1212,11 +1227,14 @@ public struct HotConfigPatch: Equatable, Encodable, Sendable {
         self.maxStorageBytesPerDb = maxStorageBytesPerDb
         self.maxSubsPerDb = maxSubsPerDb
         self.changeLogMaxRows = changeLogMaxRows
+        self.perTokenRpm = perTokenRpm
+        self.perDbRpm = perDbRpm
     }
 
     enum CodingKeys: String, CodingKey {
         case allowedOrigins, sessionTtlDays, maxFileSize, idempotencyTtlMs
         case maxTablesPerDb, maxStorageBytesPerDb, maxSubsPerDb, changeLogMaxRows
+        case perTokenRpm, perDbRpm
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -1229,6 +1247,8 @@ public struct HotConfigPatch: Equatable, Encodable, Sendable {
         try container.encodeIfPresent(maxStorageBytesPerDb, forKey: .maxStorageBytesPerDb)
         try container.encodeIfPresent(maxSubsPerDb, forKey: .maxSubsPerDb)
         try container.encodeIfPresent(changeLogMaxRows, forKey: .changeLogMaxRows)
+        try container.encodeIfPresent(perTokenRpm, forKey: .perTokenRpm)
+        try container.encodeIfPresent(perDbRpm, forKey: .perDbRpm)
     }
 }
 

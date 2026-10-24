@@ -280,8 +280,6 @@ mod tests {
             otel_service_name: String::new(),
             otel_sample_ratio: 0.0,
             limits: crate::config::LimitsConfig {
-                per_token_rpm: 0,
-                per_db_rpm: 0,
                 exact: false,
                 sync_ms: 1000,
                 storage_per_ip_rpm: 0,

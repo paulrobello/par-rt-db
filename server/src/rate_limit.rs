@@ -484,7 +484,7 @@ async fn check_pg(pool: &sqlx::PgPool, key: &RateKey, limit_rpm: u32) -> RateDec
 }
 
 pub async fn evaluate(state: &AppState, principal: &Principal, db: &str) -> RateDecision {
-    let token_limit = state.config.limits.per_token_rpm;
+    let token_limit = state.runtime.hot.load().per_token_rpm;
     if token_limit > 0
         && let Principal::Machine { token_id, .. } = principal
         && let RateDecision::Denied { retry_after_secs } = state
@@ -502,7 +502,7 @@ pub async fn evaluate(state: &AppState, principal: &Principal, db: &str) -> Rate
 /// against one database. The mutate-arm replay exemption in
 /// [`evaluate_mutate`] skips only the per-token bucket, never this one.
 async fn evaluate_db(state: &AppState, db: &str) -> RateDecision {
-    let db_limit = state.config.limits.per_db_rpm;
+    let db_limit = state.runtime.hot.load().per_db_rpm;
     if db_limit > 0
         && let RateDecision::Denied { retry_after_secs } = state
             .limits

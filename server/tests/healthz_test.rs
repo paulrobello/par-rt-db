@@ -46,8 +46,6 @@ fn test_config() -> Config {
         otel_service_name: String::new(),
         otel_sample_ratio: 0.0,
         limits: rtdb_server::config::LimitsConfig {
-            per_token_rpm: 0,
-            per_db_rpm: 0,
             exact: false,
             sync_ms: 1000,
             storage_per_ip_rpm: 0,
@@ -94,6 +92,8 @@ fn test_hot() -> HotConfig {
         max_storage_bytes_per_db: 0,
         max_subs_per_db: 0,
         change_log_max_rows: rtdb_server::change_log::DEFAULT_MAX_ROWS,
+        per_token_rpm: 0,
+        per_db_rpm: 0,
     }
 }
 

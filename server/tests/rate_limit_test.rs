@@ -455,3 +455,39 @@ async fn replayed_idempotent_mutate_skips_the_per_token_budget() -> anyhow::Resu
 
     Ok(())
 }
+
+#[tokio::test]
+async fn patched_rate_limits_apply_on_next_request_without_restart() -> anyhow::Result<()> {
+    for field in ["perTokenRpm", "perDbRpm"] {
+        let state = test_state_with_rate_limits(10, 10).await;
+        let addr = spawn_app(state.clone()).await;
+        let name = fresh_db(&state).await;
+        let (_, token) = mint_token(addr, &name).await;
+        let query = json!({"db": name, "query": {"table": "workItems"}});
+        assert_eq!(
+            api_post(addr, "/api/query", &token, query.clone())
+                .await
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        for (limit, expected) in [
+            (1u32, reqwest::StatusCode::TOO_MANY_REQUESTS),
+            (100, reqwest::StatusCode::OK),
+        ] {
+            let patched = reqwest::Client::new()
+                .patch(format!("http://{addr}/admin/config"))
+                .header("Authorization", "Bearer test-admin-key")
+                .json(&json!({field: limit}))
+                .send()
+                .await?;
+            assert_eq!(patched.status(), reqwest::StatusCode::OK);
+            let resp = api_post(addr, "/api/query", &token, query.clone()).await;
+            assert_eq!(resp.status(), expected, "{field} patched to {limit}");
+            if expected == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let error: serde_json::Value = resp.json().await?;
+                assert_eq!(error["code"], "RATE_LIMITED");
+            }
+        }
+    }
+    Ok(())
+}

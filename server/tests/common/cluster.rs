@@ -447,14 +447,15 @@ pub async fn replica_state(pool: &PgPool, opts: &ReplicaOpts) -> Arc<AppState> {
     let mut cfg = crate::common::test_config();
     cfg.multi_instance.enabled = true;
     cfg.multi_instance.instance_id = Some(crate::common::unique_instance_id(&opts.label));
-    cfg.limits.per_token_rpm = opts.per_token_rpm;
-    cfg.limits.per_db_rpm = opts.per_db_rpm;
     cfg.limits.exact = opts.exact_limits;
+    let mut hot = crate::common::test_hot();
+    hot.per_token_rpm = opts.per_token_rpm;
+    hot.per_db_rpm = opts.per_db_rpm;
     cfg.multi_instance.forward_timeout_ms = opts.forward_timeout_ms;
     cfg.multi_instance.forward_concurrency = opts.forward_concurrency;
     cfg.presence_enabled = opts.presence_enabled;
     cfg.presence_broadcast_interval_ms = opts.presence_broadcast_interval_ms;
-    AppState::new(pool.clone(), cfg, crate::common::test_hot())
+    AppState::new(pool.clone(), cfg, hot)
 }
 
 // --- Moved Helpers from multi_instance_stage4_test.rs ---

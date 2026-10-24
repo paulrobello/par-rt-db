@@ -44,6 +44,12 @@ pub struct HotConfig {
     /// `change_log::MIN_MAX_ROWS` so a misconfigured floor can't expire every
     /// cursor immediately.
     pub change_log_max_rows: usize, // RTDB_CHANGE_LOG_MAX_ROWS,    default 100 000
+    /// HTTP rate-limit ceilings (fixed-window per minute; 0 = unlimited).
+    /// Seeded from RTDB_RATE_LIMIT_PER_TOKEN_RPM / RTDB_RATE_LIMIT_PER_DB_RPM
+    /// and hot-mutable via `PATCH /admin/config`; the per-IP abuse guards stay
+    /// boot-pinned on `Config::limits`.
+    pub per_token_rpm: u32, // RTDB_RATE_LIMIT_PER_TOKEN_RPM, default 0
+    pub per_db_rpm: u32,         // RTDB_RATE_LIMIT_PER_DB_RPM,    default 0
 }
 
 impl HotConfig {
@@ -107,6 +113,16 @@ impl HotConfig {
         } else {
             change_log_max_rows.max(crate::change_log::MIN_MAX_ROWS)
         };
+        // Rate-limit ceilings (0 = unlimited). An unparseable value falls back
+        // to 0, the permissive convention every other env seed here follows.
+        let per_token_rpm = match std::env::var("RTDB_RATE_LIMIT_PER_TOKEN_RPM") {
+            Ok(v) => v.parse::<u32>().unwrap_or(0),
+            Err(_) => 0,
+        };
+        let per_db_rpm = match std::env::var("RTDB_RATE_LIMIT_PER_DB_RPM") {
+            Ok(v) => v.parse::<u32>().unwrap_or(0),
+            Err(_) => 0,
+        };
         Self {
             allowed_origins,
             session_ttl_days,
@@ -116,6 +132,8 @@ impl HotConfig {
             max_storage_bytes_per_db,
             max_subs_per_db,
             change_log_max_rows,
+            per_token_rpm,
+            per_db_rpm,
         }
     }
 
@@ -215,6 +233,10 @@ struct PersistedHotConfig {
     max_subs_per_db: Option<usize>,
     #[serde(default)]
     change_log_max_rows: Option<usize>,
+    #[serde(default)]
+    per_token_rpm: Option<u32>,
+    #[serde(default)]
+    per_db_rpm: Option<u32>,
 }
 
 impl PersistedHotConfig {
@@ -237,6 +259,8 @@ impl PersistedHotConfig {
             change_log_max_rows: self
                 .change_log_max_rows
                 .unwrap_or(defaults.change_log_max_rows),
+            per_token_rpm: self.per_token_rpm.unwrap_or(defaults.per_token_rpm),
+            per_db_rpm: self.per_db_rpm.unwrap_or(defaults.per_db_rpm),
         }
     }
 }
@@ -304,6 +328,8 @@ mod tests {
             max_storage_bytes_per_db: 0,
             max_subs_per_db: 0,
             change_log_max_rows: crate::change_log::DEFAULT_MAX_ROWS,
+            per_token_rpm: 600,
+            per_db_rpm: 6000,
         }
     }
 
@@ -360,6 +386,21 @@ mod tests {
         assert_eq!(merged.max_tables_per_db, 25);
         assert_eq!(merged.max_storage_bytes_per_db, 536870912);
         assert_eq!(merged.max_subs_per_db, 100);
+    }
+
+    #[test]
+    fn persisted_rate_limits_override_env_and_missing_fields_keep_seed() {
+        let persisted: PersistedHotConfig =
+            serde_json::from_value(serde_json::json!({"perTokenRpm": 42, "perDbRpm": 0}))
+                .expect("rate limits decode");
+        let merged = persisted.merge_onto(env_seed());
+        assert_eq!(merged.per_token_rpm, 42);
+        assert_eq!(merged.per_db_rpm, 0);
+        let persisted: PersistedHotConfig =
+            serde_json::from_value(serde_json::json!({})).expect("older row decodes");
+        let merged = persisted.merge_onto(env_seed());
+        assert_eq!(merged.per_token_rpm, 600);
+        assert_eq!(merged.per_db_rpm, 6000);
     }
 
     /// ...and specifically NOT to the type default, which would be harmful.
@@ -451,6 +492,8 @@ mod tests {
             max_storage_bytes_per_db: 0,
             max_subs_per_db: 0,
             change_log_max_rows: crate::change_log::DEFAULT_MAX_ROWS,
+            per_token_rpm: 0,
+            per_db_rpm: 0,
         };
         assert!(hot.origins_valid());
         hot.allowed_origins.push("https://c.com\"".into());

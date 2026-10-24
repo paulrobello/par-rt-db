@@ -797,7 +797,9 @@ async fn get_config_returns_response() {
                 "maxTablesPerDb": 0,
                 "maxStorageBytesPerDb": 0,
                 "maxSubsPerDb": 0,
-                "changeLogMaxRows": 100000
+                "changeLogMaxRows": 100000,
+                "perTokenRpm": 600,
+                "perDbRpm": 6000
             },
             "version": "0.1.0",
             "gitCommit": "abc1234",
@@ -818,6 +820,8 @@ async fn get_config_returns_response() {
     assert_eq!(cfg.hot.session_ttl_days, 30);
     assert_eq!(cfg.hot.max_file_size, 5242880);
     assert_eq!(cfg.hot.idempotency_ttl_ms, 300000);
+    assert_eq!(cfg.hot.per_token_rpm, 600);
+    assert_eq!(cfg.hot.per_db_rpm, 6000);
     assert_eq!(cfg.version, "0.1.0");
     assert_eq!(cfg.git_commit, "abc1234");
     assert_eq!(cfg.admins.len(), 1);
@@ -854,7 +858,9 @@ async fn patch_config_patches_and_returns_config() {
                 "maxTablesPerDb": 0,
                 "maxStorageBytesPerDb": 0,
                 "maxSubsPerDb": 0,
-                "changeLogMaxRows": 100000
+                "changeLogMaxRows": 100000,
+                "perTokenRpm": 1200,
+                "perDbRpm": 9000
             },
             "version": "",
             "gitCommit": "",
@@ -871,6 +877,8 @@ async fn patch_config_patches_and_returns_config() {
         max_storage_bytes_per_db: None,
         max_subs_per_db: None,
         change_log_max_rows: None,
+        per_token_rpm: Some(1200),
+        per_db_rpm: Some(9000),
     };
     let cfg = client.patch_config(&patch).await.unwrap();
     assert_eq!(
@@ -878,6 +886,8 @@ async fn patch_config_patches_and_returns_config() {
         vec!["https://x.example".to_string()]
     );
     assert_eq!(cfg.hot.session_ttl_days, 60);
+    assert_eq!(cfg.hot.per_token_rpm, 1200);
+    assert_eq!(cfg.hot.per_db_rpm, 9000);
 }
 
 #[tokio::test]

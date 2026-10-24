@@ -443,3 +443,27 @@ func TestSignalWorkflowPayloadOmitted(t *testing.T) {
 		t.Fatalf("SignalWorkflow: %v %v", ok, err)
 	}
 }
+
+func TestPatchConfigCarriesRateLimitCeilings(t *testing.T) {
+	body := `{"perTokenRpm":1200,"perDbRpm":9000}`
+	resp := `{"port":8300,"publicUrl":"http://x","githubBaseUrl":"","githubApiUrl":"",
+	"databaseUrlConfigured":true,"adminKeyConfigured":true,"githubConfigured":false,
+	"googleConfigured":false,"gitlabConfigured":false,"oidcConfigured":false,
+	"hot":{"allowedOrigins":[],"sessionTtlDays":30,"maxFileSize":1000,
+	"idempotencyTtlMs":10,"changeLogMaxRows":100000,"maxTablesPerDb":0,
+	"maxStorageBytesPerDb":0,"maxSubsPerDb":0,"perTokenRpm":1200,"perDbRpm":9000},
+	"version":"1.0.0","gitCommit":"abc","admins":[]}`
+	c := &capture{t: t, method: "PATCH", path: "/admin/config", bearer: wantStr(testAdminKey),
+		body: &body, status: 200, respBody: resp}
+	client := stub(t, c.handler)
+	cfg, err := client.PatchConfig(context.Background(), HotConfigPatch{
+		PerTokenRPM: ptrI64(1200),
+		PerDbRPM:    ptrI64(9000),
+	})
+	if err != nil {
+		t.Fatalf("PatchConfig: %v", err)
+	}
+	if cfg.Hot.PerTokenRPM != 1200 || cfg.Hot.PerDbRPM != 9000 {
+		t.Fatalf("got hot %+v", cfg.Hot)
+	}
+}

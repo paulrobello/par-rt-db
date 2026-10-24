@@ -74,6 +74,8 @@ async fn patch_applies_multiple_fields_and_get_round_trips() -> anyhow::Result<(
             "allowedOrigins": ["https://one.example", "  https://two.example:8443  ", ""],
             "sessionTtlDays": 7,
             "idempotencyTtlMs": 60_000,
+            "perTokenRpm": 600,
+            "perDbRpm": 6000,
         }),
     )
     .await;
@@ -89,6 +91,8 @@ async fn patch_applies_multiple_fields_and_get_round_trips() -> anyhow::Result<(
     );
     assert_eq!(hot["sessionTtlDays"], serde_json::json!(7));
     assert_eq!(hot["idempotencyTtlMs"], serde_json::json!(60_000));
+    assert_eq!(hot["perTokenRpm"], 600);
+    assert_eq!(hot["perDbRpm"], 6000);
     Ok(())
 }
 
@@ -199,6 +203,12 @@ async fn invalid_patches_are_400_and_change_nothing() -> anyhow::Result<()> {
         serde_json::json!({"maxFileSize": 2 * 1024 * 1024 * 1024u64 + 1}),
         serde_json::json!({"allowedOrigins": ["https://ok.example", "not-an-origin"]}),
         serde_json::json!({"bogusField": 1}),
+        serde_json::json!({"perTokenRpm": -1}),
+        serde_json::json!({"perDbRpm": -1}),
+        serde_json::json!({"perTokenRpm": 4294967296u64}),
+        serde_json::json!({"perDbRpm": 4294967296u64}),
+        serde_json::json!({"perTokenRpm": 1.5}),
+        serde_json::json!({"perDbRpm": "100"}),
     ];
     for body in &cases {
         let resp = admin_patch(addr, "/admin/config", body.clone()).await;
@@ -248,5 +258,25 @@ async fn patch_config_requires_admin() -> anyhow::Result<()> {
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
     let body: serde_json::Value = resp.json().await?;
     assert_eq!(body["code"], "UNAUTHORIZED");
+    Ok(())
+}
+
+#[tokio::test]
+async fn rate_limit_patch_accepts_unsigned_bounds() -> anyhow::Result<()> {
+    let addr = spawn_app(test_state().await).await;
+    for limit in [0u32, u32::MAX] {
+        let resp = admin_patch(
+            addr,
+            "/admin/config",
+            serde_json::json!({
+                "perTokenRpm": limit, "perDbRpm": limit
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await?;
+        assert_eq!(body["hot"]["perTokenRpm"], limit);
+        assert_eq!(body["hot"]["perDbRpm"], limit);
+    }
     Ok(())
 }

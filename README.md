@@ -365,7 +365,7 @@ loss is `DROP TABLE` for tables absent from the target snapshot, and migrate dat
 | `DELETE /admin/sessions?expired=true` | Bearer admin key | Revokes every EXPIRED session instance-wide (OAuth/anonymous and admin-key login rows alike — expired rows otherwise linger until each is used or individually revoked). Returns `{ok, revoked}` with the count swept; the dashboard's Sessions page exposes this as "remove all expired". |
 | `WS /admin/stream` | Bearer admin key | Live op-feed stream over WebSocket (subprotocol auth for browsers). |
 | `GET /admin/config` | Bearer admin key | Hot config, redacted (`admin_key`/OAuth secrets/`database_url` → configured-bools only). |
-| `PATCH /admin/config` | Bearer admin key | Mutates the eight hot settings — `allowedOrigins`/`sessionTtlDays`/`maxFileSize`/`idempotencyTtlMs`/`maxTablesPerDb`/`maxStorageBytesPerDb`/`maxSubsPerDb`/`changeLogMaxRows` (camelCase wire names; unknown fields are rejected); validates, persists to the `rtdb_config` row, swaps live (no restart). |
+| `PATCH /admin/config` | Bearer admin key | Mutates the ten hot settings — `allowedOrigins`/`sessionTtlDays`/`maxFileSize`/`idempotencyTtlMs`/`maxTablesPerDb`/`maxStorageBytesPerDb`/`maxSubsPerDb`/`changeLogMaxRows`/`perTokenRpm`/`perDbRpm` (camelCase wire names; unknown fields are rejected); validates, persists to the `rtdb_config` row, swaps live (no restart). |
 | `POST /admin/backup` | Bearer admin key | Spawns a manual `pg_dump` of the live DB (409 if one is already running). Always available — `RTDB_BACKUP_ENABLED` gates only the scheduled cron backups. |
 | `GET /admin/backups` | Bearer admin key | Lists existing dump files. |
 | `GET /admin/backups/{name}` | Bearer admin key | Downloads a dump file (path-traversal-guarded). |
@@ -534,10 +534,11 @@ seeded from env at first boot, persisted in a single-row `rtdb_config` table,
 and swapable via `PATCH /admin/config` without a restart): `allowed_origins`,
 `session_ttl_days`, `max_file_size`, `idempotency_ttl_ms`, the three
 per-database quota caps `max_tables_per_db` / `max_storage_bytes_per_db` /
-`max_subs_per_db` (`0` = unlimited, ENH-011), and `change_log_max_rows`
-(durable change-feed retention). **Once any `PATCH /admin/config` has been
+`max_subs_per_db` (`0` = unlimited, ENH-011), `change_log_max_rows`
+(durable change-feed retention), and the rate-limit ceilings
+`per_token_rpm` / `per_db_rpm` (`0` = unlimited). **Once any `PATCH /admin/config` has been
 applied, the persisted row is overlaid onto env on every boot — env edits to
-these eight settings stop taking effect; change them via `PATCH /admin/config`
+these ten settings stop taking effect; change them via `PATCH /admin/config`
 or the dashboard Settings page.** The full set of boot-time vars —
 OAuth, rate limits, scheduling, presence, image transforms, backups, audit,
 webhooks, OTLP tracing, and more — is annotated in [`.env.example`](.env.example). `RTDB_ALLOWED_ORIGINS` is also the

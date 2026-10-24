@@ -625,10 +625,12 @@ struct AdminClientTests {
             try demand(request.url?.path == "/admin/config", "expected /admin/config")
             let body = try jsonObjectBody(request)
             try demand(
-                Set(body.keys) == ["sessionTtlDays"],
-                "only the patched key must be sent, got \(body.keys.sorted())"
+                Set(body.keys) == ["sessionTtlDays", "perTokenRpm", "perDbRpm"],
+                "only the patched keys must be sent, got \(body.keys.sorted())"
             )
             try demand((body["sessionTtlDays"] as? Int) == 7, "sessionTtlDays mismatch: \(body)")
+            try demand((body["perTokenRpm"] as? Int) == 600, "perTokenRpm mismatch: \(body)")
+            try demand((body["perDbRpm"] as? Int) == 6000, "perDbRpm mismatch: \(body)")
             let config = """
             {"port":8300,"publicUrl":"http://x","githubBaseUrl":"https://gh",
             "githubApiUrl":"https://api","databaseUrlConfigured":true,
@@ -636,14 +638,44 @@ struct AdminClientTests {
             "gitlabConfigured":false,"oidcConfigured":false,
             "hot":{"allowedOrigins":[],"sessionTtlDays":7,"maxFileSize":1000,
             "idempotencyTtlMs":10,"maxTablesPerDb":10,"maxStorageBytesPerDb":0,"maxSubsPerDb":0,
-            "changeLogMaxRows":100000},
+            "changeLogMaxRows":100000,"perTokenRpm":600,"perDbRpm":6000},
             "version":"1.0.0","gitCommit":"abc","admins":[]}
             """
             return (200, Data(config.utf8))
         }
-        let config = try await makeAdminClient().patchConfig(HotConfigPatch(sessionTtlDays: 7))
+        let config = try await makeAdminClient().patchConfig(
+            HotConfigPatch(sessionTtlDays: 7, perTokenRpm: 600, perDbRpm: 6000)
+        )
         #expect(config.hot.sessionTtlDays == 7)
+        #expect(config.hot.perTokenRpm == 600)
+        #expect(config.hot.perDbRpm == 6000)
         #expect(config.admins.isEmpty)
+    }
+
+    @Test func patchConfigSendsOnlySetRateLimitKey() async throws {
+        StubProtocol.handler = { request in
+            try demand(request.httpMethod == "PATCH", "expected PATCH")
+            let body = try jsonObjectBody(request)
+            try demand(
+                Set(body.keys) == ["perDbRpm"],
+                "only the patched key must be sent, got \(body.keys.sorted())"
+            )
+            try demand((body["perDbRpm"] as? Int) == 1200, "perDbRpm mismatch: \(body)")
+            let config = """
+            {"port":8300,"publicUrl":"http://x","githubBaseUrl":"https://gh",
+            "githubApiUrl":"https://api","databaseUrlConfigured":true,
+            "adminKeyConfigured":true,"githubConfigured":false,"googleConfigured":false,
+            "gitlabConfigured":false,"oidcConfigured":false,
+            "hot":{"allowedOrigins":[],"sessionTtlDays":30,"maxFileSize":1000,
+            "idempotencyTtlMs":10,"maxTablesPerDb":0,"maxStorageBytesPerDb":0,"maxSubsPerDb":0,
+            "changeLogMaxRows":100000,"perTokenRpm":0,"perDbRpm":1200},
+            "version":"1.0.0","gitCommit":"abc","admins":[]}
+            """
+            return (200, Data(config.utf8))
+        }
+        let config = try await makeAdminClient().patchConfig(HotConfigPatch(perDbRpm: 1200))
+        #expect(config.hot.perTokenRpm == 0)
+        #expect(config.hot.perDbRpm == 1200)
     }
 
     @Test func patchConfigSurfaces400Envelope() async throws {

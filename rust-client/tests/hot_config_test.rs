@@ -14,12 +14,43 @@ fn hot_config_round_trips_quota_fields() {
         "maxTablesPerDb": 10,
         "maxStorageBytesPerDb": 1048576,
         "maxSubsPerDb": 50,
-        "changeLogMaxRows": 100_000
+        "changeLogMaxRows": 100_000,
+        "perTokenRpm": 600,
+        "perDbRpm": 6000
     }))
     .expect("HotConfig with quota fields decodes");
     assert_eq!(hot.max_tables_per_db, 10);
     assert_eq!(hot.max_storage_bytes_per_db, 1048576);
     assert_eq!(hot.max_subs_per_db, 50);
+    assert_eq!(hot.per_token_rpm, 600);
+    assert_eq!(hot.per_db_rpm, 6000);
+}
+
+#[test]
+fn hot_config_rate_limit_fields_round_trip() {
+    let hot: HotConfig = serde_json::from_value(json!({
+        "allowedOrigins": [],
+        "sessionTtlDays": 30,
+        "maxFileSize": 100,
+        "idempotencyTtlMs": 300000,
+        "maxTablesPerDb": 0,
+        "maxStorageBytesPerDb": 0,
+        "maxSubsPerDb": 0,
+        "changeLogMaxRows": 100_000,
+        "perTokenRpm": 0,
+        "perDbRpm": 1200
+    }))
+    .expect("HotConfig with rate-limit fields decodes");
+    assert_eq!(hot.per_token_rpm, 0);
+    assert_eq!(hot.per_db_rpm, 1200);
+    // camelCase wire names round-trip
+    let patch = HotConfigPatch {
+        per_db_rpm: Some(1200),
+        ..Default::default()
+    };
+    let v = serde_json::to_value(&patch).unwrap();
+    assert_eq!(v["perDbRpm"], 1200);
+    assert!(v.get("perTokenRpm").is_none());
 }
 
 #[test]

@@ -90,6 +90,8 @@ type HotConfigPatch struct {
 	MaxTablesPerDB       *int64   `json:"maxTablesPerDb,omitempty"`
 	MaxStorageBytesPerDB *int64   `json:"maxStorageBytesPerDb,omitempty"`
 	MaxSubsPerDB         *int64   `json:"maxSubsPerDb,omitempty"`
+	PerTokenRPM          *int64   `json:"perTokenRpm,omitempty"`
+	PerDbRPM             *int64   `json:"perDbRpm,omitempty"`
 }
 
 // --- response DTOs -------------------------------------------------------

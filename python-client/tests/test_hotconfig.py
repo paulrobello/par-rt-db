@@ -84,3 +84,43 @@ def test_hot_config_patch_change_log_max_rows_only():
 def test_cursor_expired_code_registered():
     assert ErrorCode.CURSOR_EXPIRED.value == "CURSOR_EXPIRED"
     assert _STATUS[ErrorCode.CURSOR_EXPIRED] == 410
+
+
+# --- Hot-configurable rate-limit ceilings ------------------------------------
+
+
+def test_hot_config_rate_limit_fields_round_trip():
+    hot = HotConfig.model_validate(
+        {
+            "allowedOrigins": [],
+            "sessionTtlDays": 30,
+            "maxFileSize": 100,
+            "idempotencyTtlMs": 300000,
+            "perTokenRpm": 600,
+            "perDbRpm": 6000,
+        }
+    )
+    assert hot.per_token_rpm == 600
+    assert hot.per_db_rpm == 6000
+    # camelCase alias on the wire
+    dump = hot.model_dump(by_alias=True)
+    assert dump["perTokenRpm"] == 600
+    assert dump["perDbRpm"] == 6000
+
+
+def test_hot_config_rate_limit_fields_default_to_zero_when_absent():
+    hot = HotConfig.model_validate(
+        {
+            "allowedOrigins": [],
+            "sessionTtlDays": 30,
+            "maxFileSize": 100,
+            "idempotencyTtlMs": 300000,
+        }
+    )
+    assert hot.per_token_rpm == 0
+    assert hot.per_db_rpm == 0
+
+
+def test_hot_config_patch_rate_limit_fields_only():
+    patch = HotConfigPatch(per_token_rpm=1200)
+    assert patch.model_dump(exclude_none=True, by_alias=True) == {"perTokenRpm": 1200}

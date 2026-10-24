@@ -86,6 +86,8 @@ pub(super) struct HotConfigPatch {
     max_storage_bytes_per_db: Option<u64>,
     max_subs_per_db: Option<usize>,
     change_log_max_rows: Option<usize>,
+    per_token_rpm: Option<u32>,
+    per_db_rpm: Option<u32>,
 }
 
 /// `PATCH /admin/config` — apply a subset patch to the hot config, validate,
@@ -132,6 +134,14 @@ pub(super) async fn patch_config(
             return Err(RtDbError::bad_request("idempotencyTtlMs must be > 0"));
         }
         next.idempotency_ttl_ms = ttl;
+    }
+    // Unsigned u32 fields reject negative/overflow values during extraction.
+    // 0 disables the ceiling, so every representable value is valid.
+    if let Some(limit) = patch.per_token_rpm {
+        next.per_token_rpm = limit;
+    }
+    if let Some(limit) = patch.per_db_rpm {
+        next.per_db_rpm = limit;
     }
     // Quota caps (ENH-011): unsigned types forbid negatives, and 0 means
     // unlimited (no cap), so there is no lower bound to enforce and no hard

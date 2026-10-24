@@ -38,6 +38,8 @@ const baseConfig: ConfigResponse = {
     maxStorageBytesPerDb: 0,
     maxSubsPerDb: 0,
     changeLogMaxRows: 100_000,
+    perTokenRpm: 600,
+    perDbRpm: 6000,
   },
   version: "0.1.0",
   gitCommit: "abcdef0123456789",

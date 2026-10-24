@@ -137,6 +137,8 @@ type HotConfig struct {
 	MaxTablesPerDB       int64    `json:"maxTablesPerDb"`
 	MaxStorageBytesPerDB int64    `json:"maxStorageBytesPerDb"`
 	MaxSubsPerDB         int64    `json:"maxSubsPerDb"`
+	PerTokenRPM          int64    `json:"perTokenRpm"`
+	PerDbRPM             int64    `json:"perDbRpm"`
 }
 
 // ConfigResponse is GET /admin/config — redacted boot config + hot config +
