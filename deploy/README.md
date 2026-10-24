@@ -13,6 +13,7 @@ VPS and no reverse proxy is needed — TLS is terminated at Cloudflare's edge.
 
 - [One-time DNS/tunnel wiring (already done 2026-07-21)](#one-time-dnstunnel-wiring)
 - [Deploy / update](#deploy--update)
+- [Host reservation (quiet window)](#host-reservation-quiet-window)
 - [Topology: single instance by default; multi-instance is opt-in](#topology-single-instance-by-default-multi-instance-is-opt-in)
 - [Host machine authorization rollout](#host-machine-authorization-rollout)
 - [Postgres image](#postgres-image)
@@ -148,6 +149,9 @@ host is x86_64; do not `docker save` an arm64 image from a Mac).
 
 ```sh
 # from the repo root on the workstation:
+# Host reservation gate (see "Host reservation (quiet window)"): do not start
+# this window while /var/tmp/par-host-reservation.json holds an unexpired
+# lease — `make deploy` refuses; honor it here by the same convention.
 # .gitignore already excludes target/, node_modules/, and .env/.env.* (which
 # hold the live secrets on the deploy host) — --delete without that filter
 # would wipe them out.
@@ -185,6 +189,67 @@ curl -fsS http://127.0.0.1:8300/healthz | jq .
 ```
 
 Then verify the public path: `curl -fsS https://rtdb.example.com/healthz | jq .`.
+
+## Host reservation (quiet window)
+
+The deploy host also runs workloads that need guaranteed-CPU windows (e.g.
+the-cube's 30-minute full-workload capacity benchmarks). Repeated DB image
+builds interrupt those measurements, so both sides honor a cooperative
+reservation file: while a reservation is active, new DB image builds and
+`docker compose up` runs do not start.
+
+**File**: `/var/tmp/par-host-reservation.json` on the deploy host. A single
+JSON object:
+
+```json
+{"owner": "the-cube", "reason": "co-op capacity", "until": 1769100000}
+```
+
+`until` is a unix timestamp in seconds. The reservation is **active** while
+`until > now`. Semantics are deliberate:
+
+- **Absent** file → no reservation, deploy proceeds unchanged.
+- **Expired** (`until <= now`) → no reservation, deploy proceeds unchanged.
+- **Malformed/unreadable** (bad JSON, missing fields, a non-positive-integer
+  `until`, or the file exists but can't be parsed) → the guard **fails
+  closed**: it prints one line and exits nonzero. A lease someone tried to
+  file must not be silently ignored. `jq` validates before anything is
+  interpreted.
+- **Active** → one line naming owner, reason, and expiry, exit nonzero.
+
+`make host-reserve` writes the file atomically (`mktemp` + `mv`, mode 644 so
+a different host user can read it), so the guard never reads a half-written
+file. No environment variable is involved; this is a host-local file only.
+
+**Targets** (plain POSIX sh + `jq`; run them on the deploy host from the
+rsynced tree, or anywhere with `RESERVATION_FILE` overridden):
+
+- `make host-reserve OWNER=the-cube REASON="co-op capacity" MINUTES=45` —
+  create the lease. Input validation: `OWNER` must be non-empty
+  `[A-Za-z0-9._-]`; `MINUTES` must be 1..1440; `REASON` must be non-empty.
+- `make host-release` — remove the lease (idempotent; the owner can release
+  early, or anyone after expiry).
+- `make host-reservation-check` — status/dry-run: runs the exact deploy guard
+  and exits nonzero while a lease is active. `RESERVATION_FILE=/tmp/fake.json`
+  points it at a fake file — that is how the guard logic is exercised locally
+  without touching the host.
+
+**Enforcement**: `make deploy` (from the workstation) rsyncs the tree, then
+the deploy host runs `make host-reservation-check` from that rsynced tree
+before bootstrapping the builder and before any `docker compose up` — so no
+image build or container restart starts while a lease is active. When
+blocked, it prints one line naming owner, reason, and expiry and exits
+nonzero without building or restarting anything.
+`make deploy RESERVATION_OVERRIDE=1` skips the check for genuine emergencies.
+
+**Adoption note (the-cube)**: this is an honor-system protocol — the guard
+only gates this repo's own deploy/build entrypoints (`make deploy`; the
+documented manual rsync path is an intentional bypass and must respect the
+file by convention). the-cube files a reservation via `make host-reserve ...`
+on the host before starting a benchmark window, and must equally honor the
+file: no new benchmark window may start while an unexpired reservation (e.g.
+from an emergency deploy) exists. Both sides read the same host-local file;
+there is no other coordination channel.
 
 ## Topology: single instance by default; multi-instance is opt-in
 

@@ -35,6 +35,7 @@ SWIFT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(1),$(SW
 	python-client-typecheck python-client-checkall rust-client-check-features rtdb-cli deploy \
 	env-drift-check dockerfile-stub-check backup-persistence-check cli-docs cli-docs-check \
 	rust-client-doc ts-client-doc python-client-doc swift-client-doc docs-api \
+	host-reserve host-release host-reservation-check \
 	go-client-install go-client-fmt go-client-fmt-check go-client-lint go-client-test \
 	go-client-typecheck go-client-checkall \
 	swift-client-build swift-client-test swift-client-lint swift-client-fmt \
@@ -481,6 +482,46 @@ pre-commit:
 pre-commit-update:
 	pre-commit autoupdate
 
+# ==== Shared-host quiet window (run these targets on the host) ===============
+RESERVATION_FILE ?= /var/tmp/par-host-reservation.json
+RESERVATION_OVERRIDE ?= 0
+export RESERVATION_FILE RESERVATION_OVERRIDE OWNER REASON MINUTES
+
+# Validate JSON before interpreting the lease. Malformed/unreadable files fail
+# closed; an absent file requires no extra host tools.
+define HOST_RESERVE_CHECK
+if [ "$$RESERVATION_OVERRIDE" = 1 ]; then \
+	printf '%s\n' "host reservation: emergency override enabled" >&2; \
+elif [ -e "$$RESERVATION_FILE" ]; then \
+	rsv=$$(jq -ce 'select(type == "object" and (.owner | type == "string" and length > 0) and (.reason | type == "string" and length > 0) and (.until | type == "number" and . >= 0 and . == floor))' "$$RESERVATION_FILE") || { printf '%s\n' "host reservation: cannot read valid lease at $$RESERVATION_FILE" >&2; exit 1; }; \
+	if printf '%s\n' "$$rsv" | jq -e --argjson now "$$(date +%s)" '.until > $$now' >/dev/null; then \
+		printf '%s\n' "$$rsv" | jq -r '"host reservation: BLOCKED owner=\(.owner | tojson) reason=\(.reason | tojson) until=\(.until) (unix seconds); emergency override: RESERVATION_OVERRIDE=1"' >&2; \
+		exit 1; \
+	fi; \
+fi
+endef
+
+host-reservation-check:
+	@set -e; $(HOST_RESERVE_CHECK); printf 'host-reservation-check: no active reservation (%s)\n' "$$RESERVATION_FILE"
+
+host-reserve:
+# Refuses while a lease is active (the embedded check runs with the override
+# forced off) — release the existing lease first rather than clobber it.
+	@set -e; \
+	case "$$OWNER" in ""|*[!A-Za-z0-9._-]*) printf '%s\n' "OWNER must contain only letters, digits, '.', '_' or '-'" >&2; exit 1;; esac; \
+	case "$$MINUTES" in ""|*[!0-9]*) printf '%s\n' "MINUTES must be an integer from 1 to 1440" >&2; exit 1;; esac; \
+	jq -en --arg minutes "$$MINUTES" --arg reason "$$REASON" '($$minutes | tonumber) as $$m | $$m >= 1 and $$m <= 1440 and ($$reason | length > 0)' >/dev/null || { printf '%s\n' "MINUTES must be 1..1440 and REASON must be non-empty" >&2; exit 1; }; \
+	RESERVATION_OVERRIDE=0; $(HOST_RESERVE_CHECK); \
+	rsv_tmp=$$(mktemp "$$RESERVATION_FILE.XXXXXX"); \
+	trap 'rm -f "$$rsv_tmp"' 0; trap 'exit 1' HUP INT TERM; \
+	jq -n --arg owner "$$OWNER" --arg reason "$$REASON" --arg minutes "$$MINUTES" --argjson now "$$(date +%s)" '{owner: $$owner, reason: $$reason, until: ($$now + ($$minutes | tonumber) * 60)}' >"$$rsv_tmp"; \
+	chmod 644 "$$rsv_tmp"; \
+	mv -f "$$rsv_tmp" "$$RESERVATION_FILE"; \
+	printf 'host reservation created: %s\n' "$$RESERVATION_FILE"
+
+host-release:
+	@rm -f "$$RESERVATION_FILE"
+
 # Cold builds under the builder's full four-CPU quota saturated the deploy
 # host (load 59.6 with shared-endpoint 502s, 2026-10-16); the identical cold
 # build under a two-CPU quota held load <= 11.4 with every shared endpoint
@@ -489,7 +530,7 @@ pre-commit-update:
 deploy: checkall-cached
 	rsync -az --delete --filter=':- .gitignore' --exclude .git --exclude .claude/ \
 		./ $(DEPLOY_HOST):$(DEPLOY_PATH)/
-	ssh $(DEPLOY_HOST) 'cd $(DEPLOY_PATH) && BUILDER=par-rt-db-builder && if ! docker buildx inspect "$$BUILDER" >/dev/null 2>&1; then docker buildx create --name "$$BUILDER" --driver docker-container --driver-opt default-load=true --driver-opt cpu-quota=400000 --driver-opt cpu-period=100000 --buildkitd-config "$(DEPLOY_PATH)/deploy/buildkitd.toml"; fi && docker buildx use "$$BUILDER" && docker buildx inspect --bootstrap "$$BUILDER" >/dev/null && BK=$$(docker ps --format "{{.Names}}" | grep "^buildx_buildkit_$${BUILDER}" | head -1) && [ -n "$$BK" ] && docker update --cpu-period 100000 --cpu-quota 200000 "$$BK" && { RTDB_BUILD_COMMIT=$(DEPLOY_COMMIT) BUILDX_BUILDER="$$BUILDER" docker compose up -d --build && docker compose ps; EC=$$?; docker update --cpu-period 100000 --cpu-quota 400000 "$$BK" >/dev/null; exit $$EC; }'
+	ssh $(DEPLOY_HOST) 'cd $(DEPLOY_PATH) && make host-reservation-check RESERVATION_FILE="$(RESERVATION_FILE)" RESERVATION_OVERRIDE="$(RESERVATION_OVERRIDE)" && BUILDER=par-rt-db-builder && if ! docker buildx inspect "$$BUILDER" >/dev/null 2>&1; then docker buildx create --name "$$BUILDER" --driver docker-container --driver-opt default-load=true --driver-opt cpu-quota=400000 --driver-opt cpu-period=100000 --buildkitd-config "$(DEPLOY_PATH)/deploy/buildkitd.toml"; fi && docker buildx use "$$BUILDER" && docker buildx inspect --bootstrap "$$BUILDER" >/dev/null && BK=$$(docker ps --format "{{.Names}}" | grep "^buildx_buildkit_$${BUILDER}" | head -1) && [ -n "$$BK" ] && docker update --cpu-period 100000 --cpu-quota 200000 "$$BK" && { RTDB_BUILD_COMMIT=$(DEPLOY_COMMIT) BUILDX_BUILDER="$$BUILDER" docker compose up -d --build && docker compose ps; EC=$$?; docker update --cpu-period 100000 --cpu-quota 400000 "$$BK" >/dev/null; exit $$EC; }'
 	ssh $(DEPLOY_HOST) 'curl -fsS http://127.0.0.1:8300/healthz'
 	@echo
 	curl -fsS $(DEPLOY_PUBLIC_URL)
