@@ -132,8 +132,41 @@ func cloneTableDef(in *TableDef) *TableDef {
 	for k, v := range in.Defaults {
 		out.Defaults[k] = v
 	}
+	if len(in.Constraints) > 0 {
+		out.Constraints = make(map[string]FieldConstraints, len(in.Constraints))
+		for k, v := range in.Constraints {
+			out.Constraints[k] = cloneFieldConstraints(v)
+		}
+	}
 	for k, v := range in.Computed {
 		out.Computed[k] = cloneValueExpr(v)
+	}
+	return out
+}
+
+// cloneFieldConstraints deep-copies one constraint set (fresh pointers, so a
+// migration's working schema copy shares nothing with the old schema).
+func cloneFieldConstraints(fc FieldConstraints) FieldConstraints {
+	out := fc
+	if fc.Min != nil {
+		n := *fc.Min
+		out.Min = &n
+	}
+	if fc.Max != nil {
+		n := *fc.Max
+		out.Max = &n
+	}
+	if fc.MinLength != nil {
+		n := *fc.MinLength
+		out.MinLength = &n
+	}
+	if fc.MaxLength != nil {
+		n := *fc.MaxLength
+		out.MaxLength = &n
+	}
+	if fc.Pattern != nil {
+		s := *fc.Pattern
+		out.Pattern = &s
 	}
 	return out
 }
@@ -828,6 +861,29 @@ func tableDefToWire(td *TableDef) (wire.JSONValue, error) {
 			defaults[k] = v
 		}
 		out["defaults"] = defaults
+	}
+	if len(td.Constraints) > 0 {
+		constraints := wire.Object{}
+		for k, fc := range td.Constraints {
+			fo := wire.Object{}
+			if fc.Min != nil {
+				fo["min"] = *fc.Min
+			}
+			if fc.Max != nil {
+				fo["max"] = *fc.Max
+			}
+			if fc.MinLength != nil {
+				fo["minLength"] = wire.Number(formatI64(*fc.MinLength))
+			}
+			if fc.MaxLength != nil {
+				fo["maxLength"] = wire.Number(formatI64(*fc.MaxLength))
+			}
+			if fc.Pattern != nil {
+				fo["pattern"] = wire.String(*fc.Pattern)
+			}
+			constraints[k] = fo
+		}
+		out["constraints"] = constraints
 	}
 	if len(td.Computed) > 0 {
 		computed := wire.Object{}

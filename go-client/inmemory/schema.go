@@ -115,6 +115,20 @@ type TtlDef struct {
 	DefaultDurationMs *int64
 }
 
+// FieldConstraints is one field's declared write constraints (wire camelCase,
+// mirroring core/src/schema.rs::FieldConstraints). Min/Max keep the raw JSON
+// number literal (a wire.Number) so the value round-trips byte-exact; on an
+// int64 field they must be integers so the i64 comparison stays exact.
+// Constraints are write-path only: they change no stored shape and are not
+// compared by detectDestructiveChanges (like SoftDelete).
+type FieldConstraints struct {
+	Min       *wire.Number // inclusive lower bound (number/int64)
+	Max       *wire.Number // inclusive upper bound (number/int64)
+	MinLength *int64       // inclusive minimum string length
+	MaxLength *int64       // inclusive maximum string length
+	Pattern   *string      // unanchored regex the value must match (search, not full match)
+}
+
 // TableDef is one table: fields, indexes, and the opt-in per-row rules.
 type TableDef struct {
 	Fields             map[string]FieldType
@@ -126,6 +140,7 @@ type TableDef struct {
 	AutoIncrementField *string
 	Authorize          wire.FilterExpr
 	Defaults           map[string]wire.JSONValue
+	Constraints        map[string]FieldConstraints
 	Computed           map[string]wire.ValueExpr
 	SoftDelete         bool
 }
@@ -169,7 +184,7 @@ func parseTableDef(v wire.JSONValue) (*TableDef, error) {
 	}
 	if err := rejectUnknownKeys(obj, "table", "fields", "indexes", "ownerField",
 		"collaboratorsField", "ttl", "updatedAtField", "autoIncrementField",
-		"authorize", "defaults", "computed", "softDelete"); err != nil {
+		"authorize", "defaults", "constraints", "computed", "softDelete"); err != nil {
 		return nil, err
 	}
 	td := &TableDef{Fields: map[string]FieldType{}, Defaults: map[string]wire.JSONValue{}, Computed: map[string]wire.ValueExpr{}}
@@ -231,6 +246,77 @@ func parseTableDef(v wire.JSONValue) (*TableDef, error) {
 		}
 		for k, dv := range dobj {
 			td.Defaults[k] = dv
+		}
+	}
+	if v, ok := obj["constraints"]; ok && v != nil {
+		cobj, ok := v.(wire.Object)
+		if !ok {
+			return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "table.constraints must be an object")
+		}
+		td.Constraints = map[string]FieldConstraints{}
+		for fname, cv := range cobj {
+			fco, ok := cv.(wire.Object)
+			if !ok {
+				return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+					"table.constraints entries must be objects")
+			}
+			if err := rejectUnknownKeys(fco, "constraints", "min", "max", "minLength",
+				"maxLength", "pattern"); err != nil {
+				return nil, err
+			}
+			var fc FieldConstraints
+			if bv, ok := fco["min"]; ok && bv != nil {
+				num, ok := bv.(wire.Number)
+				if !ok {
+					return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+						"constraints.min must be a number")
+				}
+				fc.Min = &num
+			}
+			if bv, ok := fco["max"]; ok && bv != nil {
+				num, ok := bv.(wire.Number)
+				if !ok {
+					return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+						"constraints.max must be a number")
+				}
+				fc.Max = &num
+			}
+			if bv, ok := fco["minLength"]; ok && bv != nil {
+				num, ok := bv.(wire.Number)
+				if !ok {
+					return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+						"constraints.minLength must be a number")
+				}
+				n, err := jsonNumberI64(num)
+				if err != nil {
+					return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+						"constraints.minLength must be an integer")
+				}
+				fc.MinLength = &n
+			}
+			if bv, ok := fco["maxLength"]; ok && bv != nil {
+				num, ok := bv.(wire.Number)
+				if !ok {
+					return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+						"constraints.maxLength must be a number")
+				}
+				n, err := jsonNumberI64(num)
+				if err != nil {
+					return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+						"constraints.maxLength must be an integer")
+				}
+				fc.MaxLength = &n
+			}
+			if bv, ok := fco["pattern"]; ok && bv != nil {
+				sv, ok := bv.(wire.String)
+				if !ok {
+					return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+						"constraints.pattern must be a string")
+				}
+				s := string(sv)
+				fc.Pattern = &s
+			}
+			td.Constraints[fname] = fc
 		}
 	}
 	if v, ok := obj["computed"]; ok && v != nil {

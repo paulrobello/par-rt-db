@@ -281,6 +281,20 @@ func (t *TableBuilder) Defaults(entries map[string]wire.JSONValue) *TableBuilder
 	return t
 }
 
+// Constraints declares per-field write constraints (server
+// TableDef::constraints, the FieldConstraints wire object): a map of field
+// name → constraint-set wire object ({min,max,minLength,maxLength,pattern}).
+// `min`/`max` are legal only on number/int64 fields (inclusive; integer
+// bounds on int64); `minLength`/`maxLength`/`pattern` only on string
+// (`pattern` is an unanchored regex search). Null and absent values never
+// violate. Enforced server-side AND by this client's in-memory engine;
+// push-time validated (a misapplied constraint or an invalid regex fails the
+// push naming the field). Omitted on the wire when the table declares none.
+func (t *TableBuilder) Constraints(entries map[string]wire.JSONValue) *TableBuilder {
+	t.ensure()["constraints"] = wire.Object(entries)
+	return t
+}
+
 // Computed declares a computed field from a ValueExpr.
 func (t *TableBuilder) Computed(name string, expr wire.ValueExpr) *TableBuilder {
 	m, ok := t.ensure()["computed"].(wire.Object)

@@ -6,6 +6,7 @@ package inmemory
 
 import (
 	"encoding/json"
+	"regexp"
 
 	rtdberrors "github.com/paulrobello/par-rt-db/go-client/errors"
 	"github.com/paulrobello/par-rt-db/go-client/wire"
@@ -307,6 +308,67 @@ func validateSchema(schema *SchemaDef) error {
 		}
 		if err := validateComputedTable(table, tableName); err != nil {
 			return err
+		}
+		if err := validateConstraintsTable(table, tableName); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateConstraintsTable is the push-time constraint validation — the port
+// of server schema::validate's validate_constraints. Rules: each key names a
+// declared field; `min`/`max` sit only on number/int64 (integer bounds on
+// int64); `minLength`/`maxLength`/`pattern` only on string; bounds don't
+// cross; `pattern` must compile under Go's regexp (RE2 — the same
+// non-backtracking lineage as the server's regex crate, so the accepted
+// pattern language matches). Violations are SCHEMA_VIOLATION naming the
+// field, matching the server's typed push error. Also re-runs on a
+// migration's derived schema via validateSchema (the changeType
+// re-validation path).
+func validateConstraintsTable(table *TableDef, tableName string) error {
+	for field, fc := range table.Constraints {
+		violate := func(detail string) error {
+			return rtdberrors.New(rtdberrors.CodeSchemaViolation,
+				"constraints on field '"+field+"': "+detail)
+		}
+		fty, declared := table.Fields[field]
+		if !declared {
+			return rtdberrors.New(rtdberrors.CodeSchemaViolation,
+				"constraints key '"+field+"' is not a declared field of table '"+tableName+"'")
+		}
+		for fty.Kind == "optional" && fty.Inner != nil {
+			fty = *fty.Inner
+		}
+		if fc.Min != nil || fc.Max != nil {
+			if fty.Kind != "number" && fty.Kind != "int64" {
+				return violate("'min'/'max' is legal only on number/int64 fields")
+			}
+			if fty.Kind == "int64" {
+				for _, b := range []*wire.Number{fc.Min, fc.Max} {
+					if b != nil {
+						if _, err := jsonNumberI64(*b); err != nil {
+							return violate("'min'/'max' bound must be an integer on an int64 field")
+						}
+					}
+				}
+			}
+		}
+		if (fc.MinLength != nil || fc.MaxLength != nil || fc.Pattern != nil) && fty.Kind != "string" {
+			return violate("'minLength'/'maxLength'/'pattern' is legal only on string fields")
+		}
+		if fc.Min != nil && fc.Max != nil {
+			if mn := jsonNumberF64(*fc.Min); mn > jsonNumberF64(*fc.Max) {
+				return violate("'min' exceeds 'max'")
+			}
+		}
+		if fc.MinLength != nil && fc.MaxLength != nil && *fc.MinLength > *fc.MaxLength {
+			return violate("'minLength' exceeds 'maxLength'")
+		}
+		if fc.Pattern != nil {
+			if _, err := regexp.Compile(*fc.Pattern); err != nil {
+				return violate("invalid pattern: '" + *fc.Pattern + "'")
+			}
 		}
 	}
 	return nil

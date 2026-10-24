@@ -5,7 +5,9 @@ package inmemory
 
 import (
 	"encoding/json"
+	"regexp"
 	"strconv"
+	"unicode/utf8"
 
 	rtdberrors "github.com/paulrobello/par-rt-db/go-client/errors"
 	"github.com/paulrobello/par-rt-db/go-client/wire"
@@ -186,8 +188,84 @@ func validateDoc(table *TableDef, doc wire.Object) error {
 				return rtdberrors.New(rtdberrors.CodeSchemaViolation,
 					"field '"+field+"' has an invalid value")
 			}
+			if err := checkConstraintsForField(table, field, v); err != nil {
+				return err
+			}
 		} else if fty.Kind != "optional" {
 			return rtdberrors.New(rtdberrors.CodeSchemaViolation, "field '"+field+"' is required")
+		}
+	}
+	return nil
+}
+
+// checkConstraintsForField is the write-path constraint check for one present
+// field value — the port of server schema::value::check_constraints_for_field.
+// Null never violates; bounds compare inclusively (exact i64 compare on int64
+// decimal strings); lengths count Unicode scalar values inclusively;
+// `pattern` is an unanchored regexp search. Violations are SCHEMA_VIOLATION
+// naming the field and constraint.
+func checkConstraintsForField(table *TableDef, field string, value wire.JSONValue) error {
+	fc, declared := table.Constraints[field]
+	if !declared || isNullValue(value) {
+		return nil
+	}
+	violate := func(label string) error {
+		return rtdberrors.New(rtdberrors.CodeSchemaViolation,
+			"field '"+field+"' violates its '"+label+"' constraint")
+	}
+	fty := table.Fields[field]
+	for fty.Kind == "optional" && fty.Inner != nil {
+		fty = *fty.Inner
+	}
+	switch fty.Kind {
+	case "number":
+		vn, ok := value.(wire.Number)
+		if !ok {
+			return nil
+		}
+		v := jsonNumberF64(vn)
+		if fc.Min != nil && v < jsonNumberF64(*fc.Min) {
+			return violate("min")
+		}
+		if fc.Max != nil && v > jsonNumberF64(*fc.Max) {
+			return violate("max")
+		}
+	case "int64":
+		vs, ok := value.(wire.String)
+		if !ok {
+			return nil
+		}
+		v, ok := parseI64(string(vs))
+		if !ok {
+			return nil
+		}
+		if fc.Min != nil {
+			if b, err := jsonNumberI64(*fc.Min); err == nil && v < b {
+				return violate("min")
+			}
+		}
+		if fc.Max != nil {
+			if b, err := jsonNumberI64(*fc.Max); err == nil && v > b {
+				return violate("max")
+			}
+		}
+	case "string":
+		vs, ok := value.(wire.String)
+		if !ok {
+			return nil
+		}
+		n := utf8.RuneCountInString(string(vs))
+		if fc.MinLength != nil && int64(n) < *fc.MinLength {
+			return violate("minLength")
+		}
+		if fc.MaxLength != nil && int64(n) > *fc.MaxLength {
+			return violate("maxLength")
+		}
+		if fc.Pattern != nil {
+			re, err := regexp.Compile(*fc.Pattern)
+			if err == nil && !re.MatchString(string(vs)) {
+				return violate("pattern")
+			}
 		}
 	}
 	return nil
