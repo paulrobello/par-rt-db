@@ -37,3 +37,67 @@ DELETE FROM rtdb.webhook_deliveries
    );
 DELETE FROM rtdb.webhooks
  WHERE url ~ '^https?://(127\.0\.0\.1|localhost)(:[0-9]+)?(/.*)?$';
+
+-- ---------------------------------------------------------------------------
+-- Merge-test fixture rows (server/tests/merge_test.rs). Killed gate runs leak
+-- the rows that file seeds directly in rtdb_auth — at ~5.4k of them every
+-- merge_users scanned each live sibling registry row and merge_test stalled
+-- (2026-10-24) — and the t/sc_ patterns above never match them. The shapes
+-- are provably test-only: production ids come from db::new_id() (bare 32-hex
+-- UUIDv7, db.rs:1023) and no src/ path mints any of these names.
+--
+--   databases: "stale<i><10hex>" x50, seeded by the stale-skip test
+--   users:     the stale-skip test's anon2?/real2?_stale_<15,16hex> pairs and
+--              the anon_<32hex> / real2?_<32hex> pairs the orchestration,
+--              storage-swap, and auth-guard tests seed
+--   sessions:  token_hash is a sha256 (no name pattern), so rows go by
+--              user_id linkage — deleted BEFORE the users (FK references).
+--
+-- Each family runs in one DO-block transaction: count first, abort that
+-- family (the exception rolls its DELETE back) if the match exceeds the
+-- 50000-row safety bound, else delete and report the count.
+DO $$
+DECLARE
+    n bigint;
+BEGIN
+    SELECT count(*) INTO n FROM rtdb_auth.databases
+     WHERE name ~ '^stale[0-9]+[0-9a-f]{10}$';
+    IF n > 50000 THEN
+        RAISE EXCEPTION 'merge-fixture clean: % stale* databases rows exceeds the 50000-row safety bound — refusing; inspect manually', n;
+    END IF;
+    DELETE FROM rtdb_auth.databases WHERE name ~ '^stale[0-9]+[0-9a-f]{10}$';
+    RAISE NOTICE 'merge-fixture clean: removed % stale* rtdb_auth.databases rows', n;
+END
+$$;
+
+-- sessions before users: sessions.user_id references users(id) with no
+-- CASCADE, so the users delete below only succeeds once these are gone.
+DO $$
+DECLARE
+    fixture_users text := '^((anon2?|real2?)_stale_[0-9a-f]{15,16}|(anon|real2?)_[0-9a-f]{32})$';
+    n bigint;
+BEGIN
+    SELECT count(*) INTO n FROM rtdb_auth.sessions
+     WHERE user_id ~ fixture_users;
+    IF n > 50000 THEN
+        RAISE EXCEPTION 'merge-fixture clean: % fixture sessions exceeds the 50000-row safety bound — refusing; inspect manually', n;
+    END IF;
+    DELETE FROM rtdb_auth.sessions WHERE user_id ~ fixture_users;
+    RAISE NOTICE 'merge-fixture clean: removed % fixture rtdb_auth.sessions rows', n;
+END
+$$;
+
+DO $$
+DECLARE
+    fixture_users text := '^((anon2?|real2?)_stale_[0-9a-f]{15,16}|(anon|real2?)_[0-9a-f]{32})$';
+    n bigint;
+BEGIN
+    SELECT count(*) INTO n FROM rtdb_auth.users
+     WHERE id ~ fixture_users;
+    IF n > 50000 THEN
+        RAISE EXCEPTION 'merge-fixture clean: % fixture users exceeds the 50000-row safety bound — refusing; inspect manually', n;
+    END IF;
+    DELETE FROM rtdb_auth.users WHERE id ~ fixture_users;
+    RAISE NOTICE 'merge-fixture clean: removed % fixture rtdb_auth.users rows', n;
+END
+$$;

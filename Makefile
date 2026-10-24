@@ -28,7 +28,7 @@ SWIFT_OS := $(shell uname -s)
 SWIFT_SKIP := @echo "Skipping swift-client (non-Darwin host)"
 SWIFT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(1),$(SWIFT_SKIP))
 
-.PHONY: clean build test lint fmt fmt-check typecheck checkall checkall-cached dev-db-up dev-db-down dev-db-clean \
+.PHONY: clean build test lint fmt fmt-check typecheck checkall checkall-cached dev-db-up dev-db-down dev-db-clean dev-db-clean-check \
 	pre-commit pre-commit-update ts-client-build ts-client-install dashboard-install \
 	dashboard-test \
 	python-client-install python-client-test python-client-lint python-client-fmt \
@@ -379,6 +379,13 @@ dockerfile-stub-check:
 backup-persistence-check:
 	./scripts/backup-persistence-check.sh
 
+# Proves dev-db-clean.sql's merge-fixture section on the live dev Postgres:
+# seeds throwaway pattern-matching rows + a non-matching sentinel, runs the
+# real clean, asserts zero fixtures remain and the sentinel survives. Runs
+# after `test` in checkall, so the dev db (dev-db-up) is guaranteed up.
+dev-db-clean-check:
+	./scripts/dev-db-clean-check.sh
+
 # SEC-007: fail when tracked files reference the operator's real infrastructure
 # hostnames. The patterns live in a gitignored local file (.hostname-leak-patterns,
 # one extended regex per line) so the patterns themselves are never published.
@@ -396,7 +403,7 @@ hostname-leak-check:
 		fi; \
 	fi
 
-checkall: env-drift-check dockerfile-stub-check backup-persistence-check hostname-leak-check cli-docs-check docs-api fmt-check lint typecheck test rust-client-check-features
+checkall: env-drift-check dockerfile-stub-check backup-persistence-check hostname-leak-check cli-docs-check docs-api fmt-check lint typecheck test rust-client-check-features dev-db-clean-check
 	@mkdir -p target && echo "$(GATE_KEY)" > $(GATE_STAMP)
 
 # Content-addressed gate reuse for deploys: `checkall` stamps the gate key
