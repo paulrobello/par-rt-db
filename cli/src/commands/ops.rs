@@ -180,6 +180,109 @@ where
     }
 }
 
+const CHANGE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Print the durable data-plane feed, keeping cursors off stdout.
+pub(crate) async fn run_changes(
+    cli: &Cli,
+    db: Option<&str>,
+    since: Option<i64>,
+    limit: Option<i64>,
+    follow: bool,
+) -> Result<()> {
+    let db = match db {
+        Some(db) => db.to_string(),
+        None => super::require_db(cli)?,
+    };
+    let token = super::require_token(cli)?;
+    let client = super::data_client(cli, &db, &token);
+    poll_changes(
+        &client,
+        since,
+        limit,
+        follow,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+        tokio::signal::ctrl_c(),
+    )
+    .await
+}
+
+fn change_error(err: RtDbError) -> anyhow::Error {
+    // Preserve the wire envelope rather than RtDbError's message-only Display.
+    anyhow::anyhow!(serde_json::json!({"code": err.code, "message": err.message}).to_string())
+}
+
+fn write_change_page<W: Write>(
+    page: &par_rt_db_client::ChangeFeedResponse,
+    out: &mut W,
+) -> Result<i64> {
+    for op in &page.ops {
+        serde_json::to_writer(&mut *out, op).context("serializing change op")?;
+        writeln!(out).context("writing change op")?;
+        out.flush().context("flushing change op")?;
+    }
+    Ok(page.next_seq)
+}
+
+async fn poll_changes<W, E, S>(
+    client: &par_rt_db_client::RtDbHttpClient,
+    since: Option<i64>,
+    limit: Option<i64>,
+    follow: bool,
+    out: &mut W,
+    err: &mut E,
+    shutdown: S,
+) -> Result<()>
+where
+    W: Write,
+    E: Write,
+    S: Future<Output = std::io::Result<()>>,
+{
+    tokio::pin!(shutdown);
+    let mut cursor = since.unwrap_or(0);
+    let mut log_id: Option<String> = None;
+    let mut probe_head = since.is_none();
+    loop {
+        let page = tokio::select! {
+            signal = &mut shutdown => {
+                signal.context("waiting for Ctrl-C")?;
+                writeln!(err, "{cursor}").context("writing nextSeq")?;
+                return Ok(());
+            }
+            page = client.changes(cursor, None, if probe_head { Some(1) } else { limit }) => {
+                page.map_err(change_error)?
+            }
+        };
+        if log_id.as_ref().is_some_and(|id| id != &page.log_id) {
+            return Err(change_error(RtDbError::new(
+                ErrorCode::CursorExpired,
+                "change log identity changed; explicitly resync with --since 0",
+            )));
+        }
+        log_id = Some(page.log_id.clone());
+        cursor = if probe_head {
+            // The probe's historical ops are deliberately not emitted.
+            probe_head = false;
+            page.head
+        } else {
+            write_change_page(&page, out)?
+        };
+        if !follow {
+            writeln!(err, "{cursor}").context("writing nextSeq")?;
+            return Ok(());
+        }
+        tokio::select! {
+            signal = &mut shutdown => {
+                signal.context("waiting for Ctrl-C")?;
+                writeln!(err, "{cursor}").context("writing nextSeq")?;
+                return Ok(());
+            }
+            _ = tokio::time::sleep(CHANGE_POLL_INTERVAL) => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +295,166 @@ mod tests {
 
     /// Everything here talks to a loopback socket, so a hang is a bug.
     const DEADLINE: Duration = Duration::from_secs(10);
+
+    fn change_page(seqs: &[i64], next_seq: i64, head: i64) -> serde_json::Value {
+        serde_json::json!({
+            "ops": seqs.iter().map(|seq| serde_json::json!({
+                "seq": seq, "table": "items", "docId": format!("d{seq}"),
+                "kind": if *seq == 2 { "delete" } else { "patch" },
+                "doc": if *seq == 2 { None } else { Some(serde_json::json!({"title":"new\nvalue"})) },
+                "ts": 1000,
+            })).collect::<Vec<_>>(),
+            "nextSeq": next_seq, "head": head, "logId": "test-log",
+        })
+    }
+
+    async fn change_server(
+        replies: Vec<(&'static str, serde_json::Value)>,
+    ) -> (
+        par_rt_db_client::RtDbHttpClient,
+        tokio::task::JoinHandle<Vec<String>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let client = par_rt_db_client::RtDbHttpClient::new(
+            &format!("http://{}", listener.local_addr().expect("addr")),
+            "test",
+            "token",
+        );
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, body) in replies {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut request = Vec::new();
+                let mut byte = [0; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert_eq!(socket.read(&mut byte).await.expect("read"), 1);
+                    request.push(byte[0]);
+                }
+                requests.push(String::from_utf8(request).expect("request"));
+                let body = body.to_string();
+                socket.write_all(format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len(),
+                ).as_bytes()).await.expect("response");
+            }
+            requests
+        });
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn changes_one_page_is_ordered_ndjson_with_post_images_and_stderr_cursor() {
+        let (client, server) = change_server(vec![("200 OK", change_page(&[1, 2], 2, 5))]).await;
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        tokio::time::timeout(
+            DEADLINE,
+            poll_changes(
+                &client,
+                Some(0),
+                Some(2),
+                false,
+                &mut out,
+                &mut err,
+                std::future::pending::<std::io::Result<()>>(),
+            ),
+        )
+        .await
+        .expect("deadline")
+        .expect("page");
+        let requests = server.await.expect("server");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("/api/db/test/changes?since=0&limit=2"));
+        let printed = String::from_utf8(out).expect("utf8");
+        let ops: Vec<serde_json::Value> = printed
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("NDJSON"))
+            .collect();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0]["seq"], 1);
+        assert_eq!(ops[0]["doc"]["title"], "new\nvalue");
+        assert_eq!(ops[1]["seq"], 2);
+        assert!(ops[1]["doc"].is_null());
+        assert_eq!(err, b"2\n");
+    }
+
+    #[tokio::test]
+    async fn changes_follow_resumes_returned_cursors_and_stops_on_expiration() {
+        let (client, server) = change_server(vec![
+            ("200 OK", change_page(&[1, 2], 2, 5)),
+            // A short/allowlist-filtered page can advance beyond its last op.
+            ("200 OK", change_page(&[3], 5, 5)),
+            ("200 OK", change_page(&[6], 6, 6)),
+            ("410 Gone", serde_json::json!({"code":"CURSOR_EXPIRED", "message":"cursor expired; resync from 0"})),
+        ]).await;
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let failure = tokio::time::timeout(
+            DEADLINE,
+            poll_changes(
+                &client,
+                Some(0),
+                Some(2),
+                true,
+                &mut out,
+                &mut err,
+                std::future::pending::<std::io::Result<()>>(),
+            ),
+        )
+        .await
+        .expect("deadline")
+        .expect_err("expired");
+        let requests = server.await.expect("server");
+        for (request, cursor) in requests.iter().zip([0, 2, 5, 6]) {
+            assert!(
+                request.contains(&format!("since={cursor}&limit=2")),
+                "{request}"
+            );
+        }
+        assert_eq!(requests.len(), 4);
+        let printed = String::from_utf8(out).expect("utf8");
+        let seqs: Vec<i64> = printed
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).expect("json")["seq"]
+                    .as_i64()
+                    .expect("seq")
+            })
+            .collect();
+        assert_eq!(seqs, [1, 2, 3, 6]);
+        let envelope: serde_json::Value =
+            serde_json::from_str(&failure.to_string()).expect("envelope");
+        assert_eq!(envelope["code"], "CURSOR_EXPIRED");
+        assert!(
+            envelope["message"]
+                .as_str()
+                .expect("message")
+                .contains("resync")
+        );
+        assert!(err.is_empty());
+    }
+
+    #[tokio::test]
+    async fn changes_without_since_only_reports_current_head() {
+        let (client, server) = change_server(vec![("200 OK", change_page(&[1], 1, 42))]).await;
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        tokio::time::timeout(
+            DEADLINE,
+            poll_changes(
+                &client,
+                None,
+                None,
+                false,
+                &mut out,
+                &mut err,
+                std::future::pending::<std::io::Result<()>>(),
+            ),
+        )
+        .await
+        .expect("deadline")
+        .expect("head");
+        assert!(out.is_empty());
+        assert_eq!(err, b"42\n");
+        assert!(server.await.expect("server")[0].contains("since=0&limit=1"));
+    }
 
     fn op_json(db: &str, doc_id: &str) -> String {
         serde_json::json!({

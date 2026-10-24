@@ -187,6 +187,22 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: WorkflowsCommand,
     },
+    /// Print one page of durable document changes as NDJSON. (machine token)
+    Changes {
+        /// Database name (falls back to the root --db or RTDB_DB).
+        #[arg(long)]
+        db: Option<String>,
+        /// Resume strictly after this seq. Omit to start at the current head;
+        /// pass 0 to read the oldest retained ops.
+        #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
+        since: Option<i64>,
+        /// Page size (server default applies when omitted, capped at 1000).
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+        limit: Option<i64>,
+        /// Keep polling every two seconds until Ctrl-C. Errors stop the tail.
+        #[arg(long)]
+        follow: bool,
+    },
     /// Inspect the instance-wide document op feed. (admin)
     Ops {
         #[command(subcommand)]
@@ -525,6 +541,35 @@ mod tests {
             panic!("expected Mutate");
         };
         assert_eq!(t, txn);
+    }
+
+    #[test]
+    fn parses_changes_flags_and_rejects_invalid_cursors() {
+        let cli = Cli::try_parse_from([
+            "rtdb", "--url", "http://x", "changes", "--db", "d", "--since", "0", "--limit", "500",
+            "--follow",
+        ])
+        .expect("changes parses");
+        assert!(matches!(cli.command, Command::Changes {
+            db: Some(ref db), since: Some(0), limit: Some(500), follow: true,
+        } if db == "d"));
+        let cli =
+            Cli::try_parse_from(["rtdb", "--url", "http://x", "changes"]).expect("defaults parse");
+        assert!(matches!(
+            cli.command,
+            Command::Changes {
+                db: None,
+                since: None,
+                limit: None,
+                follow: false,
+            }
+        ));
+        for flags in [["--since", "-1"], ["--limit", "0"]] {
+            assert!(
+                Cli::try_parse_from(["rtdb", "--url", "http://x", "changes", flags[0], flags[1],])
+                    .is_err()
+            );
+        }
     }
 
     #[test]

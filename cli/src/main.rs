@@ -98,6 +98,12 @@ async fn dispatch(cli: &Cli) -> Result<()> {
             commands::data::run_slow_queries(cli, db, *limit).await
         }
         Command::Workflows { command } => commands::workflows::run_workflows(cli, command).await,
+        Command::Changes {
+            db,
+            since,
+            limit,
+            follow,
+        } => commands::ops::run_changes(cli, db.as_deref(), *since, *limit, *follow).await,
         Command::Ops { command } => match command {
             OpsCommand::Watch { db, pretty } => {
                 commands::ops::run_ops_watch(cli, db, *pretty).await

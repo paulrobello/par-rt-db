@@ -80,6 +80,7 @@ Commands:
   explain       Explain a Query's compiled SQL against `--db` without running it. (admin)
   slow-queries  List recent slow queries across the instance. (admin)
   workflows     Manage durable workflow runs in `--db`. (admin)
+  changes       Print one page of durable document changes as NDJSON. (machine token)
   ops           Inspect the instance-wide document op feed. (admin)
   help          Print this message or the help of the given subcommand(s)
 
@@ -448,6 +449,21 @@ Options:
       --name <NAME>                  Signal name (must match the parked step's `awaitSignal.name`)
       --payload-json <PAYLOAD_JSON>  Optional JSON payload for the signal, e.g. `'{"approvedBy":"u1"}'`
   -h, --help                         Print help
+```
+
+### `rtdb changes`
+
+```text
+Print one page of durable document changes as NDJSON. (machine token)
+
+Usage: rtdb changes [OPTIONS]
+
+Options:
+      --db <DB>        Database name (falls back to the root --db or RTDB_DB)
+      --since <SINCE>  Resume strictly after this seq. Omit to start at the current head; pass 0 to read the oldest retained ops
+      --limit <LIMIT>  Page size (server default applies when omitted, capped at 1000)
+      --follow         Keep polling every two seconds until Ctrl-C. Errors stop the tail
+  -h, --help           Print help
 ```
 
 ### `rtdb ops`
