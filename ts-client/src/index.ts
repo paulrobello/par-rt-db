@@ -144,6 +144,7 @@ export type {
   FilterExpr,
   HybridSearchQuery,
   IndexJson,
+  LookupSpecJson,
   MigrateRequestJson,
   MigrateResultJson,
   OnDeleteAction,
