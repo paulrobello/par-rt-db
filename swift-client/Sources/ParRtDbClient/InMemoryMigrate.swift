@@ -148,9 +148,10 @@ func grandfatherTrgm(old: SchemaDef?, next: inout SchemaDef) {
 /// single-field, non-unique, non-partial btree index, an `updatedAtField`
 /// must name a declared numeric field differing from `ttl.field`, and an
 /// `autoIncrementField` must name a declared `int64` field differing from
-/// both. Deliberately a subset — identifier formats, owner/collaborators
-/// fields, and `defaults` shapes stay server-side (`onDelete` has its own
-/// `validateOnDelete` pass).
+/// both, and per-field write `constraints` must sit on declared fields of
+/// the right type with compiling patterns (server `validate_constraints`).
+/// Deliberately a subset — identifier formats and `defaults` shapes stay
+/// server-side (`onDelete` has its own `validateOnDelete` pass).
 public func validateSchema(_ schema: SchemaDef) throws {
     for (tableName, table) in schema.tables {
         // `olderThan` is by-query-only: an `authorize` predicate is
@@ -297,6 +298,117 @@ public func validateSchema(_ schema: SchemaDef) throws {
         // fit, and authorize independence. BAD_REQUEST, matching the server
         // (the corpus pushError cases pin the code).
         try validateComputedTable(table, tableName)
+        // Per-field write constraints (server `validate_constraints`): every
+        // key names a declared field, `min`/`max` sit only on number/int64
+        // (integer bounds on int64), `minLength`/`maxLength`/`pattern` only
+        // on string, bounds don't cross, and `pattern` compiles. Violations
+        // are SCHEMA_VIOLATION naming the field.
+        try validateConstraintsTable(table, tableName)
+    }
+}
+
+/// Strips `Optional` layers to the base type — the shared seam between
+/// push-time `validateConstraintsEntry` and the write path's
+/// `checkConstraintsForField` (server `strip_optional`).
+func stripOptional(_ ty: FieldType) -> FieldType {
+    var ty = ty
+    while case let .optional(inner) = ty {
+        ty = inner
+    }
+    return ty
+}
+
+/// Push-time validation of ONE constraints entry against its field's type —
+/// a port of server `schema::value::validate_constraints_entry`. The base
+/// type (after `Optional` unwrapping) must be `number`/`int64` for
+/// `min`/`max`, `string` for `minLength`/`maxLength`/`pattern`; a misapplied
+/// constraint is a SCHEMA_VIOLATION naming the field. `pattern` must compile
+/// under the host engine (NSRegularExpression/ICU here — see the divergence
+/// note on `checkConstraintsForField`; the server compiles with the `regex`
+/// crate). Enforces `min <= max` and `minLength <= maxLength` when both ends
+/// are declared.
+func validateConstraintsEntry(
+    _ field: String, _ fieldType: FieldType, _ fc: FieldConstraints
+) throws {
+    let base = stripOptional(fieldType)
+    let boundsOk = switch base {
+    case .number, .int64: true
+    default: false
+    }
+    for (label, bound) in [("min", fc.min), ("max", fc.max)] {
+        guard bound != nil else { continue }
+        if !boundsOk {
+            throw RtDbError(
+                code: .schemaViolation,
+                message: "constraints on field '\(field)': '\(label)' is legal only "
+                    + "on number/int64 fields"
+            )
+        }
+        if case .int64 = base, let bound,
+           bound.truncatingRemainder(dividingBy: 1) != 0 {
+            throw RtDbError(
+                code: .schemaViolation,
+                message: "constraints on field '\(field)': '\(label)' bound must be "
+                    + "an integer on an int64 field"
+            )
+        }
+    }
+    let stringOk = switch base {
+    case .string: true
+    default: false
+    }
+    for (label, present) in [
+        ("minLength", fc.minLength != nil),
+        ("maxLength", fc.maxLength != nil),
+        ("pattern", fc.pattern != nil)
+    ] {
+        if present, !stringOk {
+            throw RtDbError(
+                code: .schemaViolation,
+                message: "constraints on field '\(field)': '\(label)' is legal only "
+                    + "on string fields"
+            )
+        }
+    }
+    if let min = fc.min, let max = fc.max, min > max {
+        throw RtDbError(
+            code: .schemaViolation,
+            message: "constraints on field '\(field)': 'min' exceeds 'max'"
+        )
+    }
+    if let minLength = fc.minLength, let maxLength = fc.maxLength, minLength > maxLength {
+        throw RtDbError(
+            code: .schemaViolation,
+            message: "constraints on field '\(field)': 'minLength' exceeds 'maxLength'"
+        )
+    }
+    if let pattern = fc.pattern {
+        do {
+            // Validate compile only (same check the server runs at push time).
+            _ = try NSRegularExpression(pattern: pattern)
+        } catch {
+            throw RtDbError(
+                code: .schemaViolation,
+                message: "constraints on field '\(field)': invalid pattern: \(error)"
+            )
+        }
+    }
+}
+
+/// Push-time constraints validation for one table — a port of server
+/// `TableDefExt::validate_constraints`: every key names a declared field,
+/// then `validateConstraintsEntry` checks the entry against the field's
+/// type. Violations are SCHEMA_VIOLATION naming the field.
+func validateConstraintsTable(_ table: TableDef, _ tableName: String) throws {
+    for (field, fc) in table.constraints ?? [:] {
+        guard let fieldType = table.fields[field] else {
+            throw RtDbError(
+                code: .schemaViolation,
+                message: "constraints key '\(field)' is not a declared field "
+                    + "of table '\(tableName)'"
+            )
+        }
+        try validateConstraintsEntry(field, fieldType, fc)
     }
 }
 

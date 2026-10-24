@@ -412,6 +412,59 @@ public struct TtlDef: Equatable, Codable, Sendable {
     }
 }
 
+// MARK: - FieldConstraints
+
+/// One field's declared write constraints (see `TableDef.constraints`). All
+/// keys optional; an empty instance is legal but a no-op. Mirrors rust-client
+/// `FieldConstraints` and ts-client `FieldConstraintsJson` byte-for-byte
+/// (camelCase wire keys, each omitted when nil).
+public struct FieldConstraints: Equatable, Codable, Sendable {
+    /// Inclusive lower bound (number/int64).
+    public var min: Double?
+    /// Inclusive upper bound (number/int64).
+    public var max: Double?
+    /// Inclusive minimum string length (Unicode scalar values).
+    public var minLength: Int?
+    /// Inclusive maximum string length (Unicode scalar values).
+    public var maxLength: Int?
+    /// Unanchored regex the value must match (search, not full match).
+    public var pattern: String?
+
+    public init(
+        min: Double? = nil, max: Double? = nil,
+        minLength: Int? = nil, maxLength: Int? = nil,
+        pattern: String? = nil
+    ) {
+        self.min = min
+        self.max = max
+        self.minLength = minLength
+        self.maxLength = maxLength
+        self.pattern = pattern
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case min, max, minLength, maxLength, pattern
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        min = try container.decodeIfPresent(Double.self, forKey: .min)
+        max = try container.decodeIfPresent(Double.self, forKey: .max)
+        minLength = try container.decodeIfPresent(Int.self, forKey: .minLength)
+        maxLength = try container.decodeIfPresent(Int.self, forKey: .maxLength)
+        pattern = try container.decodeIfPresent(String.self, forKey: .pattern)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(min, forKey: .min)
+        try container.encodeIfPresent(max, forKey: .max)
+        try container.encodeIfPresent(minLength, forKey: .minLength)
+        try container.encodeIfPresent(maxLength, forKey: .maxLength)
+        try container.encodeIfPresent(pattern, forKey: .pattern)
+    }
+}
+
 // MARK: - TableDef
 
 /// One table: fields, indexes, and opt-in per-row rules / TTL / defaults.
@@ -466,6 +519,15 @@ public struct TableDef: Equatable, Codable, Sendable {
     /// migrate `evalExpr` directive: one grammar type, two executions.
     /// Omitted from the wire when empty (the server's `BTreeMap::is_empty`).
     public var computed: [String: ValueExpr]
+    /// Declarative per-field write constraints: field name -> constraint set.
+    /// `min`/`max` are legal only on number/int64 fields and compare
+    /// INCLUSIVELY; `minLength`/`maxLength`/`pattern` only on string
+    /// (`pattern` is an unanchored search). Null and absent values never
+    /// violate. Enforced on the write path only (server + in-memory engine);
+    /// push-time-validated server-side (a misapplied constraint or an invalid
+    /// regex fails the push naming the field). Omitted on the wire when the
+    /// table declares none.
+    public var constraints: [String: FieldConstraints]?
     /// Soft delete: `delete`/`deleteByQuery` rows on this table are stamped
     /// (`deleted_at`) instead of removed — invisible to every read and write
     /// lookup, restorable via the `undelete` mutation step.
@@ -482,6 +544,7 @@ public struct TableDef: Equatable, Codable, Sendable {
         authorize: FilterExpr? = nil,
         defaults: [String: JSONValue] = [:],
         computed: [String: ValueExpr] = [:],
+        constraints: [String: FieldConstraints]? = nil,
         softDelete: Bool = false
     ) {
         self.fields = fields
@@ -494,12 +557,13 @@ public struct TableDef: Equatable, Codable, Sendable {
         self.authorize = authorize
         self.defaults = defaults
         self.computed = computed
+        self.constraints = constraints
         self.softDelete = softDelete
     }
 
     enum CodingKeys: String, CodingKey {
         case fields, indexes, ttl, updatedAtField, autoIncrementField, authorize, defaults
-        case computed, ownerField, collaboratorsField, softDelete
+        case computed, constraints, ownerField, collaboratorsField, softDelete
     }
 
     public init(from decoder: Decoder) throws {
@@ -522,6 +586,9 @@ public struct TableDef: Equatable, Codable, Sendable {
         computed = try container.decodeIfPresent(
             [String: ValueExpr].self, forKey: .computed
         ) ?? [:]
+        constraints = try container.decodeIfPresent(
+            [String: FieldConstraints].self, forKey: .constraints
+        )
         softDelete = try container.decodeIfPresent(Bool.self, forKey: .softDelete) ?? false
     }
 
@@ -540,6 +607,9 @@ public struct TableDef: Equatable, Codable, Sendable {
         }
         if !computed.isEmpty {
             try container.encode(computed, forKey: .computed)
+        }
+        if let constraints, !constraints.isEmpty {
+            try container.encode(constraints, forKey: .constraints)
         }
         if softDelete {
             try container.encode(softDelete, forKey: .softDelete)
@@ -757,6 +827,21 @@ public struct TableBuilder: Sendable {
         with { $0.computed[name] = expr }
     }
 
+    /// Declare per-field write constraints (wire `constraints`): every key
+    /// names a declared field whose stored values must satisfy the given
+    /// `min`/`max` (number/int64, inclusive) and/or
+    /// `minLength`/`maxLength`/`pattern` (string; unanchored regex search) on
+    /// every write — insert, patch, replace, upsert (both branches), and
+    /// patchByQuery. Null and absent values never violate. Enforced
+    /// server-side AND by this SDK's in-memory engine; push-time validated
+    /// server-side (a misapplied constraint or an invalid regex fails the
+    /// push naming the field). Round-trips on the wire as `constraints`,
+    /// omitted when the table declares none. Re-declaring the same field
+    /// overwrites (map-insert semantics, mirroring rust's BTreeMap).
+    public func constraints(_ map: [String: FieldConstraints]) -> TableBuilder {
+        with { $0.constraints = map }
+    }
+
     /// Declare field-level default values. Each key must name a declared field
     /// and its value a non-null literal satisfying that field's type (the
     /// server validates at push time). Server-stamped values (ttl default,
@@ -788,6 +873,7 @@ public struct TableBuilder: Sendable {
             authorize: acc.authorize,
             defaults: acc.defaults,
             computed: acc.computed,
+            constraints: acc.constraints,
             softDelete: acc.softDelete
         )
     }
@@ -805,6 +891,7 @@ private struct Acc: Sendable {
     var authorize: FilterExpr?
     var defaults: [String: JSONValue] = [:]
     var computed: [String: ValueExpr] = [:]
+    var constraints: [String: FieldConstraints]?
     var softDelete = false
     /// Position of the most recently declared index, for the chainable
     /// `unique()` / `whereClause(_:)` setters. nil until the first index.

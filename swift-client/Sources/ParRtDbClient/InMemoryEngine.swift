@@ -561,6 +561,7 @@ func validateDoc(_ table: TableDef, _ doc: [String: JSONValue]) throws {
                     code: .schemaViolation, message: "field '\(field)' has an invalid value"
                 )
             }
+            try checkConstraintsForField(table, field, value)
         } else if case .optional = fieldTy {
             // absent optional is fine
         } else {

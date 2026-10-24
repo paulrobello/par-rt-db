@@ -652,3 +652,107 @@ private func compareValues(_ op: FilterLeafOp, _ lhs: Int64, _ rhs: Int64) -> Bo
     case .lte: lhs <= rhs
     }
 }
+
+// MARK: - Field constraints
+
+/// A JSONValue's numeric content as a Double — the mirror of serde's
+/// `as_f64()` (an int carries exact small-integer content, a double its
+/// bits; anything else is nil, matching as_f64's None).
+private func jsonAsF64(_ value: JSONValue) -> Double? {
+    switch value {
+    case let .int(int): Double(int)
+    case let .double(double): double
+    default: nil
+    }
+}
+
+// swiftlint:disable cyclomatic_complexity function_body_length
+/// Write-path constraint check for one present field value — a port of server
+/// `schema::value::check_constraints_for_field`. Null never violates; bounds
+/// compare inclusively (exact i64 compare on int64 decimal strings);
+/// `pattern` is an unanchored regex search. Violations are SCHEMA_VIOLATION
+/// naming the field and constraint.
+///
+/// Known divergence from the server's `regex` crate: the Swift port compiles
+/// patterns with `NSRegularExpression` (ICU), whose accepted grammar differs
+/// at the edges — ICU accepts lookaround the crate rejects, and a few crate
+/// constructs (e.g. possessive quantifiers) fail here. Where the two engines
+/// disagree the server's verdict governs in integration; this in-memory port
+/// is best-effort consistent, like the TS `RegExp` port.
+func checkConstraintsForField(_ table: TableDef, _ field: String, _ value: JSONValue) throws {
+    guard let fc = table.constraints?[field] else { return }
+    if case .null = value {
+        return
+    }
+    func violate(_ label: String) -> RtDbError {
+        RtDbError(
+            code: .schemaViolation,
+            message: "field '\(field)' violates its '\(label)' constraint"
+        )
+    }
+    let base = table.fields[field].map(stripOptional)
+    switch base {
+    case .number:
+        // Server: as_f64().unwrap_or(NAN) — a non-number never compares
+        // (NaN < min is false), so a nil here means "no bound check".
+        guard let amount = jsonAsF64(value) else { return }
+        if let min = fc.min, amount < min {
+            throw violate("min")
+        }
+        if let max = fc.max, amount > max {
+            throw violate("max")
+        }
+    case .int64:
+        // Server parses the decimal-string wire form to i64 and compares
+        // exactly (bounds are integer-valued by push validation).
+        guard case let .string(text) = value, let parsed = Int64(text) else { return }
+        let bound: (Double) -> Int64 = { raw in
+            if raw >= Double(Int64.max) {
+                return Int64.max
+            }
+            if raw <= Double(Int64.min) {
+                return Int64.min
+            }
+            return Int64(raw)
+        }
+        if let min = fc.min.map(bound), parsed < min {
+            throw violate("min")
+        }
+        if let max = fc.max.map(bound), parsed > max {
+            throw violate("max")
+        }
+    case .string:
+        // Server: as_str().unwrap_or_default() — but a non-string value can
+        // never reach here (validateValue runs first in validateDoc), so a
+        // guard is behavior-identical.
+        guard case let .string(text) = value else { return }
+        // Lengths count Unicode scalar values (server `chars().count()`),
+        // NOT grapheme clusters — hence unicodeScalars, not String.count.
+        let length = text.unicodeScalars.count
+        if let lo = fc.minLength, length < lo {
+            throw violate("minLength")
+        }
+        if let hi = fc.maxLength, length > hi {
+            throw violate("maxLength")
+        }
+        if let pattern = fc.pattern {
+            // Server: Regex::new(pattern).is_ok_and(|re| re.is_match(s)) —
+            // a pattern that fails to compile is a violation, matching the
+            // push-time gate that rejects it before any write.
+            let matches: Bool
+            if let regex = try? NSRegularExpression(pattern: pattern) {
+                let range = NSRange(text.startIndex..., in: text)
+                matches = regex.firstMatch(in: text, range: range) != nil
+            } else {
+                matches = false
+            }
+            if !matches {
+                throw violate("pattern")
+            }
+        }
+    default:
+        break
+    }
+}
+
+// swiftlint:enable cyclomatic_complexity function_body_length
