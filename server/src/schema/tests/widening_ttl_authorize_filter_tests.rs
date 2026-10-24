@@ -81,6 +81,132 @@ fn is_widening_of_rejects_empty_union() {
     assert!(!is_widening_of(&union_of(&["a", "b"]), &empty));
 }
 
+fn object_of(pairs: &[(&str, FieldType)]) -> FieldType {
+    FieldType::Object {
+        fields: pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect(),
+    }
+}
+
+fn optional_of(inner: FieldType) -> FieldType {
+    FieldType::Optional {
+        inner: Box::new(inner),
+    }
+}
+
+fn array_of(element: FieldType) -> FieldType {
+    FieldType::Array {
+        element: Box::new(element),
+    }
+}
+
+/// The `array<object>` element shape this widening rule exists for: a versions
+/// array whose elements carry a required `tag` and (after the widening) an
+/// optional `size` — the par-artifacts consumer shape.
+fn versions_element(with_size: bool) -> FieldType {
+    let mut pairs = vec![("tag", FieldType::String)];
+    if with_size {
+        pairs.push(("size", optional_of(FieldType::Number)));
+    }
+    object_of(&pairs)
+}
+
+#[test]
+fn is_widening_of_accepts_adding_optional_field_inside_array_object_elements() {
+    let old = array_of(versions_element(false));
+    let new = array_of(versions_element(true));
+    assert!(is_widening_of(&old, &new));
+    // Identical shapes stay trivially accepted (unchanged, not widening).
+    assert!(!is_type_change_rejected(&old, &new));
+}
+
+#[test]
+fn is_widening_of_accepts_adding_optional_field_to_directly_nested_object() {
+    // The helper naturally covers a directly-nested `object` field — same
+    // safety argument, no extra code.
+    let old = object_of(&[("tag", FieldType::String)]);
+    let new = object_of(&[
+        ("tag", FieldType::String),
+        ("size", optional_of(FieldType::Number)),
+    ]);
+    assert!(is_widening_of(&old, &new));
+    let wrapped_old = object_of(&[("versions", old.clone())]);
+    let wrapped_new = object_of(&[("versions", new.clone())]);
+    assert!(is_widening_of(&wrapped_old, &wrapped_new));
+}
+
+#[test]
+fn is_widening_of_accepts_empty_old_object_shape() {
+    // object{} -> object{size: optional<number>}: every stored {} validates.
+    let old = object_of(&[]);
+    let new = object_of(&[("size", optional_of(FieldType::Number))]);
+    assert!(is_widening_of(&old, &new));
+}
+
+#[test]
+fn is_widening_of_rejects_removing_an_element_object_field() {
+    let old = array_of(versions_element(true));
+    let new = array_of(versions_element(false));
+    assert!(!is_widening_of(&old, &new));
+    assert!(is_type_change_rejected(&old, &new));
+}
+
+#[test]
+fn is_widening_of_rejects_retyping_an_element_object_field() {
+    let old = array_of(object_of(&[("size", optional_of(FieldType::Number))]));
+    let new = array_of(object_of(&[("size", optional_of(FieldType::String))]));
+    assert!(!is_widening_of(&old, &new));
+}
+
+#[test]
+fn is_widening_of_rejects_adding_required_field_inside_array_object_elements() {
+    let old = array_of(versions_element(false));
+    let new = array_of(object_of(&[
+        ("tag", FieldType::String),
+        ("size", FieldType::Number),
+    ]));
+    assert!(!is_widening_of(&old, &new));
+}
+
+#[test]
+fn is_widening_of_rejects_narrowing_union_inside_element_object() {
+    let old = array_of(object_of(&[("state", union_of(&["a", "b", "c"]))]));
+    let new = array_of(object_of(&[("state", union_of(&["a", "b"]))]));
+    assert!(!is_widening_of(&old, &new));
+}
+
+#[test]
+fn is_widening_of_rejects_changing_array_element_object_to_scalar() {
+    let old = array_of(FieldType::String);
+    let new = array_of(versions_element(true));
+    assert!(!is_widening_of(&old, &new));
+}
+
+#[test]
+fn is_widening_of_rejects_optional_to_required_element_field() {
+    // Existing field rewritten from optional to required is a retyping of a
+    // stored shape: old rows lacking it would now fail validation.
+    let old = array_of(object_of(&[
+        ("tag", FieldType::String),
+        ("size", optional_of(FieldType::Number)),
+    ]));
+    let new = array_of(object_of(&[
+        ("tag", FieldType::String),
+        ("size", FieldType::Number),
+    ]));
+    assert!(!is_widening_of(&old, &new));
+}
+
+#[test]
+fn is_widening_of_rejects_scalar_array_element_to_object_swap() {
+    // A plain scalar -> object swap is a retyping, not a widening.
+    let old = array_of(FieldType::String);
+    let new = array_of(versions_element(true));
+    assert!(!is_widening_of(&old, &new));
+}
+
 fn table_with_ttl(ttl: Option<TtlDef>) -> TableDef {
     let mut fields = BTreeMap::new();
     fields.insert("expiresAt".to_string(), FieldType::Number);

@@ -62,17 +62,49 @@ function literalSet(ty: FieldTypeJson): unknown[] | null {
 }
 
 /** True iff every value accepted by `old` is also accepted by `next` — a port
- *  of server `schema::is_widening_of`. Both sides must be finite literal sets
- *  (per {@link literalSet}); membership is compared by `===` since literal values
- *  are primitives (`string | number | boolean`). Linear scan, matching the
- *  Rust `Vec::contains` semantics over the new set. */
+ *  of server `schema::is_widening_of`. Two widenings are recognized: finite
+ *  literal sets (both sides per {@link literalSet}; membership compared by `===`
+ *  since literal values are primitives) and object-shape widening (adding
+ *  `optional` fields to a nested object shape, reached through one `array`
+ *  layer or on a directly-nested `object` field — see {@link isObjectShapeWidening}).
+ *  Linear scans, matching the Rust `Vec::contains` semantics over the new set. */
 function isWideningOf(old: FieldTypeJson, next: FieldTypeJson): boolean {
   const oldVals = literalSet(old);
   const newVals = literalSet(next);
-  if (oldVals === null || newVals === null) {
-    return false;
+  if (oldVals !== null && newVals !== null && oldVals.every((o) => newVals.some((n) => n === o))) {
+    return true;
   }
-  return oldVals.every((o) => newVals.some((n) => n === o));
+  return isObjectShapeWidening(old, next);
+}
+
+/** The object-shape half of {@link isWideningOf} — a port of server
+ *  `schema::is_object_shape_widening`: `array -> array` recurses into the
+ *  element (one layer — enough for `array<object>`), `object -> object` accepts
+ *  only when every field present in `old` is still present in `next` and itself
+ *  unchanged or a safe widening, and every field only in `next` is `optional`
+ *  (so objects stored before the push still validate). Anything else is not an
+ *  object-shape widening. */
+function isObjectShapeWidening(old: FieldTypeJson, next: FieldTypeJson): boolean {
+  if (old.type === "array" && next.type === "array") {
+    return isObjectShapeWidening(old.element, next.element);
+  }
+  if (old.type === "object" && next.type === "object") {
+    return (
+      Object.entries(old.fields).every(([name, oldTy]) => {
+        const newTy = next.fields[name];
+        if (newTy === undefined) {
+          return false;
+        }
+        const unchanged =
+          JSON.stringify(stripOnDelete(newTy)) === JSON.stringify(stripOnDelete(oldTy));
+        return unchanged || isWideningOf(oldTy, newTy);
+      }) &&
+      Object.entries(next.fields).every(
+        ([name, newTy]) => name in old.fields || newTy.type === "optional",
+      )
+    );
+  }
+  return false;
 }
 
 /** Rejects destructive schema changes — a port of server
@@ -85,7 +117,9 @@ function isWideningOf(old: FieldTypeJson, next: FieldTypeJson): boolean {
  *  additive); index kind
  *  (btree vs search) by the presence/absence of `search`. A field-type change is
  *  accepted when it is a safe widening (server `schema::is_widening_of`): a
- *  finite literal-union that grows, or a single literal that becomes a union.
+ *  finite literal-union that grows, a single literal that becomes a union, or
+ *  adding `optional` fields to a nested object shape inside `array<object>`
+ *  elements (or a directly-nested `object` field).
  *  Flipping `unique`, attaching/changing a `where` predicate, or changing a
  *  search index's `language` are all breaking index changes too — rejected with
  *  the server's messages. */

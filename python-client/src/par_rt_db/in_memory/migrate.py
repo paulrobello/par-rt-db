@@ -384,16 +384,46 @@ def _literal_set(ty: Any) -> list[Any] | None:
 
 
 def _is_widening_of(old: Any, new: Any) -> bool:
-    """``True`` iff ``new`` carries a finite literal set that is a superset of
-    ``old``'s — a port of ``server/src/schema.rs::is_widening_of``. Lets
-    ``pushSchema`` accept additive widening of a literal-union field (e.g.
-    ``{a,b}`` -> ``{a,b,c}``, or ``"a"`` -> ``{a,b}``) as a non-destructive
-    change."""
+    """``True`` iff ``new`` is a safe widening of ``old`` — a port of
+    ``server/src/schema.rs::is_widening_of``. Two widenings are recognized:
+    finite literal sets (``old``'s set a subset of ``new``'s — e.g. adding a
+    variant to a literal union) and object-shape widening (adding ``optional``
+    fields to a nested object shape inside ``array<object>`` elements, or a
+    directly-nested ``object`` field — see ``_is_object_shape_widening``).
+    Lets ``pushSchema`` accept these as non-destructive changes."""
     old_vals = _literal_set(old)
     new_vals = _literal_set(new)
-    if old_vals is None or new_vals is None:
-        return False
-    return all(any(o == n for n in new_vals) for o in old_vals)
+    if (
+        old_vals is not None
+        and new_vals is not None
+        and all(any(o == n for n in new_vals) for o in old_vals)
+    ):
+        return True
+    return _is_object_shape_widening(old, new)
+
+
+def _is_object_shape_widening(old: Any, new: Any) -> bool:
+    """The object-shape half of ``_is_widening_of`` — a port of server
+    ``schema::is_object_shape_widening``: ``array`` recurses into the element
+    (one layer — enough for ``array<object>``), ``object`` accepts only when
+    every field present in ``old`` is still present in ``new`` and itself
+    unchanged or a safe widening, and every field only in ``new`` is
+    ``optional`` (so objects stored before the push still validate). Anything
+    else is not an object-shape widening."""
+    match (old, new):
+        case (_FArray(element=o), _FArray(element=n)):
+            return _is_object_shape_widening(o, n)
+        case (_FObject(fields=o), _FObject(fields=n)):
+            return all(
+                name in n
+                and (
+                    _field_type_signature(o[name]) == _field_type_signature(n[name])
+                    or _is_widening_of(o[name], n[name])
+                )
+                for name in o
+            ) and all(isinstance(nf, _FOptional) for name, nf in n.items() if name not in o)
+        case _:
+            return False
 
 
 def _vector_signature(spec: Any) -> Any:

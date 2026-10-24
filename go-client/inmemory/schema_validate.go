@@ -35,27 +35,64 @@ func literalSet(ty FieldType) []wire.JSONValue {
 	}
 }
 
-// isWideningOf reports whether every value accepted by old is also accepted
-// by next (server schema::is_widening_of) — the one legal field-type change.
+// isWideningOf reports whether next is a safe widening of old (server
+// schema::is_widening_of). Two widenings are recognized: finite literal sets
+// (a superset growth) and object-shape widening — adding optional fields to a
+// nested object shape inside array<object> elements (or a directly-nested
+// object field), see isObjectShapeWidening.
 func isWideningOf(old, next FieldType) bool {
 	oldValues := literalSet(old)
 	newValues := literalSet(next)
-	if oldValues == nil || newValues == nil {
-		return false
-	}
-	for _, ov := range oldValues {
-		found := false
-		for _, nv := range newValues {
-			if jsonEq(nv, ov) {
-				found = true
+	if oldValues != nil && newValues != nil {
+		subset := true
+		for _, ov := range oldValues {
+			found := false
+			for _, nv := range newValues {
+				if jsonEq(nv, ov) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				subset = false
 				break
 			}
 		}
-		if !found {
-			return false
+		if subset {
+			return true
 		}
 	}
-	return true
+	return isObjectShapeWidening(old, next)
+}
+
+// isObjectShapeWidening is the object-shape half of isWideningOf (server
+// schema::is_object_shape_widening): array recurses into the element (one
+// layer — enough for array<object>), object accepts only when every field
+// present in old is still present in next and itself unchanged or a safe
+// widening, and every field only in next is optional (so objects stored before
+// the push still validate). Anything else is not an object-shape widening.
+func isObjectShapeWidening(old, next FieldType) bool {
+	if old.Kind == "array" && next.Kind == "array" {
+		return isObjectShapeWidening(*old.Inner, *next.Inner)
+	}
+	if old.Kind == "object" && next.Kind == "object" {
+		for name, oldTy := range old.Fields {
+			newTy, ok := next.Fields[name]
+			if !ok {
+				return false
+			}
+			if !stripOnDelete(newTy).Equal(stripOnDelete(oldTy)) && !isWideningOf(oldTy, newTy) {
+				return false
+			}
+		}
+		for name, newTy := range next.Fields {
+			if _, ok := old.Fields[name]; !ok && newTy.Kind != "optional" {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // stripOnDelete returns ty with onDelete stripped from id fields, recursing
@@ -130,7 +167,8 @@ func grandfatherTrgm(old, next *SchemaDef) {
 // detectDestructiveChanges rejects a second push that removes or retypes any
 // existing table/field/index (server ddl.rs::detect_destructive_changes).
 // Field types compare after stripping onDelete; a change is accepted only as
-// a safe literal-union widening.
+// a safe widening (isWideningOf): literal-union growth, or adding optional
+// fields to a nested object shape.
 func detectDestructiveChanges(oldSchema, newSchema *SchemaDef) error {
 	for tableName, oldTable := range oldSchema.Tables {
 		newTable, ok := newSchema.Tables[tableName]

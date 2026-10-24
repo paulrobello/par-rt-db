@@ -485,16 +485,50 @@ pub fn strip_on_delete(ty: &FieldType) -> FieldType {
 
 /// Returns `true` when changing a field's declared type from `old` to `new` is a
 /// safe widening — every value valid under `old` remains valid under `new`, so no
-/// existing row is orphaned and no data migration is required. The only widening
-/// currently recognized is over finite literal sets: a lone `Literal` or a `Union`
-/// whose variants are all `Literal`s, where the new literal set is a superset of
-/// the old one (e.g. adding a variant to an enum-like union). Every other type
-/// change — narrowing a union (drops a variant some rows may hold), `union <->
-/// scalar`, any scalar-type change, `Optional`, `Object`, and mixed-kind unions —
-/// is NOT a widening and stays rejected by `detect_destructive_changes`.
+/// existing row is orphaned and no data migration is required. Two widenings are
+/// recognized:
+///
+/// 1. Finite literal sets: a lone `Literal` or a `Union` whose variants are all
+///    `Literal`s, where the new literal set is a superset of the old one (e.g.
+///    adding a variant to an enum-like union).
+/// 2. Object-shape widening: adding `Optional` fields to a nested object shape,
+///    reached through one `Array` layer (the `array<object>` element shape) or on
+///    a directly-nested `object` field. Every field present in `old` must still be
+///    present in `new` and itself unchanged or a safe widening; every field only
+///    in `new` must be `Optional`, so objects stored before the push — which
+///    cannot carry the field — still validate (a missing `Optional` validates as
+///    absent in every validator).
+///
+/// Every other type change — narrowing a union (drops a variant some rows may
+/// hold), `union <-> scalar`, any scalar-type change, removing or retyping an
+/// object field, adding a REQUIRED field to an object shape, and mixed-kind
+/// unions — is NOT a widening and stays rejected by `detect_destructive_changes`.
 pub fn is_widening_of(old: &FieldType, new: &FieldType) -> bool {
-    match (literal_set(old), literal_set(new)) {
-        (Some(old_vals), Some(new_vals)) => old_vals.iter().all(|old_v| new_vals.contains(old_v)),
+    if let (Some(old_vals), Some(new_vals)) = (literal_set(old), literal_set(new))
+        && old_vals.iter().all(|old_v| new_vals.contains(old_v))
+    {
+        return true;
+    }
+    is_object_shape_widening(old, new)
+}
+
+/// The object-shape half of [`is_widening_of`]: `Array -> Array` recurses into
+/// the element type (one layer — enough for `array<object>`), `Object -> Object`
+/// compares field maps, anything else is not an object-shape widening.
+fn is_object_shape_widening(old: &FieldType, new: &FieldType) -> bool {
+    match (old, new) {
+        (FieldType::Array { element: old_e }, FieldType::Array { element: new_e }) => {
+            is_object_shape_widening(old_e, new_e)
+        }
+        (FieldType::Object { fields: old_fields }, FieldType::Object { fields: new_fields }) => {
+            old_fields.iter().all(|(name, old_ty)| {
+                new_fields
+                    .get(name)
+                    .is_some_and(|new_ty| !is_type_change_rejected(old_ty, new_ty))
+            }) && new_fields.iter().all(|(name, new_ty)| {
+                old_fields.contains_key(name) || matches!(new_ty, FieldType::Optional { .. })
+            })
+        }
         _ => false,
     }
 }

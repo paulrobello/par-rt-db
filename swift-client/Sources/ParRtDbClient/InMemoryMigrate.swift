@@ -30,13 +30,50 @@ func literalSet(_ ty: FieldType) -> [JSONValue]? {
 }
 
 /// True iff every value accepted by `old` is also accepted by `next` — a port
-/// of server `schema::is_widening_of` (migrate.ts `isWideningOf`).
+/// of server `schema::is_widening_of` (migrate.ts `isWideningOf`). Two
+/// widenings are recognized: finite literal sets (a superset growth) and
+/// object-shape widening — adding `optional` fields to a nested object shape
+/// inside `array<object>` elements (or a directly-nested `object` field),
+/// see `isObjectShapeWidening`.
 func isWideningOf(_ old: FieldType, _ next: FieldType) -> Bool {
-    guard let oldValues = literalSet(old), let newValues = literalSet(next) else {
-        return false
+    var literalWidening = false
+    if let oldValues = literalSet(old), let newValues = literalSet(next) {
+        literalWidening = oldValues.allSatisfy { value in
+            newValues.contains { jsonEq($0, value) }
+        }
     }
-    return oldValues.allSatisfy { value in
-        newValues.contains { jsonEq($0, value) }
+    return literalWidening || isObjectShapeWidening(old, next)
+}
+
+/// The object-shape half of `isWideningOf` — a port of server
+/// `schema::is_object_shape_widening`: `array` recurses into the element (one
+/// layer — enough for `array<object>`), `object` accepts only when every field
+/// present in `old` is still present in `next` and itself unchanged or a safe
+/// widening, and every field only in `next` is `optional` (so objects stored
+/// before the push still validate). Anything else is not an object-shape
+/// widening.
+func isObjectShapeWidening(_ old: FieldType, _ next: FieldType) -> Bool {
+    switch (old, next) {
+    case let (.array(oldElement), .array(newElement)):
+        return isObjectShapeWidening(oldElement, newElement)
+    case let (.object(oldFields), .object(newFields)):
+        let existingUnchangedOrWidened = oldFields.allSatisfy { name, oldTy in
+            guard let newTy = newFields[name] else { return false }
+            return stripOnDelete(newTy) == stripOnDelete(oldTy) || isWideningOf(oldTy, newTy)
+        }
+        let addedFieldsOptional = newFields.allSatisfy { name, newTy in
+            oldFields[name] != nil
+                || {
+                    if case .optional = newTy {
+                        true
+                    } else {
+                        false
+                    }
+                }()
+        }
+        return existingUnchangedOrWidened && addedFieldsOptional
+    default:
+        return false
     }
 }
 

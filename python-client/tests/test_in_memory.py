@@ -311,6 +311,101 @@ def test_push_schema_rejects_widening_to_an_empty_union() -> None:
 
 
 # ---------------------------------------------------------------------------
+# nested optional-object widening (array<object> element shapes)
+# ---------------------------------------------------------------------------
+
+
+def _versions_schema(with_size: bool) -> Any:
+    """One table whose `versions` field is `array<object>` with a required
+    `tag`; `size` is optional only after the widening — the par-artifacts
+    consumer shape. Mirrors the server integration test."""
+    element = {"tag": t.string()}
+    if with_size:
+        element["size"] = t.optional(t.number())
+    return (
+        Schema.builder()
+        .table(
+            "artifacts",
+            lambda tb: tb.field("name", t.string()).field("versions", t.array(t.object(element))),
+        )
+        .build()
+    )
+
+
+def test_push_schema_accepts_adding_optional_field_inside_array_object_elements() -> None:
+    c = InMemoryRtDbClient()
+    c.push_schema(_versions_schema(False))
+    # Old row: elements lack `size`.
+    [res] = c.mutate(
+        Mutation.builder().insert("artifacts", {"name": "a", "versions": [{"tag": "v1"}]}).build()
+    )
+    docs = c.run_query(TableQuery("artifacts").build())
+    assert len(docs) == 1
+    # Widened push: additive, non-destructive, no migrate required.
+    c.push_schema(_versions_schema(True))
+    # Old row still validates (optional-absent passes) and reads back.
+    doc = c.run_query(TableQuery("artifacts").get(_id_of(res)).build())
+    assert doc["versions"] == [{"tag": "v1"}]
+    # New docs validate with and without the new field.
+    c.mutate(
+        Mutation.builder()
+        .insert("artifacts", {"name": "b", "versions": [{"tag": "v2", "size": 1024}]})
+        .insert("artifacts", {"name": "c", "versions": [{"tag": "v2"}]})
+        .build()
+    )
+    doc = c.run_query(TableQuery("artifacts").get(_id_of(res)).build())
+    assert doc["versions"] == [{"tag": "v1"}]
+    docs = c.run_query(TableQuery("artifacts").build())
+    by_name = {d["name"]: d["versions"] for d in docs}
+    assert by_name["b"] == [{"tag": "v2", "size": 1024}]
+    assert by_name["c"] == [{"tag": "v2"}]
+
+
+def test_push_schema_rejects_removing_an_element_object_field() -> None:
+    c = InMemoryRtDbClient()
+    c.push_schema(_versions_schema(True))
+    with pytest.raises(RtDbError) as ei:
+        c.push_schema(_versions_schema(False))
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "changed type of field 'artifacts.versions'" in ei.value.message
+
+
+def test_push_schema_rejects_retyping_an_element_object_field() -> None:
+    c = InMemoryRtDbClient()
+    base = _field_schema(t.array(t.object({"size": t.optional(t.number())})))
+    swapped = _field_schema(t.array(t.object({"size": t.optional(t.string())})))
+    c.push_schema(base)
+    with pytest.raises(RtDbError) as ei:
+        c.push_schema(swapped)
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "changed type of field 'things.val'" in ei.value.message
+
+
+def test_push_schema_rejects_adding_required_field_inside_array_object_elements() -> None:
+    c = InMemoryRtDbClient()
+    c.push_schema(_field_schema(t.array(t.object({"tag": t.string()}))))
+    with pytest.raises(RtDbError) as ei:
+        c.push_schema(_field_schema(t.array(t.object({"tag": t.string(), "size": t.number()}))))
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "changed type of field 'things.val'" in ei.value.message
+
+
+def test_push_schema_rejects_narrowing_union_inside_element_object() -> None:
+    c = InMemoryRtDbClient()
+    c.push_schema(
+        _field_schema(
+            t.array(t.object({"state": t.union([t.literal("a"), t.literal("b"), t.literal("c")])}))
+        )
+    )
+    with pytest.raises(RtDbError) as ei:
+        c.push_schema(
+            _field_schema(t.array(t.object({"state": t.union([t.literal("a"), t.literal("b")])})))
+        )
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "changed type of field 'things.val'" in ei.value.message
+
+
+# ---------------------------------------------------------------------------
 # insert / collect / system fields
 # ---------------------------------------------------------------------------
 

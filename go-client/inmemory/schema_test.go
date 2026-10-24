@@ -118,6 +118,201 @@ func TestPushSchemaRejectsNarrowingALiteralUnion(t *testing.T) {
 	}
 }
 
+// versionsSchema builds the artifacts fixture: `versions` is array<object>
+// with a required `tag`; `size` is optional only after the widening — the
+// par-artifacts consumer shape. Mirrors the server integration test.
+func versionsSchema(withSize bool) wire.JSONValue {
+	element := map[string]dsl.FieldType{"tag": dsl.Str()}
+	if withSize {
+		element["size"] = dsl.Optional(dsl.Num())
+	}
+	return buildSchema(func(b *dsl.SchemaBuilder) {
+		b.Table("artifacts", func(tb *dsl.TableBuilder) {
+			tb.Field("name", dsl.Str()).
+				Field("versions", dsl.ArrayOf(dsl.ObjectOf(element)))
+		})
+	})
+}
+
+func artifactVersions(t *testing.T, s *Store, id string) wire.Array {
+	t.Helper()
+	get := id
+	doc, err := EvalQuery(s, wire.Query{Table: "artifacts", Get: &get})
+	if err != nil {
+		t.Fatalf("query artifact: %v", err)
+	}
+	obj, ok := doc.(wire.Object)
+	if !ok {
+		t.Fatalf("expected object doc, got %T", doc)
+	}
+	versions, ok := obj["versions"].(wire.Array)
+	if !ok {
+		t.Fatalf("expected versions array, got %T", obj["versions"])
+	}
+	return versions
+}
+
+func TestPushSchemaAcceptsAddingOptionalFieldInsideArrayObjectElements(t *testing.T) {
+	// Monotonic clock: two same-millisecond inserts with a constant random
+	// would mint colliding uuidv7 ids.
+	counter := int64(1_700_000_000_000)
+	s := NewStore().WithClock(func() int64 { counter++; return counter }).
+		WithRandom(func() float64 { return 0.0 })
+	if err := s.PushSchema(versionsSchema(false)); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	// Old row: elements lack `size`.
+	oldID, err := doInsert(s, "artifacts", s.SchemaSnapshot().Tables["artifacts"],
+		docObj("name", "a", "versions", wire.Array{wire.Object{"tag": wire.String("v1")}}))
+	if err != nil {
+		t.Fatalf("old-row insert: %v", err)
+	}
+	// Widened push: additive, non-destructive.
+	if err := s.PushSchema(versionsSchema(true)); err != nil {
+		t.Fatalf("widened push: %v", err)
+	}
+	// Old row still validates (optional-absent passes) and reads back.
+	oldVersions := artifactVersions(t, s, oldID)
+	if len(oldVersions) != 1 {
+		t.Fatalf("expected 1 version, got %d", len(oldVersions))
+	}
+	if el, ok := oldVersions[0].(wire.Object)["tag"].(wire.String); !ok || el != "v1" {
+		t.Fatalf("old row versions clobbered: %v", oldVersions)
+	}
+	if _, has := oldVersions[0].(wire.Object)["size"]; has {
+		t.Fatal("old row unexpectedly carries size")
+	}
+	// New docs validate with and without the new field.
+	table := s.SchemaSnapshot().Tables["artifacts"]
+	withID, err := doInsert(s, "artifacts", table,
+		docObj("name", "b", "versions", wire.Array{wire.Object{"tag": wire.String("v2"), "size": wire.Number("1024")}}))
+	if err != nil {
+		t.Fatalf("insert with size: %v", err)
+	}
+	withoutID, err := doInsert(s, "artifacts", table,
+		docObj("name", "c", "versions", wire.Array{wire.Object{"tag": wire.String("v2")}}))
+	if err != nil {
+		t.Fatalf("insert without size: %v", err)
+	}
+	withEl := artifactVersions(t, s, withID)[0].(wire.Object)
+	if _, has := withEl["size"]; !has {
+		t.Fatal("doc with size lost it")
+	}
+	if tag, ok := withEl["tag"].(wire.String); !ok || tag != "v2" {
+		t.Fatalf("doc with size tag wrong: %v", withEl)
+	}
+	withoutEl := artifactVersions(t, s, withoutID)[0].(wire.Object)
+	if _, has := withoutEl["size"]; has {
+		t.Fatal("doc without size gained one")
+	}
+}
+
+func TestPushSchemaRejectsRemovingAnElementObjectField(t *testing.T) {
+	s := NewStore()
+	if err := s.PushSchema(versionsSchema(true)); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	err := s.PushSchema(versionsSchema(false))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	re, ok := err.(*rtdberrors.RtDbError)
+	if !ok || re.Code != rtdberrors.CodeBadRequest {
+		t.Fatalf("got code: %v", err)
+	}
+	if !strings.Contains(re.Message, "changed type of field 'artifacts.versions'") {
+		t.Fatalf("got: %s", re.Message)
+	}
+}
+
+func TestPushSchemaRejectsRetypingAnElementObjectField(t *testing.T) {
+	base := buildSchema(func(b *dsl.SchemaBuilder) {
+		b.Table("things", func(tb *dsl.TableBuilder) {
+			tb.Field("v", dsl.ArrayOf(dsl.ObjectOf(map[string]dsl.FieldType{"size": dsl.Optional(dsl.Num())})))
+		})
+	})
+	swapped := buildSchema(func(b *dsl.SchemaBuilder) {
+		b.Table("things", func(tb *dsl.TableBuilder) {
+			tb.Field("v", dsl.ArrayOf(dsl.ObjectOf(map[string]dsl.FieldType{"size": dsl.Optional(dsl.Str())})))
+		})
+	})
+	s := NewStore()
+	if err := s.PushSchema(base); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	err := s.PushSchema(swapped)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	re, ok := err.(*rtdberrors.RtDbError)
+	if !ok || re.Code != rtdberrors.CodeBadRequest {
+		t.Fatalf("got code: %v", err)
+	}
+	if !strings.Contains(re.Message, "changed type of field 'things.v'") {
+		t.Fatalf("got: %s", re.Message)
+	}
+}
+
+func TestPushSchemaRejectsAddingRequiredFieldInsideArrayObjectElements(t *testing.T) {
+	base := buildSchema(func(b *dsl.SchemaBuilder) {
+		b.Table("things", func(tb *dsl.TableBuilder) {
+			tb.Field("v", dsl.ArrayOf(dsl.ObjectOf(map[string]dsl.FieldType{"tag": dsl.Str()})))
+		})
+	})
+	widened := buildSchema(func(b *dsl.SchemaBuilder) {
+		b.Table("things", func(tb *dsl.TableBuilder) {
+			tb.Field("v", dsl.ArrayOf(dsl.ObjectOf(map[string]dsl.FieldType{"tag": dsl.Str(), "size": dsl.Num()})))
+		})
+	})
+	s := NewStore()
+	if err := s.PushSchema(base); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	err := s.PushSchema(widened)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	re, ok := err.(*rtdberrors.RtDbError)
+	if !ok || re.Code != rtdberrors.CodeBadRequest {
+		t.Fatalf("got code: %v", err)
+	}
+	if !strings.Contains(re.Message, "changed type of field 'things.v'") {
+		t.Fatalf("got: %s", re.Message)
+	}
+}
+
+func TestPushSchemaRejectsNarrowingUnionInsideElementObject(t *testing.T) {
+	base := buildSchema(func(b *dsl.SchemaBuilder) {
+		b.Table("things", func(tb *dsl.TableBuilder) {
+			tb.Field("v", dsl.ArrayOf(dsl.ObjectOf(map[string]dsl.FieldType{
+				"state": dsl.Union(dsl.FieldLiteral(wire.String("a")), dsl.FieldLiteral(wire.String("b")), dsl.FieldLiteral(wire.String("c"))),
+			})))
+		})
+	})
+	narrowed := buildSchema(func(b *dsl.SchemaBuilder) {
+		b.Table("things", func(tb *dsl.TableBuilder) {
+			tb.Field("v", dsl.ArrayOf(dsl.ObjectOf(map[string]dsl.FieldType{
+				"state": dsl.Union(dsl.FieldLiteral(wire.String("a")), dsl.FieldLiteral(wire.String("b"))),
+			})))
+		})
+	})
+	s := NewStore()
+	if err := s.PushSchema(base); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	err := s.PushSchema(narrowed)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	re, ok := err.(*rtdberrors.RtDbError)
+	if !ok || re.Code != rtdberrors.CodeBadRequest {
+		t.Fatalf("got code: %v", err)
+	}
+	if !strings.Contains(re.Message, "changed type of field 'things.v'") {
+		t.Fatalf("got: %s", re.Message)
+	}
+}
+
 // itemsSchemaVariant rebuilds testSchema omitting the named indexes and then
 // applying the caller's modifier (which re-adds a mutated form of one).
 func itemsSchemaVariant(omit map[string]bool, modify func(*dsl.TableBuilder)) wire.JSONValue {

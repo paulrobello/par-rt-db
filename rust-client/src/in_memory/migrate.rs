@@ -565,8 +565,9 @@ fn coerce_value(cast: crate::wire::admin::Cast, v: &Value) -> Option<Value> {
 
 /// Mirrors `server/src/ddl.rs::detect_destructive_changes`: walks `old` and
 /// rejects any removed table, removed field, changed field type (except a safe
-/// literal-union widening, which is additive and allowed — see
-/// `schema::is_widening_of`), or removed/changed index with
+/// widening — literal-union growth or additive-optional nested object fields,
+/// both additive and allowed — see `schema::is_widening_of`), or removed/changed
+/// index with
 /// [`ErrorCode::BadRequest`]. Additive changes (new tables, new fields, new
 /// indexes, widening `Optional`/`Union`/`Any` inner types via a fresh push) pass
 /// through — `push_schema` then folds the new schema into `self.tables` without

@@ -2605,6 +2605,100 @@ describe("InMemoryRtDbClient — literal-union widening (pushSchema parity)", ()
     c.pushSchema(base);
     expect(() => c.pushSchema(swapped)).toThrow(/changed type of field 'things\./);
   });
+
+  // ---- nested optional-object widening (array<object> element shapes) ----
+
+  /** One table `artifacts` whose `versions` field is `array<object>` with a
+   *  required `tag`; `size` is optional only after the widening — the
+   *  par-artifacts consumer shape. Mirrors the server integration test. */
+  function versionsSchema(withSize: boolean) {
+    const element = withSize
+      ? { tag: t.string(), size: t.optional(t.number()) }
+      : { tag: t.string() };
+    return defineSchema({
+      artifacts: defineTable({ name: t.string(), versions: t.array(t.object(element)) }),
+    });
+  }
+
+  it("adding an optional field inside array<object> elements succeeds", async () => {
+    const c = new InMemoryRtDbClient({ now: () => 1, random: () => 0 });
+    c.pushSchema(versionsSchema(false));
+    // Old row: elements lack `size`.
+    await c.mutate(
+      mutation()
+        .insert("artifacts", { name: "a", versions: [{ tag: "v1" }] })
+        .build(),
+    );
+    expect(() => c.pushSchema(versionsSchema(true))).not.toThrow();
+    // Old row still reads back (optional-absent validates).
+    let docs = (await c.query({
+      json: { table: "artifacts", filter: { op: "eq", field: "name", value: "a" } },
+    } as unknown as RtQuery<unknown[]>)) as Array<Record<string, unknown>>;
+    expect(docs[0].versions).toEqual([{ tag: "v1" }]);
+    // New docs validate with and without the new field.
+    await c.mutate(
+      mutation()
+        .insert("artifacts", { name: "b", versions: [{ tag: "v2", size: 1024 }] })
+        .insert("artifacts", { name: "c", versions: [{ tag: "v2" }] })
+        .build(),
+    );
+    docs = (await c.query({
+      json: { table: "artifacts", filter: { op: "eq", field: "name", value: "b" } },
+    } as unknown as RtQuery<unknown[]>)) as Array<Record<string, unknown>>;
+    expect(docs[0].versions).toEqual([{ tag: "v2", size: 1024 }]);
+    docs = (await c.query({
+      json: { table: "artifacts", filter: { op: "eq", field: "name", value: "c" } },
+    } as unknown as RtQuery<unknown[]>)) as Array<Record<string, unknown>>;
+    expect(docs[0].versions).toEqual([{ tag: "v2" }]);
+  });
+
+  it("removing an element object field is rejected", () => {
+    const c = new InMemoryRtDbClient();
+    c.pushSchema(versionsSchema(true));
+    expect(() => c.pushSchema(versionsSchema(false))).toThrow(
+      /changed type of field 'artifacts\.versions'/,
+    );
+  });
+
+  it("retyping an element object field is rejected", () => {
+    const base = defineSchema({
+      things: defineTable({ v: t.array(t.object({ size: t.optional(t.number()) })) }),
+    });
+    const swapped = defineSchema({
+      things: defineTable({ v: t.array(t.object({ size: t.optional(t.string()) })) }),
+    });
+    const c = new InMemoryRtDbClient();
+    c.pushSchema(base);
+    expect(() => c.pushSchema(swapped)).toThrow(/changed type of field 'things\.v'/);
+  });
+
+  it("adding a REQUIRED field inside array<object> elements is rejected", () => {
+    const base = defineSchema({
+      things: defineTable({ v: t.array(t.object({ tag: t.string() })) }),
+    });
+    const widened = defineSchema({
+      things: defineTable({ v: t.array(t.object({ tag: t.string(), size: t.number() })) }),
+    });
+    const c = new InMemoryRtDbClient();
+    c.pushSchema(base);
+    expect(() => c.pushSchema(widened)).toThrow(/changed type of field 'things\.v'/);
+  });
+
+  it("narrowing a union inside an element object is rejected", () => {
+    const base = defineSchema({
+      things: defineTable({
+        v: t.array(t.object({ state: t.union(t.literal("a"), t.literal("b"), t.literal("c")) })),
+      }),
+    });
+    const narrowed = defineSchema({
+      things: defineTable({
+        v: t.array(t.object({ state: t.union(t.literal("a"), t.literal("b")) })),
+      }),
+    });
+    const c = new InMemoryRtDbClient();
+    c.pushSchema(base);
+    expect(() => c.pushSchema(narrowed)).toThrow(/changed type of field 'things\.v'/);
+  });
 });
 
 describe("InMemoryRtDbClient — migrate", () => {
