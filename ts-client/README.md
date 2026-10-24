@@ -13,6 +13,7 @@ inferred types.
   - [Authentication & token storage](#authentication-token-storage)
 - [Node / CLI](#node-cli)
 - [React Native / Expo](#react-native-expo)
+- [Offline mutation queue](#offline-mutation-queue)
 - [Transaction deadlines](#transaction-deadlines)
 - [Scheduling](#scheduling)
 - [Durable workflows](#durable-workflows)
@@ -345,6 +346,48 @@ The `react` entry (`useQuery` / `useMutation` / `usePresence` /
 `usePaginatedQuery` hooks) imports clean under RN (it depends only on `react`),
 so the hooks are usable in an Expo app; only the popup-based OAuth helpers
 within it are browser-only, per the auth bullet above.
+
+## Offline mutation queue
+
+Opt-in on the reactive `RtDbClient` (off by default — the default mutate
+contract is unchanged):
+
+```ts
+const db = new RtDbClient({
+  url: "https://rtdb.example.com",
+  db: "kanban",
+  getToken: () => token,
+  offlineQueue: true,           // enable the queue
+  offlineQueueTtlMs: 300_000,   // optional; default 5 minutes
+});
+```
+
+While the option is on, a `mutate()` issued when the client cannot dispatch —
+not yet authenticated, or the connection is down — is queued instead of riding
+the ordinary pre-auth buffer, and an in-flight mutation whose connection drops
+before it was acknowledged is re-queued for replay instead of rejecting.
+`mutate()` promises stay pending while queued and resolve with the replayed
+commit's step results; they reject only when an entry expires from the queue,
+the client is `close()`d, or `setToken()` resets the credential. A server-side
+`mutateErr` is never re-queued — the server already evaluated and refused it.
+
+On the next successful handshake the queue replays in original call order,
+each mutation carrying its ORIGINAL idempotency key — the caller's, or one
+minted automatically (`off-…`) when none was supplied — so the server's
+[idempotency dedup table](../FEATURE_MATRIX.md) prevents double-applies.
+Entries older than `offlineQueueTtlMs` (default 300_000 ms, matching the
+server's default idempotency-key dedup TTL, so an entry is never replayed
+after the server would have forgotten its key) are pruned and rejected at the
+next enqueue, `getOfflineQueueStatus()` read, or reconnect — there is no
+background timer. The queue is memory-only; entries do not survive a page or
+app restart.
+
+Queue depth and age are observable:
+
+```ts
+const { depth, oldestAgeMs } = db.getOfflineQueueStatus();
+// { depth: 2, oldestAgeMs: 5000 } — null oldestAgeMs when empty
+```
 
 ## Row-field guards
 

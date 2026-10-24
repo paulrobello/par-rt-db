@@ -82,7 +82,13 @@ export type {
   WebhookDelivery,
 } from "./admin.js";
 export { RtDbAdminClient } from "./admin.js";
-export type { AuthState, ConnectionState, RtDbClientOptions, WebSocketLike } from "./client.js";
+export type {
+  AuthState,
+  ConnectionState,
+  OfflineQueueStatus,
+  RtDbClientOptions,
+  WebSocketLike,
+} from "./client.js";
 export { RtDbClient } from "./client.js";
 export type { RtDbErrorCode, RtDbErrorEnvelope } from "./errors.js";
 export { RtDbError } from "./errors.js";

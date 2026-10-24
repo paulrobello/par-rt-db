@@ -120,6 +120,43 @@ export interface RtDbClientOptions {
    * unchanged when disabled.
    */
   optimisticUpdates?: boolean;
+  /**
+   * Opt-in offline mutation queue (default off). When enabled, a `mutate()`
+   * call made while the client cannot dispatch (not authenticated, or the
+   * socket is down) is queued instead of riding the ordinary pre-auth buffer,
+   * and an in-flight mutation whose connection drops before it was
+   * acknowledged is re-queued for replay instead of rejecting. On the next
+   * successful handshake, queued mutations replay in their original call
+   * order, each carrying its ORIGINAL idempotency key (one is minted
+   * automatically when the caller supplied none) so the server's dedup table
+   * prevents double-applies. The `mutate()` promise stays pending while
+   * queued and resolves with the replayed commit's step results; it rejects
+   * only when the entry expires from the queue, the client is `close()`d, or
+   * `setToken()` resets the credential. Server-side `mutateErr` rejections
+   * are never re-queued — the server already evaluated and refused them.
+   * Expiry is lazy: entries older than `offlineQueueTtlMs` are pruned (and
+   * their promises rejected) at the next enqueue, `getOfflineQueueStatus()`
+   * read, or reconnect — no background timer.
+   */
+  offlineQueue?: boolean;
+  /**
+   * TTL (ms) for offline-queued mutations. Default 300_000 (5 minutes),
+   * matching the server's default idempotency-key dedup TTL
+   * (`RTDB_IDEMPOTENCY_TTL_MS`): an entry is never replayed after the server
+   * would have forgotten its key, so a late replay could double-apply.
+   * Requires `offlineQueue`.
+   */
+  offlineQueueTtlMs?: number;
+}
+
+/** Snapshot of the opt-in offline mutation queue, from
+ * {@link RtDbClient.getOfflineQueueStatus}. */
+export interface OfflineQueueStatus {
+  /** Number of mutations currently queued for replay. */
+  depth: number;
+  /** Age in ms of the oldest queued entry (from the client's injectable
+   * clock), or `null` when the queue is empty. */
+  oldestAgeMs: number | null;
 }
 
 interface Subscription {
@@ -144,6 +181,9 @@ interface QueuedMutate extends PendingMutate {
   mutId: string;
   idempotencyKey?: string;
   txn: TransactionJson;
+  /** Client-clock timestamp of the mutation call. The offline queue's TTL and
+   * age observability are measured from this, across reconnects. */
+  queuedAt: number;
 }
 
 /** The ClientMessage a schedule call will send once authenticated, carried while
@@ -184,6 +224,12 @@ interface QueuedWorkflow {
 const DEFAULT_BACKOFF = { baseMs: 500, maxMs: 15_000 };
 const DEFAULT_HEARTBEAT_MS = 20_000;
 const DEFAULT_AUTH_UNREACHABLE_AFTER = 5;
+/**
+ * Default TTL for the opt-in offline mutation queue — deliberately the server's
+ * default idempotency-key dedup TTL (`mutation_log::DEFAULT_DEDUP_TTL_MS`): a
+ * replay older than the dedup table's memory could double-apply.
+ */
+const DEFAULT_OFFLINE_QUEUE_TTL_MS = 300_000;
 /**
  * App-range close code we use for the drops WE initiate (heartbeat timeout,
  * socket error). The WebSocket spec forbids passing the reserved 1006 to
@@ -227,7 +273,7 @@ export class RtDbClient {
 
   private readonly subsByKey = new Map<string, Subscription>();
   private readonly subsById = new Map<string, Subscription>();
-  private readonly pendingMutates = new Map<string, PendingMutate>();
+  private readonly pendingMutates = new Map<string, QueuedMutate>();
   private readonly unsentMutates: QueuedMutate[] = [];
   private readonly pendingSchedules = new Map<string, QueuedSchedule>();
   private readonly unsentSchedules: QueuedSchedule[] = [];
@@ -266,6 +312,12 @@ export class RtDbClient {
   /** mutId → subscriptions whose last result this mutation optimistically overlaid. */
   private readonly optimisticOverlays = new Map<string, Set<Subscription>>();
   private readonly optimistic: boolean;
+  /** Opt-in offline mutation queue. Invariant: every entry carries an
+   * idempotency key (caller-supplied or client-minted) so a replay can never
+   * double-apply against the server's dedup table. */
+  private readonly offlineQueue: QueuedMutate[] = [];
+  private readonly offline: boolean;
+  private readonly offlineTtlMs: number;
 
   private counter = 0;
   /**
@@ -303,6 +355,8 @@ export class RtDbClient {
     this.authUnreachableAfter =
       options.authUnreachableAfterAttempts ?? DEFAULT_AUTH_UNREACHABLE_AFTER;
     this.optimistic = options.optimisticUpdates ?? false;
+    this.offline = options.offlineQueue ?? false;
+    this.offlineTtlMs = options.offlineQueueTtlMs ?? DEFAULT_OFFLINE_QUEUE_TTL_MS;
   }
 
   /**
@@ -328,7 +382,8 @@ export class RtDbClient {
 
   /**
    * Closes the connection and stops reconnecting. Rejects every in-flight
-   * mutation, scheduled-txn call, and workflow call, and reverts any
+   * mutation, scheduled-txn call, and workflow call — and every offline-queued
+   * mutation (a torn-down client can never replay them) — and reverts any
    * unresolved optimistic subscription overlay back to its last
    * server-confirmed value. Call `connect()` to reopen.
    */
@@ -414,6 +469,29 @@ export class RtDbClient {
   }
 
   /**
+   * Snapshot of the opt-in offline mutation queue: how many mutations are
+   * queued for replay and the age (ms, on the client's injectable clock) of
+   * the oldest entry, or `null` when the queue is empty. Depth drops to 0 as
+   * a reconnect replays the queue. Reading the status is itself a prune
+   * point: entries older than `offlineQueueTtlMs` are rejected (and removed)
+   * by this call, so polling the getter surfaces expiry without any
+   * background timer.
+   */
+  getOfflineQueueStatus(): OfflineQueueStatus {
+    this.pruneOfflineQueue();
+    if (this.offlineQueue.length === 0) {
+      return { depth: 0, oldestAgeMs: null };
+    }
+    let oldest = Number.POSITIVE_INFINITY;
+    for (const entry of this.offlineQueue) {
+      if (entry.queuedAt < oldest) {
+        oldest = entry.queuedAt;
+      }
+    }
+    return { depth: this.offlineQueue.length, oldestAgeMs: this.now() - oldest };
+  }
+
+  /**
    * Subscribes to a live query: `onUpdate` fires with the current result
    * immediately (once known) and again on every server-pushed change.
    * Deduplicates identical queries under one server subscription. Returns
@@ -471,6 +549,12 @@ export class RtDbClient {
    * `opts.mutId` is a deprecated alias for `opts.idempotencyKey` and remains
    * accepted for backwards compatibility; it is unrelated to the wire-only
    * `mutId` reply-correlation field.
+   *
+   * With the `offlineQueue` option enabled, calls made while the client cannot
+   * dispatch (and in-flight calls whose connection drops before they were
+   * acknowledged) queue for replay on reconnect, in call order, each carrying
+   * its original idempotency key; see {@link RtDbClientOptions.offlineQueue}
+   * for the full semantics.
    */
   mutate(
     txn: TransactionJson,
@@ -492,21 +576,29 @@ export class RtDbClient {
       if (this.optimistic) {
         this.applyOptimistic(mutId, txn);
       }
+      const callerKey = opts?.idempotencyKey ?? opts?.mutId;
+      // ARC-133: only set `idempotencyKey` when it has a value. With
+      // exactOptionalPropertyTypes the `?:` field cannot accept a literal
+      // `undefined`, so the ?? chain must resolve to either a real key or
+      // omission (absence = server generates one), never an explicit undefined.
+      // When the offline queue is enabled a key is ALWAYS present — the caller's
+      // if supplied, otherwise a client-minted one — so a replayed entry can
+      // never double-apply against the server's dedup table.
+      const idempotencyKey =
+        callerKey !== undefined ? callerKey : this.offline ? this.mintOfflineKey(mutId) : undefined;
       const entry: QueuedMutate = {
         mutId,
-        // ARC-133: only set `idempotencyKey` when it has a value. With
-        // exactOptionalPropertyTypes the `?:` field cannot accept a literal
-        // `undefined`, so the ?? chain must resolve to either a real key or
-        // omission (absence = server generates one), never an explicit undefined.
-        ...(opts?.idempotencyKey || opts?.mutId
-          ? { idempotencyKey: (opts?.idempotencyKey ?? opts?.mutId) as string }
-          : {}),
+        ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
         txn,
         resolve,
         reject,
+        queuedAt: this.now(),
       };
       if (this.authState === "authenticated" && this.socket) {
         this.dispatchMutate(entry);
+      } else if (this.offline) {
+        this.pruneOfflineQueue();
+        this.offlineQueue.push(entry);
       } else {
         // Never sent yet: flush once on the next authOk. Not a retry.
         this.unsentMutates.push(entry);
@@ -889,7 +981,7 @@ export class RtDbClient {
   }
 
   private dispatchMutate(entry: QueuedMutate): void {
-    this.pendingMutates.set(entry.mutId, { resolve: entry.resolve, reject: entry.reject });
+    this.pendingMutates.set(entry.mutId, entry);
     this.send({
       type: "mutate",
       mutId: entry.mutId,
@@ -1259,6 +1351,14 @@ export class RtDbClient {
     for (const [room, state] of this.joinedRooms) {
       this.send({ type: "presence", room, state });
     }
+    this.pruneOfflineQueue();
+    // Leave the tail queued if a send synchronously closes the socket.
+    while (this.socket && this.offlineQueue.length > 0) {
+      const entry = this.offlineQueue.shift();
+      if (entry) {
+        this.dispatchMutate(entry);
+      }
+    }
     const queued = this.unsentMutates.splice(0);
     for (const entry of queued) {
       this.dispatchMutate(entry);
@@ -1279,8 +1379,15 @@ export class RtDbClient {
     // Delta fold state is per-connection: a reconnect re-joins every room
     // (flushOnAuth) and the server restarts each with a full snapshot.
     this.presenceFold.clear();
-    // In-flight (already-sent) mutations are never auto-resent — reject them.
-    this.rejectPendingMutates("connection closed before the mutation was acknowledged");
+    if (this.offline && code !== 4401 && !this.stopped) {
+      // Map insertion order is call order. Pending entries precede the tail
+      // that has not yet been sent, including a drop during replay.
+      this.offlineQueue.unshift(...this.pendingMutates.values());
+      this.pendingMutates.clear();
+      this.pruneOfflineQueue();
+    } else {
+      this.rejectPendingMutates("connection closed before the mutation was acknowledged");
+    }
     // Same for in-flight schedule and workflow requests: they are never auto-resent.
     this.rejectPendingSchedules("connection closed before the schedule was acknowledged");
     this.rejectPendingWorkflows("connection closed before the workflow call was acknowledged");
@@ -1325,17 +1432,31 @@ export class RtDbClient {
     this.pendingMutates.clear();
   }
 
-  /** Rejects every mutation — in-flight and never-sent. Used on terminal teardown. */
+  /** Rejects every mutation — in-flight and offline-queued. Used on terminal teardown
+   * (close() and setToken()): a torn-down client can never replay them. */
   private rejectAllMutates(reason: string): void {
     this.rejectPendingMutates(reason);
-    if (this.unsentMutates.length === 0) {
-      return;
-    }
     const error = new RtDbError("INTERNAL", reason);
-    for (const entry of this.unsentMutates.splice(0)) {
+    for (const entry of [...this.unsentMutates.splice(0), ...this.offlineQueue.splice(0)]) {
       this.revertOptimistic(entry.mutId);
       entry.reject(error);
     }
+  }
+
+  private pruneOfflineQueue(): void {
+    const cutoff = this.now() - this.offlineTtlMs;
+    for (let i = this.offlineQueue.length - 1; i >= 0; i--) {
+      const entry = this.offlineQueue[i];
+      if (entry && entry.queuedAt <= cutoff) {
+        this.offlineQueue.splice(i, 1);
+        this.revertOptimistic(entry.mutId);
+        entry.reject(new RtDbError("INTERNAL", "offline mutation queue TTL expired"));
+      }
+    }
+  }
+
+  private mintOfflineKey(mutId: string): string {
+    return `off-${mutId}-${this.random().toString(36).slice(2, 10)}`;
   }
 
   /** Rejects only in-flight (sent, unacked) schedule requests; never-sent ones stay queued. */
