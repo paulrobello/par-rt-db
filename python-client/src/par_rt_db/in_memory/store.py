@@ -931,8 +931,11 @@ def _check_constraints_for_field(table: TableDef, field: str, value: Any) -> Non
     """Write-path constraint check for one present field value — a port of
     server ``schema::value::check_constraints_for_field``. Null never
     violates; bounds compare inclusively (the int64 decimal string parses to
-    a float for the compare); ``pattern`` is an unanchored ``re.search``.
-    Violations are SCHEMA_VIOLATION naming the field and constraint."""
+    an exact ``int`` — never ``float``, which is precise only to 2^53 and
+    mis-compares bounds past it, pinned by the corpus's
+    ``constraint-int64-bounds-past-2p53`` cases); ``pattern`` is an
+    unanchored ``re.search``. Violations are SCHEMA_VIOLATION naming the
+    field and constraint."""
     fc = table.constraints.get(field)
     if fc is None or value is None:
         return
@@ -953,13 +956,14 @@ def _check_constraints_for_field(table: TableDef, field: str, value: Any) -> Non
             raise violate("max")
     elif isinstance(base, _FInt64):
         try:
-            v = float(value) if isinstance(value, str) else math.nan
+            v = int(value) if isinstance(value, str) else None
         except ValueError:
-            v = math.nan
-        if fc.min is not None and v < fc.min:
-            raise violate("min")
-        if fc.max is not None and v > fc.max:
-            raise violate("max")
+            v = None
+        if v is not None:
+            if fc.min is not None and v < fc.min:
+                raise violate("min")
+            if fc.max is not None and v > fc.max:
+                raise violate("max")
     elif isinstance(base, _FString):
         if not isinstance(value, str):
             return

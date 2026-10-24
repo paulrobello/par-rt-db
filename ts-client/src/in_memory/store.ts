@@ -653,12 +653,23 @@ function checkConstraintsForField(table: TableJson, field: string, value: unknow
       throw violate("max");
     }
   } else if (base === "int64") {
-    const v = typeof value === "string" ? Number(value) : NaN;
-    if (fc.min !== undefined && v < fc.min) {
-      throw violate("min");
-    }
-    if (fc.max !== undefined && v > fc.max) {
-      throw violate("max");
+    // Exact i64 compare on the decimal string (BigInt) — IEEE doubles are
+    // exact only to 2^53, so a float parse mis-compares bounds past it
+    // (pinned by the corpus's constraint-int64-bounds-past-2p53 cases). A
+    // non-parsable value or non-integer bound never violates, matching the
+    // server's `parse::<i64>` (bounds are push-validated integers anyway).
+    const v = typeof value === "string" && isInt64String(value) ? BigInt(value) : null;
+    if (v !== null) {
+      const bound = (b: number | undefined): bigint | null =>
+        b !== undefined && Number.isInteger(b) ? BigInt(b) : null;
+      const min = bound(fc.min);
+      if (min !== null && v < min) {
+        throw violate("min");
+      }
+      const max = bound(fc.max);
+      if (max !== null && v > max) {
+        throw violate("max");
+      }
     }
   } else if (base === "string" && typeof value === "string") {
     if (fc.minLength !== undefined && value.length < fc.minLength) {

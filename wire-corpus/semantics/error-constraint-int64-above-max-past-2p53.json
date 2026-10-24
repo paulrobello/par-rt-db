@@ -1,0 +1,25 @@
+{
+  "name": "error-constraint-int64-above-max-past-2p53",
+  "$comment": "Int64 constraint bounds beyond 2^53: a value one above max = 2^62 (4611686018427387904) violates under exact i64 compare and must fail SCHEMA_VIOLATION. A float-parsing engine rounds the value 4611686018427387905 down to 2^62 and wrongly lets it pass (pre-fix ts/python divergence the corpus pins).",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "counter": { "type": "int64" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }],
+        "constraints": { "counter": { "max": 4611686018427387904 } }
+      }
+    }
+  },
+  "seed": [],
+  "op": {
+    "txn": {
+      "steps": [
+        { "op": "insert", "table": "tasks", "doc": { "name": "ok", "counter": "4611686018427387905" } }
+      ]
+    }
+  },
+  "expect": { "error": { "code": "SCHEMA_VIOLATION" } }
+}

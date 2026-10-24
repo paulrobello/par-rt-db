@@ -1,0 +1,26 @@
+{
+  "name": "constraint-int64-bounds-past-2p53-pass",
+  "$comment": "Int64 constraint bounds beyond 2^53 (IEEE-double exactness limit): the bound compare is EXACT i64 on the decimal string, never a float. Both seeds sit exactly on inclusive bounds far past 2^53 — one at min = 2^62 (4611686018427387904) and one at max = i64::MAX (9223372036854775807) — and must insert cleanly. A float-parsing engine (pre-fix ts/python) mis-handles the i64::MAX seed: float('9223372036854775807') rounds up to 2^63 and reads as above the max.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": { "type": "string" },
+          "counter": { "type": "int64" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }],
+        "constraints": { "counter": { "min": 4611686018427387904, "max": 9223372036854775807 } }
+      }
+    }
+  },
+  "seed": [
+    { "$id": "lo", "doc": { "name": "edge-min", "counter": "4611686018427387904" } },
+    { "$id": "hi", "doc": { "name": "edge-max", "counter": "9223372036854775807" } }
+  ],
+  "op": { "query": { "table": "tasks" } },
+  "expect": [
+    { "name": "edge-min", "counter": "4611686018427387904" },
+    { "name": "edge-max", "counter": "9223372036854775807" }
+  ],
+  "unordered": true
+}

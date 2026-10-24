@@ -259,13 +259,15 @@ class TtlDef(_S):
 class FieldConstraints(_S):
     """One field's declared write constraints (see :attr:`TableDef.constraints`).
     All keys optional; an empty object is legal but a no-op. Bounds are JSON
-    numbers (integer-valued on int64 fields — exact i64 compare server-side).
-    Mirrors ``server/src/schema.rs::FieldConstraints`` (``deny_unknown_fields``,
+    numbers, kept as Python ``int`` when the wire literal is integral so an
+    int64 bound past 2^53 stays exact (IEEE doubles are exact only to 2^53 —
+    exact i64 compare server-side); ``float`` otherwise. Mirrors
+    ``server/src/schema.rs::FieldConstraints`` (``deny_unknown_fields``,
     each key ``skip_serializing_if = "Option::is_none"``); ``None`` values are
     omitted on the wire."""
 
-    min: float | None = None
-    max: float | None = None
+    min: int | float | None = None
+    max: int | float | None = None
     min_length: int | None = None
     max_length: int | None = None
     pattern: str | None = None
