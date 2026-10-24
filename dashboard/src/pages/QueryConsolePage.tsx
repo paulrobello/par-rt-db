@@ -4,6 +4,16 @@ import { useEffect, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
 import { RtDbRequestError, useAdmin } from "../lib/admin";
 import { toErrorMessage } from "../lib/errors";
+import { downloadTextFile, toCsvString, toJsonString, type ExportRow } from "../lib/exportResults";
+import {
+  loadRecentQueries,
+  loadSavedQueries,
+  pushRecentQuery,
+  saveRecentQueries,
+  saveSavedQueries,
+  type RecentQuery,
+  type SavedQuery,
+} from "../lib/queryConsoleStorage";
 import s from "./QueryConsolePage.module.css";
 
 type Mode = "query" | "mutate";
@@ -36,6 +46,42 @@ export function QueryConsolePage() {
   const [buffers, setBuffers] = useState<Record<Mode, string>>({ ...DEFAULTS });
   const [output, setOutput] = useState<Output>(null);
   const [loading, setLoading] = useState(false);
+  const [saved, setSaved] = useState<SavedQuery[]>(loadSavedQueries);
+  const [recent, setRecent] = useState<RecentQuery[]>(loadRecentQueries);
+  const [saveName, setSaveName] = useState<string>("");
+  const [storageError, setStorageError] = useState<string | null>(null);
+  const rows =
+    output?.kind === "result" &&
+    Array.isArray(output.data) &&
+    output.data.every(
+      (row: unknown) => typeof row === "object" && row !== null && !Array.isArray(row),
+    )
+      ? (output.data as ExportRow[])
+      : null;
+  const columns = rows ? [...new Set(rows.flatMap((row) => Object.keys(row)))] : [];
+
+  function saveQuery(): void {
+    try {
+      JSON.parse(buffers.query);
+      const next = [
+        ...saved.filter((q) => q.name !== saveName.trim()),
+        { name: saveName.trim(), db, text: buffers.query },
+      ];
+      saveSavedQueries(next);
+      setSaved(next);
+      setSaveName("");
+      setStorageError(null);
+    } catch (e) {
+      setStorageError(`Could not save query: ${toErrorMessage(e)}`);
+    }
+  }
+
+  function replay(query: RecentQuery): void {
+    setMode("query");
+    setDb(query.db);
+    setBuffers((prev) => ({ ...prev, query: query.text }));
+    void run(query.text, query.db, "query");
+  }
 
   // Auto-select the first database once the list arrives.
   useEffect(() => {
@@ -48,8 +94,12 @@ export function QueryConsolePage() {
     setBuffers((prev) => ({ ...prev, [mode]: next }));
   }
 
-  async function run() {
-    if (!db) {
+  async function run(
+    queryText: string = text,
+    database: string = db,
+    runMode: Mode = mode,
+  ): Promise<void> {
+    if (!database) {
       setOutput({
         kind: "error",
         code: "NO_DATABASE",
@@ -60,7 +110,7 @@ export function QueryConsolePage() {
     }
     let parsed: unknown;
     try {
-      parsed = JSON.parse(text);
+      parsed = JSON.parse(queryText);
     } catch (e) {
       setOutput({
         kind: "error",
@@ -72,11 +122,19 @@ export function QueryConsolePage() {
     }
     setLoading(true);
     try {
-      if (mode === "query") {
-        const body = await client.adminQuery(db, parsed as QueryJson);
+      if (runMode === "query") {
+        const next = pushRecentQuery(recent, { db: database, text: queryText });
+        setRecent(next);
+        try {
+          saveRecentQueries(next);
+          setStorageError(null);
+        } catch (e) {
+          setStorageError(`Could not persist history: ${toErrorMessage(e)}`);
+        }
+        const body = await client.adminQuery(database, parsed as QueryJson);
         setOutput({ kind: "result", data: body });
       } else {
-        const body = await client.adminMutate(db, parsed as TransactionJson);
+        const body = await client.adminMutate(database, parsed as TransactionJson);
         setOutput({ kind: "result", data: body });
       }
     } catch (e) {
@@ -150,15 +208,94 @@ export function QueryConsolePage() {
         />
 
         <div className={s.actions}>
-          <Button variant="primary" onClick={run} disabled={loading || !db}>
+          <Button variant="primary" onClick={() => void run()} disabled={loading || !db}>
             {loading ? "running…" : "run"}
           </Button>
           {loading && <Spinner label="running" />}
           {mode === "mutate" && !loading && <span className={s.warn}>mutate writes data</span>}
         </div>
 
+        {mode === "query" && (
+          <div className={s.actions}>
+            <label className={s.field}>
+              <span className={s.fieldLabel}>Query name</span>
+              <input
+                className={s.select}
+                value={saveName}
+                onChange={(e) => setSaveName(e.target.value)}
+              />
+            </label>
+            <Button onClick={saveQuery} disabled={!saveName.trim() || !db}>
+              Save query
+            </Button>
+          </div>
+        )}
+        {storageError && (
+          <p className={s.errorBody} role="alert">
+            {storageError}
+          </p>
+        )}
+        <section aria-label="Saved queries">
+          <Placard>Saved queries</Placard>
+          {saved.length === 0 ? (
+            <p className={s.hint}>No saved queries.</p>
+          ) : (
+            <ul className={s.queryList}>
+              {saved.map((q) => (
+                <li key={q.name}>
+                  <Button onClick={() => replay(q)} disabled={loading || !databases.includes(q.db)}>
+                    {q.name}
+                  </Button>
+                  <span className={s.hint}>{q.db}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+        <section aria-label="Recent queries">
+          <Placard>Recent queries · last 20 distinct</Placard>
+          {recent.length === 0 ? (
+            <p className={s.hint}>No recent queries.</p>
+          ) : (
+            <ol className={s.queryList}>
+              {recent.map((q) => (
+                <li key={q.text}>
+                  <Button onClick={() => replay(q)} disabled={loading || !databases.includes(q.db)}>
+                    {q.text}
+                  </Button>
+                  <span className={s.hint}>{q.db}</span>
+                </li>
+              ))}
+            </ol>
+          )}
+        </section>
+
         <section>
-          <Placard>Result</Placard>
+          <div className={s.actions}>
+            <Placard>Result</Placard>
+            {rows && (
+              <>
+                <Button
+                  onClick={() =>
+                    downloadTextFile(
+                      "query-results.csv",
+                      toCsvString(columns, rows),
+                      "text/csv;charset=utf-8",
+                    )
+                  }
+                >
+                  Export CSV
+                </Button>
+                <Button
+                  onClick={() =>
+                    downloadTextFile("query-results.json", toJsonString(rows), "application/json")
+                  }
+                >
+                  Export JSON
+                </Button>
+              </>
+            )}
+          </div>
           <div className={s.resultPanel}>
             {output === null ? (
               <p className={s.resultEmpty}>Run a {mode} to see the result.</p>

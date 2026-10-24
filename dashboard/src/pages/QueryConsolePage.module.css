@@ -99,6 +99,27 @@
   gap: var(--sp-3);
 }
 
+.queryList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin: 0;
+  padding-left: var(--sp-4);
+  max-height: 240px;
+  overflow: auto;
+}
+
+.queryList li {
+  overflow-wrap: anywhere;
+}
+
+.queryList button {
+  white-space: pre-wrap;
+  text-align: left;
+  max-width: 100%;
+  margin-right: var(--sp-2);
+}
+
 .warn {
   font-family: var(--mono);
   font-size: var(--t-mono-xs);

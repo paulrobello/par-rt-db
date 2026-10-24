@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -93,5 +93,69 @@ describe("QueryConsolePage", () => {
     expect(await screen.findByText(/BAD_REQUEST/)).toBeInTheDocument();
     expect(screen.getByText(/HTTP 400/)).toBeInTheDocument();
     expect(screen.getByText(/unknown table: widgets/)).toBeInTheDocument();
+  });
+
+  it("saves a query by name, survives a simulated reload, and re-runs it with one click", async () => {
+    const user = userEvent.setup();
+    adminClientMock.adminQuery.mockResolvedValue([]);
+    render(<QueryConsolePage />);
+    await user.type(screen.getByLabelText("Query name"), "winners");
+    await user.click(screen.getByRole("button", { name: "Save query" }));
+    expect(JSON.parse(localStorage.getItem("rtdb.queryConsole.saved") ?? "[]")).toHaveLength(1);
+
+    cleanup();
+    render(<QueryConsolePage />);
+    await user.click(screen.getByRole("button", { name: "winners" }));
+    expect(adminClientMock.adminQuery).toHaveBeenCalledWith("test-db", {
+      table: "users",
+      take: 100,
+    });
+  });
+
+  it("lists recent executed queries deduped and most-recent-first", async () => {
+    const user = userEvent.setup();
+    adminClientMock.adminQuery.mockResolvedValue([]);
+    render(<QueryConsolePage />);
+
+    const runQuery = async (body: string): Promise<void> => {
+      const editor = screen.getByRole("textbox", { name: "query DSL" }) as HTMLTextAreaElement;
+      await user.clear(editor);
+      await user.type(editor, body.replaceAll("{", "{{"));
+      await user.click(screen.getByRole("button", { name: "run" }));
+      await screen.findByRole("button", { name: '{ "table": "a" }' });
+    };
+
+    await runQuery('{ "table": "a" }');
+    await user.clear(screen.getByRole("textbox", { name: "query DSL" }));
+    await user.type(screen.getByRole("textbox", { name: "query DSL" }), '{{ "other": "b" }');
+    await user.click(screen.getByRole("button", { name: "run" }));
+    await screen.findByRole("button", { name: '{ "other": "b" }' });
+    await runQuery('{ "table": "a" }');
+    const recentSection = screen.getByLabelText("Recent queries");
+    const chips = within(recentSection).getAllByRole("button");
+    expect(chips.map((c) => c.textContent)).toEqual(['{ "table": "a" }', '{ "other": "b" }']);
+  });
+
+  it("exports the current result grid as CSV and JSON downloads", async () => {
+    const user = userEvent.setup();
+    adminClientMock.adminQuery.mockResolvedValue([{ _id: "k1", name: "Ada" }]);
+    render(<QueryConsolePage />);
+
+    await user.click(screen.getByRole("button", { name: "run" }));
+    await screen.findByText(/_id/);
+
+    const create = vi.fn(() => "blob:page-export");
+    vi.stubGlobal("URL", { createObjectURL: create, revokeObjectURL: vi.fn() });
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    try {
+      await user.click(screen.getByRole("button", { name: "Export CSV" }));
+      expect(create).toHaveBeenCalledOnce();
+      const anchor = click.mock.instances[0] as HTMLAnchorElement;
+      expect(anchor.download).toBe("query-results.csv");
+      await user.click(screen.getByRole("button", { name: "Export JSON" }));
+      expect(click.mock.instances[1]).toHaveProperty("download", "query-results.json");
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
