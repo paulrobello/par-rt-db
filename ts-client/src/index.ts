@@ -138,6 +138,7 @@ export type {
   DirectiveJson,
   DirectiveReportJson,
   DistanceMetric,
+  FieldConstraintsJson,
   FieldExpectationJson,
   FieldTypeJson,
   FilterExpr,
