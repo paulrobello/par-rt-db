@@ -389,6 +389,14 @@ pub fn admin_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             get(admin_list_deliveries),
         )
         .route(
+            "/admin/db/{db}/webhooks/{id}/deliveries/{delivery_id}/redeliver",
+            post(admin_redeliver_delivery),
+        )
+        .route(
+            "/admin/db/{db}/webhooks/{id}/deliveries/redeliver-failed",
+            post(admin_redeliver_failed),
+        )
+        .route(
             "/admin/db/{db}/schedules",
             get(admin_list_schedules).post(admin_create_schedule),
         )

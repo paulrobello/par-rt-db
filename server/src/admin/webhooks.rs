@@ -269,6 +269,74 @@ pub(super) async fn admin_edit_webhook(
     Ok(Json(updated))
 }
 
+#[derive(Serialize)]
+pub(super) struct RedeliverFailedResponse {
+    deliveries: Vec<crate::webhook::DeliveryRow>,
+}
+
+/// `POST /admin/db/{db}/webhooks/{id}/deliveries/{delivery_id}/redeliver` —
+/// re-enqueue a failed (attempts-exhausted) delivery for another attempt:
+/// attempts reset to 0, `last_error` cleared, `next_attempt` now, so the
+/// delivery worker picks it up. A delivery that is not failed
+/// (`pending`/`retrying`/`delivered`) is rejected with a typed CONFLICT and
+/// left untouched — the reset is one conditional UPDATE, so a concurrent
+/// redeliver can never double-fire. Unknown id → 404. Returns the updated
+/// delivery row.
+pub(super) async fn admin_redeliver_delivery(
+    State(state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    Path((db, id, delivery_id)): Path<(String, String, String)>,
+) -> Result<Json<crate::webhook::DeliveryRow>, RtDbError> {
+    if !db::database_exists(&state.pool, &db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    let id: i64 = id
+        .parse()
+        .map_err(|_| RtDbError::bad_request("webhook id must be an integer"))?;
+    let delivery_id: i64 = delivery_id
+        .parse()
+        .map_err(|_| RtDbError::bad_request("delivery id must be an integer"))?;
+    if !state.config.webhooks_enabled {
+        return Err(RtDbError::bad_request(
+            "webhooks are disabled on this server (set RTDB_WEBHOOKS_ENABLED=true at boot)",
+        ));
+    }
+    match crate::webhook::redeliver_delivery(&state.pool, id, &db, delivery_id).await? {
+        crate::webhook::RedeliverOutcome::Reset(row) => Ok(Json(row)),
+        crate::webhook::RedeliverOutcome::StillActive => Err(RtDbError::conflict(
+            "only failed deliveries can be redelivered",
+        )),
+        crate::webhook::RedeliverOutcome::Missing => {
+            Err(RtDbError::not_found("delivery not found for this webhook"))
+        }
+    }
+}
+
+/// `POST /admin/db/{db}/webhooks/{id}/deliveries/redeliver-failed` — bulk
+/// redeliver: reset every `failed` delivery of this webhook back to `pending`
+/// (attempts 0, last_error cleared, next_attempt now) and return the reset
+/// rows. Non-failed statuses are untouched. Reuses the delivery-row wire shape;
+/// no new error codes.
+pub(super) async fn admin_redeliver_failed(
+    State(state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    Path((db, id)): Path<(String, String)>,
+) -> Result<Json<RedeliverFailedResponse>, RtDbError> {
+    if !db::database_exists(&state.pool, &db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    let id: i64 = id
+        .parse()
+        .map_err(|_| RtDbError::bad_request("webhook id must be an integer"))?;
+    if !state.config.webhooks_enabled {
+        return Err(RtDbError::bad_request(
+            "webhooks are disabled on this server (set RTDB_WEBHOOKS_ENABLED=true at boot)",
+        ));
+    }
+    let deliveries = crate::webhook::redeliver_failed_deliveries(&state.pool, id, &db).await?;
+    Ok(Json(RedeliverFailedResponse { deliveries }))
+}
+
 #[derive(Deserialize)]
 pub(super) struct DeliveryListParams {
     #[serde(default)]

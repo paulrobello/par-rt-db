@@ -843,6 +843,160 @@ async fn webhook_deliveries_filter_sort_and_paginate() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn webhook_redelivery_requeues_exhausted_and_rejects_active() -> anyhow::Result<()> {
+    let state = test_state_with_webhooks().await;
+    let pool = state.pool.clone();
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let other = fresh_db(&state).await;
+    let received: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let rx_addr = listener.local_addr()?;
+    let receiver = tokio::spawn(
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/hook", axum::routing::post(receive_hook))
+                .with_state(received.clone()),
+        )
+        .into_future(),
+    );
+    let webhook_id = create_webhook(
+        addr,
+        &name,
+        json!({"url": format!("http://{rx_addr}/hook")}),
+    )
+    .await;
+    let payload = json!({"db": name.as_str(), "docId": "redeliver", "kind": "insert"});
+    let delivery_id: i64 = sqlx::query_scalar(
+        "INSERT INTO rtdb.webhook_deliveries (webhook_id, payload, attempts, next_attempt, status, last_error) \
+         VALUES ($1, $2, 6, $3, 'failed', 'HTTP 503') RETURNING id",
+    ).bind(webhook_id).bind(&payload).bind(i64::MAX).fetch_one(&pool).await?;
+    let path = format!("/admin/db/{name}/webhooks/{webhook_id}/deliveries/{delivery_id}/redeliver");
+
+    let cross_db = admin_post(
+        addr,
+        &format!("/admin/db/{other}/webhooks/{webhook_id}/deliveries/{delivery_id}/redeliver"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(cross_db.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(cross_db.json::<Value>().await?["code"], "NOT_FOUND");
+    let missing = admin_post(
+        addr,
+        &format!("/admin/db/{name}/webhooks/{webhook_id}/deliveries/0/redeliver"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(missing.json::<Value>().await?["code"], "NOT_FOUND");
+
+    // Simultaneous replay requests must only enqueue once.
+    let (first, second) = tokio::join!(
+        admin_post(addr, &path, json!({})),
+        admin_post(addr, &path, json!({}))
+    );
+    let (success, conflict) = if first.status().is_success() {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    assert_eq!(success.status(), reqwest::StatusCode::OK);
+    let reset: Value = success.json().await?;
+    assert_eq!(reset["id"], delivery_id);
+    assert_eq!(reset["attempts"], 0);
+    assert_eq!(reset["status"], "pending");
+    assert!(reset["lastError"].is_null());
+    assert_eq!(reset["payload"], payload);
+    assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(conflict.json::<Value>().await?["code"], "CONFLICT");
+
+    // Pending/retrying includes the worker's in-flight state. Neither is reset.
+    for status in ["pending", "retrying"] {
+        sqlx::query("UPDATE rtdb.webhook_deliveries SET status = $2 WHERE id = $1")
+            .bind(delivery_id)
+            .bind(status)
+            .execute(&pool)
+            .await?;
+        let resp = admin_post(addr, &path, json!({})).await;
+        assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+        assert_eq!(resp.json::<Value>().await?["code"], "CONFLICT");
+    }
+    wait_until(Duration::from_secs(30), || async {
+        rtdb_server::webhook::drain_once(&pool)
+            .await
+            .expect("drain");
+        sqlx::query_scalar::<_, bool>(
+            "SELECT status = 'delivered' FROM rtdb.webhook_deliveries WHERE id = $1",
+        )
+        .bind(delivery_id)
+        .fetch_one(&pool)
+        .await
+        .expect("status")
+    })
+    .await;
+    let list: Value = admin_get(
+        addr,
+        &format!("/admin/db/{name}/webhooks/{webhook_id}/deliveries"),
+    )
+    .await
+    .json()
+    .await?;
+    assert_eq!(list["deliveries"][0]["id"], delivery_id);
+    assert_eq!(list["deliveries"][0]["status"], "delivered");
+    // At-least-once: every POST the receiver captured carries the delivery's
+    // payload verbatim (the worker may race drain_once, so >= 1, all identical).
+    let got = received.lock().await.clone();
+    assert!(
+        !got.is_empty(),
+        "receiver got at least one POST after redeliver"
+    );
+    assert!(got.iter().all(|b| b == &payload));
+    receiver.abort();
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn webhook_redeliver_failed_only_resets_scoped_failed_rows() -> anyhow::Result<()> {
+    let state = test_state_with_webhooks().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let id = create_webhook(addr, &name, json!({"url": "http://example.com/hook"})).await;
+    let other_id = create_webhook(addr, &name, json!({"url": "http://example.com/other"})).await;
+    for (webhook_id, status) in [
+        (id, "failed"),
+        (id, "pending"),
+        (id, "retrying"),
+        (id, "delivered"),
+        (other_id, "failed"),
+    ] {
+        sqlx::query("INSERT INTO rtdb.webhook_deliveries (webhook_id, payload, attempts, next_attempt, status, last_error) VALUES ($1, $2, 6, $3, $4, 'HTTP 503')")
+            .bind(webhook_id).bind(json!({})).bind(i64::MAX).bind(status).execute(&state.pool).await?;
+    }
+    let path = format!("/admin/db/{name}/webhooks/{id}/deliveries/redeliver-failed");
+    let resp = admin_post(addr, &path, json!({})).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await?;
+    let reset = body["deliveries"].as_array().expect("deliveries");
+    assert_eq!(reset.len(), 1);
+    assert_eq!(reset[0]["status"], "pending");
+    assert_eq!(reset[0]["attempts"], 0);
+    assert!(reset[0]["lastError"].is_null());
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM rtdb.webhook_deliveries WHERE webhook_id = $1 AND status = 'failed'",
+    )
+    .bind(other_id)
+    .fetch_one(&state.pool)
+    .await?;
+    assert_eq!(remaining, 1);
+    let again: Value = admin_post(addr, &path, json!({})).await.json().await?;
+    assert_eq!(again["deliveries"], json!([]));
+    Ok(())
+}
+
 // SEC-134: delete_webhook and fetch_deliveries must scope on (id, db) the same
 // way edit_webhook does, so a caller can't act on another database's webhook by
 // guessing its numeric id. Both functions are exercised through their admin

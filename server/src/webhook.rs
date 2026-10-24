@@ -980,6 +980,120 @@ pub async fn fetch_deliveries(
         .collect())
 }
 
+/// Outcome of a single-delivery redeliver request. The reset is a single
+/// conditional UPDATE, so two concurrent redelivers can never both win: the
+/// first flips the row to `pending`, the second observes a non-terminal status
+/// and gets `StillActive`.
+#[derive(Debug)]
+pub enum RedeliverOutcome {
+    /// The row was `failed` (attempts exhausted) and has been reset to
+    /// `pending`; carries the updated row.
+    Reset(DeliveryRow),
+    /// The delivery exists but is not failed (`pending`/`retrying`/`delivered`)
+    /// — never reset (the handler maps this to a typed CONFLICT).
+    StillActive,
+    /// No delivery with this id under this (webhook, db) pair.
+    Missing,
+}
+
+/// Re-enqueues a failed (attempts-exhausted) delivery for another attempt:
+/// resets `attempts` to 0, `last_error` to NULL, and `next_attempt` to now with
+/// `status = 'pending'` so the delivery worker picks it up on its next pass.
+/// Only `failed` rows are reset — a `pending`/`retrying`/`delivered`
+/// row yields [`RedeliverOutcome::StillActive`]. The `db` scope joins to
+/// `rtdb.webhooks` the same way `fetch_deliveries` does (SEC-134). Called by
+/// `POST /admin/db/{db}/webhooks/{id}/deliveries/{delivery_id}/redeliver`.
+pub async fn redeliver_delivery(
+    pool: &PgPool,
+    webhook_id: i64,
+    db: &str,
+    delivery_id: i64,
+) -> Result<RedeliverOutcome, RtDbError> {
+    type Row = (i64, i32, String, i64, Option<String>, serde_json::Value);
+    let row: Option<Row> = sqlx::query_as(
+        "UPDATE rtdb.webhook_deliveries d \
+         SET attempts = 0, status = 'pending', next_attempt = $1, last_error = NULL \
+         FROM rtdb.webhooks w \
+         WHERE d.webhook_id = w.id AND d.webhook_id = $2 AND d.id = $3 AND w.db = $4 \
+           AND d.status = 'failed' \
+         RETURNING d.id, d.attempts, d.status, d.next_attempt, d.last_error, d.payload",
+    )
+    .bind(now_ms())
+    .bind(webhook_id)
+    .bind(delivery_id)
+    .bind(db)
+    .fetch_optional(pool)
+    .await?;
+    if let Some((id, attempts, status, next_attempt, last_error, payload)) = row {
+        return Ok(RedeliverOutcome::Reset(DeliveryRow {
+            id,
+            attempts,
+            status,
+            next_attempt,
+            last_error,
+            payload,
+        }));
+    }
+    // No terminal row matched: either the delivery does not exist under this
+    // (webhook, db) pair or it is still pending/retrying. Re-read the row to
+    // distinguish the two for the caller (404 vs CONFLICT at the handler).
+    let exists: Option<(String,)> = sqlx::query_as(
+        "SELECT d.status FROM rtdb.webhook_deliveries d \
+         JOIN rtdb.webhooks w ON w.id = d.webhook_id \
+         WHERE d.webhook_id = $1 AND d.id = $2 AND w.db = $3",
+    )
+    .bind(webhook_id)
+    .bind(delivery_id)
+    .bind(db)
+    .fetch_optional(pool)
+    .await?;
+    match exists {
+        Some(_) => Ok(RedeliverOutcome::StillActive),
+        None => Ok(RedeliverOutcome::Missing),
+    }
+}
+
+/// Bulk form of [`redeliver_delivery`]: resets every `failed` delivery of
+/// webhook `id` (scoped to `db`) back to `pending` with attempts 0 and a fresh
+/// `next_attempt`, returning the reset rows in delivery-id order. `pending`,
+/// `retrying`, and `delivered` rows are untouched. Called by
+/// `POST /admin/db/{db}/webhooks/{id}/deliveries/redeliver-failed`.
+pub async fn redeliver_failed_deliveries(
+    pool: &PgPool,
+    webhook_id: i64,
+    db: &str,
+) -> Result<Vec<DeliveryRow>, RtDbError> {
+    type Row = (i64, i32, String, i64, Option<String>, serde_json::Value);
+    let mut rows: Vec<Row> = sqlx::query_as(
+        "UPDATE rtdb.webhook_deliveries d \
+         SET attempts = 0, status = 'pending', next_attempt = $1, last_error = NULL \
+         FROM rtdb.webhooks w \
+         WHERE d.webhook_id = w.id AND d.webhook_id = $2 AND w.db = $3 \
+           AND d.status = 'failed' \
+         RETURNING d.id, d.attempts, d.status, d.next_attempt, d.last_error, d.payload",
+    )
+    .bind(now_ms())
+    .bind(webhook_id)
+    .bind(db)
+    .fetch_all(pool)
+    .await?;
+    // Postgres does not allow ORDER BY in an UPDATE ... RETURNING; sort here.
+    rows.sort_by_key(|(id, _, _, _, _, _)| *id);
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, attempts, status, next_attempt, last_error, payload)| DeliveryRow {
+                id,
+                attempts,
+                status,
+                next_attempt,
+                last_error,
+                payload,
+            },
+        )
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
