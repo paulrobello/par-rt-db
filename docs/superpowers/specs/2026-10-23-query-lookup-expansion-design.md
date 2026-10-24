@@ -247,7 +247,7 @@ combination-rule specialization):
 7. `lookup-cap-overflow` — `cap: 1001` → `BAD_REQUEST`.
 8. `lookup-projection` — `fields` listing the alias keeps the joined key;
    omitting it drops it.
-9. `query-combo-lookups-count` / `-distinct` / `-aggregate` — one
+9. `query-combo-lookups-excludes-count` / `-distinct` / `-aggregate` (rule ids `lookups-excludes-*`) — one
    `semantics/query-combo-<rule-id>.json` per new forbid rule (required by
    `combinations_coverage.rs`).
 

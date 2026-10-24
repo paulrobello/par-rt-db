@@ -1,6 +1,6 @@
 {
-  "name": "query-combo-lookups-aggregate",
-  "$comment": "Rule 'lookups-excludes-aggregate': lookups expand docs; over an aggregate terminal it is meaningless. Representative violation pins BAD_REQUEST across all runners.",
+  "name": "query-combo-lookups-excludes-count",
+  "$comment": "Rule 'lookups-excludes-count' from wire-corpus/query-combinations.json: lookups expand docs; over a count terminal it is meaningless. Representative violation: a collect-shaped query with a lookup and count:true. Pins BAD_REQUEST across all runners.",
   "schema": {
     "tables": {
       "users": {
@@ -25,7 +25,7 @@
     "query": {
       "table": "posts",
       "lookups": [{ "field": "authorId", "table": "users", "as": "author" }],
-      "aggregate": { "op": "count" }
+      "count": true
     }
   },
   "expect": {

@@ -7,7 +7,7 @@ skip-when-empty list), the ``TableQuery.lookup`` builder, compile-time
 validation (error codes), and in-memory expansion semantics (single-Id →
 doc-or-null, Array<Id> → declared order with dangling ids dropped and ``cap``
 truncation). The full behavioral corpus lives in ``wire-corpus/semantics/``
-(``lookup-*``, ``query-combo-lookups-*``), executed by
+(``lookup-*``, ``query-combo-lookups-excludes-*``), executed by
 ``tests/test_semantics_corpus.py``; this file pins the python-only surfaces
 the corpus cannot (the builder and the pydantic wire model).
 """

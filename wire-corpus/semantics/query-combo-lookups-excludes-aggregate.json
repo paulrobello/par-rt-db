@@ -1,6 +1,6 @@
 {
-  "name": "query-combo-lookups-distinct",
-  "$comment": "Rule 'lookups-excludes-distinct': lookups expand docs; over a distinct terminal it is meaningless. Representative violation pins BAD_REQUEST across all runners.",
+  "name": "query-combo-lookups-excludes-aggregate",
+  "$comment": "Rule 'lookups-excludes-aggregate': lookups expand docs; over an aggregate terminal it is meaningless. Representative violation pins BAD_REQUEST across all runners.",
   "schema": {
     "tables": {
       "users": {
@@ -25,7 +25,7 @@
     "query": {
       "table": "posts",
       "lookups": [{ "field": "authorId", "table": "users", "as": "author" }],
-      "distinct": true
+      "aggregate": { "op": "count" }
     }
   },
   "expect": {
