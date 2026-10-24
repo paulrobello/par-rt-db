@@ -1,7 +1,6 @@
 import type { WebSocketLike } from "./client.js";
 import { RtDbError } from "./errors.js";
 import { enrollRequest, type FileMetadata, type SignedUrl, type TransformOpts } from "./http.js";
-import { PROTOCOL_VERSION } from "./protocol.js";
 import type {
   MigrateRequestJson,
   MigrateResultJson,
@@ -17,6 +16,7 @@ import type {
   WorkflowSpec,
   WorkflowStatus,
 } from "./protocol.js";
+import { PROTOCOL_VERSION } from "./protocol.js";
 import type { RtQuery } from "./query.js";
 import type { AnySchema } from "./schema.js";
 
@@ -1476,6 +1476,25 @@ export class RtDbAdminClient {
     const body = await this.request(
       "GET",
       `/admin/db/${encodeURIComponent(db)}/webhooks/${encodeURIComponent(id)}/deliveries${qs ? `?${qs}` : ""}`,
+    );
+    return (body as { deliveries: WebhookDelivery[] }).deliveries;
+  }
+
+  /** Re-enqueue a failed delivery. Active deliveries are rejected with CONFLICT. */
+  async redeliverDelivery(db: string, id: number, deliveryId: number): Promise<WebhookDelivery> {
+    return (await this.request(
+      "POST",
+      `/admin/db/${encodeURIComponent(db)}/webhooks/${encodeURIComponent(id)}/deliveries/${encodeURIComponent(deliveryId)}/redeliver`,
+      {},
+    )) as WebhookDelivery;
+  }
+
+  /** Re-enqueue all failed deliveries for one webhook. */
+  async redeliverFailed(db: string, id: number): Promise<WebhookDelivery[]> {
+    const body = await this.request(
+      "POST",
+      `/admin/db/${encodeURIComponent(db)}/webhooks/${encodeURIComponent(id)}/deliveries/redeliver-failed`,
+      {},
     );
     return (body as { deliveries: WebhookDelivery[] }).deliveries;
   }

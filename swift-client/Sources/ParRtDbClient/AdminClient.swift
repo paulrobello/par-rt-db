@@ -554,6 +554,25 @@ public actor RtDbAdminClient {
         return response.deliveries
     }
 
+    /// Re-enqueue a failed delivery. Active deliveries return CONFLICT.
+    public func redeliverDelivery(
+        _ db: String, id: Int64, deliveryId: Int64
+    ) async throws -> WebhookDelivery {
+        try await request(
+            "redeliver delivery", method: "POST",
+            path: "/admin/db/\(encodePath(db))/webhooks/\(id)/deliveries/\(deliveryId)/redeliver"
+        )
+    }
+
+    /// Re-enqueue all failed deliveries for one webhook.
+    public func redeliverFailed(_ db: String, id: Int64) async throws -> [WebhookDelivery] {
+        let response: DeliveriesResponse = try await request(
+            "redeliver failed deliveries", method: "POST",
+            path: "/admin/db/\(encodePath(db))/webhooks/\(id)/deliveries/redeliver-failed"
+        )
+        return response.deliveries
+    }
+
     // MARK: Audit
 
     /// `GET /admin/audit?db=&table=&op=&principal=&source=&limit=&offset=` →

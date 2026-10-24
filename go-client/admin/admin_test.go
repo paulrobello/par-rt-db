@@ -84,6 +84,33 @@ func bodyEqual(got []byte, want string) bool {
 
 func wantStr(s string) *string { return &s }
 
+func TestRedeliverDelivery(t *testing.T) {
+	body := `{}`
+	c := &capture{t: t, method: "POST", path: "/admin/db/app/webhooks/7/deliveries/33/redeliver", bearer: wantStr(testAdminKey), body: &body,
+		status: 200, respBody: `{"id":33,"attempts":0,"status":"pending","nextAttempt":99,"lastError":null,"payload":{}}`}
+	client := stub(t, c.handler)
+	row, err := client.RedeliverDelivery(context.Background(), "app", 7, 33)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.ID != 33 || row.Status != "pending" || row.Attempts != 0 {
+		t.Fatalf("unexpected row: %+v", row)
+	}
+}
+
+func TestRedeliverFailed(t *testing.T) {
+	c := &capture{t: t, method: "POST", path: "/admin/db/app/webhooks/7/deliveries/redeliver-failed",
+		status: 200, respBody: `{"deliveries":[{"id":34,"attempts":0,"status":"pending","nextAttempt":99,"lastError":null,"payload":{}}]}`}
+	client := stub(t, c.handler)
+	rows, err := client.RedeliverFailed(context.Background(), "app", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ID != 34 {
+		t.Fatalf("unexpected rows: %+v", rows)
+	}
+}
+
 func TestCreateDB(t *testing.T) {
 	body := `{"name":"app"}`
 	c := &capture{t: t, method: "POST", path: "/admin/create-db", bearer: wantStr(testAdminKey), body: &body,

@@ -985,6 +985,46 @@ struct AdminClientTests {
         #expect(deliveries[0].payload.objectValue?["op"] == .string("insert"))
     }
 
+    @Test func redeliverDeliveryHitsPathAndRedeliverFailedParsesRows() async throws {
+        let client = makeAdminClient()
+        let redeliverSingleBody =
+            #"{"id":33,"attempts":0,"status":"pending","nextAttempt":99,"lastError":null,"payload":{"op":"insert"}}"#
+        // lastError omitted: DeliveryRow.lastError is Optional, so a missing
+        // key decodes as nil and the stub stays inside the line-length limit.
+        let redeliverBulkBody =
+            #"{"deliveries":[{"id":34,"attempts":0,"status":"pending","nextAttempt":100,"payload":{}}]}"#
+        StubProtocol.handler = { request in
+            try demand(request.httpMethod == "POST", "expected POST")
+            try demand(
+                request.url?.path == "/admin/db/app/webhooks/7/deliveries/33/redeliver",
+                "path mismatch: \(request.url?.path ?? "nil")"
+            )
+            return (
+                200,
+                Data(redeliverSingleBody.utf8)
+            )
+        }
+        let redelivered = try await client.redeliverDelivery("app", id: 7, deliveryId: 33)
+        #expect(redelivered.id == 33)
+        #expect(redelivered.status == "pending")
+        #expect(redelivered.attempts == 0)
+
+        StubProtocol.handler = { request in
+            try demand(request.httpMethod == "POST", "expected POST")
+            try demand(
+                request.url?.path == "/admin/db/app/webhooks/7/deliveries/redeliver-failed",
+                "path mismatch: \(request.url?.path ?? "nil")"
+            )
+            return (
+                200,
+                Data(redeliverBulkBody.utf8)
+            )
+        }
+        let rows = try await client.redeliverFailed("app", id: 7)
+        #expect(rows.count == 1)
+        #expect(rows[0].id == 34)
+    }
+
     // MARK: audit / sessions / merge
 
     @Test func getAuditBuildsQueryParamsFromOptions() async throws {

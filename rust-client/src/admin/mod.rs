@@ -841,6 +841,39 @@ impl RtDbAdminClient {
         Ok(parsed.deliveries)
     }
 
+    /// Re-enqueue a failed delivery; active deliveries return CONFLICT.
+    pub async fn redeliver_delivery(
+        &self,
+        db: &str,
+        id: i64,
+        delivery_id: i64,
+    ) -> Result<crate::wire::admin::WebhookDelivery, RtDbError> {
+        let resp = self
+            .post_json(
+                &format!("/admin/db/{db}/webhooks/{id}/deliveries/{delivery_id}/redeliver"),
+                &serde_json::json!({}),
+            )
+            .await?;
+        crate::http_common::deserialize(resp).await
+    }
+
+    /// Re-enqueue all failed deliveries for one webhook.
+    pub async fn redeliver_failed(
+        &self,
+        db: &str,
+        id: i64,
+    ) -> Result<Vec<crate::wire::admin::WebhookDelivery>, RtDbError> {
+        let resp = self
+            .post_json(
+                &format!("/admin/db/{db}/webhooks/{id}/deliveries/redeliver-failed"),
+                &serde_json::json!({}),
+            )
+            .await?;
+        let parsed: crate::wire::admin::DeliveriesResponse =
+            crate::http_common::deserialize(resp).await?;
+        Ok(parsed.deliveries)
+    }
+
     /// `GET /admin/audit?db=&table=&op=&principal=&source=&limit=&offset=` →
     /// `{entries:[...]}`, newest `ts_ms` first. `db` is always sent; every other
     /// filter is omitted from the query when `None` (matches all rows).

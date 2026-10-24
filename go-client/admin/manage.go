@@ -109,6 +109,26 @@ func (c *AdminClient) ListDeliveries(ctx context.Context, db string, id int64, o
 	return resp.Deliveries, nil
 }
 
+// RedeliverDelivery re-enqueues a failed delivery. Active deliveries return CONFLICT.
+func (c *AdminClient) RedeliverDelivery(ctx context.Context, db string, id int64, deliveryID int64) (*WebhookDelivery, error) {
+	var out WebhookDelivery
+	if err := c.api.Call(ctx, methodPost, fmt.Sprintf("/admin/db/%s/webhooks/%d/deliveries/%d/redeliver", db, id, deliveryID), map[string]any{}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// RedeliverFailed re-enqueues all failed deliveries for one webhook.
+func (c *AdminClient) RedeliverFailed(ctx context.Context, db string, id int64) ([]WebhookDelivery, error) {
+	var resp struct {
+		Deliveries []WebhookDelivery `json:"deliveries"`
+	}
+	if err := c.api.Call(ctx, methodPost, fmt.Sprintf("/admin/db/%s/webhooks/%d/deliveries/redeliver-failed", db, id), map[string]any{}, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Deliveries, nil
+}
+
 // GetAudit: GET /admin/audit → the durable audit rows, newest ts_ms first.
 // db is always sent; the other filters are omitted when unset.
 func (c *AdminClient) GetAudit(ctx context.Context, db string, opts *AuditQuery) ([]AuditEntry, error) {

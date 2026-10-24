@@ -1656,6 +1656,46 @@ def test_list_deliveries_parses_fixture_with_opaque_payload() -> None:
     assert d.payload == {"arbitrary": ["nested", {"obj": True}]}
 
 
+def test_redeliver_delivery_posts_and_parses_row() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/admin/db/kanban/webhooks/11/deliveries/33/redeliver"
+        assert request.method == "POST"
+        return httpx.Response(
+            200,
+            json={**_DELIVERY_ROW_FAILED, "status": "pending", "attempts": 0, "lastError": None},
+        )
+
+    with _sync_client(handler) as c:
+        d = c.redeliver_delivery("kanban", 11, 33)
+    assert isinstance(d, WebhookDelivery)
+    assert d.status == "pending"
+    assert d.attempts == 0
+    assert d.last_error is None
+
+
+def test_redeliver_failed_parses_rows() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/admin/db/kanban/webhooks/11/deliveries/redeliver-failed"
+        return httpx.Response(
+            200, json={"deliveries": [{**_DELIVERY_ROW_FAILED, "status": "pending"}]}
+        )
+
+    with _sync_client(handler) as c:
+        rows = c.redeliver_failed("kanban", 11)
+    assert len(rows) == 1
+    assert rows[0].status == "pending"
+
+
+async def test_async_redeliver_delivery_posts_and_parses_row() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/admin/db/kanban/webhooks/11/deliveries/33/redeliver"
+        return httpx.Response(200, json={**_DELIVERY_ROW_FAILED, "status": "pending"})
+
+    async with _async_client(handler) as c:
+        d = await c.redeliver_delivery("kanban", 11, 33)
+    assert d.status == "pending"
+
+
 # --- async: webhook mirror (representative) -------------------------------
 
 

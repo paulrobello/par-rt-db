@@ -16,6 +16,8 @@ const adminClientMock = vi.hoisted(() => ({
   editWebhook: vi.fn(),
   deleteWebhook: vi.fn(),
   listDeliveries: vi.fn(),
+  redeliverDelivery: vi.fn(),
+  redeliverFailed: vi.fn(),
 }));
 
 vi.mock("../lib/admin", () => ({
@@ -190,6 +192,40 @@ describe("WebhooksPage", () => {
     expect(within(deliveriesTable).getByText("delivered")).toBeInTheDocument();
     expect(within(deliveriesTable).getByText("failed")).toBeInTheDocument();
     expect(within(deliveriesTable).getByText("11")).toBeInTheDocument(); // delivery id
+  });
+
+  it("redelivers only failed rows and refreshes their outcome", async () => {
+    adminClientMock.listWebhooks.mockResolvedValue([enabledAll]);
+    adminClientMock.listDeliveries.mockResolvedValue([deliveryDelivered, deliveryFailed]);
+    adminClientMock.redeliverDelivery.mockResolvedValue({ ...deliveryFailed, status: "pending" });
+    const user = userEvent.setup();
+    render(<WebhooksPage />);
+    await screen.findByText("https://example.com/hook");
+    await user.click(screen.getByRole("button", { name: "deliveries" }));
+    const failedRow = (await screen.findByText("connection refused")).closest("tr");
+    if (!failedRow) throw new Error("failed row not found");
+    expect(screen.getAllByRole("button", { name: /^redeliver$/ })).toHaveLength(1);
+    adminClientMock.listDeliveries.mockResolvedValue([
+      { ...deliveryFailed, status: "pending", lastError: null },
+    ]);
+    await user.click(within(failedRow).getByRole("button", { name: "redeliver" }));
+    await waitFor(() =>
+      expect(adminClientMock.redeliverDelivery).toHaveBeenCalledWith("db1", 1, 11),
+    );
+    expect(await screen.findByText("pending", { selector: "span" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^redeliver$/ })).not.toBeInTheDocument();
+  });
+
+  it("redelivers all failed deliveries and surfaces action errors", async () => {
+    adminClientMock.listWebhooks.mockResolvedValue([enabledAll]);
+    adminClientMock.redeliverFailed.mockRejectedValue(new Error("delivery conflict"));
+    const user = userEvent.setup();
+    render(<WebhooksPage />);
+    await screen.findByText("https://example.com/hook");
+    await user.click(screen.getByRole("button", { name: "deliveries" }));
+    await user.click(await screen.findByRole("button", { name: "redeliver all failed" }));
+    await waitFor(() => expect(adminClientMock.redeliverFailed).toHaveBeenCalledWith("db1", 1));
+    expect(await screen.findByRole("alert")).toHaveTextContent("delivery conflict");
   });
 
   it("filters deliveries by status via the status select", async () => {

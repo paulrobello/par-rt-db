@@ -1070,6 +1070,34 @@ describe("RtDbAdminClient webhooks", () => {
     expect(init.headers.Authorization).toBe("Bearer k");
   });
 
+  it("redelivers a delivery and unwraps bulk failed deliveries", async () => {
+    const delivery: WebhookDelivery = {
+      id: 11,
+      attempts: 0,
+      status: "pending",
+      nextAttempt: 1,
+      lastError: null,
+      payload: {},
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(delivery))
+      .mockResolvedValueOnce(jsonResponse({ deliveries: [delivery] }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.redeliverDelivery("kanban", 3, 11)).resolves.toEqual(delivery);
+    await expect(admin.redeliverFailed("kanban", 3)).resolves.toEqual([delivery]);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://h:8300/admin/db/kanban/webhooks/3/deliveries/11/redeliver",
+    );
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "http://h:8300/admin/db/kanban/webhooks/3/deliveries/redeliver-failed",
+    );
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(init.method).toBe("POST");
+      expect(init.headers.Authorization).toBe("Bearer k");
+    }
+  });
+
   it("listDeliveries omits the query string when no opts are provided", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ deliveries: [] }));
     const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });

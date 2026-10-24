@@ -1,15 +1,11 @@
+import type { RtDbAdminClient } from "@par-rt-db/client";
 /** Webhook management — register webhooks and inspect the delivery outbox with retry state. */
 import { useEffect, useState } from "react";
-import {
-  timeLabel,
-  WebhookCreateForm,
-  WebhookDeliveriesPanel,
-  WebhookEditPanel,
-} from "../components/webhooks";
 import { Button, Placard, Spinner } from "../components/ui";
+import { timeLabel, WebhookCreateForm, WebhookEditPanel } from "../components/webhooks";
 import { useAdmin } from "../lib/admin";
 import { toErrorMessage } from "../lib/errors";
-import type { Webhook } from "../lib/types";
+import type { Webhook, WebhookDelivery } from "../lib/types";
 import { useAsync } from "../lib/useAsync";
 import s from "./WebhooksPage.module.css";
 
@@ -228,6 +224,161 @@ export function WebhooksPage() {
       )}
 
       <WebhookCreateForm client={client} db={db} onCreated={refresh} />
+    </section>
+  );
+}
+
+function deliveryBadgeClass(status: string): string {
+  switch (status) {
+    case "delivered":
+      return s.badgeDelivered;
+    case "pending":
+      return s.badgePending;
+    case "retrying":
+      return s.badgeRetrying;
+    case "failed":
+      return s.badgeFailed;
+    default:
+      return "";
+  }
+}
+
+/** A one-line preview of the delivery payload — JSON-stringified and truncated
+ *  for the table cell; the title attribute carries the full text on hover. */
+function payloadPreview(payload: unknown): { title: string; text: string } {
+  const title = (() => {
+    try {
+      return JSON.stringify(payload);
+    } catch {
+      return String(payload);
+    }
+  })();
+  return { title, text: title.length > 60 ? `${title.slice(0, 60)}…` : title };
+}
+
+interface WebhookDeliveriesPanelProps {
+  client: RtDbAdminClient;
+  db: string;
+  webhookId: number;
+  onClose: () => void;
+}
+
+function WebhookDeliveriesPanel({ client, db, webhookId, onClose }: WebhookDeliveriesPanelProps) {
+  const [statusFilter, setStatusFilter] = useState("");
+  const [redelivering, setRedelivering] = useState<number | "all" | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  async function redeliver(id: number | "all"): Promise<void> {
+    setRedelivering(id);
+    setActionError(null);
+    try {
+      if (id === "all") await client.redeliverFailed(db, webhookId);
+      else await client.redeliverDelivery(db, webhookId, id);
+      await refresh();
+    } catch (e) {
+      setActionError(toErrorMessage(e));
+    } finally {
+      setRedelivering(null);
+    }
+  }
+  const {
+    data: deliveries,
+    loading: deliveriesLoading,
+    error: deliveriesError,
+    refresh,
+  } = useAsync(
+    () => client.listDeliveries(db, webhookId, statusFilter ? { status: statusFilter } : {}),
+    [client, db, webhookId, statusFilter],
+    [] as WebhookDelivery[],
+  );
+
+  return (
+    <section className={s.deliveriesBlock}>
+      <Placard>Deliveries — webhook #{webhookId}</Placard>
+      <div className={s.deliveriesHead}>
+        <label className={s.field}>
+          <span className={s.fieldLabel}>status filter</span>
+          <select
+            className={s.select}
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value)}
+          >
+            <option value="">— any —</option>
+            <option value="pending">pending</option>
+            <option value="retrying">retrying</option>
+            <option value="delivered">delivered</option>
+            <option value="failed">failed</option>
+          </select>
+        </label>
+        <Button onClick={() => void refresh()} disabled={deliveriesLoading}>
+          {deliveriesLoading ? "refreshing…" : "refresh"}
+        </Button>
+        <Button
+          onClick={() => void redeliver("all")}
+          disabled={redelivering !== null || deliveriesLoading}
+        >
+          {redelivering === "all" ? "redelivering…" : "redeliver all failed"}
+        </Button>
+        {deliveriesLoading && <Spinner label="loading deliveries" />}
+        <Button onClick={() => onClose()}>close</Button>
+      </div>
+      {actionError && (
+        <p role="alert" className={s.error}>
+          {actionError}
+        </p>
+      )}
+      {deliveriesError && <p className={s.error}>{deliveriesError}</p>}
+      {deliveries.length === 0 ? (
+        <p className={s.muted}>no deliveries.</p>
+      ) : (
+        <div className={s.subTableWrap}>
+          <table className={s.table}>
+            <thead>
+              <tr>
+                <th>id</th>
+                <th>status</th>
+                <th>attempts</th>
+                <th>next attempt</th>
+                <th>last error</th>
+                <th>payload</th>
+                <th>actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {deliveries.map((d) => {
+                const preview = payloadPreview(d.payload);
+                return (
+                  <tr key={d.id}>
+                    <td className={s.idCell}>{d.id}</td>
+                    <td>
+                      <span className={`${s.badge} ${deliveryBadgeClass(d.status)}`}>
+                        {d.status}
+                      </span>
+                    </td>
+                    <td className="tnum">{d.attempts}</td>
+                    <td>{timeLabel(d.nextAttempt)}</td>
+                    <td className={s.errCell} title={d.lastError ?? ""}>
+                      {d.lastError ?? "—"}
+                    </td>
+                    <td className={s.payloadCell} title={preview.title}>
+                      {preview.text}
+                    </td>
+                    <td>
+                      {d.status === "failed" && (
+                        <Button
+                          onClick={() => void redeliver(d.id)}
+                          disabled={redelivering !== null}
+                        >
+                          {redelivering === d.id ? "redelivering…" : "redeliver"}
+                        </Button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
     </section>
   );
 }

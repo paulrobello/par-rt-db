@@ -1446,6 +1446,55 @@ async fn delete_webhook_surfaces_not_found_envelope() {
 }
 
 #[tokio::test]
+async fn redeliver_delivery_posts_and_parses_row() {
+    let (server, client) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/admin/db/kanban/webhooks/3/deliveries/11/redeliver"))
+        .and(header("authorization", BEARER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!(
+            {"id":11,"attempts":0,"status":"pending","nextAttempt":5000,"lastError":null,"payload":{"db":"kanban","docId":"n1","kind":"insert"}}
+        )))
+        .mount(&server)
+        .await;
+    let row = client.redeliver_delivery("kanban", 3, 11).await.unwrap();
+    assert_eq!(row.id, 11);
+    assert_eq!(row.attempts, 0);
+    assert_eq!(row.status, "pending");
+    assert_eq!(row.last_error, None);
+}
+
+#[tokio::test]
+async fn redeliver_failed_parses_rows_and_surfaces_conflict() {
+    let (server, client) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/admin/db/kanban/webhooks/3/deliveries/redeliver-failed"))
+        .and(header("authorization", BEARER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!(
+            {"deliveries":[{"id":12,"attempts":0,"status":"pending","nextAttempt":6000,"lastError":null,"payload":{}}]}
+        )))
+        .mount(&server)
+        .await;
+    let rows = client.redeliver_failed("kanban", 3).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, 12);
+    assert_eq!(rows[0].status, "pending");
+
+    let (server, client) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/admin/db/kanban/webhooks/3/deliveries/11/redeliver"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(
+            json!({"code": "CONFLICT", "message": "only failed deliveries can be redelivered"}),
+        ))
+        .mount(&server)
+        .await;
+    let err = client
+        .redeliver_delivery("kanban", 3, 11)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict);
+}
+
+#[tokio::test]
 async fn list_deliveries_returns_rows_with_query_params() {
     let (server, client) = setup().await;
     Mock::given(method("GET"))

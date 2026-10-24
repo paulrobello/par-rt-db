@@ -920,6 +920,24 @@ def _op_delete_webhook(db: str, id: int) -> _AdminRequest:
     )
 
 
+def _op_redeliver_delivery(db: str, id: int, delivery_id: int) -> _AdminRequest:
+    return _AdminRequest(
+        "POST",
+        f"/admin/db/{db}/webhooks/{id}/deliveries/{delivery_id}/redeliver",
+        {"json": {}},
+        _parse_model(WebhookDelivery),
+    )
+
+
+def _op_redeliver_failed(db: str, id: int) -> _AdminRequest:
+    return _AdminRequest(
+        "POST",
+        f"/admin/db/{db}/webhooks/{id}/deliveries/redeliver-failed",
+        {"json": {}},
+        _parse_model_list(WebhookDelivery, "deliveries"),
+    )
+
+
 def _op_list_deliveries(
     db: str,
     id: int,
@@ -2014,6 +2032,14 @@ class RtDbAdminClient:
         """
         self._executor.run(_op_delete_webhook(db, id))
 
+    def redeliver_delivery(self, db: str, id: int, delivery_id: int) -> WebhookDelivery:
+        """Re-enqueue a failed delivery. Active deliveries raise CONFLICT."""
+        return self._executor.run(_op_redeliver_delivery(db, id, delivery_id))
+
+    def redeliver_failed(self, db: str, id: int) -> list[WebhookDelivery]:
+        """Re-enqueue all failed deliveries for one webhook."""
+        return self._executor.run(_op_redeliver_failed(db, id))
+
     def list_deliveries(
         self,
         db: str,
@@ -2763,6 +2789,14 @@ class AsyncRtDbAdminClient:
     async def delete_webhook(self, db: str, id: int) -> None:
         """``DELETE /admin/db/{db}/webhooks/{id}`` → ``{ok:true}`` (async)."""
         await self._executor.run(_op_delete_webhook(db, id))
+
+    async def redeliver_delivery(self, db: str, id: int, delivery_id: int) -> WebhookDelivery:
+        """Re-enqueue a failed delivery. Active deliveries raise CONFLICT (async)."""
+        return await self._executor.run(_op_redeliver_delivery(db, id, delivery_id))
+
+    async def redeliver_failed(self, db: str, id: int) -> list[WebhookDelivery]:
+        """Re-enqueue all failed deliveries for one webhook (async)."""
+        return await self._executor.run(_op_redeliver_failed(db, id))
 
     async def list_deliveries(
         self,
