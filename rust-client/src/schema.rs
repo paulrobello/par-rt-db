@@ -10,8 +10,8 @@
 use std::collections::BTreeMap;
 
 pub use par_rt_db_core::schema::{
-    DistanceMetric, FieldType, IndexDef, OnDeleteAction, SchemaDef, TableDef, TtlDef,
-    VectorIndexSpec, is_widening_of, strip_on_delete,
+    DistanceMetric, FieldConstraints, FieldType, IndexDef, OnDeleteAction, SchemaDef, TableDef,
+    TtlDef, VectorIndexSpec, is_widening_of, strip_on_delete,
 };
 
 use crate::value_expr::ValueExpr;

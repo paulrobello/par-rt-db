@@ -13,7 +13,9 @@ http = ["dep:reqwest"]
 # `futures-util` is needed by `http` (streaming upload) as well as `ws`.
 ws = ["dep:tokio", "dep:tokio-tungstenite"]
 admin = ["http"]
-in_memory = ["dep:sha2"]
+# `regex` backs the per-field `pattern` constraint (unanchored search) — same
+# crate the server enforces with, so both engines share semantics.
+in_memory = ["dep:sha2", "dep:regex"]
 
 [lints]
 workspace = true
@@ -30,6 +32,10 @@ tokio = { workspace = true, features = ["macros", "rt", "sync", "time"], optiona
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"], optional = true }
 futures-util = { workspace = true }
 sha2 = { workspace = true, optional = true }
+# Optional behind `in_memory`: the per-field `pattern` constraint's unanchored
+# search — the same `regex` crate the server compiles patterns with, so both
+# engines share semantics.
+regex = { version = "1", optional = true }
 
 [dev-dependencies]
 # `net`/`io-util` are dev-only on purpose: the library never names

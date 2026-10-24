@@ -898,6 +898,11 @@ pub trait InMemorySchemaValidateExt {
 impl InMemorySchemaValidateExt for SchemaDef {
     fn validate(&self) -> Result<(), RtDbError> {
         for (table_name, table) in &self.tables {
+            // Per-field write constraints (server `validate_constraints`):
+            // push-time rejection of misapplied entries / invalid regexes,
+            // first on the table — matching the ts-client's
+            // `validateConstraints` call order in `pushSchema`.
+            super::validate::validate_constraints(table_name, table)?;
             // `olderThan` context gate for `authorize` (server
             // `validate_structure`'s `validate_filter_expr_fields(authorize,
             // _, true, false)` call): an authorize predicate is evaluated per

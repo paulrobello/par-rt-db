@@ -2277,6 +2277,7 @@ dependencies = [
  "criterion",
  "futures-util",
  "par-rt-db-core",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

@@ -6,6 +6,8 @@
 
 use std::collections::BTreeMap;
 
+use regex::Regex;
+
 use super::*;
 
 /// Deep clone of a JSON doc. Docs are pure JSON — safe to round-trip — so
@@ -176,6 +178,7 @@ pub fn validate_doc(table: &TableDef, doc: &Value) -> Result<(), RtDbError> {
                         format!("field '{field}' has an invalid value"),
                     ));
                 }
+                check_constraints_for_field(table, field, v)?;
             }
             None if !matches!(field_ty, FieldType::Optional { .. }) => {
                 return Err(RtDbError::new(
@@ -185,6 +188,201 @@ pub fn validate_doc(table: &TableDef, doc: &Value) -> Result<(), RtDbError> {
             }
             None => {}
         }
+    }
+    Ok(())
+}
+
+/// Unwraps `Optional` layers to the base type — constraints apply to the
+/// non-null values of an optional field; null itself never violates. Port of
+/// server `schema::strip_optional`.
+pub(super) fn strip_optional(mut ty: &FieldType) -> &FieldType {
+    while let FieldType::Optional { inner } = ty {
+        ty = inner;
+    }
+    ty
+}
+
+/// Write-path constraint check for one present field value — a port of server
+/// `schema::value::check_constraints_for_field` and the TS
+/// `checkConstraintsForField`. Null never violates; a missing `constraints`
+/// entry is a no-op. `min`/`max` compare inclusively — f64 compare on
+/// `number`, exact i64 compare on `int64` (the decimal-string wire form parses
+/// to i64); `minLength`/`maxLength` count Unicode scalar values; `pattern` is
+/// an unanchored regex search. Violations are `SCHEMA_VIOLATION` naming the
+/// field and constraint.
+pub(super) fn check_constraints_for_field(
+    table: &TableDef,
+    field_name: &str,
+    value: &Value,
+) -> Result<(), RtDbError> {
+    let Some(fc) = table.constraints.get(field_name) else {
+        return Ok(());
+    };
+    if value.is_null() {
+        return Ok(());
+    }
+    let violate = |label: &str| {
+        RtDbError::new(
+            ErrorCode::SchemaViolation,
+            format!("field '{field_name}' violates its '{label}' constraint"),
+        )
+    };
+    match table.fields.get(field_name).map(strip_optional) {
+        Some(FieldType::Number) => {
+            let v = value.as_f64().unwrap_or(f64::NAN);
+            if let Some(min) = fc.min.as_ref().and_then(|n| n.as_f64())
+                && v < min
+            {
+                return Err(violate("min"));
+            }
+            if let Some(max) = fc.max.as_ref().and_then(|n| n.as_f64())
+                && v > max
+            {
+                return Err(violate("max"));
+            }
+        }
+        Some(FieldType::Int64) => {
+            let v = value.as_str().and_then(|s| s.parse::<i64>().ok());
+            let Some(v) = v else {
+                return Ok(());
+            };
+            let bound = |n: &serde_json::Number| {
+                n.as_i64()
+                    .or_else(|| n.as_f64().map(|f| f as i64))
+                    .unwrap_or(i64::MAX)
+            };
+            if let Some(min) = fc.min.as_ref().map(bound)
+                && v < min
+            {
+                return Err(violate("min"));
+            }
+            if let Some(max) = fc.max.as_ref().map(bound)
+                && v > max
+            {
+                return Err(violate("max"));
+            }
+        }
+        Some(FieldType::String) => {
+            let s = value.as_str().unwrap_or_default();
+            let len = s.chars().count() as u64;
+            if let Some(lo) = fc.min_length
+                && len < lo
+            {
+                return Err(violate("minLength"));
+            }
+            if let Some(hi) = fc.max_length
+                && len > hi
+            {
+                return Err(violate("maxLength"));
+            }
+            if let Some(pattern) = &fc.pattern {
+                let ok = Regex::new(pattern).is_ok_and(|re| re.is_match(s));
+                if !ok {
+                    return Err(violate("pattern"));
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Push-time validation of ONE constraints entry against its field's type —
+/// a port of server `schema::value::validate_constraints_entry`. The base
+/// type (after `Optional` unwrapping) must be `number`/`int64` for
+/// `min`/`max`, `string` for `minLength`/`maxLength`/`pattern`; a misapplied
+/// constraint is a `SCHEMA_VIOLATION` naming the field. `pattern` must
+/// compile under the `regex` crate (unanchored-search semantics). Also
+/// enforces `min <= max` and `minLength <= maxLength` when both ends are
+/// declared.
+pub(super) fn validate_constraints_entry(
+    field_name: &str,
+    field_type: &FieldType,
+    fc: &par_rt_db_core::schema::FieldConstraints,
+) -> Result<(), RtDbError> {
+    let base = strip_optional(field_type);
+    let bounds_ok = matches!(base, FieldType::Number | FieldType::Int64);
+    for (label, bound) in [("min", fc.min.as_ref()), ("max", fc.max.as_ref())] {
+        let Some(bound) = bound else { continue };
+        if !bounds_ok {
+            return Err(RtDbError::new(
+                ErrorCode::SchemaViolation,
+                format!(
+                    "constraints on field '{field_name}': '{label}' is legal only on number/int64 fields"
+                ),
+            ));
+        }
+        if matches!(base, FieldType::Int64) && bound.is_f64() {
+            return Err(RtDbError::new(
+                ErrorCode::SchemaViolation,
+                format!(
+                    "constraints on field '{field_name}': '{label}' bound must be an integer on an int64 field"
+                ),
+            ));
+        }
+    }
+    let string_ok = matches!(base, FieldType::String);
+    for (label, present) in [
+        ("minLength", fc.min_length.is_some()),
+        ("maxLength", fc.max_length.is_some()),
+        ("pattern", fc.pattern.is_some()),
+    ] {
+        if present && !string_ok {
+            return Err(RtDbError::new(
+                ErrorCode::SchemaViolation,
+                format!(
+                    "constraints on field '{field_name}': '{label}' is legal only on string fields"
+                ),
+            ));
+        }
+    }
+    if let (Some(lo), Some(hi)) = (&fc.min, &fc.max) {
+        let lo = lo.as_f64().unwrap_or(f64::NEG_INFINITY);
+        let hi = hi.as_f64().unwrap_or(f64::INFINITY);
+        if lo > hi {
+            return Err(RtDbError::new(
+                ErrorCode::SchemaViolation,
+                format!("constraints on field '{field_name}': 'min' exceeds 'max'"),
+            ));
+        }
+    }
+    if let (Some(lo), Some(hi)) = (fc.min_length, fc.max_length)
+        && lo > hi
+    {
+        return Err(RtDbError::new(
+            ErrorCode::SchemaViolation,
+            format!("constraints on field '{field_name}': 'minLength' exceeds 'maxLength'"),
+        ));
+    }
+    if let Some(pattern) = &fc.pattern
+        && let Err(err) = Regex::new(pattern)
+    {
+        return Err(RtDbError::new(
+            ErrorCode::SchemaViolation,
+            format!("constraints on field '{field_name}': invalid pattern: {err}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Push-time validation of a table's whole `constraints` map — a port of
+/// server `schema::validate`'s `validate_constraints`: every key names a
+/// declared field, then each entry is checked by
+/// [`validate_constraints_entry`]. Called by the
+/// `InMemorySchemaValidateExt` schema validation (both `push_schema` and the
+/// migrate derived-schema validation), so an in-memory push rejects with
+/// `SCHEMA_VIOLATION` what the live server 422s.
+pub(super) fn validate_constraints(table_name: &str, table: &TableDef) -> Result<(), RtDbError> {
+    for (field, fc) in &table.constraints {
+        let fty = table.fields.get(field).ok_or_else(|| {
+            RtDbError::new(
+                ErrorCode::SchemaViolation,
+                format!(
+                    "constraints key '{field}' is not a declared field of table '{table_name}'"
+                ),
+            )
+        })?;
+        validate_constraints_entry(field, fty, fc)?;
     }
     Ok(())
 }

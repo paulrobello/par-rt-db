@@ -83,7 +83,17 @@ insert (a patch / upsert-update patch / patchByQuery supplying a different
 value is rejected, and a replace must round-trip the stored value —
 omitted/null is filled back in). `.computed(field, expr)` declares a computed
 field (ENH-028) — the named field is re-derived from the closed `ValueExpr`
-grammar on every write (see below).
+grammar on every write (see below). `.constraints(&[(field, FieldConstraints)])`
+declares per-field write constraints (FM-43) — `min`/`max` bounds on
+`number`/`int64` fields (inclusive; exact i64 compare on `int64`, whose
+declared bounds must be integers) and/or `minLength`/`maxLength`/`pattern` on
+`string` fields (lengths in Unicode scalar values, inclusive; `pattern` is an
+unanchored regex search). The server enforces them on every write: a violating
+insert/patch/replace/upsert/patchByQuery fails with `SCHEMA_VIOLATION` naming
+the field and rolls back the transaction; `null` and absent values never
+violate. Push-time validated — a constraint on the wrong field type, an
+invalid regex, crossed bounds, or a key naming an undeclared field fails the
+push.
 
 ### In-memory test harness (feature `in_memory`)
 
