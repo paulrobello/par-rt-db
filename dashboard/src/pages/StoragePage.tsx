@@ -97,40 +97,6 @@ export function StoragePage() {
     }
   }
 
-  /** Mint a signed, time-limited URL for `id` in `db` via the server's
-   *  GET /api/storage/{db}/{id}/signed-url. The same-origin HttpOnly session
-   *  cookie authenticates the mint (the server's SEC-001 dashboard path); the
-   *  admin client has no mint surface, and per ARC-106 this is the dashboard's
-   *  one narrow call rather than a parallel HTTP client.
-   *  Returns the signed URL string, or throws with a message. */
-  async function mintSignedUrl(db: string, id: string, transform: TransformOpts | null) {
-    const params = new URLSearchParams();
-    if (transform) {
-      if (transform.w !== undefined) params.set("w", String(transform.w));
-      if (transform.h !== undefined) params.set("h", String(transform.h));
-      if (transform.fit !== undefined) params.set("fit", transform.fit);
-      if (transform.q !== undefined) params.set("q", String(transform.q));
-      if (transform.format !== undefined && transform.format !== "auto")
-        params.set("format", transform.format);
-    }
-    const qs = [...params.keys()].length > 0 ? `?${params.toString()}` : "";
-    const response = await fetch(
-      `${window.location.origin}/api/storage/${encodeURIComponent(db)}/${encodeURIComponent(id)}/signed-url${qs}`,
-      { credentials: "include" },
-    );
-    const body: unknown = await response.json().catch(() => null);
-    if (
-      !response.ok ||
-      body === null ||
-      typeof body !== "object" ||
-      !("url" in body) ||
-      typeof (body as { url: unknown }).url !== "string"
-    ) {
-      throw new Error(`signed-URL mint failed (HTTP ${response.status})`);
-    }
-    return (body as { url: string }).url;
-  }
-
   async function copyPublicUrl(file: FileMeta) {
     if (!db) return;
     setActionError(null);
@@ -142,12 +108,16 @@ export function StoragePage() {
     });
     setCopyingId(file.id);
     try {
-      // Mint server-side; never copy a hand-built bare link. Under
-      // RTDB_STORAGE_REQUIRE_SIGNED_URLS=true a bare /storage/{id} link 403s
-      // for the receiver. Transform opts ride the mint so the server binds
-      // them into the signature (SEC-003) — appending them client-side to a
-      // signed URL fails verification.
-      const url = await mintSignedUrl(db, file.id, size === "orig" ? null : SIZE_OPTS[size]);
+      // Mint server-side via the admin client; never copy a hand-built bare
+      // link. Under RTDB_STORAGE_REQUIRE_SIGNED_URLS=true a bare /storage/{id}
+      // link 403s for the receiver. Transform opts ride the mint so the
+      // server binds them into the signature (SEC-003) — appending them
+      // client-side to a signed URL fails verification.
+      const { url } = await client.getSignedUrl(
+        db,
+        file.id,
+        size === "orig" ? undefined : SIZE_OPTS[size],
+      );
       await navigator.clipboard.writeText(url);
       setCopiedId(file.id);
       if (copiedTimer.current) clearTimeout(copiedTimer.current);

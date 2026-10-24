@@ -120,7 +120,7 @@ pub enum Fit {
 }
 
 impl Fit {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Fit::Cover => "cover",
             Fit::Contain => "contain",

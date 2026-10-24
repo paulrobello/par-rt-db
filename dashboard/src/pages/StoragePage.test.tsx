@@ -6,15 +6,16 @@ import type { FileMeta } from "../lib/types";
 // StoragePage lists a database's stored files and wires upload/delete to
 // AdminClient. The list must render on db load; delete must confirm first then
 // call deleteFile; upload must call uploadFile with the chosen file's bytes.
-// Copy-URL mints a signed, expiring link via GET /api/storage/{db}/{id}/
-// signed-url (same-origin session cookie) — never copies a bare /storage link,
-// which 403s once the server requires signed URLs — and disables the row's
-// copy button with an inline reason when minting fails.
+// Copy-URL mints a signed, expiring link via AdminClient.getSignedUrl — never
+// copies a bare /storage link, which 403s once the server requires signed
+// URLs — and disables the row's copy button with an inline reason when
+// minting fails.
 
 const adminClientMock = vi.hoisted(() => ({
   listFiles: vi.fn(),
   uploadFile: vi.fn(),
   deleteFile: vi.fn(),
+  getSignedUrl: vi.fn(),
 }));
 
 vi.mock("../lib/admin", () => ({
@@ -36,19 +37,16 @@ const fileRow: FileMeta = {
 
 const SIGNED_URL = `https://rtdb.example/storage/${fileRow.id}?exp=1750003600000&sig=abc123`;
 
-function stubFetchSignedUrl(url: string = SIGNED_URL) {
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(async () => Response.json({ url, expiresAt: 1_750_003_600_000 }, { status: 200 })),
-  );
-}
-
 describe("StoragePage", () => {
   beforeEach(() => {
     for (const fn of Object.values(adminClientMock)) fn.mockReset();
     adminClientMock.listFiles.mockResolvedValue([]);
     adminClientMock.deleteFile.mockResolvedValue({ ok: true });
     adminClientMock.uploadFile.mockResolvedValue({ id: "newid001-aaaa" });
+    adminClientMock.getSignedUrl.mockResolvedValue({
+      url: SIGNED_URL,
+      expiresAt: 1_750_003_600_000,
+    });
   });
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -117,7 +115,10 @@ describe("StoragePage", () => {
   it("mints a signed URL with the selected image transform before copying", async () => {
     adminClientMock.listFiles.mockResolvedValue([fileRow]);
     const signedTransformed = `https://rtdb.example/storage/${fileRow.id}?w=512&fit=contain&exp=1750003600000&sig=def456`;
-    stubFetchSignedUrl(signedTransformed);
+    adminClientMock.getSignedUrl.mockResolvedValue({
+      url: signedTransformed,
+      expiresAt: 1_750_003_600_000,
+    });
     const user = userEvent.setup();
     render(<StoragePage />);
     const row = (await screen.findByText("file0001")).closest("tr");
@@ -132,17 +133,16 @@ describe("StoragePage", () => {
     await user.click(within(row).getByRole("button", { name: "copy signed URL" }));
 
     await waitFor(() => {
-      expect(fetch).toHaveBeenCalledWith(
-        `${window.location.origin}/api/storage/db1/${fileRow.id}/signed-url?w=512&fit=contain`,
-        { credentials: "include" },
-      );
+      expect(adminClientMock.getSignedUrl).toHaveBeenCalledWith("db1", fileRow.id, {
+        w: 512,
+        fit: "contain",
+      });
       expect(writeText).toHaveBeenCalledWith(signedTransformed);
     });
   });
 
   it("copies the minted signed URL, not a bare link, when size is original", async () => {
     adminClientMock.listFiles.mockResolvedValue([fileRow]);
-    stubFetchSignedUrl();
     const user = userEvent.setup();
     render(<StoragePage />);
     const row = (await screen.findByText("file0001")).closest("tr");
@@ -155,10 +155,7 @@ describe("StoragePage", () => {
     expect(copy).toHaveAttribute("title", "copies a signed, time-limited URL (it expires)");
     await user.click(copy);
     await waitFor(() => {
-      expect(fetch).toHaveBeenCalledWith(
-        `${window.location.origin}/api/storage/db1/${fileRow.id}/signed-url`,
-        { credentials: "include" },
-      );
+      expect(adminClientMock.getSignedUrl).toHaveBeenCalledWith("db1", fileRow.id, undefined);
       expect(writeText).toHaveBeenCalledWith(SIGNED_URL);
     });
     expect(writeText).not.toHaveBeenCalledWith(`${window.location.origin}/storage/${fileRow.id}`);
@@ -166,10 +163,7 @@ describe("StoragePage", () => {
 
   it("disables copy with an inline reason if signed-URL mint fails", async () => {
     adminClientMock.listFiles.mockResolvedValue([fileRow]);
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => Response.json({ code: "FORBIDDEN", message: "denied" }, { status: 403 })),
-    );
+    adminClientMock.getSignedUrl.mockRejectedValue(new Error("signed-URL mint failed (HTTP 403)"));
     const user = userEvent.setup();
     render(<StoragePage />);
     const row = (await screen.findByText("file0001")).closest("tr");

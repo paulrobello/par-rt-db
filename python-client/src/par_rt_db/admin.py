@@ -113,6 +113,7 @@ from .admin_models import (
     SchemaHistorySummary,
     SchemaPreviewDiff,
     SessionInfo,
+    SignedUrl,
     SlowQueriesResponse,
     SubscriptionsResponse,
     TokenInfo,
@@ -652,6 +653,38 @@ def _op_admin_upload_file(
 
 def _op_admin_delete_file(db: str, id: str) -> _AdminRequest:
     return _AdminRequest("DELETE", f"/admin/db/{db}/storage/{id}", {}, _parse_expect_ok)
+
+
+def _op_get_signed_url(
+    db: str,
+    id: str,
+    *,
+    w: int | None = None,
+    h: int | None = None,
+    fit: str | None = None,
+    q: int | None = None,
+    format: str | None = None,
+) -> _AdminRequest:
+    """Mint a signed, time-limited URL for a storage blob. The transform
+    params ride the mint so the server binds them into the signature
+    (SEC-003); ``format="auto"`` is the server default and is omitted."""
+    params: dict[str, Any] = {}
+    if w is not None:
+        params["w"] = w
+    if h is not None:
+        params["h"] = h
+    if fit is not None:
+        params["fit"] = fit
+    if q is not None:
+        params["q"] = q
+    if format is not None and format != "auto":
+        params["format"] = format
+    return _AdminRequest(
+        "GET",
+        f"/api/storage/{db}/{id}/signed-url",
+        {"params": params or None},
+        _parse_model(SignedUrl),
+    )
 
 
 # --- per-db anonymous-access toggle (SEC-103) ---
@@ -1701,6 +1734,26 @@ class RtDbAdminClient:
         """
         self._executor.run(_op_admin_delete_file(db, id))
 
+    def get_signed_url(
+        self,
+        db: str,
+        id: str,
+        *,
+        w: int | None = None,
+        h: int | None = None,
+        fit: str | None = None,
+        q: int | None = None,
+        format: str | None = None,
+    ) -> SignedUrl:
+        """``GET /api/storage/{db}/{id}/signed-url`` → ``SignedUrl``.
+
+        Mints an HMAC-signed, time-limited public serve URL. The optional
+        image-transform kwargs ride the mint so the server binds them into the
+        signature (SEC-003) — appending them client-side to a signed URL fails
+        verification. ``format="auto"`` is the server default and is omitted.
+        """
+        return self._executor.run(_op_get_signed_url(db, id, w=w, h=h, fit=fit, q=q, format=format))
+
     # --- per-db anonymous-access toggle (SEC-103) ---
 
     def get_anonymous_access(self, db: str) -> bool:
@@ -2493,6 +2546,26 @@ class AsyncRtDbAdminClient:
         See :meth:`RtDbAdminClient.admin_delete_file` for idempotency semantics.
         """
         await self._executor.run(_op_admin_delete_file(db, id))
+
+    async def get_signed_url(
+        self,
+        db: str,
+        id: str,
+        *,
+        w: int | None = None,
+        h: int | None = None,
+        fit: str | None = None,
+        q: int | None = None,
+        format: str | None = None,
+    ) -> SignedUrl:
+        """``GET /api/storage/{db}/{id}/signed-url`` → ``SignedUrl`` (async).
+
+        See :meth:`RtDbAdminClient.get_signed_url` for the mint and
+        SEC-003 transform-binding semantics.
+        """
+        return await self._executor.run(
+            _op_get_signed_url(db, id, w=w, h=h, fit=fit, q=q, format=format)
+        )
 
     # --- per-db anonymous-access toggle (SEC-103) ---
 

@@ -2182,3 +2182,22 @@ public struct FileMetadata: Equatable, Codable, Sendable {
         creationTime = try container.decode(Int64.self, forKey: .creationTime)
     }
 }
+
+/// `GET /api/storage/{db}/{id}/signed-url` response: a time-limited signed
+/// serve URL and its absolute expiry (epoch milliseconds). The URL fetches
+/// until `expiresAt`.
+public struct SignedUrl: Equatable, Codable, Sendable {
+    /// The signed URL — fetchable (publicly) until `expiresAt`.
+    public var url: String
+    /// Absolute expiry, epoch milliseconds.
+    public var expiresAt: Int64
+
+    public init(url: String, expiresAt: Int64) {
+        self.url = url
+        self.expiresAt = expiresAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case url, expiresAt
+    }
+}

@@ -2568,6 +2568,63 @@ async fn delete_file_deletes_and_returns_ok() {
     client.delete_file("kanban", "f9").await.unwrap();
 }
 
+#[tokio::test]
+async fn get_signed_url_mints_with_transform_query() {
+    let (server, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/api/storage/kanban/f1/signed-url"))
+        .and(header("authorization", BEARER))
+        .and(query_param("w", "512"))
+        .and(query_param("fit", "contain"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "url": "https://rtdb.example/storage/f1?w=512&fit=contain&exp=1750003600000&sig=def456",
+            "expiresAt": 1750003600000i64
+        })))
+        .mount(&server)
+        .await;
+    let signed = client
+        .get_signed_url(
+            "kanban",
+            "f1",
+            Some(&crate::http::TransformOpts {
+                w: Some(512),
+                fit: Some(crate::http::Fit::Contain),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        signed.url,
+        "https://rtdb.example/storage/f1?w=512&fit=contain&exp=1750003600000&sig=def456"
+    );
+    assert_eq!(signed.expires_at, 1750003600000);
+}
+
+#[tokio::test]
+async fn get_signed_url_omits_query_when_no_transform() {
+    let (server, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/api/storage/kanban/f1/signed-url"))
+        .and(header("authorization", BEARER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "url": "https://rtdb.example/storage/f1?exp=1750003600000&sig=abc123",
+            "expiresAt": 1750003600000i64
+        })))
+        .mount(&server)
+        .await;
+    let signed = client.get_signed_url("kanban", "f1", None).await.unwrap();
+    assert_eq!(signed.expires_at, 1750003600000);
+    // The bare-GET mock matched, so no transform params leaked into the query.
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1);
+    assert!(
+        reqs[0].url.query().is_none(),
+        "query leaked: {:?}",
+        reqs[0].url
+    );
+}
+
 // ── Anonymous-access toggle (mirror ts-client admin.test.ts) ────────────
 
 #[tokio::test]

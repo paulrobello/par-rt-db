@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strconv"
 
 	"github.com/paulrobello/par-rt-db/go-client/httpclient"
 	"github.com/paulrobello/par-rt-db/go-client/wire"
@@ -189,6 +190,36 @@ func (c *AdminClient) UploadFile(ctx context.Context, db string, data []byte, co
 // DeleteFile: DELETE /admin/db/{db}/storage/{id} → {ok:true}; idempotent.
 func (c *AdminClient) DeleteFile(ctx context.Context, db, id string) error {
 	return c.ok(ctx, methodDelete, fmt.Sprintf("/admin/db/%s/storage/%s", db, id), nil)
+}
+
+// GetSignedUrl: GET /api/storage/{db}/{id}/signed-url → a time-limited
+// signed serve URL. Transform opts ride the mint so the server binds them
+// into the signature (SEC-003); nil opts mint a plain URL. "auto" format is
+// the server default and is omitted (rust/ts parity).
+func (c *AdminClient) GetSignedUrl(ctx context.Context, db, id string, opts *httpclient.TransformOpts) (*httpclient.SignedUrl, error) {
+	q := url.Values{}
+	if opts != nil {
+		if opts.W != nil {
+			q.Set("w", strconv.Itoa(*opts.W))
+		}
+		if opts.H != nil {
+			q.Set("h", strconv.Itoa(*opts.H))
+		}
+		if opts.Fit != "" {
+			q.Set("fit", string(opts.Fit))
+		}
+		if opts.Q != nil {
+			q.Set("q", strconv.Itoa(*opts.Q))
+		}
+		if opts.Format != "" && opts.Format != "auto" {
+			q.Set("format", string(opts.Format))
+		}
+	}
+	var out httpclient.SignedUrl
+	if err := c.get(ctx, fmt.Sprintf("/api/storage/%s/%s/signed-url", db, id), q, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // GetAnonymousAccess: GET /admin/db/{db}/anonymous-access → the per-db

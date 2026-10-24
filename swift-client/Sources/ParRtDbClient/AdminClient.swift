@@ -821,6 +821,43 @@ public actor RtDbAdminClient {
         )
     }
 
+    /// `GET /api/storage/{db}/{id}/signed-url` → `SignedUrl`. Mints an
+    /// HMAC-signed, time-limited public serve URL; the transform params ride
+    /// the mint so the server binds them into the signature (SEC-003) —
+    /// appending them client-side to a signed URL fails verification.
+    /// `format: .auto` is the server default and is omitted (rust/ts parity).
+    public func getSignedUrl(
+        _ db: String,
+        _ id: String,
+        width: Int? = nil,
+        height: Int? = nil,
+        fit: Fit? = nil,
+        quality: Int? = nil,
+        format: OutFormat? = nil
+    ) async throws -> SignedUrl {
+        var query: [URLQueryItem] = []
+        if let width {
+            query.append(URLQueryItem(name: "w", value: String(width)))
+        }
+        if let height {
+            query.append(URLQueryItem(name: "h", value: String(height)))
+        }
+        if let fit {
+            query.append(URLQueryItem(name: "fit", value: fit.rawValue))
+        }
+        if let quality {
+            query.append(URLQueryItem(name: "q", value: String(quality)))
+        }
+        if let format, format != .auto {
+            query.append(URLQueryItem(name: "format", value: format.rawValue))
+        }
+        return try await getJson(
+            "signed url",
+            "/api/storage/\(encodePath(db))/\(encodePath(id))/signed-url",
+            query: query
+        )
+    }
+
     // MARK: Anonymous-access toggle (SEC-103)
 
     /// `GET /admin/db/{db}/anonymous-access` → `{enabled}` — the per-database

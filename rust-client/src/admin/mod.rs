@@ -1270,6 +1270,49 @@ impl RtDbAdminClient {
         self.expect_ok(resp).await
     }
 
+    /// `GET /api/storage/{db}/{id}/signed-url` → `{url, expiresAt}`. Mints an
+    /// HMAC-signed, time-limited public serve URL; `transform` params ride the
+    /// mint so the server binds them into the signature (SEC-003) — appending
+    /// them client-side to a signed URL fails verification. Reuses
+    /// `SignedUrl`/`TransformOpts` from `http` (admin implies http).
+    pub async fn get_signed_url(
+        &self,
+        db: &str,
+        id: &str,
+        transform: Option<&crate::http::TransformOpts>,
+    ) -> Result<crate::http::SignedUrl, RtDbError> {
+        let mut pairs: Vec<(&str, String)> = Vec::new();
+        if let Some(t) = transform {
+            if let Some(w) = t.w {
+                pairs.push(("w", w.to_string()));
+            }
+            if let Some(h) = t.h {
+                pairs.push(("h", h.to_string()));
+            }
+            if let Some(fit) = t.fit {
+                pairs.push(("fit", fit.as_str().to_string()));
+            }
+            if let Some(q) = t.q {
+                pairs.push(("q", q.to_string()));
+            }
+            if let Some(f) = t.format {
+                // `Auto` is the server default; omit it so the query stays
+                // minimal (same convention as `RtDbHttpClient::transform_url`).
+                let s = match f {
+                    crate::http::OutFormat::Auto => "",
+                    crate::http::OutFormat::Jpeg => "jpeg",
+                    crate::http::OutFormat::Png => "png",
+                };
+                if !s.is_empty() {
+                    pairs.push(("format", s.to_string()));
+                }
+            }
+        }
+        let query: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        self.get_json(&format!("/api/storage/{db}/{id}/signed-url"), &query)
+            .await
+    }
+
     // ── Anonymous-access toggle (SEC-103:
     //     GET|PATCH /admin/db/{db}/anonymous-access) ───────────────────────────
     //

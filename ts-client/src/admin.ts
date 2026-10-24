@@ -1,6 +1,6 @@
 import type { WebSocketLike } from "./client.js";
 import { RtDbError } from "./errors.js";
-import { enrollRequest, type FileMetadata } from "./http.js";
+import { enrollRequest, type FileMetadata, type SignedUrl, type TransformOpts } from "./http.js";
 import { PROTOCOL_VERSION } from "./protocol.js";
 import type {
   MigrateRequestJson,
@@ -1396,6 +1396,28 @@ export class RtDbAdminClient {
       "DELETE",
       `/admin/db/${encodeURIComponent(db)}/storage/${encodeURIComponent(id)}`,
     )) as { ok: boolean };
+  }
+
+  /** Mint a signed, time-limited URL for a storage blob (GET
+   *  /api/storage/{db}/{id}/signed-url) → `{url, expiresAt}`. Transform opts
+   *  ride the mint so the server binds them into the signature (SEC-003) —
+   *  appending them client-side to a signed URL fails verification. `format:
+   *  "auto"` is the server default and is omitted. */
+  async getSignedUrl(db: string, id: string, transform?: TransformOpts): Promise<SignedUrl> {
+    const params = new URLSearchParams();
+    if (transform) {
+      if (transform.w !== undefined) params.set("w", String(transform.w));
+      if (transform.h !== undefined) params.set("h", String(transform.h));
+      if (transform.fit !== undefined) params.set("fit", transform.fit);
+      if (transform.q !== undefined) params.set("q", String(transform.q));
+      if (transform.format !== undefined && transform.format !== "auto")
+        params.set("format", transform.format);
+    }
+    const qs = [...params.keys()].length > 0 ? `?${params.toString()}` : "";
+    return (await this.request(
+      "GET",
+      `/api/storage/${encodeURIComponent(db)}/${encodeURIComponent(id)}/signed-url${qs}`,
+    )) as SignedUrl;
   }
 
   /** List webhooks registered for `db` (GET /admin/db/{db}/webhooks). Returns an

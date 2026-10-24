@@ -1701,3 +1701,49 @@ describe("HotConfig rate-limit fields (hot-configurable ceilings)", () => {
     expect(patch.perDbRpm).toBe(1200);
   });
 });
+
+describe("admin signed URL mint", () => {
+  it("sends authenticated transform parameters and returns the expiry", async () => {
+    const signed = { url: "https://h/storage/f1?sig=a", expiresAt: 1234 };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(signed));
+    const client = new RtDbAdminClient({ url: "http://h", adminKey: "k", fetch: fetchMock });
+    expect(
+      await client.getSignedUrl("app", "f1", {
+        w: 512,
+        h: 256,
+        fit: "cover",
+        q: 80,
+        format: "jpeg",
+      }),
+    ).toEqual(signed);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://h/api/storage/app/f1/signed-url?w=512&h=256&fit=cover&q=80&format=jpeg",
+      expect.objectContaining({
+        method: "GET",
+        headers: expect.objectContaining({ Authorization: "Bearer k" }),
+      }),
+    );
+  });
+
+  it("omits unset options and auto format", async () => {
+    // Each call needs a fresh Response — a Response body can only be read once.
+    const fetchMock = vi
+      .fn()
+      .mockImplementation(async () => jsonResponse({ url: "https://h/f1", expiresAt: 1 }));
+    const client = new RtDbAdminClient({ url: "http://h", adminKey: "k", fetch: fetchMock });
+    await client.getSignedUrl("app", "f1");
+    await client.getSignedUrl("app", "f1", { format: "auto" });
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "http://h/api/storage/app/f1/signed-url",
+      "http://h/api/storage/app/f1/signed-url",
+    ]);
+  });
+
+  it("maps mint failures through the normal admin error envelope", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ code: "NOT_FOUND", message: "unknown file" }, 404));
+    const client = new RtDbAdminClient({ url: "http://h", adminKey: "k", fetch: fetchMock });
+    await expect(client.getSignedUrl("app", "f1")).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+});

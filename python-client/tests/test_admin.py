@@ -50,6 +50,7 @@ from par_rt_db.admin_models import (
     HostCapability,
     MergeConflict,
     MergeDbResult,
+    SignedUrl,
 )
 from par_rt_db.errors import ErrorCode, RtDbError
 from par_rt_db.http_client import FileMetadata, SubscriptionInfo
@@ -2710,6 +2711,47 @@ def test_admin_delete_file_hits_route() -> None:
     assert result is None
     assert captured["method"] == "DELETE"
     assert captured["path"] == "/admin/db/kanban/storage/f1"
+
+
+def test_get_signed_url_builds_transform_query() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["query"] = (request.url.query or b"").decode()
+        return httpx.Response(
+            200,
+            json={
+                "url": "https://rtdb.example/storage/f1?w=512&fit=contain&exp=5&sig=a",
+                "expiresAt": 5,
+            },
+        )
+
+    with _sync_client(handler) as c:
+        signed = c.get_signed_url("kanban", "f1", w=512, fit="contain")
+    assert captured["method"] == "GET"
+    assert captured["path"] == "/api/storage/kanban/f1/signed-url"
+    assert captured["query"] == "w=512&fit=contain"
+    assert isinstance(signed, SignedUrl)
+    assert signed.url == "https://rtdb.example/storage/f1?w=512&fit=contain&exp=5&sig=a"
+    assert signed.expires_at == 5
+
+
+def test_get_signed_url_omits_empty_query() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["query"] = str(request.url.query or "")
+        return httpx.Response(
+            200,
+            json={"url": "https://rtdb.example/storage/f1?exp=5&sig=a", "expiresAt": 5},
+        )
+
+    with _sync_client(handler) as c:
+        signed = c.get_signed_url("kanban", "f1")
+    assert captured["query"] == ""
+    assert signed.url == "https://rtdb.example/storage/f1?exp=5&sig=a"
 
 
 # --- per-db anonymous-access toggle (SEC-103) ------------------------------

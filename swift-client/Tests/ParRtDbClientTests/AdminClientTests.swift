@@ -1237,6 +1237,36 @@ struct AdminClientTests {
         try await client.deleteFile("app", id: "f3")
     }
 
+    @Test func adminSignedUrlMintsWithTransformQuery() async throws {
+        let client = makeAdminClient()
+        StubProtocol.handler = { request in
+            try adminAuth(request)
+            try demand(request.httpMethod == "GET", "expected GET")
+            try demand(request.url?.path == "/api/storage/app/f1/signed-url", "path mismatch")
+            let query = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            try demand(query.contains(URLQueryItem(name: "w", value: "512")), "width missing")
+            try demand(query.contains(URLQueryItem(name: "fit", value: "contain")), "fit missing")
+            let body = #"{"url":"https://rtdb.example/storage/f1?w=512&fit=contain&exp=5&sig=a","expiresAt":5}"#
+            return (200, Data(body.utf8))
+        }
+        let signed = try await client.getSignedUrl("app", "f1", width: 512, fit: .contain)
+        #expect(signed.url == "https://rtdb.example/storage/f1?w=512&fit=contain&exp=5&sig=a")
+        #expect(signed.expiresAt == 5)
+    }
+
+    @Test func adminSignedUrlOmitsEmptyQuery() async throws {
+        let client = makeAdminClient()
+        StubProtocol.handler = { request in
+            try adminAuth(request)
+            try demand(request.httpMethod == "GET", "expected GET")
+            try demand(request.url?.path == "/api/storage/app/f1/signed-url", "path mismatch")
+            try demand(request.url?.query == nil, "query leaked")
+            return (200, Data(#"{"url":"https://rtdb.example/storage/f1?exp=5&sig=a","expiresAt":5}"#.utf8))
+        }
+        let signed = try await client.getSignedUrl("app", "f1")
+        #expect(signed.expiresAt == 5)
+    }
+
     @Test func anonymousAccessGetAndSet() async throws {
         let client = makeAdminClient()
         StubProtocol.handler = { request in

@@ -12,10 +12,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
 	rtdberrors "github.com/paulrobello/par-rt-db/go-client/errors"
+	"github.com/paulrobello/par-rt-db/go-client/httpclient"
 	"github.com/paulrobello/par-rt-db/go-client/wire"
 )
 
@@ -323,6 +325,53 @@ func TestImportDBOKFalseIsError(t *testing.T) {
 	err := client.ImportDB(context.Background(), "app", "line1\n")
 	if !rtdberrors.IsCode(err, rtdberrors.CodeInternal) {
 		t.Fatalf("want INTERNAL on ok=false, got %v", err)
+	}
+}
+
+func TestGetSignedUrlMintsWithTransformQuery(t *testing.T) {
+	var gotQuery url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/storage/app/f1/signed-url" {
+			t.Errorf("got %s %s", r.Method, r.URL.Path)
+		}
+		gotQuery = r.URL.Query()
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"url":"https://rtdb.example/storage/f1?w=512&fit=contain&exp=5&sig=a","expiresAt":5}`))
+	}))
+	defer srv.Close()
+	client := NewAdminClient(srv.URL, testAdminKey)
+	w := 512
+	out, err := client.GetSignedUrl(context.Background(), "app", "f1",
+		&httpclient.TransformOpts{W: &w, Fit: httpclient.FitContain})
+	if err != nil {
+		t.Fatalf("GetSignedUrl: %v", err)
+	}
+	if out.URL != "https://rtdb.example/storage/f1?w=512&fit=contain&exp=5&sig=a" || out.ExpiresAt != 5 {
+		t.Fatalf("got %+v", out)
+	}
+	if gotQuery.Get("w") != "512" || gotQuery.Get("fit") != "contain" {
+		t.Fatalf("got query %v", gotQuery)
+	}
+}
+
+func TestGetSignedUrlOmitsEmptyQuery(t *testing.T) {
+	var gotQuery url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"url":"https://rtdb.example/storage/f1?exp=5&sig=a","expiresAt":5}`))
+	}))
+	defer srv.Close()
+	client := NewAdminClient(srv.URL, testAdminKey)
+	out, err := client.GetSignedUrl(context.Background(), "app", "f1", nil)
+	if err != nil {
+		t.Fatalf("GetSignedUrl: %v", err)
+	}
+	if out.ExpiresAt != 5 {
+		t.Fatalf("got %+v", out)
+	}
+	if len(gotQuery) != 0 {
+		t.Fatalf("query leaked: %v", gotQuery)
 	}
 }
 
