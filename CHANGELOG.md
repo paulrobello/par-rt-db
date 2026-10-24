@@ -122,6 +122,14 @@ alter observable behavior on upgrade.
 
 ### Added
 
+- **Nested optional-object widening on push-schema.** Adding an optional
+  field inside `array<object>` element shapes (or a directly-nested `object`
+  field) is now accepted as an additive widening on push — no destructive
+  migrate required; existing rows stay valid (a missing optional validates).
+  Mirrored in all five in-memory engines; the rejection matrix (remove,
+  retype, required-add, union-narrowing, element-type swap) is pinned by
+  explicit tests in the server and every engine.
+
 - **Webhook delivery redelivery.** `POST /admin/db/{db}/webhooks/{id}/deliveries/{delivery_id}/redeliver`
   re-enqueues a failed (attempts-exhausted) delivery — one conditional UPDATE,
   so pending/retrying/delivered rows are a typed `CONFLICT` and concurrent
