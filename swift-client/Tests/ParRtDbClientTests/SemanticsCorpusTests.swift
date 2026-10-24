@@ -654,8 +654,18 @@ private func seedClient(
     var ids: [String: String] = [:]
     for (index, entry) in corpusCase.seed.enumerated() {
         let seed = try parseSeedEntry(entry, singleTable, corpusCase.stem, index)
+        // `$idRef` substitution applies to seed docs too: a seed may reference
+        // the minted id of any EARLIER `$id`-labeled seed (lookups need real
+        // cross-doc id references, which no other placeholder expresses).
+        // Forward references stay an authoring error.
+        let filled = try substitute(.object(seed.doc), ids, corpusCase.stem)
+        guard case let .object(doc) = filled else {
+            throw CorpusFailure(
+                "\(corpusCase.stem): seed #\(index): substitution produced a non-object"
+            )
+        }
         let results = try client.mutate(Transaction(steps: [
-            .insert(table: seed.table, doc: seed.doc)
+            .insert(table: seed.table, doc: doc)
         ]))
         guard case let .insert(id) = results[0] else {
             throw CorpusFailure("\(corpusCase.stem): seed #\(index): insert result missing id")

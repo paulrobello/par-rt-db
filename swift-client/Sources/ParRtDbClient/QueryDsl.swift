@@ -335,6 +335,19 @@ public struct TableQuery: Sendable {
         with { $0.fields = names }
     }
 
+    /// Server-side lookup expansion: resolves `field` (an Id / Optional<Id> /
+    /// Array<Id> declared field whose `Id.table` equals `table`) on each
+    /// result doc into the referenced document(s), exposed under `alias` on
+    /// the same doc. Depth-1 only; id-equality only. `cap` is the per-parent
+    /// joined-row cap for an id-ARRAY lookup (default 100, hard max 1000).
+    /// Legal with every doc-returning terminal, rejected `BAD_REQUEST` with
+    /// count/distinct/aggregate; the projection (`fields`) may name the alias.
+    public func lookup(
+        field: String, table: String, as alias: String, cap: UInt32? = nil
+    ) -> TableQuery {
+        with { $0.lookups.append(LookupSpec(field: field, table: table, as: alias, cap: cap)) }
+    }
+
     /// Validate terminal combinations (the server cascade's rules and messages,
     /// ported verbatim) and construct the wire `Query`.
     public func build() throws -> Query {
@@ -360,7 +373,8 @@ public struct TableQuery: Sendable {
             search: acc.search,
             vectorSearch: wireVectorSearch(),
             hybridSearch: wireHybridSearch(),
-            fields: acc.fields
+            fields: acc.fields,
+            lookups: acc.lookups
         )
     }
 
@@ -415,6 +429,7 @@ private struct Acc: Sendable {
     var vectorSearch: VectorSearchArgs?
     var hybridSearch: HybridSearchArgs?
     var fields: [String]?
+    var lookups: [LookupSpec] = []
 }
 
 /// Accumulator-only spec structs: keep the numeric fields as Int so `build()`

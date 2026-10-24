@@ -934,10 +934,14 @@ public final class InMemoryRtDbClient: MigrationStore {
 
     /// One-shot query — same shape as the HTTP client's `query` (store.ts
     /// `query`). The raw JSONValue result is decodable via `parseResult`.
+    /// One-shot query — same shape as the HTTP client's `query` (store.ts
+    /// `query`). The raw JSONValue result is decodable via `parseResult`.
     public func query(_ query: Query) throws -> JSONValue {
-        try executeQuery(query, requireTable(query.table)) { [self] table in
+        try executeQuery(query, requireTable(query.table), { [self] table in
             rowsFor(table)
-        }
+        }, { [self] table in
+            try requireTable(table)
+        })
     }
 
     /// Executes a transaction and returns one result per step, in order
@@ -1078,9 +1082,11 @@ public final class InMemoryRtDbClient: MigrationStore {
         let sub = EngineSubscription(query: query, table: query.table)
         subs.append(sub)
         sub.onUpdate = onUpdate
-        let initial = try executeQuery(sub.query, requireTable(sub.table)) { [self] table in
+        let initial = try executeQuery(sub.query, requireTable(sub.table), { [self] table in
             rowsFor(table)
-        }
+        }, { [self] table in
+            try requireTable(table)
+        })
         sub.last = initial
         sub.hasValue = true
         onUpdate(initial)
@@ -1099,7 +1105,10 @@ public final class InMemoryRtDbClient: MigrationStore {
     private func notifySubs(_ writeSet: Set<String>) {
         for sub in subs {
             guard writeSet.contains(sub.table), sub.onUpdate != nil,
-                  let next = try? executeQuery(sub.query, requireTable(sub.table), rowsFor)
+                  let next = try? executeQuery(
+                      sub.query, requireTable(sub.table), rowsFor,
+                      { [self] table in try requireTable(table) }
+                  )
             else { continue }
             if sub.hasValue, let last = sub.last, diffCanonical(sub.query, next) == diffCanonical(sub.query, last) {
                 continue

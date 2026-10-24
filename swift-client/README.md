@@ -244,6 +244,17 @@ let done = try TableQuery("tasks")
 // always kept; .fields() with no names = ids-only view; unknown = badRequest)
 let titles = try TableQuery("tasks").fields("title", "status").build()
 
+// Server-side lookup expansion: resolves a declared Id/Optional<Id>/Array<Id>
+// field into the referenced document(s) under the `as` key on each result doc
+// — N+1-free joins in one round trip, with per-row authorization applied on
+// the server. Legal with every doc-returning terminal; count/distinct/
+// aggregate reject it; .fields() may name the alias (cap: per-parent joined
+// row cap for an id-array lookup, default 100, hard max 1000).
+let enriched = try TableQuery("posts")
+    .lookup(field: "authorId", table: "users", as: "author")
+    .lookup(field: "tagIds", table: "tags", as: "tags", cap: 20)
+    .build()
+
 // Terminal-combination rules are enforced client-side at build(), with the
 // server's verbatim messages (e.g. "first cannot be combined with take").
 ```

@@ -322,18 +322,241 @@ func mergeDoc(_ row: StoredRow) -> JSONValue {
     return .object(merged)
 }
 
-// MARK: - Projection (Query.fields)
+// MARK: - Lookup expansion (mirrors server `query::lookup`)
+
+// swiftlint:disable cyclomatic_complexity function_body_length
+
+/// At most 4 lookups per query; a fifth is `BAD_REQUEST` (resource-cap style).
+let maxQueryLookups = 4
+/// Hard max of a `LookupSpec.cap` value; above is `BAD_REQUEST` at compile time.
+let maxLookupCap: UInt32 = 1000
+/// Default per-parent joined-row cap for an id-ARRAY lookup.
+let defaultLookupCap: UInt32 = 100
+/// Ceiling on total joined rows per execution; truncation proceeds in
+/// parent-result order (deterministic).
+let maxJoinedRows = 8192
+
+/// Compile-time lookup validation — a port of server `validate_lookups`:
+/// unknown lookup table → `NOT_FOUND`; field not declared or not
+/// `Id`/`Optional<Id>`/`Array<Id>` → `BAD_REQUEST`; declared `Id.table` ≠
+/// lookup `table` → `BAD_REQUEST`; `as` collisions → `BAD_REQUEST`; `cap` >
+/// 1000 → `BAD_REQUEST`; > 4 lookups → `BAD_REQUEST`. Returns the aliases the
+/// projection gate admits.
+func validateLookups(
+    _ query: Query, _ tableFor: (String) throws -> TableDef
+) throws -> [String] {
+    if query.lookups.isEmpty {
+        return []
+    }
+    if query.lookups.count > maxQueryLookups {
+        throw RtDbError(code: .badRequest, message: "at most \(maxQueryLookups) lookups per query")
+    }
+    var aliases: [String] = []
+    for lk in query.lookups {
+        let parentDef = try tableFor(query.table)
+        _ = try tableFor(lk.table)
+        guard let ty = parentDef.fields[lk.field] else {
+            throw RtDbError(
+                code: .badRequest,
+                message: "lookup field '\(lk.field)' is not declared on table '\(query.table)'"
+            )
+        }
+        let declaredChildTable: String? = switch ty {
+        case let .id(table, _):
+            table
+        case let .optional(inner):
+            if case let .id(table, _) = inner {
+                table
+            } else {
+                nil
+            }
+        case let .array(element):
+            if case let .id(table, _) = element {
+                table
+            } else {
+                nil
+            }
+        default:
+            nil
+        }
+        guard let declared = declaredChildTable else {
+            throw RtDbError(
+                code: .badRequest,
+                message: "lookup field '\(lk.field)' must be declared Id, Optional<Id>, or Array<Id>"
+            )
+        }
+        if declared != lk.table {
+            throw RtDbError(
+                code: .badRequest,
+                message:
+                "lookup field '\(lk.field)' declares Id table '\(declared)' "
+                    + "but the lookup names '\(lk.table)'"
+            )
+        }
+        let alias = lk.as
+        if alias.hasPrefix("_") {
+            throw RtDbError(
+                code: .badRequest, message: "lookup alias '\(alias)' must not start with '_'"
+            )
+        }
+        if parentDef.fields[alias] != nil {
+            throw RtDbError(
+                code: .badRequest, message: "lookup alias '\(alias)' collides with a declared field"
+            )
+        }
+        if aliases.contains(alias) {
+            throw RtDbError(
+                code: .badRequest,
+                message: "lookup alias '\(alias)' collides with another lookup alias"
+            )
+        }
+        if let cap = lk.cap, cap > maxLookupCap {
+            throw RtDbError(code: .badRequest, message: "lookup cap exceeds maximum of \(maxLookupCap)")
+        }
+        aliases.append(alias)
+    }
+    return aliases
+}
+
+/// Whether the lookup's declared field type makes it array-form
+/// (`Array<Id>`) rather than single-form (`Id`/`Optional<Id>`). Validation
+/// has already pinned the field to one of the three accepted shapes.
+func isArrayLookup(_ parentDef: TableDef, _ field: String) -> Bool {
+    guard let ty = parentDef.fields[field] else {
+        return false
+    }
+    let inner: FieldType = if case let .optional(wrapped) = ty {
+        wrapped
+    } else {
+        ty
+    }
+    if case .array = inner {
+        return true
+    }
+    return false
+}
+
+/// Execute-time expansion — a port of server `expand_lookups` (ts query.ts
+/// `expandLookups`): per lookup, collect the distinct ids across the result
+/// docs, fetch the visible child rows once (FM-33: stamped rows are
+/// invisible), then fan out in memory — declared id-array order, dangling ids
+/// dropped, `cap` truncation, and a deterministic `maxJoinedRows` ceiling in
+/// parent-result order. The in-memory harness models no principal, so joined
+/// rows carry no per-row authorization predicates (the server appends them to
+/// its batched fetch).
+func expandLookups(
+    _ result: JSONValue,
+    _ query: Query,
+    _ tableFor: (String) throws -> TableDef,
+    _ rowsFor: (String) -> [String: StoredRow]
+) throws -> JSONValue {
+    // Doc references by result shape (mirrors `mapResultDocs`'s routing);
+    // walk-and-rebuild, so the caller's result carries the joined keys.
+    let docs: [JSONValue] = if case let .object(page) = result, case let .array(pageDocs) = page["docs"] {
+        pageDocs
+    } else if query.count || query.distinct || query.aggregate != nil {
+        []
+    } else if query.get != nil || query.unique || query.first {
+        [result]
+    } else if case let .array(items) = result {
+        items
+    } else {
+        []
+    }
+    guard !docs.isEmpty, let parentDef = try tableFor(query.table) as TableDef? else {
+        return result
+    }
+    var rebuilt = docs
+    var budget = maxJoinedRows
+    for lk in query.lookups {
+        _ = try tableFor(lk.table)
+        let arrayForm = isArrayLookup(parentDef, lk.field)
+        // Distinct ids across the result set, first-seen order.
+        var ids: [String] = []
+        var seen: Set<String> = []
+        for doc in rebuilt {
+            guard case let .object(fields) = doc else { continue }
+            switch fields[lk.field] {
+            case let .string(id):
+                if !seen.contains(id) {
+                    seen.insert(id)
+                    ids.append(id)
+                }
+            case let .array(items):
+                for item in items {
+                    if case let .string(id) = item, !seen.contains(id) {
+                        seen.insert(id)
+                        ids.append(id)
+                    }
+                }
+            default:
+                break
+            }
+        }
+        // One in-memory fetch: visible (non-stamped) child rows by id.
+        let childRows = rowsFor(lk.table)
+        var fetched: [String: JSONValue] = [:]
+        for id in ids {
+            if let row = childRows[id], row.deletedAt == nil {
+                fetched[id] = mergeDoc(row)
+            }
+        }
+        let cap = lk.cap ?? defaultLookupCap
+        for (index, doc) in rebuilt.enumerated() {
+            guard case var .object(fields) = doc else { continue }
+            switch fields[lk.field] {
+            case let .string(id):
+                let joined: JSONValue? = budget > 0 ? fetched[id] : nil
+                if joined != nil {
+                    budget -= 1
+                }
+                fields[lk.as] = joined ?? .null
+            case let .array(items):
+                var out: [JSONValue] = []
+                for item in items {
+                    if out.count >= Int(cap) || budget == 0 {
+                        break
+                    }
+                    if case let .string(id) = item, let joined = fetched[id] {
+                        out.append(joined)
+                        budget -= 1
+                    }
+                }
+                fields[lk.as] = .array(out)
+            default:
+                fields[lk.as] = arrayForm ? .array([]) : .null
+            }
+            rebuilt[index] = .object(fields)
+        }
+    }
+    // Rebuild the result with the mutated docs, per the terminal's shape.
+    if case var .object(page) = result, page["docs"] != nil {
+        page["docs"] = .array(rebuilt)
+        return .object(page)
+    }
+    if query.get != nil || query.unique || query.first {
+        return rebuilt[0]
+    }
+    return .array(rebuilt)
+}
+
+// swiftlint:enable cyclomatic_complexity function_body_length
 
 /// Validate a `Query.fields` projection against the table — a port of server
-/// `validate_projection`: every name must be a declared field or one of the
-/// system fields (`_id`/`_creationTime`/`_version` — always included, so
-/// listing them is an allowed no-op). Anything else — including typo'd system
-/// names and other `_`-prefixed names — is BAD_REQUEST. `[]` (system fields
-/// only) validates trivially.
-func validateProjection(_ tableDef: TableDef, _ fields: [String]) throws {
+/// `validate_projection`: every name must be a declared field, one of the
+/// lookup aliases (admitted only when the query carries lookups — the aliases
+/// are synthetic result fields, the same class as `_searchSnippet`), or one
+/// of the system fields (`_id`/`_creationTime`/`_version` — always included,
+/// so listing them is an allowed no-op). Anything else — including typo'd
+/// system names and other `_`-prefixed names — is BAD_REQUEST. `[]` (system
+/// fields only) validates trivially.
+func validateProjection(_ tableDef: TableDef, _ fields: [String], _ lookupAliases: [String]) throws {
     let systemFields: Set = ["_id", "_creationTime", "_version"]
     for name in fields {
-        if systemFields.contains(name) || tableDef.fields[name] != nil {
+        let admitted =
+            systemFields.contains(name) || tableDef.fields[name] != nil
+                || lookupAliases.contains(name)
+        if admitted {
             continue
         }
         throw RtDbError(code: .badRequest, message: "unknown projection field '\(name)'")
@@ -416,16 +639,22 @@ struct ScanPlan {
 func executeQuery(
     _ query: Query,
     _ tableDef: TableDef,
-    _ rowsFor: (String) -> [String: StoredRow]
+    _ rowsFor: (String) -> [String: StoredRow],
+    _ tableFor: (String) throws -> TableDef
 ) throws -> JSONValue {
+    let aliases = try validateLookups(query, tableFor)
     if let fields = query.fields {
-        try validateProjection(tableDef, fields)
+        try validateProjection(tableDef, fields, aliases)
     }
     let result = try executeQueryUnprojected(query, tableDef, rowsFor)
+    let expanded =
+        query.lookups.isEmpty
+            ? result
+            : try expandLookups(result, query, tableFor, rowsFor)
     if let fields = query.fields {
-        return projectedResult(query, result, fields)
+        return projectedResult(query, expanded, fields)
     }
-    return result
+    return expanded
 }
 
 /// The dispatcher under the projection seam: guards, standalone terminals,
@@ -515,7 +744,8 @@ private func checkQueryCombinations(_ query: Query) throws {
         ("filter", query.filter != nil),
         ("search", query.search != nil),
         ("vectorSearch", query.vectorSearch != nil),
-        ("hybridSearch", query.hybridSearch != nil)
+        ("hybridSearch", query.hybridSearch != nil),
+        ("lookups", !query.lookups.isEmpty)
     ]
     let present = Set(flags.filter(\.1).map(\.0))
 

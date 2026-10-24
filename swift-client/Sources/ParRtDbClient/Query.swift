@@ -38,6 +38,52 @@ public struct Paginate: Equatable, Codable, Sendable {
     }
 }
 
+/// Mirrors server/src/query.rs::LookupSpec (core/src/query.rs `LookupSpec`) —
+/// camelCase, unknown fields rejected; the output key uses the raw `as` wire
+/// name; `cap` omitted when nil.
+public struct LookupSpec: Equatable, Codable, Sendable {
+    /// Declared field on the query's table: `Id`, `Optional<Id>`, or
+    /// `Array<Id>` whose element is an `Id`.
+    public var field: String
+    /// The referenced table. Must equal the field's declared `Id.table`.
+    public var table: String
+    /// Output key on each parent doc (`as` is a reserved word in several
+    /// client languages; the wire key is the raw `as`).
+    public var `as`: String
+    /// Per-parent joined-row cap for an id-ARRAY lookup. Default 100, hard
+    /// max 1000 (values above are `BAD_REQUEST`). Omitted when nil.
+    public var cap: UInt32?
+
+    public init(field: String, table: String, as: String, cap: UInt32? = nil) {
+        self.field = field
+        self.table = table
+        self.as = `as`
+        self.cap = cap
+    }
+
+    enum CodingKeys: String, CodingKey, CaseIterable {
+        case field, table, cap
+        case `as`
+    }
+
+    public init(from decoder: Decoder) throws {
+        try decoder.rejectUnknownKeys("LookupSpec", as: CodingKeys.self)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        field = try container.decode(String.self, forKey: .field)
+        table = try container.decode(String.self, forKey: .table)
+        `as` = try container.decode(String.self, forKey: .as)
+        cap = try container.decodeIfPresent(UInt32.self, forKey: .cap)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(field, forKey: .field)
+        try container.encode(table, forKey: .table)
+        try container.encode(`as`, forKey: .as)
+        try container.encodeIfPresent(cap, forKey: .cap)
+    }
+}
+
 /// Mirrors server/src/dsl.rs::Query (rust-client/src/query.rs::Query) — the
 /// wire `Query`: one table plus at most one read terminal. Single-word keys
 /// carry no case convention; `vectorSearch`/`hybridSearch` are explicitly
@@ -87,6 +133,12 @@ public struct Query: Equatable, Codable, Sendable {
     /// Projection: keep only these user fields per result doc; `_`-prefixed
     /// system fields are always kept. `[]` = system fields only; nil = full docs.
     public var fields: [String]?
+    /// Server-side lookup expansion: resolve an id / id-array field on each
+    /// result doc into the referenced document(s) of `table`, exposed under
+    /// the `as` key on the same doc. Depth-1 only; id-equality only. Omitted
+    /// from the wire when empty — mirrors server `Query.lookups`
+    /// (`skip_serializing_if = "Vec::is_empty"`).
+    public var lookups: [LookupSpec]
 
     public init(
         table: String, get: String? = nil, index: String? = nil, eq: [JSONValue] = [],
@@ -96,7 +148,8 @@ public struct Query: Equatable, Codable, Sendable {
         distinct: Bool = false, aggregate: AggregateSpec? = nil,
         paginate: Paginate? = nil, filter: FilterExpr? = nil,
         search: SearchQuery? = nil, vectorSearch: VectorSearchQuery? = nil,
-        hybridSearch: HybridSearchQuery? = nil, fields: [String]? = nil
+        hybridSearch: HybridSearchQuery? = nil, fields: [String]? = nil,
+        lookups: [LookupSpec] = []
     ) {
         self.table = table
         self.get = get
@@ -119,12 +172,13 @@ public struct Query: Equatable, Codable, Sendable {
         self.vectorSearch = vectorSearch
         self.hybridSearch = hybridSearch
         self.fields = fields
+        self.lookups = lookups
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
         case table, get, index, eq, gt, gte, lt, lte, order, take
         case unique, first, count, distinct, aggregate, paginate, filter
-        case search, vectorSearch, hybridSearch, fields
+        case search, vectorSearch, hybridSearch, fields, lookups
     }
 
     public init(from decoder: Decoder) throws {
@@ -151,6 +205,7 @@ public struct Query: Equatable, Codable, Sendable {
         vectorSearch = try container.decodeIfPresent(VectorSearchQuery.self, forKey: .vectorSearch)
         hybridSearch = try container.decodeIfPresent(HybridSearchQuery.self, forKey: .hybridSearch)
         fields = try container.decodeIfPresent([String].self, forKey: .fields)
+        lookups = try container.decodeIfPresent([LookupSpec].self, forKey: .lookups) ?? []
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -186,5 +241,8 @@ public struct Query: Equatable, Codable, Sendable {
         try container.encodeIfPresent(vectorSearch, forKey: .vectorSearch)
         try container.encodeIfPresent(hybridSearch, forKey: .hybridSearch)
         try container.encodeIfPresent(fields, forKey: .fields)
+        if !lookups.isEmpty {
+            try container.encode(lookups, forKey: .lookups)
+        }
     }
 }

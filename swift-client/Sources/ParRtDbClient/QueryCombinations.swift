@@ -22,7 +22,7 @@ enum QueryCombinationRules {
     static let clauses: [String] = [
         "get", "index", "eq", "gt", "gte", "lt", "lte", "order", "take", "unique", "first",
         "count", "distinct", "aggregate", "paginate", "filter", "search", "vectorSearch",
-        "hybridSearch"
+        "hybridSearch", "lookups"
     ]
 
     /// Rules in table order — order has no effect on which `code` a query fails with
@@ -469,6 +469,27 @@ enum QueryCombinationRules {
             code: "BAD_REQUEST",
             message: "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, "
                 + "aggregate, filter, or vector search"
+        ),
+        QueryCombinationRule(
+            id: "lookups-excludes-count",
+            forbid: ["lookups", "count"],
+            atMostOne: nil,
+            code: "BAD_REQUEST",
+            message: "lookups cannot be combined with count, distinct, or aggregate"
+        ),
+        QueryCombinationRule(
+            id: "lookups-excludes-distinct",
+            forbid: ["lookups", "distinct"],
+            atMostOne: nil,
+            code: "BAD_REQUEST",
+            message: "lookups cannot be combined with count, distinct, or aggregate"
+        ),
+        QueryCombinationRule(
+            id: "lookups-excludes-aggregate",
+            forbid: ["lookups", "aggregate"],
+            atMostOne: nil,
+            code: "BAD_REQUEST",
+            message: "lookups cannot be combined with count, distinct, or aggregate"
         )
     ]
 }
