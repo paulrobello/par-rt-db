@@ -10,7 +10,7 @@
 
 use serde::Serialize;
 
-use crate::schema::{FieldType, SchemaDef, strip_on_delete};
+use crate::schema::{FieldType, SchemaDef, is_type_change_rejected};
 
 /// Result of comparing a pending schema against the currently-applied one.
 /// `added` lists every new table/column/index the push will create; `rejected`
@@ -64,10 +64,12 @@ pub struct Rejection {
 /// - A table in `pending` not in `current` → every column and index under it is
 ///   `added`.
 /// - A table in both: each pending-only column is `added`; each current-only
-///   column is `rejected` (cannot drop); a column present in both with a
-///   different `FieldType` is `rejected` (cannot change type). The same three
-///   rules apply to indexes, matched by name. (`FieldType` and `IndexDef` both
-///   derive `PartialEq`, so `!=` is a structural equality.)
+///   column is `rejected` (cannot drop); a column present in both whose type
+///   change `schema::is_type_change_rejected` rejects is `rejected` — the same
+///   predicate the push path uses, so a safe widening (a literal-union
+///   superset) is accepted here exactly as `ddl::push_schema` accepts it. The
+///   same three rules apply to indexes, matched by name. (`FieldType` and
+///   `IndexDef` both derive `PartialEq`, so `!=` is a structural equality.)
 /// - Tables present in `current` but absent from `pending` are out of scope:
 ///   `push_schema` iterates the pending schema's tables and ignores others, so
 ///   a missing table here is not a drop the DDL layer would reject.
@@ -96,10 +98,13 @@ pub fn diff(current: Option<&SchemaDef>, pending: &SchemaDef) -> SchemaDiff {
                     name: fname.clone(),
                     field_type: field_type_display(ftype),
                 }),
-                // FM-33: compare with each side's `Id.on_delete` stripped, so an
-                // added/changed `onDelete` action is not previewed as a
-                // rejection (mirrors `ddl::detect_destructive_changes`).
-                Some(existing) if strip_on_delete(existing) != strip_on_delete(ftype) => {
+                // FM-33: `on_delete` is compared stripped, and widening changes
+                // (`is_widening_of`, e.g. a literal-union superset) are accepted
+                // — exactly as the push path classifies them, via the shared
+                // `is_type_change_rejected` predicate. Before this predicate
+                // existed preview false-rejected union widenings that
+                // `ddl::push_schema` accepted.
+                Some(existing) if is_type_change_rejected(existing, ftype) => {
                     rejected.push(Rejection {
                         table: table_name.clone(),
                         item: fname.clone(),
@@ -352,6 +357,85 @@ mod tests {
         assert!(r.reason.contains("cannot be changed"));
         assert!(r.reason.contains("string"));
         assert!(r.reason.contains("number"));
+    }
+
+    // A literal-union widening (new literal set is a superset) is what push
+    // accepts via `is_widening_of`, so preview must NOT list it as rejected
+    // (card: preview false-rejected union widenings push accepted).
+    #[test]
+    fn union_widening_is_not_rejected() {
+        fn lit(v: &str) -> FieldType {
+            FieldType::Literal {
+                value: serde_json::json!(v),
+            }
+        }
+        let current = schema(&[(
+            "artifacts",
+            table(
+                &[(
+                    "kind",
+                    FieldType::Union {
+                        variants: vec![lit("html"), lit("svg")],
+                    },
+                )],
+                &[],
+            ),
+        )]);
+        let pending = schema(&[(
+            "artifacts",
+            table(
+                &[(
+                    "kind",
+                    FieldType::Union {
+                        variants: vec![lit("html"), lit("svg"), lit("markdown")],
+                    },
+                )],
+                &[],
+            ),
+        )]);
+        let diff = diff(Some(&current), &pending);
+        assert!(diff.rejected.is_empty());
+        assert!(diff.added.is_empty());
+    }
+
+    // The mirror case: narrowing a union (dropping a variant) is not a
+    // widening and stays rejected by the shared predicate.
+    #[test]
+    fn union_narrowing_is_still_rejected() {
+        fn lit(v: &str) -> FieldType {
+            FieldType::Literal {
+                value: serde_json::json!(v),
+            }
+        }
+        let current = schema(&[(
+            "artifacts",
+            table(
+                &[(
+                    "kind",
+                    FieldType::Union {
+                        variants: vec![lit("html"), lit("svg"), lit("markdown")],
+                    },
+                )],
+                &[],
+            ),
+        )]);
+        let pending = schema(&[(
+            "artifacts",
+            table(
+                &[(
+                    "kind",
+                    FieldType::Union {
+                        variants: vec![lit("html"), lit("svg")],
+                    },
+                )],
+                &[],
+            ),
+        )]);
+        let diff = diff(Some(&current), &pending);
+        assert!(diff.added.is_empty());
+        assert_eq!(diff.rejected.len(), 1);
+        assert_eq!(diff.rejected[0].item, "kind");
+        assert!(diff.rejected[0].reason.contains("cannot be changed"));
     }
 
     // Dropping an index is rejected.

@@ -499,6 +499,17 @@ pub fn is_widening_of(old: &FieldType, new: &FieldType) -> bool {
     }
 }
 
+/// The single shared classification of a field type change as rejected
+/// (destructive) vs accepted (unchanged or safe widening): a change is
+/// rejected only when the types differ apart from `Id.on_delete` AND the
+/// change is not a safe widening ([`is_widening_of`]). Both consumers of this
+/// predicate — the push path (`engine::detect_destructive_changes`) and the
+/// advisory preview path (`schema_diff::diff`) — must call this one function
+/// so the two endpoints cannot disagree.
+pub fn is_type_change_rejected(old: &FieldType, new: &FieldType) -> bool {
+    strip_on_delete(new) != strip_on_delete(old) && !is_widening_of(old, new)
+}
+
 /// Finite set of accepted values for a literal-only type: `Some` for a lone
 /// `Literal` or a `Union` whose variants are all `Literal`s; `None` for any other
 /// type (unions mixing in non-literal variants, scalars, `Optional`, `Object`).

@@ -1426,6 +1426,91 @@ async fn schema_preview_changing_column_type_is_rejected() -> anyhow::Result<()>
     Ok(())
 }
 
+// Card 01a16c61 regression: preview and push must agree on a literal-union
+// widening. `fresh_db` applies the kanban fixture whose `projects.status` is a
+// literal union; widening it with a new variant is what `is_widening_of`
+// sanctions, so preview reports NO rejection and the identical push succeeds.
+#[tokio::test]
+async fn schema_preview_accepts_union_widening_that_push_accepts() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    let mut pending = kanban_schema_json();
+    pending["tables"]["projects"]["fields"]["status"]["variants"]
+        .as_array_mut()
+        .expect("status variants array")
+        .push(serde_json::json!({"type":"literal","value":"reopened"}));
+
+    let resp = preview_schema(addr, &name, pending.clone()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(
+        body["rejected"],
+        serde_json::json!([]),
+        "union widening must not be rejected by preview: {body}"
+    );
+
+    // The identical schema must also be accepted by the authoritative gate.
+    let resp = admin_post(
+        addr,
+        "/admin/push-schema",
+        serde_json::json!({"db": name, "schema": pending}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    Ok(())
+}
+
+// The mirror case: a non-widening type change (scalar swap) is rejected by
+// BOTH endpoints — preview lists it, push refuses it with 400.
+#[tokio::test]
+async fn schema_preview_and_push_agree_scalar_type_change_is_rejected_by_both() -> anyhow::Result<()>
+{
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    let mut pending = kanban_schema_json();
+    pending["tables"]["projects"]["fields"]["status"] = serde_json::json!({"type":"string"});
+
+    let resp = preview_schema(addr, &name, pending.clone()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let rejected = body["rejected"].as_array().expect("rejected array");
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0]["table"], serde_json::json!("projects"));
+    assert_eq!(rejected[0]["item"], serde_json::json!("status"));
+    assert!(
+        rejected[0]["reason"]
+            .as_str()
+            .expect("reason string")
+            .contains("cannot be changed"),
+        "reason: {}",
+        rejected[0]["reason"]
+    );
+
+    let resp = admin_post(
+        addr,
+        "/admin/push-schema",
+        serde_json::json!({"db": name, "schema": pending}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let err: serde_json::Value = resp.json().await?;
+    assert_eq!(err["code"], "BAD_REQUEST");
+    assert!(
+        err["message"]
+            .as_str()
+            .expect("message")
+            .contains("changed type of field 'projects.status'"),
+        "push refusal should name the field: {err}"
+    );
+
+    Ok(())
+}
+
 // Preview is admin-gated: a non-admin bearer is rejected with 401, matching
 // every other /admin/* route.
 #[tokio::test]

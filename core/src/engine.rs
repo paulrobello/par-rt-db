@@ -26,7 +26,7 @@
 //! `.map_err(...)`.
 
 use crate::mutation::{Step, Transaction};
-use crate::schema::{SchemaDef, is_widening_of, strip_on_delete};
+use crate::schema::{SchemaDef, is_type_change_rejected};
 use crate::wire::{FilterExpr, ValueExpr};
 
 /// Validates this transaction's deadline guards and returns the earliest one.
@@ -66,10 +66,7 @@ pub fn detect_destructive_changes(old: &SchemaDef, new: &SchemaDef) -> Result<()
                 None => {
                     return Err(format!("removed field '{table_name}.{field_name}'"));
                 }
-                Some(new_field_type)
-                    if strip_on_delete(new_field_type) != strip_on_delete(old_field_type)
-                        && !is_widening_of(old_field_type, new_field_type) =>
-                {
+                Some(new_field_type) if is_type_change_rejected(old_field_type, new_field_type) => {
                     return Err(format!("changed type of field '{table_name}.{field_name}'"));
                 }
                 _ => {}
