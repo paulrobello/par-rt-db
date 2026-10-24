@@ -268,17 +268,196 @@ interface ScanPlan {
 const PROJECTION_SYSTEM_FIELDS = new Set(["_id", "_creationTime", "_version"]);
 
 /** Validate a `fields` projection against the table: every name must be a
- *  declared field or one of the system fields (`_id`/`_creationTime`/
- *  `_version` — always included, so listing them is an allowed no-op). Anything
- *  else — including typo'd system names and other `_`-prefixed names — is
- *  `BAD_REQUEST` at compile time, the same gate the server runs in
- *  `compile_query` (and `/explain`). `[]` (system fields only) validates
- *  trivially. */
-function validateProjection(tableDef: TableJson, fields: string[]): void {
+ *  declared field, one of the lookup aliases (admitted only when the query
+ *  carries lookups — the aliases are synthetic result fields, the same class
+ *  as `_searchSnippet`), or one of the system fields (`_id`/`_creationTime`/
+ *  `_version` — always included, so listing them is an allowed no-op).
+ *  Anything else is `BAD_REQUEST` at compile time, the same gate the server
+ *  runs in `compile_query` (and `/explain`). */
+function validateProjection(tableDef: TableJson, fields: string[], lookupAliases: string[]): void {
   for (const name of fields) {
-    if (PROJECTION_SYSTEM_FIELDS.has(name) || name in tableDef.fields) continue;
+    if (
+      PROJECTION_SYSTEM_FIELDS.has(name) ||
+      name in tableDef.fields ||
+      lookupAliases.includes(name)
+    ) {
+      continue;
+    }
     throw new RtDbError("BAD_REQUEST", `unknown projection field '${name}'`);
   }
+}
+
+// ====== Lookup expansion (mirrors server `query::lookup`) ======
+
+/** At most 4 lookups per query; a fifth is `BAD_REQUEST`. */
+const MAX_LOOKUPS = 4;
+/** Hard max of a `LookupSpec.cap`; above is `BAD_REQUEST` at compile time. */
+const MAX_LOOKUP_CAP = 1000;
+/** Default per-parent joined-row cap for an id-ARRAY lookup. */
+const DEFAULT_LOOKUP_CAP = 100;
+/** Ceiling on total joined rows per execution; truncation proceeds in
+ * parent-result order. */
+const MAX_JOINED_ROWS = 8192;
+
+/** Compile-time lookup validation (mirrors server `validate_lookups`):
+ * unknown lookup table → `NOT_FOUND`; field not declared or not
+ * `Id`/`Optional<Id>`/`Array<Id>` → `BAD_REQUEST`; declared `Id.table` ≠
+ * lookup `table` → `BAD_REQUEST`; `as` collisions → `BAD_REQUEST`; `cap` >
+ * 1000 → `BAD_REQUEST`; > 4 lookups → `BAD_REQUEST`. Returns the aliases the
+ * projection gate admits. */
+function validateLookups(q: QueryJson, tableFor: (name: string) => TableJson): string[] {
+  if (q.lookups === undefined || q.lookups.length === 0) return [];
+  if (q.lookups.length > MAX_LOOKUPS) {
+    throw new RtDbError("BAD_REQUEST", `at most ${MAX_LOOKUPS} lookups per query`);
+  }
+  const parentDef = tableFor(q.table);
+  const aliases: string[] = [];
+  for (const lk of q.lookups) {
+    tableFor(lk.table);
+    const ty = parentDef.fields[lk.field];
+    if (ty === undefined) {
+      throw new RtDbError(
+        "BAD_REQUEST",
+        `lookup field '${lk.field}' is not declared on table '${q.table}'`,
+      );
+    }
+    const tag = (ty as { type: string }).type;
+    const inner =
+      tag === "id"
+        ? ty
+        : tag === "optional"
+          ? (ty as { inner: { type: string } }).inner
+          : tag === "array"
+            ? (ty as { element: { type: string } }).element
+            : undefined;
+    if (inner === undefined || (inner as { type: string }).type !== "id") {
+      throw new RtDbError(
+        "BAD_REQUEST",
+        `lookup field '${lk.field}' must be declared Id, Optional<Id>, or Array<Id>`,
+      );
+    }
+    const declared = (inner as unknown as { table: string }).table;
+    if (declared !== lk.table) {
+      throw new RtDbError(
+        "BAD_REQUEST",
+        `lookup field '${lk.field}' declares Id table '${declared}' but the lookup names '${lk.table}'`,
+      );
+    }
+    if (lk.as.startsWith("_")) {
+      throw new RtDbError("BAD_REQUEST", `lookup alias '${lk.as}' must not start with '_'`);
+    }
+    if (lk.as in parentDef.fields) {
+      throw new RtDbError("BAD_REQUEST", `lookup alias '${lk.as}' collides with a declared field`);
+    }
+    if (aliases.includes(lk.as)) {
+      throw new RtDbError(
+        "BAD_REQUEST",
+        `lookup alias '${lk.as}' collides with another lookup alias`,
+      );
+    }
+    if (lk.cap !== undefined && lk.cap > MAX_LOOKUP_CAP) {
+      throw new RtDbError("BAD_REQUEST", `lookup cap exceeds maximum of ${MAX_LOOKUP_CAP}`);
+    }
+    aliases.push(lk.as);
+  }
+  return aliases;
+}
+
+/** Whether the lookup's declared field type makes it array-form. Validation
+ *  has already pinned the field to one of the three accepted shapes. */
+function isArrayLookup(parentDef: TableJson, field: string): boolean {
+  const ty = parentDef.fields[field];
+  let tag = (ty as { type: string } | undefined)?.type;
+  if (tag === "optional") {
+    tag = (ty as { inner: { type: string } }).inner.type;
+  }
+  return tag === "array";
+}
+
+/** Execute-time expansion (mirrors server `expand_lookups`): per lookup,
+ *  collect the distinct ids across the result docs, fetch the visible child
+ *  rows once (FM-33: stamped rows are invisible), then fan out in memory —
+ *  declared id-array order, dangling ids dropped, `cap` truncation, and a
+ *  deterministic `MAX_JOINED_ROWS` ceiling in parent-result order. The
+ *  in-memory harness models no principal, so joined rows carry no per-row
+ *  authorization predicates (the server appends them to its batched fetch). */
+function expandLookups(
+  result: unknown,
+  q: QueryJson,
+  tableFor: (name: string) => TableJson,
+  rowsFor: (table: string) => Map<string, StoredRow>,
+): unknown {
+  // Doc references by result shape (mirrors `mapResultDocs`'s routing):
+  // mutate-in-place keeps identity, so the caller's result object changes.
+  let docs: Record<string, unknown>[];
+  if (isPlainObject(result) && Array.isArray(result.docs)) {
+    docs = result.docs as Record<string, unknown>[];
+  } else if (q.count || q.distinct || q.aggregate !== undefined) {
+    docs = [];
+  } else if (q.get !== undefined || q.unique || q.first) {
+    docs = isPlainObject(result) ? [result] : [];
+  } else {
+    docs = Array.isArray(result) ? (result as Record<string, unknown>[]) : [];
+  }
+  const parentDef = tableFor(q.table);
+  let budget = MAX_JOINED_ROWS;
+  for (const lk of q.lookups ?? []) {
+    tableFor(lk.table);
+    const arrayForm = isArrayLookup(parentDef, lk.field);
+    // Distinct ids across the result set, first-seen order.
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    for (const doc of docs) {
+      const v = doc[lk.field];
+      if (typeof v === "string") {
+        if (!seen.has(v)) {
+          seen.add(v);
+          ids.push(v);
+        }
+      } else if (Array.isArray(v)) {
+        for (const id of v) {
+          if (typeof id === "string" && !seen.has(id)) {
+            seen.add(id);
+            ids.push(id);
+          }
+        }
+      }
+    }
+    // One in-memory fetch: visible (non-stamped) child rows by id.
+    const childRows = rowsFor(lk.table);
+    const fetched = new Map<string, Record<string, unknown>>();
+    for (const id of ids) {
+      const row = childRows.get(id);
+      if (row && row.deletedAt === undefined) {
+        fetched.set(id, mergeDoc(row));
+      }
+    }
+    const cap = lk.cap ?? DEFAULT_LOOKUP_CAP;
+    for (const doc of docs) {
+      const v = doc[lk.field];
+      if (typeof v === "string") {
+        const joined = budget > 0 ? fetched.get(v) : undefined;
+        if (joined !== undefined) budget -= 1;
+        doc[lk.as] = joined ?? null;
+      } else if (Array.isArray(v)) {
+        const out: Record<string, unknown>[] = [];
+        for (const id of v) {
+          if (out.length >= cap || budget === 0) break;
+          if (typeof id === "string") {
+            const joined = fetched.get(id);
+            if (joined !== undefined) {
+              out.push(joined);
+              budget -= 1;
+            }
+          }
+        }
+        doc[lk.as] = out;
+      } else {
+        doc[lk.as] = arrayForm ? [] : null;
+      }
+    }
+  }
+  return result;
 }
 
 /** Map `fn` over every doc of an executed result. The result shape is taken
@@ -365,12 +544,18 @@ export function executeQuery(
   q: QueryJson,
   tableDef: TableJson,
   rowsFor: (table: string) => Map<string, StoredRow>,
+  tableFor: (name: string) => TableJson,
 ): unknown {
+  const aliases = validateLookups(q, tableFor);
   if (q.fields !== undefined) {
-    validateProjection(tableDef, q.fields);
+    validateProjection(tableDef, q.fields, aliases);
   }
   const result = executeUnprojected(q, tableDef, rowsFor);
-  return q.fields === undefined ? result : projectResult(result, q.fields, q);
+  const expanded =
+    q.lookups !== undefined && q.lookups.length > 0
+      ? expandLookups(result, q, tableFor, rowsFor)
+      : result;
+  return q.fields === undefined ? expanded : projectResult(expanded, q.fields, q);
 }
 
 function executeUnprojected(
@@ -452,6 +637,7 @@ function presentQueryCombos(q: QueryJson): Set<QueryComboClause> {
   if (q.search !== undefined) present.add("search");
   if (q.vectorSearch !== undefined) present.add("vectorSearch");
   if (q.hybridSearch !== undefined) present.add("hybridSearch");
+  if ((q.lookups?.length ?? 0) > 0) present.add("lookups");
   return present;
 }
 

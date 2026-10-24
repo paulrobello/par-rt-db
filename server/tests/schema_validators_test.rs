@@ -188,6 +188,7 @@ async fn document_round_trips_through_insert_patch_and_query() -> anyhow::Result
         &db_name,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "widgets".to_string(),
             get: Some(id.clone()),
             index: None,

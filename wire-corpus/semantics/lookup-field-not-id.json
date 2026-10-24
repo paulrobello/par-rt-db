@@ -1,0 +1,30 @@
+{
+  "name": "lookup-field-not-id",
+  "$comment": "A lookup whose `field` is declared but not Id / Optional<Id> / Array<Id> is BAD_REQUEST at compile time.",
+  "schema": {
+    "tables": {
+      "users": {
+        "fields": { "name": { "type": "string" } }
+      },
+      "posts": {
+        "fields": {
+          "title": { "type": "string" },
+          "authorId": { "type": "optional", "inner": { "type": "id", "table": "users" } }
+        }
+      }
+    }
+  },
+  "seed": [
+    { "doc": { "name": "Ann" }, "table": "users", "$id": "u_ann" },
+    { "doc": { "title": "p1", "authorId": { "$idRef": "u_ann" } }, "table": "posts" }
+  ],
+  "op": {
+    "query": {
+      "table": "posts",
+      "lookups": [{ "field": "title", "table": "users", "as": "author" }]
+    }
+  },
+  "expect": {
+    "error": { "code": "BAD_REQUEST" }
+  }
+}

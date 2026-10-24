@@ -1293,31 +1293,49 @@ impl SubscriptionManager {
         // `.await`s below, so it doesn't have to.
         let mut pending = Vec::new();
         for (key, entry) in db_subs.iter() {
-            if !write_set.tables.contains(&entry.query.table) {
+            // A query with lookups reads its parent table plus every lookup
+            // table, so the dispatch gate consults the union: a write naming a
+            // lookup table must reach the re-run pass even though the
+            // parent-table fast path (`write_set.tables.contains`) misses it.
+            let parent_touched = write_set.tables.contains(&entry.query.table);
+            let lookup_touched = entry
+                .query
+                .lookups
+                .iter()
+                .any(|lk| write_set.tables.contains(&lk.table));
+            if !parent_touched && !lookup_touched {
                 continue;
             }
-            // `Some(class)` once this iteration is a shadow verification of a
-            // skip rather than a real re-run: the decision said "skip", and the
-            // sampler picked it for checking. The class rides along so a
-            // divergence names which read set got it wrong.
-            let verifying = match decide(&entry.read_set, &entry.query.table, write_set) {
-                Decision::Rerun => {
-                    if let Some(metrics) = &self.metrics {
-                        metrics.record_subs_rerun(db);
-                    }
-                    None
+            // When only a lookup table was written, the parent-table window
+            // skip classes (`ReadSet` reasons only about parent-table writes)
+            // are unsound — force the re-run and let the canonical diff absorb
+            // the cost (cheap v1 rule; fine-grained skip optimization across
+            // joined tables is deferred).
+            let verifying = if lookup_touched {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_subs_rerun(db);
                 }
-                Decision::Skip(class) => {
-                    if let Some(metrics) = &self.metrics {
-                        metrics.record_subs_skip(db, class);
+                None
+            } else {
+                match decide(&entry.read_set, &entry.query.table, write_set) {
+                    Decision::Rerun => {
+                        if let Some(metrics) = &self.metrics {
+                            metrics.record_subs_rerun(db);
+                        }
+                        None
                     }
-                    if !self.sample_skip_verification() {
-                        continue;
+                    Decision::Skip(class) => {
+                        if let Some(metrics) = &self.metrics {
+                            metrics.record_subs_skip(db, class);
+                        }
+                        if !self.sample_skip_verification() {
+                            continue;
+                        }
+                        if let Some(metrics) = &self.metrics {
+                            metrics.record_subs_skip_verification();
+                        }
+                        Some(class)
                     }
-                    if let Some(metrics) = &self.metrics {
-                        metrics.record_subs_skip_verification();
-                    }
-                    Some(class)
                 }
             };
             pending.push((

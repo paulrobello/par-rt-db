@@ -633,7 +633,7 @@ mirrored as the HTTP `Retry-After` header); every other code omits it:
 ### Query shape
 
 `{"table": "<name>", "get"?, "index"?, "eq"?, "order"?, "take"?, "unique"?, "first"?,
-"count"?, "filter"?, "search"?, "vectorSearch"?, "hybridSearch"?, "paginate"?, "distinct"?, "aggregate"?, "fields"?}`
+"count"?, "filter"?, "search"?, "vectorSearch"?, "hybridSearch"?, "paginate"?, "distinct"?, "aggregate"?, "fields"?, "lookups"?}`
 — exactly one terminal per query (terminals are mutually exclusive), except
 that `paginate` pages a ranked terminal rather than replacing it, so it may
 accompany `search`/`vectorSearch`/`hybridSearch` (see
@@ -682,6 +682,31 @@ unknown field), it composes with every doc-bearing terminal (`count`/
 `distinct`/`aggregate` return no docs, so it is a no-op there), and a
 projected subscription does not push when a write changes only non-projected
 fields (the pushed payloads still carry `_version`).
+
+An optional `lookups` array performs server-side lookup expansion — an
+N+1-free id join on the read DSL. Each `{"field", "table", "as", "cap"?}`
+spec resolves a declared `Id`/`Optional<Id>`/`Array<Id>` field (whose
+`Id.table` must equal `table`) on every result doc into the referenced
+document(s) of `table`, exposed under the `as` key on the same doc: `null`
+for the single form (field null/absent, dangling id, or an unauthorized row)
+and an array in the id-array's declared order for the `Array<Id>` form
+(dangling/unauthorized ids dropped, truncated to `cap` — default 100, hard
+max 1000, above is `BAD_REQUEST`; at most 4 lookups per query). Depth-1 only,
+id-equality only. Every joined row passes the exact per-row authorization the
+parent read applies (`ownerField`/`collaboratorsField`/`authorize`), so an
+invisible row reads as absent rather than erroring (an authorization failure
+on one joined child must never freeze a live subscription). Joined docs carry
+the child table's system fields, so a client can patch/subscribe against a
+joined doc's identity. Legal with every doc-returning terminal (`get`,
+`unique`, `first`, `take`/collect, `paginate`, `search`, `vectorSearch`,
+`hybridSearch`) and rejected `BAD_REQUEST` with the doc-less ones (`count`,
+`distinct`, `aggregate`); the `fields` projection may name lookup aliases
+(omitting an alias drops the joined docs; full docs remain the default).
+Subscriptions see joined keys as part of the change-detection canonical: a
+child-table write that changes joined output re-runs the subscription and
+pushes; a re-run where nothing visible changed pushes nothing. Mirrored in
+all five clients (ts `QueryJson.lookups` + `.lookup()` builder, rust via the
+shared core type); pinned by the `lookup-*` semantics-corpus cases.
 
 ### Transaction shape
 

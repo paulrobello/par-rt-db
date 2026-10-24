@@ -484,6 +484,21 @@ field; grouped `count` is the count-per-group the dashboards need).
 
 The read and write paths share index-value typing; keep them aligned.
 
+**Lookup expansion sits between terminal execution and projection** in
+`execute_query` (`query/lookup.rs`): a query's `lookups` specs resolve each
+result doc's id/id-array field into the referenced documents via one batched
+`WHERE id = ANY($n)` fetch per lookup, appending the same per-row predicates
+the parent scan composes (`ownerField`/`collaboratorsField`, the `authorize`
+predicate, soft-delete and host-policy visibility) — an unauthorized child
+row is never fetched, not errored (a re-run error would freeze the
+subscription). Validation lives in the compile cascade, so HTTP one-shots,
+the WS initial push, `/explain`, and subscription re-runs reject the same
+shapes. The `subs.rs` dispatch gate unions the lookup tables into the
+write-set check (a lookup-table write forces a re-run; the parent-table
+window skip classes stay parent-only), and joined keys are part of the
+canonical the projected-subscription diff compares (which strips `_version`
+recursively, joined docs included).
+
 ## Image transforms
 
 Read-time, HTTP-only (`image_transform.rs`): pure-Rust decode → resize →

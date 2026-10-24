@@ -329,7 +329,12 @@ async function runCase(caseName: string, caseData: SemanticsCase): Promise<void>
   const ids = new Map<string, string>();
   for (const [i, entry] of (caseData.seed ?? []).entries()) {
     const { table, doc, label } = parseSeedEntry(entry, singleTable, caseName);
-    const results = await client.mutate({ steps: [{ op: "insert", table, doc }] });
+    // `$idRef` substitution applies to seed docs too: a seed may reference the
+    // minted id of any EARLIER `$id`-labeled seed (lookups need real cross-doc
+    // id references, which no other placeholder expresses). Forward references
+    // stay an authoring error.
+    const docFilled = substitute(doc, ids, caseName) as Record<string, unknown>;
+    const results = await client.mutate({ steps: [{ op: "insert", table, doc: docFilled }] });
     if (label !== undefined) {
       const first = results[0];
       if (first === null || typeof first !== "object" || !("id" in first)) {

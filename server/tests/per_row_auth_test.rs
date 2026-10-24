@@ -166,6 +166,7 @@ async fn fetch_doc(
 /// because `Query` does not derive `Default`). Overridable by the caller.
 fn notes_query() -> Query {
     Query {
+        lookups: Vec::new(),
         table: "notes".to_string(),
         get: None,
         index: None,
@@ -358,6 +359,7 @@ async fn non_owner_table_is_unaffected_by_owner() -> anyhow::Result<()> {
     }
 
     let q = Query {
+        lookups: Vec::new(),
         table: "open".to_string(),
         get: None,
         index: None,
@@ -593,6 +595,7 @@ async fn search_filters_to_own_rows() -> anyhow::Result<()> {
     }
 
     let q = Query {
+        lookups: Vec::new(),
         table: "notes".to_string(),
         search: Some(rtdb_server::query::SearchQuery {
             index: "search_content".into(),
@@ -718,6 +721,7 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
     }
 
     let q = Query {
+        lookups: Vec::new(),
         table: "docs".to_string(),
         vector_search: Some(rtdb_server::query::VectorSearchQuery {
             index: "by_embedding".into(),
@@ -863,6 +867,7 @@ async fn vector_search_composes_filter_fields_with_owner() -> anyhow::Result<()>
         value: serde_json::json!("x"),
     };
     let q = Query {
+        lookups: Vec::new(),
         table: "docs".to_string(),
         vector_search: Some(rtdb_server::query::VectorSearchQuery {
             index: "by_embedding".into(),
@@ -2522,6 +2527,7 @@ async fn seed_post(
 /// A `posts` query with every field spelled out (mirrors `notes_query`).
 fn posts_query() -> Query {
     Query {
+        lookups: Vec::new(),
         table: "posts".to_string(),
         get: None,
         index: None,
@@ -3271,6 +3277,7 @@ async fn fetch_doc_bypass(
     id: &str,
 ) -> Option<serde_json::Value> {
     let q = Query {
+        lookups: Vec::new(),
         table: table.to_string(),
         get: Some(id.to_string()),
         index: None,
@@ -3419,6 +3426,7 @@ async fn authorize_insert_without_user_leaf_forbidden_when_predicate_fails() -> 
     // Nothing was persisted (Forbidden rolled back the txn). A bypass count
     // sees every row, so 0 confirms the insert never landed.
     let q = Query {
+        lookups: Vec::new(),
         table: "public_only".to_string(),
         get: None,
         index: None,
@@ -3623,6 +3631,7 @@ async fn authorize_upsert_insert_stamps_eq_user_leaf_to_caller() -> anyhow::Resu
 /// literal when checking another user's read view).
 fn get_query(table: &str, id: &str) -> Query {
     Query {
+        lookups: Vec::new(),
         table: table.to_string(),
         get: Some(id.to_string()),
         index: None,
@@ -4084,6 +4093,7 @@ async fn seed_doc(
 
 fn docs_query() -> Query {
     Query {
+        lookups: Vec::new(),
         table: "docs".to_string(),
         get: None,
         index: None,
@@ -4736,6 +4746,7 @@ async fn sec117_seed_without_flag(
     // Re-read via execute_query (bypass) so the doc has system fields merged
     // in the same shape `filter_matches` sees on the enforcement path.
     let get_q = Query {
+        lookups: Vec::new(),
         table: "items".to_string(),
         get: Some(id),
         index: None,
@@ -4780,6 +4791,7 @@ async fn sec117_assert_agree(predicate: FilterExpr, expect_visible: bool) {
 
     // SQL scan path: query as a real user so `authorize` compiles into WHERE.
     let q = Query {
+        lookups: Vec::new(),
         table: "items".to_string(),
         get: None,
         index: None,

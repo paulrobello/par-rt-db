@@ -64,6 +64,7 @@ async fn anon_enabled_state() -> Arc<AppState> {
 /// which the owner gate narrows to the caller's own rows).
 fn collect_notes() -> Query {
     Query {
+        lookups: Vec::new(),
         table: "notes".to_string(),
         get: None,
         index: None,

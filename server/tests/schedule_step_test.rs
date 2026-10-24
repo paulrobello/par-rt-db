@@ -72,6 +72,7 @@ fn insert_project_step() -> Step {
 /// the tests use instead of adding new server surface.
 fn take_query(table: &str) -> Query {
     Query {
+        lookups: Vec::new(),
         table: table.to_string(),
         get: None,
         index: None,

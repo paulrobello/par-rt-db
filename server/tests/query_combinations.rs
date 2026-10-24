@@ -66,6 +66,7 @@ const ID: &str = "0123456789abcdef0123456789abcdef";
 /// Base query with every field defaulted; cases mutate it.
 fn base_query() -> Query {
     Query {
+        lookups: Vec::new(),
         table: "items".to_string(),
         get: None,
         index: None,

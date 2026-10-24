@@ -100,9 +100,13 @@ pub fn compile_query(
     crate::auth::host_policy::schema_contract(ctx, &q.table, table_def)?;
     // Projection validation runs before every early return so all terminals
     // (including `get`) reject unknown field names at compile time — the same
-    // shapes fail for the same reasons on the /explain path.
+    // shapes fail for the same reasons on the /explain path. Lookup validation
+    // runs alongside it (unknown lookup table → NOT_FOUND, non-id field →
+    // BAD_REQUEST, alias collisions, cap bound), and hands its aliases to the
+    // projection gate so `fields` may name them.
+    let lookup_aliases = super::lookup::validate_lookups(schema, table_def, q)?;
     if let Some(fields) = &q.fields {
-        validate_projection(table_def, fields)?;
+        validate_projection(table_def, fields, &lookup_aliases)?;
     }
     let owner_field = table_def.owner_field.as_deref();
     let collaborators_field = table_def.collaborators_field.as_deref();
@@ -1281,9 +1285,15 @@ fn compile_collect_terminal(
     let (doc_select, projection_binds) = match q.fields.as_deref() {
         None => ("\"doc\"".to_string(), Vec::new()),
         Some(fields) => {
+            // Lookup source fields ride the SQL projection too: expansion runs
+            // on the terminal output BEFORE the in-process project_result pass,
+            // so it still needs the id/id-array inputs; the post-projection
+            // pass then strips them (aliases are attached by expansion, not
+            // present at SQL time).
             let projection_fields = fields
                 .iter()
                 .filter(|field| !field.starts_with('_'))
+                .chain(q.lookups.iter().map(|lk| &lk.field))
                 .collect::<std::collections::BTreeSet<_>>();
             if projection_fields.is_empty() {
                 ("'{}'::jsonb".to_string(), Vec::new())

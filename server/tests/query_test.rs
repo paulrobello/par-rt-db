@@ -150,6 +150,7 @@ async fn get_by_id_returns_doc_with_system_fields() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: Some(target.clone()),
             index: None,
@@ -206,6 +207,7 @@ async fn get_missing_returns_null() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: Some("0".repeat(32)),
             index: None,
@@ -253,6 +255,7 @@ async fn get_combined_with_index_is_bad_request() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: Some(items[0].clone()),
             index: Some("by_project".to_string()),
@@ -300,6 +303,7 @@ async fn get_combined_with_paginate_is_bad_request() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: Some(items[0].clone()),
             index: None,
@@ -350,6 +354,7 @@ async fn unique_combined_with_take_is_bad_request() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "projects".to_string(),
             get: None,
             index: Some("by_name".to_string()),
@@ -398,6 +403,7 @@ async fn full_eq_compound_index_orders_by_created_at_asc() -> anyhow::Result<()>
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: Some("by_project_and_status".to_string()),
@@ -444,6 +450,7 @@ async fn full_eq_compound_index_order_desc_reverses() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: Some("by_project_and_status".to_string()),
@@ -492,6 +499,7 @@ async fn prefix_eq_on_compound_index_sorts_by_remaining_index_field_then_created
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: Some("by_project_and_status".to_string()),
@@ -547,6 +555,7 @@ async fn unique_on_by_name_returns_single_doc() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "projects".to_string(),
             get: None,
             index: Some("by_name".to_string()),
@@ -599,6 +608,7 @@ async fn unique_with_duplicate_name_is_precondition_failed() -> anyhow::Result<(
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "projects".to_string(),
             get: None,
             index: Some("by_name".to_string()),
@@ -647,6 +657,7 @@ async fn no_index_collect_returns_all_docs_in_created_at_order() -> anyhow::Resu
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: None,
@@ -693,6 +704,7 @@ async fn take_over_cap_is_bad_request() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: None,
@@ -740,6 +752,7 @@ async fn unknown_index_is_bad_request() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: Some("no_such_index".to_string()),
@@ -787,6 +800,7 @@ async fn eq_longer_than_index_fields_is_bad_request() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "projects".to_string(),
             get: None,
             index: Some("by_name".to_string()),
@@ -832,6 +846,7 @@ async fn unknown_table_is_not_found() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "bogus".to_string(),
             get: None,
             index: None,
@@ -879,6 +894,7 @@ async fn take_zero_returns_empty_docs() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: None,
@@ -923,6 +939,7 @@ async fn unique_without_index_scans_whole_table() -> anyhow::Result<()> {
     let schema = kanban_schema();
 
     let unique_query = Query {
+        lookups: Vec::new(),
         table: "projects".to_string(),
         get: None,
         index: None,
@@ -999,6 +1016,7 @@ async fn canonical_is_stable_for_identical_results() -> anyhow::Result<()> {
     seed_kanban(&pool, &db, &schema).await?;
 
     let query = Query {
+        lookups: Vec::new(),
         table: "workItems".to_string(),
         get: None,
         index: None,
@@ -1046,6 +1064,7 @@ async fn range_gt_excludes_boundary_and_sorts_by_bound_field() -> anyhow::Result
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: Some("by_project_and_status".to_string()),
@@ -1095,6 +1114,7 @@ async fn range_gte_includes_boundary() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: Some("by_project_and_status".to_string()),
@@ -1150,6 +1170,7 @@ async fn range_gt_and_lt_bounded_numeric_range() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: Some("by_project_and_order".to_string()),
@@ -1199,6 +1220,7 @@ async fn range_bounded_numeric_range_with_order_desc_and_take() -> anyhow::Resul
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: Some("by_project_and_order".to_string()),
@@ -1245,6 +1267,7 @@ async fn range_without_eq_prefix_applies_to_first_index_field() -> anyhow::Resul
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: Some("by_status".to_string()),
@@ -1294,6 +1317,7 @@ async fn range_gt_and_gte_both_set_is_bad_request() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: Some("by_status".to_string()),
@@ -1341,6 +1365,7 @@ async fn range_lt_and_lte_both_set_is_bad_request() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: Some("by_status".to_string()),
@@ -1388,6 +1413,7 @@ async fn range_without_index_is_bad_request() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: None,
@@ -1435,6 +1461,7 @@ async fn range_with_no_remaining_index_field_is_bad_request() -> anyhow::Result<
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: Some("by_project_and_status".to_string()),
@@ -1482,6 +1509,7 @@ async fn range_combined_with_get_is_bad_request() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: Some(items[0].clone()),
             index: None,
@@ -1529,6 +1557,7 @@ async fn range_value_wrong_type_is_bad_request() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: Some("by_project_and_order".to_string()),
@@ -1576,6 +1605,7 @@ async fn range_lte_includes_boundary_value() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: Some("by_project_and_order".to_string()),
@@ -1627,6 +1657,7 @@ async fn first_on_no_matching_docs_returns_null() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: Some("by_project_and_status".to_string()),
@@ -1673,6 +1704,7 @@ async fn first_with_single_matching_doc_returns_it() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: Some("by_project_and_status".to_string()),
@@ -1726,6 +1758,7 @@ async fn first_combined_with_range_bound_returns_smallest_in_ascending_order() -
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: Some("by_project_and_order".to_string()),
@@ -1777,6 +1810,7 @@ async fn first_combined_with_range_bound_and_order_desc_returns_largest() -> any
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: Some("by_project_and_order".to_string()),
@@ -1828,6 +1862,7 @@ async fn first_combined_with_take_is_bad_request() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: None,
@@ -1875,6 +1910,7 @@ async fn first_combined_with_unique_is_bad_request() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: None,
@@ -1922,6 +1958,7 @@ async fn first_combined_with_get_is_bad_request() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: Some(items[0].clone()),
             index: None,
@@ -1971,6 +2008,7 @@ async fn count_on_empty_table_returns_zero() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: None,
@@ -2017,6 +2055,7 @@ async fn count_with_eq_prefix_counts_matching_subset() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: Some("by_project_and_status".to_string()),
@@ -2063,6 +2102,7 @@ async fn count_with_range_bound_counts_matching_subset() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: Some("by_project_and_order".to_string()),
@@ -2109,6 +2149,7 @@ async fn count_combined_with_order_is_bad_request() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: None,
@@ -2156,6 +2197,7 @@ async fn count_combined_with_take_is_bad_request() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: None,
@@ -2203,6 +2245,7 @@ async fn count_combined_with_unique_is_bad_request() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: None,
@@ -2250,6 +2293,7 @@ async fn count_combined_with_first_is_bad_request() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: None,
             index: None,
@@ -2297,6 +2341,7 @@ async fn count_combined_with_get_is_bad_request() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "workItems".to_string(),
             get: Some(items[0].clone()),
             index: None,
@@ -2350,6 +2395,7 @@ fn distinct_query(
     range: impl FnOnce(&mut Query),
 ) -> Query {
     let mut q = Query {
+        lookups: Vec::new(),
         table: "workItems".to_string(),
         get: None,
         index: index.map(str::to_string),
@@ -2652,6 +2698,7 @@ fn aggregate_query(
     range: impl FnOnce(&mut Query),
 ) -> Query {
     let mut q = Query {
+        lookups: Vec::new(),
         table: "workItems".to_string(),
         get: None,
         index: index.map(str::to_string),
@@ -3270,6 +3317,7 @@ fn paginate_query(
     paginate: Paginate,
 ) -> Query {
     Query {
+        lookups: Vec::new(),
         table: "workItems".to_string(),
         get: None,
         index: index.map(str::to_string),
@@ -4318,6 +4366,7 @@ async fn int64_index_range_and_eq_compare_numerically() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "events".to_string(),
             get: None,
             index: Some("by_ts".to_string()),
@@ -4352,6 +4401,7 @@ async fn int64_index_range_and_eq_compare_numerically() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "events".to_string(),
             get: None,
             index: Some("by_ts".to_string()),
@@ -4397,6 +4447,7 @@ async fn int64_index_count_and_aggregate() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "events".to_string(),
             get: None,
             index: Some("by_ts".to_string()),
@@ -4430,6 +4481,7 @@ async fn int64_index_count_and_aggregate() -> anyhow::Result<()> {
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             table: "events".to_string(),
             get: None,
             index: Some("by_ts".to_string()),
@@ -4470,6 +4522,7 @@ async fn int64_index_count_and_aggregate() -> anyhow::Result<()> {
 /// int64-schema `events` table.
 fn int64_aggregate_query(spec: AggregateSpec) -> Query {
     Query {
+        lookups: Vec::new(),
         table: "events".to_string(),
         get: None,
         index: Some("by_ts".to_string()),
@@ -5011,6 +5064,7 @@ async fn projection_collect_sql_returns_only_requested_fields() -> anyhow::Resul
     assert!(!raw_docs[1].as_object().unwrap().contains_key("title"));
 
     let first_query = Query {
+        lookups: Vec::new(),
         first: true,
         order: Some(Order::Asc),
         ..query.clone()
@@ -5031,6 +5085,7 @@ async fn projection_collect_sql_returns_only_requested_fields() -> anyhow::Resul
     assert!(!first_docs[0].as_object().unwrap().contains_key("title"));
 
     let unique_query = Query {
+        lookups: Vec::new(),
         unique: true,
         eq: vec![serde_json::json!(project_id), serde_json::json!(1.0)],
         order: None,
@@ -5055,6 +5110,7 @@ async fn projection_collect_sql_returns_only_requested_fields() -> anyhow::Resul
         &db,
         &schema,
         &Query {
+            lookups: Vec::new(),
             fields: None,
             ..query
         },

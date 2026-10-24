@@ -241,7 +241,7 @@ written literally. Runners implement exactly these three:
 | Placeholder | Where | Expands to |
 | --- | --- | --- |
 | `"$id": "<label>"` | a `seed` entry | Nothing in-band: the runner strips the key before inserting and records `label → minted id`. |
-| `{"$idRef": "<label>"}` | anywhere in `op` / `then.query` | The recorded id string for that seed label (e.g. the value for a `get`, a `patch`/`delete` step's `id`). |
+| `{"$idRef": "<label>"}` | anywhere in `op` / `then.query`, and in a `seed` doc (references to EARLIER `$id`-labeled seeds only — ids mint later in array order, so forward references are an authoring error) | The recorded id string for that seed label (e.g. the value for a `get`, a `patch`/`delete` step's `id`, or an `Id`/`Array<Id>` field on a later seed doc — lookups need real cross-doc id references, which no other placeholder expresses). |
 | `"$prev"` | `op.query.paginate.cursor` | The `nextCursor` of the same query's first page (see step 4 of the runner algorithm). |
 
 Placeholders never appear in `expect` — expectations use `normalize` instead.

@@ -125,6 +125,35 @@ pub struct Query {
     /// `None` = full docs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields: Option<Vec<String>>,
+    /// Server-side lookup expansion: resolve an id / id-array field on each
+    /// result doc into the referenced document(s) of `table`, exposed under the
+    /// `as` key on the same doc. Depth-1 only; id-equality only. Additive in
+    /// the FM-32 style — every existing query serializes byte-identically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lookups: Vec<LookupSpec>,
+}
+
+/// One server-side lookup: resolve `field` (an `Id`/`Optional<Id>`/`Array<Id>`
+/// declared field whose `Id.table` equals `table`) on each result doc into the
+/// referenced document(s), exposed under the `as` key. Single-vs-array output
+/// is derived from the field's declared type, not a wire flag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LookupSpec {
+    /// Declared field on the query's table: `Id { table }`,
+    /// `Optional<Id { table }>`, or `Array { element: Id { table } }`
+    /// ([`crate::schema::FieldType`]).
+    pub field: String,
+    /// The referenced table. Must equal the field's declared `Id.table`.
+    pub table: String,
+    /// Output key on each parent doc. `as` is a Rust keyword; the raw
+    /// identifier mirrors `IndexDef.r#where` (`crate::schema`).
+    #[serde(rename = "as")]
+    pub r#as: String,
+    /// Per-parent joined-row cap for an id-ARRAY lookup. Default 100,
+    /// hard max 1000 (values above are `BadRequest`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap: Option<u32>,
 }
 
 /// Serde skip predicate for `bool` fields whose default is `false`. Keeps the
@@ -378,6 +407,9 @@ pub fn query_clauses(q: &Query) -> HashSet<&'static str> {
     if q.hybrid_search.is_some() {
         set.insert("hybridSearch");
     }
+    if !q.lookups.is_empty() {
+        set.insert("lookups");
+    }
     set
 }
 
@@ -461,5 +493,40 @@ mod tests {
     #[test]
     fn order_wire_form_is_lowercase() {
         assert_eq!(serde_json::to_value(Order::Desc).unwrap(), json!("desc"));
+    }
+
+    #[test]
+    fn lookups_omit_on_empty_and_carry_as_rename() {
+        let q = Query {
+            table: "posts".into(),
+            ..Default::default()
+        };
+        assert_eq!(serde_json::to_value(&q).unwrap(), json!({"table":"posts"}));
+        let q = Query {
+            table: "posts".into(),
+            lookups: vec![LookupSpec {
+                field: "authorId".into(),
+                table: "users".into(),
+                r#as: "author".into(),
+                cap: Some(20),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&q).unwrap(),
+            json!({"table":"posts","lookups":[{"field":"authorId","table":"users","as":"author","cap":20}]})
+        );
+        let wire =
+            json!({"table":"posts","lookups":[{"field":"authorId","table":"users","as":"author"}]});
+        let q: Query = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(q.lookups[0].r#as, "author");
+        assert_eq!(q.lookups[0].cap, None);
+        // deny_unknown_fields on LookupSpec: a misspelled key is rejected.
+        assert!(
+            serde_json::from_value::<Query>(
+                json!({"table":"posts","lookups":[{"field":"f","table":"t","as":"a","extra":1}]})
+            )
+            .is_err()
+        );
     }
 }

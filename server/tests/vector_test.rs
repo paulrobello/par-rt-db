@@ -427,6 +427,7 @@ async fn vector_search_rejects_non_finite_query_vector() {
     let schema = vector_schema(3, false);
     for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         let q = Query {
+            lookups: Vec::new(),
             table: "docs".to_string(),
             vector_search: Some(VectorSearchQuery {
                 index: "by_embedding".to_string(),
@@ -465,6 +466,7 @@ async fn vector_search_rejects_non_finite_query_vector() {
 /// vector queries so the test only spells out the vector terminal.
 fn empty_query() -> Query {
     Query {
+        lookups: Vec::new(),
         table: String::new(),
         get: None,
         index: None,

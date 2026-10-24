@@ -1,0 +1,34 @@
+{
+  "name": "query-combo-lookups-distinct",
+  "$comment": "Rule 'lookups-excludes-distinct': lookups expand docs; over a distinct terminal it is meaningless. Representative violation pins BAD_REQUEST across all runners.",
+  "schema": {
+    "tables": {
+      "users": {
+        "fields": { "name": { "type": "string" } },
+        "indexes": [
+          { "name": "by_name", "fields": ["name"] }
+        ]
+      },
+      "posts": {
+        "fields": {
+          "title": { "type": "string" },
+          "authorId": { "type": "optional", "inner": { "type": "id", "table": "users" } }
+        }
+      }
+    }
+  },
+  "seed": [
+    { "doc": { "name": "Ann" }, "table": "users", "$id": "u_ann" },
+    { "doc": { "title": "p1", "authorId": { "$idRef": "u_ann" } }, "table": "posts" }
+  ],
+  "op": {
+    "query": {
+      "table": "posts",
+      "lookups": [{ "field": "authorId", "table": "users", "as": "author" }],
+      "distinct": true
+    }
+  },
+  "expect": {
+    "error": { "code": "BAD_REQUEST" }
+  }
+}

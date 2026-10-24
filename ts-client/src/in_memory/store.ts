@@ -2705,7 +2705,12 @@ export class InMemoryRtDbClient {
   // ---- query execution -------------------------------------------------------
 
   private executeQuery(q: QueryJson): unknown {
-    return executeQuery(q, this.requireTable(q.table), (t) => this.rowsFor(t));
+    return executeQuery(
+      q,
+      this.requireTable(q.table),
+      (t) => this.rowsFor(t),
+      (t) => this.requireTable(t),
+    );
   }
 
   // ---- subscriptions ---------------------------------------------------------

@@ -78,6 +78,7 @@ async fn get_doc(
     id: &str,
 ) -> serde_json::Value {
     let query = Query {
+        lookups: Vec::new(),
         table: table.to_string(),
         get: Some(id.to_string()),
         index: None,
@@ -361,6 +362,7 @@ async fn doc_present(
     id: &str,
 ) -> bool {
     let query = Query {
+        lookups: Vec::new(),
         table: table.to_string(),
         get: Some(id.to_string()),
         index: None,

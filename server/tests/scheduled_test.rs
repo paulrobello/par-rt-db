@@ -350,6 +350,7 @@ async fn poll_for_n(
     timeout: Duration,
 ) -> bool {
     let query = Query {
+        lookups: Vec::new(),
         table: "items".to_string(),
         get: None,
         index: Some("by_n".to_string()),

@@ -1,0 +1,41 @@
+{
+  "name": "lookup-projection",
+  "$comment": "Projection may name a lookup alias: `fields` listing the alias keeps the joined key (and drops unlisted parent fields); the `then` re-query omits the alias from `fields`, dropping the joined docs — full docs remain the default.",
+  "schema": {
+    "tables": {
+      "users": {
+        "fields": { "name": { "type": "string" } }
+      },
+      "posts": {
+        "fields": {
+          "title": { "type": "string" },
+          "authorId": { "type": "optional", "inner": { "type": "id", "table": "users" } }
+        }
+      }
+    }
+  },
+  "seed": [
+    { "doc": { "name": "Ann" }, "table": "users", "$id": "u_ann" },
+    { "doc": { "title": "p1", "authorId": { "$idRef": "u_ann" } }, "table": "posts" }
+  ],
+  "op": {
+    "query": {
+      "table": "posts",
+      "lookups": [{ "field": "authorId", "table": "users", "as": "author" }],
+      "fields": ["author"]
+    }
+  },
+  "expect": [
+    { "author": { "name": "Ann" } }
+  ],
+  "then": {
+    "query": {
+      "table": "posts",
+      "lookups": [{ "field": "authorId", "table": "users", "as": "author" }],
+      "fields": ["title"]
+    },
+    "expect": [
+      { "title": "p1" }
+    ]
+  }
+}

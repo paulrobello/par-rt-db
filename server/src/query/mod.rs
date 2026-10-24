@@ -18,6 +18,7 @@
 #[cfg(test)]
 mod combinations_coverage;
 mod filter;
+mod lookup;
 mod row_auth;
 mod search;
 mod terminals;
@@ -179,15 +180,24 @@ fn field_is_indexed(table_def: &TableDef, field: &str) -> bool {
 }
 
 /// Validate a `Query::fields` projection against the table: every name must be
-/// a declared field or one of the system fields (`_id`/`_creationTime`/
-/// `_version` — always included, so listing them is an allowed no-op). Anything
-/// else — including typo'd system names and other `_`-prefixed names — is
-/// `BadRequest` at compile time, the same gate `/explain` runs. `Some([])`
+/// a declared field, one of the lookup aliases (admitted only when the query
+/// carries lookups — the aliases are synthetic result fields, the same class
+/// as `_searchSnippet`), or one of the system fields (`_id`/`_creationTime`/
+/// `_version` — always included, so listing them is an allowed no-op).
+/// Anything else — including typo'd system names and other `_`-prefixed names —
+/// is `BadRequest` at compile time, the same gate `/explain` runs. `Some([])`
 /// (system fields only) validates trivially.
-pub fn validate_projection(table_def: &TableDef, fields: &[String]) -> Result<(), RtDbError> {
+pub fn validate_projection(
+    table_def: &TableDef,
+    fields: &[String],
+    lookup_aliases: &[String],
+) -> Result<(), RtDbError> {
     const SYSTEM_FIELDS: [&str; 3] = ["_id", "_creationTime", "_version"];
     for name in fields {
-        if SYSTEM_FIELDS.contains(&name.as_str()) || table_def.fields.contains_key(name) {
+        if SYSTEM_FIELDS.contains(&name.as_str())
+            || table_def.fields.contains_key(name)
+            || lookup_aliases.iter().any(|a| a == name)
+        {
             continue;
         }
         return Err(RtDbError::bad_request(format!(
@@ -244,6 +254,16 @@ pub fn diff_canonical(result: &QueryResult, q: &Query) -> String {
     fn strip_version(doc: &mut serde_json::Value) {
         if let serde_json::Value::Object(map) = doc {
             map.remove("_version");
+        }
+        // Lookup-joined docs are nested INSIDE a parent doc, so the strip must
+        // recurse: a projected lookup subscription whose child write bumped
+        // only the joined doc's `_version` would otherwise re-push forever.
+        // User fields can never be `_`-prefixed, so recursion strips nothing
+        // on lookup-free results.
+        if let serde_json::Value::Object(map) = doc {
+            for v in map.values_mut() {
+                strip_version(v);
+            }
         }
     }
     let mut stripped = result.clone();
@@ -369,6 +389,14 @@ pub async fn execute_query(
                 "unknown compiled terminal '{other}'"
             ))),
         }?;
+        // Lookup expansion runs just before the projection seam: every
+        // terminal's docs flow through both, so joined keys are part of the
+        // canonical a subscription diffs against — a child write that changes
+        // joined output changes the canonical and pushes; a re-run where
+        // nothing visible changed diffs equal and pushes nothing.
+        if !q.lookups.is_empty() {
+            lookup::expand_lookups(pool, db, schema, &mut result, q, ctx, include_deleted).await?;
+        }
         // Apply the caller's field projection at this one seam: every
         // terminal's docs flow back through here, so one pass covers HTTP
         // one-shots, the WS initial subscribe push, and every subscription

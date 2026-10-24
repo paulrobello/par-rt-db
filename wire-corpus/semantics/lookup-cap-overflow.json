@@ -1,0 +1,30 @@
+{
+  "name": "lookup-cap-overflow",
+  "$comment": "A lookup `cap` above the hard max of 1000 is BAD_REQUEST at compile time — the caller declaring cap:1001 made a static mistake (D3).",
+  "schema": {
+    "tables": {
+      "tags": {
+        "fields": { "label": { "type": "string" } }
+      },
+      "users": {
+        "fields": {
+          "name": { "type": "string" },
+          "tagIds": { "type": "array", "element": { "type": "id", "table": "tags" } }
+        }
+      }
+    }
+  },
+  "seed": [
+    { "doc": { "label": "alpha" }, "table": "tags", "$id": "t_alpha" },
+    { "doc": { "name": "U", "tagIds": [{ "$idRef": "t_alpha" }] }, "table": "users" }
+  ],
+  "op": {
+    "query": {
+      "table": "users",
+      "lookups": [{ "field": "tagIds", "table": "tags", "as": "tags", "cap": 1001 }]
+    }
+  },
+  "expect": {
+    "error": { "code": "BAD_REQUEST" }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "name": "query-combo-lookups-aggregate",
+  "$comment": "Rule 'lookups-excludes-aggregate': lookups expand docs; over an aggregate terminal it is meaningless. Representative violation pins BAD_REQUEST across all runners.",
+  "schema": {
+    "tables": {
+      "users": {
+        "fields": { "name": { "type": "string" } },
+        "indexes": [
+          { "name": "by_name", "fields": ["name"] }
+        ]
+      },
+      "posts": {
+        "fields": {
+          "title": { "type": "string" },
+          "authorId": { "type": "optional", "inner": { "type": "id", "table": "users" } }
+        }
+      }
+    }
+  },
+  "seed": [
+    { "doc": { "name": "Ann" }, "table": "users", "$id": "u_ann" },
+    { "doc": { "title": "p1", "authorId": { "$idRef": "u_ann" } }, "table": "posts" }
+  ],
+  "op": {
+    "query": {
+      "table": "posts",
+      "lookups": [{ "field": "authorId", "table": "users", "as": "author" }],
+      "aggregate": { "op": "count" }
+    }
+  },
+  "expect": {
+    "error": { "code": "BAD_REQUEST" }
+  }
+}

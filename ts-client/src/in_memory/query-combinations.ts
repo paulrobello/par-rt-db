@@ -33,7 +33,8 @@ export type QueryComboClause =
   | "filter"
   | "search"
   | "vectorSearch"
-  | "hybridSearch";
+  | "hybridSearch"
+  | "lookups";
 
 export const QUERY_COMBO_CLAUSES: readonly QueryComboClause[] = [
   "get",
@@ -55,6 +56,7 @@ export const QUERY_COMBO_CLAUSES: readonly QueryComboClause[] = [
   "search",
   "vectorSearch",
   "hybridSearch",
+  "lookups",
 ];
 
 export interface QueryComboRule {
@@ -450,5 +452,23 @@ export const QUERY_COMBO_RULES: readonly QueryComboRule[] = [
     code: "BAD_REQUEST",
     message:
       "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, filter, or vector search",
+  },
+  {
+    id: "lookups-excludes-count",
+    forbid: ["lookups", "count"],
+    code: "BAD_REQUEST",
+    message: "lookups cannot be combined with count, distinct, or aggregate",
+  },
+  {
+    id: "lookups-excludes-distinct",
+    forbid: ["lookups", "distinct"],
+    code: "BAD_REQUEST",
+    message: "lookups cannot be combined with count, distinct, or aggregate",
+  },
+  {
+    id: "lookups-excludes-aggregate",
+    forbid: ["lookups", "aggregate"],
+    code: "BAD_REQUEST",
+    message: "lookups cannot be combined with count, distinct, or aggregate",
   },
 ];

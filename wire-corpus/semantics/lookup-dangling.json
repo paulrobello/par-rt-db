@@ -1,0 +1,51 @@
+{
+  "name": "lookup-dangling",
+  "$comment": "Dangling ids (well-formed but nonexistent): the single form reads as null; the array form drops them, keeping the existing ids' docs in declared order. D1 (omit, don't error) for the dangling case. `then` re-runs the array form against the same data.",
+  "schema": {
+    "tables": {
+      "users": {
+        "fields": {
+          "name": { "type": "string" },
+          "tagIds": { "type": "array", "element": { "type": "id", "table": "tags" } }
+        }
+      },
+      "tags": {
+        "fields": { "label": { "type": "string" } }
+      },
+      "posts": {
+        "fields": {
+          "title": { "type": "string" },
+          "authorId": { "type": "optional", "inner": { "type": "id", "table": "users" } }
+        }
+      }
+    }
+  },
+  "seed": [
+    { "doc": { "name": "Ann", "tagIds": [] }, "table": "users", "$id": "u_ann" },
+    { "doc": { "label": "alpha" }, "table": "tags", "$id": "t_alpha" },
+    { "doc": { "title": "p1", "authorId": "e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0" }, "table": "posts" },
+    { "doc": { "name": "U", "tagIds": ["d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1", { "$idRef": "t_alpha" }] }, "table": "users" }
+  ],
+  "op": {
+    "query": {
+      "table": "posts",
+      "lookups": [{ "field": "authorId", "table": "users", "as": "author" }],
+      "fields": ["title", "author"]
+    }
+  },
+  "expect": [
+    { "title": "p1", "author": null }
+  ],
+  "then": {
+    "query": {
+      "table": "users",
+      "lookups": [{ "field": "tagIds", "table": "tags", "as": "tags" }],
+      "fields": ["name", "tags"]
+    },
+    "unordered": true,
+    "expect": [
+      { "name": "Ann", "tags": [] },
+      { "name": "U", "tags": [{ "label": "alpha" }] }
+    ]
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "name": "lookup-array-order-cap",
+  "$comment": "Array<Id> lookup: joined docs come back in the id-array's declared order, truncated to the first `cap` (2 here) when the array is longer. Pins declared-order fan-out + cap truncation.",
+  "schema": {
+    "tables": {
+      "tags": {
+        "fields": { "label": { "type": "string" } }
+      },
+      "users": {
+        "fields": {
+          "name": { "type": "string" },
+          "tagIds": { "type": "array", "element": { "type": "id", "table": "tags" } }
+        }
+      }
+    }
+  },
+  "seed": [
+    { "doc": { "label": "alpha" }, "table": "tags", "$id": "t_alpha" },
+    { "doc": { "label": "bravo" }, "table": "tags", "$id": "t_bravo" },
+    { "doc": { "label": "charlie" }, "table": "tags", "$id": "t_charlie" },
+    { "doc": { "label": "delta" }, "table": "tags", "$id": "t_delta" },
+    { "doc": { "name": "U", "tagIds": [{ "$idRef": "t_charlie" }, { "$idRef": "t_alpha" }, { "$idRef": "t_bravo" }, { "$idRef": "t_delta" }] }, "table": "users" }
+  ],
+  "op": {
+    "query": {
+      "table": "users",
+      "lookups": [{ "field": "tagIds", "table": "tags", "as": "tags", "cap": 2 }],
+      "fields": ["name", "tags"]
+    }
+  },
+  "expect": [
+    { "name": "U", "tags": [{ "label": "charlie" }, { "label": "alpha" }] }
+  ]
+}

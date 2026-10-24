@@ -111,6 +111,7 @@ async fn seed(
 
 async fn count_titles(pool: &PgPool, db: &str, schema: &SchemaDef, title: &str) -> i64 {
     let q = Query {
+        lookups: Vec::new(),
         table: "tasks".to_string(),
         get: None,
         index: Some("by_title".to_string()),
@@ -272,6 +273,7 @@ async fn read_query_filter_older_than_is_rejected() -> anyhow::Result<()> {
     let schema = push(&pool, &db, number_schema_json()).await?;
 
     let q = Query {
+        lookups: Vec::new(),
         table: "tasks".to_string(),
         get: None,
         index: None,

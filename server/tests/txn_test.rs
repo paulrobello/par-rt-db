@@ -256,6 +256,7 @@ async fn insert_strips_explicit_null_optional_field() -> anyhow::Result<()> {
         &db,
         &schema,
         &rtdb_server::query::Query {
+            lookups: Vec::new(),
             table: "projects".to_string(),
             get: Some(id),
             index: None,
@@ -1151,6 +1152,7 @@ async fn patch_recomputes_int64_indexed_column() -> anyhow::Result<()> {
         &db,
         &schema,
         &rtdb_server::query::Query {
+            lookups: Vec::new(),
             table: "events".to_string(),
             get: None,
             index: Some("by_ts".to_string()),
@@ -1207,6 +1209,7 @@ async fn patch_recomputes_int64_indexed_column() -> anyhow::Result<()> {
         &db,
         &schema,
         &rtdb_server::query::Query {
+            lookups: Vec::new(),
             table: "events".to_string(),
             get: None,
             index: Some("by_ts".to_string()),
@@ -1293,6 +1296,7 @@ async fn replace_recomputes_int64_indexed_column() -> anyhow::Result<()> {
         &db,
         &schema,
         &rtdb_server::query::Query {
+            lookups: Vec::new(),
             table: "events".to_string(),
             get: None,
             index: Some("by_ts".to_string()),
@@ -1646,6 +1650,7 @@ async fn count_by_status(
     status: &str,
 ) -> anyhow::Result<i64> {
     let q = Query {
+        lookups: Vec::new(),
         table: "workItems".to_string(),
         get: None,
         index: Some("by_status".to_string()),

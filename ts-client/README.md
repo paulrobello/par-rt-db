@@ -282,7 +282,13 @@ each result doc to the listed fields (system fields
 `_id`/`_creationTime`/`_version` are always kept; `.fields()` with no args is
 an ids-only view; unknown names are `BAD_REQUEST`) — it composes with every
 doc-bearing terminal, and a projected subscription stays silent when a write
-changes only non-projected fields.
+changes only non-projected fields. `.lookup({field, table, as, cap?})` adds a
+server-side lookup expansion spec: the server (and the in-memory harness)
+resolves the declared `Id`/`Optional<Id>`/`Array<Id>` field into the
+referenced document(s) under the `as` key on each result doc — N+1-free joins
+in one round trip, with per-row authorization applied on the server. Legal
+with every doc-returning terminal; `count`/`distinct`/`aggregate` reject it;
+`.fields()` may name the alias.
 
 ```ts
 // given .index("by_project_status", ["projectId", "status"]) — distinct and

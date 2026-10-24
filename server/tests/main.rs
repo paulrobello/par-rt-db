@@ -34,6 +34,7 @@ mod hot_config_test;
 mod http_api_test;
 mod idle_reclaim_test;
 mod image_transform_test;
+mod lookup_test;
 mod merge_test;
 mod migration_test;
 mod multi_instance_stage4_test;

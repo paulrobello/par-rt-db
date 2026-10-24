@@ -127,6 +127,7 @@ async fn all_titles(pool: &sqlx::PgPool, db: &str) -> Vec<String> {
     let schema: rtdb_server::schema::SchemaDef =
         serde_json::from_value(owner_schema()).expect("parse owner schema");
     let query = rtdb_server::query::Query {
+        lookups: Vec::new(),
         table: "notes".into(),
         get: None,
         index: None,

@@ -34,6 +34,28 @@ export interface QueryJson {
    * wire when unset (full docs) — mirrors server `Query.fields`
    * (`skip_serializing_if = "Option::is_none"`). */
   fields?: string[];
+  /** Server-side lookup expansion: resolve an id / id-array field on each
+   * result doc into the referenced document(s) of `table`, exposed under the
+   * `as` key on the same doc. Depth-1 only; id-equality only. Omitted on the
+   * wire when empty — mirrors server `Query.lookups`
+   * (`skip_serializing_if = "Vec::is_empty"`). */
+  lookups?: LookupSpecJson[];
+}
+
+/** Mirrors server `query::LookupSpec` byte-for-byte (camelCase, `as` rename,
+ * deny_unknown_fields). */
+export interface LookupSpecJson {
+  /** Declared field on the query's table: `Id { table }`,
+   * `Optional<Id { table }>`, or `Array { element: Id { table } }`. */
+  field: string;
+  /** The referenced table. Must equal the field's declared `Id.table`. */
+  table: string;
+  /** Output key on each parent doc (`as` is a reserved word in several
+   * client languages; the wire key is the raw `as`). */
+  as: string;
+  /** Per-parent joined-row cap for an id-ARRAY lookup. Default 100, hard max
+   * 1000 (values above are `BAD_REQUEST`). Omitted when unset. */
+  cap?: number;
 }
 
 /**

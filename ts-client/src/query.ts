@@ -5,6 +5,7 @@ import type {
   AggregateSpec,
   FilterExpr,
   HybridSearchQuery,
+  LookupSpecJson,
   Order,
   PaginatedResultJson,
   QueryJson,
@@ -77,6 +78,30 @@ export class TableQuery<DocT, Indexes extends string> {
    * in-memory harness) at compile time. */
   fields(...names: string[]): TableQuery<DocT, Indexes> {
     return new TableQuery({ ...this.json, fields: names });
+  }
+
+  /** Server-side lookup expansion: resolves `opts.field` (an Id /
+   * Optional<Id> / Array<Id> declared field whose `Id.table` equals
+   * `opts.table`) on each result doc into the referenced document(s),
+   * exposed under `opts.as` on the same doc. Depth-1 only; id-equality only.
+   * `opts.cap` is the per-parent joined-row cap for an id-ARRAY lookup
+   * (default 100, hard max 1000). Legal with every doc-returning terminal,
+   * rejected `BAD_REQUEST` with count/distinct/aggregate; the projection
+   * (`fields`) may name `opts.as`. */
+  lookup(opts: {
+    field: string;
+    table: string;
+    as: string;
+    cap?: number;
+  }): TableQuery<DocT, Indexes> {
+    const spec: LookupSpecJson = {
+      field: opts.field,
+      table: opts.table,
+      as: opts.as,
+      ...(opts.cap !== undefined ? { cap: opts.cap } : {}),
+    };
+    const lookups = [...(this.json.lookups ?? []), spec];
+    return new TableQuery({ ...this.json, lookups });
   }
 
   /** Full-text `search` over a declared search index. Composes with `take`

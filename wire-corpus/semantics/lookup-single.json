@@ -1,0 +1,37 @@
+{
+  "name": "lookup-single",
+  "$comment": "Doc-returning collect with a single-Id lookup: each parent doc gains `author` = the joined users doc (child system fields projected away here by the runner's default normalize). A parent with a null/absent optional Id reads as author:null. Pins one-round-trip id-join semantics.",
+  "schema": {
+    "tables": {
+      "users": {
+        "fields": { "name": { "type": "string" } }
+      },
+      "posts": {
+        "fields": {
+          "title": { "type": "string" },
+          "authorId": { "type": "optional", "inner": { "type": "id", "table": "users" } }
+        }
+      }
+    }
+  },
+  "seed": [
+    { "doc": { "name": "Ann" }, "table": "users", "$id": "u_ann" },
+    { "doc": { "name": "Bo" }, "table": "users", "$id": "u_bo" },
+    { "doc": { "title": "p1", "authorId": { "$idRef": "u_ann" } }, "table": "posts" },
+    { "doc": { "title": "p2", "authorId": { "$idRef": "u_bo" } }, "table": "posts" },
+    { "doc": { "title": "p3" }, "table": "posts" }
+  ],
+  "op": {
+    "query": {
+      "table": "posts",
+      "lookups": [{ "field": "authorId", "table": "users", "as": "author" }],
+      "fields": ["title", "author"]
+    }
+  },
+  "unordered": true,
+  "expect": [
+    { "title": "p1", "author": { "name": "Ann" } },
+    { "title": "p2", "author": { "name": "Bo" } },
+    { "title": "p3", "author": null }
+  ]
+}

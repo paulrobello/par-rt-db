@@ -267,6 +267,7 @@ async fn delete(
 
 fn base_query(table: &str) -> Query {
     Query {
+        lookups: Vec::new(),
         table: table.to_string(),
         get: None,
         index: None,
