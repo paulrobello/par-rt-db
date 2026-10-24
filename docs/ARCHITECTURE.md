@@ -538,9 +538,13 @@ minute. The per-token bucket aggregates every connection one machine token
 opens across both transports, so concurrent jobs sharing a token share one
 budget. Measured against the shipped defaults, a recovery-style client
 (fixture replay plus a 100 ms lease poll) peaks near 500 requests in one
-minute — under the 600 default but with little headroom, which is why
-concurrent activity on the same token, not the solo run, is what tips a
-minute into denial. One ordering the mutate arms add on top: a replay of an
+minute — under the 1,200 default with headroom for roughly two such
+consumers on one token, which is why concurrent activity on the same token,
+not the solo run, is what tips a minute into denial. A deployment can also
+lift a trusted database out of both buckets entirely: a db named in
+`RTDB_RATE_LIMIT_EXEMPT_DBS` (boot-pinned, see `LimitsConfig`) skips the
+per-token and per-db checks for every request against it. One ordering the
+mutate arms add on top: a replay of an
 idempotency key this machine token already submitted within the current
 minute skips the per-token bucket (the committer dedups it to a no-op, so
 re-charging it only punishes a recovering client for retrying), while the

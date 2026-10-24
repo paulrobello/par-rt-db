@@ -167,6 +167,7 @@ pub fn test_config() -> Config {
             anonymous_per_ip_rpm: 0,
             admin_per_ip_rpm: 0,
             oauth_begin_per_ip_rpm: 0,
+            rate_limit_exempt_dbs: Vec::new(),
         },
         storage: rtdb_server::config::StorageConfig {
             require_signed_urls: false,
@@ -230,6 +231,27 @@ pub async fn test_state() -> Arc<AppState> {
 /// so the ceilings are set on the hot seed before constructing AppState.
 pub async fn test_state_with_rate_limits(per_token_rpm: u32, per_db_rpm: u32) -> Arc<AppState> {
     let config = test_config();
+    let mut hot = test_hot();
+    hot.per_token_rpm = per_token_rpm;
+    hot.per_db_rpm = per_db_rpm;
+    let pool = test_pool(&config.database_url)
+        .await
+        .expect("connect to test postgres");
+    db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
+    AppState::new(pool, config, hot)
+}
+
+/// Like `test_state_with_rate_limits` but also names `exempt_dbs` on the
+/// boot-pinned `LimitsConfig` — the per-db capacity exemption
+/// (`RTDB_RATE_LIMIT_EXEMPT_DBS`) reads `state.config.limits`, not hot
+/// config, so it must be set before AppState is built.
+pub async fn test_state_with_rate_limit_exemptions(
+    per_token_rpm: u32,
+    per_db_rpm: u32,
+    exempt_dbs: Vec<String>,
+) -> Arc<AppState> {
+    let mut config = test_config();
+    config.limits.rate_limit_exempt_dbs = exempt_dbs;
     let mut hot = test_hot();
     hot.per_token_rpm = per_token_rpm;
     hot.per_db_rpm = per_db_rpm;

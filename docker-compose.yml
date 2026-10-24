@@ -234,14 +234,17 @@ services:
       # 0 is still accepted and means unlimited (the code default) — these
       # shipped non-zero defaults make the limiters active out-of-the-box.
       # OAuth sessions carry no token id and are rate-limited per-db only.
-      RTDB_RATE_LIMIT_PER_TOKEN_RPM: ${RTDB_RATE_LIMIT_PER_TOKEN_RPM:-600}
-      RTDB_RATE_LIMIT_PER_DB_RPM: ${RTDB_RATE_LIMIT_PER_DB_RPM:-6000}
+      RTDB_RATE_LIMIT_PER_TOKEN_RPM: ${RTDB_RATE_LIMIT_PER_TOKEN_RPM:-1200}
+      RTDB_RATE_LIMIT_PER_DB_RPM: ${RTDB_RATE_LIMIT_PER_DB_RPM:-12000}
       # ARC-007: multi-instance-only. false (default) counts locally per
       # replica and reconciles with Postgres every RTDB_RATE_LIMIT_SYNC_MS
       # instead of a synchronous per-request round trip; true keeps the exact
       # per-request Postgres UPSERT.
       RTDB_RATE_LIMIT_EXACT: ${RTDB_RATE_LIMIT_EXACT:-false}
       RTDB_RATE_LIMIT_SYNC_MS: ${RTDB_RATE_LIMIT_SYNC_MS:-1000}
+      # Boot-pinned capacity exemption: requests against a listed db
+      # (comma-separated) skip both buckets. Changing the list takes a restart.
+      RTDB_RATE_LIMIT_EXEMPT_DBS: ${RTDB_RATE_LIMIT_EXEMPT_DBS:-}
       # Document TTL reaper. Sweep cadence per db and rows deleted per
       # table per sweep. Best-effort, boot-only. Defaults mirror the server.
       RTDB_TTL_SWEEP_INTERVAL_SECS: ${RTDB_TTL_SWEEP_INTERVAL_SECS:-60}

@@ -330,6 +330,7 @@ mod tests {
                 anonymous_per_ip_rpm: 0,
                 admin_per_ip_rpm: 0,
                 oauth_begin_per_ip_rpm: 0,
+                rate_limit_exempt_dbs: Vec::new(),
             },
             storage: crate::config::StorageConfig {
                 require_signed_urls: false,

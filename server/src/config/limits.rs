@@ -36,6 +36,13 @@ pub struct LimitsConfig {
     /// Postgres and refreshes its shared-count view. Unused when `exact` is
     /// true.
     pub sync_ms: u64,
+    /// RTDB_RATE_LIMIT_EXEMPT_DBS (default empty; comma-separated db names).
+    /// Every request against a listed db skips the per-token and per-db
+    /// capacity ceilings entirely; the WS per-connection frame cap and the
+    /// per-IP abuse guards below never consult this. Boot-pinned on purpose:
+    /// the ceilings themselves are hot config, but naming a trusted db is a
+    /// deployment-level decision, so changing the list takes a restart.
+    pub rate_limit_exempt_dbs: Vec<String>,
 }
 
 impl Default for LimitsConfig {
@@ -47,6 +54,7 @@ impl Default for LimitsConfig {
             oauth_begin_per_ip_rpm: 0,
             exact: false,
             sync_ms: 1000,
+            rate_limit_exempt_dbs: Vec::new(),
         }
     }
 }
@@ -60,6 +68,11 @@ impl LimitsConfig {
         // Approximate-limiter flush interval; clamped so a typo'd tiny value
         // can't turn the flush into a tight loop.
         let sync_ms = env_parsed("RTDB_RATE_LIMIT_SYNC_MS", 1000u64)?.max(50);
+
+        // Boot-pinned capacity exemption (see the field doc). Parsed via
+        // `parse_db_list`, which is unit-tested without mutating env.
+        let rate_limit_exempt_dbs =
+            parse_db_list(&std::env::var("RTDB_RATE_LIMIT_EXEMPT_DBS").unwrap_or_default());
 
         // Per-IP rate limit on the public storage route (SEC-004). 0 = off,
         // matching the existing per-token/per-db limiter convention.
@@ -89,6 +102,37 @@ impl LimitsConfig {
             oauth_begin_per_ip_rpm,
             exact,
             sync_ms,
+            rate_limit_exempt_dbs,
         })
+    }
+}
+
+/// Splits a comma-separated db list (`RTDB_RATE_LIMIT_EXEMPT_DBS`) into
+/// trimmed, non-empty entries. Factored out of `from_env` so the split rules
+/// are unit-testable without mutating process-global env.
+fn parse_db_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_db_list_trims_and_drops_empties() {
+        assert!(parse_db_list("").is_empty());
+        assert!(parse_db_list("   ").is_empty());
+        assert_eq!(parse_db_list("the-cube"), vec!["the-cube".to_string()]);
+        assert_eq!(
+            parse_db_list(" the-cube , other-db ,, x"),
+            vec![
+                "the-cube".to_string(),
+                "other-db".to_string(),
+                "x".to_string()
+            ]
+        );
     }
 }

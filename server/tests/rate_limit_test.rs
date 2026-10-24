@@ -9,7 +9,10 @@
 
 use std::net::SocketAddr;
 
-use crate::common::{admin_post, fresh_db, spawn_app, test_state_with_rate_limits};
+use crate::common::{
+    admin_post, fresh_db, spawn_app, test_state_with_rate_limit_exemptions,
+    test_state_with_rate_limits,
+};
 use serde_json::json;
 
 /// POSTs `body` to `path` with a Bearer token; mirrors `http_api_test::api_post`.
@@ -342,6 +345,60 @@ async fn per_db_budget_does_not_leak_across_dbs() -> anyhow::Result<()> {
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    Ok(())
+}
+
+// (d2) The boot-pinned db exemption (`RTDB_RATE_LIMIT_EXEMPT_DBS`): every
+// request against an exempt db skips BOTH buckets, so it serves a burst that
+// would deny under per-token = per-db = 1, while a regular db under the same
+// ceilings still denies its second request.
+#[tokio::test]
+async fn exempt_db_skips_both_buckets() -> anyhow::Result<()> {
+    use rtdb_server::schema::SchemaDef;
+    use rtdb_server::{db, ddl};
+
+    // The exemption must name the db before the state exists, so the name is
+    // reserved up front and the db is created below — mirroring `fresh_db`'s
+    // create + kanban fixture push.
+    let name = format!("t{}", uuid::Uuid::now_v7().simple());
+    let state = test_state_with_rate_limit_exemptions(1, 1, vec![name.clone()]).await;
+    let addr = spawn_app(state.clone()).await;
+
+    db::create_database(&state.pool, &name).await?;
+    let schema: SchemaDef = serde_json::from_value(crate::common::kanban_schema_json())
+        .expect("parse kanban schema fixture");
+    ddl::push_schema(&state.pool, &name, schema).await?;
+
+    let (_, token) = mint_token(addr, &name).await;
+    let query = json!({"db": name, "query": {"table": "workItems"}});
+    for i in 1..=5 {
+        let resp = api_post(addr, "/api/query", &token, query.clone()).await;
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "exempt-db request {i} must bypass both buckets"
+        );
+    }
+
+    // Control: a non-exempt db keeps its ceilings — with per-token = 1, its
+    // token's second request is denied even though the exempt db above never
+    // charged any bucket.
+    let other = fresh_db(&state).await;
+    let (_, other_token) = mint_token(addr, other.as_str()).await;
+    let other_query = json!({"db": other, "query": {"table": "workItems"}});
+    assert_eq!(
+        api_post(addr, "/api/query", &other_token, other_query.clone())
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        api_post(addr, "/api/query", &other_token, other_query)
+            .await
+            .status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS
+    );
 
     Ok(())
 }

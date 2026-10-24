@@ -483,7 +483,24 @@ async fn check_pg(pool: &sqlx::PgPool, key: &RateKey, limit_rpm: u32) -> RateDec
     }
 }
 
+/// True when `db` is on the boot-pinned exemption list
+/// (`LimitsConfig::rate_limit_exempt_dbs`, `RTDB_RATE_LIMIT_EXEMPT_DBS`):
+/// every request against an exempt db skips both the per-token and the
+/// per-db bucket. The per-IP abuse guards and the WS per-connection frame
+/// cap never consult this — those protect the instance, not capacity budgets.
+fn db_is_exempt(state: &AppState, db: &str) -> bool {
+    state
+        .config
+        .limits
+        .rate_limit_exempt_dbs
+        .iter()
+        .any(|exempt| exempt == db)
+}
+
 pub async fn evaluate(state: &AppState, principal: &Principal, db: &str) -> RateDecision {
+    if db_is_exempt(state, db) {
+        return RateDecision::Allowed;
+    }
     let token_limit = state.runtime.hot.load().per_token_rpm;
     if token_limit > 0
         && let Principal::Machine { token_id, .. } = principal
@@ -500,8 +517,14 @@ pub async fn evaluate(state: &AppState, principal: &Principal, db: &str) -> Rate
 
 /// The per-db aggregate bucket alone — the ceiling shared by every principal
 /// against one database. The mutate-arm replay exemption in
-/// [`evaluate_mutate`] skips only the per-token bucket, never this one.
+/// [`evaluate_mutate`] skips only the per-token bucket, never this one; a db
+/// named in `RTDB_RATE_LIMIT_EXEMPT_DBS` skips it entirely
+/// ([`db_is_exempt`], checked here directly because the replay path calls
+/// this without going through [`evaluate`]).
 async fn evaluate_db(state: &AppState, db: &str) -> RateDecision {
+    if db_is_exempt(state, db) {
+        return RateDecision::Allowed;
+    }
     let db_limit = state.runtime.hot.load().per_db_rpm;
     if db_limit > 0
         && let RateDecision::Denied { retry_after_secs } = state

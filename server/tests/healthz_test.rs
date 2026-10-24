@@ -52,6 +52,7 @@ fn test_config() -> Config {
             anonymous_per_ip_rpm: 0,
             admin_per_ip_rpm: 0,
             oauth_begin_per_ip_rpm: 0,
+            rate_limit_exempt_dbs: Vec::new(),
         },
         storage: rtdb_server::config::StorageConfig {
             require_signed_urls: false,
