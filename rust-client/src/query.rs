@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // module. The `TableQuery` builder below and the opts bags are
 // rust-client-only ergonomics and stay defined here; they produce the core
 // `Query` directly.
-pub use par_rt_db_core::query::{Order, Paginate, Query};
+pub use par_rt_db_core::query::{LookupSpec, Order, Paginate, Query};
 
 // ARC-130: response-shaped (returned by the paginate terminal). The caller
 // reads it; the server constructs it. `#[non_exhaustive]` lets the wire shape
@@ -183,6 +183,25 @@ impl TableQuery {
     /// compile time.
     pub fn fields(mut self, names: &[&str]) -> Self {
         self.q.fields = Some(names.iter().map(|n| (*n).to_string()).collect());
+        self
+    }
+
+    /// Server-side lookup expansion: resolves `field` (an `Id` /
+    /// `Optional<Id>` / `Array<Id>` declared field whose `Id.table` equals
+    /// `table`) on each result doc into the referenced document(s), exposed
+    /// under `alias` on the same doc. Depth-1 only; id-equality only. `cap` is
+    /// the per-parent joined-row cap for an id-ARRAY lookup (default 100, hard
+    /// max 1000). Legal with every doc-returning terminal, rejected
+    /// `BAD_REQUEST` with count/distinct/aggregate; the projection
+    /// (`fields`) may name `alias`. Chainable (`.lookup(..).lookup(..)`, up to
+    /// 4). Mirrors the ts-client's `TableQuery.lookup`.
+    pub fn lookup(mut self, field: &str, table: &str, alias: &str, cap: Option<u32>) -> Self {
+        self.q.lookups.push(LookupSpec {
+            field: field.into(),
+            table: table.into(),
+            r#as: alias.into(),
+            cap,
+        });
         self
     }
 

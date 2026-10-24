@@ -354,6 +354,15 @@ async fn run_case(case_name: &str, case: &Value) {
         .unwrap_or_else(|| panic!("{case_name}: seed must be an array"));
     for (i, entry) in seed.iter().enumerate() {
         let (table, doc, label) = parse_seed_entry(entry, single_table.as_deref(), case_name);
+        // `$idRef` substitution applies to seed docs too: a seed may reference
+        // the minted id of any EARLIER `$id`-labeled seed (lookups need real
+        // cross-doc id references, which no other placeholder expresses).
+        // Forward references stay an authoring error.
+        let doc = substitute(&Value::Object(doc), &ids, case_name);
+        let doc = doc
+            .as_object()
+            .cloned()
+            .expect("substitute of an object returns an object");
         let txn = Transaction {
             steps: vec![Step::Insert {
                 table: table.clone(),

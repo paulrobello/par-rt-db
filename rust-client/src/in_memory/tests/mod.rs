@@ -8,7 +8,7 @@
 //! cascade / soft delete (FM-33). Cross-cluster fixtures live here.
 use super::*;
 use crate::mutation::Mutation;
-use crate::query::{Paginate, Paginated, SearchOpts, TableQuery, VectorSearchOpts};
+use crate::query::{LookupSpec, Paginate, Paginated, SearchOpts, TableQuery, VectorSearchOpts};
 use crate::schema::{Schema, SchemaBuilderExt, Table};
 use crate::wire::{AggregateOp, AggregateSpec, FilterExpr, SearchMode};
 use serde_json::json;
@@ -19,6 +19,7 @@ mod cascade;
 mod computed;
 mod constraints;
 mod filter;
+mod lookup;
 // Every migrate test (and its fixture) is `#[cfg(feature = "admin")]` — the
 // migrate surface only exists on admin-enabled builds, so the module is too.
 #[cfg(feature = "admin")]

@@ -41,13 +41,24 @@ impl InMemoryRtDbClient {
     /// same, only the sort columns differ.
     pub fn run_query(&self, q: &Query) -> Result<Value, RtDbError> {
         let table_def = self.require_table(&q.table)?.clone();
+        // Lookup validation runs first (the server's compile cascade order), so
+        // a bad lookup spec surfaces as NOT_FOUND/BAD_REQUEST before anything
+        // executes; the returned aliases are the extra names a `fields`
+        // projection may then admit.
+        let lookup_aliases = validate_lookups(q, &table_def, &self.tables)?;
         // Projection validation runs before every early return so all terminals
         // (including `get`) reject unknown field names up front — the same
         // compile-time gate the server runs in `compile_query` (and `/explain`).
         if let Some(fields) = &q.fields {
-            validate_projection(&table_def, fields)?;
+            validate_projection(&table_def, fields, &lookup_aliases)?;
         }
-        let result = self.execute_query(q, &table_def)?;
+        let mut result = self.execute_query(q, &table_def)?;
+        // Lookup expansion sits between terminal execution and projection (the
+        // server `execute_query` seam), so joined keys are part of the shape a
+        // projection then narrows and a subscription diffs.
+        if !q.lookups.is_empty() {
+            expand_lookups(&mut result, q, &table_def, &self.docs, &self.tables)?;
+        }
         // Apply the caller's field projection at this one seam: every
         // doc-bearing terminal's docs flow back through here (mirrors server
         // `execute_query`), so one pass covers one-shot reads and every
@@ -1078,15 +1089,23 @@ impl InMemoryRtDbClient {
 const PROJECTION_SYSTEM_FIELDS: [&str; 3] = ["_id", "_creationTime", "_version"];
 
 /// Validate a `fields` projection against the table: every name must be a
-/// declared field or one of the system fields (`_id`/`_creationTime`/
-/// `_version` — always included, so listing them is an allowed no-op).
-/// Anything else — including typo'd system names and other `_`-prefixed
-/// names — is `BAD_REQUEST` at compile time, the same gate the server runs
-/// in `compile_query` (and `/explain`). `[]` (system fields only) validates
+/// declared field, one of the system fields (`_id`/`_creationTime`/
+/// `_version` — always included, so listing them is an allowed no-op), or a
+/// lookup alias (admitted only when the query carries `lookups` — the same
+/// admission rule server `validate_projection` applies). Anything else —
+/// including typo'd system names and other `_`-prefixed names — is
+/// `BAD_REQUEST` at compile time, the same gate the server runs in
+/// `compile_query` (and `/explain`). `[]` (system fields only) validates
 /// trivially.
-fn validate_projection(table_def: &TableDef, fields: &[String]) -> Result<(), RtDbError> {
+fn validate_projection(
+    table_def: &TableDef,
+    fields: &[String],
+    lookup_aliases: &[String],
+) -> Result<(), RtDbError> {
     for name in fields {
-        if PROJECTION_SYSTEM_FIELDS.contains(&name.as_str()) || table_def.fields.contains_key(name)
+        if PROJECTION_SYSTEM_FIELDS.contains(&name.as_str())
+            || table_def.fields.contains_key(name)
+            || lookup_aliases.iter().any(|a| a == name)
         {
             continue;
         }
@@ -1174,6 +1193,277 @@ pub(super) fn diff_canonical(result: &Value, q: &Query) -> String {
         doc.remove("_version");
     });
     canonical(&stripped)
+}
+
+// ---------------------------------------------------------------------------
+// Lookup expansion — mirrors server 'query::lookup' ('validate_lookups' /
+// 'expand_lookups') and the ts-client's 'validateLookups' / 'expandLookups'
+// ('ts-client/src/in_memory/query.ts:308/384'). Compile-time validation runs
+// before every early return in 'run_query'; expansion sits between terminal
+// execution and projection. The in-memory harness models no principal, so
+// joined rows carry no per-row authorization predicates (the server appends
+// them to its batched fetch) — a dangling or soft-deleted child reads as
+// absent (null / dropped from the array), never an error.
+// ---------------------------------------------------------------------------
+
+/// At most 4 lookups per query; a fifth is 'BadRequest' (resource-cap style).
+const MAX_LOOKUPS: usize = 4;
+
+/// Hard max of a 'LookupSpec.cap' value; above is 'BadRequest' at compile time
+/// (the caller made a static mistake; clamping would hide it).
+const MAX_LOOKUP_CAP: u32 = 1000;
+
+/// Default per-parent joined-row cap for an id-ARRAY lookup.
+const DEFAULT_LOOKUP_CAP: u32 = 100;
+
+/// Ceiling on total joined rows materialized per query execution; on exceed,
+/// truncation proceeds in parent-result order (deterministic).
+const MAX_JOINED_ROWS: usize = 8192;
+
+/// Compile-time lookup validation (mirrors server 'validate_lookups'):
+/// unknown lookup table → 'NOT_FOUND'; 'field' not declared, or not
+/// 'Id'/'Optional<Id>'/'Array<Id>' → 'BAD_REQUEST'; declared 'Id.table' ≠ lookup
+/// 'table' → 'BAD_REQUEST'; 'as' collides with a declared field, a
+/// '_'-prefixed name, or another lookup's alias → 'BAD_REQUEST'; 'cap' > 1000
+/// → 'BAD_REQUEST'; > 4 lookups → 'BAD_REQUEST'. Returns the aliases the
+/// projection gate admits.
+fn validate_lookups(
+    q: &Query,
+    parent_def: &TableDef,
+    tables: &HashMap<String, TableDef>,
+) -> Result<Vec<String>, RtDbError> {
+    if q.lookups.is_empty() {
+        return Ok(Vec::new());
+    }
+    if q.lookups.len() > MAX_LOOKUPS {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            format!("at most {MAX_LOOKUPS} lookups per query"),
+        ));
+    }
+    let mut aliases: Vec<String> = Vec::new();
+    for lk in &q.lookups {
+        // Unknown lookup table is NOT_FOUND, mirroring `require_table`.
+        tables.get(&lk.table).ok_or_else(|| {
+            RtDbError::new(
+                ErrorCode::NotFound,
+                format!("table '{}' not found", lk.table),
+            )
+        })?;
+        let ty = parent_def.fields.get(&lk.field).ok_or_else(|| {
+            RtDbError::new(
+                ErrorCode::BadRequest,
+                format!(
+                    "lookup field '{}' is not declared on table '{}'",
+                    lk.field, q.table
+                ),
+            )
+        })?;
+        let declared_child_table = match ty {
+            FieldType::Id { table, .. } => Some(table),
+            FieldType::Optional { inner } => match inner.as_ref() {
+                FieldType::Id { table, .. } => Some(table),
+                _ => None,
+            },
+            FieldType::Array { element } => match element.as_ref() {
+                FieldType::Id { table, .. } => Some(table),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(declared) = declared_child_table else {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!(
+                    "lookup field '{}' must be declared Id, Optional<Id>, or Array<Id>",
+                    lk.field
+                ),
+            ));
+        };
+        if declared != &lk.table {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!(
+                    "lookup field '{}' declares Id table '{}' but the lookup names '{}'",
+                    lk.field, declared, lk.table
+                ),
+            ));
+        }
+        if lk.r#as.starts_with('_') {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("lookup alias '{}' must not start with '_'", lk.r#as),
+            ));
+        }
+        if parent_def.fields.contains_key(&lk.r#as) {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("lookup alias '{}' collides with a declared field", lk.r#as),
+            ));
+        }
+        if aliases.iter().any(|a| a == &lk.r#as) {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!(
+                    "lookup alias '{}' collides with another lookup alias",
+                    lk.r#as
+                ),
+            ));
+        }
+        if let Some(cap) = lk.cap
+            && cap > MAX_LOOKUP_CAP
+        {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                format!("lookup cap exceeds maximum of {MAX_LOOKUP_CAP}"),
+            ));
+        }
+        aliases.push(lk.r#as.clone());
+    }
+    Ok(aliases)
+}
+
+/// Whether the declared field type makes the lookup array-form ('Array<Id>')
+/// rather than single-form ('Id' / 'Optional<Id>'). Validation has already
+/// pinned the field to one of the three accepted shapes.
+fn is_array_lookup(ty: &FieldType) -> bool {
+    match ty {
+        FieldType::Array { .. } => true,
+        FieldType::Optional { inner } => matches!(inner.as_ref(), FieldType::Array { .. }),
+        _ => false,
+    }
+}
+
+/// Every result doc as a mutable map, routed by the query's terminal (the same
+/// routing 'map_result_docs' uses, mirroring the server's match over the
+/// 'QueryResult' enum): the paginate envelope's 'docs', the single doc of
+/// 'get'/'unique'/'first', or the array of the collect/search terminals.
+/// Doc-less terminals ('count'/'distinct'/'aggregate') yield nothing — they
+/// never reach here anyway (the 'lookups-excludes-*' combination rules reject
+/// them at compile time).
+fn lookup_docs_mut<'a>(q: &Query, result: &'a mut Value) -> Vec<&'a mut Map<String, Value>> {
+    if q.count || q.distinct || q.aggregate.is_some() {
+        return Vec::new();
+    }
+    if q.paginate.is_some() {
+        return match result.get_mut("docs") {
+            Some(Value::Array(docs)) => docs.iter_mut().filter_map(Value::as_object_mut).collect(),
+            _ => Vec::new(),
+        };
+    }
+    if q.get.is_some() || q.unique || q.first {
+        return match result {
+            Value::Object(m) => vec![m],
+            _ => Vec::new(),
+        };
+    }
+    match result {
+        Value::Array(docs) => docs.iter_mut().filter_map(Value::as_object_mut).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Execute-time expansion (mirrors server 'expand_lookups' and the ts
+/// 'expandLookups'): per lookup, collect the distinct ids across the result
+/// docs, fetch the visible child rows once (FM-33: stamped rows are
+/// invisible), then fan out in memory — declared id-array order, dangling ids
+/// dropped, 'cap' truncation, and a deterministic 'MAX_JOINED_ROWS' ceiling in
+/// parent-result order. Mutates the doc-bearing result in place.
+fn expand_lookups(
+    result: &mut Value,
+    q: &Query,
+    parent_def: &TableDef,
+    docs: &HashMap<(String, String), StoredRow>,
+    tables: &HashMap<String, TableDef>,
+) -> Result<(), RtDbError> {
+    let mut lookup_docs = lookup_docs_mut(q, result);
+    let mut budget = MAX_JOINED_ROWS;
+    for lk in &q.lookups {
+        // Unknown lookup table is NOT_FOUND, mirroring `require_table`.
+        tables.get(&lk.table).ok_or_else(|| {
+            RtDbError::new(
+                ErrorCode::NotFound,
+                format!("table '{}' not found", lk.table),
+            )
+        })?;
+        let array_form = parent_def
+            .fields
+            .get(&lk.field)
+            .map(is_array_lookup)
+            .unwrap_or(false);
+
+        // Distinct ids across the result set, first-seen order.
+        let mut ids: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for doc in &lookup_docs {
+            match doc.get(&lk.field) {
+                Some(Value::String(id)) => {
+                    if seen.insert(id.clone()) {
+                        ids.push(id.clone());
+                    }
+                }
+                Some(Value::Array(arr)) => {
+                    for id in arr {
+                        if let Some(id) = id.as_str()
+                            && seen.insert(id.to_string())
+                        {
+                            ids.push(id.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // One in-memory fetch: visible (non-stamped) child rows by id.
+        let mut fetched: HashMap<String, Value> = HashMap::with_capacity(ids.len());
+        for id in &ids {
+            if let Some(row) = docs.get(&(lk.table.clone(), id.clone()))
+                && row.deleted_at.is_none()
+            {
+                fetched.insert(id.clone(), merge_doc(row));
+            }
+        }
+
+        let cap = lk.cap.unwrap_or(DEFAULT_LOOKUP_CAP);
+        for doc in lookup_docs.iter_mut() {
+            match doc.get(&lk.field) {
+                Some(Value::String(id)) => {
+                    let joined = if budget > 0 { fetched.get(id) } else { None };
+                    if joined.is_some() {
+                        budget -= 1;
+                    }
+                    doc.insert(lk.r#as.clone(), joined.cloned().unwrap_or(Value::Null));
+                }
+                Some(Value::Array(arr)) => {
+                    let mut out: Vec<Value> = Vec::new();
+                    for id in arr {
+                        if out.len() >= cap as usize || budget == 0 {
+                            break;
+                        }
+                        if let Some(id) = id.as_str()
+                            && let Some(joined) = fetched.get(id)
+                        {
+                            out.push(joined.clone());
+                            budget -= 1;
+                        }
+                    }
+                    doc.insert(lk.r#as.clone(), Value::Array(out));
+                }
+                _ => {
+                    // Absent/null field on the parent: single form reads as
+                    // null; array form reads as an empty array (no ids).
+                    let leaf = if array_form {
+                        Value::Array(Vec::new())
+                    } else {
+                        Value::Null
+                    };
+                    doc.insert(lk.r#as.clone(), leaf);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build the clause-presence set for `q`. Defined once in

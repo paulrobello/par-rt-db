@@ -74,7 +74,8 @@ pub mod ws;
 pub use error::{ErrorCode, ErrorEnvelope, RtDbError, retry_on_precondition};
 pub use mutation::{FieldExpectation, Mutation, StepResult, Transaction, WorkflowStepSpecExt};
 pub use query::{
-    HybridSearchOpts, Order, Paginate, Paginated, Query, SearchOpts, TableQuery, VectorSearchOpts,
+    HybridSearchOpts, LookupSpec, Order, Paginate, Paginated, Query, SearchOpts, TableQuery,
+    VectorSearchOpts,
 };
 pub use schema::{
     DistanceMetric, FieldType, IndexDef, OnDeleteAction, SchemaBuilderExt, SchemaDef, TableDef,
