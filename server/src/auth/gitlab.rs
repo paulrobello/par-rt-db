@@ -346,6 +346,7 @@ mod tests {
             },
             storage: crate::config::StorageConfig {
                 require_signed_urls: false,
+                share_grants_enabled: false,
                 image: crate::config::ImageTransformConfig {
                     enabled: true,
                     max_dim: 2048,

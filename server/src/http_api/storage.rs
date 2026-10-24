@@ -141,8 +141,8 @@ pub(crate) async fn upload_handler(
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SignedUrlResponse {
-    url: String,
-    expires_at: i64,
+    pub(crate) url: String,
+    pub(crate) expires_at: i64,
 }
 
 /// Mint a signed, time-limited URL for `{id}`. Same auth as authed serve
@@ -699,7 +699,7 @@ fn build_serve_response(
 
 #[derive(Serialize)]
 pub(crate) struct OkResponse {
-    ok: bool,
+    pub(crate) ok: bool,
 }
 
 /// Delete a stored file. Idempotent: deleting a missing id still returns

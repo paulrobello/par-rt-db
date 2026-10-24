@@ -63,6 +63,17 @@ pub struct StorageConfig {
     /// mint endpoint (`GET /api/storage/{db}/{id}/signed-url`) is unaffected
     /// and remains the way to mint time-limited URLs under either mode.
     pub require_signed_urls: bool,
+    /// RTDB_SHARE_GRANTS_ENABLED (default false). Per-row public share grants:
+    /// when true, a db-authorized caller can mint an unguessable single-row
+    /// share token (`POST /api/db/{db}/share-grants`) and an UNAUTHENTICATED
+    /// holder of that token can read EXACTLY the granted row
+    /// (`GET /share/{token}`) or mint a signed URL for EXACTLY the granted
+    /// blob (`GET /share/{token}/signed-url`). Off by default: enabling
+    /// exposes grant-targeted content to the public internet — the token is
+    /// the credential (256-bit, stored only as a SHA-256 hash), and grants
+    /// should be minted only for content meant for public sharing.
+    /// `http_api::share` carries the full threat model.
+    pub share_grants_enabled: bool,
     /// On-the-fly image transforms on storage serve (ENH-014). RTDB_IMAGE_*.
     pub image: ImageTransformConfig,
 }
@@ -73,9 +84,11 @@ impl StorageConfig {
         // Default false (Convex-parity: opaque public bearer URLs); operators
         // who want signed-only access flip it on.
         let require_signed_urls = env_bool("RTDB_STORAGE_REQUIRE_SIGNED_URLS", false);
+        let share_grants_enabled = env_bool("RTDB_SHARE_GRANTS_ENABLED", false);
         let image = ImageTransformConfig::from_env()?;
         Ok(Self {
             require_signed_urls,
+            share_grants_enabled,
             image,
         })
     }

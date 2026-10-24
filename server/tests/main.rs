@@ -64,6 +64,7 @@ mod schema_validators_test;
 mod search_test;
 mod semantics_corpus_test;
 mod sessions_test;
+mod share_grants_test;
 mod shutdown_drain_test;
 mod storage_signed_url_test;
 mod storage_test;

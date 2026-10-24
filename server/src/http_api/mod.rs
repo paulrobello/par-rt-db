@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, FromRequest, Path, Request, State};
 use axum::http::HeaderMap;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 
 use crate::AppState;
@@ -148,6 +148,18 @@ pub fn http_api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         )
         // Metadata — same auth + cross-db isolation as authed serve.
         .route("/api/storage/{db}/{id}/metadata", get(metadata_handler))
+        // Per-row public share grants (flag-gated: RTDB_SHARE_GRANTS_ENABLED).
+        // Mint/revoke are authed (`authed(db)`); the two GETs are the only
+        // unauthenticated document-read routes in the server and are scoped to
+        // EXACTLY the granted row/blob by the grant row itself — see
+        // `share`'s module docs for the threat model.
+        .route("/api/db/{db}/share-grants", post(mint_share_grant_handler))
+        .route(
+            "/api/db/{db}/share-grants/{token}",
+            delete(revoke_share_grant_handler),
+        )
+        .route("/share/{token}", get(share_read_handler))
+        .route("/share/{token}/signed-url", get(share_signed_url_handler))
         // Mint a signed, time-limited URL — same auth as authed serve; the
         // holder fetches via `GET /storage/{id}?exp=&sig=` until expiry.
         .route("/api/storage/{db}/{id}/signed-url", get(signed_url_handler))
@@ -377,6 +389,7 @@ mod client_ip_tests {
 mod changes;
 mod data;
 mod schedule;
+mod share;
 mod storage;
 mod workflow;
 
@@ -386,6 +399,10 @@ pub(crate) use schedule::{
     cancel_handler, claim_schedules_handler, complete_schedule_handler, fail_schedule_handler,
     list_schedules_handler, pause_handler, resume_handler, retry_schedule_handler,
     schedule_handler,
+};
+pub(crate) use share::{
+    mint_share_grant_handler, revoke_share_grant_handler, share_read_handler,
+    share_signed_url_handler,
 };
 pub(crate) use storage::{
     delete_handler, metadata_handler, serve_authed_handler, serve_public_handler,

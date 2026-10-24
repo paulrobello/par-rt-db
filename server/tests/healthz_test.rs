@@ -55,6 +55,7 @@ fn test_config() -> Config {
         },
         storage: rtdb_server::config::StorageConfig {
             require_signed_urls: false,
+            share_grants_enabled: false,
             image: rtdb_server::config::ImageTransformConfig {
                 enabled: true,
                 max_dim: 2048,

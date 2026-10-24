@@ -124,6 +124,13 @@ services:
       # false (default) keeps the opaque-id-as-bearer-URL behavior (Convex
       # parity); true makes `?exp=&sig=` mandatory on GET /storage/{id}.
       RTDB_STORAGE_REQUIRE_SIGNED_URLS: ${RTDB_STORAGE_REQUIRE_SIGNED_URLS:-false}
+      # Per-row public share grants (default false). When true, a db-authorized
+      # caller mints an unguessable single-row share token and an
+      # UNAUTHENTICATED holder reads exactly the granted row or mints a signed
+      # URL for exactly the granted blob. RISK: exposes grant-targeted content
+      # to the public internet; the token IS the credential (SHA-256-hashed at
+      # rest). See README "Per-row public share grants".
+      RTDB_SHARE_GRANTS_ENABLED: ${RTDB_SHARE_GRANTS_ENABLED:-false}
       # NOTE: this `environment:` block is an explicit ALLOWLIST — a key present
       # in `.env` but absent here never reaches the container. Adding a new
       # RTDB_* boot knob means adding a line here too, or it silently keeps its

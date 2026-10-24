@@ -15,6 +15,7 @@
 * [Endpoints](#endpoints)
    * [Health, realtime, queries, mutations, scheduling](#health-realtime-queries-mutations-scheduling)
    * [File storage (HTTP-only, bypasses the committer)](#file-storage-http-only-bypasses-the-committer)
+   * [Per-row public share grants](#per-row-public-share-grants)
    * [Admin: databases, schema, tokens, allowlist](#admin-databases-schema-tokens-allowlist)
    * [Admin: dashboard operator surface](#admin-dashboard-operator-surface)
    * [Auth (OAuth + sessions)](#auth-oauth--sessions)
@@ -274,6 +275,51 @@ since browsers cannot set headers on a WS handshake.
 
 Both serve routes honor HTTP `Range` requests: `Range: bytes=...` → `206 Partial Content` with `Content-Range`/`Content-Length` (and `Accept-Ranges: bytes` advertised), `416` for an out-of-bounds range, and a `200` full body when no range is requested. Single-range only; on-the-fly image transforms (`?w=` etc.) skip range handling.
 
+### Per-row public share grants
+
+A share grant is an unguessable token that lets an **unauthenticated** visitor read **exactly one** granted document row — and, when the grant names a blob, mint a signed URL for **exactly that blob** — never anything db-wide. This is what backs a public share link (e.g. `/s/{token}` on an app backend) without that backend having to hold a machine token: the nearest prior primitive, `POST /auth/anonymous`, grants a full db-authorized principal (every ownerless table becomes readable, signed-url minting is db-scoped), so it can never scope a share to one row.
+
+**Disabled by default.** Enable with `RTDB_SHARE_GRANTS_ENABLED=true`. Enabling exposes grant-targeted content to the public internet: mint grants only for content meant for public sharing. The token **is** the credential — the server mints 256 bits from the OS CSPRNG and stores only its SHA-256 hash (anything at 128+ bits of entropy is acceptable; never share a token across grants, and treat a minted token as you would a password). Revocation = `DELETE` of the grant (idempotent) or expiry (default 7 days, cap 30 days); expired grants are cleaned up lazily. Every unauthenticated failure — unknown, expired, or revoked token, deleted row or blob, flag off — returns the identical `401 {"code":"UNAUTHORIZED","message":"invalid share token"}` envelope, so the public surface is enumeration-free. The public routes share the per-IP `RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM` budget.
+
+| Method & path | Auth | Description |
+| --- | --- | --- |
+| `POST /api/db/{db}/share-grants` | Bearer token | Mint a grant: `{ table, id, blobId?, ttlSeconds? }` → `{ token, url, expiresAt }`. The table must be schema-declared and the row must exist; a named blob must live in the same db. Flag-gated (403 when off). The token is returned once — only its hash is stored. |
+| `DELETE /api/db/{db}/share-grants/{token}` | Bearer token | Revoke (idempotent; db-scoped). |
+| `GET /share/{token}` | **none** | Read the granted row (the doc). |
+| `GET /share/{token}/signed-url` | **none** | Mint a signed URL for exactly the grant's `blobId` (`?ttlSeconds=` as usual). Grants without a blob get the generic 401. Composes with `RTDB_STORAGE_REQUIRE_SIGNED_URLS=true`: the share-minted signed URL is then the only way a visitor can fetch the granted blob. |
+
+Worked example:
+
+```bash
+export RTDB_URL=http://localhost:8300
+export MACH=<machine-token-for-db-mydb>
+export ADMIN=<admin-key>
+
+# 1. Operator turns the feature on: RTDB_SHARE_GRANTS_ENABLED=true (server restart).
+
+# 2. Your backend (holding the machine token) inserts the row and mints a grant:
+curl -s -X POST "$RTDB_URL/api/mutate" -H "Authorization: Bearer $MACH" \
+  -H 'Content-Type: application/json' \
+  -d '{"db":"mydb","txn":{"steps":[{"op":"insert","table":"pages","doc":{"title":"hello","body":"public copy"}}]}}'
+# → {"results":[{"id":"01J...","table":"pages",...}]}
+
+curl -s -X POST "$RTDB_URL/api/db/mydb/share-grants" -H "Authorization: Bearer $MACH" \
+  -H 'Content-Type: application/json' \
+  -d '{"table":"pages","id":"01J...","ttlSeconds":86400}'
+# → {"token":"<64-hex>","url":"https://rtdb.example/share/<64-hex>","expiresAt":1766...}
+
+# 3. Any visitor (no credentials) reads exactly that row:
+curl -s "$RTDB_URL/share/<64-hex>"
+# → {"_id":"01J...","title":"hello","body":"public copy"}
+
+# 4. For a blob-backed share (grant minted with "blobId":"<storage-id>"):
+curl -s "$RTDB_URL/share/<64-hex>/signed-url"
+# → {"url":"https://rtdb.example/storage/<id>?exp=...&sig=...","expiresAt":...}
+
+# 5. Revoke:
+curl -s -X DELETE "$RTDB_URL/api/db/mydb/share-grants/<64-hex>" -H "Authorization: Bearer $MACH"
+```
+
 ### Admin: databases, schema, tokens, allowlist
 
 | Method & path | Auth | Description |
@@ -512,6 +558,7 @@ operators tune on first boot:
 | `RTDB_RATE_LIMIT_EXACT` | no | `false` | ARC-007: multi-instance-only (`RTDB_MULTI_INSTANCE=true`). `false` (default) has each replica count `RTDB_RATE_LIMIT_PER_TOKEN_RPM`/`RTDB_RATE_LIMIT_PER_DB_RPM` locally and reconcile with `rtdb_auth.rate_counters` every `RTDB_RATE_LIMIT_SYNC_MS` instead of a synchronous Postgres round trip per request. Overshoot is bounded by roughly (number of replicas × one sync window) of extra allowance — every replica can admit up to its own local budget before its next flush reconciles the shared count — and a request is never denied below the configured limit, only possibly over-admitted within that bound. `true` keeps the pre-ARC-007 exact path: one synchronous UPSERT per checked request, no overshoot. |
 | `RTDB_RATE_LIMIT_SYNC_MS` | no | `1000` | ARC-007: how often the approximate limiter (`RTDB_RATE_LIMIT_EXACT=false`) flushes local deltas into Postgres and refreshes its shared-count view; clamped to >= 50. Unused when `RTDB_RATE_LIMIT_EXACT=true` or in single-instance mode. |
 | `RTDB_RATE_LIMIT_OAUTH_BEGIN_PER_IP_RPM` | no | `0` (disabled; shipped `.env.example`/compose default `30`) | Per-IP rate limit on the unauthenticated `GET /auth/{provider}/begin` login route (SEC-003). Without it a single IP can mint OAuth state rows in a loop. `0` disables. |
+| `RTDB_SHARE_GRANTS_ENABLED` | no | `false` | Per-row public share grants: when `true`, a db-authorized caller can mint an unguessable single-row share token and an unauthenticated holder reads exactly the granted row or mints a signed URL for exactly the granted blob. **Risk:** enabling exposes grant-targeted content to the public internet — mint grants only for content meant for public sharing; the token is the credential (256-bit, stored only as a SHA-256 hash; revocation = `DELETE` or expiry). See [Per-row public share grants](#per-row-public-share-grants). |
 
 ### Topology and security
 

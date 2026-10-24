@@ -170,6 +170,7 @@ pub fn test_config() -> Config {
         },
         storage: rtdb_server::config::StorageConfig {
             require_signed_urls: false,
+            share_grants_enabled: false,
             image: rtdb_server::config::ImageTransformConfig {
                 enabled: true,
                 max_dim: 2048,
@@ -292,6 +293,20 @@ pub async fn test_state_with_require_signed_urls() -> Arc<AppState> {
 pub async fn test_state_with_transforms_disabled() -> Arc<AppState> {
     let mut config = test_config();
     config.storage.image.enabled = false;
+    let pool = test_pool(&config.database_url)
+        .await
+        .expect("connect to test postgres");
+    db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
+    AppState::new(pool, config, test_hot())
+}
+
+/// Like `test_state` but with `storage.share_grants_enabled = true`. Used by
+/// `tests/share_grants_test.rs` to exercise the per-row public share grants
+/// end-to-end without touching env vars. Mirrors the `test_state_with_*`
+/// pattern.
+pub async fn test_state_with_share_grants() -> Arc<AppState> {
+    let mut config = test_config();
+    config.storage.share_grants_enabled = true;
     let pool = test_pool(&config.database_url)
         .await
         .expect("connect to test postgres");
