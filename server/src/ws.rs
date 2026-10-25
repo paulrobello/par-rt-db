@@ -4,7 +4,8 @@
 //! axum 0.8's WebSocket is built on `tungstenite`, which does not implement
 //! permessage-deflate (no feature flag). Cutting WS bandwidth therefore
 //! requires a fronting proxy (e.g. nginx with WS compression) or swapping the
-//! WS library (yawc/fastwebsockets). See ideas.md.
+//! WS library (yawc/fastwebsockets). Tracked on the kanban board as card
+//! 019fa9d44c867040a0a76e1c4a928343 (WebSocket permessage-deflate compression).
 
 use std::sync::Arc;
 use std::time::Duration;
