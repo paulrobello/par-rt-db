@@ -295,6 +295,26 @@ func (t *TableBuilder) Constraints(entries map[string]wire.JSONValue) *TableBuil
 	return t
 }
 
+// Describe attaches a human-readable description to the table, and optional
+// per-field descriptions keyed by declared field name (server
+// TableDef::description / ::field_descriptions). Pure metadata the server
+// persists verbatim: no validation, no DDL, not compared by the additive
+// push gate, so editing it is an ordinary additive push. Round-trips on the
+// wire as `description` and `fieldDescriptions`, omitted when unset.
+func (t *TableBuilder) Describe(tableDescription string, fieldDescriptions map[string]string) *TableBuilder {
+	if tableDescription != "" {
+		t.ensure()["description"] = wire.String(tableDescription)
+	}
+	if len(fieldDescriptions) > 0 {
+		fd := map[string]wire.JSONValue{}
+		for k, v := range fieldDescriptions {
+			fd[k] = wire.String(v)
+		}
+		t.ensure()["fieldDescriptions"] = wire.Object(fd)
+	}
+	return t
+}
+
 // Computed declares a computed field from a ValueExpr.
 func (t *TableBuilder) Computed(name string, expr wire.ValueExpr) *TableBuilder {
 	m, ok := t.ensure()["computed"].(wire.Object)

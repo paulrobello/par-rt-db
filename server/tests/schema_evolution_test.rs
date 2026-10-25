@@ -45,6 +45,8 @@ fn priority_schema(variants: &[&str]) -> SchemaDef {
             auto_increment_field: None,
             authorize: None,
             soft_delete: false,
+
+            ..Default::default()
         },
     );
     SchemaDef { tables }
@@ -140,6 +142,8 @@ fn email_index_schema(unique: bool, where_clause: Option<FilterExpr>) -> SchemaD
             auto_increment_field: None,
             authorize: None,
             soft_delete: false,
+
+            ..Default::default()
         },
     );
     SchemaDef { tables }
@@ -223,6 +227,8 @@ fn versions_schema(with_size: bool) -> SchemaDef {
             auto_increment_field: None,
             authorize: None,
             soft_delete: false,
+
+            ..Default::default()
         },
     );
     SchemaDef { tables }
@@ -420,5 +426,63 @@ async fn adding_required_field_inside_array_object_elements_is_rejected() {
             .contains("changed type of field 'artifacts.versions'"),
         "{}",
         err.message
+    );
+}
+
+/// Descriptions (table + per-field) are pure metadata: a push carrying them
+/// persists them verbatim, `db::load_schema` (the storage behind admin schema
+/// read-back, `GET /admin/db/{db}/schema`) round-trips them intact, and a
+/// later push that ADDS descriptions to a previously undescribed table is an
+/// ordinary additive push (not destructive).
+#[tokio::test]
+async fn schema_descriptions_round_trip_through_storage() {
+    let state = test_state().await;
+    let db = fresh_empty_db(&state).await;
+    let described = {
+        let mut s = priority_schema(&["low", "high"]);
+        let table = s.tables.get_mut("items").expect("table");
+        table.description = Some("Work items".into());
+        table
+            .field_descriptions
+            .insert("priority".to_string(), "Urgency bucket".into());
+        s
+    };
+    push_schema(&state.pool, &db, described)
+        .await
+        .expect("push");
+
+    let loaded = rtdb_server::db::load_schema(&state.pool, &db)
+        .await
+        .expect("load")
+        .expect("schema present");
+    let table = loaded.tables.get("items").expect("table");
+    assert_eq!(table.description.as_deref(), Some("Work items"));
+    assert_eq!(
+        table.field_descriptions.get("priority").map(String::as_str),
+        Some("Urgency bucket")
+    );
+
+    // Editing descriptions on the already-pushed schema is additive.
+    let mut edited = priority_schema(&["low", "high"]);
+    let table = edited.tables.get_mut("items").expect("table");
+    table.description = Some("Renamed description".into());
+    table
+        .field_descriptions
+        .insert("priority".to_string(), "Reworded".into());
+    push_schema(&state.pool, &db, edited)
+        .await
+        .expect("description-only edits are additive");
+    let reloaded = rtdb_server::db::load_schema(&state.pool, &db)
+        .await
+        .expect("load")
+        .expect("schema present");
+    assert_eq!(
+        reloaded
+            .tables
+            .get("items")
+            .expect("table")
+            .description
+            .as_deref(),
+        Some("Renamed description")
     );
 }

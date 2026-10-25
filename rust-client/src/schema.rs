@@ -34,6 +34,8 @@ pub struct TableBuilder {
     constraints: BTreeMap<String, par_rt_db_core::schema::FieldConstraints>,
     computed: BTreeMap<String, ValueExpr>,
     soft_delete: bool,
+    description: Option<String>,
+    field_descriptions: BTreeMap<String, String>,
     /// Index of the most recently pushed [`IndexDef`] in [`Self::indexes`], so
     /// the chainable `.unique()` / `.where_clause()` setters can configure it
     /// after `index`/`search_index`/`vector_index` returned `self`. `None`
@@ -57,6 +59,8 @@ impl TableBuilder {
             constraints: BTreeMap::new(),
             computed: BTreeMap::new(),
             soft_delete: false,
+            description: None,
+            field_descriptions: BTreeMap::new(),
             last_index: None,
         }
     }
@@ -294,6 +298,28 @@ impl TableBuilder {
         self
     }
 
+    /// Attach a human-readable description to the table and optional per-field
+    /// descriptions keyed by declared field name (pass `&[]` for none),
+    /// mirroring the TS client's chainable `.describe(tableDescription,
+    /// fieldDescriptions?)`. Pure metadata the server persists verbatim (no
+    /// validation, no DDL, not compared by the additive push gate); the
+    /// dashboard surfaces the table description on the schema page and
+    /// per-field descriptions as data-browser column tooltips. Round-trips on
+    /// the wire as `description` and `fieldDescriptions`, both omitted when
+    /// unset.
+    pub fn describe(
+        mut self,
+        table_description: &str,
+        field_descriptions: &[(&str, &str)],
+    ) -> Self {
+        self.description = Some(table_description.into());
+        self.field_descriptions = field_descriptions
+            .iter()
+            .map(|(name, text)| ((*name).to_string(), (*text).to_string()))
+            .collect();
+        self
+    }
+
     fn finish(self) -> TableDef {
         TableDef {
             fields: self.fields,
@@ -308,6 +334,8 @@ impl TableBuilder {
             constraints: self.constraints,
             computed: self.computed,
             soft_delete: self.soft_delete,
+            description: self.description,
+            field_descriptions: self.field_descriptions,
         }
     }
 }
@@ -1470,5 +1498,48 @@ mod tests {
         let old = array_of(FieldType::String);
         let new = array_of(versions_element(true));
         assert!(!is_widening_of(&old, &new));
+    }
+
+    #[test]
+    fn describe_emits_descriptions_and_survives_chaining() {
+        // Mirrors the TS `describe(tableDescription, fieldDescriptions?)`
+        // builder: the declared description lands on the wire as `description`
+        // and `fieldDescriptions` (camelCase), and the method chains after
+        // other setters like `.index(...)`.
+        let td = Table::new()
+            .field("name", FieldType::String)
+            .field("qty", FieldType::Number)
+            .index("by_name", &["name"])
+            .describe("Inventory items", &[("name", "Display name")])
+            .finish();
+        let json = serde_json::to_value(&td).unwrap();
+        assert_eq!(json["description"], "Inventory items");
+        assert_eq!(json["fieldDescriptions"], json!({"name": "Display name"}));
+        // Round-trips back through the wire type.
+        let back: TableDef = serde_json::from_value(json).unwrap();
+        assert_eq!(back.description.as_deref(), Some("Inventory items"));
+        assert_eq!(
+            back.field_descriptions.get("name").map(String::as_str),
+            Some("Display name")
+        );
+    }
+
+    #[test]
+    fn description_less_table_omits_the_description_keys_on_the_wire() {
+        // The skip-when-empty contract: a description-less table serializes
+        // WITHOUT both keys (so pre-description servers decode it unchanged),
+        // and `.describe(..., &[])` (the TS optional-omit form) keeps the same
+        // behavior.
+        let none = Table::new().field("body", FieldType::String).finish();
+        let json = serde_json::to_value(&none).unwrap();
+        assert!(json.get("description").is_none());
+        assert!(json.get("fieldDescriptions").is_none());
+
+        let empty = Table::new()
+            .field("body", FieldType::String)
+            .describe("Only a table description", &[])
+            .finish();
+        let json = serde_json::to_value(&empty).unwrap();
+        assert!(json.get("fieldDescriptions").is_none());
     }
 }

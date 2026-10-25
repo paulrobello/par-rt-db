@@ -280,9 +280,14 @@ export function DataBrowserPage() {
           <table className={s.table}>
             <thead>
               <tr>
-                {cols.map((c) => (
-                  <th key={c}>{c}</th>
-                ))}
+                {cols.map((c) => {
+                  const description = schema?.tables[table]?.fieldDescriptions?.[c];
+                  return (
+                    <th key={c} title={description}>
+                      {c}
+                    </th>
+                  );
+                })}
                 <th aria-label="actions"></th>
               </tr>
             </thead>

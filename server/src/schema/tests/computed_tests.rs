@@ -19,6 +19,8 @@ fn simple_table() -> TableDef {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     }
 }
 
@@ -107,6 +109,8 @@ fn computed_table() -> TableDef {
         computed: BTreeMap::new(),
 
         soft_delete: false,
+
+        ..Default::default()
     }
 }
 

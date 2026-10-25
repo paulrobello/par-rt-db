@@ -1802,6 +1802,8 @@ mod tests {
                 authorize: None,
 
                 soft_delete: false,
+
+                ..Default::default()
             },
         );
         SchemaDef { tables }
@@ -1935,6 +1937,8 @@ mod tests {
                 authorize: None,
 
                 soft_delete: false,
+
+                ..Default::default()
             },
         );
         let schema = SchemaDef { tables };
@@ -2021,6 +2025,8 @@ mod tests {
                 authorize: None,
 
                 soft_delete: false,
+
+                ..Default::default()
             },
         );
         SchemaDef { tables }
@@ -2337,6 +2343,8 @@ mod tests {
                 authorize: None,
 
                 soft_delete: false,
+
+                ..Default::default()
             },
         );
         let old = SchemaDef { tables };
@@ -2387,6 +2395,8 @@ mod tests {
                 authorize: None,
 
                 soft_delete: false,
+
+                ..Default::default()
             },
         );
         tables.insert(
@@ -2405,6 +2415,8 @@ mod tests {
                 authorize: None,
 
                 soft_delete: false,
+
+                ..Default::default()
             },
         );
         let old = SchemaDef { tables };

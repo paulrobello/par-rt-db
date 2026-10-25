@@ -207,6 +207,8 @@ export class TableDefinition<
     readonly autoIncrementFieldName?: string,
     readonly computedMap?: Record<string, ValueExprJson>,
     readonly constraintsMap?: Record<string, FieldConstraintsJson>,
+    readonly descriptionText?: string,
+    readonly descriptionsMap?: Record<string, string>,
   ) {}
 
   /**
@@ -229,6 +231,8 @@ export class TableDefinition<
       this.autoIncrementFieldName,
       this.computedMap,
       this.constraintsMap,
+      this.descriptionText,
+      this.descriptionsMap,
     );
   }
 
@@ -282,6 +286,8 @@ export class TableDefinition<
       this.autoIncrementFieldName,
       this.computedMap,
       this.constraintsMap,
+      this.descriptionText,
+      this.descriptionsMap,
     );
   }
 
@@ -312,6 +318,8 @@ export class TableDefinition<
       this.autoIncrementFieldName,
       this.computedMap,
       this.constraintsMap,
+      this.descriptionText,
+      this.descriptionsMap,
     );
   }
 
@@ -354,6 +362,8 @@ export class TableDefinition<
       this.autoIncrementFieldName,
       this.computedMap,
       this.constraintsMap,
+      this.descriptionText,
+      this.descriptionsMap,
     );
   }
 
@@ -374,6 +384,8 @@ export class TableDefinition<
       this.autoIncrementFieldName,
       this.computedMap,
       this.constraintsMap,
+      this.descriptionText,
+      this.descriptionsMap,
     );
   }
 
@@ -395,6 +407,8 @@ export class TableDefinition<
       this.autoIncrementFieldName,
       this.computedMap,
       this.constraintsMap,
+      this.descriptionText,
+      this.descriptionsMap,
     );
   }
 
@@ -421,6 +435,8 @@ export class TableDefinition<
       this.autoIncrementFieldName,
       this.computedMap,
       this.constraintsMap,
+      this.descriptionText,
+      this.descriptionsMap,
     );
   }
 
@@ -445,6 +461,8 @@ export class TableDefinition<
       this.autoIncrementFieldName,
       this.computedMap,
       this.constraintsMap,
+      this.descriptionText,
+      this.descriptionsMap,
     );
   }
 
@@ -470,6 +488,8 @@ export class TableDefinition<
       this.autoIncrementFieldName,
       this.computedMap,
       this.constraintsMap,
+      this.descriptionText,
+      this.descriptionsMap,
     );
   }
 
@@ -498,6 +518,37 @@ export class TableDefinition<
       this.autoIncrementFieldName,
       this.computedMap,
       map,
+      this.descriptionText,
+      this.descriptionsMap,
+    );
+  }
+
+  /** Attach a human-readable description to the table, and optional per-field
+   * descriptions keyed by declared field name. Pure metadata the server
+   * persists verbatim (no validation, no DDL, not compared by the additive
+   * push gate — editing it is an ordinary additive push); the dashboard
+   * surfaces the table description on the schema page and per-field
+   * descriptions as data-browser column tooltips. Round-trips on the wire as
+   * `description` and `fieldDescriptions`, omitted when unset. */
+  describe(
+    tableDescription: string,
+    fieldDescriptions?: Record<string, string>,
+  ): TableDefinition<Fields, Indexes, Stamped> {
+    return new TableDefinition(
+      this.fields,
+      this.indexes,
+      this.ownerFieldName,
+      this.collaboratorsFieldName,
+      this.ttlDef,
+      this.authorizeDef,
+      this.defaultsMap,
+      this.softDeleteFlag,
+      this.updatedAtFieldName,
+      this.autoIncrementFieldName,
+      this.computedMap,
+      this.constraintsMap,
+      tableDescription,
+      fieldDescriptions,
     );
   }
 
@@ -521,6 +572,8 @@ export class TableDefinition<
       this.autoIncrementFieldName,
       this.computedMap,
       this.constraintsMap,
+      this.descriptionText,
+      this.descriptionsMap,
     );
   }
 
@@ -550,6 +603,8 @@ export class TableDefinition<
       this.autoIncrementFieldName,
       this.computedMap,
       this.constraintsMap,
+      this.descriptionText,
+      this.descriptionsMap,
     );
   }
 
@@ -581,6 +636,9 @@ export class TableDefinition<
       this.updatedAtFieldName,
       field,
       this.computedMap,
+      this.constraintsMap,
+      this.descriptionText,
+      this.descriptionsMap,
     );
   }
 
@@ -611,6 +669,8 @@ export class TableDefinition<
       this.autoIncrementFieldName,
       { ...this.computedMap, [field]: expr },
       this.constraintsMap,
+      this.descriptionText,
+      this.descriptionsMap,
     );
   }
 
@@ -652,6 +712,12 @@ export class TableDefinition<
     if (this.softDeleteFlag) {
       json.softDelete = true;
     }
+    if (this.descriptionText) {
+      json.description = this.descriptionText;
+    }
+    if (this.descriptionsMap && Object.keys(this.descriptionsMap).length > 0) {
+      json.fieldDescriptions = this.descriptionsMap;
+    }
     return json;
   }
 }
@@ -659,7 +725,7 @@ export class TableDefinition<
 /** Declare one table from a field-name → validator map (e.g. `t.string()`),
  * then chain `.index()`/`.searchIndex()`/`.vectorIndex()`/`.ownerField()`/
  * `.collaboratorsField()`/`.authorize()`/`.ttl()`/`.defaults()`/`.softDelete()`/
- * `.updatedAtField()`/`.autoIncrementField()`/`.computed()`.
+ * `.updatedAtField()`/`.autoIncrementField()`/`.computed()`/`.describe()`.
  * Both the runtime schema pushed to the server and the inferred TS document
  * types derive from this one declaration — there is no codegen. */
 export function defineTable<Fields extends Record<string, Validator<unknown, boolean>>>(

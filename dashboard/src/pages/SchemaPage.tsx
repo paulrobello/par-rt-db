@@ -160,6 +160,11 @@ export function SchemaPage() {
               <div key={name} className={s.tableBlock}>
                 <div className={s.tableHead}>
                   <h2 className={s.tableName}>{name}</h2>
+                  {table.description && (
+                    <span className={s.tableDesc} title={table.description}>
+                      {table.description}
+                    </span>
+                  )}
                   {table.softDelete && <span className={s.owner}>soft delete</span>}
                   {table.ownerField && <span className={s.owner}>owner: {table.ownerField}</span>}
                   {table.updatedAtField && (
@@ -173,7 +178,9 @@ export function SchemaPage() {
                   <tbody>
                     {Object.entries(table.fields).map(([fname, ftype]) => (
                       <tr key={fname}>
-                        <td className={s.fieldName}>{fname}</td>
+                        <td className={s.fieldName} title={table.fieldDescriptions?.[fname]}>
+                          {fname}
+                        </td>
                         <td className={s.fieldType}>{formatFieldType(ftype)}</td>
                       </tr>
                     ))}

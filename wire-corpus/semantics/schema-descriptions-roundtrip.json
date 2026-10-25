@@ -1,0 +1,27 @@
+{
+  "name": "schema-descriptions-roundtrip",
+  "$comment": "Schema descriptions (table `description` + per-field `fieldDescriptions`, keyed by field name): pure wire metadata that every runner must accept on push — the server persists them verbatim in the stored schema JSON (admin schema read-back serves the same JSON) and old-schema clients decode the schema unchanged because both keys are optional with skip_serializing_if (a description-less table serializes WITHOUT them — pinned by core/src/schema.rs::table_descriptions_wire_contract and ts-client's schema.test.ts). Descriptions change no query result, step result, error code, or document visibility; this case pins that the described schema pushes, seeds, and queries normally.",
+  "schema": {
+    "tables": {
+      "items": {
+        "fields": {
+          "name": { "type": "string" },
+          "qty": { "type": "number" }
+        },
+        "indexes": [{ "name": "by_name", "fields": ["name"] }],
+        "description": "Inventory items",
+        "fieldDescriptions": { "name": "Display name", "qty": "Units in stock" }
+      }
+    }
+  },
+  "seed": [{ "table": "items", "doc": { "name": "widget", "qty": 5 } }],
+  "op": {
+    "query": {
+      "table": "items",
+      "index": "by_name",
+      "eq": ["widget"]
+    }
+  },
+  "expect": [{ "name": "widget", "qty": 5 }],
+  "normalize": ["_id", "_creationTime", "_version"]
+}

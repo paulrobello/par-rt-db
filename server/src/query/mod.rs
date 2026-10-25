@@ -472,6 +472,8 @@ mod tests {
             authorize: None,
 
             soft_delete: false,
+
+            ..Default::default()
         }
     }
 
@@ -496,6 +498,8 @@ mod tests {
             authorize: None,
 
             soft_delete: false,
+
+            ..Default::default()
         }
     }
 
@@ -582,6 +586,8 @@ mod tests {
             authorize: None,
 
             soft_delete: false,
+
+            ..Default::default()
         };
         // Not
         let (sql, binds) = compile_filter(

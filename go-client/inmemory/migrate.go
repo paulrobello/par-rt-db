@@ -141,6 +141,16 @@ func cloneTableDef(in *TableDef) *TableDef {
 	for k, v := range in.Computed {
 		out.Computed[k] = cloneValueExpr(v)
 	}
+	if in.Description != nil {
+		v := *in.Description
+		out.Description = &v
+	}
+	if len(in.FieldDescriptions) > 0 {
+		out.FieldDescriptions = make(map[string]string, len(in.FieldDescriptions))
+		for k, v := range in.FieldDescriptions {
+			out.FieldDescriptions[k] = v
+		}
+	}
 	return out
 }
 
@@ -898,6 +908,16 @@ func tableDefToWire(td *TableDef) (wire.JSONValue, error) {
 	}
 	if td.SoftDelete {
 		out["softDelete"] = wire.Bool(true)
+	}
+	if td.Description != nil {
+		out["description"] = wire.String(*td.Description)
+	}
+	if len(td.FieldDescriptions) > 0 {
+		fd := wire.Object{}
+		for k, v := range td.FieldDescriptions {
+			fd[k] = wire.String(v)
+		}
+		out["fieldDescriptions"] = fd
 	}
 	return out, nil
 }

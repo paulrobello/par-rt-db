@@ -286,8 +286,9 @@ class TableDef(_S):
     ``collaborators_field``, an optional ``ttl`` policy, an optional
     ``updated_at_field`` stamp policy (FM-36), an optional ``authorize``
     per-row predicate (Model C), optional field-level ``defaults`` (FM-32),
-    optional per-field write ``constraints``, and an optional ``soft_delete``
-    flag (FM-33)."""
+    optional per-field write ``constraints``, an optional ``soft_delete``
+    flag (FM-33), and optional human-readable descriptions (``description`` /
+    ``field_descriptions``)."""
 
     fields: dict[str, FieldType]
     indexes: list[IndexDef] = Field(default_factory=list)
@@ -330,6 +331,16 @@ class TableDef(_S):
     # removes the key. Wire name is `computed`, omitted when empty (server
     # `BTreeMap::is_empty` skip rule).
     computed: dict[str, ValueExpr] = Field(default_factory=dict)
+    # Optional human-readable table description (pure metadata: no validation,
+    # no DDL, not compared by the destructive-change check — editing it is an
+    # ordinary additive push). Wire key `description`, omitted when unset
+    # (server `skip_serializing_if = "Option::is_none"`).
+    description: str | None = None
+    # Optional per-field descriptions keyed by declared field name (surfaced as
+    # column tooltips in the dashboard's data browser). Wire key
+    # `fieldDescriptions`, omitted when empty (server `BTreeMap::is_empty`
+    # skip rule).
+    field_descriptions: dict[str, str] = Field(default_factory=dict)
 
     @model_serializer(mode="wrap")
     def _drop_absent_owner(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
@@ -369,6 +380,14 @@ class TableDef(_S):
         # skip_serializing_if = "BTreeMap::is_empty").
         if not out.get("constraints"):
             out.pop("constraints", None)
+        # `description` is an opt-in string (server skip_serializing_if =
+        # "Option::is_none"); omit it on the wire when unset.
+        if out.get("description") is None:
+            out.pop("description", None)
+        # `fieldDescriptions` is omitted on the wire when empty (server
+        # skip_serializing_if = "BTreeMap::is_empty").
+        if not out.get("fieldDescriptions"):
+            out.pop("fieldDescriptions", None)
         return out
 
 
@@ -402,6 +421,8 @@ class TableBuilder:
         self._auto_increment: str | None = None
         self._computed: dict[str, Any] | None = None
         self._constraints: dict[str, Any] | None = None
+        self._description: str | None = None
+        self._field_descriptions: dict[str, str] | None = None
 
     def field(self, name: str, ft: Any) -> TableBuilder:
         """Declare a typed field ``name`` of type ``ft`` (a ``t.*`` constructor dict)."""
@@ -590,6 +611,23 @@ class TableBuilder:
         self._computed[name] = expr
         return self
 
+    def describe(
+        self,
+        table_description: str,
+        field_descriptions: dict[str, str] | None = None,
+    ) -> TableBuilder:
+        """Attach a human-readable description to the table, and optional
+        per-field descriptions keyed by declared field name. Pure metadata the
+        server persists verbatim (no validation, no DDL, not compared by the
+        additive push gate — editing it is an ordinary additive push); the
+        dashboard surfaces the table description on the schema page and
+        per-field descriptions as data-browser column tooltips. Round-tripped
+        on the wire as ``description`` and ``fieldDescriptions``, omitted when
+        unset."""
+        self._description = table_description
+        self._field_descriptions = dict(field_descriptions) if field_descriptions else None
+        return self
+
     def _build(self) -> dict[str, Any]:
         out: dict[str, Any] = {"fields": self._fields, "indexes": self._indexes}
         if self._owner is not None:
@@ -610,6 +648,10 @@ class TableBuilder:
             out["computed"] = self._computed
         if self._constraints:
             out["constraints"] = self._constraints
+        if self._description is not None:
+            out["description"] = self._description
+        if self._field_descriptions:
+            out["fieldDescriptions"] = self._field_descriptions
         return out
 
 

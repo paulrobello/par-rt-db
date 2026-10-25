@@ -744,4 +744,58 @@ struct SchemaBuilderTests {
         #expect(twoTables.tables.count == 2)
         #expect(oneTable.tables.count == 1)
     }
+
+    @Test func descriptionsSerializeAndRoundTrip() throws {
+        // Mirrors rust `descriptions_serialize_and_round_trips` — wire keys
+        // `description` / `fieldDescriptions`, encodeIfPresent (empty map
+        // omitted), builder chaining, last-write-wins.
+        let table = TableBuilder()
+            .field("title", .string)
+            .describe(
+                "Projects", fieldDescriptions: ["title": "The display name"]
+            )
+            .field("body", .string)
+            .finish()
+        let wire = try wireValue(table).objectValue
+        #expect(wire?["description"] == .string("Projects"))
+        #expect(
+            wire?["fieldDescriptions"]
+                == obj(["title": .string("The display name")])
+        )
+        #expect(try roundTrip(table) == table)
+
+        // Table-only description: fieldDescriptions omitted.
+        let tableOnly = TableBuilder().field("title", .string).describe("Just a table").finish()
+        #expect(try wireValue(tableOnly).objectValue?["fieldDescriptions"] == nil)
+        #expect(try wireValue(tableOnly).objectValue?["description"] == .string("Just a table"))
+
+        // Legacy payloads without either key decode at their defaults.
+        let legacy = try decodeStruct(TableDef.self, #"{"fields":{"title":{"type":"string"}}}"#)
+        #expect(legacy.description == nil)
+        #expect(legacy.fieldDescriptions == nil)
+
+        // Chaining has value semantics: describing a copy never mutates the
+        // original builder's accumulated state.
+        let base = TableBuilder().field("title", .string)
+        let described = base.describe("Described")
+        #expect(base.finish().description == nil)
+        #expect(described.finish().description == "Described")
+
+        // Re-describing overwrites (last-write-wins).
+        let twice = TableBuilder().field("title", .string)
+            .describe("First").describe("Second").finish()
+        #expect(twice.description == "Second")
+    }
+
+    @Test func emptyFieldDescriptionsOmitWireKey() throws {
+        // An explicitly-passed empty map encodes nothing (mirrors the TS
+        // `Object.keys(...).length > 0` guard and the server's
+        // `BTreeMap::is_empty` skip).
+        let table = try TableDef(
+            fields: ["title": .string],
+            fieldDescriptions: [:]
+        )
+        #expect(try wireValue(table).objectValue?["fieldDescriptions"] == nil)
+        #expect(try wireValue(table).objectValue?["description"] == nil)
+    }
 }

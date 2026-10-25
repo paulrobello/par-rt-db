@@ -74,6 +74,8 @@ fn rejects_index_referencing_unknown_field() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     let schema = SchemaDef {
         tables: BTreeMap::from([("items".to_string(), table)]),
@@ -102,6 +104,8 @@ fn rejects_literal_with_non_scalar_value() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     let schema = SchemaDef {
         tables: BTreeMap::from([("items".to_string(), table)]),
@@ -125,6 +129,8 @@ fn rejects_empty_union() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     let schema = SchemaDef {
         tables: BTreeMap::from([("items".to_string(), table)]),
@@ -155,6 +161,8 @@ fn rejects_optional_wrapping_optional() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     let schema = SchemaDef {
         tables: BTreeMap::from([("items".to_string(), table)]),
@@ -368,6 +376,8 @@ fn record_field_validates_structurally_and_recurses() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     let schema = SchemaDef {
         tables: BTreeMap::from([("items".to_string(), table)]),
@@ -477,6 +487,8 @@ fn rejects_index_over_record_field() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     let schema = SchemaDef {
         tables: BTreeMap::from([("items".to_string(), table)]),
@@ -544,6 +556,8 @@ fn rejects_search_index_over_non_text_field() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     let schema = SchemaDef {
         tables: BTreeMap::from([("items".to_string(), table)]),
@@ -581,6 +595,8 @@ fn accepts_search_index_over_optional_text_field() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     let schema = SchemaDef {
         tables: BTreeMap::from([("items".to_string(), table)]),

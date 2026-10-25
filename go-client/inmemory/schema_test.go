@@ -511,3 +511,79 @@ func TestApplyPatchRejectsAutoIncrementValueReshuffle(t *testing.T) {
 		t.Fatal("float-spelled autoIncrement patch must be rejected")
 	}
 }
+
+// Descriptions are pure metadata: stored verbatim by push, editable by an
+// ordinary additive push (the destructive-change gate compares fields and
+// indexes only), and decoded tolerantly (a description-less table carries
+// neither key — mirroring the server's serde parse).
+func TestPushSchemaStoresDescriptions(t *testing.T) {
+	s := NewStore()
+	if err := s.PushSchema(buildSchema(func(b *dsl.SchemaBuilder) {
+		b.Table("items", func(tb *dsl.TableBuilder) {
+			tb.Field("name", dsl.Str()).Field("qty", dsl.Num()).
+				Describe("Inventory items", map[string]string{"name": "Display name"})
+		})
+	})); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	stored := s.SchemaSnapshot().Tables["items"]
+	if stored.Description == nil || *stored.Description != "Inventory items" {
+		t.Fatalf("description not stored: %v", stored.Description)
+	}
+	if stored.FieldDescriptions["name"] != "Display name" {
+		t.Fatalf("fieldDescriptions not stored: %v", stored.FieldDescriptions)
+	}
+
+	// Editing the description is an ordinary additive push.
+	if err := s.PushSchema(buildSchema(func(b *dsl.SchemaBuilder) {
+		b.Table("items", func(tb *dsl.TableBuilder) {
+			tb.Field("name", dsl.Str()).Field("qty", dsl.Num()).
+				Describe("Inventory items v2", map[string]string{"qty": "On hand"})
+		})
+	})); err != nil {
+		t.Fatalf("description edit push: %v", err)
+	}
+	stored = s.SchemaSnapshot().Tables["items"]
+	if stored.Description == nil || *stored.Description != "Inventory items v2" {
+		t.Fatalf("description edit not applied: %v", stored.Description)
+	}
+
+	// An undescribed table decodes with both members unset.
+	if err := s.PushSchema(buildSchema(func(b *dsl.SchemaBuilder) {
+		b.Table("items", func(tb *dsl.TableBuilder) {
+			tb.Field("name", dsl.Str()).Field("qty", dsl.Num())
+		})
+	})); err != nil {
+		t.Fatalf("undescribed push: %v", err)
+	}
+	stored = s.SchemaSnapshot().Tables["items"]
+	if stored.Description != nil || stored.FieldDescriptions != nil {
+		t.Fatalf("unset descriptions must decode to nil, got %v / %v",
+			stored.Description, stored.FieldDescriptions)
+	}
+}
+
+// A mis-typed description payload is rejected, mirroring the server's
+// deny-unknown-fields + typed serde parse.
+func TestPushSchemaRejectsMisTypedDescriptions(t *testing.T) {
+	s := NewStore()
+	table := func(v wire.JSONValue) wire.JSONValue {
+		return wire.Object(map[string]wire.JSONValue{"tables": wire.Object(map[string]wire.JSONValue{"items": v})})
+	}
+	badDesc := table(wire.Object(map[string]wire.JSONValue{
+		"fields":      wire.Object(map[string]wire.JSONValue{"name": wire.Object(map[string]wire.JSONValue{"type": wire.String("string")})}),
+		"description": wire.Number("1"),
+	}))
+	if err := s.PushSchema(badDesc); err == nil {
+		t.Fatal("non-string description must be rejected")
+	}
+	badFieldDesc := table(wire.Object(map[string]wire.JSONValue{
+		"fields": wire.Object(map[string]wire.JSONValue{"name": wire.Object(map[string]wire.JSONValue{"type": wire.String("string")})}),
+		"fieldDescriptions": wire.Object(map[string]wire.JSONValue{
+			"name": wire.Number("1"),
+		}),
+	}))
+	if err := s.PushSchema(badFieldDesc); err == nil {
+		t.Fatal("non-string fieldDescriptions entry must be rejected")
+	}
+}

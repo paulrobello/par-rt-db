@@ -102,6 +102,8 @@ fn vector_index_rejects_dimension_mismatch() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     assert!(table.validate_structure("docs").is_err());
 }
@@ -138,6 +140,8 @@ fn vector_index_accepts_matching_dims_and_filter_fields() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     assert!(table.validate_structure("docs").is_ok());
 }
@@ -173,6 +177,8 @@ fn vector_index_rejects_search_and_vector_both_set() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     assert!(table.validate_structure("docs").is_err());
 }
@@ -210,6 +216,8 @@ fn vector_index_rejects_zero_dimensions() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     assert!(table.validate_structure("docs").is_err());
 }
@@ -246,6 +254,8 @@ fn vector_index_rejects_two_fields() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     assert!(table.validate_structure("docs").is_err());
 }
@@ -281,6 +291,8 @@ fn vector_index_rejects_non_vector_field() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     assert!(table.validate_structure("docs").is_err());
 }
@@ -316,6 +328,8 @@ fn vector_index_rejects_unknown_filter_field() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     assert!(table.validate_structure("docs").is_err());
 }
@@ -357,6 +371,8 @@ fn vector_index_rejects_non_scalar_filter_field() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     assert!(table.validate_structure("docs").is_err());
 }

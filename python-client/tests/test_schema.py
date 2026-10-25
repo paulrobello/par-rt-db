@@ -13,7 +13,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from par_rt_db.schema import IndexDef, Schema, VectorIndexSpec, t
+from par_rt_db.schema import IndexDef, Schema, TableDef, VectorIndexSpec, t
 
 
 def test_scalar_and_compound_fields_round_trip():
@@ -544,3 +544,87 @@ def test_soft_delete_builder_emits_flag_only_when_set():
         {"fields": {"a": {"type": "string"}}, "softDelete": False}
     )
     assert "softDelete" not in explicit_false.model_dump(by_alias=True)
+
+
+# --- table/field descriptions ---
+
+
+def test_table_descriptions_wire_contract():
+    """Mirrors ``core/src/schema.rs::table_descriptions_wire_contract``: an
+    undescribed table serializes WITHOUT ``description``/``fieldDescriptions``
+    (skip-when-empty, not ``exclude_none``-dependent — ``model_dump`` with no
+    flags must already omit them), a described table carries both camelCase
+    keys, and both decode back value-identically."""
+    plain = TableDef.model_validate({"fields": {"name": {"type": "string"}}})
+    # Pin the exact JSON: no exclude_none/exclude_defaults trickery involved.
+    # (`indexes` serializes as an empty array like the crate's `#[serde(default)]`
+    # Vec — the load-bearing absence is `description`/`fieldDescriptions`.)
+    assert json.loads(plain.model_dump_json(by_alias=True)) == {
+        "fields": {"name": {"type": "string"}},
+        "indexes": [],
+    }
+
+    # Old-schema decode: a payload with the new keys decodes fine, and one
+    # without them decodes to None/empty.
+    assert plain.description is None
+    assert plain.field_descriptions == {}
+
+    described = TableDef.model_validate(
+        {
+            "fields": {"name": {"type": "string"}, "qty": {"type": "number"}},
+            "description": "Inventory items",
+            "fieldDescriptions": {"name": "Display name", "qty": "Units in stock"},
+        }
+    )
+    wire = json.loads(described.model_dump_json(by_alias=True))
+    assert wire["description"] == "Inventory items"
+    assert wire["fieldDescriptions"] == {"name": "Display name", "qty": "Units in stock"}
+    assert TableDef.model_validate(wire) == described
+
+    # A table with only a table-level description (empty map) omits the map key.
+    table_only = TableDef.model_validate({"fields": {"a": {"type": "string"}}, "description": "d"})
+    assert json.loads(table_only.model_dump_json(by_alias=True)) == {
+        "fields": {"a": {"type": "string"}},
+        "indexes": [],
+        "description": "d",
+    }
+
+
+def test_describe_builder_sets_descriptions():
+    """``.describe(table_description, field_descriptions?)`` mirrors the
+    ts-client idiom: the builder emits ``description`` always and
+    ``fieldDescriptions`` only when a non-empty map is given."""
+    schema = (
+        Schema.builder()
+        .table(
+            "items",
+            lambda tb: (
+                tb.field("name", t.string())
+                .field("qty", t.number())
+                .index("by_name", ["name"])
+                .describe("Inventory items", {"name": "Display name", "qty": "Units in stock"})
+            ),
+        )
+        .table("plain", lambda tb: tb.field("name", t.string()))
+        .build()
+    )
+    wire = json.loads(schema.model_dump_json(by_alias=True))
+    items = wire["tables"]["items"]
+    assert items["description"] == "Inventory items"
+    assert items["fieldDescriptions"] == {"name": "Display name", "qty": "Units in stock"}
+    # An undescribed table never carries either key.
+    assert "description" not in wire["tables"]["plain"]
+    assert "fieldDescriptions" not in wire["tables"]["plain"]
+
+    # Round-trips through model_validate (a pushed schema parses back).
+    assert Schema.model_validate(wire) == schema
+
+    # describe() without a field map emits only the table description.
+    schema_table_only = (
+        Schema.builder()
+        .table("t", lambda tb: tb.field("a", t.string()).describe("just the table"))
+        .build()
+    )
+    wire_table_only = json.loads(schema_table_only.model_dump_json(by_alias=True))
+    assert wire_table_only["tables"]["t"]["description"] == "just the table"
+    assert "fieldDescriptions" not in wire_table_only["tables"]["t"]

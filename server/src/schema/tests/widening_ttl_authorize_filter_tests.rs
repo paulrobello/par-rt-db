@@ -233,6 +233,8 @@ fn table_with_ttl(ttl: Option<TtlDef>) -> TableDef {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     }
 }
 
@@ -374,6 +376,8 @@ fn table_with_string_fields(field_names: &[&str]) -> TableDef {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     }
 }
 

@@ -898,6 +898,17 @@ export interface TableJson {
    * restores it. `true` only; omitted on the wire when false. Server-enforced;
    * clients only declare it. */
   softDelete?: boolean;
+  /** Optional human-readable description of the table, surfaced by the
+   * dashboard's schema/data-browser views. Pure metadata: it changes no
+   * validation, no DDL, and is not compared by the server's additive-push
+   * gate, so editing it is an ordinary additive push. Omitted on the wire
+   * when unset. */
+  description?: string;
+  /** Optional per-field descriptions keyed by declared field name, surfaced
+   * as column tooltips in the dashboard's data browser. Pure metadata like
+   * {@link TableJson.description}: no validation, no DDL, not compared by
+   * the push gate. Omitted on the wire when the table declares none. */
+  fieldDescriptions?: Record<string, string>;
 }
 
 /** One field's declared write constraints (see {@link TableJson.constraints}).

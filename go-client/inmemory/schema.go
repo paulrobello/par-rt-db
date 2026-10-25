@@ -143,6 +143,8 @@ type TableDef struct {
 	Constraints        map[string]FieldConstraints
 	Computed           map[string]wire.ValueExpr
 	SoftDelete         bool
+	Description        *string
+	FieldDescriptions  map[string]string
 }
 
 // SchemaDef is a whole schema: named tables.
@@ -184,7 +186,8 @@ func parseTableDef(v wire.JSONValue) (*TableDef, error) {
 	}
 	if err := rejectUnknownKeys(obj, "table", "fields", "indexes", "ownerField",
 		"collaboratorsField", "ttl", "updatedAtField", "autoIncrementField",
-		"authorize", "defaults", "constraints", "computed", "softDelete"); err != nil {
+		"authorize", "defaults", "constraints", "computed", "softDelete",
+		"description", "fieldDescriptions"); err != nil {
 		return nil, err
 	}
 	td := &TableDef{Fields: map[string]FieldType{}, Defaults: map[string]wire.JSONValue{}, Computed: map[string]wire.ValueExpr{}}
@@ -224,6 +227,25 @@ func parseTableDef(v wire.JSONValue) (*TableDef, error) {
 	}
 	if td.AutoIncrementField, err = optString(obj, "autoIncrementField"); err != nil {
 		return nil, err
+	}
+	if td.Description, err = optString(obj, "description"); err != nil {
+		return nil, err
+	}
+	if v, ok := obj["fieldDescriptions"]; ok && v != nil {
+		fdObj, ok := v.(wire.Object)
+		if !ok {
+			return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+				"table.fieldDescriptions must be an object")
+		}
+		td.FieldDescriptions = map[string]string{}
+		for fname, fv := range fdObj {
+			s, ok := fv.(wire.String)
+			if !ok {
+				return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+					"table.fieldDescriptions entries must be strings")
+			}
+			td.FieldDescriptions[fname] = string(s)
+		}
 	}
 	if v, ok := obj["softDelete"]; ok {
 		b, ok := v.(wire.Bool)

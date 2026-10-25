@@ -1590,6 +1590,8 @@ mod tests {
             auto_increment_field: None,
             authorize: None,
             soft_delete: false,
+
+            ..Default::default()
         }
     }
 

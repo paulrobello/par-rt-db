@@ -44,6 +44,8 @@ fn simple_table() -> TableDef {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     }
 }
 
@@ -83,6 +85,8 @@ fn rejects_field_name_with_invalid_chars() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     let schema = SchemaDef {
         tables: BTreeMap::from([("items".to_string(), table)]),
@@ -125,6 +129,8 @@ fn accepts_field_name_at_max_length_60() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     let schema = SchemaDef {
         tables: BTreeMap::from([("items".to_string(), table)]),
@@ -149,6 +155,8 @@ fn rejects_field_name_over_max_length_60() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     let schema = SchemaDef {
         tables: BTreeMap::from([("items".to_string(), table)]),
@@ -182,6 +190,8 @@ fn accepts_index_name_at_max_length_30() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     let schema = SchemaDef {
         tables: BTreeMap::from([("items".to_string(), table)]),
@@ -215,6 +225,8 @@ fn rejects_index_name_over_max_length_30() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     let schema = SchemaDef {
         tables: BTreeMap::from([("items".to_string(), table)]),
@@ -241,6 +253,8 @@ fn rejects_case_insensitive_field_name_collision() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     let schema = SchemaDef {
         tables: BTreeMap::from([("items".to_string(), table)]),
@@ -285,6 +299,8 @@ fn rejects_case_insensitive_index_name_collision() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     let schema = SchemaDef {
         tables: BTreeMap::from([("items".to_string(), table)]),
@@ -308,6 +324,8 @@ fn rejects_field_name_starting_with_underscore() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     let schema = SchemaDef {
         tables: BTreeMap::from([("items".to_string(), table)]),
@@ -358,6 +376,8 @@ fn rejects_index_over_array_field() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     let schema = SchemaDef {
         tables: BTreeMap::from([("items".to_string(), table)]),
@@ -390,6 +410,8 @@ fn rejects_index_with_empty_fields() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     let schema = SchemaDef {
         tables: BTreeMap::from([("items".to_string(), table)]),
@@ -422,6 +444,8 @@ fn rejects_index_with_duplicate_fields() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     let schema = SchemaDef {
         tables: BTreeMap::from([("items".to_string(), table)]),
@@ -466,6 +490,8 @@ fn rejects_duplicate_index_names() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     let schema = SchemaDef {
         tables: BTreeMap::from([("items".to_string(), table)]),
@@ -498,6 +524,8 @@ fn rejects_index_name_with_invalid_chars() {
         authorize: None,
 
         soft_delete: false,
+
+        ..Default::default()
     };
     let schema = SchemaDef {
         tables: BTreeMap::from([("items".to_string(), table)]),

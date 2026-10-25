@@ -314,7 +314,7 @@ pub struct FieldConstraints {
 }
 
 /// One table: fields, indexes, and opt-in per-row rules / TTL / defaults.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TableDef {
     /// Field name → declared type.
     pub fields: BTreeMap<String, FieldType>,
@@ -429,6 +429,28 @@ pub struct TableDef {
     /// unchanged.
     #[serde(default, rename = "softDelete", skip_serializing_if = "is_false")]
     pub soft_delete: bool,
+    /// Optional human-readable description of the table, surfaced by the
+    /// dashboard's schema/data-browser views. Pure metadata: it changes no
+    /// validation, no DDL, and is not compared by
+    /// `detect_destructive_changes` (like `softDelete`), so editing it is an
+    /// ordinary additive push. Omitted on the wire when `None`, so existing
+    /// schemas (and old clients) deserialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Optional per-field descriptions keyed by field name (the FM-32
+    /// table-level-map pattern — a map here avoids a description envelope
+    /// through every `FieldType` variant, which carries
+    /// `deny_unknown_fields`). Surfaced as column tooltips in the dashboard's
+    /// data browser. Pure metadata like [`TableDef::description`]: no
+    /// validation, no DDL, not compared by `detect_destructive_changes`.
+    /// Omitted on the wire when empty, so existing schemas deserialize
+    /// unchanged.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        rename = "fieldDescriptions"
+    )]
+    pub field_descriptions: BTreeMap<String, String>,
 }
 
 /// A whole schema: named tables. Pushed via `POST /admin/push-schema`.
@@ -571,5 +593,72 @@ pub fn literal_set(ty: &FieldType) -> Option<Vec<&serde_json::Value>> {
             }
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the wire contract of `TableDef::description` /
+    /// `fieldDescriptions`: a description-less table serializes WITHOUT both
+    /// keys (skip_serializing_if — the attribute has bitten this repo before
+    /// via corpus drift), a described table serializes with the camelCase
+    /// `fieldDescriptions` key, and both decode back value-identically.
+    #[test]
+    fn table_descriptions_wire_contract() {
+        let plain = TableDef {
+            fields: BTreeMap::from([("name".into(), FieldType::String)]),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("description").is_none());
+        assert!(json.get("fieldDescriptions").is_none());
+
+        // Old-schema decode: a payload carrying the new keys decodes fine
+        // (the keys are optional), and one without them decodes to None/empty.
+        let decoded: TableDef =
+            serde_json::from_value(serde_json::json!({"fields": {"name": {"type": "string"}}}))
+                .unwrap();
+        assert_eq!(decoded.description, None);
+        assert!(decoded.field_descriptions.is_empty());
+
+        let described = TableDef {
+            fields: BTreeMap::from([("name".into(), FieldType::String)]),
+            description: Some("Inventory items".into()),
+            field_descriptions: BTreeMap::from([("name".into(), "Display name".into())]),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&described).unwrap();
+        assert_eq!(json["description"], "Inventory items");
+        assert_eq!(json["fieldDescriptions"]["name"], "Display name");
+        let round_tripped: TableDef = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped, described);
+    }
+
+    /// Descriptions are pure metadata: they must not affect the additive-push
+    /// comparison — editing a description is not a destructive change, and a
+    /// description-only change of the field types still classifies as
+    /// unchanged.
+    #[test]
+    fn descriptions_do_not_affect_destructive_detection() {
+        let base = TableDef {
+            fields: BTreeMap::from([("name".into(), FieldType::String)]),
+            ..Default::default()
+        };
+        let described = TableDef {
+            description: Some("desc".into()),
+            field_descriptions: BTreeMap::from([("name".into(), "d".into())]),
+            ..base.clone()
+        };
+        let schema = |t: TableDef| SchemaDef {
+            tables: BTreeMap::from([("items".into(), t)]),
+        };
+        let (old, new) = (schema(base), schema(described));
+        assert_eq!(
+            crate::engine::detect_destructive_changes(&old, &new),
+            Ok(()),
+            "adding descriptions must be additive"
+        );
     }
 }

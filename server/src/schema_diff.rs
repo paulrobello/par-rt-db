@@ -256,6 +256,8 @@ mod tests {
             authorize: None,
 
             soft_delete: false,
+
+            ..Default::default()
         }
     }
 

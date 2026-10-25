@@ -471,7 +471,8 @@ public struct FieldConstraints: Equatable, Codable, Sendable {
 /// Mirrors rust-client `TableDef` — `indexes` omitted when nil, `ownerField` /
 /// `collaboratorsField` / `ttl` / `updatedAtField` / `autoIncrementField` /
 /// `authorize` omitted when nil, `defaults` and `computed` omitted when empty,
-/// `softDelete` omitted when false.
+/// `softDelete` omitted when false, `description` omitted when nil,
+/// `fieldDescriptions` omitted when nil or empty.
 public struct TableDef: Equatable, Codable, Sendable {
     /// Field name to declared type.
     public var fields: [String: FieldType]
@@ -532,6 +533,17 @@ public struct TableDef: Equatable, Codable, Sendable {
     /// (`deleted_at`) instead of removed — invisible to every read and write
     /// lookup, restorable via the `undelete` mutation step.
     public var softDelete: Bool
+    /// Optional human-readable description of the table, surfaced by the
+    /// dashboard's schema/data-browser views. Pure metadata: it changes no
+    /// validation, no DDL, and is not compared by the server's additive-push
+    /// gate, so editing it is an ordinary additive push. Omitted on the wire
+    /// when unset.
+    public var description: String?
+    /// Optional per-field descriptions keyed by declared field name, surfaced
+    /// as column tooltips in the dashboard's data browser. Pure metadata like
+    /// `description`: no validation, no DDL, not compared by the push gate.
+    /// Omitted on the wire when the table declares none.
+    public var fieldDescriptions: [String: String]?
 
     public init(
         fields: [String: FieldType],
@@ -545,7 +557,9 @@ public struct TableDef: Equatable, Codable, Sendable {
         defaults: [String: JSONValue] = [:],
         computed: [String: ValueExpr] = [:],
         constraints: [String: FieldConstraints]? = nil,
-        softDelete: Bool = false
+        softDelete: Bool = false,
+        description: String? = nil,
+        fieldDescriptions: [String: String]? = nil
     ) {
         self.fields = fields
         self.indexes = indexes
@@ -559,11 +573,14 @@ public struct TableDef: Equatable, Codable, Sendable {
         self.computed = computed
         self.constraints = constraints
         self.softDelete = softDelete
+        self.description = description
+        self.fieldDescriptions = fieldDescriptions
     }
 
     enum CodingKeys: String, CodingKey {
         case fields, indexes, ttl, updatedAtField, autoIncrementField, authorize, defaults
         case computed, constraints, ownerField, collaboratorsField, softDelete
+        case description, fieldDescriptions
     }
 
     public init(from decoder: Decoder) throws {
@@ -590,6 +607,10 @@ public struct TableDef: Equatable, Codable, Sendable {
             [String: FieldConstraints].self, forKey: .constraints
         )
         softDelete = try container.decodeIfPresent(Bool.self, forKey: .softDelete) ?? false
+        description = try container.decodeIfPresent(String.self, forKey: .description)
+        fieldDescriptions = try container.decodeIfPresent(
+            [String: String].self, forKey: .fieldDescriptions
+        )
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -613,6 +634,10 @@ public struct TableDef: Equatable, Codable, Sendable {
         }
         if softDelete {
             try container.encode(softDelete, forKey: .softDelete)
+        }
+        try container.encodeIfPresent(description, forKey: .description)
+        if let fieldDescriptions, !fieldDescriptions.isEmpty {
+            try container.encode(fieldDescriptions, forKey: .fieldDescriptions)
         }
     }
 }
@@ -858,6 +883,23 @@ public struct TableBuilder: Sendable {
         with { $0.softDelete = enabled }
     }
 
+    /// Attach a human-readable description to the table, and optional
+    /// per-field descriptions keyed by declared field name. Pure metadata the
+    /// server persists verbatim (no validation, no DDL, not compared by the
+    /// additive push gate — editing it is an ordinary additive push); the
+    /// dashboard surfaces the table description on the schema page and
+    /// per-field descriptions as data-browser column tooltips. Round-trips on
+    /// the wire as `description` and `fieldDescriptions`, omitted when unset.
+    /// Mirrors the TS `.describe(tableDescription, fieldDescriptions?)`.
+    public func describe(
+        _ tableDescription: String, fieldDescriptions: [String: String]? = nil
+    ) -> TableBuilder {
+        with {
+            $0.description = tableDescription
+            $0.fieldDescriptions = fieldDescriptions
+        }
+    }
+
     /// Consume into the finished `TableDef` (internal: reached through
     /// `SchemaBuilder.table`; `@testable` tests mirror rust's direct
     /// `.finish()` fixtures).
@@ -874,7 +916,9 @@ public struct TableBuilder: Sendable {
             defaults: acc.defaults,
             computed: acc.computed,
             constraints: acc.constraints,
-            softDelete: acc.softDelete
+            softDelete: acc.softDelete,
+            description: acc.description,
+            fieldDescriptions: acc.fieldDescriptions
         )
     }
 }
@@ -893,6 +937,8 @@ private struct Acc: Sendable {
     var computed: [String: ValueExpr] = [:]
     var constraints: [String: FieldConstraints]?
     var softDelete = false
+    var description: String?
+    var fieldDescriptions: [String: String]?
     /// Position of the most recently declared index, for the chainable
     /// `unique()` / `whereClause(_:)` setters. nil until the first index.
     var lastIndex: Int?

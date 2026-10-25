@@ -57,6 +57,27 @@ describe("schema builder", () => {
     expect(s.toJSON().tables.notes).toEqual({ fields: { body: { type: "string" } } });
   });
 
+  it("emits description/fieldDescriptions when declared and survives chaining", () => {
+    const s = defineSchema({
+      items: defineTable({ name: t.string(), qty: t.number() })
+        .index("by_name", ["name"])
+        .describe("Inventory items", { name: "Display name" }),
+    });
+    expect(s.toJSON().tables.items).toEqual({
+      fields: { name: { type: "string" }, qty: { type: "number" } },
+      indexes: [{ name: "by_name", fields: ["name"] }],
+      description: "Inventory items",
+      fieldDescriptions: { name: "Display name" },
+    });
+  });
+
+  it("a description-less table omits the description keys on the wire", () => {
+    const s = defineSchema({ notes: defineTable({ body: t.string() }) });
+    const json = s.toJSON().tables.notes;
+    expect(json).not.toHaveProperty("description");
+    expect(json).not.toHaveProperty("fieldDescriptions");
+  });
+
   it("serializes nested object and id-array field types", () => {
     const s = defineSchema({
       t1: defineTable({

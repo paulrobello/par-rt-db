@@ -399,6 +399,8 @@ mod tests {
             ttl: None,
             updated_at_field: None,
             auto_increment_field: None,
+
+            ..Default::default()
         }
     }
 

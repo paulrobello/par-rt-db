@@ -57,6 +57,8 @@ fn vector_schema_with_metric(dim: u32, with_filter: bool, metric: DistanceMetric
             auto_increment_field: None,
             authorize: None,
             soft_delete: false,
+
+            ..Default::default()
         },
     );
     SchemaDef { tables }

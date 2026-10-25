@@ -54,6 +54,8 @@ fn owner_schema() -> SchemaDef {
             auto_increment_field: None,
             authorize: None,
             soft_delete: false,
+
+            ..Default::default()
         },
     );
     let mut open_fields = BTreeMap::new();
@@ -73,6 +75,8 @@ fn owner_schema() -> SchemaDef {
             auto_increment_field: None,
             authorize: None,
             soft_delete: false,
+
+            ..Default::default()
         },
     );
     SchemaDef { tables }
@@ -567,6 +571,8 @@ async fn search_filters_to_own_rows() -> anyhow::Result<()> {
             auto_increment_field: None,
             authorize: None,
             soft_delete: false,
+
+            ..Default::default()
         },
     );
     let schema = SchemaDef { tables };
@@ -694,6 +700,8 @@ async fn vector_search_filters_to_own_rows() -> anyhow::Result<()> {
             auto_increment_field: None,
             authorize: None,
             soft_delete: false,
+
+            ..Default::default()
         },
     );
     let schema = SchemaDef { tables };
@@ -834,6 +842,8 @@ async fn vector_search_composes_filter_fields_with_owner() -> anyhow::Result<()>
             auto_increment_field: None,
             authorize: None,
             soft_delete: false,
+
+            ..Default::default()
         },
     );
     let schema = SchemaDef { tables };
@@ -1808,6 +1818,8 @@ fn collab_schema() -> SchemaDef {
             auto_increment_field: None,
             authorize: None,
             soft_delete: false,
+
+            ..Default::default()
         },
     );
     SchemaDef { tables }
@@ -2474,6 +2486,8 @@ fn authorize_schema() -> SchemaDef {
             auto_increment_field: None,
             authorize,
             soft_delete: false,
+
+            ..Default::default()
         },
     );
     SchemaDef { tables }
@@ -3169,6 +3183,8 @@ fn insert_stamp_schema() -> SchemaDef {
             auto_increment_field: None,
             authorize,
             soft_delete: false,
+
+            ..Default::default()
         }
     };
     let mut tables = BTreeMap::new();
@@ -4042,6 +4058,8 @@ fn composed_schema() -> SchemaDef {
                 value: json!("public"),
             }),
             soft_delete: false,
+
+            ..Default::default()
         },
     );
     SchemaDef { tables }
@@ -4699,6 +4717,8 @@ fn sec117_schema(authorize: FilterExpr) -> SchemaDef {
             auto_increment_field: None,
             authorize: Some(authorize),
             soft_delete: false,
+
+            ..Default::default()
         },
     );
     SchemaDef { tables }
