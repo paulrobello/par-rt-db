@@ -631,6 +631,7 @@ jobs:
         env:
           LENNY2_SSH_KEY: ${{ secrets.LENNY2_SSH_KEY }}
         run: |
+          mkdir -p ~/.ssh
           install -m 600 /dev/null ~/.ssh/id_ed25519
           printf '%s\n' "$LENNY2_SSH_KEY" > ~/.ssh/id_ed25519
           ssh-keyscan -t ed25519 lenny2.par-com.net >> ~/.ssh/known_hosts
