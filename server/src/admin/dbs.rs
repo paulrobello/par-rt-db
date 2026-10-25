@@ -283,13 +283,19 @@ pub(super) async fn db_stats(
     tables.sort_by(|a, b| a.name.cmp(&b.name));
     let hot = state.runtime.hot.load();
     let subs_used = state.realtime.subs.count_for_db(&db).await;
+    // `storageUsedBytes` is the quota basis itself (UsageCache::measure: doc
+    // tables + blobs, engine bookkeeping such as the change log excluded) so
+    // the advertised figure is what enforcement acts on — not the doc-tables
+    // subtotal below (`totalSizeBytes`), which once diverged from it by ~1 GiB
+    // on a change-log-heavy db (the-cube b8d4af5).
+    let storage_used_bytes = crate::quota::UsageCache::measure(&state.pool, &db).await?;
     Ok(Json(DbStatsResponse {
         tables,
         total_size_bytes,
         tables_quota: hot.max_tables_per_db,
         tables_used: schema_def.tables.len(),
         storage_quota_bytes: hot.max_storage_bytes_per_db,
-        storage_used_bytes: total_size_bytes.max(0) as u64,
+        storage_used_bytes,
         subs_quota: hot.max_subs_per_db,
         subs_used,
     }))

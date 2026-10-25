@@ -63,9 +63,18 @@ impl UsageCache {
         }
     }
 
-    /// Live on-disk size of one db's user tables + blob table (heap + indexes +
-    /// TOAST), framework bookkeeping excluded. Reads `pg_total_relation_size` —
-    /// sub-millisecond. Schema name is `$1`-bound (no interpolation).
+    /// Live on-disk size of one db's user data — schema-defined document tables
+    /// plus blob tables (`storage` + `storage_chunks`; heap + indexes + TOAST) —
+    /// all engine bookkeeping excluded. The excluded set is every engine-created
+    /// ordinary relation: `meta`, `mutations`, `mutation_cache_v2`,
+    /// `scheduled_txns`, `schema_history`, `workflows`, and the change log
+    /// (`changes` + `change_head`). The change log is bounded by its own
+    /// row-count retention (`change_log::DEFAULT_MAX_ROWS`), so excluding it
+    /// from the byte quota does not unbound disk; charging it here would
+    /// double-charge document data against a UI figure that excludes it
+    /// (the-cube b8d4af5: HTTP 507 at 2 GiB while admin stats reported 1 GiB).
+    /// Reads `pg_total_relation_size` — sub-millisecond. Schema name is
+    /// `$1`-bound (no interpolation).
     pub async fn measure(pool: &PgPool, db: &str) -> Result<u64, RtDbError> {
         let schema = crate::ddl::pg_schema(db);
         let bytes: i64 = sqlx::query_scalar(
@@ -73,7 +82,8 @@ impl UsageCache {
              FROM pg_class c \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE n.nspname = $1 AND c.relkind = 'r' \
-               AND c.relname NOT IN ('meta','mutations','mutation_cache_v2','scheduled_txns','schema_history')",
+               AND c.relname NOT IN ('meta','mutations','mutation_cache_v2','scheduled_txns','schema_history',\
+                                     'workflows','changes','change_head')",
         )
         .bind(&schema)
         .fetch_one(pool)

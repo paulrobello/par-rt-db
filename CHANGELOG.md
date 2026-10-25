@@ -468,6 +468,20 @@ alter observable behavior on upgrade.
 
 ### Fixed
 
+- **Storage quota and admin stats now report one accounting basis (server —
+  FEATURE_MATRIX #26).** Enforcement measured user data + blobs while also
+  charging engine bookkeeping: the change log (`changes`/`change_head`) and
+  `workflows` were charged against the byte cap, but
+  `GET /admin/dbs/{db}/stats` reported document-table bytes only as
+  `storageUsedBytes` — a change-log-heavy db could hit `QUOTA_EXCEEDED`
+  (HTTP 507) while the dashboard advertised headroom (the-cube b8d4af5: 507 at
+  2 GiB with admin stats reporting 1 GiB). `UsageCache::measure` now excludes
+  the full engine bookkeeping set (`meta`/`mutations`/`mutation_cache_v2`/
+  `scheduled_txns`/`schema_history`/`workflows`/`changes`/`change_head`), and
+  `db_stats` reports that same measure as `storageUsedBytes` (`totalSizeBytes`
+  stays the document-table subtotal shown per table). Caps are unchanged,
+  growing writes are still rejected at the same cap, and the change log stays
+  bounded by its own row-count retention.
 - **A forwarded mutate carrying no idempotency key is given a server-minted
   one.** A reply racing the forward timeout is dropped, and the origin then
   takes over and resubmits the same write — which, for an unkeyed mutate,

@@ -286,3 +286,93 @@ async fn upload_over_storage_cap_is_rejected() -> anyhow::Result<()> {
     assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE);
     Ok(())
 }
+
+// the-cube b8d4af55: enforcement charged engine bookkeeping (the change log's
+// `changes`/`change_head` plus `workflows`) while /admin/dbs/{db}/stats
+// reported doc-table bytes only — a change-log-heavy db hit HTTP 507 at 2 GiB
+// while the dashboard advertised ~1 GiB of headroom. Both surfaces must use
+// one basis: doc tables + blob tables, engine bookkeeping excluded (the change
+// log is bounded by its own row-count retention, so the byte quota excluding
+// it does not unbound disk). The test pins the exact set difference: the
+// pre-fix basis minus the new basis is exactly changes + change_head +
+// workflows.
+#[tokio::test]
+async fn quota_basis_excludes_change_log_and_matches_admin_stats() -> anyhow::Result<()> {
+    let state = crate::common::test_state().await;
+    let db = fresh_db(&state).await;
+
+    // Grow the change log: every commit appends full document copies to
+    // `changes`, so padded titles put a measurable retained history in it.
+    for i in 0..40 {
+        let doc = serde_json::json!({
+            "projectId": "0".repeat(32),
+            "title": format!("item-{i}{}", "x".repeat(4096)),
+            "status": "backlog",
+            "order": i as f64,
+            "completedAt": null
+        });
+        state
+            .realtime
+            .committers
+            .mutate(
+                &db,
+                None,
+                Transaction {
+                    steps: vec![Step::Insert {
+                        table: "workItems".to_string(),
+                        doc: doc.as_object().expect("json object").clone(),
+                    }],
+                },
+                PrincipalCtx::bypass(),
+            )
+            .await?;
+    }
+
+    // Ordinary-relation sums via `pg_total_relation_size`, schema `$1`-bound.
+    // The dynamic fragments are audited constants (table-name lists); only the
+    // schema name is runtime data and it is `$1`-bound.
+    let sum_sql = |extra: &str| {
+        format!(
+            "SELECT COALESCE(SUM(pg_total_relation_size(c.oid)), 0)::bigint \
+                 FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relkind = 'r' {extra}"
+        )
+    };
+    let schema = format!("db_{db}");
+    let sql = sum_sql(
+        "AND c.relname NOT IN ('meta','mutations','mutation_cache_v2','scheduled_txns','schema_history')",
+    );
+    let old_basis: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(&schema)
+        .fetch_one(&state.pool)
+        .await?;
+    let sql = sum_sql("AND c.relname IN ('changes','change_head','workflows')");
+    let log_tables: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(&schema)
+        .fetch_one(&state.pool)
+        .await?;
+
+    let basis = rtdb_server::quota::UsageCache::measure(&state.pool, &db).await?;
+    assert!(
+        old_basis > i64::try_from(basis)?,
+        "change log must have charged the old basis: {old_basis} vs {basis}"
+    );
+    assert_eq!(
+        i64::try_from(basis)? + log_tables,
+        old_basis,
+        "excluded set must be exactly changes + change_head + workflows"
+    );
+
+    // Admin stats must report the same basis enforcement acts on.
+    let addr = crate::common::spawn_app(state.clone()).await;
+    let resp = crate::common::admin_get(addr, &format!("/admin/dbs/{db}/stats")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(
+        body["storageUsedBytes"].as_u64(),
+        Some(basis),
+        "admin stats must match the enforcement basis"
+    );
+    Ok(())
+}
