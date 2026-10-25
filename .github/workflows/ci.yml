@@ -620,7 +620,9 @@ jobs:
     name: Deploy to lenny2
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
-    needs: [drift, lint, typecheck, test, features, docs, swift]
+    # docs is excluded: it self-skips on plain main pushes (heavy artifact
+    # tiering), and a needs on a skipped job skips this job too.
+    needs: [drift, lint, typecheck, test, features, swift]
     timeout-minutes: 45
     permissions:
       contents: read
