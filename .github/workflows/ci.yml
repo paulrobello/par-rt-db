@@ -608,16 +608,18 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@v5.0.1
 
-  # Lenny2 CD recipe (established across par-hack, read-it-to-me, par-artifacts):
-  # on a green main push, the runner SSHes lenny2 with a forced-command deploy
-  # key. The server-side /usr/local/bin/parrtdb-deploy accepts ONLY a bare
-  # 40-hex SHA — the key can do nothing else — then fetches, checks out, and
-  # builds that exact commit on the host (buildx builder with CPU clamps, the
-  # same host-reservation lease check `make deploy` runs) and polls /healthz
-  # until the new rollout is ready. Exactly ONE ssh invocation per deploy; the
-  # private key lives only in the LENNY2_SSH_KEY secret.
+  # Deploy-host CD recipe (established across par-hack, read-it-to-me,
+  # par-artifacts): on a green main push, the runner SSHes the deploy host with
+  # a forced-command deploy key. The server-side /usr/local/bin/parrtdb-deploy
+  # accepts ONLY a bare 40-hex SHA — the key can do nothing else — then
+  # fetches, checks out, and builds that exact commit on the host (buildx
+  # builder with CPU clamps, the same host-reservation lease check `make
+  # deploy` runs) and polls /healthz until the new rollout is ready. Exactly
+  # ONE ssh invocation per deploy; the private key lives only in the
+  # LENNY2_SSH_KEY secret and the hostname only in LENNY2_DEPLOY_HOST (the
+  # hostname-leak-check gate forbids real hostnames in tracked files).
   deploy:
-    name: Deploy to lenny2
+    name: Deploy to production host
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     # docs is excluded: it self-skips on plain main pushes (heavy artifact
@@ -630,12 +632,13 @@ jobs:
       - name: Deploy ${{ github.sha }} via the forced-command deploy key
         env:
           LENNY2_SSH_KEY: ${{ secrets.LENNY2_SSH_KEY }}
+          LENNY2_DEPLOY_HOST: ${{ secrets.LENNY2_DEPLOY_HOST }}
         run: |
           mkdir -p ~/.ssh
           install -m 600 /dev/null ~/.ssh/id_ed25519
           printf '%s\n' "$LENNY2_SSH_KEY" > ~/.ssh/id_ed25519
-          ssh-keyscan -t ed25519 lenny2.par-com.net >> ~/.ssh/known_hosts
+          ssh-keyscan -t ed25519 "$LENNY2_DEPLOY_HOST" >> ~/.ssh/known_hosts
           ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes \
             -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
-            root@lenny2.par-com.net "${{ github.sha }}"
+            "root@$LENNY2_DEPLOY_HOST" "${{ github.sha }}"
           rm -f ~/.ssh/id_ed25519
