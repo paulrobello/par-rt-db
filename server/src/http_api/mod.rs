@@ -140,12 +140,10 @@ pub fn http_api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/api/storage/{db}",
             post(upload_handler).layer(DefaultBodyLimit::disable()),
         )
-        // Authed serve — bearer authorizes `{db}`; id must live in that db's
-        // table (404 otherwise, enforcing cross-db isolation).
-        .route(
-            "/api/storage/{db}/{id}",
-            get(serve_authed_handler).delete(delete_handler),
-        )
+        // Authed serve lives in `storage_serve_routes` (kept outside the
+        // router-wide gzip layer — see that fn's docs); this path stays here
+        // for the DELETE twin, which returns JSON.
+        .route("/api/storage/{db}/{id}", delete(delete_handler))
         // Metadata — same auth + cross-db isolation as authed serve.
         .route("/api/storage/{db}/{id}/metadata", get(metadata_handler))
         // Per-row public share grants (flag-gated: RTDB_SHARE_GRANTS_ENABLED).
@@ -163,6 +161,20 @@ pub fn http_api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // Mint a signed, time-limited URL — same auth as authed serve; the
         // holder fetches via `GET /storage/{id}?exp=&sig=` until expiry.
         .route("/api/storage/{db}/{id}/signed-url", get(signed_url_handler))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state,
+            host_surface_guard,
+        ))
+}
+
+/// Blob byte-serving routes, kept OUT of the router-wide gzip layer in
+/// `lib.rs`: range requests and the `Accept-Ranges`/`Content-Length` contract
+/// must survive content negotiation, and blob bodies are usually
+/// already-compressed media. `host_surface_guard` still applies. The DELETE
+/// twin of the authed path stays inside the compressed API router.
+pub fn storage_serve_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/api/storage/{db}/{id}", get(serve_authed_handler))
         // Public, unauthenticated serve — the one unauthenticated route in the
         // server, by design. The opaque id resolves to its owning db via the
         // global index.

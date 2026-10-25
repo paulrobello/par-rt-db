@@ -47,7 +47,7 @@ bytes = "1"
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 tower = "0.5"
-tower-http = { version = "0.7", features = ["trace", "cors", "fs"] }
+tower-http = { version = "0.7", features = ["trace", "cors", "fs", "compression-gzip"] }
 serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "json"] }
@@ -121,6 +121,7 @@ opentelemetry-otlp = { version = "0.33", default-features = false, features = [
 tracing-opentelemetry = { version = "0.34", optional = true }
 
 [dev-dependencies]
+reqwest = { workspace = true, features = ["gzip"] }
 anyhow.workspace = true
 tempfile = "3"
 tokio-tungstenite.workspace = true

@@ -75,6 +75,10 @@ use subs::SubscriptionManager;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceBuilder;
+use tower_http::compression::{
+    CompressionLayer,
+    predicate::{DefaultPredicate, Predicate, SizeAbove},
+};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
@@ -798,8 +802,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/metrics", get(prometheus_metrics_handler))
         .merge(admin::admin_routes(state.clone()))
         .merge(http_api::http_api_routes(state.clone()))
+        // Gzip only on the JSON API + admin surface (including the streaming
+        // /admin/export-db JSONL and /admin/backups downloads): SizeAbove(1 KiB)
+        // leaves tiny payloads uncompressed, and DefaultPredicate already skips
+        // SSE. Applied before the /sync merge so the WS upgrade is untouched.
+        .layer(
+            CompressionLayer::new()
+                .compress_when(DefaultPredicate::new().and(SizeAbove::new(1024))),
+        )
         .merge(ws::ws_routes())
-        .merge(auth::provider::auth_routes());
+        .merge(auth::provider::auth_routes())
+        // Blob byte-serving merges after the gzip layer: range requests and
+        // the Accept-Ranges/Content-Length contract must survive content
+        // negotiation, and blob bodies are usually already-compressed media.
+        .merge(http_api::storage_serve_routes(state.clone()));
 
     // Static SPA hosting, mounted LAST as the fallback so it can never shadow a
     // real route. Only when RTDB_STATIC_DIR is set and the directory exists;

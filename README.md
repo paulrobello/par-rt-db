@@ -238,6 +238,11 @@ message). The dashboard's WS to `/admin/stream` is a browser special-case: the
 admin bearer rides in the `Sec-WebSocket-Protocol: rtdb-admin.<token>` subprotocol
 since browsers cannot set headers on a WS handshake.
 
+The JSON API and admin surface are gzip-compressed when the client sends
+`Accept-Encoding: gzip` (responses at or under 1 KiB stay uncompressed; SSE and
+`image/*` are skipped). The WebSocket upgrade at `/sync` is untouched by
+compression.
+
 ### Health, realtime, queries, mutations, scheduling
 
 | Method & path | Auth | Description |
