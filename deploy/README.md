@@ -39,7 +39,24 @@ VPS and no reverse proxy is needed — TLS is terminated at Cloudflare's edge.
 
 ## Deploy / update
 
-The preferred path is `make deploy` from the repo root: it gates via
+The default path is continuous deployment (adopted 2026-10-25, the "Lenny2 CD
+recipe" established across par-hack, read-it-to-me, and par-artifacts): every
+green push to `main` runs the CI `deploy` job, which SSHes to the deploy host
+with a forced-command key and rolls that exact commit. The private key lives
+only in the repo's `LENNY2_SSH_KEY` GitHub secret; on the host it is
+half of a keypair whose `authorized_keys` line restricts it to
+`command="/usr/local/bin/parrtdb-deploy $SSH_ORIGINAL_COMMAND",restrict` — the
+key can do nothing but run that script, and the script accepts ONLY a bare
+40-hex SHA as its argument (anything else exits 2). Exactly one SSH invocation
+happens per deploy. The script re-runs the deploy-path invariants: the
+host-reservation lease check (an active quiet-window lease BLOCKS the deploy),
+git fetch + `checkout -f <sha>` in `/docker/par-rt-db`, the constrained
+`par-rt-db-builder` build (`RTDB_BUILD_COMMIT` baked in, builder clamped to
+two CPUs during the build and restored after, including on failure), and a
+bounded `/healthz` poll (5-minute ceiling) that fails the job if the rollout
+never serves.
+
+The manual path remains `make deploy` from the repo root: it gates via
 `make checkall-cached` (reusing the green verdict stamped by a previous
 `make checkall` for the identical tree content — any edit to a tracked file
 changes the git tree hash and forces a full re-gate), then rsyncs to the
@@ -47,6 +64,9 @@ deploy host and runs
 `BUILDX_BUILDER=par-rt-db-builder docker compose up -d --build` with
 `RTDB_BUILD_COMMIT` baked in. See
 the [`Makefile`](../Makefile) `deploy` target for the canonical commands.
+Use it for out-of-band deploys (e.g. with an emergency
+`RESERVATION_OVERRIDE=1`) or when the CD path is unavailable; the CD path is
+authoritative for ordinary main pushes.
 
 The deploy target bootstraps the named `par-rt-db-builder` BuildKit
 `docker-container` builder if it does not already exist. The builder reads
