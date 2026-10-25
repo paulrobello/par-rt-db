@@ -636,5 +636,6 @@ jobs:
           printf '%s\n' "$LENNY2_SSH_KEY" > ~/.ssh/id_ed25519
           ssh-keyscan -t ed25519 lenny2.par-com.net >> ~/.ssh/known_hosts
           ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
             root@lenny2.par-com.net "${{ github.sha }}"
           rm -f ~/.ssh/id_ed25519
