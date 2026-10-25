@@ -90,6 +90,8 @@ export type {
   WebSocketLike,
 } from "./client.js";
 export { RtDbClient } from "./client.js";
+export { ChangeFeedStream } from "./change-feed.js";
+export type { StreamChangesOptions } from "./change-feed.js";
 export type { RtDbErrorCode, RtDbErrorEnvelope } from "./errors.js";
 export { RtDbError } from "./errors.js";
 export type {

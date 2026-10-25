@@ -20,6 +20,7 @@ inferred types.
 - [Cascade delete & soft delete](#cascade-delete-soft-delete)
 - [Search](#search)
 - [Realtime presence](#realtime-presence)
+- [Change feed](#change-feed)
 - [Schema migration](#schema-migration)
 - [File storage](#file-storage)
 - [In-memory test client](#in-memory-test-client)
@@ -621,6 +622,31 @@ value rolls the whole migrate back atomically). `evalExprTyped` (preferred) and 
 legacy raw-SQL `evalExpr` are the scoped escape hatch (one table's `doc` jsonb,
 no joins/DDL). See
 [`docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md`](../docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md).
+
+## Change feed
+
+`RtDbHttpClient.streamChanges()` wraps the durable per-db change feed
+(`GET /api/db/{db}/changes`, machine tokens only) in an auto-resuming async
+iterator, for HTTP-only consumers that can't hold a WebSocket open:
+
+```ts
+const feed = client.streamChanges({ since: savedCursor, pollIntervalMs: 1_000 });
+for await (const op of feed) {
+  processOp(op);
+  savedCursor = feed.cursor; // persist wherever restart-resume durability lives
+}
+```
+
+Each poll fetches one page with `since = feed.cursor`, yields its ops one by
+one, and advances `feed.cursor` to the last yielded op's `seq`; the caller
+owns persisting the cursor across restarts. A failed poll retries from the
+same cursor on a jittered exponential backoff (`backoffBaseMs`/`backoffMaxMs`),
+so an error never skips or replays an op; an empty page waits
+`pollIntervalMs`. `CURSOR_EXPIRED` (cursor older than retention) and a
+mid-stream `logId` change (the db was dropped and recreated — seqs restarted)
+are terminal: the error is thrown and the iteration ends, mirroring
+`rtdb changes --follow` — never a silent resync. Stop by breaking out of the
+`for await`, aborting `signal`, or calling `.stop()`.
 
 ## File storage
 

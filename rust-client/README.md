@@ -30,7 +30,7 @@ Crate name: `par-rt-db-client` → in Rust, `use par_rt_db_client::...`.
 
 | Feature | Default | Surface |
 | --- | --- | --- |
-| `http` | yes | `RtDbHttpClient` — typed query / mutate / `auth_me` / `fetch_schema` (machine-token schema read-back) / `changes` (durable change-feed cursor polling) |
+| `http` | yes | `RtDbHttpClient` — typed query / mutate / `auth_me` / `fetch_schema` (machine-token schema read-back) / `changes` (durable change-feed cursor polling) / `stream_changes` (auto-resuming change-feed iterator: yields ops one by one, advances the resume cursor to the last yielded seq, retries failed polls on a jittered backoff, and treats `CursorExpired` and a `log_id` change as terminal; `ChangeFeedStream::cursor` is the value the caller persists) |
 | `ws` | no | `RtDbClient` (`src/ws.rs`) — reactive WebSocket client (live query subscriptions, mutate, presence, optimistic updates, schedules, workflows) |
 | `admin` | no | `RtDbAdminClient` (`src/admin/mod.rs`) — `/admin/*` control-plane client: db create/list/push-schema, schema/stats read-back, token mint/revoke/list, db + server-wide admin allowlist CRUD, metrics, hot config GET/PATCH, op-feed `recent`, `stream_admin(db, table)` —
 the `/admin/stream` WebSocket consumer (features `admin` + `ws`; carries the

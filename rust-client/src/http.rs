@@ -2,17 +2,22 @@
 //! ARC-013 `X-Rtdb-Protocol` version header on every call, both attached by the
 //! crate-internal `AuthedRequest::authed` seam in `http_common`.
 
-use crate::error::{RtDbError, retry_on_precondition};
+use crate::error::{ErrorCode, RtDbError, retry_on_precondition};
 use crate::http_common::AuthedRequest;
 use crate::mutation::{Mutation, StepResult, Transaction};
 use crate::query::{Query, TableQuery};
 use crate::wire::{
-    AuthedUser, ClaimedSchedule, ScheduleInfo, ScheduleWhen, WorkflowInfo, WorkflowSpec,
+    AuthedUser, ChangeOp, ClaimedSchedule, ScheduleInfo, ScheduleWhen, WorkflowInfo, WorkflowSpec,
     WorkflowStatus,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::collections::VecDeque;
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
+use tokio::sync::Notify;
 
 /// Maximum total attempts for [`RtDbHttpClient::mutate_with_retry`] when a
 /// caller wants the SDK's default bound. Matches `ts-client`'s
@@ -49,6 +54,7 @@ fn encode_uri_component(s: &str) -> String {
 /// bearer-token authorized. For live query subscriptions use the reactive
 /// `RtDbClient` (`ws` feature); for `/admin/*` work obtain an admin client via
 /// `admin_client()` (the `admin` feature).
+#[derive(Clone)]
 pub struct RtDbHttpClient {
     url: String,
     db: String,
@@ -1066,6 +1072,41 @@ impl RtDbHttpClient {
         crate::http_common::deserialize::<crate::wire::ChangeFeedResponse>(resp).await
     }
 
+    /// Opens an auto-resuming stream over the durable per-db change feed
+    /// (machine tokens only). Each [`next`](ChangeFeedStream::next) call
+    /// yields one committed op and advances the resume cursor
+    /// ([`cursor`](ChangeFeedStream::cursor)) to the last yielded op's seq;
+    /// a failed poll retries from that cursor on a jittered exponential
+    /// backoff, and an empty page waits `poll_interval` before polling
+    /// again. `since` (default 0) is the starting cursor — pass the value
+    /// persisted by a previous run to resume after a restart. Stop via
+    /// [`stop`](ChangeFeedStream::stop); `ErrorCode::CursorExpired` and a
+    /// mid-stream `log_id` change are terminal — the error is returned once,
+    /// then the stream ends, mirroring `rtdb changes --follow` (never a
+    /// silent resync).
+    pub fn stream_changes(
+        &self,
+        since: i64,
+        table: Option<&str>,
+        limit: Option<i64>,
+        opts: ChangeFeedStreamOptions,
+    ) -> ChangeFeedStream {
+        ChangeFeedStream {
+            client: self.clone(),
+            cursor: since,
+            table: table.map(str::to_owned),
+            limit,
+            log_id: None,
+            opts,
+            stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            pending: std::collections::VecDeque::new(),
+            attempt: 0,
+            terminal: false,
+            terminal_err: None,
+        }
+    }
+
     /// Fetch the database's pushed `SchemaDef` via `GET /api/db/{db}/schema` —
     /// the machine-token twin of the admin client's
     /// [`get_schema`](crate::admin::RtDbAdminClient::get_schema). Serves
@@ -1516,6 +1557,158 @@ impl RtDbHttpClient {
     }
 }
 
+/// Tuning for [`RtDbHttpClient::stream_changes`]. Defaults mirror the
+/// ts-client's `streamChanges`: a 1s caught-up poll interval and a
+/// 500ms→15s jittered retry backoff.
+#[derive(Debug, Clone)]
+pub struct ChangeFeedStreamOptions {
+    /// Wait after an empty page (the stream is caught up).
+    pub poll_interval: Duration,
+    /// Base for the jittered exponential retry backoff after a failed poll.
+    pub backoff_base: Duration,
+    /// Cap for the retry backoff.
+    pub backoff_max: Duration,
+}
+
+impl Default for ChangeFeedStreamOptions {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(1),
+            backoff_base: Duration::from_millis(500),
+            backoff_max: Duration::from_secs(15),
+        }
+    }
+}
+
+/// Jittered exponential backoff: `min(max, base * 2^attempt) * (0.5 + rand*0.5)`,
+/// matching `ts-client` and `ws::backoff_delay`.
+fn backoff_delay(base: Duration, max: Duration, attempt: u32) -> Duration {
+    let exp = base.saturating_mul(2u32.saturating_pow(attempt.min(20)));
+    let raw = exp.min(max);
+    let frac = 0.5 + jitter_fraction() * 0.5;
+    raw.mul_f64(frac)
+}
+
+/// Per-process pseudo-random fraction in `[0, 1)` sourced from the hasher of a
+/// fresh `RandomState` — no external RNG dependency, sufficient for backoff jitter.
+fn jitter_fraction() -> f64 {
+    use std::hash::{BuildHasher, Hasher};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(n);
+    (h.finish() >> 11) as f64 / ((1u64 << 53) as f64)
+}
+
+/// Auto-resuming handle over the durable per-db change feed
+/// (`GET /api/db/{db}/changes`, machine tokens only), created by
+/// [`RtDbHttpClient::stream_changes`]. Each [`next`](Self::next) call yields
+/// one committed op in seq order and advances [`cursor`](Self::cursor) to
+/// the last yielded op's seq — persist that value (the caller owns cursor
+/// durability) and pass it back as `since` after a restart. A failed poll
+/// retries from the same cursor on the jittered backoff, so an error never
+/// skips or replays an op; an empty page waits `poll_interval`. The stream
+/// ends (returns `None`) after [`stop`](Self::stop), after a terminal error
+/// (`CursorExpired` or a `log_id` change — the db was replaced), or when
+/// the page loop can no longer continue.
+pub struct ChangeFeedStream {
+    client: RtDbHttpClient,
+    cursor: i64,
+    table: Option<String>,
+    limit: Option<i64>,
+    log_id: Option<String>,
+    opts: ChangeFeedStreamOptions,
+    stopped: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+    pending: VecDeque<ChangeOp>,
+    attempt: u32,
+    /// Set once a terminal error has been surfaced — the stream ends after
+    /// handing it to the consumer.
+    terminal: bool,
+    terminal_err: Option<RtDbError>,
+}
+
+impl ChangeFeedStream {
+    /// The resume cursor: the last op's seq handed to the consumer.
+    pub fn cursor(&self) -> i64 {
+        self.cursor
+    }
+
+    /// Ends the stream — a pending poll/backoff wait wakes and the next
+    /// [`next`](Self::next) call returns `None`.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::Relaxed);
+        self.notify.notify_one();
+    }
+
+    /// Yields the next committed op, or `None` once the stream has ended.
+    /// `Some(Err(..))` carries a failed poll exactly once before the stream
+    /// ends; transient failures never surface here — they retry internally
+    /// on the backoff.
+    pub async fn next(&mut self) -> Option<Result<ChangeOp, RtDbError>> {
+        loop {
+            if self.terminal || self.stopped.load(Ordering::Relaxed) {
+                return None;
+            }
+            if let Some(err) = self.terminal_err.take() {
+                self.terminal = true;
+                return Some(Err(err));
+            }
+            if let Some(op) = self.pending.pop_front() {
+                self.cursor = op.seq;
+                return Some(Ok(op));
+            }
+            match self
+                .client
+                .changes(self.cursor, self.table.as_deref(), self.limit)
+                .await
+            {
+                Ok(page) => {
+                    self.attempt = 0;
+                    match &self.log_id {
+                        None => self.log_id = Some(page.log_id.clone()),
+                        Some(seen) if *seen != page.log_id => {
+                            self.terminal_err = Some(RtDbError::internal(format!(
+                                "change feed logId changed ({seen} -> {}): the database was dropped and recreated; resync from since 0",
+                                page.log_id
+                            )));
+                            continue;
+                        }
+                        Some(_) => {}
+                    }
+                    if page.ops.is_empty() {
+                        if !self.sleep(self.opts.poll_interval).await {
+                            return None;
+                        }
+                    } else {
+                        self.pending.extend(page.ops);
+                    }
+                }
+                Err(e) if e.code == ErrorCode::CursorExpired => {
+                    self.terminal_err = Some(e);
+                }
+                Err(_) => {
+                    self.attempt += 1;
+                    let delay =
+                        backoff_delay(self.opts.backoff_base, self.opts.backoff_max, self.attempt);
+                    if !self.sleep(delay).await {
+                        return None;
+                    }
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// Waits `d`, returning `false` if woken early by [`stop`](Self::stop).
+    async fn sleep(&self, d: Duration) -> bool {
+        tokio::select! {
+            _ = tokio::time::sleep(d) => true,
+            _ = self.notify.notified() => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1534,6 +1727,190 @@ mod tests {
         let server = MockServer::start().await;
         let client = RtDbHttpClient::new(server.uri().as_str(), "t<uuid>", "machine-token");
         (server, client)
+    }
+
+    fn change_op(seq: i64) -> Value {
+        json!({
+            "seq": seq,
+            "table": "notes",
+            "docId": format!("d{seq}"),
+            "kind": "insert",
+            "doc": {"_id": format!("d{seq}")},
+            "ts": 1_700_000_000_000i64 + seq,
+        })
+    }
+
+    fn feed_page(seqs: &[i64], log: &str) -> Value {
+        let last = seqs.last().copied().unwrap_or(0);
+        json!({
+            "ops": seqs.iter().map(|&s| change_op(s)).collect::<Vec<_>>(),
+            "nextSeq": last,
+            "head": last,
+            "logId": log,
+        })
+    }
+
+    fn stream_opts() -> ChangeFeedStreamOptions {
+        ChangeFeedStreamOptions {
+            poll_interval: Duration::from_millis(1),
+            backoff_base: Duration::from_millis(1),
+            backoff_max: Duration::from_millis(2),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_changes_yields_ops_and_advances_the_cursor() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(query_param("since", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(feed_page(&[1, 2], "log-1")))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(query_param("since", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(feed_page(&[3], "log-1")))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let mut stream = client.stream_changes(0, None, None, stream_opts());
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let op = tokio::time::timeout(Duration::from_millis(500), stream.next())
+                .await
+                .expect("stream stalled")
+                .expect("stream ended early")
+                .expect("stream errored");
+            got.push(op.seq);
+        }
+        assert_eq!(got, vec![1, 2, 3]);
+        assert_eq!(stream.cursor(), 3);
+    }
+
+    #[tokio::test]
+    async fn stream_changes_resumes_after_a_failed_poll() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(query_param("since", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(feed_page(&[1], "log-1")))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_json(json!({"code": "INTERNAL", "message": "blip"})),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(query_param("since", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(feed_page(&[2], "log-1")))
+            .mount(&server)
+            .await;
+
+        let mut stream = client.stream_changes(0, None, None, stream_opts());
+        let first = tokio::time::timeout(Duration::from_millis(500), stream.next())
+            .await
+            .expect("stream stalled")
+            .expect("stream ended early")
+            .expect("stream errored");
+        assert_eq!(first.seq, 1);
+        let second = tokio::time::timeout(Duration::from_millis(500), stream.next())
+            .await
+            .expect("stream stalled")
+            .expect("stream ended early")
+            .expect("stream errored");
+        assert_eq!(second.seq, 2);
+        assert_eq!(stream.cursor(), 2);
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn stream_changes_cursor_expired_is_terminal() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(410)
+                    .set_body_json(json!({"code": "CURSOR_EXPIRED", "message": "cursor too old"})),
+            )
+            .mount(&server)
+            .await;
+
+        let mut stream = client.stream_changes(0, None, None, stream_opts());
+        let err = tokio::time::timeout(Duration::from_millis(500), stream.next())
+            .await
+            .expect("stream stalled")
+            .expect("stream should surface the terminal error")
+            .expect_err("expected CursorExpired");
+        assert!(matches!(err.code, ErrorCode::CursorExpired));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), stream.next())
+                .await
+                .expect("stream stalled")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_changes_log_id_change_is_terminal() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(query_param("since", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(feed_page(&[1], "log-a")))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(feed_page(&[2], "log-b")))
+            .mount(&server)
+            .await;
+
+        let mut stream = client.stream_changes(0, None, None, stream_opts());
+        let first = tokio::time::timeout(Duration::from_millis(500), stream.next())
+            .await
+            .expect("stream stalled")
+            .expect("stream ended early")
+            .expect("stream errored");
+        assert_eq!(first.seq, 1);
+        let err = tokio::time::timeout(Duration::from_millis(500), stream.next())
+            .await
+            .expect("stream stalled")
+            .expect("stream should surface the terminal error")
+            .expect_err("expected logId-change error");
+        assert!(err.message.contains("logId changed"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), stream.next())
+                .await
+                .expect("stream stalled")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_changes_stop_ends_a_caught_up_stream() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(feed_page(&[], "log-1")))
+            .mount(&server)
+            .await;
+
+        let mut stream = client.stream_changes(0, None, None, stream_opts());
+        // Caught up: the poll loop is sleeping in poll_interval, not spinning.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), stream.next())
+                .await
+                .is_err()
+        );
+        stream.stop();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), stream.next())
+                .await
+                .expect("stop did not wake the poll wait")
+                .is_none()
+        );
     }
 
     #[tokio::test]

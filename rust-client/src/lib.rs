@@ -94,7 +94,8 @@ pub use wire::{
 
 #[cfg(feature = "http")]
 pub use http::{
-    FileMetadata, Fit, OutFormat, RtDbHttpClient, SignedUrl, TransformOpts, UploadResult,
+    ChangeFeedStream, ChangeFeedStreamOptions, FileMetadata, Fit, OutFormat, RtDbHttpClient,
+    SignedUrl, TransformOpts, UploadResult,
 };
 
 #[cfg(feature = "admin")]

@@ -1,3 +1,5 @@
+import type { EnrollResult } from "./admin.js";
+import { ChangeFeedStream, type StreamChangesOptions } from "./change-feed.js";
 import { RtDbError } from "./errors.js";
 import { parseStepResults, type StepResult } from "./mutation.js";
 import type {
@@ -8,14 +10,13 @@ import type {
   QueryJson,
   ScheduleInfo,
   ScheduleWhen,
+  TransactionJson,
   WorkflowInfo,
   WorkflowSpec,
   WorkflowStatus,
-  TransactionJson,
 } from "./protocol.js";
 import { PROTOCOL_VERSION } from "./protocol.js";
 import type { RtQuery } from "./query.js";
-import type { EnrollResult } from "./admin.js";
 
 /**
  * Shared no-auth redemption request for both the HTTP client's `enroll` and the
@@ -405,6 +406,22 @@ export class RtDbHttpClient {
     const query = params.toString();
     const path = `/api/db/${encodeURIComponent(this.db)}/changes${query ? `?${query}` : ""}`;
     return (await this.get(path, this.token)) as ChangeFeedResponse;
+  }
+
+  /**
+   * Opens an auto-resuming iterator over the change feed (machine tokens
+   * only). Yields each committed op one by one, advancing the resume cursor
+   * ({@link ChangeFeedStream.cursor}) to the last yielded op's `seq`; a
+   * failed poll retries from that cursor on a jittered exponential backoff,
+   * and an empty page waits `pollIntervalMs` before polling again. `since`
+   * (default 0) is the starting cursor — pass the value persisted by a
+   * previous run to resume after a restart. Stop by breaking out of the
+   * `for await`, aborting `signal`, or calling `.stop()`; `CURSOR_EXPIRED`
+   * and a mid-stream `logId` change are terminal, mirroring
+   * `rtdb changes --follow`.
+   */
+  streamChanges(opts?: StreamChangesOptions): ChangeFeedStream {
+    return new ChangeFeedStream((since) => this.listChanges({ ...opts, since }), opts);
   }
 
   /**

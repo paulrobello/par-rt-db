@@ -9,7 +9,9 @@ repository = "https://github.com/paulrobello/par-rt-db"
 
 [features]
 default = ["http"]
-http = ["dep:reqwest"]
+# `tokio` backs `ChangeFeedStream`'s interruptible poll/backoff sleeps
+# (time + sync only — the library never names `tokio::net`, see `ws.rs`).
+http = ["dep:reqwest", "dep:tokio"]
 # `futures-util` is needed by `http` (streaming upload) as well as `ws`.
 ws = ["dep:tokio", "dep:tokio-tungstenite"]
 admin = ["http"]
