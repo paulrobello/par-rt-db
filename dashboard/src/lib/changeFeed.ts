@@ -1,29 +1,7 @@
-import type { ChangeFeedResponse, ChangeOp } from "@par-rt-db/client";
-import { RtDbError } from "@par-rt-db/client";
+import type { ChangeFeedResponse, ChangeOp, RtDbAdminClient } from "@par-rt-db/client";
 
 export const HISTORY_SCAN_LIMIT = 5000;
 const PAGE_SIZE = 500;
-
-export async function fetchChangePage(
-  db: string,
-  table: string,
-  token: string,
-  since: number,
-  signal: AbortSignal,
-): Promise<ChangeFeedResponse> {
-  const params = new URLSearchParams({ table, since: String(since), limit: String(PAGE_SIZE) });
-  const response = await fetch(`/api/db/${encodeURIComponent(db)}/changes?${params}`, {
-    headers: { Authorization: `Bearer ${token}` },
-    credentials: "omit",
-    signal,
-  });
-  const body: unknown = await response.json();
-  if (!response.ok) {
-    if (RtDbError.isEnvelope(body)) throw RtDbError.fromEnvelope(body, response.status);
-    throw new Error(`Change feed request failed (HTTP ${response.status})`);
-  }
-  return body as ChangeFeedResponse;
-}
 
 export interface DocumentHistory {
   entries: ChangeOp[];
@@ -32,10 +10,10 @@ export interface DocumentHistory {
 }
 
 export async function loadDocumentHistory(
+  client: RtDbAdminClient,
   db: string,
   table: string,
   id: string,
-  token: string,
   signal: AbortSignal,
 ): Promise<DocumentHistory> {
   const entries: ChangeOp[] = [];
@@ -44,7 +22,12 @@ export async function loadDocumentHistory(
   let logId: string | undefined;
   let snapshotHead: number | undefined;
   for (let pageNumber = 0; pageNumber < HISTORY_SCAN_LIMIT / PAGE_SIZE; pageNumber++) {
-    const page = await fetchChangePage(db, table, token, since, signal);
+    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+    const page: ChangeFeedResponse = await client.adminChanges(db, {
+      since,
+      table,
+      limit: PAGE_SIZE,
+    });
     if (logId !== undefined && logId !== page.logId) {
       throw new Error("The database was recreated during the scan. Load history again.");
     }

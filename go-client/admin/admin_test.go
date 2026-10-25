@@ -543,3 +543,59 @@ func TestPatchConfigCarriesRateLimitCeilings(t *testing.T) {
 		t.Fatalf("got hot %+v", cfg.Hot)
 	}
 }
+
+func TestAdminChanges(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/admin/db/app/changes" {
+			t.Errorf("got %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer "+testAdminKey {
+			t.Errorf("got Authorization %q", r.Header.Get("Authorization"))
+		}
+		got := r.URL.Query()
+		want := url.Values{"since": {"40"}, "table": {"items"}, "limit": {"2"}}
+		for k, v := range want {
+			if got.Get(k) != v[0] {
+				t.Errorf("query %s: got %q want %q", k, got.Get(k), v[0])
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ops":[{"seq":41,"table":"items","docId":"d41","kind":"patch","doc":{"title":"x"},"ts":10},` +
+			`{"seq":42,"table":"items","docId":"d42","kind":"delete","doc":null,"ts":11}],` +
+			`"nextSeq":42,"head":57,"logId":"0a1b2c3d4e5f6071"}`))
+	}))
+	defer srv.Close()
+	client := NewAdminClient(srv.URL, testAdminKey)
+	resp, err := client.AdminChanges(context.Background(), "app", 40, ptrStr("items"), ptrI64(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.NextSeq != 42 || resp.Head != 57 || resp.LogID != "0a1b2c3d4e5f6071" || len(resp.Ops) != 2 {
+		t.Fatalf("resp %+v", resp)
+	}
+	if resp.Ops[0].Kind != wire.ChangeKindPatch || resp.Ops[0].DocID != "d41" {
+		t.Fatalf("op0 %+v", resp.Ops[0])
+	}
+	if doc, ok := resp.Ops[0].Doc.(wire.Object); !ok || doc["title"] != wire.String("x") {
+		t.Fatalf("op0 doc %#v", resp.Ops[0].Doc)
+	}
+	if _, ok := resp.Ops[1].Doc.(wire.Null); !ok || resp.Ops[1].Kind != wire.ChangeKindDelete {
+		t.Fatalf("op1 %+v", resp.Ops[1])
+	}
+}
+
+func TestAdminChangesOmittedOptionalParamsAndCursorExpired(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.RawQuery != "since=0" {
+			t.Errorf("query %s", r.URL.RawQuery)
+		}
+		w.WriteHeader(http.StatusGone)
+		_, _ = w.Write([]byte(`{"code":"CURSOR_EXPIRED","message":"cursor predates retention"}`))
+	}))
+	defer srv.Close()
+	client := NewAdminClient(srv.URL, testAdminKey)
+	_, err := client.AdminChanges(context.Background(), "app", 0, nil, nil)
+	if !rtdberrors.IsCode(err, rtdberrors.CodeCursorExpired) {
+		t.Fatalf("want CURSOR_EXPIRED, got %v", err)
+	}
+}

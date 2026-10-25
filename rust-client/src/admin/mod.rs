@@ -664,6 +664,55 @@ impl RtDbAdminClient {
         crate::mutation::parse_step_results(parsed.results)
     }
 
+    /// `GET /admin/db/{db}/changes?since=&table=&limit=` → one
+    /// [`ChangeFeedResponse`](crate::wire::ChangeFeedResponse) page of the
+    /// retained change feed, admin-key variant of the data-plane
+    /// [`changes`](crate::http::RtDbHttpClient::changes) route. Serves
+    /// dashboard/CLI admin consumers: unlike the machine-token data-plane route
+    /// there is no per-table allowlist filtering — the admin gate grants the
+    /// whole database. Reuses the data-plane wire type; the shapes are
+    /// identical.
+    ///
+    /// Cursor semantics mirror `changes`: `since` returns ops with seq
+    /// strictly greater (default 0); a full page sets `next_seq` to the last
+    /// op's seq, a short page to the log head, so resuming with
+    /// `next_seq` as the next `since` never re-reads. `table` restricts the
+    /// page to one table (`next_seq`/`head` stay global); `limit` is the page
+    /// size (server clamps 1..1000, default 500). An impossible cursor — older
+    /// than retention or ahead of the log — surfaces as
+    /// `ErrorCode::CursorExpired` (410 `CURSOR_EXPIRED`); an unknown database
+    /// as `ErrorCode::NotFound` (404 `NOT_FOUND`).
+    pub async fn admin_changes(
+        &self,
+        db: &str,
+        since: Option<i64>,
+        table: Option<&str>,
+        limit: Option<i64>,
+    ) -> Result<crate::wire::ChangeFeedResponse, RtDbError> {
+        let mut url = reqwest::Url::parse(&format!("{}/admin/db/", self.url))
+            .map_err(|e| RtDbError::internal(format!("invalid admin URL: {e}")))?;
+        url.path_segments_mut()
+            .map_err(|()| RtDbError::internal("invalid admin URL base"))?
+            .pop_if_empty()
+            .push(db)
+            .push("changes");
+        let mut req = self.client.get(url).authed(&self.token);
+        if let Some(since) = since {
+            req = req.query(&[("since", since.to_string())]);
+        }
+        if let Some(table) = table {
+            req = req.query(&[("table", table)]);
+        }
+        if let Some(limit) = limit {
+            req = req.query(&[("limit", limit.to_string())]);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("admin request failed: {e}")))?;
+        crate::http_common::deserialize(resp).await
+    }
+
     /// `POST /admin/backup` (empty body) → 202 `{ok:true}`. Triggers one
     /// `pg_dump` immediately; the dump runs detached and the in-progress flag
     /// is observable via [`list_backups`](Self::list_backups). A second call

@@ -21,6 +21,7 @@ use crate::error::RtDbError;
 use crate::{AppState, auth};
 
 mod backups;
+mod changes;
 mod dbs;
 mod docs;
 mod login;
@@ -40,6 +41,7 @@ mod workflows;
 // without editing the route table — every route stays byte-identical to the
 // pre-split file. DTOs stay private to their own submodule.
 use backups::*;
+use changes::*;
 use dbs::*;
 use docs::*;
 use login::*;
@@ -359,6 +361,9 @@ pub fn admin_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/admin/dbs/{db}/stats", get(db_stats))
         .route("/admin/db/{db}/query", post(admin_query))
         .route("/admin/db/{db}/mutate", post(admin_mutate))
+        // The retained change feed under the admin gate — the dashboard reads
+        // document history through its cookie session, no machine token.
+        .route("/admin/db/{db}/changes", get(admin_changes))
         .route("/admin/db/{db}/migrate", post(admin_migrate))
         .route("/admin/db/{db}/schema/restore", post(restore_schema))
         .route(

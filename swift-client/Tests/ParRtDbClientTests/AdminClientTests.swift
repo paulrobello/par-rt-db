@@ -365,6 +365,86 @@ struct AdminClientTests {
         #expect(stats.subsUsed == 3)
     }
 
+    // MARK: admin change feed
+
+    @Test func adminChangesEncodesRouteQueryAndDecodesFeed() async throws {
+        StubProtocol.handler = { request in
+            try adminAuth(request)
+            try demand(request.httpMethod == "GET", "expected GET")
+            try demand(
+                request.url?.path == "/admin/db/app/changes",
+                "expected /admin/db/app/changes, got \(request.url?.path ?? "nil")"
+            )
+            try demand(
+                request.url?.query == "since=5&table=users&limit=10",
+                "query mismatch: \(request.url?.query ?? "nil")"
+            )
+            let body = """
+            {"ops":[{"seq":6,"table":"users","docId":"d1","kind":"insert","doc":{"a":1},"ts":9}],
+             "nextSeq":6,"head":8,"logId":"log-1"}
+            """
+            return (200, Data(body.utf8))
+        }
+        let page = try await makeAdminClient()
+            .adminChanges("app", since: 5, table: "users", limit: 10)
+        #expect(page.ops.count == 1)
+        #expect(page.ops[0] == ChangeOp(
+            seq: 6, table: "users", docId: "d1", kind: "insert", doc: .object(["a": .int(1)]), ts: 9
+        ))
+        #expect(page.nextSeq == 6)
+        #expect(page.head == 8)
+        #expect(page.logId == "log-1")
+    }
+
+    @Test func adminChangesDefaultsOmitOptionalParams() async throws {
+        StubProtocol.handler = { request in
+            try adminAuth(request)
+            try demand(
+                request.url?.path == "/admin/db/app/changes",
+                "expected /admin/db/app/changes, got \(request.url?.path ?? "nil")"
+            )
+            try demand(
+                request.url?.query == "since=0",
+                "query mismatch: \(request.url?.query ?? "nil")"
+            )
+            return (200, Data(#"{"ops":[],"nextSeq":0,"head":0,"logId":"log-1"}"#.utf8))
+        }
+        let page = try await makeAdminClient().adminChanges("app")
+        #expect(page.ops.isEmpty)
+        #expect(page.nextSeq == 0)
+        #expect(page.head == 0)
+    }
+
+    @Test func adminChangesPercentEncodesDb() async throws {
+        StubProtocol.handler = { request in
+            try adminAuth(request)
+            try demand(
+                request.url?.absoluteString.hasPrefix(
+                    "http://rtdb.test/admin/db/a%20db/changes?since=0"
+                ) == true,
+                "encoded path mismatch: \(request.url?.absoluteString ?? "nil")"
+            )
+            return (200, Data(#"{"ops":[],"nextSeq":0,"head":0,"logId":"log-1"}"#.utf8))
+        }
+        _ = try await makeAdminClient().adminChanges("a db")
+    }
+
+    @Test func adminChangesSurfacesCursorExpired() async throws {
+        StubProtocol.handler = { request in
+            try adminAuth(request)
+            return (
+                410,
+                Data(#"{"code":"CURSOR_EXPIRED","message":"cursor predates retention"}"#.utf8)
+            )
+        }
+        do {
+            _ = try await makeAdminClient().adminChanges("app", since: 3)
+            Issue.record("adminChanges should throw on a 410 envelope")
+        } catch let error as RtDbError {
+            #expect(error.code == .cursorExpired)
+        }
+    }
+
     // MARK: tokens / allowlist / admins
 
     @Test func mintTokenWithOptionsPostsCapabilities() async throws {

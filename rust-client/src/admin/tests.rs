@@ -935,6 +935,97 @@ async fn ops_recent_returns_events_and_query_params() {
     assert_eq!(ops[1].owner, Some("u1".to_string()));
 }
 
+#[tokio::test]
+async fn admin_changes_encodes_path_and_query_and_returns_change_feed() {
+    let (server, client) = setup().await;
+    let response = json!({
+        "ops": [{
+            "seq": 43, "table": "notes & drafts/☃", "docId": "n1",
+            "kind": "patch", "doc": {"_id": "n1", "body": "updated"}, "ts": 1000
+        }],
+        "nextSeq": 45, "head": 45, "logId": "log-1"
+    });
+    Mock::given(method("GET"))
+        .and(path("/admin/db/db%20%2F%3F%23%25/changes"))
+        .and(query_param("since", "42"))
+        .and(query_param("table", "notes & drafts/☃"))
+        .and(query_param("limit", "123"))
+        .and(header("authorization", BEARER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let got: crate::wire::ChangeFeedResponse = client
+        .admin_changes("db /?#%", Some(42), Some("notes & drafts/☃"), Some(123))
+        .await
+        .unwrap();
+    let expected: crate::wire::ChangeFeedResponse = serde_json::from_value(response).unwrap();
+    assert_eq!(got, expected);
+}
+
+#[tokio::test]
+async fn admin_changes_omits_unset_query_params() {
+    let (server, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/admin/db/kanban/changes"))
+        .and(header("authorization", BEARER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ops": [], "nextSeq": 0, "head": 0, "logId": "log-1"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let got = client
+        .admin_changes("kanban", None, None, None)
+        .await
+        .unwrap();
+    assert!(got.ops.is_empty());
+    assert_eq!(got.next_seq, 0);
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests[0].url.query().is_none());
+}
+
+#[tokio::test]
+async fn admin_changes_surfaces_cursor_expired_envelope() {
+    let (server, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/admin/db/kanban/changes"))
+        .and(header("authorization", BEARER))
+        .and(query_param("since", "999"))
+        .respond_with(ResponseTemplate::new(410).set_body_json(json!({
+            "code": "CURSOR_EXPIRED", "message": "cursor is ahead of the log"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let err = client
+        .admin_changes("kanban", Some(999), None, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::CursorExpired);
+    assert_eq!(err.message, "cursor is ahead of the log");
+}
+
+#[tokio::test]
+async fn admin_changes_surfaces_unknown_database_envelope() {
+    let (server, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/admin/db/missing/changes"))
+        .and(header("authorization", BEARER))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "code": "NOT_FOUND", "message": "database not found"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let err = client
+        .admin_changes("missing", None, None, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotFound);
+    assert_eq!(err.message, "database not found");
+}
+
 // Owner-bypass document endpoints (`POST /admin/db/{db}/query|mutate`).
 // Unlike the non-admin `run`/`mutate`, `db` rides in the path (singular
 // `db`, not the plural `dbs` used by `get_schema`/`db_stats`), so the body

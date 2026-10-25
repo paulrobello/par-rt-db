@@ -83,6 +83,34 @@ func (c *AdminClient) OpsRecent(ctx context.Context, db string, table *string, n
 	return resp.Ops, nil
 }
 
+// AdminChanges: GET /admin/db/{db}/changes?since=&table=&limit= → the
+// retained durable change feed under the admin control plane, decoded into
+// the shared wire.ChangeFeedResponse. Unlike the data-plane
+// /api/db/{db}/changes (machine-token only, filtered by the token's table
+// allowlist), this route serves dashboard/CLI admin consumers: the admin
+// gate grants the whole database, with no per-table allowlist filtering.
+// Ops returned are strictly after since (0 = everything retained); table
+// restricts the page to one table while nextSeq/head stay global; limit 0
+// takes the server default (500, clamped 1..1000). Resume by passing the
+// previous NextSeq as since: a full page ends at NextSeq = last op seq, a
+// short page at NextSeq = head. A cursor older than retention or ahead of
+// the log surfaces CURSOR_EXPIRED (410); an unknown database is NOT_FOUND
+// (404).
+func (c *AdminClient) AdminChanges(ctx context.Context, db string, since int64, table *string, limit *int64) (*wire.ChangeFeedResponse, error) {
+	q := url.Values{"since": {fmt.Sprintf("%d", since)}}
+	if table != nil {
+		q.Set("table", *table)
+	}
+	if limit != nil {
+		q.Set("limit", fmt.Sprintf("%d", *limit))
+	}
+	var out wire.ChangeFeedResponse
+	if err := c.get(ctx, fmt.Sprintf("/admin/db/%s/changes", db), q, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // AdminQuery: POST /admin/db/{db}/query {query, includeDeleted?} → the
 // dynamic result. Owner-bypass: reads across every ownerField rule.
 // includeDeleted true surfaces soft-deleted rows; nil omits the key so the

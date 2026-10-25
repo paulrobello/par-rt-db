@@ -84,7 +84,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from pydantic import BaseModel, ValidationError
 
@@ -127,6 +127,7 @@ from .query import Query, TableQuery, _terminal_of, parse_result
 from .schema import SchemaDef
 from .wire import (
     PROTOCOL_VERSION,
+    ChangeFeedResponse,
     ScheduleInfo,
     ScheduleWhen,
     WorkflowInfo,
@@ -501,6 +502,29 @@ def _op_admin_mutate(
     if idempotency_key is not None:
         body["idempotencyKey"] = idempotency_key
     return _AdminRequest("POST", f"/admin/db/{db}/mutate", {"json": body}, _parse_step_results)
+
+
+def _op_admin_changes(
+    db: str,
+    since: int = 0,
+    *,
+    table: str | None = None,
+    limit: int | None = None,
+) -> _AdminRequest:
+    # ``since``/``limit`` default server-side (0 and 500); omitted keys are not
+    # sent so the defaults apply. httpx percent-encodes the query params; the
+    # path segment is encoded explicitly.
+    params: dict[str, Any] = {"since": since}
+    if table is not None:
+        params["table"] = table
+    if limit is not None:
+        params["limit"] = limit
+    return _AdminRequest(
+        "GET",
+        f"/admin/db/{quote(db, safe='')}/changes",
+        {"params": params},
+        _parse_model(ChangeFeedResponse),
+    )
 
 
 def _op_backup_now() -> _AdminRequest:
@@ -1585,6 +1609,36 @@ class RtDbAdminClient:
         """
         return self._executor.run(_op_admin_mutate(db, txn, idempotency_key=idempotency_key))
 
+    def admin_changes(
+        self,
+        db: str,
+        since: int = 0,
+        *,
+        table: str | None = None,
+        limit: int | None = None,
+    ) -> ChangeFeedResponse:
+        """``GET /admin/db/{db}/changes?since=&table=&limit=`` → one page of
+        the retained change feed (admin-authenticated).
+
+        Same log and cursor semantics as :meth:`RtDbHttpClient.changes`: ops
+        with ``seq > since``, oldest first; a full page returns
+        ``next_seq`` = last op's seq, a short page means the log is
+        exhausted and ``next_seq == head`` — resume by passing ``next_seq``
+        as the next ``since`` and loop while ``next_seq < head``.
+        ``table`` restricts the page to one table (``next_seq``/``head``
+        stay global); ``limit`` defaults to 500 server-side, clamped to
+        1000. Unlike the machine-token data-plane route this serves
+        dashboard/CLI admin consumers, and there is no per-table allowlist
+        filtering — the admin gate grants the whole database.
+
+        Raises:
+            RtDbError: ``CURSOR_EXPIRED`` (410) when ``since`` predates the
+                retained log or is ahead of ``head`` (the database was
+                replaced or rewound); 404 ``NOT_FOUND`` for an unknown
+                database.
+        """
+        return self._executor.run(_op_admin_changes(db, since, table=table, limit=limit))
+
     # --- managed backups ---
 
     def backup_now(self) -> None:
@@ -2429,6 +2483,23 @@ class AsyncRtDbAdminClient:
         See :meth:`RtDbAdminClient.admin_mutate` for owner-bypass semantics.
         """
         return await self._executor.run(_op_admin_mutate(db, txn, idempotency_key=idempotency_key))
+
+    async def admin_changes(
+        self,
+        db: str,
+        since: int = 0,
+        *,
+        table: str | None = None,
+        limit: int | None = None,
+    ) -> ChangeFeedResponse:
+        """``GET /admin/db/{db}/changes?since=&table=&limit=`` → one page of
+        the retained change feed (async, admin-authenticated).
+
+        See :meth:`RtDbAdminClient.admin_changes` for cursor semantics,
+        whole-database access, and the ``CURSOR_EXPIRED`` (410) and
+        ``NOT_FOUND`` (404) errors.
+        """
+        return await self._executor.run(_op_admin_changes(db, since, table=table, limit=limit))
 
     # --- managed backups ---
 

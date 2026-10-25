@@ -2,6 +2,7 @@ import type { WebSocketLike } from "./client.js";
 import { RtDbError } from "./errors.js";
 import { enrollRequest, type FileMetadata, type SignedUrl, type TransformOpts } from "./http.js";
 import type {
+  ChangeFeedResponse,
   MigrateRequestJson,
   MigrateResultJson,
   QueryJson,
@@ -1320,6 +1321,33 @@ export class RtDbAdminClient {
       version,
       confirm,
     })) as { ok: boolean; restoredTo: number };
+  }
+
+  /** Retained change-feed page under the admin control plane
+   *  (GET /admin/db/{db}/changes). Same wire shape (`ChangeFeedResponse`) and
+   *  cursor semantics as the data-plane `listChanges`, but served under /admin
+   *  for dashboard/CLI admin consumers: the admin credential gates the whole
+   *  database — there is no per-table allowlist filtering. `since` returns ops
+   *  with `seq > since` (default 0); `table` restricts the page to one table
+   *  (`nextSeq`/`head` stay global); `limit` is the page size (server default
+   *  500, clamped to 1000). A full page returns `nextSeq` = the last op's
+   *  `seq`; a short page returns `nextSeq` = `head` — resume by passing
+   *  `nextSeq` as the next `since`. An impossible cursor (older than
+   *  retention or ahead of the log) rejects with `CURSOR_EXPIRED` (410); an
+   *  unknown db rejects with 404 `NOT_FOUND`. */
+  async adminChanges(
+    db: string,
+    opts?: { since?: number; table?: string; limit?: number },
+  ): Promise<ChangeFeedResponse> {
+    const params = new URLSearchParams();
+    if (opts?.since !== undefined) params.set("since", String(opts.since));
+    if (opts?.table !== undefined) params.set("table", opts.table);
+    if (opts?.limit !== undefined) params.set("limit", String(opts.limit));
+    const qs = params.toString();
+    return (await this.request(
+      "GET",
+      `/admin/db/${encodeURIComponent(db)}/changes${qs ? `?${qs}` : ""}`,
+    )) as ChangeFeedResponse;
   }
 
   /** Trigger one pg_dump now (POST /admin/backup, 202 Accepted). Runs async server-side;

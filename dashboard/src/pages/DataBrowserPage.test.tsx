@@ -1,10 +1,15 @@
-import type { ChangeOp } from "@par-rt-db/client";
+import type { ChangeOp, RtDbAdminClient } from "@par-rt-db/client";
+import { RtDbError } from "@par-rt-db/client";
 import { cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const mocks = vi.hoisted(() => ({ getSchema: vi.fn(), adminMutate: vi.fn() }));
+const mocks = vi.hoisted(() => ({
+  getSchema: vi.fn(),
+  adminMutate: vi.fn(),
+  adminChanges: vi.fn(),
+}));
 vi.mock("../lib/admin", () => ({ useAdmin: () => ({ client: mocks }) }));
 vi.mock("../lib/useLiveTable", () => ({
   useLiveTable: () => ({
@@ -19,12 +24,15 @@ vi.mock("../lib/useLiveTable", () => ({
 import { diffDocuments, loadDocumentHistory } from "../lib/changeFeed";
 import { DataBrowserPage } from "./DataBrowserPage";
 
-const fetchMock = vi.fn();
 function op(seq: number, doc: Record<string, unknown> | null, docId = "d1"): ChangeOp {
   return { seq, table: "docs", docId, kind: "patch", doc, ts: 1758300000000 + seq };
 }
-function page(ops: ChangeOp[], nextSeq = 100, head = 100): Response {
-  return new Response(JSON.stringify({ ops, nextSeq, head, logId: "log1" }), { status: 200 });
+function feed(
+  ops: ChangeOp[],
+  nextSeq = 100,
+  head = 100,
+): ReturnType<RtDbAdminClient["adminChanges"]> {
+  return Promise.resolve({ ops, nextSeq, head, logId: "log1" });
 }
 function mount(): void {
   render(
@@ -38,8 +46,6 @@ function mount(): void {
 async function openHistory(): Promise<ReturnType<typeof userEvent.setup>> {
   const user = userEvent.setup();
   await user.click(screen.getByRole("button", { name: "History" }));
-  await user.type(screen.getByLabelText("Machine token"), "existing-token");
-  await user.click(screen.getByRole("button", { name: "Load history" }));
   await screen.findByLabelText("Version history");
   return user;
 }
@@ -51,17 +57,21 @@ const versions = [
 beforeEach(() => {
   mocks.getSchema.mockReset().mockResolvedValue({ tables: {} });
   mocks.adminMutate.mockReset().mockResolvedValue([]);
-  fetchMock.mockReset().mockImplementation(async () => page(versions));
-  vi.stubGlobal("fetch", fetchMock);
+  mocks.adminChanges.mockReset().mockImplementation((_db: string, opts: { since: number }) =>
+    feed(
+      versions.filter((v) => v.seq > opts.since).map((v) => ({ ...v })),
+      100,
+      100,
+    ),
+  );
 });
-afterEach(() => {
-  cleanup();
-  vi.unstubAllGlobals();
-});
+afterEach(cleanup);
 
 describe("document history", () => {
   it("lists three patch post-images in sequence order, filtering other documents", async () => {
-    fetchMock.mockResolvedValueOnce(page([...versions, op(4, { name: "other" }, "other")]));
+    mocks.adminChanges.mockImplementation((_db: string, opts: { since: number }) =>
+      feed([...versions, op(4, { name: "other" }, "other")].filter((v) => v.seq > opts.since)),
+    );
     mount();
     await openHistory();
     const list = screen.getByLabelText("Version history");
@@ -73,12 +83,9 @@ describe("document history", () => {
     for (const name of ["first", "second", "third"]) {
       expect(within(list).getByText(new RegExp(`"name": "${name}"`))).toBeInTheDocument();
     }
-    expect(fetchMock).toHaveBeenCalledWith(
-      expect.stringContaining("since=0"),
-      expect.objectContaining({
-        headers: { Authorization: "Bearer existing-token" },
-        credentials: "omit",
-      }),
+    expect(mocks.adminChanges).toHaveBeenCalledWith(
+      "test-db",
+      expect.objectContaining({ since: 0, table: "docs", limit: 500 }),
     );
     expect(localStorage.length).toBe(0);
   });
@@ -108,40 +115,44 @@ describe("document history", () => {
     await screen.findByRole("status");
   });
   it("caps scanning at ten pages and shows the bound/retention disclosure", async () => {
-    fetchMock.mockImplementation(async (url: string) => {
-      const since = Number(new URL(url, "http://local").searchParams.get("since"));
+    mocks.adminChanges.mockImplementation((_db: string, opts: { since: number }) => {
+      const since = opts.since;
       const ops = Array.from({ length: 500 }, (_, i) => op(since + i + 1, { value: i }, "other"));
-      return page(ops, since + 500, 6000);
+      return feed(ops, since + 500, 6000);
     });
     mount();
     await openHistory();
     expect(await screen.findByText(/Scan stopped after 5000 ops/)).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledTimes(10);
+    expect(mocks.adminChanges).toHaveBeenCalledTimes(10);
   });
   it("surfaces expired retention without inventing versions", async () => {
-    fetchMock.mockResolvedValueOnce(
-      new Response(
-        JSON.stringify({ code: "CURSOR_EXPIRED", message: "cursor predates retention" }),
-        { status: 410 },
-      ),
+    mocks.adminChanges.mockRejectedValueOnce(
+      RtDbError.fromEnvelope({ code: "CURSOR_EXPIRED", message: "cursor predates retention" }, 410),
     );
     mount();
-    const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "History" }));
-    await user.type(screen.getByLabelText("Machine token"), "token");
-    await user.click(screen.getByRole("button", { name: "Load history" }));
+    await userEvent.setup().click(screen.getByRole("button", { name: "History" }));
     expect(await screen.findByText(/No missing versions have been inferred/)).toBeInTheDocument();
     expect(screen.queryByLabelText("Version history")).not.toBeInTheDocument();
   });
   it("pages forward and rejects a changed log identity", async () => {
-    fetchMock.mockResolvedValueOnce(page([op(1, { a: 1 })], 1, 2));
-    fetchMock.mockResolvedValueOnce(
-      new Response(JSON.stringify({ ops: [], nextSeq: 2, head: 2, logId: "different" })),
-    );
+    const client = {
+      adminChanges: vi
+        .fn()
+        .mockImplementationOnce(() => feed([op(1, { a: 1 })], 1, 2))
+        .mockImplementationOnce(() =>
+          Promise.resolve({ ops: [], nextSeq: 2, head: 2, logId: "different" }),
+        ),
+    };
     await expect(
-      loadDocumentHistory("db", "docs", "d1", "token", new AbortController().signal),
+      loadDocumentHistory(
+        client as unknown as RtDbAdminClient,
+        "db",
+        "docs",
+        "d1",
+        new AbortController().signal,
+      ),
     ).rejects.toThrow("recreated");
-    expect(fetchMock.mock.calls[1][0]).toContain("since=1");
+    expect(client.adminChanges.mock.calls[1][1]).toEqual(expect.objectContaining({ since: 1 }));
   });
   it("compares keys and arrays structurally", () => {
     expect(

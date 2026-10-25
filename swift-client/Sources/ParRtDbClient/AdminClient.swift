@@ -200,6 +200,40 @@ public actor RtDbAdminClient {
         try await getJson("db stats", "/admin/dbs/\(encodePath(db))/stats")
     }
 
+    // MARK: Change feed
+
+    /// `GET /admin/db/{db}/changes?since=&table=&limit=` → one
+    /// `ChangeFeedResponse` page of the retained change feed — the admin-key
+    /// variant of the data-plane `RtDbHttpClient.changes` route. Serves
+    /// dashboard/CLI admin consumers: unlike the machine-token data-plane
+    /// route there is no per-table allowlist filtering — the admin gate
+    /// grants the whole database. Reuses the data-plane wire type; the shapes
+    /// are identical.
+    ///
+    /// Cursor semantics mirror `changes`: `since` returns ops with `seq`
+    /// strictly greater (default 0); a full page sets `nextSeq` to the last
+    /// op's `seq`, a short page to the log `head`, so resuming with
+    /// `nextSeq` as the next `since` never re-reads. `table` restricts the
+    /// page to one table (`nextSeq`/`head` stay global); `limit` is the page
+    /// size (server default 500, clamped 1..1000). An impossible cursor —
+    /// older than retention or ahead of the log — surfaces as
+    /// `ErrorCode.cursorExpired` (410); an unknown database as
+    /// `ErrorCode.notFound` (404).
+    public func adminChanges(
+        _ db: String, since: Int64 = 0, table: String? = nil, limit: Int? = nil
+    ) async throws -> ChangeFeedResponse {
+        var query = [URLQueryItem(name: "since", value: String(since))]
+        if let table {
+            query.append(URLQueryItem(name: "table", value: table))
+        }
+        if let limit {
+            query.append(URLQueryItem(name: "limit", value: String(limit)))
+        }
+        return try await getJson(
+            "admin changes", "/admin/db/\(encodePath(db))/changes", query: query
+        )
+    }
+
     // MARK: Tokens + allowlist + admins
 
     /// `POST /admin/mint-token` `{db, name}` → `{tokenId, token}` — a

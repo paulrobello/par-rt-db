@@ -371,22 +371,27 @@ function DocumentHistoryPanel({
   onRestore: (steps: TransactionJson["steps"]) => Promise<boolean>;
   busy: boolean;
 }) {
-  const [token, setToken] = useState("");
+  const { client } = useAdmin();
   const [history, setHistory] = useState<DocumentHistory | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [restoreTarget, setRestoreTarget] = useState<{ seq: number; version: number } | null>(null);
   const [restoreMessage, setRestoreMessage] = useState<string | null>(null);
   const request = useRef<AbortController | null>(null);
-  useEffect(() => () => request.current?.abort(), []);
+  // Loads on open through the admin session; the button is a manual reload.
+  // The panel remounts per document (key includes db/table/id), so client,
+  // db, table, and id are fixed per mount — a mount-only effect is intended.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: remount-per-doc
+  useEffect(() => {
+    void load();
+    return () => {
+      request.current?.abort();
+    };
+  }, []);
   const [left, setLeft] = useState<number | null>(null);
   const [right, setRight] = useState<number | null>(null);
 
   async function load() {
-    if (!token.trim()) {
-      setError("A machine token is required to read the change feed.");
-      return;
-    }
     setLoading(true);
     setError(null);
     request.current?.abort();
@@ -397,7 +402,7 @@ function DocumentHistoryPanel({
     setRight(null);
     setRestoreTarget(null);
     try {
-      const result = await loadDocumentHistory(db, table, id, token.trim(), controller.signal);
+      const result = await loadDocumentHistory(client, db, table, id, controller.signal);
       if (!controller.signal.aborted) setHistory(result);
     } catch (e) {
       if (!controller.signal.aborted) setError(toErrorMessage(e));
@@ -436,20 +441,10 @@ function DocumentHistoryPanel({
         </button>
       </div>
       <p className={s.historyHint}>
-        Reads the durable change feed with a machine token (read-only preferred). The token is used
-        only for these reads, in memory, from this browser session — never stored. The feed keeps a
-        bounded number of rows, so older history may be trimmed.
+        Reads the durable change feed through your admin session — no machine token. The feed keeps
+        a bounded number of rows, so older history may be trimmed.
       </p>
       <div className={s.tokenRow}>
-        <input
-          className={s.input}
-          type="password"
-          placeholder="machine token"
-          value={token}
-          onChange={(e) => setToken(e.target.value)}
-          aria-label="Machine token"
-          autoComplete="off"
-        />
         <Button onClick={() => void load()} disabled={loading}>
           {loading ? "scanning…" : "Load history"}
         </Button>

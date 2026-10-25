@@ -445,3 +445,169 @@ fn cursor_expired_wire_shape() {
     assert_eq!(json["code"], serde_json::json!("CURSOR_EXPIRED"));
     assert_eq!(err.status(), reqwest::StatusCode::GONE);
 }
+
+// --- admin surface (`GET /admin/db/{db}/changes`) ---
+
+/// Logs in via POST /admin/login with the test admin key and returns the
+/// `rtdb_session` cookie value (the CSRF nonce is minted too but the changes
+/// route is a GET, which the CSRF guard never gates).
+async fn admin_session_cookie(addr: std::net::SocketAddr) -> String {
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/admin/login"))
+        .json(&serde_json::json!({ "adminKey": "test-admin-key" }))
+        .send()
+        .await
+        .expect("send admin login");
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT, "login ok");
+    let mut session = None;
+    for v in resp.headers().get_all(reqwest::header::SET_COOKIE) {
+        let s = v.to_str().expect("set-cookie str");
+        if s.starts_with("rtdb_session=") {
+            session = Some(s.split(';').next().expect("cookie pair").trim().to_string());
+        }
+    }
+    session.expect("login set rtdb_session cookie")
+}
+
+async fn get_admin_changes(
+    addr: std::net::SocketAddr,
+    db_name: &str,
+    query: &str,
+    bearer: Option<&str>,
+    cookie: Option<&str>,
+) -> reqwest::Response {
+    let mut req =
+        reqwest::Client::new().get(format!("http://{addr}/admin/db/{db_name}/changes{query}"));
+    if let Some(b) = bearer {
+        req = req.header("Authorization", format!("Bearer {b}"));
+    }
+    if let Some(c) = cookie {
+        req = req.header("Cookie", c);
+    }
+    req.send().await.expect("send admin changes request")
+}
+
+#[tokio::test]
+async fn admin_feed_allows_admin_bearer_and_cookie_and_denies_others() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let addr = spawn_app(state.clone()).await;
+    let _guard = crate::common::background_guard(&state);
+    insert_project(&state.pool, &db.0, "admin-visible").await?;
+
+    // Admin key bearer: 200 with the retained op.
+    let resp = get_admin_changes(addr, &db.0, "", Some("test-admin-key"), None).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "bearer admin reads");
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["ops"].as_array().expect("ops").len(), 1);
+    assert_eq!(body["ops"][0]["table"], serde_json::json!("projects"));
+
+    // Dashboard cookie session: 200 too — no machine token involved.
+    let session = admin_session_cookie(addr).await;
+    let resp = get_admin_changes(addr, &db.0, "", None, Some(&session)).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "cookie admin reads");
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["ops"].as_array().expect("ops").len(), 1);
+
+    // Unauthenticated: 401.
+    let resp = get_admin_changes(addr, &db.0, "", None, None).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let body: serde_json::Value = resp.json().await.expect("envelope");
+    assert_eq!(body["code"], serde_json::json!("UNAUTHORIZED"));
+
+    // Non-admin credentials stay denied: a data-plane machine token is not an
+    // admin credential (and a user session isn't either — the allowlist is
+    // empty in tests).
+    let machine = mint_machine_token(addr, &db.0, None).await;
+    let resp = get_admin_changes(addr, &db.0, "", Some(&machine), None).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+    let body: serde_json::Value = resp.json().await.expect("envelope");
+    assert_eq!(body["code"], serde_json::json!("FORBIDDEN"));
+
+    let user_session =
+        mint_user_session(&state.pool, "user-feed-admin", "feed-admin@example.com").await;
+    let resp = get_admin_changes(addr, &db.0, "", Some(&user_session), None).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_feed_cursor_and_log_identity_match_the_data_plane() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let addr = spawn_app(state.clone()).await;
+    let _guard = crate::common::background_guard(&state);
+
+    for name in ["a", "b", "c"] {
+        insert_project(&state.pool, &db.0, name).await?;
+    }
+
+    // Pagination: a full page carries last-returned nextSeq; the short tail
+    // jumps to head; logId is the same log identity on every page.
+    let resp = get_admin_changes(addr, &db.0, "?limit=2", Some("test-admin-key"), None).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["ops"].as_array().expect("ops").len(), 2);
+    assert_eq!(body["nextSeq"], serde_json::json!(2), "full page: last seq");
+    assert_eq!(body["head"], serde_json::json!(3));
+    let log_id = body["logId"].as_str().expect("logId").to_string();
+    assert!(!log_id.is_empty());
+
+    let resp = get_admin_changes(addr, &db.0, "?since=2", Some("test-admin-key"), None).await;
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["ops"].as_array().expect("ops").len(), 1);
+    assert_eq!(body["nextSeq"], serde_json::json!(3), "short page: head");
+    assert_eq!(body["logId"], serde_json::json!(log_id));
+
+    // Ahead-of-log cursor: typed CURSOR_EXPIRED (410), same as the data plane.
+    let resp = get_admin_changes(addr, &db.0, "?since=999", Some("test-admin-key"), None).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::GONE);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], serde_json::json!("CURSOR_EXPIRED"));
+
+    // Below-retention cursor: trim to the newest row; since=0 predates the
+    // window while the exact boundary (oldest-1) stays servable.
+    change_log::trim_expired(&state.pool, &db.0, 1).await?;
+    let resp = get_admin_changes(addr, &db.0, "?since=0", Some("test-admin-key"), None).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::GONE);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], serde_json::json!("CURSOR_EXPIRED"));
+    let resp = get_admin_changes(addr, &db.0, "?since=2", Some("test-admin-key"), None).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_feed_reads_seeded_tables_and_unknown_db_is_404() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let addr = spawn_app(state.clone()).await;
+    let _guard = crate::common::background_guard(&state);
+
+    // A db whose change-log tables were dropped (pre-feature db) still reads.
+    let schema = rtdb_server::ddl::pg_schema(&db.0);
+    for table in ["changes", "change_head"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE \"{schema}\".\"{table}\""
+        )))
+        .execute(&state.pool)
+        .await?;
+    }
+    let resp = get_admin_changes(addr, &db.0, "", Some("test-admin-key"), None).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "read re-seeds");
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["head"], serde_json::json!(0));
+    assert!(!body["logId"].as_str().expect("logId").is_empty());
+
+    // Unknown db: the admin convention's 404, not a 500.
+    let resp = get_admin_changes(
+        addr,
+        "t_no_such_db_admin_feed",
+        "",
+        Some("test-admin-key"),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    Ok(())
+}

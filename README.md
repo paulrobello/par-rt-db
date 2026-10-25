@@ -408,6 +408,7 @@ loss is `DROP TABLE` for tables absent from the target snapshot, and migrate dat
 | `GET /admin/subscriptions` | Bearer admin key | Lists active subscriptions across all dbs (live query inspector). |
 | `GET /admin/presence` | Bearer admin key | Live per-room presence inspector: one row per room with member count, serialized-state bytes, and the oldest member's join age. In multi-instance mode, `memberCount`/`stateBytes` merge in gossiped peer membership (best-effort, never authoritative — `mergedWithPeers` discloses it); `localMemberCount` is always this replica's own count. Also surfaced as `presenceDetail` on `GET /admin/metrics`. |
 | `POST /admin/db/{db}/explain` | Bearer admin key | Query introspection (ENH-019): re-compiles a `Query` through the real path and returns `{sql, params, terminal, warnings}` — a plan, no rows. |
+| `GET /admin/db/{db}/changes` | Bearer admin key or dashboard cookie | The retained change feed under the admin gate — identical cursor/`logId`/`410 CURSOR_EXPIRED` semantics as the data-plane feed, no machine token and no table allowlist (the admin gate grants the whole database). Backs the dashboard's document-history viewer. Mirrored in all five admin clients (`adminChanges` TS/Swift, `admin_changes` Rust/Python, `AdminChanges` Go). |
 | `GET /admin/slow-queries` | Bearer admin key | Bounded in-memory ring of queries slower than `RTDB_SLOW_QUERY_MS` (default 0 = disabled; `RTDB_SLOW_QUERY_CAPACITY` default 200; `RTDB_SLOW_QUERY_LOG_PARAMS=false` keeps doc content out). |
 | `GET /admin/sessions?user=&limit=` | Bearer admin key | Lists active interactive sessions (OAuth/anonymous/admin-key). `?user=` filters by `user_id` or email (omitted ⇒ all, server-wide); `?limit=` clamped to `[1, 1000]`, default 200. `token_hash` is a non-reversible sha256 digest, safe to surface. |
 | `DELETE /admin/sessions/{token_hash}` | Bearer admin key | Revokes a single session by its `token_hash` (takes effect on the next op over an already-open connection — `session_still_valid` re-queries on every interactive Subscribe/Mutate/Presence). |
@@ -1255,9 +1256,15 @@ The consumer contract:
   `410 CURSOR_EXPIRED` — an empty success would be silent data loss.
 - **Auth**: machine tokens only, filtered by the token's table allowlist the
   same way every other executor surface is. Read-only tokens are fine.
+- **Admin twin**: `GET /admin/db/{db}/changes` serves the same retained log
+  under the admin gate (admin key or dashboard cookie session) — identical
+  cursor/`logId`/`CURSOR_EXPIRED` semantics, no machine token and no table
+  allowlist (the admin gate grants the whole database). It backs the
+  dashboard's document-history viewer.
 
 All five client SDKs expose the feed (`listChanges` in TS, `changes()` in
-Rust/Python/Swift/Go).
+Rust/Python/Swift/Go) and the admin twin (`adminChanges` in TS/Swift,
+`admin_changes` in Rust/Python, `AdminChanges` in Go).
 
 ## Field constraints
 

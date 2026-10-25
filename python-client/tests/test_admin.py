@@ -1152,6 +1152,94 @@ def test_admin_mutate_posts_txn_and_parses_step_result() -> None:
     assert len(results) == 2
 
 
+@pytest.mark.parametrize("filtered", [False, True])
+async def test_admin_changes_sync_async_request_and_response(filtered: bool) -> None:
+    from par_rt_db.wire import ChangeFeedResponse
+
+    db = "db /?#é"
+    table = "items /?&=é"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.raw_path.split(b"?")[0] == (b"/admin/db/db%20%2F%3F%23%C3%A9/changes")
+        assert request.headers["authorization"] == ADMIN_BEARER
+        assert dict(request.url.params) == (
+            {"since": "40", "table": table, "limit": "100"} if filtered else {"since": "0"}
+        )
+        return httpx.Response(
+            200,
+            json={
+                "ops": [
+                    {
+                        "seq": 41,
+                        "table": "items",
+                        "docId": "d41",
+                        "kind": "patch",
+                        "doc": {"value": 2},
+                        "ts": 1234,
+                    },
+                    {
+                        "seq": 42,
+                        "table": "items",
+                        "docId": "d42",
+                        "kind": "delete",
+                        "doc": None,
+                        "ts": 1235,
+                    },
+                ],
+                "nextSeq": 57,
+                "head": 57,
+                "logId": "log-instance",
+            },
+        )
+
+    with _sync_client(handler) as c:
+        page = c.admin_changes(db, 40, table=table, limit=100) if filtered else c.admin_changes(db)
+    async with _async_client(handler) as ac:
+        async_page = (
+            await ac.admin_changes(db, 40, table=table, limit=100)
+            if filtered
+            else await ac.admin_changes(db)
+        )
+    assert isinstance(page, ChangeFeedResponse)
+    assert isinstance(async_page, ChangeFeedResponse)
+    assert async_page == page
+    assert page.next_seq == page.head == 57
+    assert page.log_id == "log-instance"
+    assert [op.seq for op in page.ops] == [41, 42]
+    assert page.ops[0].doc_id == "d41"
+    assert page.ops[0].doc == {"value": 2}
+    assert page.ops[1].kind == "delete"
+    assert page.ops[1].doc is None
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "message"),
+    [
+        (410, ErrorCode.CURSOR_EXPIRED, "cursor predates retention"),
+        (410, ErrorCode.CURSOR_EXPIRED, "cursor is ahead of the log"),
+        (404, ErrorCode.NOT_FOUND, "unknown database"),
+    ],
+)
+async def test_admin_changes_sync_async_typed_errors(
+    status: int, code: ErrorCode, message: str
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/admin/db/dbx/changes"
+        assert request.headers["authorization"] == ADMIN_BEARER
+        return httpx.Response(status, json={"code": code.value, "message": message})
+
+    with _sync_client(handler) as c, pytest.raises(RtDbError) as sync_exc:
+        c.admin_changes("dbx", 1)
+    async with _async_client(handler) as ac:
+        with pytest.raises(RtDbError) as async_exc:
+            await ac.admin_changes("dbx", 1)
+    for exc in (sync_exc, async_exc):
+        assert exc.value.code is code
+        assert exc.value.status_code == status
+        assert exc.value.message == message
+
+
 def test_db_stats_parses_table_stats() -> None:
     with _sync_client(
         _handler_map(

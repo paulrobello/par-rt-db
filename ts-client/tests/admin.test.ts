@@ -18,6 +18,7 @@ import type { WebSocketLike } from "../src/client.js";
 import { RtDbError } from "../src/errors.js";
 import { Migration } from "../src/migration.js";
 import {
+  type ChangeFeedResponse,
   PROTOCOL_VERSION,
   type SchemaHistoryEntry,
   type SchemaHistoryEntrySummary,
@@ -1773,5 +1774,87 @@ describe("admin signed URL mint", () => {
       .mockResolvedValue(jsonResponse({ code: "NOT_FOUND", message: "unknown file" }, 404));
     const client = new RtDbAdminClient({ url: "http://h", adminKey: "k", fetch: fetchMock });
     await expect(client.getSignedUrl("app", "f1")).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+});
+
+describe("RtDbAdminClient adminChanges (admin change feed)", () => {
+  const feed: ChangeFeedResponse = {
+    ops: [
+      {
+        seq: 6,
+        table: "tasks",
+        docId: "d1",
+        kind: "patch",
+        doc: { done: true },
+        ts: 1700000000000,
+      },
+    ],
+    nextSeq: 10,
+    head: 10,
+    logId: "log-1",
+  };
+
+  it("encodes path + query (since/table/limit, db URL-encoded) with the bearer header", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(feed));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+
+    await admin.adminChanges("my db", { since: 5, table: "team tasks", limit: 100 });
+
+    const [url, init] = fetchMock.mock.calls[0];
+    // URLSearchParams forms (space = `+` in the query component).
+    expect(url).toBe("http://h:8300/admin/db/my%20db/changes?since=5&table=team+tasks&limit=100");
+    expect(init.method).toBe("GET");
+    expect(init.headers.Authorization).toBe("Bearer k");
+  });
+
+  it("omits the query string entirely when no opts are passed", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(feed));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+
+    await admin.adminChanges("kanban");
+
+    expect(fetchMock.mock.calls[0][0]).toBe("http://h:8300/admin/db/kanban/changes");
+  });
+
+  it("returns the ChangeFeedResponse body verbatim", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(feed));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+
+    await expect(admin.adminChanges("kanban", { since: 5 })).resolves.toEqual(feed);
+  });
+
+  it("cookie mode omits the Authorization header", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(feed));
+    // Plant a readable CSRF cookie the way /admin/login does.
+    const old = document.cookie;
+    // biome-ignore lint/suspicious/noDocumentCookie: jsdom has no Cookie Store API; document.cookie is the only way to plant a readable cookie
+    document.cookie = "rtdb-admin-csrf=nonce123;path=/";
+    try {
+      const admin = new RtDbAdminClient({ url: "http://h:8300", fetch: fetchMock });
+      await admin.adminChanges("kanban");
+      const [, init] = fetchMock.mock.calls[0];
+      expect(init.credentials).toBe("include");
+      expect(init.headers.Authorization).toBeUndefined();
+      expect(init.headers["X-Rtdb-Csrf"]).toBe("nonce123");
+    } finally {
+      // best-effort cleanup; jsdom retains other cookies too
+      // biome-ignore lint/suspicious/noDocumentCookie: jsdom has no Cookie Store API
+      document.cookie = "rtdb-admin-csrf=;max-age=0;path=/";
+      // biome-ignore lint/suspicious/noDocumentCookie: jsdom has no Cookie Store API
+      if (old) document.cookie = old;
+    }
+  });
+
+  it("surfaces a 410 envelope as RtDbError with code CURSOR_EXPIRED", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse({ code: "CURSOR_EXPIRED", message: "cursor older than retention" }, 410),
+      );
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+
+    const result = admin.adminChanges("kanban", { since: 1 });
+    await expect(result).rejects.toBeInstanceOf(RtDbError);
+    await expect(result).rejects.toMatchObject({ code: "CURSOR_EXPIRED", status: 410 });
   });
 });
