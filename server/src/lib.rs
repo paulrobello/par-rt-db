@@ -33,6 +33,7 @@ pub mod migrate;
 pub mod mutation_log;
 pub mod notify;
 pub mod op_feed;
+pub mod openapi;
 pub mod pagination;
 pub mod presence;
 pub mod privacy;
@@ -800,6 +801,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/healthz", get(health::handler))
         .route("/privacy", get(privacy::handler))
         .route("/metrics", get(prometheus_metrics_handler))
+        // OPENAPI: machine-readable description of the HTTP surface; unauthenticated
+        // (shapes, not secrets) and present even when RTDB_STATIC_DIR is unset.
+        .route("/openapi.json", get(openapi::handler))
         .merge(admin::admin_routes(state.clone()))
         .merge(http_api::http_api_routes(state.clone()))
         // Gzip only on the JSON API + admin surface (including the streaming

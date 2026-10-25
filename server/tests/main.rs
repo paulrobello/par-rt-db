@@ -44,6 +44,7 @@ mod mutation_dedup_test;
 mod notify_test;
 mod oauth_ms_apple_test;
 mod oauth_test;
+mod openapi_drift;
 mod per_row_auth_test;
 mod pool_bound_test;
 mod presence_test;
