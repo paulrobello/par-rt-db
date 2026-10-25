@@ -8,6 +8,7 @@
 //!
 //! Admin subcommands (`list-dbs`, `create-db`, `clone-db`, `push-schema`,
 //! `mint-token`, `revoke-token`, `sessions list|revoke`, `merge-users`,
+//! `backup create|list|download|delete`, `restore`,
 //! `workflows list|get|start|cancel|signal`, `ops watch`) send the instance
 //! admin key as the bearer — all one-shot over HTTP except `ops watch`, which
 //! tails the `/admin/stream` op feed over a WebSocket. Data-plane subcommands
@@ -54,6 +55,10 @@ async fn dispatch(cli: &Cli) -> Result<()> {
         Command::ListDbs => commands::dbs::run_list_dbs(cli).await,
         Command::CreateDb { name } => commands::dbs::run_create_db(cli, name).await,
         Command::CloneDb { from, to } => commands::dbs::run_clone_db(cli, from, to).await,
+        Command::Backup { command } => commands::backups::run_backup(cli, command).await,
+        Command::Restore { name, confirm } => {
+            commands::backups::run_restore(cli, name, confirm).await
+        }
         Command::PushSchema { file } => commands::schema::run_push_schema(cli, file).await,
         Command::MintToken { db, name } => commands::tokens::run_mint_token(cli, db, name).await,
         Command::RevokeToken { id } => commands::tokens::run_revoke_token(cli, id).await,

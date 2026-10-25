@@ -66,6 +66,8 @@ Commands:
   list-dbs      List every database on the instance. (admin)
   create-db     Create a new database. (admin)
   clone-db      Clone a database (schema + documents) into a new one. (admin)
+  backup        Manage instance-wide PostgreSQL backups. (admin)
+  restore       Restore a backup into a fresh rtdb_restored_<stamp> database. (admin)
   push-schema   Push a SchemaDef JSON file to `--db`. (admin)
   mint-token    Mint a machine token for a database. (admin)
   revoke-token  Revoke a machine token by id. (admin)
@@ -140,6 +142,91 @@ Arguments:
 
 Options:
   -h, --help  Print help
+```
+
+### `rtdb backup`
+
+```text
+Manage instance-wide PostgreSQL backups. (admin)
+
+Usage: rtdb backup <COMMAND>
+
+Commands:
+  create    Start a backup asynchronously; poll `backup list` for completion
+  list      List backup names, sizes, and timestamps; report running status on stderr
+  download  Download a backup to a new local file (never overwrites an existing file)
+  delete    Delete a backup file from the server
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+#### `rtdb backup create`
+
+```text
+Start a backup asynchronously; poll `backup list` for completion
+
+Usage: rtdb backup create
+
+Options:
+  -h, --help  Print help
+```
+
+#### `rtdb backup list`
+
+```text
+List backup names, sizes, and timestamps; report running status on stderr
+
+Usage: rtdb backup list
+
+Options:
+  -h, --help  Print help
+```
+
+#### `rtdb backup download`
+
+```text
+Download a backup to a new local file (never overwrites an existing file)
+
+Usage: rtdb backup download <NAME> <FILE>
+
+Arguments:
+  <NAME>  Backup file name on the server
+  <FILE>  Destination file path
+
+Options:
+  -h, --help  Print help
+```
+
+#### `rtdb backup delete`
+
+```text
+Delete a backup file from the server
+
+Usage: rtdb backup delete --confirm <CONFIRM> <NAME>
+
+Arguments:
+  <NAME>  Backup file name to delete
+
+Options:
+      --confirm <CONFIRM>  Typed confirmation — must equal the backup name
+  -h, --help               Print help
+```
+
+### `rtdb restore`
+
+```text
+Restore a backup into a fresh rtdb_restored_<stamp> database. (admin)
+
+Usage: rtdb restore --confirm <CONFIRM> <NAME>
+
+Arguments:
+  <NAME>  Backup file name to restore
+
+Options:
+      --confirm <CONFIRM>  Typed confirmation — must equal the backup name
+  -h, --help               Print help
 ```
 
 ### `rtdb push-schema`

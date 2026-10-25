@@ -60,6 +60,19 @@ pub(crate) enum Command {
         /// Destination database name (must not already exist).
         to: String,
     },
+    /// Manage instance-wide PostgreSQL backups. (admin)
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommand,
+    },
+    /// Restore a backup into a fresh rtdb_restored_<stamp> database. (admin)
+    Restore {
+        /// Backup file name to restore.
+        name: String,
+        /// Typed confirmation — must equal the backup name.
+        #[arg(long)]
+        confirm: String,
+    },
     /// Push a SchemaDef JSON file to `--db`. (admin)
     PushSchema {
         /// Path to a JSON file containing a `SchemaDef` (wire shape:
@@ -211,6 +224,29 @@ pub(crate) enum Command {
 }
 
 #[derive(Subcommand, Debug)]
+pub(crate) enum BackupCommand {
+    /// Start a backup asynchronously; poll `backup list` for completion.
+    Create,
+    /// List backup names, sizes, and timestamps; report running status on stderr.
+    List,
+    /// Download a backup to a new local file (never overwrites an existing file).
+    Download {
+        /// Backup file name on the server.
+        name: String,
+        /// Destination file path.
+        file: PathBuf,
+    },
+    /// Delete a backup file from the server.
+    Delete {
+        /// Backup file name to delete.
+        name: String,
+        /// Typed confirmation — must equal the backup name.
+        #[arg(long)]
+        confirm: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub(crate) enum OpsCommand {
     /// Tail the live op feed (`/admin/stream`): print every committed document
     /// op until Ctrl-C.
@@ -353,6 +389,69 @@ mod tests {
             "--token-hash",
             "abc",
         ]));
+    }
+
+    #[test]
+    fn parses_backup_and_restore_subcommands() {
+        for (verb, expected) in [("create", true), ("list", false)] {
+            let cli = Cli::try_parse_from(["rtdb", "--url", "http://x", "backup", verb]).unwrap();
+            assert!(
+                matches!(
+                    cli.command,
+                    Command::Backup {
+                        command: BackupCommand::Create
+                    }
+                ) == expected
+            );
+        }
+        let cli = Cli::try_parse_from([
+            "rtdb",
+            "--url",
+            "http://x",
+            "backup",
+            "download",
+            "dump.dump",
+            "local.dump",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Command::Backup { command: BackupCommand::Download { name, file } } if name == "dump.dump" && file == *"local.dump")
+        );
+        let cli = Cli::try_parse_from([
+            "rtdb",
+            "--url",
+            "http://x",
+            "backup",
+            "delete",
+            "dump.dump",
+            "--confirm",
+            "dump.dump",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Command::Backup { command: BackupCommand::Delete { name, confirm } } if name == confirm && name == "dump.dump")
+        );
+        let cli = Cli::try_parse_from([
+            "rtdb",
+            "--url",
+            "http://x",
+            "restore",
+            "dump.dump",
+            "--confirm",
+            "dump.dump",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Command::Restore { name, confirm } if name == confirm && name == "dump.dump")
+        );
+        for command in [
+            vec!["restore", "dump.dump"],
+            vec!["backup", "delete", "dump.dump"],
+        ] {
+            assert!(
+                Cli::try_parse_from([vec!["rtdb", "--url", "http://x"], command].concat()).is_err()
+            );
+        }
     }
 
     #[test]

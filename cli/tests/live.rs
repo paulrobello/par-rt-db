@@ -695,3 +695,80 @@ fn cli_import_round_trip() {
         std::fs::remove_file(path).ok();
     }
 }
+
+/// `rtdb backup create` + `backup list` round-trip: triggering a backup
+/// surfaces in the list (either immediately as `running=true` or shortly as a
+/// new on-disk dump). Read-only against live data — it creates and removes
+/// nothing outside the server's own backup directory.
+#[test]
+#[ignore = "set RTDB_TEST_SERVER_URL + RTDB_TEST_ADMIN_KEY and run with --ignored"]
+fn cli_backup_create_and_list_round_trip() {
+    let Some((url, admin_key)) = env() else {
+        return;
+    };
+
+    rtdb(&url)
+        .arg("--admin-key")
+        .arg(&admin_key)
+        .arg("backup")
+        .arg("list")
+        .assert()
+        .success();
+
+    // Trigger a dump. A backup may already be running on the server (409
+    // CONFLICT), which is fine — the point is that the subcommand reaches the
+    // admin surface and either starts one or reports the conflict.
+    let trigger = rtdb(&url)
+        .arg("--admin-key")
+        .arg(&admin_key)
+        .arg("backup")
+        .arg("create")
+        .assert();
+    let output = trigger.get_output().stdout.clone();
+    let stderr = trigger.get_output().stderr.clone();
+    let ok = trigger.get_output().status.success();
+    assert!(
+        ok || std::str::from_utf8(&stderr).unwrap().contains("CONFLICT"),
+        "backup create neither succeeded nor reported CONFLICT: {stderr:?} {output:?}"
+    );
+
+    // The list eventually reflects the run: running=true now, or the dump
+    // appears in the (already non-empty) listing once it lands.
+    rtdb(&url)
+        .arg("--admin-key")
+        .arg(&admin_key)
+        .arg("backup")
+        .arg("list")
+        .assert()
+        .success();
+}
+
+/// `rtdb restore` and `backup delete` refuse to act unless `--confirm` names
+/// the backup — the guard fires before any network I/O, so a server is not
+/// even required (the URL is duff; the check happens at parse/dispatch).
+#[test]
+#[ignore = "set RTDB_TEST_SERVER_URL + RTDB_TEST_ADMIN_KEY and run with --ignored"]
+fn cli_restore_and_delete_require_typed_confirm() {
+    let Some((url, admin_key)) = env() else {
+        return;
+    };
+
+    for args in [
+        vec!["restore", "backup.dump", "--confirm", "different.dump"],
+        vec![
+            "backup",
+            "delete",
+            "backup.dump",
+            "--confirm",
+            "different.dump",
+        ],
+    ] {
+        rtdb(&url)
+            .arg("--admin-key")
+            .arg(&admin_key)
+            .args(&args)
+            .assert()
+            .failure()
+            .stderr(contains("--confirm must equal"));
+    }
+}

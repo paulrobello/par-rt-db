@@ -2,6 +2,7 @@
 //! shared client builders, credential gates, and input-file helpers every
 //! family uses.
 
+pub(crate) mod backups;
 pub(crate) mod data;
 pub(crate) mod dbs;
 pub(crate) mod import;
