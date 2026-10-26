@@ -103,6 +103,10 @@ export type FilterExpr =
  * `tsquery`; the server and clients never emit an explicit `"tsquery"`. */
 export type SearchMode = "tsquery" | "trgm";
 
+/** Mirrors server `query::SearchRankMode` byte-for-byte: tsquery-mode ranking
+ * function. An omitted `rankMode` means `ts_rank`. Rejected in trgm mode. */
+export type SearchRankMode = "ts_rank" | "ts_rank_cd";
+
 /** Mirrors server `query::SearchQuery` byte-for-byte (camelCase, deny_unknown_fields).
  * `filter` narrows search results server-side via the db-side `FilterExpr` DSL
  * (the full type — not vector search's eq-only map); `mode` selects the match
@@ -116,6 +120,10 @@ export interface SearchQuery {
   filter?: FilterExpr;
   mode?: SearchMode;
   snippet?: boolean;
+  /** Tsquery-mode ranking function (`ts_rank` default | `ts_rank_cd`). */
+  rankMode?: SearchRankMode;
+  /** Trgm-mode similarity floor in `0..=1`; hits scoring below are dropped. */
+  minSimilarity?: number;
 }
 
 /** Mirrors server `query::AggregateOp` byte-for-byte (lowercase variants).
@@ -947,6 +955,10 @@ export interface TableJson {
    * restores it. `true` only; omitted on the wire when false. Server-enforced;
    * clients only declare it. */
   softDelete?: boolean;
+  /** Append-only table: every step except `insert`/`insertMany` that targets
+   * it fails with `SCHEMA_VIOLATION` (schema-driven cascade/TTL removal is
+   * exempt). `true` only; omitted on the wire when false. */
+  insertOnly?: boolean;
   /** Optional human-readable description of the table, surfaced by the
    * dashboard's schema/data-browser views. Pure metadata: it changes no
    * validation, no DDL, and is not compared by the server's additive-push

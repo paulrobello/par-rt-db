@@ -429,6 +429,16 @@ pub struct TableDef {
     /// unchanged.
     #[serde(default, rename = "softDelete", skip_serializing_if = "is_false")]
     pub soft_delete: bool,
+    /// Append-only table: `patch`, `adjustCounter`, `replace`, `upsert`,
+    /// `upsertMany`, `delete`, `undelete`, `patchByQuery` and `deleteByQuery`
+    /// steps targeting it fail with `SCHEMA_VIOLATION`; `insert`/`insertMany`
+    /// stay allowed. Schema-driven removal stays sanctioned: the TTL reaper,
+    /// `onDelete` cascade (cascade delete and cascade setNull reaching an
+    /// insertOnly child) and the admin owner-bypass mutate route are exempt.
+    /// Omitted on the wire when false, so existing schemas deserialize
+    /// unchanged.
+    #[serde(default, rename = "insertOnly", skip_serializing_if = "is_false")]
+    pub insert_only: bool,
     /// Optional human-readable description of the table, surfaced by the
     /// dashboard's schema/data-browser views. Pure metadata: it changes no
     /// validation, no DDL, and is not compared by

@@ -101,7 +101,7 @@ pub(super) async fn admin_mutate(
             &db,
             body.idempotency_key,
             body.txn,
-            crate::auth::PrincipalCtx::bypass(),
+            crate::auth::PrincipalCtx::admin_bypass(),
         )
         .await?;
     state.runtime.metrics.record_mutation();

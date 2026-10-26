@@ -66,7 +66,7 @@ private fun parseTableDef(v: JsonElement): TableDef {
     val obj = v as? JsonObject ?: bad("table definition must be a JSON object")
     rejectUnknownKeys(
         obj, "table", "fields", "indexes", "ownerField", "collaboratorsField", "ttl", "updatedAtField",
-        "autoIncrementField", "authorize", "defaults", "constraints", "computed", "softDelete",
+        "autoIncrementField", "authorize", "defaults", "constraints", "computed", "softDelete", "insertOnly",
         "description", "fieldDescriptions",
     )
     val fieldsObj = obj["fields"] as? JsonObject ?: bad("table.fields must be an object")
@@ -92,6 +92,10 @@ private fun parseTableDef(v: JsonElement): TableDef {
         fieldDescriptions = m
     }
 
+    var insertOnly = false
+    obj["insertOnly"]?.let { iv ->
+        insertOnly = boolOf(iv) ?: bad("table.insertOnly must be a boolean")
+    }
     var softDelete = false
     obj["softDelete"]?.let { sv ->
         // Go: absent is false; present (even null) must be a bool.
@@ -153,6 +157,7 @@ private fun parseTableDef(v: JsonElement): TableDef {
         constraints = constraints,
         computed = computed,
         softDelete = softDelete,
+        insertOnly = insertOnly,
         description = description,
         fieldDescriptions = fieldDescriptions,
     )

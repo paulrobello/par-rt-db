@@ -428,6 +428,27 @@ describe("onDelete / softDelete builders (FM-33)", () => {
     expect(plain.toJSON().tables.tasks).not.toHaveProperty("softDelete");
   });
 
+  it(".insertOnly() emits insertOnly:true, omitted when unset", () => {
+    const ins = defineSchema({ logs: defineTable({ msg: t.string() }).insertOnly() });
+    expect(ins.toJSON().tables.logs).toEqual({
+      fields: { msg: { type: "string" } },
+      insertOnly: true,
+    });
+    const plain = defineSchema({ logs: defineTable({ msg: t.string() }) });
+    expect(plain.toJSON().tables.logs).not.toHaveProperty("insertOnly");
+  });
+
+  it(".insertOnly() survives later chained builders", () => {
+    const s = defineSchema({
+      logs: defineTable({ msg: t.string() })
+        .insertOnly()
+        .index("by_msg", ["msg"])
+        .describe("append-only log")
+        .softDelete(),
+    });
+    expect(s.toJSON().tables.logs).toMatchObject({ insertOnly: true, softDelete: true });
+  });
+
   it(".softDelete() composes with indexes and other table options", () => {
     const s = defineSchema({
       tasks: defineTable({ name: t.string(), done: t.boolean() })

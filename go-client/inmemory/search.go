@@ -283,6 +283,20 @@ func executeSearchTerminal(s *Store, q *wire.Query, search *wire.SearchQuery, ta
 		return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
 			"search index '"+search.Index+"' does not declare trgm: true — trgm mode requires it")
 	}
+	if search.RankMode != "" && search.Mode == wire.SearchModeTrgm {
+		return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "rankMode is only supported in tsquery mode")
+	}
+	if search.RankMode != "" && search.RankMode != wire.SearchRankTsRank && search.RankMode != wire.SearchRankTsRankCd {
+		return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "rankMode must be ts_rank or ts_rank_cd")
+	}
+	if search.MinSimilarity != nil {
+		if search.Mode != wire.SearchModeTrgm {
+			return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "minSimilarity is only supported in trgm mode")
+		}
+		if m := *search.MinSimilarity; !(m >= 0 && m <= 1) {
+			return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "minSimilarity must be between 0 and 1")
+		}
+	}
 	indexFields := indexDef.Fields
 	snippet := search.Snippet != nil && *search.Snippet
 	if snippet && search.Mode == wire.SearchModeTrgm {
@@ -327,7 +341,7 @@ func executeSearchTerminal(s *Store, q *wire.Query, search *wire.SearchQuery, ta
 					}
 				}
 			}
-			if best != nil {
+			if best != nil && (search.MinSimilarity == nil || *best >= *search.MinSimilarity) {
 				sr := scoredRow{score: *best, doc: doc}
 				if n, ok := doc["_creationTime"].(wire.Number); ok {
 					if v, ok := parseI64(string(n)); ok {

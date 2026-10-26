@@ -1048,6 +1048,18 @@ function executeSearchTerminal(
   if (snippet && search.mode === "trgm") {
     throw new RtDbError("BAD_REQUEST", "snippet is only supported in tsquery mode");
   }
+  if (search.rankMode !== undefined && search.mode === "trgm") {
+    throw new RtDbError("BAD_REQUEST", "rankMode is only supported in tsquery mode");
+  }
+  const minSimilarity = search.minSimilarity;
+  if (minSimilarity !== undefined) {
+    if (search.mode !== "trgm") {
+      throw new RtDbError("BAD_REQUEST", "minSimilarity is only supported in trgm mode");
+    }
+    if (!(minSimilarity >= 0 && minSimilarity <= 1)) {
+      throw new RtDbError("BAD_REQUEST", "minSimilarity must be between 0 and 1");
+    }
+  }
   const limit = q.take ?? MAX_TAKE;
   const scored: SearchHit[] = [];
   if (search.mode === "trgm") {
@@ -1073,7 +1085,9 @@ function executeSearchTerminal(
           if (similarity > best) best = similarity;
         }
       }
-      if (best > 0) scored.push({ row, score: best });
+      if (best > 0 && (minSimilarity === undefined || best >= minSimilarity)) {
+        scored.push({ row, score: best });
+      }
     }
   } else {
     const alts = parseWebsearchQuery(search.query);

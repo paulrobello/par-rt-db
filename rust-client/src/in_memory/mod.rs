@@ -739,12 +739,44 @@ impl InMemoryRtDbClient {
         Ok(results)
     }
 
+    /// `insertOnly` gate (mirrors server `enforce_insert_only`): steps that
+    /// modify or remove an existing row of an append-only table fail with
+    /// `SCHEMA_VIOLATION`. Runs per top-level step only, so schema-driven
+    /// removals (`onDelete` cascade, TTL) stay exempt.
+    fn enforce_insert_only(&self, step: &Step) -> Result<(), RtDbError> {
+        let table = match step {
+            Step::Patch { table, .. }
+            | Step::AdjustCounter { table, .. }
+            | Step::Replace { table, .. }
+            | Step::Delete { table, .. }
+            | Step::Undelete { table, .. }
+            | Step::Upsert { table, .. }
+            | Step::UpsertMany { table, .. }
+            | Step::PatchByQuery { table, .. }
+            | Step::DeleteByQuery { table, .. } => table,
+            _ => return Ok(()),
+        };
+        let insert_only = self
+            .schema
+            .as_ref()
+            .and_then(|s| s.tables.get(table))
+            .is_some_and(|t| t.insert_only);
+        if insert_only {
+            return Err(RtDbError::new(
+                ErrorCode::SchemaViolation,
+                format!("table '{table}' is insertOnly: only insert and insertMany are allowed"),
+            ));
+        }
+        Ok(())
+    }
+
     /// Per-step executor — ports `executeStep` (`ts-client/src/in_memory.ts:747-805`).
     /// Each step validates against the live schema, mutates `self.docs` (or, for
     /// `Expect*`, just observes), and returns the [`StepResult`] plus every
     /// table that was written (the Task 5 notify path fans out by table; a
     /// cascading delete may write several).
     fn execute_step(&mut self, step: &Step) -> Result<(StepResult, Vec<String>), RtDbError> {
+        self.enforce_insert_only(step)?;
         match step {
             Step::Insert { table, doc } => self.step_insert(table, doc),
             Step::InsertMany { table, docs } => self.step_insert_many(table, docs),

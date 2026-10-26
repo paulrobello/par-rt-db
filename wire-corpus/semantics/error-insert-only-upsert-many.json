@@ -1,0 +1,65 @@
+{
+  "name": "error-insert-only-upsert-many",
+  "$comment": "insertOnly (append-only table): a upsertMany step against the table fails with SCHEMA_VIOLATION; seeds still insert.",
+  "schema": {
+    "tables": {
+      "events": {
+        "fields": {
+          "kind": {
+            "type": "string"
+          },
+          "n": {
+            "type": "number"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_kind",
+            "fields": [
+              "kind"
+            ],
+            "unique": true
+          },
+          {
+            "name": "by_n",
+            "fields": [
+              "n"
+            ]
+          }
+        ],
+        "insertOnly": true
+      }
+    }
+  },
+  "seed": [
+    {
+      "$id": "e1",
+      "doc": {
+        "kind": "a",
+        "n": 1
+      }
+    }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "upsertMany",
+          "table": "events",
+          "index": "by_kind",
+          "docs": [
+            {
+              "kind": "a",
+              "n": 5
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "expect": {
+    "error": {
+      "code": "SCHEMA_VIOLATION"
+    }
+  }
+}

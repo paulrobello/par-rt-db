@@ -861,6 +861,7 @@ async fn inspector_snapshots_subscriptions_and_per_db_counters() -> anyhow::Resu
                 tables: None,
                 host_capability: None,
                 enqueuer: None,
+                admin: false,
             },
         )
         .await?;

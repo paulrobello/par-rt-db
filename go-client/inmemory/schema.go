@@ -143,6 +143,7 @@ type TableDef struct {
 	Constraints        map[string]FieldConstraints
 	Computed           map[string]wire.ValueExpr
 	SoftDelete         bool
+	InsertOnly         bool
 	Description        *string
 	FieldDescriptions  map[string]string
 }
@@ -186,7 +187,7 @@ func parseTableDef(v wire.JSONValue) (*TableDef, error) {
 	}
 	if err := rejectUnknownKeys(obj, "table", "fields", "indexes", "ownerField",
 		"collaboratorsField", "ttl", "updatedAtField", "autoIncrementField",
-		"authorize", "defaults", "constraints", "computed", "softDelete",
+		"authorize", "defaults", "constraints", "computed", "softDelete", "insertOnly",
 		"description", "fieldDescriptions"); err != nil {
 		return nil, err
 	}
@@ -253,6 +254,13 @@ func parseTableDef(v wire.JSONValue) (*TableDef, error) {
 			return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "table.softDelete must be a boolean")
 		}
 		td.SoftDelete = bool(b)
+	}
+	if v, ok := obj["insertOnly"]; ok {
+		b, ok := v.(wire.Bool)
+		if !ok {
+			return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "table.insertOnly must be a boolean")
+		}
+		td.InsertOnly = bool(b)
 	}
 	if v, ok := obj["ttl"]; ok && v != nil {
 		ttl, err := parseTTL(v)

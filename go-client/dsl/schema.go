@@ -346,6 +346,13 @@ func (t *TableBuilder) SoftDelete() *TableBuilder {
 	return t
 }
 
+// InsertOnly marks the table append-only: only insert and insertMany steps
+// may target it.
+func (t *TableBuilder) InsertOnly() *TableBuilder {
+	t.ensure()["insertOnly"] = wire.Bool(true)
+	return t
+}
+
 // Build finalizes the table wire shape.
 func (t *TableBuilder) Build() wire.JSONValue {
 	out := t.ensure()

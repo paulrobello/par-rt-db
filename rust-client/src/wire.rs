@@ -612,7 +612,8 @@ pub struct WorkflowInfoFull {
 // the server and the Go client's "groupBy must always serialize" test.
 pub use par_rt_db_core::query::{
     AggregateGroup, AggregateGroupsTruncated, AggregateMultiGroup, AggregateOp, AggregateSpec,
-    GroupBy, HavingCmp, HybridSearchQuery, SearchMode, SearchQuery, VectorSearchQuery,
+    GroupBy, HavingCmp, HybridSearchQuery, SearchMode, SearchQuery, SearchRankMode,
+    VectorSearchQuery,
 };
 
 /// One slot of a mutate-batch response.
@@ -1079,6 +1080,8 @@ mod tests {
             filter: None,
             mode: None,
             snippet: None,
+            rank_mode: None,
+            min_similarity: None,
         };
         assert_eq!(
             serde_json::to_value(&q).unwrap(),
@@ -1112,6 +1115,8 @@ mod tests {
             }),
             mode: None,
             snippet: None,
+            rank_mode: None,
+            min_similarity: None,
         };
         assert_eq!(
             serde_json::to_value(&with_filter).unwrap(),
@@ -1140,6 +1145,8 @@ mod tests {
             filter: None,
             mode: Some(SearchMode::Trgm),
             snippet: None,
+            rank_mode: None,
+            min_similarity: None,
         };
         assert_eq!(
             serde_json::to_value(&trgm).unwrap(),
@@ -1159,6 +1166,8 @@ mod tests {
             index: "search_body".into(),
             query: "conv".into(),
             snippet: None,
+            rank_mode: None,
+            min_similarity: None,
         };
         assert_eq!(
             serde_json::to_value(&tsquery).unwrap(),
@@ -1200,6 +1209,8 @@ mod tests {
             filter: None,
             mode: None,
             snippet: Some(true),
+            rank_mode: None,
+            min_similarity: None,
         };
         assert_eq!(
             serde_json::to_value(&snippet).unwrap(),

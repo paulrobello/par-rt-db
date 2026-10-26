@@ -167,6 +167,7 @@ export type {
   SchemaHistoryEntrySummary,
   SchemaJson,
   SearchMode,
+  SearchRankMode,
   SearchQuery,
   ServerMessage,
   StepJson,

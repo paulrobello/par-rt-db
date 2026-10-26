@@ -1,0 +1,69 @@
+{
+  "name": "error-insert-only-upsert",
+  "$comment": "insertOnly (append-only table): a upsert step against the table fails with SCHEMA_VIOLATION; seeds still insert.",
+  "schema": {
+    "tables": {
+      "events": {
+        "fields": {
+          "kind": {
+            "type": "string"
+          },
+          "n": {
+            "type": "number"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_kind",
+            "fields": [
+              "kind"
+            ],
+            "unique": true
+          },
+          {
+            "name": "by_n",
+            "fields": [
+              "n"
+            ]
+          }
+        ],
+        "insertOnly": true
+      }
+    }
+  },
+  "seed": [
+    {
+      "$id": "e1",
+      "doc": {
+        "kind": "a",
+        "n": 1
+      }
+    }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "upsert",
+          "table": "events",
+          "index": "by_kind",
+          "eq": [
+            "a"
+          ],
+          "insert": {
+            "kind": "a",
+            "n": 1
+          },
+          "patch": {
+            "n": 2
+          }
+        }
+      ]
+    }
+  },
+  "expect": {
+    "error": {
+      "code": "SCHEMA_VIOLATION"
+    }
+  }
+}

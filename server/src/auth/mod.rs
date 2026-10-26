@@ -154,6 +154,7 @@ pub async fn resolve_enqueuer(
                 tables: None,
                 host_capability: None,
                 enqueuer: Some(enqueuer.clone()),
+                admin: false,
             });
         }
         return Err(RtDbError::forbidden(
@@ -172,6 +173,7 @@ pub async fn resolve_enqueuer(
             tables: None,
             host_capability: None,
             enqueuer: Some(enqueuer.clone()),
+            admin: false,
         })
     } else {
         Err(RtDbError::forbidden(
@@ -414,6 +416,12 @@ pub struct PrincipalCtx {
     /// arrives as `None` on the older owner, which then fires as bypass).
     #[serde(default)]
     pub enqueuer: Option<EnqueuerIdentity>,
+    /// Admin owner-bypass writes (`POST /admin/db/{db}/mutate`, the WS admin
+    /// bypass): the only context allowed to patch/replace/delete rows of an
+    /// `insertOnly` table. `#[serde(default)]` keeps mixed-version forwarding
+    /// decoding (an older origin's context arrives as non-admin).
+    #[serde(default)]
+    pub admin: bool,
 }
 
 impl PrincipalCtx {
@@ -436,6 +444,16 @@ impl PrincipalCtx {
             tables: None,
             host_capability: None,
             enqueuer: None,
+            admin: false,
+        }
+    }
+
+    /// [`PrincipalCtx::bypass`] marked as an admin owner-bypass write, exempt
+    /// from the `insertOnly` table gate.
+    pub fn admin_bypass() -> Self {
+        PrincipalCtx {
+            admin: true,
+            ..Self::bypass()
         }
     }
 }
@@ -453,6 +471,7 @@ impl Principal {
                 tables: None,
                 host_capability: None,
                 enqueuer: self.enqueuer(),
+                admin: false,
             },
             Principal::Machine {
                 tables,
@@ -464,6 +483,7 @@ impl Principal {
                 tables: tables.clone(),
                 host_capability: host_capability.clone(),
                 enqueuer: None,
+                admin: false,
             },
         }
     }

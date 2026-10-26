@@ -325,6 +325,9 @@ class TableDef(_S):
     # the harness / server txn docs). Wire key `softDelete`, omitted when false
     # (server `skip_serializing_if = "is_false"`).
     soft_delete: bool = False
+    # Append-only table: every step except `insert`/`insertMany` fails with
+    # SCHEMA_VIOLATION. Wire key `insertOnly`, omitted when false.
+    insert_only: bool = False
     # ENH-028: computed fields — a `ValueExpr` per declared field, re-evaluated
     # by the server on every write and stored (declarative denormalization).
     # Client-supplied values are dropped before validation; a null result
@@ -372,6 +375,8 @@ class TableDef(_S):
         # drop False, keep True.
         if not out.get("softDelete"):
             out.pop("softDelete", None)
+        if not out.get("insertOnly"):
+            out.pop("insertOnly", None)
         # `computed` is omitted on the wire when empty (server
         # skip_serializing_if = "BTreeMap::is_empty").
         if not out.get("computed"):
@@ -417,6 +422,7 @@ class TableBuilder:
         self._authorize: FilterExpr | None = None
         self._defaults: dict[str, Any] | None = None
         self._soft_delete: bool = False
+        self._insert_only: bool = False
         self._updated_at: str | None = None
         self._auto_increment: str | None = None
         self._computed: dict[str, Any] | None = None
@@ -555,6 +561,15 @@ class TableBuilder:
         self._soft_delete = True
         return self
 
+    def insert_only(self) -> TableBuilder:
+        """Declare this table append-only: only ``insert``/``insertMany`` steps
+        may target it; every other write step fails with ``SCHEMA_VIOLATION``.
+        Schema-driven removal (``onDelete`` cascade, TTL reaping) stays
+        sanctioned. Round-tripped on the wire as ``insertOnly``, omitted when
+        unset."""
+        self._insert_only = True
+        return self
+
     def updated_at_field(self, name: str) -> TableBuilder:
         """Declare the server-stamped updated-at field (FM-36). ``name`` must
         reference a declared ``number`` or ``int64`` field; the server stamps it
@@ -640,6 +655,8 @@ class TableBuilder:
             out["defaults"] = self._defaults
         if self._soft_delete:
             out["softDelete"] = True
+        if self._insert_only:
+            out["insertOnly"] = True
         if self._updated_at is not None:
             out["updatedAtField"] = self._updated_at
         if self._auto_increment is not None:

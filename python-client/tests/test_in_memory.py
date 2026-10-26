@@ -4197,3 +4197,63 @@ def test_int64_aggregate_sum_past_u64_stays_exact() -> None:
     )
     v = c.run_query(TableQuery("events").with_index("by_ts").aggregate("sum").build())
     assert v == "27670116110564327421"
+
+
+def test_insert_only_gate_runs_first_and_allows_insert() -> None:
+    c = InMemoryRtDbClient()
+    c.push_schema(
+        Schema.builder()
+        .table("audit", lambda tb: tb.field("line", t.string()).insert_only())
+        .build()
+    )
+    [res] = c.mutate(Mutation.builder().insert("audit", {"line": "a"}).build())
+    assert res is not None
+    rid = res.id  # type: ignore[union-attr]
+    c.mutate(Mutation.builder().insert_many("audit", [{"line": "b"}]).build())
+    for m in (
+        Mutation.builder().patch("audit", rid, {"line": "x"}),
+        Mutation.builder().replace("audit", rid, {"line": "x"}),
+        Mutation.builder().delete("audit", rid),
+        # undelete gate fires before the "does not declare softDelete" BadRequest.
+        Mutation.builder().undelete("audit", rid),
+    ):
+        with pytest.raises(RtDbError) as ei:
+            c.mutate(m.build())
+        assert ei.value.code == ErrorCode.SCHEMA_VIOLATION
+        assert "insertOnly" in str(ei.value)
+
+
+def test_search_rank_mode_and_min_similarity_validation_and_floor() -> None:
+    c = InMemoryRtDbClient()
+    c.push_schema(
+        Schema.builder()
+        .table(
+            "docs",
+            lambda tb: tb.field("body", t.string()).search_index("s", ["body"]).trgm(),
+        )
+        .build()
+    )
+    c.mutate(
+        Mutation.builder()
+        .insert("docs", {"body": "cat"})
+        .insert("docs", {"body": "cat in a very long field of text"})
+        .build()
+    )
+
+    def run(**kw: Any) -> Any:
+        return c.run_query(TableQuery("docs").search("s", "cat", **kw).build())
+
+    assert len(run(mode="trgm")) == 2
+    assert [d["body"] for d in run(mode="trgm", min_similarity=0.5)] == ["cat"]
+    assert len(run(mode="trgm", min_similarity=0)) == 2
+    assert len(run(rank_mode="ts_rank_cd")) == len(run(rank_mode="ts_rank"))
+    for kw, msg in (
+        ({"mode": "trgm", "rank_mode": "ts_rank"}, "rankMode is only supported"),
+        ({"min_similarity": 0.5}, "minSimilarity is only supported"),
+        ({"mode": "trgm", "min_similarity": 1.5}, "between 0 and 1"),
+        ({"mode": "trgm", "min_similarity": -0.1}, "between 0 and 1"),
+    ):
+        with pytest.raises(RtDbError) as ei:
+            run(**kw)
+        assert ei.value.code == ErrorCode.BAD_REQUEST
+        assert msg in str(ei.value)

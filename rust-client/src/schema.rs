@@ -34,6 +34,7 @@ pub struct TableBuilder {
     constraints: BTreeMap<String, par_rt_db_core::schema::FieldConstraints>,
     computed: BTreeMap<String, ValueExpr>,
     soft_delete: bool,
+    insert_only: bool,
     description: Option<String>,
     field_descriptions: BTreeMap<String, String>,
     /// Index of the most recently pushed [`IndexDef`] in [`Self::indexes`], so
@@ -59,6 +60,7 @@ impl TableBuilder {
             constraints: BTreeMap::new(),
             computed: BTreeMap::new(),
             soft_delete: false,
+            insert_only: false,
             description: None,
             field_descriptions: BTreeMap::new(),
             last_index: None,
@@ -283,6 +285,14 @@ impl TableBuilder {
         self.soft_delete = true;
         self
     }
+
+    /// Declares the table append-only: only `insert`/`insertMany` steps are
+    /// allowed; every other write step fails with `SCHEMA_VIOLATION`.
+    /// Round-trips on the wire as `insertOnly: true` (omitted when false).
+    pub fn insert_only(mut self) -> Self {
+        self.insert_only = true;
+        self
+    }
     /// Declare per-field write constraints (see
     /// `par_rt_db_core::schema::FieldConstraints`): a map of field name →
     /// constraint set. Compile-maintenance mirror only — write-path
@@ -334,6 +344,7 @@ impl TableBuilder {
             constraints: self.constraints,
             computed: self.computed,
             soft_delete: self.soft_delete,
+            insert_only: self.insert_only,
             description: self.description,
             field_descriptions: self.field_descriptions,
         }

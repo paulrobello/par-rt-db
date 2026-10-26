@@ -96,3 +96,19 @@ func TestSchemaDescribeEmitsOnlyWhenSet(t *testing.T) {
 		}
 	}
 }
+
+func TestTableBuilderInsertOnly(t *testing.T) {
+	schema := DefineSchema()
+	schema.Table("log", func(t *TableBuilder) {
+		t.Field("n", Int64())
+		t.InsertOnly()
+	})
+	schema.Table("plain", func(t *TableBuilder) { t.Field("n", Int64()) })
+	b, err := json.Marshal(schema.Build())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(b, []byte(`"insertOnly":true`)) || bytes.Count(b, []byte("insertOnly")) != 1 {
+		t.Fatalf("insertOnly emitted wrongly: %s", b)
+	}
+}

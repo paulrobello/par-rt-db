@@ -209,7 +209,35 @@ fun mergeDoc(row: StoredRow): JsonObject {
 
 internal fun wireObject(v: JsonElement): JsonObject = v as? JsonObject ?: throw badRequest("expected a JSON object")
 
-private fun executeStep(s: Store, step: Step): StepOut =
+/** The table of a step that modifies or removes an existing row, else null. */
+private fun existingRowWriteTable(step: Step): String? =
+    when (step) {
+        is Step.Patch -> step.table
+        is Step.AdjustCounter -> step.table
+        is Step.Replace -> step.table
+        is Step.Delete -> step.table
+        is Step.Undelete -> step.table
+        is Step.Upsert -> step.table
+        is Step.UpsertMany -> step.table
+        is Step.PatchByQuery -> step.table
+        is Step.DeleteByQuery -> step.table
+        else -> null
+    }
+
+/** insertOnly gate; schema-driven removals (onDelete cascade, TTL) never pass through here. */
+private fun enforceInsertOnly(s: Store, step: Step) {
+    val table = existingRowWriteTable(step) ?: return
+    if (s.tables[table]?.insertOnly == true) {
+        throw RtDbException(ErrorCode.SCHEMA_VIOLATION, "table '$table' is insertOnly: only insert and insertMany are allowed")
+    }
+}
+
+private fun executeStep(s: Store, step: Step): StepOut {
+    enforceInsertOnly(s, step)
+    return executeStepUnchecked(s, step)
+}
+
+private fun executeStepUnchecked(s: Store, step: Step): StepOut =
     when (step) {
         is Step.Insert -> stepInsert(s, step)
         is Step.InsertMany -> stepInsertMany(s, step)

@@ -1,0 +1,98 @@
+{
+  "name": "insert-only-insert-and-insert-many-allowed",
+  "$comment": "insertOnly: insert and insertMany are the allowed writes; the follow-up read sees all three rows.",
+  "schema": {
+    "tables": {
+      "events": {
+        "fields": {
+          "kind": {
+            "type": "string"
+          },
+          "n": {
+            "type": "number"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_kind",
+            "fields": [
+              "kind"
+            ],
+            "unique": true
+          },
+          {
+            "name": "by_n",
+            "fields": [
+              "n"
+            ]
+          }
+        ],
+        "insertOnly": true
+      }
+    }
+  },
+  "seed": [
+    {
+      "$id": "e1",
+      "doc": {
+        "kind": "a",
+        "n": 1
+      }
+    }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "insert",
+          "table": "events",
+          "doc": {
+            "kind": "b",
+            "n": 2
+          }
+        },
+        {
+          "op": "insertMany",
+          "table": "events",
+          "docs": [
+            {
+              "kind": "c",
+              "n": 3
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "expect": [
+    {},
+    {}
+  ],
+  "then": {
+    "query": {
+      "table": "events"
+    },
+    "expect": [
+      {
+        "kind": "a",
+        "n": 1
+      },
+      {
+        "kind": "b",
+        "n": 2
+      },
+      {
+        "kind": "c",
+        "n": 3
+      }
+    ],
+    "unordered": true
+  },
+  "normalize": [
+    "_id",
+    "_creationTime",
+    "_version",
+    "id",
+    "ids"
+  ]
+}

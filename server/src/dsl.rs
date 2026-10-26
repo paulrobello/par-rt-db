@@ -31,7 +31,7 @@ pub use par_rt_db_core::wire::FilterExpr;
 pub use par_rt_db_core::query::{
     AggregateGroup, AggregateGroupsTruncated, AggregateMultiGroup, AggregateOp, AggregateSpec,
     GroupBy, HavingCmp, HybridSearchQuery, Order, Paginate, Query, SearchMode, SearchQuery,
-    VectorSearchQuery,
+    SearchRankMode, VectorSearchQuery,
 };
 
 /// Server-side extension methods on the core [`Query`] (orphan rule: an

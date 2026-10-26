@@ -174,6 +174,15 @@ const (
 	SearchModeTrgm    SearchMode = "trgm"
 )
 
+// SearchRankMode mirrors server SearchRankMode — tsquery-mode ranking
+// function; omitted on the wire when unset.
+type SearchRankMode string
+
+const (
+	SearchRankTsRank   SearchRankMode = "ts_rank"
+	SearchRankTsRankCd SearchRankMode = "ts_rank_cd"
+)
+
 // Mirrors server/src/dsl.rs::SearchQuery (camelCase).
 type SearchQuery struct {
 	Index   string     `json:"index"`
@@ -181,6 +190,11 @@ type SearchQuery struct {
 	Filter  FilterExpr `json:"filter,omitempty"`
 	Mode    SearchMode `json:"mode,omitempty"`
 	Snippet *bool      `json:"snippet,omitempty"`
+	// RankMode selects the tsquery-mode ranking function (rejected in trgm mode).
+	RankMode SearchRankMode `json:"rankMode,omitempty"`
+	// MinSimilarity is the trgm-mode similarity floor in 0..=1 (rejected in
+	// tsquery mode).
+	MinSimilarity *float64 `json:"minSimilarity,omitempty"`
 }
 
 // Mirrors server/src/dsl.rs::VectorSearchQuery (camelCase).
@@ -385,11 +399,15 @@ func (s *SearchQuery) UnmarshalJSON(b []byte) error {
 		Filter  json.RawMessage `json:"filter,omitempty"`
 		Mode    SearchMode      `json:"mode,omitempty"`
 		Snippet *bool           `json:"snippet,omitempty"`
+
+		RankMode      SearchRankMode `json:"rankMode,omitempty"`
+		MinSimilarity *float64       `json:"minSimilarity,omitempty"`
 	}](b)
 	if err != nil {
 		return err
 	}
 	s.Index, s.Query, s.Mode, s.Snippet = r.Index, r.Query, r.Mode, r.Snippet
+	s.RankMode, s.MinSimilarity = r.RankMode, r.MinSimilarity
 	if len(r.Filter) > 0 {
 		f, err := UnmarshalFilterExpr(r.Filter)
 		if err != nil {

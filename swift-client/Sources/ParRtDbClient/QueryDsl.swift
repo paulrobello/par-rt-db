@@ -276,17 +276,21 @@ public struct TableQuery: Sendable {
     /// order). `filter` here is NESTED on the terminal — distinct from the
     /// top-level `.filter()` builder, which the server rejects alongside
     /// `search`. `mode: .trgm` opts into substring matching; `snippet: true`
-    /// attaches a `_searchSnippet` highlight per hit.
+    /// attaches a `_searchSnippet` highlight per hit. `rankMode` picks the
+    /// tsquery ranking function; `minSimilarity` floors trgm hits (0...1).
     public func search(
         _ index: String,
         _ query: String,
         filter: FilterExpr? = nil,
         mode: SearchMode? = nil,
-        snippet: Bool? = nil
+        snippet: Bool? = nil,
+        rankMode: SearchRankMode? = nil,
+        minSimilarity: Double? = nil
     ) -> TableQuery {
         with {
             $0.search = SearchQuery(
-                index: index, query: query, filter: filter, mode: mode, snippet: snippet
+                index: index, query: query, filter: filter, mode: mode, snippet: snippet,
+                rankMode: rankMode, minSimilarity: minSimilarity
             )
         }
     }

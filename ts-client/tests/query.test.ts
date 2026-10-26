@@ -388,6 +388,31 @@ describe("TableQuery.search", () => {
     });
   });
 
+  it("emits rankMode and minSimilarity on the wire only when provided", () => {
+    const q = api.items
+      .query()
+      .search("search_content", "hello", { rankMode: "ts_rank_cd" })
+      .take(10);
+    expect(q.json.search).toEqual({
+      index: "search_content",
+      query: "hello",
+      rankMode: "ts_rank_cd",
+    });
+    const m = api.items
+      .query()
+      .search("search_content", "hello", { mode: "trgm", minSimilarity: 0 })
+      .take(10);
+    expect(m.json.search).toEqual({
+      index: "search_content",
+      query: "hello",
+      mode: "trgm",
+      minSimilarity: 0,
+    });
+    const none = api.items.query().search("search_content", "hello").take(10);
+    expect(none.json.search).not.toHaveProperty("rankMode");
+    expect(none.json.search).not.toHaveProperty("minSimilarity");
+  });
+
   it("omits snippet on the wire when not provided", () => {
     const q = api.items.query().search("search_content", "hello world").take(10);
     expect(q.json.search).not.toHaveProperty("snippet");

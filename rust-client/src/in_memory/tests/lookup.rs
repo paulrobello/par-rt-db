@@ -441,6 +441,8 @@ async fn composes_with_paginate_and_search() {
                 filter: None,
                 mode: None,
                 snippet: None,
+                rank_mode: None,
+                min_similarity: None,
             }),
             lookups: vec![author_lookup()],
             ..Default::default()

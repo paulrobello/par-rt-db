@@ -628,3 +628,22 @@ def test_describe_builder_sets_descriptions():
     wire_table_only = json.loads(schema_table_only.model_dump_json(by_alias=True))
     assert wire_table_only["tables"]["t"]["description"] == "just the table"
     assert "fieldDescriptions" not in wire_table_only["tables"]["t"]
+
+
+def test_insert_only_builder_emits_flag_only_when_set():
+    """``.insert_only()`` emits ``"insertOnly": True``; absent/False omit the key."""
+    from par_rt_db.schema import TableDef
+
+    schema = (
+        Schema.builder()
+        .table("audit", lambda tb: tb.field("line", t.string()).insert_only())
+        .table("logs", lambda tb: tb.field("line", t.string()))
+        .build()
+    )
+    wire = json.loads(schema.model_dump_json(by_alias=True))
+    assert wire["tables"]["audit"]["insertOnly"] is True
+    assert "insertOnly" not in wire["tables"]["logs"]
+    assert Schema.model_validate(wire) == schema
+    assert "insertOnly" not in TableDef.model_validate(
+        {"fields": {"a": {"type": "string"}}, "insertOnly": False}
+    ).model_dump(by_alias=True)

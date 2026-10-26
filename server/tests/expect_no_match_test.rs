@@ -70,6 +70,7 @@ fn user(id: &str) -> PrincipalCtx {
         tables: None,
         host_capability: None,
         enqueuer: None,
+        admin: false,
     }
 }
 

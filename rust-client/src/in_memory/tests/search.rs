@@ -28,6 +28,8 @@ async fn query_search_rejects_conflicting_terminals() {
                 filter: None,
                 mode: None,
                 snippet: None,
+                rank_mode: None,
+                min_similarity: None,
             }),
             index: Some("by_name".into()),
             ..Default::default()

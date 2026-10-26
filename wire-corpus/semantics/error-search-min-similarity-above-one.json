@@ -1,0 +1,49 @@
+{
+  "name": "error-search-min-similarity-above-one",
+  "$comment": "minSimilarity must lie in 0..1; 1.5 is BAD_REQUEST.",
+  "schema": {
+    "tables": {
+      "notes": {
+        "fields": {
+          "body": {
+            "type": "string"
+          }
+        },
+        "indexes": [
+          {
+            "name": "search_body",
+            "fields": [
+              "body"
+            ],
+            "search": true,
+            "trgm": true
+          }
+        ]
+      }
+    }
+  },
+  "seed": [
+    {
+      "body": "convex"
+    },
+    {
+      "body": "convexity in practice and more"
+    }
+  ],
+  "op": {
+    "query": {
+      "table": "notes",
+      "search": {
+        "index": "search_body",
+        "query": "convex",
+        "mode": "trgm",
+        "minSimilarity": 1.5
+      }
+    }
+  },
+  "expect": {
+    "error": {
+      "code": "BAD_REQUEST"
+    }
+  }
+}

@@ -1,0 +1,63 @@
+{
+  "name": "error-insert-only-adjust-counter",
+  "$comment": "insertOnly (append-only table): a adjustCounter step against the table fails with SCHEMA_VIOLATION; seeds still insert.",
+  "schema": {
+    "tables": {
+      "events": {
+        "fields": {
+          "kind": {
+            "type": "string"
+          },
+          "n": {
+            "type": "number"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_kind",
+            "fields": [
+              "kind"
+            ],
+            "unique": true
+          },
+          {
+            "name": "by_n",
+            "fields": [
+              "n"
+            ]
+          }
+        ],
+        "insertOnly": true
+      }
+    }
+  },
+  "seed": [
+    {
+      "$id": "e1",
+      "doc": {
+        "kind": "a",
+        "n": 1
+      }
+    }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "adjustCounter",
+          "table": "events",
+          "id": {
+            "$idRef": "e1"
+          },
+          "field": "n",
+          "delta": 1
+        }
+      ]
+    }
+  },
+  "expect": {
+    "error": {
+      "code": "SCHEMA_VIOLATION"
+    }
+  }
+}

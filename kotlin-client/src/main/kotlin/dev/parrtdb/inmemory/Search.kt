@@ -181,6 +181,11 @@ internal fun executeSearchTerminal(s: Store, q: Query, search: SearchQuery, tabl
         throw bad("search index '${search.index}' does not declare trgm: true — trgm mode requires it")
     }
     val indexFields = indexDef.fields
+    if (search.rankMode != null && search.mode == SearchMode.Trgm) throw bad("rankMode is only supported in tsquery mode")
+    search.minSimilarity?.let { min ->
+        if (search.mode != SearchMode.Trgm) throw bad("minSimilarity is only supported in trgm mode")
+        if (min < 0.0 || min > 1.0) throw bad("minSimilarity must be between 0 and 1")
+    }
     val snippet = search.snippet == true
     if (snippet && search.mode == SearchMode.Trgm) throw bad("snippet is only supported in tsquery mode")
     search.filter?.let { validateFilterExpr(it, table) }
@@ -200,7 +205,7 @@ internal fun executeSearchTerminal(s: Store, q: Query, search: SearchQuery, tabl
                     if (best == null || score > best) best = score
                 }
             }
-            if (best == null) continue
+            if (best == null || (search.minSimilarity != null && best < search.minSimilarity)) continue
             val ct = doc["_creationTime"]
             val createdAt = if (ct != null && isJsonNumber(ct)) parseI64((ct as JsonPrimitive).content) ?: 0L else Long.MIN_VALUE
             val id = (doc["_id"] as? JsonPrimitive)?.takeIf { it.isString }?.content ?: ""

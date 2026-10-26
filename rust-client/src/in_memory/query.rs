@@ -466,6 +466,26 @@ impl InMemoryRtDbClient {
                 "snippet is only supported in tsquery mode",
             ));
         }
+        if search.rank_mode.is_some() && search.mode == Some(crate::wire::SearchMode::Trgm) {
+            return Err(RtDbError::new(
+                ErrorCode::BadRequest,
+                "rankMode is only supported in tsquery mode",
+            ));
+        }
+        if let Some(min) = search.min_similarity {
+            if search.mode != Some(crate::wire::SearchMode::Trgm) {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "minSimilarity is only supported in trgm mode",
+                ));
+            }
+            if !(0.0..=1.0).contains(&min) {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    "minSimilarity must be between 0 and 1",
+                ));
+            }
+        }
         if let Some(filter) = &search.filter {
             validate_filter(filter, table_def)?;
         }
@@ -494,7 +514,8 @@ impl InMemoryRtDbClient {
                         best = Some(best.map_or(score, |b: f64| b.max(score)));
                     }
                 }
-                if let Some(score) = best {
+                if let Some(score) = best.filter(|s| search.min_similarity.is_none_or(|m| *s >= m))
+                {
                     let created_at = doc
                         .get("_creationTime")
                         .and_then(Value::as_i64)

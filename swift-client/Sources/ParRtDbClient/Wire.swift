@@ -1606,6 +1606,12 @@ public enum SearchMode: String, Codable, Sendable {
     case trgm
 }
 
+/// Mirrors core SearchRankMode — tsquery-mode ranking function.
+public enum SearchRankMode: String, Codable, Sendable {
+    case tsRank = "ts_rank"
+    case tsRankCd = "ts_rank_cd"
+}
+
 /// Mirrors server/src/dsl.rs::SearchQuery — camelCase, unknown fields
 /// rejected; `filter`/`mode`/`snippet` omitted when nil.
 public struct SearchQuery: Equatable, Codable, Sendable {
@@ -1619,20 +1625,27 @@ public struct SearchQuery: Equatable, Codable, Sendable {
     public var mode: SearchMode?
     /// Whether to include highlighted snippets in results.
     public var snippet: Bool?
+    /// Tsquery-mode ranking function; rejected in trgm mode.
+    public var rankMode: SearchRankMode?
+    /// Trgm-mode similarity floor in 0...1; rejected in tsquery mode.
+    public var minSimilarity: Double?
 
     public init(
         index: String, query: String, filter: FilterExpr? = nil,
-        mode: SearchMode? = nil, snippet: Bool? = nil
+        mode: SearchMode? = nil, snippet: Bool? = nil,
+        rankMode: SearchRankMode? = nil, minSimilarity: Double? = nil
     ) {
         self.index = index
         self.query = query
         self.filter = filter
         self.mode = mode
         self.snippet = snippet
+        self.rankMode = rankMode
+        self.minSimilarity = minSimilarity
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
-        case index, query, filter, mode, snippet
+        case index, query, filter, mode, snippet, rankMode, minSimilarity
     }
 
     public init(from decoder: Decoder) throws {
@@ -1643,6 +1656,8 @@ public struct SearchQuery: Equatable, Codable, Sendable {
         filter = try container.decodeIfPresent(FilterExpr.self, forKey: .filter)
         mode = try container.decodeIfPresent(SearchMode.self, forKey: .mode)
         snippet = try container.decodeIfPresent(Bool.self, forKey: .snippet)
+        rankMode = try container.decodeIfPresent(SearchRankMode.self, forKey: .rankMode)
+        minSimilarity = try container.decodeIfPresent(Double.self, forKey: .minSimilarity)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -1652,6 +1667,8 @@ public struct SearchQuery: Equatable, Codable, Sendable {
         try container.encodeIfPresent(filter, forKey: .filter)
         try container.encodeIfPresent(mode, forKey: .mode)
         try container.encodeIfPresent(snippet, forKey: .snippet)
+        try container.encodeIfPresent(rankMode, forKey: .rankMode)
+        try container.encodeIfPresent(minSimilarity, forKey: .minSimilarity)
     }
 }
 

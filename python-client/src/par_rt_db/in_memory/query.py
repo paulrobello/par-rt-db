@@ -1245,6 +1245,15 @@ class _QueryEngine(_Core):
             )
         if q.search.snippet is True and q.search.mode == "trgm":
             raise RtDbError(ErrorCode.BAD_REQUEST, "snippet is only supported in tsquery mode")
+        if q.search.rank_mode is not None and q.search.mode == "trgm":
+            raise RtDbError(ErrorCode.BAD_REQUEST, "rankMode is only supported in tsquery mode")
+        if q.search.min_similarity is not None:
+            if q.search.mode != "trgm":
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST, "minSimilarity is only supported in trgm mode"
+                )
+            if not 0.0 <= q.search.min_similarity <= 1.0:
+                raise RtDbError(ErrorCode.BAD_REQUEST, "minSimilarity must be between 0 and 1")
         if q.search.filter is not None:
             _validate_filter(q.search.filter, table_def)
         candidates: list[StoredRow] = [
@@ -1298,6 +1307,8 @@ class _QueryEngine(_Core):
             for row in candidates:
                 score = _trgm_score(search_def, row.doc, needle)
                 if score is None:
+                    continue
+                if q.search.min_similarity is not None and score < q.search.min_similarity:
                     continue
                 ranks[row.id] = score
                 matched.append(row)
@@ -1398,7 +1409,9 @@ class _QueryEngine(_Core):
         scored: list[tuple[float, StoredRow]] = []
         for row in candidates:
             best = _trgm_score(search_def, row.doc, needle)
-            if best is not None:
+            if best is not None and (
+                q.search.min_similarity is None or best >= q.search.min_similarity
+            ):
                 scored.append((best, row))
 
         def cmp(a: tuple[float, StoredRow], b: tuple[float, StoredRow]) -> int:

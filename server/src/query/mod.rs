@@ -45,7 +45,7 @@ use terminals::{
 pub use crate::dsl::{
     AggregateGroup, AggregateGroupsTruncated, AggregateMultiGroup, AggregateOp, AggregateSpec,
     FilterExpr, GroupBy, HavingCmp, HybridSearchQuery, Order, Paginate, PaginatedResult, Query,
-    QueryResult, SearchMode, SearchQuery, VectorSearchQuery, filter_matches,
+    QueryResult, SearchMode, SearchQuery, SearchRankMode, VectorSearchQuery, filter_matches,
 };
 // ARC-203: the compile/execute surface that used to live in this single file.
 pub(crate) use filter::{compile_filter, compile_filter_literal, compile_scan_where};

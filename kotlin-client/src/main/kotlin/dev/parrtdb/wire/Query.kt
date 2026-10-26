@@ -24,6 +24,15 @@ enum class SearchMode(val wire: String) {
     }
 }
 
+enum class SearchRankMode(val wire: String) {
+    TsRank("ts_rank"),
+    TsRankCd("ts_rank_cd");
+
+    companion object {
+        fun fromWire(s: String): SearchRankMode = entries.firstOrNull { it.wire == s } ?: wireFail("unknown search rankMode `$s`")
+    }
+}
+
 enum class AggregateOp(val wire: String) {
     Sum("sum"),
     Avg("avg"),
@@ -64,6 +73,10 @@ data class SearchQuery(
     val filter: FilterExpr? = null,
     val mode: SearchMode? = null,
     val snippet: Boolean? = null,
+    /** Tsquery-mode ranking function; omitted on the wire when null (the default `ts_rank`). */
+    val rankMode: SearchRankMode? = null,
+    /** Trgm-mode similarity floor in 0..1; omitted on the wire when null. */
+    val minSimilarity: Double? = null,
 ) {
     fun toJson() =
         jsonObj(
@@ -72,6 +85,8 @@ data class SearchQuery(
             "filter" to filter?.toJson(),
             "mode" to mode?.let { jsonStr(it.wire) },
             "snippet" to snippet?.let { jsonBool(it) },
+            "rankMode" to rankMode?.let { jsonStr(it.wire) },
+            "minSimilarity" to minSimilarity?.let { jsonNum(if (it == Math.rint(it)) it.toLong().toString() else it.toString()) },
         )
 
     companion object {
@@ -83,6 +98,12 @@ data class SearchQuery(
                 o.opt("filter")?.let { FilterExpr.fromJson(it) },
                 o.optStr("mode")?.let { SearchMode.fromWire(it) },
                 o.optBool("snippet"),
+                o.optStr("rankMode")?.let { SearchRankMode.fromWire(it) },
+                o.opt("minSimilarity")?.let { v ->
+                    val p = v as? JsonPrimitive
+                    if (p == null || p.isString) wireFail("search.minSimilarity: expected a number")
+                    p.content.toDoubleOrNull() ?: wireFail("search.minSimilarity: expected a number")
+                },
             ).also { o.finish() }
         }
     }
@@ -178,16 +199,66 @@ sealed interface GroupBy {
     }
 }
 
+/** One `having` entry: numeric bounds ANDed together; at least one is required (checked by the engine/server). */
+data class HavingCmp(
+    val eq: Double? = null,
+    val ne: Double? = null,
+    val gt: Double? = null,
+    val gte: Double? = null,
+    val lt: Double? = null,
+    val lte: Double? = null,
+) {
+    fun hasBound(): Boolean = listOf(eq, ne, gt, gte, lt, lte).any { it != null }
+
+    fun matches(v: Double): Boolean =
+        (eq == null || v == eq) && (ne == null || v != ne) && (gt == null || v > gt) &&
+            (gte == null || v >= gte) && (lt == null || v < lt) && (lte == null || v <= lte)
+
+    fun toJson() =
+        jsonObj(
+            "eq" to eq?.let { havingNum(it) },
+            "ne" to ne?.let { havingNum(it) },
+            "gt" to gt?.let { havingNum(it) },
+            "gte" to gte?.let { havingNum(it) },
+            "lt" to lt?.let { havingNum(it) },
+            "lte" to lte?.let { havingNum(it) },
+        )
+
+    companion object {
+        fun fromJson(e: JsonElement): HavingCmp {
+            val o = StrictObj.of(e, "having")
+            fun bound(k: String): Double? =
+                o.opt(k)?.let { v ->
+                    val p = v as? JsonPrimitive
+                    if (p == null || p.isString) wireFail("having.$k: expected a number")
+                    p.content.toDoubleOrNull() ?: wireFail("having.$k: expected a number")
+                }
+            return HavingCmp(bound("eq"), bound("ne"), bound("gt"), bound("gte"), bound("lt"), bound("lte")).also { o.finish() }
+        }
+    }
+}
+
+private fun havingNum(d: Double): JsonElement =
+    if (d == Math.rint(d) && Math.abs(d) < 1e15) jsonNum(d.toLong()) else jsonNum(d)
+
+/** A grouped aggregate result that hit the group cap: `{"groups":[...],"truncated":true}`; under the cap it is the bare array. */
+data class AggregateGroupsTruncated(val groups: List<JsonElement>, val truncated: Boolean = true) {
+    fun toJson() = jsonObj("groups" to JsonArray(groups), "truncated" to jsonBool(truncated))
+}
+
 data class AggregateSpec(
     val op: AggregateOp? = null,
     val aggregates: Map<String, AggregateOp>? = null,
     val groupBy: GroupBy = GroupBy.Flag(false),
+    /** Post-group filter: aggregate name (alias, or the op name for a single-op spec) to bounds. */
+    val having: Map<String, HavingCmp>? = null,
 ) {
     fun toJson() =
         jsonObj(
             "op" to op?.let { jsonStr(it.wire) },
             "aggregates" to aggregates?.let { m -> JsonObject(m.mapValues { jsonStr(it.value.wire) }) },
             "groupBy" to groupBy.toJson(),
+            "having" to having?.let { m -> JsonObject(m.mapValues { it.value.toJson() }) },
         )
 
     companion object {
@@ -200,7 +271,12 @@ data class AggregateSpec(
                     ao.mapValues { AggregateOp.fromWire(reqStr(it.value, "aggregate.aggregates")) }
                 }
             val gb = GroupBy.fromJson(o.raw("groupBy"))
-            return AggregateSpec(op, aggs, gb).also { o.finish() }
+            val having =
+                o.opt("having")?.let { h ->
+                    val ho = h as? JsonObject ?: wireFail("aggregate.having: expected an object")
+                    ho.mapValues { HavingCmp.fromJson(it.value) }
+                }
+            return AggregateSpec(op, aggs, gb, having).also { o.finish() }
         }
     }
 }

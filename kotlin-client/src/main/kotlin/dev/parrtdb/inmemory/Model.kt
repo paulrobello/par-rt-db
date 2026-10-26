@@ -69,6 +69,7 @@ data class TableDef(
     val constraints: Map<String, FieldConstraints> = emptyMap(),
     val computed: Map<String, ValueExpr> = emptyMap(),
     val softDelete: Boolean = false,
+    val insertOnly: Boolean = false,
     val description: String? = null,
     val fieldDescriptions: Map<String, String>? = null,
 )

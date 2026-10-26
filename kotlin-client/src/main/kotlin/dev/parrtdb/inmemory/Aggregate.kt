@@ -2,9 +2,11 @@ package dev.parrtdb.inmemory
 
 import dev.parrtdb.errors.ErrorCode
 import dev.parrtdb.errors.RtDbException
+import dev.parrtdb.wire.AggregateGroupsTruncated
 import dev.parrtdb.wire.AggregateOp
 import dev.parrtdb.wire.AggregateSpec
 import dev.parrtdb.wire.GroupBy
+import dev.parrtdb.wire.HavingCmp
 import dev.parrtdb.wire.jsonNum
 import dev.parrtdb.wire.jsonStr
 import kotlinx.serialization.json.JsonArray
@@ -26,7 +28,35 @@ private class AggregatePlan(
     val legacy: Boolean,
     val aggField: String,
     val aggFieldPg: PgType,
+    val having: Map<String, HavingCmp>?,
 )
+
+/** The server's build_having BAD_REQUEST gates. */
+private fun validateHaving(having: Map<String, HavingCmp>?, ops: List<OpAlias>, grouped: Boolean, aggPg: PgType) {
+    if (having == null) return
+    if (!grouped) throw bad("aggregate having requires groupBy")
+    if (having.isEmpty()) throw bad("aggregate having must not be empty")
+    for ((name, cmp) in having) {
+        val op = ops.firstOrNull { it.alias == name }?.op ?: throw bad("aggregate having references unknown aggregate '$name'")
+        if (!cmp.hasBound()) throw bad("aggregate having '$name' needs at least one bound")
+        if (op != AggregateOp.Count && aggPg != PgType.Number && aggPg != PgType.Int64) {
+            throw bad("aggregate having '$name' requires a numeric aggregate")
+        }
+    }
+}
+
+/** A null or non-numeric aggregate fails, like SQL. */
+private fun havingKeeps(having: Map<String, HavingCmp>?, row: JsonObject): Boolean {
+    if (having == null) return true
+    for ((name, cmp) in having) {
+        val cell = (row["values"] as? JsonObject)?.get(name) ?: row["value"]
+        val p = cell as? JsonPrimitive ?: return false
+        if (p is JsonNull) return false
+        val f = p.content.toDoubleOrNull() ?: return false
+        if (!cmp.matches(f)) return false
+    }
+    return true
+}
 
 private fun isAggAliasChar(c: Char): Boolean = c in 'a'..'z' || c in 'A'..'Z' || c in '0'..'9' || c == '_'
 
@@ -86,7 +116,8 @@ private fun planAggregate(agg: AggregateSpec, table: TableDef, plan: ScanPlan): 
         }
     }
     val aggFieldPg = if (aggField.isNotEmpty()) plan.fieldPg(table, aggField) else PgType.Text
-    return AggregatePlan(ops, groupFields, groupFields.map { plan.fieldPg(table, it) }, legacy, aggField, aggFieldPg)
+    validateHaving(agg.having, ops, groupFields.isNotEmpty(), aggFieldPg)
+    return AggregatePlan(ops, groupFields, groupFields.map { plan.fieldPg(table, it) }, legacy, aggField, aggFieldPg, agg.having)
 }
 
 /**
@@ -127,8 +158,8 @@ private fun aggregateGrouped(ap: AggregatePlan, filtered: List<StoredRow>, evalu
                 if (c != 0) return@sortedWith c
             }
             0
-        }.take(maxTake)
-    return JsonArray(
+        }
+    val rows =
         sorted.map { g ->
             if (ap.legacy) {
                 JsonObject(linkedMapOf("key" to g.keys[0], "value" to evaluate(g.rows, ap.ops[0].op)))
@@ -137,8 +168,10 @@ private fun aggregateGrouped(ap: AggregatePlan, filtered: List<StoredRow>, evalu
                 for (o in ap.ops) values[o.alias] = evaluate(g.rows, o.op)
                 JsonObject(linkedMapOf("keys" to JsonArray(g.keys), "values" to JsonObject(values)))
             }
-        },
-    )
+        }.filter { havingKeeps(ap.having, it) }
+    // The cap applies after having; a capped result carries the marker.
+    if (rows.size > maxTake) return AggregateGroupsTruncated(rows.take(maxTake)).toJson()
+    return JsonArray(rows)
 }
 
 private fun aggregateScalar(ap: AggregatePlan, filtered: List<StoredRow>, evaluate: (List<StoredRow>, AggregateOp) -> JsonElement): JsonElement {

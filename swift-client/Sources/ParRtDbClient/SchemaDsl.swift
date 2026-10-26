@@ -533,6 +533,10 @@ public struct TableDef: Equatable, Codable, Sendable {
     /// (`deleted_at`) instead of removed — invisible to every read and write
     /// lookup, restorable via the `undelete` mutation step.
     public var softDelete: Bool
+    /// Append-only table: every step except `insert`/`insertMany` fails with
+    /// `SCHEMA_VIOLATION`. `onDelete` cascades and TTL reaping stay exempt.
+    /// Omitted on the wire when false.
+    public var insertOnly: Bool
     /// Optional human-readable description of the table, surfaced by the
     /// dashboard's schema/data-browser views. Pure metadata: it changes no
     /// validation, no DDL, and is not compared by the server's additive-push
@@ -558,6 +562,7 @@ public struct TableDef: Equatable, Codable, Sendable {
         computed: [String: ValueExpr] = [:],
         constraints: [String: FieldConstraints]? = nil,
         softDelete: Bool = false,
+        insertOnly: Bool = false,
         description: String? = nil,
         fieldDescriptions: [String: String]? = nil
     ) {
@@ -573,6 +578,7 @@ public struct TableDef: Equatable, Codable, Sendable {
         self.computed = computed
         self.constraints = constraints
         self.softDelete = softDelete
+        self.insertOnly = insertOnly
         self.description = description
         self.fieldDescriptions = fieldDescriptions
     }
@@ -580,7 +586,7 @@ public struct TableDef: Equatable, Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case fields, indexes, ttl, updatedAtField, autoIncrementField, authorize, defaults
         case computed, constraints, ownerField, collaboratorsField, softDelete
-        case description, fieldDescriptions
+        case description, fieldDescriptions, insertOnly
     }
 
     public init(from decoder: Decoder) throws {
@@ -607,6 +613,7 @@ public struct TableDef: Equatable, Codable, Sendable {
             [String: FieldConstraints].self, forKey: .constraints
         )
         softDelete = try container.decodeIfPresent(Bool.self, forKey: .softDelete) ?? false
+        insertOnly = try container.decodeIfPresent(Bool.self, forKey: .insertOnly) ?? false
         description = try container.decodeIfPresent(String.self, forKey: .description)
         fieldDescriptions = try container.decodeIfPresent(
             [String: String].self, forKey: .fieldDescriptions
@@ -634,6 +641,9 @@ public struct TableDef: Equatable, Codable, Sendable {
         }
         if softDelete {
             try container.encode(softDelete, forKey: .softDelete)
+        }
+        if insertOnly {
+            try container.encode(insertOnly, forKey: .insertOnly)
         }
         try container.encodeIfPresent(description, forKey: .description)
         if let fieldDescriptions, !fieldDescriptions.isEmpty {
@@ -883,6 +893,14 @@ public struct TableBuilder: Sendable {
         with { $0.softDelete = enabled }
     }
 
+    /// Declare an append-only table: `patch`, `adjustCounter`, `replace`,
+    /// `delete`, `undelete`, `upsert`, `upsertMany`, `patchByQuery` and
+    /// `deleteByQuery` steps against it fail with `SCHEMA_VIOLATION`; `insert`
+    /// and `insertMany` stay allowed. Wire-omitted when disabled.
+    public func insertOnly(_ enabled: Bool = true) -> TableBuilder {
+        with { $0.insertOnly = enabled }
+    }
+
     /// Attach a human-readable description to the table, and optional
     /// per-field descriptions keyed by declared field name. Pure metadata the
     /// server persists verbatim (no validation, no DDL, not compared by the
@@ -917,6 +935,7 @@ public struct TableBuilder: Sendable {
             computed: acc.computed,
             constraints: acc.constraints,
             softDelete: acc.softDelete,
+            insertOnly: acc.insertOnly,
             description: acc.description,
             fieldDescriptions: acc.fieldDescriptions
         )
@@ -937,6 +956,7 @@ private struct Acc: Sendable {
     var computed: [String: ValueExpr] = [:]
     var constraints: [String: FieldConstraints]?
     var softDelete = false
+    var insertOnly = false
     var description: String?
     var fieldDescriptions: [String: String]?
     /// Position of the most recently declared index, for the chainable

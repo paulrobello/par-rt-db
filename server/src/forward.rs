@@ -865,6 +865,7 @@ mod tests {
                     tables: None,
                     host_capability: None,
                     enqueuer: None,
+                    admin: false,
                 },
             },
             ForwardWrite::MergeUsers {

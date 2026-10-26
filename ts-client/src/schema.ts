@@ -209,6 +209,7 @@ export class TableDefinition<
     readonly constraintsMap?: Record<string, FieldConstraintsJson>,
     readonly descriptionText?: string,
     readonly descriptionsMap?: Record<string, string>,
+    readonly insertOnlyFlag?: boolean,
   ) {}
 
   /**
@@ -233,6 +234,7 @@ export class TableDefinition<
       this.constraintsMap,
       this.descriptionText,
       this.descriptionsMap,
+      this.insertOnlyFlag,
     );
   }
 
@@ -288,6 +290,7 @@ export class TableDefinition<
       this.constraintsMap,
       this.descriptionText,
       this.descriptionsMap,
+      this.insertOnlyFlag,
     );
   }
 
@@ -320,6 +323,7 @@ export class TableDefinition<
       this.constraintsMap,
       this.descriptionText,
       this.descriptionsMap,
+      this.insertOnlyFlag,
     );
   }
 
@@ -364,6 +368,7 @@ export class TableDefinition<
       this.constraintsMap,
       this.descriptionText,
       this.descriptionsMap,
+      this.insertOnlyFlag,
     );
   }
 
@@ -386,6 +391,7 @@ export class TableDefinition<
       this.constraintsMap,
       this.descriptionText,
       this.descriptionsMap,
+      this.insertOnlyFlag,
     );
   }
 
@@ -409,6 +415,7 @@ export class TableDefinition<
       this.constraintsMap,
       this.descriptionText,
       this.descriptionsMap,
+      this.insertOnlyFlag,
     );
   }
 
@@ -437,6 +444,7 @@ export class TableDefinition<
       this.constraintsMap,
       this.descriptionText,
       this.descriptionsMap,
+      this.insertOnlyFlag,
     );
   }
 
@@ -463,6 +471,7 @@ export class TableDefinition<
       this.constraintsMap,
       this.descriptionText,
       this.descriptionsMap,
+      this.insertOnlyFlag,
     );
   }
 
@@ -490,6 +499,7 @@ export class TableDefinition<
       this.constraintsMap,
       this.descriptionText,
       this.descriptionsMap,
+      this.insertOnlyFlag,
     );
   }
 
@@ -520,6 +530,7 @@ export class TableDefinition<
       map,
       this.descriptionText,
       this.descriptionsMap,
+      this.insertOnlyFlag,
     );
   }
 
@@ -549,6 +560,7 @@ export class TableDefinition<
       this.constraintsMap,
       tableDescription,
       fieldDescriptions,
+      this.insertOnlyFlag,
     );
   }
 
@@ -574,6 +586,34 @@ export class TableDefinition<
       this.constraintsMap,
       this.descriptionText,
       this.descriptionsMap,
+      this.insertOnlyFlag,
+    );
+  }
+
+  /** Opt into an append-only table: `patch`, `adjustCounter`, `replace`,
+   * `upsert`, `upsertMany`, `delete`, `undelete`, `patchByQuery` and
+   * `deleteByQuery` steps targeting it fail with `SCHEMA_VIOLATION`;
+   * `insert`/`insertMany` stay allowed. Schema-driven removal (`onDelete`
+   * cascade/setNull, the TTL reaper) is exempt. Server-enforced; the client
+   * only declares it and round-trips it on the wire as `insertOnly: true`,
+   * omitted when unset. */
+  insertOnly(): TableDefinition<Fields, Indexes, Stamped> {
+    return new TableDefinition(
+      this.fields,
+      this.indexes,
+      this.ownerFieldName,
+      this.collaboratorsFieldName,
+      this.ttlDef,
+      this.authorizeDef,
+      this.defaultsMap,
+      this.softDeleteFlag,
+      this.updatedAtFieldName,
+      this.autoIncrementFieldName,
+      this.computedMap,
+      this.constraintsMap,
+      this.descriptionText,
+      this.descriptionsMap,
+      true,
     );
   }
 
@@ -605,6 +645,7 @@ export class TableDefinition<
       this.constraintsMap,
       this.descriptionText,
       this.descriptionsMap,
+      this.insertOnlyFlag,
     );
   }
 
@@ -639,6 +680,7 @@ export class TableDefinition<
       this.constraintsMap,
       this.descriptionText,
       this.descriptionsMap,
+      this.insertOnlyFlag,
     );
   }
 
@@ -671,6 +713,7 @@ export class TableDefinition<
       this.constraintsMap,
       this.descriptionText,
       this.descriptionsMap,
+      this.insertOnlyFlag,
     );
   }
 
@@ -711,6 +754,9 @@ export class TableDefinition<
     }
     if (this.softDeleteFlag) {
       json.softDelete = true;
+    }
+    if (this.insertOnlyFlag) {
+      json.insertOnly = true;
     }
     if (this.descriptionText) {
       json.description = this.descriptionText;

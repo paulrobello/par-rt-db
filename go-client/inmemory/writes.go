@@ -247,6 +247,9 @@ func diffCanonical(result wire.JSONValue, q *wire.Query) string {
 // executeStep runs one step and reports every table it wrote (a cascading
 // delete can write several) — the notify fan-out is table-keyed.
 func executeStep(s *Store, step wire.Step) (wire.StepResult, []string, error) {
+	if err := enforceInsertOnly(s, step); err != nil {
+		return wire.StepResult{}, nil, err
+	}
 	switch t := step.(type) {
 	case wire.StepInsert:
 		return stepInsert(s, t)
@@ -289,6 +292,41 @@ func executeStep(s *Store, step wire.Step) (wire.StepResult, []string, error) {
 	default:
 		return wire.StepResult{}, nil, rtdberrors.New(rtdberrors.CodeInternal, "unknown step kind")
 	}
+}
+
+// enforceInsertOnly rejects a top-level step that modifies or removes an
+// existing row of an insertOnly table with SCHEMA_VIOLATION. It runs before
+// the step's own validation; schema-driven removals (onDelete cascade, TTL
+// reaping) never pass through executeStep and stay exempt.
+func enforceInsertOnly(s *Store, step wire.Step) error {
+	var table string
+	switch t := step.(type) {
+	case wire.StepPatch:
+		table = t.Table
+	case wire.StepAdjustCounter:
+		table = t.Table
+	case wire.StepReplace:
+		table = t.Table
+	case wire.StepDelete:
+		table = t.Table
+	case wire.StepUndelete:
+		table = t.Table
+	case wire.StepUpsert:
+		table = t.Table
+	case wire.StepUpsertMany:
+		table = t.Table
+	case wire.StepPatchByQuery:
+		table = t.Table
+	case wire.StepDeleteByQuery:
+		table = t.Table
+	default:
+		return nil
+	}
+	if td, ok := s.tables[table]; ok && td.InsertOnly {
+		return rtdberrors.New(rtdberrors.CodeSchemaViolation,
+			"table '"+table+"' is insertOnly: only insert and insertMany are allowed")
+	}
+	return nil
 }
 
 func stepInsert(s *Store, t wire.StepInsert) (wire.StepResult, []string, error) {

@@ -149,11 +149,37 @@ class _WritesEngine(_Core):
         self._auto_counters[table_name] = next_value
         return {**doc, field: str(next_value)}
 
+    def _enforce_insert_only(self, step: Step) -> None:
+        """``insertOnly`` gate: runs FIRST for every top-level step. A step that
+        modifies or removes an existing row of an append-only table fails with
+        SCHEMA_VIOLATION. Schema-driven removal (``onDelete`` cascade, TTL
+        reaping) never passes through here and stays sanctioned."""
+        if not isinstance(
+            step,
+            _Patch
+            | _AdjustCounter
+            | _Replace
+            | _Delete
+            | _Undelete
+            | _Upsert
+            | _UpsertMany
+            | _PatchByQuery
+            | _DeleteByQuery,
+        ):
+            return
+        table_def = self._tables.get(step.table)
+        if table_def is not None and table_def.insert_only:
+            raise RtDbError(
+                ErrorCode.SCHEMA_VIOLATION,
+                f"table '{step.table}' is insertOnly: only insert and insertMany are allowed",
+            )
+
     def _execute_step(self, step: Step) -> tuple[StepResult, set[str]]:
         """Run one step, returning its result and the set of tables it wrote
         (empty for read-only/control-flow steps). FM-33: a delete step's set
         includes every child table its ``onDelete`` cascade touched, so
         subscribers on those tables re-run."""
+        self._enforce_insert_only(step)
         match step:
             case _ExpectBefore():
                 return None, set()

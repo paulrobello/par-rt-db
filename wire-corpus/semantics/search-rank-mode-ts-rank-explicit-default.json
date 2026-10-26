@@ -1,0 +1,52 @@
+{
+  "name": "search-rank-mode-ts-rank-explicit-default",
+  "$comment": "rankMode: \"ts_rank\" is the explicit spelling of the default ranking: the hit set equals the omitted-rankMode query.",
+  "schema": {
+    "tables": {
+      "notes": {
+        "fields": {
+          "body": {
+            "type": "string"
+          }
+        },
+        "indexes": [
+          {
+            "name": "search_body",
+            "fields": [
+              "body"
+            ],
+            "search": true,
+            "trgm": true
+          }
+        ]
+      }
+    }
+  },
+  "seed": [
+    {
+      "body": "alpha beta"
+    },
+    {
+      "body": "alpha one two three four five six seven eight nine ten beta"
+    }
+  ],
+  "op": {
+    "query": {
+      "table": "notes",
+      "search": {
+        "index": "search_body",
+        "query": "alpha beta",
+        "rankMode": "ts_rank"
+      }
+    }
+  },
+  "expect": [
+    {
+      "body": "alpha beta"
+    },
+    {
+      "body": "alpha one two three four five six seven eight nine ten beta"
+    }
+  ],
+  "unordered": true
+}

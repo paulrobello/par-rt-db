@@ -140,6 +140,9 @@ class TableBuilder {
 
     fun softDelete(): TableBuilder = also { extra["softDelete"] = jsonBool(true) }
 
+    /** Append-only table: only insert/insertMany steps are allowed, every other write fails SCHEMA_VIOLATION. */
+    fun insertOnly(): TableBuilder = also { extra["insertOnly"] = jsonBool(true) }
+
     fun build(): JsonObject {
         val out = LinkedHashMap<String, JsonElement>(extra)
         out["fields"] = JsonObject(LinkedHashMap(fields))

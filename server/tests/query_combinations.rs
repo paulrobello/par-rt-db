@@ -105,6 +105,8 @@ fn search_body_x() -> SearchQuery {
         filter: None,
         mode: None,
         snippet: None,
+        rank_mode: None,
+        min_similarity: None,
     }
 }
 

@@ -13,7 +13,7 @@ use crate::auth::PrincipalCtx;
 use crate::ddl::{pg_col, pg_schema, pg_search_col, pg_table, pg_vector_col};
 use crate::dsl::{
     EqBind, HybridSearchQuery, Paginate, PaginatedResult, QueryResult, SearchMode, SearchQuery,
-    VectorSearchQuery,
+    SearchRankMode, VectorSearchQuery,
 };
 use crate::error::RtDbError;
 use crate::pagination::{decode_cursor, encode_cursor};
@@ -234,6 +234,25 @@ pub(crate) fn compile_search(
     // `snippet` needs a tsquery tree to highlight; trgm mode matches raw
     // substrings, so the combination is rejected rather than silently
     // ignored.
+    // Ranking options are mode-specific; a mismatched combination is rejected
+    // rather than silently ignored.
+    if search.rank_mode.is_some() && mode == SearchMode::Trgm {
+        return Err(RtDbError::bad_request(
+            "rankMode is only supported in tsquery mode",
+        ));
+    }
+    if let Some(min) = search.min_similarity {
+        if mode != SearchMode::Trgm {
+            return Err(RtDbError::bad_request(
+                "minSimilarity is only supported in trgm mode",
+            ));
+        }
+        if !(0.0..=1.0).contains(&min) {
+            return Err(RtDbError::bad_request(
+                "minSimilarity must be between 0 and 1",
+            ));
+        }
+    }
     let snippet = search.snippet.unwrap_or(false);
     if snippet && mode == SearchMode::Trgm {
         return Err(RtDbError::bad_request(
@@ -273,9 +292,11 @@ pub(crate) fn compile_search(
     // single-predicate form byte-identical to the pre-filter SQL.
     let mut binds: Vec<EqBind> = Vec::new();
     let mut extra = String::new();
+    // Trgm binds `$1` text, `$2` ILIKE pattern, then (optionally) `$3` the
+    // similarity floor.
     let start = match mode {
         SearchMode::Tsquery => 2usize,
-        SearchMode::Trgm => 3,
+        SearchMode::Trgm => 3 + usize::from(search.min_similarity.is_some()),
     };
     if let Some(filter) = &search.filter {
         let (fragment, filter_binds) = compile_filter(filter, table_def, start, false)?;
@@ -325,10 +346,16 @@ pub(crate) fn compile_search(
     // non-NULL and GREATEST is well-defined. The `created_at`/`id` tiebreaks
     // keep ordering deterministic like the tsquery arm.
     let (match_clause, rank_expr) = match mode {
-        SearchMode::Tsquery => (
-            format!("\"{sv_col}\" @@ {tsq}"),
-            format!("ts_rank(\"{sv_col}\", {tsq})"),
-        ),
+        SearchMode::Tsquery => {
+            let rank_fn = match search.rank_mode {
+                Some(SearchRankMode::TsRankCd) => "ts_rank_cd",
+                Some(SearchRankMode::TsRank) | None => "ts_rank",
+            };
+            (
+                format!("\"{sv_col}\" @@ {tsq}"),
+                format!("{rank_fn}(\"{sv_col}\", {tsq})"),
+            )
+        }
         SearchMode::Trgm => {
             let ilike = index_def
                 .fields
@@ -342,7 +369,13 @@ pub(crate) fn compile_search(
                 .map(|field_name| format!("similarity(\"{}\", $1)", pg_col(field_name)))
                 .collect::<Vec<_>>()
                 .join(", ");
-            (format!("({ilike})"), format!("GREATEST({sim})"))
+            let rank = format!("GREATEST({sim})");
+            let matched = if search.min_similarity.is_some() {
+                format!("({ilike}) AND {rank} >= $3::real")
+            } else {
+                format!("({ilike})")
+            };
+            (matched, rank)
         }
     };
 
@@ -390,6 +423,9 @@ pub(crate) fn compile_search(
     all.push(EqBind::Text(search.query.clone()));
     if mode == SearchMode::Trgm {
         all.push(EqBind::Text(format!("%{}%", search.query)));
+        if let Some(min) = search.min_similarity {
+            all.push(EqBind::Num(min));
+        }
     }
     all.extend(binds);
     all.extend(cursor_binds);

@@ -88,9 +88,9 @@ pub use wire::{
     AggregateGroup, AggregateGroupsTruncated, AggregateOp, AggregateSpec, AuthedUser,
     AwaitSignalSpec, ChangeFeedResponse, ChangeOp, ClaimedSchedule, ClientMessage, FilterExpr,
     HavingCmp, HostCapability, OutcomeStatus, PresenceMember, ScheduleInfo, ScheduleKind,
-    ScheduleStatus, ScheduleWhen, SearchMode, SearchQuery, ServerMessage, StepOutcome, StepRetry,
-    UserKind, VectorSearchQuery, WorkflowInfo, WorkflowInfoFull, WorkflowSpec, WorkflowStatus,
-    WorkflowStepSpec,
+    ScheduleStatus, ScheduleWhen, SearchMode, SearchQuery, SearchRankMode, ServerMessage,
+    StepOutcome, StepRetry, UserKind, VectorSearchQuery, WorkflowInfo, WorkflowInfoFull,
+    WorkflowSpec, WorkflowStatus, WorkflowStepSpec,
 };
 
 #[cfg(feature = "http")]

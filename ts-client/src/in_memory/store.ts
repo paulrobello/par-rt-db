@@ -132,6 +132,20 @@ async function toUint8Array(body: UploadInput): Promise<Uint8Array> {
 export const MAX_STEPS = 1024;
 /** Hard cap on rows a single `patchByQuery`/`deleteByQuery` step may touch.
  * Mirrors server `txn::MAX_BY_QUERY_ROWS`; a larger match set is truncated. */
+/** Step ops an `insertOnly` table rejects with SCHEMA_VIOLATION (everything that
+ *  modifies or removes an existing row; `insert`/`insertMany` stay allowed). */
+const INSERT_ONLY_BLOCKED_OPS: ReadonlySet<string> = new Set([
+  "patch",
+  "adjustCounter",
+  "replace",
+  "delete",
+  "undelete",
+  "upsert",
+  "upsertMany",
+  "patchByQuery",
+  "deleteByQuery",
+]);
+
 const MAX_BY_QUERY_ROWS = 1000;
 
 function checkBulkLen(op: string, len: number): void {
@@ -2181,6 +2195,15 @@ export class InMemoryRtDbClient {
       return { result: { cancelled } };
     }
     const table = step.table;
+    // `insertOnly` gate (mirrors server `enforce_insert_only`): runs first for
+    // the step, per top-level step only, so schema-driven removals (cascade,
+    // TTL reaping) that never pass through here stay sanctioned.
+    if (INSERT_ONLY_BLOCKED_OPS.has(step.op) && this.schema?.tables[table]?.insertOnly) {
+      throw new RtDbError(
+        "SCHEMA_VIOLATION",
+        `table '${table}' is insertOnly: only insert and insertMany are allowed`,
+      );
+    }
     switch (step.op) {
       case "insert": {
         const tableDef = this.requireTable(table);

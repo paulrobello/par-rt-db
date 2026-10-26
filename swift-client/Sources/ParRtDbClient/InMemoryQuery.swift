@@ -1133,6 +1133,7 @@ private func executeSearchTerminal(
             code: .badRequest, message: "snippet is only supported in tsquery mode"
         )
     }
+    try validateSearchRanking(search)
     let limit = query.take.map(Int.init) ?? maxQueryTake
 
     struct Scored {
@@ -1163,7 +1164,7 @@ private func executeSearchTerminal(
                     }
                 }
             }
-            if best > 0 {
+            if best > 0, best >= (search.minSimilarity ?? 0) {
                 scored.append(Scored(row: row, score: best, snippet: nil))
             }
         }

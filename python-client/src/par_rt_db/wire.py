@@ -480,6 +480,9 @@ FilterExpr = Annotated[
 #: wire form); a value outside the set is rejected at parse time.
 SearchMode = Literal["tsquery", "trgm"]
 
+#: Tsquery-mode ranking function for ``search`` (wire ``"ts_rank"`` | ``"ts_rank_cd"``).
+SearchRankMode = Literal["ts_rank", "ts_rank_cd"]
+
 
 class SearchQuery(_Camel):
     """Full-text search terminal: ``{index, query, filter?, mode?, snippet?}``.
@@ -505,6 +508,10 @@ class SearchQuery(_Camel):
     filter: FilterExpr | None = None
     mode: SearchMode | None = None
     snippet: bool | None = None
+    # Tsquery-mode ranking function; rejected in trgm mode.
+    rank_mode: SearchRankMode | None = None
+    # Trgm-mode similarity floor in 0..=1; rejected in tsquery mode.
+    min_similarity: float | None = None
 
     @model_serializer(mode="wrap")
     def _drop_none_optionals(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
@@ -515,6 +522,10 @@ class SearchQuery(_Camel):
             out.pop("mode", None)
         if out.get("snippet") is None:
             out.pop("snippet", None)
+        if out.get("rankMode") is None:
+            out.pop("rankMode", None)
+        if out.get("minSimilarity") is None:
+            out.pop("minSimilarity", None)
         return out
 
 

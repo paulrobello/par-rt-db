@@ -28,6 +28,7 @@
 * [Durable workflows](#durable-workflows)
 * [Change feed](#change-feed)
 * [Computed fields](#computed-fields)
+* [Append-only tables](#append-only-tables-insertonly)
 * [Field constraints](#field-constraints)
 * [Realtime presence](#realtime-presence)
 * [Make targets](#make-targets)
@@ -671,7 +672,13 @@ websearch syntax — quoted phrases require adjacency, a bare `or` unions,
 `mode: "trgm"` switches to substring/autocomplete matching — case-insensitive
 `ILIKE` ranked by `pg_trgm` `similarity()`, backed by a GIN trigram index; the
 index **must** declare `trgm: true` at push time — a search index without the
-flag is rejected with `BAD_REQUEST` ("does not declare trgm: true")),
+flag is rejected with `BAD_REQUEST` ("does not declare trgm: true");
+two optional ranking knobs, both omitted from the wire when unset so existing
+requests stay byte-identical: `rankMode: "ts_rank" | "ts_rank_cd"` (tsquery
+mode only; `ts_rank_cd` is cover-density ranking and rewards tighter term
+proximity, `ts_rank` is the default) and `minSimilarity` (trgm mode only, a
+number in `0..=1`; hits whose `similarity()` is below it are dropped). A knob
+used in the wrong mode, or `minSimilarity` outside `0..=1`, is `BAD_REQUEST`),
 `vectorSearch` ranks by
 the index's declared metric distance over a write-maintained pgvector column
 (also accepting an optional full `filter`), `hybridSearch` fuses the full-text
@@ -1314,6 +1321,36 @@ The consumer contract:
 All five client SDKs expose the feed (`listChanges` in TS, `changes()` in
 Rust/Python/Swift/Go) and the admin twin (`adminChanges` in TS/Swift,
 `admin_changes` in Rust/Python, `AdminChanges` in Go).
+
+## Append-only tables (`insertOnly`)
+
+A table may declare `"insertOnly": true` (omitted on the wire when false). Such a
+table is append-only for transaction steps: `insert` and `insertMany` pass, while
+`patch`, `adjustCounter`, `replace`, `delete`, `undelete`, `upsert`, `upsertMany`,
+`patchByQuery`, and `deleteByQuery` targeting it fail with the existing
+`SCHEMA_VIOLATION` code (no new error code) and roll the transaction back. Reads,
+indexes and queries are unchanged, and the flag is not compared by
+destructive-change detection (adding or removing it is an additive push).
+
+Schema-driven and operator paths stay sanctioned:
+
+- **TTL expiry** still reaps rows from an `insertOnly` table.
+- **`onDelete` cascade is exempt (decision).** Deleting a parent row on a regular
+  table still removes (`cascade`) or nulls (`setNull`) its `insertOnly` children,
+  because the cascade is declared in the schema and walks outside the per-step
+  gate. Only a *direct* modifying step on the `insertOnly` table is rejected, so
+  declare `onDelete: restrict` on the reference if children must never be removed
+  by a parent delete.
+- **The admin owner-bypass mutate route** (`POST /admin/db/{db}/mutate`, which the
+  dashboard uses, and the admin WS bypass) is exempt, so operators can still
+  correct or purge rows. Machine tokens, users, and scheduled jobs are gated.
+
+`insertOnly` and `softDelete` are redundant together (every delete is rejected, so
+nothing can be stamped); `undelete` is rejected like any other modifying step.
+Mirrored in all seven implementations (server plus the ts/rust/python/swift/go/
+kotlin clients' schema DSLs and in-memory engines); see the `insert-only-*` /
+`error-insert-only-*` cases in [`wire-corpus/semantics/`](wire-corpus/semantics/)
+and [FEATURE_MATRIX #48](FEATURE_MATRIX.md).
 
 ## Field constraints
 

@@ -1763,3 +1763,118 @@ async fn search_paginate_rejects_a_mismatched_cursor() {
         .expect_err("mismatched cursor rejected");
     assert_eq!(err.code, ErrorCode::BadRequest);
 }
+
+// --- ranking options: rankMode / minSimilarity ---
+
+fn search_with(extra: serde_json::Value, query: &str) -> Query {
+    let mut search = serde_json::json!({"index": "search_content", "query": query});
+    for (k, v) in extra.as_object().expect("object") {
+        search[k] = v.clone();
+    }
+    serde_json::from_value(serde_json::json!({"table": "notes", "search": search}))
+        .expect("search query")
+}
+
+// ts_rank_cd (cover density) rewards tighter proximity: the doc where the two
+// terms are adjacent outranks the doc where they are far apart, and both modes
+// return the same hit set.
+#[tokio::test]
+async fn rank_mode_ts_rank_cd_orders_by_cover_density() {
+    let state = test_state().await;
+    let (db, schema) = fresh_search_db(&state).await;
+    let pool = &state.pool;
+    insert_note(
+        pool,
+        &db,
+        &schema,
+        "far",
+        "alpha one two three four five six seven eight nine ten beta",
+    )
+    .await;
+    insert_note(pool, &db, &schema, "near", "alpha beta").await;
+    let res = execute_query(
+        pool,
+        &db,
+        &schema,
+        &search_with(serde_json::json!({"rankMode": "ts_rank_cd"}), "alpha beta"),
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .expect("ts_rank_cd search");
+    assert_eq!(titles(&res), vec!["near".to_string(), "far".to_string()]);
+    let plain = execute_query(
+        pool,
+        &db,
+        &schema,
+        &search_with(serde_json::json!({"rankMode": "ts_rank"}), "alpha beta"),
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .expect("ts_rank search");
+    assert_eq!(titles(&plain).len(), 2);
+}
+
+// minSimilarity drops trgm hits scoring below the floor; "convex" scores 1.0
+// for "convex" while "convexity in practice" scores far lower.
+#[tokio::test]
+async fn min_similarity_floors_trgm_hits() {
+    let state = test_state().await;
+    let (db, schema) = fresh_search_db(&state).await;
+    let pool = &state.pool;
+    insert_note(pool, &db, &schema, "convex", "").await;
+    insert_note(pool, &db, &schema, "convexity in practice and more", "").await;
+    let q = |extra: serde_json::Value| {
+        let mut e = extra;
+        e["mode"] = serde_json::json!("trgm");
+        search_with(e, "convex")
+    };
+    let all = execute_query(
+        pool,
+        &db,
+        &schema,
+        &q(serde_json::json!({})),
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .expect("trgm all");
+    assert_eq!(titles(&all).len(), 2);
+    let floored = execute_query(
+        pool,
+        &db,
+        &schema,
+        &q(serde_json::json!({"minSimilarity": 0.9})),
+        &PrincipalCtx::bypass(),
+        false,
+    )
+    .await
+    .expect("trgm floored");
+    assert_eq!(titles(&floored), vec!["convex".to_string()]);
+}
+
+#[tokio::test]
+async fn ranking_options_reject_wrong_mode_and_out_of_range() {
+    let state = test_state().await;
+    let (db, schema) = fresh_search_db(&state).await;
+    let cases = [
+        serde_json::json!({"mode": "trgm", "rankMode": "ts_rank_cd"}),
+        serde_json::json!({"minSimilarity": 0.5}),
+        serde_json::json!({"mode": "trgm", "minSimilarity": 1.5}),
+        serde_json::json!({"mode": "trgm", "minSimilarity": -0.1}),
+    ];
+    for extra in cases {
+        let err = execute_query(
+            &state.pool,
+            &db,
+            &schema,
+            &search_with(extra.clone(), "x"),
+            &PrincipalCtx::bypass(),
+            false,
+        )
+        .await
+        .expect_err(&format!("{extra} must be rejected"));
+        assert_eq!(err.code, ErrorCode::BadRequest, "{extra}");
+    }
+}

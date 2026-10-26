@@ -768,7 +768,7 @@ private final class EngineSubscription {
 public final class InMemoryRtDbClient: MigrationStore {
     private let nowFn: @Sendable () -> Int64
     private let randomFn: @Sendable () -> Double
-    private var schema: SchemaDef?
+    var schema: SchemaDef?
     var tables: [String: RowStore] = [:]
     private var idempotency: [String: [JSONValue]] = [:]
     private var subs: [EngineSubscription] = []
@@ -1025,6 +1025,7 @@ public final class InMemoryRtDbClient: MigrationStore {
         var writeSet: Set<String> = []
         do {
             for step in txn.steps {
+                try enforceInsertOnly(step)
                 let execution = try executeStep(step)
                 results.append(execution.result)
                 if let table = execution.table {

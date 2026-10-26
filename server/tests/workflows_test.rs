@@ -624,6 +624,7 @@ async fn spec_bounds_and_allowlist_rejected() -> anyhow::Result<()> {
         tables: Some(vec!["projects".to_string()]),
         host_capability: None,
         enqueuer: None,
+        admin: false,
     };
 
     // The smuggle attempt: a spec whose step txn writes the forbidden table.

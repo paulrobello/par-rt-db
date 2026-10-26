@@ -609,6 +609,8 @@ async fn search_filters_to_own_rows() -> anyhow::Result<()> {
             filter: None,
             mode: None,
             snippet: None,
+            rank_mode: None,
+            min_similarity: None,
         }),
         ..notes_query()
     };

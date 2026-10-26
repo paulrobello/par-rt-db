@@ -50,6 +50,7 @@ from .wire import (
     LookupSpec,
     SearchMode,
     SearchQuery,
+    SearchRankMode,
     VectorSearchQuery,
     to_camel,
 )
@@ -260,6 +261,8 @@ class TableQuery:
         filter_: FilterExpr | None = None,
         mode: SearchMode | None = None,
         snippet: bool | None = None,
+        rank_mode: SearchRankMode | None = None,
+        min_similarity: float | None = None,
     ) -> TableQuery:
         """Full-text search terminal. ``filter_`` is a ``FilterExpr`` (the same
         type ``.filter()`` and ``authorize`` use) that narrows search results
@@ -275,7 +278,11 @@ class TableQuery:
         ``mode="trgm"`` is rejected server-side). ``query`` honors web search
         operators (FM-31): quoted phrases require adjacency, the bare word
         ``or`` unions, ``-term`` excludes. ``mode``/``snippet`` are omitted from
-        the wire when ``None`` so existing requests stay byte-identical."""
+        the wire when ``None`` so existing requests stay byte-identical.
+        ``rank_mode`` (``"ts_rank"`` | ``"ts_rank_cd"``) picks the tsquery
+        ranking function and is rejected with ``mode="trgm"``; ``min_similarity``
+        (0..1) drops trgm hits scoring below it and is rejected outside trgm
+        mode. Both are omitted from the wire when ``None``."""
         payload: dict[str, Any] = {"index": index, "query": query}
         if filter_ is not None:
             payload["filter"] = filter_
@@ -283,6 +290,10 @@ class TableQuery:
             payload["mode"] = mode
         if snippet is not None:
             payload["snippet"] = snippet
+        if rank_mode is not None:
+            payload["rankMode"] = rank_mode
+        if min_similarity is not None:
+            payload["minSimilarity"] = min_similarity
         self._search = SearchQuery.model_validate(payload)
         return self
 

@@ -196,6 +196,29 @@ pub struct SearchQuery {
     /// `Some(true)` adds a `_searchSnippet` per hit (tsquery mode only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snippet: Option<bool>,
+    /// Tsquery-mode ranking function: `ts_rank` (default) or `ts_rank_cd`
+    /// (cover density, rewards tighter term proximity). Rejected in trgm mode.
+    #[serde(default, rename = "rankMode", skip_serializing_if = "Option::is_none")]
+    pub rank_mode: Option<SearchRankMode>,
+    /// Trgm-mode similarity floor in `0..=1`: hits scoring below it are
+    /// dropped. Rejected in tsquery mode.
+    #[serde(
+        default,
+        rename = "minSimilarity",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub min_similarity: Option<f64>,
+}
+
+/// Ranking function for tsquery-mode `search` (wire `"ts_rank"` | `"ts_rank_cd"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchRankMode {
+    /// Term-frequency ranking (the default when `rankMode` is omitted).
+    #[serde(rename = "ts_rank")]
+    TsRank,
+    /// Cover-density ranking: rewards tighter term proximity.
+    #[serde(rename = "ts_rank_cd")]
+    TsRankCd,
 }
 
 /// Match mode for the `search` terminal. `Tsquery` (the default) matches

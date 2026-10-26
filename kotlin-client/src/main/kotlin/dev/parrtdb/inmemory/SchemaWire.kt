@@ -70,6 +70,7 @@ fun tableDefToWire(td: TableDef): JsonElement {
     }
     if (td.computed.isNotEmpty()) out["computed"] = sortedObj(td.computed.mapValues { it.value.toJson() })
     if (td.softDelete) out["softDelete"] = jsonBool(true)
+    if (td.insertOnly) out["insertOnly"] = jsonBool(true)
     td.description?.let { out["description"] = jsonStr(it) }
     td.fieldDescriptions?.takeIf { it.isNotEmpty() }?.let { fd -> out["fieldDescriptions"] = sortedObj(fd.mapValues { jsonStr(it.value) }) }
     return sortedObj(out)

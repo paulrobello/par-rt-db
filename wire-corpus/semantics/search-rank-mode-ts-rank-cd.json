@@ -1,0 +1,52 @@
+{
+  "name": "search-rank-mode-ts-rank-cd",
+  "$comment": "rankMode: \"ts_rank_cd\" (cover-density ranking, rewards tighter term proximity) is accepted in tsquery mode and matches the same hit set as the default; the server orders by ts_rank_cd, the in-memory engines do not rank an unpaginated tsquery search, so the set is compared unordered. The explicit default \"ts_rank\" is accepted too.",
+  "schema": {
+    "tables": {
+      "notes": {
+        "fields": {
+          "body": {
+            "type": "string"
+          }
+        },
+        "indexes": [
+          {
+            "name": "search_body",
+            "fields": [
+              "body"
+            ],
+            "search": true,
+            "trgm": true
+          }
+        ]
+      }
+    }
+  },
+  "seed": [
+    {
+      "body": "alpha beta"
+    },
+    {
+      "body": "alpha one two three four five six seven eight nine ten beta"
+    }
+  ],
+  "op": {
+    "query": {
+      "table": "notes",
+      "search": {
+        "index": "search_body",
+        "query": "alpha beta",
+        "rankMode": "ts_rank_cd"
+      }
+    }
+  },
+  "expect": [
+    {
+      "body": "alpha beta"
+    },
+    {
+      "body": "alpha one two three four five six seven eight nine ten beta"
+    }
+  ],
+  "unordered": true
+}

@@ -475,6 +475,7 @@ async fn scoped_token_cannot_enqueue_forbidden_table() -> anyhow::Result<()> {
         tables: Some(vec!["projects".to_string()]),
         host_capability: None,
         enqueuer: None,
+        admin: false,
     };
 
     // (a) Regression guard: a top-level Insert into workItems is Forbidden

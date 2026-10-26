@@ -83,6 +83,7 @@ func cloneTableDef(in *TableDef) *TableDef {
 		Defaults:   map[string]wire.JSONValue{},
 		Computed:   map[string]wire.ValueExpr{},
 		SoftDelete: in.SoftDelete,
+		InsertOnly: in.InsertOnly,
 	}
 	for k, v := range in.Fields {
 		out.Fields[k] = cloneFieldType(v)
@@ -908,6 +909,9 @@ func tableDefToWire(td *TableDef) (wire.JSONValue, error) {
 	}
 	if td.SoftDelete {
 		out["softDelete"] = wire.Bool(true)
+	}
+	if td.InsertOnly {
+		out["insertOnly"] = wire.Bool(true)
 	}
 	if td.Description != nil {
 		out["description"] = wire.String(*td.Description)

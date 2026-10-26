@@ -1,0 +1,84 @@
+{
+  "name": "insert-only-cascade-delete-exempt",
+  "$comment": "Documented decision: onDelete cascade is schema-driven and EXEMPT from the insertOnly gate. Deleting the parent (a normal table) removes its insertOnly children; only DIRECT delete steps on the insertOnly table are rejected.",
+  "schema": {
+    "tables": {
+      "parents": {
+        "fields": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_name",
+            "fields": [
+              "name"
+            ]
+          }
+        ]
+      },
+      "kids": {
+        "fields": {
+          "parentId": {
+            "type": "id",
+            "table": "parents",
+            "onDelete": "cascade"
+          },
+          "note": {
+            "type": "string"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_parent",
+            "fields": [
+              "parentId"
+            ]
+          }
+        ],
+        "insertOnly": true
+      }
+    }
+  },
+  "seed": [
+    {
+      "table": "parents",
+      "$id": "p1",
+      "doc": {
+        "name": "p"
+      }
+    },
+    {
+      "table": "kids",
+      "doc": {
+        "parentId": {
+          "$idRef": "p1"
+        },
+        "note": "x"
+      }
+    }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "delete",
+          "table": "parents",
+          "id": {
+            "$idRef": "p1"
+          }
+        }
+      ]
+    }
+  },
+  "expect": [
+    null
+  ],
+  "then": {
+    "query": {
+      "table": "kids"
+    },
+    "expect": []
+  }
+}

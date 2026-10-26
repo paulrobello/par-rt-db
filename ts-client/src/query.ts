@@ -12,6 +12,7 @@ import type {
   PaginatedResultJson,
   QueryJson,
   SearchMode,
+  SearchRankMode,
   SearchQuery,
   VectorQuery,
 } from "./protocol.js";
@@ -117,12 +118,21 @@ export class TableQuery<DocT, Indexes extends string> {
    * optional `mode` selects the match strategy — `tsquery` (default, word/stem
    * full-text) or `trgm` (case-insensitive substring, ranked by similarity);
    * the optional `snippet` (FM-31) opts each hit into a `_searchSnippet`
-   * fragment with matched terms wrapped in `<mark>` (tsquery mode only) — all
+   * fragment with matched terms wrapped in `<mark>` (tsquery mode only); the
+   * optional `rankMode` (`ts_rank` | `ts_rank_cd`, tsquery mode only) picks the
+   * ranking function and `minSimilarity` (0..1, trgm mode only) drops hits
+   * scoring below it — all
    * omitted on the wire when absent so existing requests stay byte-identical. */
   search(
     index: string,
     query: string,
-    opts?: { filter?: FilterExpr; mode?: SearchMode; snippet?: boolean },
+    opts?: {
+      filter?: FilterExpr;
+      mode?: SearchMode;
+      snippet?: boolean;
+      rankMode?: SearchRankMode;
+      minSimilarity?: number;
+    },
   ): TableQuery<DocT, Indexes> {
     const search: SearchQuery = {
       index,
@@ -130,6 +140,8 @@ export class TableQuery<DocT, Indexes extends string> {
       ...(opts?.filter ? { filter: opts.filter } : {}),
       ...(opts?.mode ? { mode: opts.mode } : {}),
       ...(opts?.snippet !== undefined ? { snippet: opts.snippet } : {}),
+      ...(opts?.rankMode !== undefined ? { rankMode: opts.rankMode } : {}),
+      ...(opts?.minSimilarity !== undefined ? { minSimilarity: opts.minSimilarity } : {}),
     };
     return new TableQuery({ ...this.json, search });
   }

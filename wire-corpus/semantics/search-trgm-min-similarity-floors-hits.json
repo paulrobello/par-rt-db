@@ -1,0 +1,49 @@
+{
+  "name": "search-trgm-min-similarity-floors-hits",
+  "$comment": "minSimilarity (trgm mode only, 0..1) drops hits whose similarity is below the floor: both rows contain the substring 'convex' but only the exact-match row clears 0.9 (the long row scores about 0.2 in every engine).",
+  "schema": {
+    "tables": {
+      "notes": {
+        "fields": {
+          "body": {
+            "type": "string"
+          }
+        },
+        "indexes": [
+          {
+            "name": "search_body",
+            "fields": [
+              "body"
+            ],
+            "search": true,
+            "trgm": true
+          }
+        ]
+      }
+    }
+  },
+  "seed": [
+    {
+      "body": "convex"
+    },
+    {
+      "body": "convexity in practice and more"
+    }
+  ],
+  "op": {
+    "query": {
+      "table": "notes",
+      "search": {
+        "index": "search_body",
+        "query": "convex",
+        "mode": "trgm",
+        "minSimilarity": 0.9
+      }
+    }
+  },
+  "expect": [
+    {
+      "body": "convex"
+    }
+  ]
+}

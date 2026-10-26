@@ -233,7 +233,28 @@ impl TableQuery {
             filter: opts.filter,
             mode: opts.mode,
             snippet: opts.snippet,
+            rank_mode: None,
+            min_similarity: None,
         });
+        self
+    }
+
+    /// Tsquery-mode ranking function for the `search` terminal (`ts_rank_cd`
+    /// rewards tighter term proximity). No-op without a `search` terminal;
+    /// omitted on the wire when unset.
+    pub fn search_rank_mode(mut self, mode: crate::wire::SearchRankMode) -> Self {
+        if let Some(search) = self.q.search.as_mut() {
+            search.rank_mode = Some(mode);
+        }
+        self
+    }
+
+    /// Trgm-mode similarity floor (`0..=1`) for the `search` terminal. No-op
+    /// without a `search` terminal; omitted on the wire when unset.
+    pub fn search_min_similarity(mut self, min: f64) -> Self {
+        if let Some(search) = self.q.search.as_mut() {
+            search.min_similarity = Some(min);
+        }
         self
     }
 

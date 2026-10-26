@@ -47,6 +47,40 @@ pub const MAX_STEPS: usize = 1024;
 /// Recursive step count; the total tree must stay within `MAX_STEPS`. Thin
 /// wrapper over [`par_rt_db_core::engine::count_steps`] (ARC-004 follow-up) —
 /// see its doc comment for the full recursion semantics.
+/// `insertOnly` gate: a step that modifies or removes an existing row of an
+/// append-only table fails with `SCHEMA_VIOLATION` unless the caller is the
+/// admin owner-bypass. Runs per top-level step only, so schema-driven
+/// removals (`onDelete` cascade, TTL reaping) that never pass through here
+/// stay sanctioned.
+fn enforce_insert_only(
+    ctx: &PrincipalCtx,
+    schema: &SchemaDef,
+    table: &str,
+    step: &Step,
+) -> Result<(), RtDbError> {
+    let mutates_existing = matches!(
+        step,
+        Step::Patch { .. }
+            | Step::AdjustCounter { .. }
+            | Step::Replace { .. }
+            | Step::Delete { .. }
+            | Step::Undelete { .. }
+            | Step::Upsert { .. }
+            | Step::UpsertMany { .. }
+            | Step::PatchByQuery { .. }
+            | Step::DeleteByQuery { .. }
+    );
+    if !mutates_existing || ctx.admin {
+        return Ok(());
+    }
+    if schema.tables.get(table).is_some_and(|def| def.insert_only) {
+        return Err(RtDbError::schema(format!(
+            "table '{table}' is insertOnly: only insert and insertMany are allowed"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn count_steps(txn: &Transaction) -> usize {
     par_rt_db_core::engine::count_steps(txn)
 }
@@ -489,6 +523,7 @@ pub async fn execute_txn_with_side(
             // NESTED steps recursively in `step_schedule`.
             if let Some(table) = step.table() {
                 authorize_table(sctx.ctx, table)?;
+                enforce_insert_only(sctx.ctx, sctx.schema, table, step)?;
             }
             match step {
                 Step::Insert { table, doc } => step_insert(&mut sctx, table, doc).await?,

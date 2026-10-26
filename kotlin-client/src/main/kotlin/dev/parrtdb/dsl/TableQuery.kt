@@ -2,6 +2,7 @@ package dev.parrtdb.dsl
 
 import dev.parrtdb.wire.AggregateOp
 import dev.parrtdb.wire.AggregateSpec
+import dev.parrtdb.wire.HavingCmp
 import dev.parrtdb.wire.FilterExpr
 import dev.parrtdb.wire.GroupBy
 import dev.parrtdb.wire.HybridSearchQuery
@@ -54,6 +55,12 @@ class TableQuery private constructor(private val q: Query) {
 
     fun aggregateGroupByFields(op: AggregateOp, vararg fields: String): TableQuery =
         TableQuery(q.copy(aggregate = AggregateSpec(op = op, groupBy = GroupBy.Fields(fields.toList()))))
+
+    /** Adds a post-group `having` bound for [name] (an alias, or the op name); no-op without an aggregate. */
+    fun having(name: String, cmp: HavingCmp): TableQuery {
+        val spec = q.aggregate ?: return this
+        return TableQuery(q.copy(aggregate = spec.copy(having = (spec.having ?: emptyMap()) + (name to cmp))))
+    }
 
     /** Named multi-op aggregate, e.g. `mapOf("total" to AggregateOp.Sum, "n" to AggregateOp.Count)`. */
     fun aggregates(aggregates: Map<String, AggregateOp>, groupBy: GroupBy = GroupBy.Flag(false)): TableQuery =

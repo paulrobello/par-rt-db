@@ -53,6 +53,7 @@ type (
 	Order             = wire.Order
 	Paginate          = wire.Paginate
 	SearchMode        = wire.SearchMode
+	SearchRankMode    = wire.SearchRankMode
 	SearchQuery       = wire.SearchQuery
 	VectorSearchQuery = wire.VectorSearchQuery
 	HybridSearchQuery = wire.HybridSearchQuery

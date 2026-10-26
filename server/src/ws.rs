@@ -543,7 +543,7 @@ async fn authorize_op(
     let admin = is_admin(pool, principal).await;
     if admin {
         session_still_valid(pool, principal).await?;
-        Ok((PrincipalCtx::bypass(), true))
+        Ok((PrincipalCtx::admin_bypass(), true))
     } else {
         authorize(pool, principal, db).await?;
         Ok((principal.row_ctx(), false))
