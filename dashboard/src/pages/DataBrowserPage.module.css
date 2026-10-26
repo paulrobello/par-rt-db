@@ -356,3 +356,17 @@
   border-color: var(--warn);
   background: color-mix(in srgb, var(--warn) 8%, transparent);
 }
+
+/* Document editor */
+.textareaInvalid {
+  border-color: var(--error);
+}
+.textarea:focus-visible {
+  border-color: var(--accent);
+}
+/* Soft-deleted rows read as struck-through, dimmed history. */
+.rowDeleted td:not(:last-child) {
+  color: var(--ink-3);
+  text-decoration: line-through;
+  text-decoration-color: var(--rule-strong);
+}

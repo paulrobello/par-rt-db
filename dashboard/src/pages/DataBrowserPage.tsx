@@ -1,6 +1,6 @@
 /** Live data browser — subscribe to a table, paginate via cursor, and render each row's cells. */
 
-import type { ChangeOp, SchemaJson, TransactionJson } from "@par-rt-db/client";
+import { type ChangeOp, RtDbError, type SchemaJson, type TransactionJson } from "@par-rt-db/client";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { Button, LiveValue, Placard, Spinner, StatusLamp } from "../components/ui";
@@ -21,6 +21,11 @@ import s from "./DataBrowserPage.module.css";
 const TAKE_OPTIONS = [50, 100, 200];
 const HISTORY_SCAN_LIMIT = 5000;
 
+/** Surfaces the server's wire `{code, message}` envelope verbatim. */
+export function formatWriteError(e: unknown): string {
+  return e instanceof RtDbError ? `${e.code}: ${e.message}` : toErrorMessage(e);
+}
+
 function cellText(v: unknown): string {
   if (v === null) return "null";
   if (typeof v === "object") return JSON.stringify(v);
@@ -34,7 +39,15 @@ export function DataBrowserPage() {
   const [schemaError, setSchemaError] = useState<string | null>(null);
   const [order, setOrder] = useState<"asc" | "desc">("desc");
   const [take, setTake] = useState(100);
-  const { docs, loading, error, live, refresh } = useLiveTable(db, table, order, take);
+  const [showDeleted, setShowDeleted] = useState(false);
+  const isSoftDelete = !!schema?.tables[table]?.softDelete;
+  const { docs, loading, error, live, deletedIds, refresh } = useLiveTable(
+    db,
+    table,
+    order,
+    take,
+    showDeleted && isSoftDelete,
+  );
 
   const fields = useMemo(() => {
     const t = schema?.tables[table];
@@ -76,8 +89,9 @@ export function DataBrowserPage() {
     };
   }, [client, db]);
 
-  const [insertOpen, setInsertOpen] = useState(false);
-  const [insertDoc, setInsertDoc] = useState("{}");
+  // Editor: null = closed, "new" = create, otherwise the document id being edited.
+  const [editTarget, setEditTarget] = useState<string | null>(null);
+  const editDoc = docs.find((doc) => doc._id === editTarget);
   const [patchOpen, setPatchOpen] = useState(false);
   const [patchId, setPatchId] = useState("");
   const [patchFields, setPatchFields] = useState("{}");
@@ -95,22 +109,11 @@ export function DataBrowserPage() {
       await refresh();
       return true;
     } catch (e) {
-      setMutError(toErrorMessage(e));
+      setMutError(formatWriteError(e));
       return false;
     } finally {
       setMutBusy(false);
     }
-  }
-
-  async function doInsert() {
-    let doc: Record<string, unknown>;
-    try {
-      doc = JSON.parse(insertDoc);
-    } catch {
-      setMutError("invalid JSON for document");
-      return;
-    }
-    if (await mutate([{ op: "insert", table, doc }])) setInsertOpen(false);
   }
 
   async function doPatch() {
@@ -126,6 +129,10 @@ export function DataBrowserPage() {
       return;
     }
     if (await mutate([{ op: "patch", table, id: patchId.trim(), fields: f }])) setPatchOpen(false);
+  }
+
+  async function doUndelete(id: string) {
+    await mutate([{ op: "undelete", table, id }]);
   }
 
   async function doDelete(id: string) {
@@ -184,19 +191,29 @@ export function DataBrowserPage() {
         <Button
           onClick={() => {
             setPatchOpen(false);
-            setInsertOpen((v) => !v);
+            setEditTarget((v) => (v === "new" ? null : "new"));
           }}
         >
-          Insert
+          New document
         </Button>
         <Button
           onClick={() => {
-            setInsertOpen(false);
+            setEditTarget(null);
             setPatchOpen((v) => !v);
           }}
         >
           Patch
         </Button>
+        {isSoftDelete && (
+          <label className={s.take}>
+            <input
+              type="checkbox"
+              checked={showDeleted}
+              onChange={(e) => setShowDeleted(e.target.checked)}
+            />
+            <span>show deleted</span>
+          </label>
+        )}
         <Button onClick={() => void refresh()}>Refresh</Button>
         <Button
           disabled={loading || !!error || docs.length === 0}
@@ -228,20 +245,18 @@ export function DataBrowserPage() {
           busy={mutBusy}
         />
       )}
-      {insertOpen && (
-        <div className={s.composer}>
-          <Placard>Insert document</Placard>
-          <textarea
-            className={s.textarea}
-            value={insertDoc}
-            onChange={(e) => setInsertDoc(e.target.value)}
-            spellCheck={false}
-            rows={8}
-          />
-          <Button variant="primary" onClick={doInsert} disabled={mutBusy}>
-            Insert
-          </Button>
-        </div>
+      {editTarget && (editTarget === "new" || editDoc) && (
+        <DocumentEditorPanel
+          key={`${db}/${table}/${editTarget}`}
+          db={db}
+          table={table}
+          doc={editTarget === "new" ? null : (editDoc ?? null)}
+          onClose={() => setEditTarget(null)}
+          onSaved={async () => {
+            await refresh();
+          }}
+          onOpenHistory={(id) => setHistoryId(id)}
+        />
       )}
       {patchOpen && (
         <div className={s.composer}>
@@ -293,7 +308,10 @@ export function DataBrowserPage() {
             </thead>
             <tbody>
               {docs.map((doc) => (
-                <tr key={doc._id} className={doc._id === freshId ? s.rowFresh : undefined}>
+                <tr
+                  key={doc._id}
+                  className={`${doc._id === freshId ? s.rowFresh : ""} ${deletedIds.has(doc._id) ? s.rowDeleted : ""}`}
+                >
                   {cols.map((c) => (
                     <td
                       key={c}
@@ -308,6 +326,18 @@ export function DataBrowserPage() {
                     </td>
                   ))}
                   <td className={s.actions}>
+                    {!deletedIds.has(doc._id) && (
+                      <button
+                        type="button"
+                        className={s.linkBtn}
+                        onClick={() => {
+                          setPatchOpen(false);
+                          setEditTarget(doc._id);
+                        }}
+                      >
+                        Edit
+                      </button>
+                    )}
                     <button
                       type="button"
                       className={s.linkBtn}
@@ -315,7 +345,16 @@ export function DataBrowserPage() {
                     >
                       History
                     </button>
-                    {confirmId === doc._id ? (
+                    {deletedIds.has(doc._id) ? (
+                      <button
+                        type="button"
+                        className={s.linkBtn}
+                        onClick={() => void doUndelete(doc._id)}
+                        disabled={mutBusy}
+                      >
+                        undelete
+                      </button>
+                    ) : confirmId === doc._id ? (
                       <>
                         <button
                           type="button"
@@ -565,5 +604,136 @@ function DocumentHistoryPanel({
         </>
       )}
     </div>
+  );
+}
+
+/**
+ * JSON editor for one document (edit) or a new one (create). Edit saves as
+ * `expectVersion` + `replace` through the admin mutate surface, so a concurrent
+ * write is rejected instead of clobbered. A server rejection is shown as its
+ * wire `{code, message}` envelope and nothing is saved. Every write lands in
+ * the change feed, which the History panel reads as the audit trail.
+ */
+function DocumentEditorPanel({
+  db,
+  table,
+  doc,
+  onClose,
+  onSaved,
+  onOpenHistory,
+}: {
+  db: string;
+  table: string;
+  doc: Record<string, unknown> | null;
+  onClose: () => void;
+  onSaved: () => Promise<void>;
+  onOpenHistory: (id: string) => void;
+}) {
+  const { client } = useAdmin();
+  const original = useMemo(() => (doc ? documentBody(doc) : {}), [doc]);
+  const [text, setText] = useState(() => JSON.stringify(original, null, 2));
+  const [busy, setBusy] = useState(false);
+  const [rejection, setRejection] = useState<string | null>(null);
+  // Version at open time: the optimistic-concurrency guard for the replace.
+  const [openedVersion] = useState(() => (typeof doc?._version === "number" ? doc._version : null));
+  const id = typeof doc?._id === "string" ? doc._id : null;
+
+  const parsed = useMemo<
+    { ok: true; value: Record<string, unknown> } | { ok: false; reason: string }
+  >(() => {
+    try {
+      const v: unknown = JSON.parse(text);
+      if (v === null || typeof v !== "object" || Array.isArray(v))
+        return { ok: false, reason: "A document must be a JSON object." };
+      return { ok: true, value: v as Record<string, unknown> };
+    } catch (e) {
+      return { ok: false, reason: toErrorMessage(e) };
+    }
+  }, [text]);
+  const differences = parsed.ok ? diffDocuments(original, parsed.value) : [];
+  const canSave = parsed.ok && !busy && (id === null || differences.length > 0);
+
+  async function save() {
+    if (!parsed.ok) return;
+    setBusy(true);
+    setRejection(null);
+    try {
+      if (id === null) {
+        await client.adminMutate(db, { steps: [{ op: "insert", table, doc: parsed.value }] });
+      } else {
+        await client.adminMutate(db, {
+          steps: [
+            ...(openedVersion !== null
+              ? [{ op: "expectVersion" as const, table, id, version: openedVersion }]
+              : []),
+            { op: "replace", table, id, doc: parsed.value },
+          ],
+        });
+      }
+      await onSaved();
+      // Close on success: reopening picks up the new _version for the next guard.
+      onClose();
+    } catch (e) {
+      setRejection(formatWriteError(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className={s.composer} aria-label={id ? "Edit document" : "New document"}>
+      <div className={s.historyHead}>
+        <Placard>{id ? "Edit document" : "New document"}</Placard>
+        <button type="button" className={s.linkBtn} onClick={onClose}>
+          close
+        </button>
+      </div>
+      {id && (
+        <p className={s.historyHint}>
+          {id} · v{openedVersion ?? "?"} · replaces the whole body. Fields you remove are removed.
+          Saving is rejected if the document changed since you opened it.
+        </p>
+      )}
+      <textarea
+        className={`${s.textarea} ${parsed.ok ? "" : s.textareaInvalid}`}
+        aria-label="Document JSON"
+        aria-invalid={!parsed.ok}
+        value={text}
+        onChange={(e) => {
+          setText(e.target.value);
+        }}
+        spellCheck={false}
+        rows={Math.min(18, Math.max(6, text.split("\n").length + 1))}
+      />
+      {!parsed.ok && (
+        <p className={s.error} role="alert">
+          Invalid JSON: {parsed.reason}
+        </p>
+      )}
+      {parsed.ok && id !== null && (
+        <p className={s.historyHint}>
+          {differences.length === 0
+            ? "No changes."
+            : `${differences.length} field${differences.length === 1 ? "" : "s"} changed: ${differences
+                .map((d) => `${d.field} (${d.kind})`)
+                .join(", ")}`}
+        </p>
+      )}
+      {rejection && (
+        <p className={s.error} role="alert">
+          Rejected, not saved. {rejection}
+        </p>
+      )}
+      <div className={s.tokenRow}>
+        <Button variant="primary" onClick={() => void save()} disabled={!canSave}>
+          {busy ? "saving…" : id ? "Save changes" : "Create document"}
+        </Button>
+        {id && (
+          <button type="button" className={s.linkBtn} onClick={() => onOpenHistory(id)}>
+            View history
+          </button>
+        )}
+      </div>
+    </section>
   );
 }

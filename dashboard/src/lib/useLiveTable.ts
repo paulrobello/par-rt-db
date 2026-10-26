@@ -17,6 +17,8 @@ export interface LiveTableValue {
   error: string | null;
   /** true = true realtime over /sync (OAuth); false = stream-driven refresh with polling fallback. */
   live: boolean;
+  /** Ids of soft-deleted rows; populated only when `includeDeleted` is on. */
+  deletedIds: ReadonlySet<string>;
   refresh: () => Promise<void>;
 }
 
@@ -34,13 +36,17 @@ export function useLiveTable(
   table: string,
   order: "asc" | "desc",
   take: number,
+  includeDeleted = false,
 ): LiveTableValue {
   const { client: admin, ops, connection } = useAdmin();
   const { method } = useSession();
   const [docs, setDocs] = useState<Doc[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const live = method === "oauth";
+  // /sync cannot carry the admin-only includeDeleted flag, so that view always
+  // takes the admin polling path.
+  const live = method === "oauth" && !includeDeleted;
+  const [deletedIds, setDeletedIds] = useState<ReadonlySet<string>>(new Set());
   const refresh = useRef<() => Promise<void>>(async () => {});
   // High-water mark over the `ops` array (newest-first), tracked by the server
   // `ts` of the newest op seen. `ops[0].ts` is monotonic across frames, so a
@@ -78,9 +84,19 @@ export function useLiveTable(
     let cancelled = false;
     const poll = async () => {
       try {
-        const r = await admin.adminQuery(db, query);
+        const r = (await admin.adminQuery(db, query, { includeDeleted })) as Doc[];
+        // The server does not stamp deleted rows in the result. The live-only
+        // window of the same size is a superset of the live rows in the mixed
+        // window (same order), so ids missing from it are the soft-deleted ones.
+        const deleted = new Set<string>();
+        if (includeDeleted) {
+          const liveRows = (await admin.adminQuery(db, query)) as Doc[];
+          const liveIds = new Set(liveRows.map((d) => d._id));
+          for (const d of r) if (!liveIds.has(d._id)) deleted.add(d._id);
+        }
         if (!cancelled) {
-          setDocs(r as Doc[]);
+          setDocs(r);
+          setDeletedIds(deleted);
           setError(null);
         }
       } catch (e) {
@@ -107,7 +123,7 @@ export function useLiveTable(
     return () => {
       cancelled = true;
     };
-  }, [admin, db, table, order, take, live, connection]);
+  }, [admin, db, table, order, take, live, connection, includeDeleted]);
 
   // Stream-driven refresh for the non-live path: when a fresh op frame matches
   // this table, re-poll. Scanned from the newest end back to the high-water `ts`
@@ -139,5 +155,5 @@ export function useLiveTable(
     if (match) void refresh.current();
   }, [ops, db, table, live]);
 
-  return { docs, loading, error, live, refresh: () => refresh.current() };
+  return { docs, loading, error, live, deletedIds, refresh: () => refresh.current() };
 }
