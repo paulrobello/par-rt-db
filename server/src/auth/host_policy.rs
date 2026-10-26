@@ -24,6 +24,13 @@ struct Address<'a> {
     project: &'a str,
 }
 
+/// Parses `name@host:project`. `*` is valid ONLY in the name position, and
+/// only when `wildcard` is set (`to_addr`). A wildcard project (`*@host:*`) is
+/// rejected by design: this is a contractual restriction of `ParMeshV1`, not a
+/// gap. `routing()` requires `to_addr` to carry the same concrete project as
+/// `target`, and `sql_visibility()`'s read-lane regex likewise allows `*` only
+/// in the name position. Clients expand a project-wide broadcast into concrete
+/// per-project scopes (`*@host:<project>`) instead of storing `*@host:*`.
 fn address(value: &str, wildcard: bool) -> Option<Address<'_>> {
     let (name, rest) = value.split_once('@')?;
     let (host, project) = rest.split_once(':')?;

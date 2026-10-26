@@ -539,6 +539,12 @@ schema lacks the expected fields:
   restricted subscription whose token is revoked or expired stops receiving data, not just
   losing the ability to issue new requests.
 
+**Wildcard grammar (contractual under `parMeshV1`).** In `to_addr`, `*` is valid only in the
+name position (`*@host:<project>`). A wildcard project (`*@host:*`) is rejected by design:
+routing requires `to_addr` to carry the same concrete project as the message's `target`, and
+the read-visibility lane applies the same rule. Clients expand a broadcast across projects
+into one message per concrete `*@host:<project>` scope.
+
 Deployment rollout constraints (legacy-token bypass, the all-replicas-upgraded
 prerequisite, and the mutation replay-cache generation bump): see
 [deploy/README.md](deploy/README.md#host-machine-authorization-rollout).

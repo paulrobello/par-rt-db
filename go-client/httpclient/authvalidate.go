@@ -15,8 +15,10 @@ import (
 // GET /auth/validate, returning the authed user. Unlike AuthMe (which
 // validates this client's own bearer), this takes the token to validate as
 // an argument and accepts both token kinds — for a trusted backend
-// validating a player's credential. An invalid/expired token surfaces as
-// the standard RtDbError auth envelope.
+// validating a player's credential. A host-restricted machine token (one
+// minted with a hostCapability) is the exception: the server denies it with
+// 403 FORBIDDEN. An invalid/expired token surfaces as the standard RtDbError
+// auth envelope.
 //
 // An EMPTY token is rejected locally (BAD_REQUEST, no HTTP request): Go's
 // HTTP layer trims trailing OWS, so `Bearer ` would arrive at the server as

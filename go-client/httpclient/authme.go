@@ -9,8 +9,14 @@ import (
 	"github.com/paulrobello/par-rt-db/go-client/wire"
 )
 
-// AuthMe resolves the caller's identity (machine token or session cookie).
+// AuthMe resolves the principal this client's credential maps to via
 // GET /auth/me → {user: AuthedUser}.
+//
+// Session-only: the credential must be a user-session bearer or the
+// rtdb_session cookie. Machine tokens are rejected by the server (401
+// "session required") and surface as the standard RtDbError envelope. To
+// validate an arbitrary token (a trusted backend checking a player's
+// credential), use AuthValidate.
 func (c *Client) AuthMe(ctx context.Context) (*wire.AuthedUser, error) {
 	var resp struct {
 		User wire.AuthedUser `json:"user"`
