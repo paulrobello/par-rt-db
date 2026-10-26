@@ -182,6 +182,7 @@ private func loadFixture() throws -> GoldenFixture {
 
 /// Translate the fixture's field-type shorthand into a `FieldType`. Only the
 /// types the fixture uses are implemented; a new shorthand fails loudly.
+// swiftformat:disable redundantReturn
 private func fieldType(fromShorthand shorthand: String) throws -> FieldType {
     switch shorthand {
     case "string": return .string
@@ -199,6 +200,8 @@ private func fieldType(fromShorthand shorthand: String) throws -> FieldType {
         throw GoldenFailure("fixture field type not implemented: \(shorthand)")
     }
 }
+
+// swiftformat:enable redundantReturn
 
 /// The index's vector dimensions when it declares a `vector` spec, else nil.
 private func vectorDimensions(_ index: [String: JSONValue]) -> UInt32? {

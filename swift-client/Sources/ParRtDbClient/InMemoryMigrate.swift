@@ -967,19 +967,19 @@ func applyMigrationDirective(
 ) throws -> (report: DirectiveReport, table: String?) {
     switch directive {
     case let .renameField(table, from, to):
-        return try applyRenameFieldDirective(&planned, table, from, to, store)
+        try applyRenameFieldDirective(&planned, table, from, to, store)
     case let .renameTable(from, to):
-        return try applyRenameTableDirective(&planned, from, to, store)
+        try applyRenameTableDirective(&planned, from, to, store)
     case let .changeType(table, field, to, cast, defaultValue):
-        return try applyChangeTypeDirective(&planned, table, field, to, cast, defaultValue, store)
+        try applyChangeTypeDirective(&planned, table, field, to, cast, defaultValue, store)
     case let .dropField(table, field):
-        return try applyDropFieldDirective(&planned, table, field, store)
+        try applyDropFieldDirective(&planned, table, field, store)
     case let .dropTable(name):
-        return try applyDropTableDirective(&planned, name, store)
+        try applyDropTableDirective(&planned, name, store)
     case let .dropIndex(table, name):
-        return try applyDropIndexDirective(&planned, table, name)
+        try applyDropIndexDirective(&planned, table, name)
     case let .setDefault(table, field, value):
-        return try applySetDefaultDirective(&planned, table, field, value, store)
+        try applySetDefaultDirective(&planned, table, field, value, store)
     case .evalExpr:
         // No SQL engine in the harness — throw rather than silently misbehave
         // (both dual-accept arms, typed and legacy, for the same reason).
