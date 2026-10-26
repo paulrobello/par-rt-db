@@ -5,8 +5,9 @@
 by utility and level of effort so parity work can be picked off in value order.
 **Perspective:** "Utility" is judged for the apps this instance actually serves (kanban
 board, personal SPAs, CLI/agent tooling) — not for a hypothetical SaaS at scale.
-**Sources:** the implemented server (`server/src/`), the five client SDKs
-(`ts-client/`, `rust-client/`, `python-client/`, `swift-client/`, `go-client/`), the
+**Sources:** the implemented server (`server/src/`), the six client SDKs
+(`ts-client/`, `rust-client/`, `python-client/`, `swift-client/`, `go-client/`,
+`kotlin-client/`), the
 `wire-corpus/` semantics corpus, and Convex's documented feature set
 (queries/mutations/actions, scheduling, storage, search, auth, components). The
 2026-07-21 design spec is a historical record, not a source for this matrix.
