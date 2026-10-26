@@ -26,6 +26,7 @@ from ..mutation import (
     _ExpectNoMatch,
     _ExpectVersion,
     _Insert,
+    _InsertMany,
     _is_safe_counter_integer,
     _Patch,
     _PatchByQuery,
@@ -34,6 +35,7 @@ from ..mutation import (
     _StartWorkflow,
     _Undelete,
     _Upsert,
+    _UpsertMany,
 )
 from ..schema import TableDef, _FNumber, _FOptional
 from . import store as _store
@@ -57,6 +59,9 @@ from .store import (
     _cancel_workflow_result as _cancel_workflow_result,
 )
 from .store import (
+    _check_bulk_len as _check_bulk_len,
+)
+from .store import (
     _coerce_index_value as _coerce_index_value,
 )
 from .store import (
@@ -64,6 +69,9 @@ from .store import (
 )
 from .store import (
     _delete_by_query_result as _delete_by_query_result,
+)
+from .store import (
+    _insert_many_result as _insert_many_result,
 )
 from .store import (
     _insert_result as _insert_result,
@@ -91,6 +99,9 @@ from .store import (
 )
 from .store import (
     _strip_unset_optionals as _strip_unset_optionals,
+)
+from .store import (
+    _upsert_many_result as _upsert_many_result,
 )
 from .store import (
     _upsert_result as _upsert_result,
@@ -150,6 +161,44 @@ class _WritesEngine(_Core):
                 table_def = self._require_table(table)
                 new_id = self._do_insert(table, table_def, doc)
                 return _insert_result(new_id), {table}
+            case _InsertMany(table=table, docs=docs):
+                _check_bulk_len("insertMany", len(docs))
+                table_def = self._require_table(table)
+                ids = [self._do_insert(table, table_def, doc) for doc in docs]
+                return _insert_many_result(ids), {table}
+            case _UpsertMany(table=table, index=index, docs=docs):
+                _check_bulk_len("upsertMany", len(docs))
+                table_def = self._require_table(table)
+                index_fields = _require_index(table_def, index).fields
+                many_ids: list[str] = []
+                many_inserted: list[bool] = []
+                for n, doc in enumerate(docs):
+                    missing = [f for f in index_fields if f not in doc]
+                    if missing:
+                        raise RtDbError(
+                            ErrorCode.BAD_REQUEST,
+                            f"upsertMany docs[{n}] is missing indexed field "
+                            f"'{missing[0]}' of index '{index}'",
+                        )
+                    rows = self._eq_lookup(table_def, table, index, [doc[f] for f in index_fields])
+                    if len(rows) > 1:
+                        raise RtDbError(
+                            ErrorCode.PRECONDITION_FAILED, "upsert matched multiple documents"
+                        )
+                    if rows:
+                        merged = apply_patch(
+                            table_def,
+                            rows[0].doc,
+                            _stamp_updated_at(table_def, doc, self._now()),
+                            now=self._now(),
+                        )
+                        self._do_update(table_def, table, rows[0].id, merged)
+                        many_ids.append(rows[0].id)
+                        many_inserted.append(False)
+                    else:
+                        many_ids.append(self._do_insert(table, table_def, doc))
+                        many_inserted.append(True)
+                return _upsert_many_result(many_ids, many_inserted), {table}
             case _Patch(table=table, id=sid, fields=fields):
                 table_def = self._require_table(table)
                 self._do_patch(table_def, table, sid, fields)

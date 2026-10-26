@@ -2364,6 +2364,49 @@ def test_expect_no_match_counts_toward_the_by_query_step_cap() -> None:
     assert "by-query steps" in ei.value.message
 
 
+def test_insert_many_inserts_past_step_cap_and_rolls_back_on_invalid_doc() -> None:
+    c = _new_client()
+    docs = [{"name": f"n{i}", "status": "todo", "order": i} for i in range(40)]
+    [res] = c.mutate(Mutation.builder().insert_many("items", docs).build())
+    assert res is not None
+    assert len(res.model_dump()["ids"]) == 40
+    bad = [{"name": f"z{i}", "status": "todo", "order": i} for i in range(20)]
+    bad[7]["order"] = "x"
+    with pytest.raises(RtDbError) as ei:
+        c.mutate(Mutation.builder().insert_many("items", bad).build())
+    assert ei.value.code is ErrorCode.SCHEMA_VIOLATION
+    assert len(c.run_query(TableQuery("items").build())) == 40
+    too_many = [{"name": f"m{i}", "status": "todo", "order": i} for i in range(1001)]
+    with pytest.raises(RtDbError) as ei2:
+        c.mutate(Mutation.builder().insert_many("items", too_many).build())
+    assert ei2.value.code is ErrorCode.BAD_REQUEST
+
+
+def test_upsert_many_patches_existing_and_inserts_new_by_index_equality() -> None:
+    c = _new_client()
+    c.mutate(
+        Mutation.builder().insert("items", {"name": "a", "status": "todo", "order": 1}).build()
+    )
+    [res] = c.mutate(
+        Mutation.builder()
+        .upsert_many(
+            "items",
+            "by_name",
+            [
+                {"name": "a", "status": "done", "order": 1},
+                {"name": "b", "status": "todo", "order": 2},
+            ],
+        )
+        .build()
+    )
+    assert res is not None
+    assert res.model_dump()["inserted"] == [False, True]
+    assert len(c.run_query(TableQuery("items").build())) == 2
+    with pytest.raises(RtDbError) as ei:
+        c.mutate(Mutation.builder().upsert_many("items", "by_name", [{"status": "x"}]).build())
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+
+
 def test_sec104_rejects_over_budget_by_query_step_count() -> None:
     # Mirrors server `sec104_rejects_over_budget_by_query_step_count`. A txn
     # with MAX_BY_QUERY_STEPS_PER_TXN+1 patchByQuery steps is rejected at the

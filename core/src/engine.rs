@@ -275,6 +275,7 @@ pub fn worst_case_affected(txn: &Transaction, max_by_query_rows: u32) -> usize {
             Step::PatchByQuery { limit, .. } | Step::DeleteByQuery { limit, .. } => {
                 (*limit).unwrap_or(max_by_query_rows).min(max_by_query_rows) as usize
             }
+            Step::InsertMany { docs, .. } | Step::UpsertMany { docs, .. } => docs.len(),
             Step::ExpectBefore { .. }
             | Step::ExpectNoMatch { .. }
             | Step::Schedule { .. }

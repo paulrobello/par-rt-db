@@ -109,11 +109,13 @@ export { Migration } from "./migration.js";
 export type {
   StepCancelScheduleResult,
   StepDeleteByQueryResult,
+  StepInsertManyResult,
   StepInsertResult,
   StepPatchByQueryResult,
   StepResult,
   StepScheduleResult,
   StepStartWorkflowResult,
+  StepUpsertManyResult,
   StepUpsertResult,
 } from "./mutation.js";
 export { awaitSignal, mutation, parseStepResults, TxnBuilder } from "./mutation.js";

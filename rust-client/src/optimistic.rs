@@ -144,7 +144,10 @@ fn project_unfiltered_array(
             // unambiguous to overlay — the authoritative update delivers the
             // restored row. Same fallthrough as the ts-client's switch.
             Step::Undelete { .. } => {}
-            Step::Upsert { .. } | Step::AdjustCounter { .. } => return OptimisticProjection::Skip,
+            Step::Upsert { .. }
+            | Step::UpsertMany { .. }
+            | Step::InsertMany { .. }
+            | Step::AdjustCounter { .. } => return OptimisticProjection::Skip,
             Step::ExpectVersion { .. }
             | Step::ExpectFields { .. }
             | Step::ExpectAbsent { .. }
@@ -188,6 +191,8 @@ fn project_filtered_array(query: &Query, last: &Value, txn: &Transaction) -> Opt
             | Step::Patch { .. }
             | Step::Replace { .. }
             | Step::Upsert { .. }
+            | Step::UpsertMany { .. }
+            | Step::InsertMany { .. }
             | Step::AdjustCounter { .. } => return OptimisticProjection::Skip,
             Step::ExpectVersion { .. }
             | Step::ExpectFields { .. }
@@ -243,7 +248,7 @@ fn project_get(query: &Query, last: &Value, txn: &Transaction) -> OptimisticProj
                     working = Value::Object(d);
                 }
             }
-            Step::Upsert { .. } => return OptimisticProjection::Skip,
+            Step::Upsert { .. } | Step::UpsertMany { .. } => return OptimisticProjection::Skip,
             // A by-query step may patch/delete the target row, but the filter is
             // unevaluable here — decline rather than guess.
             Step::PatchByQuery { .. } | Step::DeleteByQuery { .. } => {
@@ -287,6 +292,8 @@ impl OptimisticStepTable for Step {
             | Step::ExpectVersion { table, .. }
             | Step::ExpectFields { table, .. }
             | Step::Upsert { table, .. }
+            | Step::InsertMany { table, .. }
+            | Step::UpsertMany { table, .. }
             | Step::AdjustCounter { table, .. }
             | Step::PatchByQuery { table, .. }
             | Step::DeleteByQuery { table, .. } => Some(table.as_str()),

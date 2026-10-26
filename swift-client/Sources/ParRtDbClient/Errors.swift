@@ -92,6 +92,12 @@ func uint32(_ value: Int, _ name: String) throws -> UInt32 {
     return exact
 }
 
+/// Optional-count variant of `uint32` for `patchByQuery`/`deleteByQuery`
+/// limits, shared the same way.
+func uint32Opt(_ value: Int?, _ name: String) throws -> UInt32? {
+    try value.map { try uint32($0, name) }
+}
+
 /// Retry helper for optimistic-concurrency conflicts (rust-client/src/error.rs
 /// `retry_on_precondition`): runs `body` up to `attempts` times, retrying only
 /// when it throws an `RtDbError` whose code is PRECONDITION_FAILED. Any other

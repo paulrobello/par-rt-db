@@ -69,6 +69,8 @@ public func worstCaseAffected(_ txn: Transaction) -> Int {
         switch step {
         case let .patchByQuery(_, _, _, limit), let .deleteByQuery(_, _, limit):
             total += min(Int(limit ?? UInt32(InMemoryLimits.maxByQueryRows)), InMemoryLimits.maxByQueryRows)
+        case let .insertMany(_, docs), let .upsertMany(_, _, docs):
+            total += docs.count
         case .expectBefore, .expectNoMatch, .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
             continue // control-flow: touches no documents
         default:
@@ -1635,7 +1637,8 @@ public final class InMemoryRtDbClient: MigrationStore {
         case .expectBefore, .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
             try executeControlFlowStep(step)
         case .insert, .patch, .adjustCounter, .replace, .delete, .undelete,
-             .expectVersion, .expectFields, .expectAbsent, .expectNoMatch, .upsert, .patchByQuery,
+             .expectVersion, .expectFields, .expectAbsent, .expectNoMatch, .upsert, .insertMany,
+             .upsertMany, .patchByQuery,
              .deleteByQuery:
             try executeTableStep(step)
         }
@@ -1645,17 +1648,18 @@ public final class InMemoryRtDbClient: MigrationStore {
     private func executeControlFlowStep(_ step: Step) throws -> StepExecution {
         switch step {
         case .expectBefore:
-            return StepExecution(result: .null, table: nil, extraTables: [])
+            StepExecution(result: .null, table: nil, extraTables: [])
         case let .schedule(when, txn, external):
-            return try stepSchedule(when, txn, external ?? false)
+            try stepSchedule(when, txn, external ?? false)
         case let .cancelSchedule(id):
-            return stepCancelSchedule(id)
+            stepCancelSchedule(id)
         case let .startWorkflow(spec):
-            return try stepStartWorkflow(spec)
+            try stepStartWorkflow(spec)
         case let .cancelWorkflow(id):
-            return stepCancelWorkflow(id)
+            stepCancelWorkflow(id)
         case .insert, .patch, .adjustCounter, .replace, .delete, .undelete,
-             .expectVersion, .expectFields, .expectAbsent, .expectNoMatch, .upsert, .patchByQuery,
+             .expectVersion, .expectFields, .expectAbsent, .expectNoMatch, .upsert, .insertMany,
+             .upsertMany, .patchByQuery,
              .deleteByQuery:
             throw RtDbError(code: .internal, message: "table steps handled by executeTableStep")
         }
@@ -1666,6 +1670,10 @@ public final class InMemoryRtDbClient: MigrationStore {
         switch step {
         case let .insert(table, doc):
             return try stepInsert(table, doc)
+        case let .insertMany(table, docs):
+            return try stepInsertMany(table, docs)
+        case let .upsertMany(table, index, docs):
+            return try stepUpsertMany(table, index, docs)
         case let .patch(table, id, fields):
             return try stepPatch(table, id, fields)
         case let .adjustCounter(table, id, field, delta, minimum, maximum, expected):
@@ -1748,6 +1756,63 @@ public final class InMemoryRtDbClient: MigrationStore {
         let tableDef = try requireTable(table)
         let id = try doInsert(table, tableDef, doc)
         return StepExecution(result: .object(["id": .string(id)]), table: table, extraTables: [])
+    }
+
+    private func checkBulkLen(_ op: String, _ count: Int) throws {
+        if count > InMemoryLimits.maxByQueryRows {
+            throw RtDbError(
+                code: .badRequest,
+                message: "\(op) has \(count) docs, exceeding the limit of \(InMemoryLimits.maxByQueryRows)"
+            )
+        }
+    }
+
+    private func stepInsertMany(
+        _ table: String, _ docs: [[String: JSONValue]]
+    ) throws -> StepExecution {
+        try checkBulkLen("insertMany", docs.count)
+        let tableDef = try requireTable(table)
+        var ids: [JSONValue] = []
+        for doc in docs {
+            try ids.append(.string(doInsert(table, tableDef, doc)))
+        }
+        return StepExecution(result: .object(["ids": .array(ids)]), table: table, extraTables: [])
+    }
+
+    private func stepUpsertMany(
+        _ table: String, _ index: String, _ docs: [[String: JSONValue]]
+    ) throws -> StepExecution {
+        try checkBulkLen("upsertMany", docs.count)
+        let tableDef = try requireTable(table)
+        guard let indexDef = (tableDef.indexes ?? []).first(where: { $0.name == index }) else {
+            throw RtDbError(code: .badRequest, message: "index '\(index)' not found")
+        }
+        var ids: [JSONValue] = []
+        var flags: [JSONValue] = []
+        for (docIndex, doc) in docs.enumerated() {
+            var eq: [JSONValue] = []
+            for field in indexDef.fields {
+                guard let value = doc[field] else {
+                    throw RtDbError(
+                        code: .badRequest,
+                        message: "upsertMany docs[\(docIndex)] is missing indexed field '\(field)' of index '\(index)'"
+                    )
+                }
+                eq.append(value)
+            }
+            let step = try stepUpsert(table, index, eq, doc, doc)
+            guard case let .object(result) = step.result, let id = result["id"],
+                  let inserted = result["inserted"]
+            else {
+                throw RtDbError(code: .internal, message: "upsert returned an unexpected result")
+            }
+            ids.append(id)
+            flags.append(inserted)
+        }
+        return StepExecution(
+            result: .object(["ids": .array(ids), "inserted": .array(flags)]),
+            table: table, extraTables: []
+        )
     }
 
     private func stepPatch(

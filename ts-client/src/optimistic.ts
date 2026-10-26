@@ -157,6 +157,8 @@ function projectUnfilteredArray(
       case "adjustCounter":
         return SKIP;
       case "upsert":
+      case "upsertMany":
+      case "insertMany":
         return SKIP;
       // expectVersion / expectAbsent / expectNoMatch are preconditions with no data effect.
     }
@@ -192,7 +194,9 @@ function projectFilteredArray(
       step.op === "patch" ||
       step.op === "replace" ||
       step.op === "adjustCounter" ||
-      step.op === "upsert"
+      step.op === "upsert" ||
+      step.op === "upsertMany" ||
+      step.op === "insertMany"
     ) {
       return SKIP;
     }
@@ -233,8 +237,10 @@ function projectGet(query: QueryJson, last: unknown, txn: TransactionJson): Opti
       case "adjustCounter":
         return SKIP;
       case "insert":
+      case "insertMany":
         break;
       case "upsert":
+      case "upsertMany":
         return SKIP;
     }
   }

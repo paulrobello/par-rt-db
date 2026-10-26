@@ -12,7 +12,7 @@ use crate::auth::PrincipalCtx;
 use crate::db::now_ms;
 use crate::ddl::pg_table;
 use crate::error::{ErrorCode, RtDbError};
-use crate::schema::{FieldType, SchemaDef, SchemaDefExt};
+use crate::schema::{FieldType, SchemaDef, SchemaDefExt, TableDefExt};
 use crate::txn::{
     EqBind, MAX_BY_QUERY_ROWS, OpKind, WriteSet, apply_defaults, apply_patch, check_owner,
     check_owner_doc, delete_row_cascade, doc_visible_to, stamp_authorize, stamp_auto_increment,
@@ -53,6 +53,77 @@ pub(crate) async fn step_insert(
     table: &str,
     doc: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), RtDbError> {
+    let id = insert_one(sctx, table, doc).await?;
+    sctx.results.push(serde_json::json!({ "id": id }));
+    Ok(())
+}
+
+/// `InsertMany` step: insert every doc in order inside the open transaction.
+/// Any failing doc aborts the whole txn (the caller's `?` rolls back), so the
+/// step is all-or-nothing like every other step. Result: `{"ids": [...]}`.
+pub(crate) async fn step_insert_many(
+    sctx: &mut StepCtx<'_>,
+    table: &str,
+    docs: &[serde_json::Map<String, serde_json::Value>],
+) -> Result<(), RtDbError> {
+    check_bulk_len("insertMany", docs.len())?;
+    let mut ids = Vec::with_capacity(docs.len());
+    for doc in docs {
+        ids.push(insert_one(sctx, table, doc).await?);
+    }
+    sctx.results.push(serde_json::json!({ "ids": ids }));
+    Ok(())
+}
+
+/// `UpsertMany` step: per doc, resolve the row through the full-arity equality
+/// on `index` (eq values read from the doc's own indexed fields), then insert
+/// the doc or merge it into the match, exactly like [`step_upsert`] with
+/// `insert == patch == doc`. Result: `{"ids": [...], "inserted": [bool, ...]}`.
+pub(crate) async fn step_upsert_many(
+    sctx: &mut StepCtx<'_>,
+    table: &str,
+    index: &str,
+    docs: &[serde_json::Map<String, serde_json::Value>],
+) -> Result<(), RtDbError> {
+    check_bulk_len("upsertMany", docs.len())?;
+    let index_fields: Vec<String> = sctx.schema.table(table)?.index(index)?.fields.clone();
+    let mut ids = Vec::with_capacity(docs.len());
+    let mut inserted = Vec::with_capacity(docs.len());
+    for (n, doc) in docs.iter().enumerate() {
+        let mut eq = Vec::with_capacity(index_fields.len());
+        for field in &index_fields {
+            match doc.get(field) {
+                Some(value) => eq.push(value.clone()),
+                None => {
+                    return Err(RtDbError::bad_request(format!(
+                        "upsertMany docs[{n}] is missing indexed field '{field}' of index '{index}'"
+                    )));
+                }
+            }
+        }
+        let (id, was_inserted) = upsert_one(sctx, table, index, &eq, doc, doc).await?;
+        ids.push(id);
+        inserted.push(was_inserted);
+    }
+    sctx.results
+        .push(serde_json::json!({ "ids": ids, "inserted": inserted }));
+    Ok(())
+}
+
+fn check_bulk_len(op: &str, len: usize) -> Result<(), RtDbError> {
+    if len > MAX_BY_QUERY_ROWS as usize {
+        return Err(RtDbError::bad_request(format!(
+            "{op} has {len} docs, exceeding the limit of {MAX_BY_QUERY_ROWS}"
+        )));
+    }
+    Ok(())
+}
+
+async fn insert_one(
+    sctx: &mut StepCtx<'_>,
+    table: &str,
+    doc: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String, RtDbError> {
     let table_def = sctx.schema.table(table)?;
     let now = now_ms();
     let doc = stamp_ttl_default(table_def, doc.clone(), now);
@@ -75,8 +146,7 @@ pub(crate) async fn step_insert(
         Some(Some(&stored)),
         Some(created_at),
     );
-    sctx.results.push(serde_json::json!({ "id": id }));
-    Ok(())
+    Ok(id)
 }
 
 pub(crate) async fn step_patch(
@@ -416,6 +486,20 @@ pub(crate) async fn step_upsert(
     insert: &serde_json::Map<String, serde_json::Value>,
     patch: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), RtDbError> {
+    let (id, inserted) = upsert_one(sctx, table, index, eq, insert, patch).await?;
+    sctx.results
+        .push(serde_json::json!({ "id": id, "inserted": inserted }));
+    Ok(())
+}
+
+async fn upsert_one(
+    sctx: &mut StepCtx<'_>,
+    table: &str,
+    index: &str,
+    eq: &[serde_json::Value],
+    insert: &serde_json::Map<String, serde_json::Value>,
+    patch: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(String, bool), RtDbError> {
     let table_def = sctx.schema.table(table)?;
     let mut rows = eq_lookup(sctx.tx, sctx.pg_schema_name, table_def, table, index, eq).await?;
     if rows.len() > 1 {
@@ -444,8 +528,7 @@ pub(crate) async fn step_upsert(
                 Some(Some(&stored)),
                 Some(created_at),
             );
-            sctx.results
-                .push(serde_json::json!({ "id": id, "inserted": true }));
+            Ok((id, true))
         }
         Some((id, doc_value, created_at)) => {
             let doc = match doc_value {
@@ -472,11 +555,9 @@ pub(crate) async fn step_upsert(
                 Some(Some(&merged)),
                 Some(created_at),
             );
-            sctx.results
-                .push(serde_json::json!({ "id": id, "inserted": false }));
+            Ok((id, false))
         }
     }
-    Ok(())
 }
 
 pub(crate) async fn step_patch_by_query(

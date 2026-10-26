@@ -56,6 +56,16 @@ describe("transaction builder", () => {
     );
   });
 
+  it("builds insertMany and upsertMany steps", () => {
+    const docs = [{ projectId: "p1", title: "a" }];
+    expect(mutation().insertMany("items", docs).build()).toEqual({
+      steps: [{ op: "insertMany", table: "items", docs }],
+    });
+    expect(mutation().upsertMany("items", "by_project_and_title", docs).build()).toEqual({
+      steps: [{ op: "upsertMany", table: "items", index: "by_project_and_title", docs }],
+    });
+  });
+
   it("produces an empty txn when nothing is added", () => {
     expect(mutation().build()).toEqual({ steps: [] });
   });

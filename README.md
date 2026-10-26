@@ -255,7 +255,7 @@ compression.
 | `GET /sync` | first WS frame | WebSocket upgrade. Speaks the realtime protocol (auth, subscribe, mutate, schedule, ping). |
 | `POST /api/query` | Bearer token | One-shot query against a database; see [Query shape](#query-shape). |
 | `POST /api/query-batch` | Bearer token | Fans out N queries in one round trip (per-query error isolation); each slot returns `{ok, result}` or `{ok:false, error}`. |
-| `POST /api/mutate` | Bearer token | One-shot transaction (`insert`/`patch`/`replace`/`delete`/`undelete`/`expectVersion`/`expectFields`/`expectAbsent`/`expectNoMatch`/`expectBefore`/`upsert`/`adjustCounter` + `patchByQuery`/`deleteByQuery` + `schedule`/`cancelSchedule` + `startWorkflow`/`cancelWorkflow` steps). |
+| `POST /api/mutate` | Bearer token | One-shot transaction (`insert`/`patch`/`replace`/`delete`/`undelete`/`expectVersion`/`expectFields`/`expectAbsent`/`expectNoMatch`/`expectBefore`/`upsert`/`adjustCounter` + bulk `insertMany`/`upsertMany` + `patchByQuery`/`deleteByQuery` + `schedule`/`cancelSchedule` + `startWorkflow`/`cancelWorkflow` steps). |
 | `POST /api/mutate-batch` | Bearer token | Fans out N independent transactions in one round trip (per-entry error isolation, deliberately not atomic); each positional slot returns `{ok, results}` or `{ok:false, error}`. Entries may carry their own `idempotencyKey` (per-entry dedup/replay). |
 | `POST /api/schedule` | Bearer token | Schedules a transaction: `afterMs`/`runAt` one-shot, `cron` (5-field, min-first, UTC unless `tz` is given), or `interval` (fixed `everyMs`); returns `{id}`. Pass `"external": true` to create an external-claim job (never internally executed; claimed by an app worker via `/api/schedule/claim` with a fencing token). |
 | `POST /api/schedule/claim` | Bearer token | Atomically claims up to `limit` due external jobs (`leaseMs` lease each), returning `ClaimedSchedule[]` with per-job monotonic `leaseGeneration` fencing tokens. |
@@ -730,7 +730,8 @@ shared core type); pinned by the `lookup-*` semantics-corpus cases.
 `{"steps": [...]}` where each step is tagged by `"op"`: `insert`, `patch`,
 `replace`, `delete`, `undelete` (softDelete tables only — clears the
 `deleted_at` stamp), `expectVersion`, `expectFields`, `expectAbsent`, `expectNoMatch`, `upsert` (per-id, one
-document each), `adjustCounter` (atomically adds a safe-integer delta to a
+document each), the bulk import steps `insertMany` and `upsertMany` (see
+below), `adjustCounter` (atomically adds a safe-integer delta to a
 declared numeric field, with optional `min`/`max` bounds and `expected` row
 fields — see [`docs/atomic-counter.md`](docs/atomic-counter.md)), the
 predicate-driven bulk steps `patchByQuery` and
@@ -749,6 +750,14 @@ missing/terminal run — a no-op, not an error) — see `server/src/txn.rs`.
 `expectFields(table, id, expected)` checks exact values at selected object-key paths without writing the live row or advancing its version. Unasserted fields may change. Missing and null remain distinct, selected objects compare in full, and existing visibility/table scopes apply. See [row-field guards](docs/transaction-field-guards.md) for bounds, ordering, retries and SDK methods.
 
 `expectAbsent` and `upsert` resolve rows through the named index and require **full-index equality**: `eq` carries exactly one value per declared index field, in declaration order. Unlike queries — whose `eq` prefix binds may be followed by range predicates — a prefix is not accepted, and an arity mismatch fails with `BAD_REQUEST` (e.g. "index 'by_room_actor' expects 3 eq value(s), got 2") before any step executes. To guard on a shorter key, declare a second nonunique index over exactly those fields.
+
+The bulk import steps carry many documents in one step, so an import is no longer bounded by one step per document:
+
+- `{"op":"insertMany","table":t,"docs":[...]}` inserts every doc in order, validated and indexed exactly like `insert` (defaults, stamps, computed fields, constraints, unique indexes, per-row auth). The step result is `{"ids":[...]}` in doc order.
+- `{"op":"upsertMany","table":t,"index":i,"docs":[...]}` resolves each doc through the named index's **full equality**, reading the eq values from the doc's own indexed fields (a doc missing one fails `BAD_REQUEST`), then inserts the doc or merges it into the single match like `upsert` with `insert == patch == doc`. The step result is `{"ids":[...],"inserted":[bool,...]}` in doc order.
+- **Row cap.** At most `MAX_BY_QUERY_ROWS` (1000) docs per step; more fails `BAD_REQUEST` before any doc is written. Each doc counts toward the admin `RTDB_MAX_AFFECTED_DOCS` budget and the 10,000-row per-transaction ceiling.
+- **Atomicity.** Any invalid document (schema violation, unique conflict, constraint failure, authorization) aborts the whole transaction with that document's typed error, rolling back the earlier docs of the step and every other step.
+- v1 scope: a step carries documents only, with no interleaved preconditions. Mirrored in all five clients (`insertMany`/`upsertMany` builders and in-memory engines) and pinned by the `txn-insert-many-*` and `txn-upsert-many-*` corpus cases.
 
 The `expectNoMatch` step (`{"op":"expectNoMatch","table":...,"filter":{...}}`) is a predicate-driven precondition: if any live row in `table` that the caller can see matches `filter` (the same `FilterExpr` the by-query steps accept, including `olderThan`), the whole transaction aborts with `PRECONDITION_FAILED` and the fixed message "filter matched an existing document". Otherwise it writes nothing and its step result is `null`. Steps run in order, so an `insert` earlier in the same transaction counts. Client builders expose the idiom as `insertIf(table, doc, { expectNoMatch: filter })`, which emits `expectNoMatch` followed by `insert`. Because the committer serializes writes per database, concurrent overlapping inserts (for example room bookings) admit exactly one. Notes:
 

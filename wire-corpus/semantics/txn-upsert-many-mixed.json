@@ -1,0 +1,110 @@
+{
+  "name": "txn-upsert-many-mixed",
+  "$comment": "upsertMany resolves each doc through the full equality on by_sku (eq values read from the doc): s1 patches the seeded row, s50/s51 insert. `inserted` is deterministic and asserted; `ids` is normalized away.",
+  "schema": {
+    "tables": {
+      "items": {
+        "fields": {
+          "sku": {
+            "type": "string"
+          },
+          "qty": {
+            "type": "number"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_sku",
+            "fields": [
+              "sku"
+            ],
+            "unique": true
+          }
+        ]
+      }
+    }
+  },
+  "seed": [
+    {
+      "sku": "s0",
+      "qty": 0
+    },
+    {
+      "sku": "s1",
+      "qty": 1
+    },
+    {
+      "sku": "s2",
+      "qty": 2
+    }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "upsertMany",
+          "table": "items",
+          "index": "by_sku",
+          "docs": [
+            {
+              "sku": "s1",
+              "qty": 99
+            },
+            {
+              "sku": "s50",
+              "qty": 50
+            },
+            {
+              "sku": "s51",
+              "qty": 51
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "expect": [
+    {
+      "inserted": [
+        false,
+        true,
+        true
+      ]
+    }
+  ],
+  "then": {
+    "query": {
+      "table": "items",
+      "index": "by_sku"
+    },
+    "expect": [
+      {
+        "sku": "s0",
+        "qty": 0
+      },
+      {
+        "sku": "s1",
+        "qty": 99
+      },
+      {
+        "sku": "s2",
+        "qty": 2
+      },
+      {
+        "sku": "s50",
+        "qty": 50
+      },
+      {
+        "sku": "s51",
+        "qty": 51
+      }
+    ]
+  },
+  "normalize": [
+    "_id",
+    "_creationTime",
+    "_version",
+    "id",
+    "ids"
+  ]
+}

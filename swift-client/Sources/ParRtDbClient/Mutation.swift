@@ -70,6 +70,11 @@ public enum Step: Equatable, Codable, Sendable {
     /// (`PRECONDITION_FAILED` otherwise). Writes nothing; pair with an
     /// `insert` for a conditional insert.
     case expectNoMatch(table: String, filter: FilterExpr)
+    /// Bulk insert (at most 1000 docs, atomic); result `{"ids": [...]}`.
+    case insertMany(table: String, docs: [[String: JSONValue]])
+    /// Bulk upsert resolved per doc through the full equality on `index` (eq
+    /// values read from the doc); result `{"ids": [...], "inserted": [...]}`.
+    case upsertMany(table: String, index: String, docs: [[String: JSONValue]])
     /// Insert-or-patch keyed by an index eq-prefix match.
     case upsert(
         table: String, index: String, eq: [JSONValue],
@@ -96,7 +101,7 @@ public enum Step: Equatable, Codable, Sendable {
 
     enum CodingKeys: String, CodingKey, CaseIterable {
         case op, table, doc, id, fields, field, delta, min, max, expected, version, index, eq, insert, patch
-        case filter, limit, when, txn, spec, external, deadlineMs
+        case filter, limit, when, txn, spec, external, deadlineMs, docs
     }
 
     // swiftlint:disable:next cyclomatic_complexity function_body_length
@@ -200,6 +205,25 @@ public enum Step: Equatable, Codable, Sendable {
             self = try .expectNoMatch(
                 table: container.decode(String.self, forKey: .table),
                 filter: container.decode(FilterExpr.self, forKey: .filter)
+            )
+        case "insertMany":
+            try rejectUnknownVariantFields(
+                "Step", variant: payload.tag, keys: payload.keys,
+                allowed: ["op", "table", "docs"]
+            )
+            self = try .insertMany(
+                table: container.decode(String.self, forKey: .table),
+                docs: container.decode([[String: JSONValue]].self, forKey: .docs)
+            )
+        case "upsertMany":
+            try rejectUnknownVariantFields(
+                "Step", variant: payload.tag, keys: payload.keys,
+                allowed: ["op", "table", "index", "docs"]
+            )
+            self = try .upsertMany(
+                table: container.decode(String.self, forKey: .table),
+                index: container.decode(String.self, forKey: .index),
+                docs: container.decode([[String: JSONValue]].self, forKey: .docs)
             )
         case "upsert":
             try rejectUnknownVariantFields(
@@ -334,6 +358,15 @@ public enum Step: Equatable, Codable, Sendable {
             try container.encode("expectNoMatch", forKey: .op)
             try container.encode(table, forKey: .table)
             try container.encode(filter, forKey: .filter)
+        case let .insertMany(table, docs):
+            try container.encode("insertMany", forKey: .op)
+            try container.encode(table, forKey: .table)
+            try container.encode(docs, forKey: .docs)
+        case let .upsertMany(table, index, docs):
+            try container.encode("upsertMany", forKey: .op)
+            try container.encode(table, forKey: .table)
+            try container.encode(index, forKey: .index)
+            try container.encode(docs, forKey: .docs)
         case let .upsert(table, index, eq, insert, patch):
             try container.encode("upsert", forKey: .op)
             try container.encode(table, forKey: .table)
@@ -382,6 +415,10 @@ public enum Step: Equatable, Codable, Sendable {
 /// silently dropping `inserted`. `null` is the result of
 /// patch/delete/expect*/undelete steps.
 public enum StepResult: Equatable, Codable, Sendable {
+    /// `{"ids", "inserted"}` from an upsertMany step.
+    case upsertMany(ids: [String], inserted: [Bool])
+    /// `{"ids"}` from an insertMany step.
+    case insertMany(ids: [String])
     /// `{"id", "inserted"}` from an upsert step.
     case upsert(id: String, inserted: Bool)
     /// `{"id"}` from an insert step.
@@ -416,7 +453,9 @@ public enum StepResult: Equatable, Codable, Sendable {
         // Each shape is tried in rust's declaration order; first match wins.
         // A variant fails when a required field is missing or wrong-typed,
         // exactly like serde's untagged fall-through.
-        if let id = fields["id"]?.stringValue, case let .bool(inserted) = fields["inserted"] {
+        if let bulk = Self.fromBulkIds(fields) {
+            self = bulk
+        } else if let id = fields["id"]?.stringValue, case let .bool(inserted) = fields["inserted"] {
             self = .upsert(id: id, inserted: inserted)
         } else if let id = fields["id"]?.stringValue {
             self = .insert(id: id)
@@ -440,9 +479,45 @@ public enum StepResult: Equatable, Codable, Sendable {
         }
     }
 
+    /// The `ids`-carrying bulk results, tried in rust's declaration order
+    /// (upsertMany before insertMany so a scalar-`ids` body falls through).
+    private static func fromBulkIds(_ fields: [String: JSONValue]) -> StepResult? {
+        if let ids = stringArray(fields["ids"]), let inserted = boolArray(fields["inserted"]) {
+            return .upsertMany(ids: ids, inserted: inserted)
+        }
+        if let ids = stringArray(fields["ids"]) {
+            return .insertMany(ids: ids)
+        }
+        return nil
+    }
+
+    private static func stringArray(_ value: JSONValue?) -> [String]? {
+        guard case let .array(items)? = value else { return nil }
+        let strings = items.compactMap(\.stringValue)
+        return strings.count == items.count ? strings : nil
+    }
+
+    private static func boolArray(_ value: JSONValue?) -> [Bool]? {
+        guard case let .array(items)? = value else { return nil }
+        var out: [Bool] = []
+        for item in items {
+            guard case let .bool(flag) = item else { return nil }
+            out.append(flag)
+        }
+        return out
+    }
+
     public func encode(to encoder: Encoder) throws {
         var container = encoder.singleValueContainer()
         switch self {
+        case let .upsertMany(ids, inserted):
+            try container.encode(
+                JSONValue.object([
+                    "ids": .array(ids.map { .string($0) }), "inserted": .array(inserted.map { .bool($0) })
+                ])
+            )
+        case let .insertMany(ids):
+            try container.encode(JSONValue.object(["ids": .array(ids.map { .string($0) })]))
         case let .upsert(id, inserted):
             try container.encode(JSONValue.object(["id": .string(id), "inserted": .bool(inserted)]))
         case let .insert(id):

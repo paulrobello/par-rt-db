@@ -196,6 +196,8 @@ impl StepTableExt for Step {
     fn table(&self) -> Option<&str> {
         match self {
             Step::Insert { table, .. }
+            | Step::InsertMany { table, .. }
+            | Step::UpsertMany { table, .. }
             | Step::Patch { table, .. }
             | Step::AdjustCounter { table, .. }
             | Step::Replace { table, .. }

@@ -1,4 +1,4 @@
-"""Transaction DSL: ``Step`` (18 ops), ``StepResult``, ``Transaction``,
+"""Transaction DSL: ``Step`` (20 ops), ``StepResult``, ``Transaction``,
 and the ``Mutation`` builder.
 
 Mirrors ``server/src/txn.rs`` (the ``Step`` enum + ``Transaction`` struct +
@@ -9,7 +9,7 @@ Wire shapes (load-bearing — match the server exactly):
 
 * ``Step`` is tagged by ``op`` (camelCase variants: ``insert``/``patch``/``adjustCounter``/
   ``replace``/``delete``/``undelete``/``expectVersion``/``expectFields``/``expectBefore``/``expectAbsent``/
-  ``expectNoMatch``/``upsert``/``patchByQuery``/``deleteByQuery``/``schedule``/
+  ``expectNoMatch``/``insertMany``/``upsertMany``/``upsert``/``patchByQuery``/``deleteByQuery``/``schedule``/
   ``cancelSchedule``/``startWorkflow``/``cancelWorkflow``) with
   ``deny_unknown_fields`` mirrored via ``extra="forbid"``.
 * ``Transaction`` is ``{"steps": Step[]}``; the server caps at 1024 steps —
@@ -66,6 +66,25 @@ class _Insert(_Step):
     op: Literal["insert"] = "insert"
     table: str
     doc: dict[str, Any]
+
+
+class _InsertMany(_Step):
+    """Bulk insert (at most 1000 docs, atomic). Step result ``{"ids": [...]}``."""
+
+    op: Literal["insertMany"] = "insertMany"
+    table: str
+    docs: list[dict[str, Any]]
+
+
+class _UpsertMany(_Step):
+    """Bulk upsert resolved per doc through the full equality on ``index``
+    (eq values come from the doc itself). At most 1000 docs. Step result
+    ``{"ids": [...], "inserted": [...]}``."""
+
+    op: Literal["upsertMany"] = "upsertMany"
+    table: str
+    index: str
+    docs: list[dict[str, Any]]
 
 
 class _Patch(_Step):
@@ -262,7 +281,7 @@ class _CancelWorkflow(_Step):
     id: str
 
 
-#: Discriminated union of all 18 step ops. The ``op`` literal drives dispatch;
+#: Discriminated union of all 20 step ops. The ``op`` literal drives dispatch;
 #: ``deny_unknown_fields`` is per-variant via ``extra="forbid"`` on ``_Step``.
 Step = Annotated[
     (
@@ -277,6 +296,8 @@ Step = Annotated[
         | _ExpectBefore
         | _ExpectAbsent
         | _ExpectNoMatch
+        | _InsertMany
+        | _UpsertMany
         | _Upsert
         | _PatchByQuery
         | _DeleteByQuery
@@ -302,6 +323,31 @@ class Transaction(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     steps: list[Step]
+
+
+class _StepInsertMany(BaseModel):
+    """Per-step result for ``insertMany``: ``{"ids"}``."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+        alias_generator=to_camel,
+    )
+
+    ids: list[str]
+
+
+class _StepUpsertMany(BaseModel):
+    """Per-step result for ``upsertMany``: ``{"ids", "inserted"}`` (parallel lists)."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+        alias_generator=to_camel,
+    )
+
+    ids: list[str]
+    inserted: list[bool]
 
 
 class _StepInsert(BaseModel):
@@ -411,7 +457,9 @@ class _StepStartWorkflowResult(BaseModel):
 #: ``startWorkflow``/``cancelWorkflow`` carry ``{workflowId}`` /
 #: ``{cancelled}`` (the latter shares the cancelSchedule shape).
 StepResult = (
-    _StepUpsert
+    _StepUpsertMany
+    | _StepInsertMany
+    | _StepUpsert
     | _StepInsert
     | _StepPatchByQuery
     | _StepDeleteByQuery
@@ -438,6 +486,19 @@ class _MutationBuilder:
         """Insert step: create a new document in ``table``. The server assigns
         ``id``/``created_at``."""
         self._steps.append(_Insert(table=table, doc=doc))
+        return self
+
+    def insert_many(self, table: str, docs: list[dict[str, Any]]) -> _MutationBuilder:
+        """Bulk insert step: create every doc in ``docs`` (at most 1000, atomic —
+        any invalid doc fails the whole transaction). Result ``{"ids": [...]}``."""
+        self._steps.append(_InsertMany(table=table, docs=docs))
+        return self
+
+    def upsert_many(self, table: str, index: str, docs: list[dict[str, Any]]) -> _MutationBuilder:
+        """Bulk upsert step: each doc is resolved through the full equality on
+        ``index`` (its own indexed fields) and inserted or merged. At most 1000
+        docs. Result ``{"ids": [...], "inserted": [...]}``."""
+        self._steps.append(_UpsertMany(table=table, index=index, docs=docs))
         return self
 
     def patch(self, table: str, id: str, fields: dict[str, Any]) -> _MutationBuilder:

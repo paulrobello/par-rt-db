@@ -4,6 +4,7 @@ package inmemory
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -644,5 +645,58 @@ func TestExpectNoMatchCountsTowardByQueryStepCap(t *testing.T) {
 	re, ok := err.(*rtdberrors.RtDbError)
 	if !ok || re.Code != rtdberrors.CodeBadRequest || !strings.Contains(re.Message, "by-query steps") {
 		t.Fatalf("want BAD_REQUEST by-query cap, got %v", err)
+	}
+}
+
+func bulkDocs(n int) []wire.JSONValue {
+	out := make([]wire.JSONValue, n)
+	for i := range out {
+		out[i] = docObj("name", "n"+strconv.Itoa(i), "status", "todo", "order", i)
+	}
+	return out
+}
+
+func TestInsertManyPastStepCapAndRollbackOnInvalidDoc(t *testing.T) {
+	s := newTestStore(t)
+	res, err := ApplyTxn(s, dsl.NewMutation().InsertMany("items", bulkDocs(40)).Build(), "")
+	if err != nil || len(res) != 1 || len(res[0].IDs) != 40 {
+		t.Fatalf("insertMany: %v %+v", err, res)
+	}
+	bad := bulkDocs(20)
+	bad[7] = docObj("name", "z7", "status", "todo", "order", "oops")
+	_, err = ApplyTxn(s, dsl.NewMutation().InsertMany("items", bad).Build(), "")
+	re, ok := err.(*rtdberrors.RtDbError)
+	if !ok || re.Code != rtdberrors.CodeSchemaViolation {
+		t.Fatalf("want SCHEMA_VIOLATION, got %v", err)
+	}
+	if countItemsNamed(s, "n0") != 1 || countItemsNamed(s, "n1") != 1 {
+		t.Fatal("original rows disturbed")
+	}
+	_, err = ApplyTxn(s, dsl.NewMutation().InsertMany("items", bulkDocs(1001)).Build(), "")
+	re, ok = err.(*rtdberrors.RtDbError)
+	if !ok || re.Code != rtdberrors.CodeBadRequest {
+		t.Fatalf("want BAD_REQUEST over cap, got %v", err)
+	}
+}
+
+func TestUpsertManyPatchesExistingAndInsertsNew(t *testing.T) {
+	s := newTestStore(t)
+	seedRow(t, s, "items", 100, docObj("name", "a", "status", "todo", "order", int64(1)))
+	res, err := ApplyTxn(s, dsl.NewMutation().UpsertMany("items", "by_name", []wire.JSONValue{
+		docObj("name", "a", "status", "done", "order", 1),
+		docObj("name", "b", "status", "todo", "order", 2),
+	}).Build(), "")
+	if err != nil || len(res[0].IDs) != 2 {
+		t.Fatalf("upsertMany: %v %+v", err, res)
+	}
+	if len(res[0].InsertedMany) != 2 || res[0].InsertedMany[0] || !res[0].InsertedMany[1] {
+		t.Fatalf("inserted flags: %v", res[0].InsertedMany)
+	}
+	_, err = ApplyTxn(s, dsl.NewMutation().UpsertMany("items", "by_name", []wire.JSONValue{
+		docObj("status", "x"),
+	}).Build(), "")
+	re, ok := err.(*rtdberrors.RtDbError)
+	if !ok || re.Code != rtdberrors.CodeBadRequest {
+		t.Fatalf("want BAD_REQUEST, got %v", err)
 	}
 }

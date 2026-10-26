@@ -39,7 +39,7 @@ func (t *Transaction) UnmarshalJSON(b []byte) error {
 
 // Step is one write/control step. Variants: StepInsert/StepPatch/
 // StepAdjustCounter/StepReplace/StepDelete/StepExpectVersion/StepExpectFields/
-// StepExpectAbsent/StepExpectNoMatch/StepUpsert/StepPatchByQuery/StepDeleteByQuery/
+// StepExpectAbsent/StepExpectNoMatch/StepInsertMany/StepUpsertMany/StepUpsert/StepPatchByQuery/StepDeleteByQuery/
 // StepSchedule/StepCancelSchedule/StepStartWorkflow/StepCancelWorkflow/
 // StepUndelete.
 type Step interface {
@@ -433,6 +433,87 @@ func (v *StepExpectNoMatch) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// Mirrors core/src/mutation.rs::Step::InsertMany — bulk insert (at most 1000
+// docs, atomic); result {"ids": [...]}.
+type StepInsertMany struct {
+	Table string      `json:"table"`
+	Docs  []JSONValue `json:"docs"`
+}
+
+func (StepInsertMany) isStep() {}
+
+func (v StepInsertMany) MarshalJSON() ([]byte, error) {
+	type alias StepInsertMany
+	if v.Docs == nil {
+		v.Docs = []JSONValue{}
+	}
+	return MarshalTagged("op", "insertMany", alias(v))
+}
+
+func (v *StepInsertMany) UnmarshalJSON(b []byte) error {
+	r, err := StrictUnmarshal[struct {
+		Table string            `json:"table"`
+		Docs  []json.RawMessage `json:"docs"`
+	}](b)
+	if err != nil {
+		return err
+	}
+	docs, err := unmarshalDocs(r.Docs)
+	if err != nil {
+		return err
+	}
+	v.Table, v.Docs = r.Table, docs
+	return nil
+}
+
+// Mirrors core/src/mutation.rs::Step::UpsertMany — bulk upsert resolved per
+// doc through the full equality on Index (eq values read from the doc);
+// result {"ids": [...], "inserted": [...]}.
+type StepUpsertMany struct {
+	Table string      `json:"table"`
+	Index string      `json:"index"`
+	Docs  []JSONValue `json:"docs"`
+}
+
+func (StepUpsertMany) isStep() {}
+
+func (v StepUpsertMany) MarshalJSON() ([]byte, error) {
+	type alias StepUpsertMany
+	if v.Docs == nil {
+		v.Docs = []JSONValue{}
+	}
+	return MarshalTagged("op", "upsertMany", alias(v))
+}
+
+func (v *StepUpsertMany) UnmarshalJSON(b []byte) error {
+	r, err := StrictUnmarshal[struct {
+		Table string            `json:"table"`
+		Index string            `json:"index"`
+		Docs  []json.RawMessage `json:"docs"`
+	}](b)
+	if err != nil {
+		return err
+	}
+	docs, err := unmarshalDocs(r.Docs)
+	if err != nil {
+		return err
+	}
+	v.Table, v.Index, v.Docs = r.Table, r.Index, docs
+	return nil
+}
+
+func unmarshalDocs(raw []json.RawMessage) ([]JSONValue, error) {
+	docs := make([]JSONValue, len(raw))
+	for i := range raw {
+		d, err := UnmarshalJSON(raw[i])
+		if err != nil {
+			return nil, err
+		}
+		docs[i] = d
+	}
+	return docs, nil
+}
+
 // Mirrors core/src/mutation.rs::Step::Upsert
 type StepUpsert struct {
 	Table  string      `json:"table"`
@@ -812,7 +893,7 @@ func UnmarshalScheduleWhen(data []byte) (ScheduleWhen, error) {
 	}
 }
 
-// UnmarshalStep routes a tagged step to its variant across all 18 ops.
+// UnmarshalStep routes a tagged step to its variant across all 20 ops.
 func UnmarshalStep(data []byte) (Step, error) {
 	tag, err := PeekTag(data, "op")
 	if err != nil {
@@ -841,6 +922,10 @@ func UnmarshalStep(data []byte) (Step, error) {
 		return DecodeTagged[StepExpectAbsent](data, "op")
 	case "expectNoMatch":
 		return DecodeTagged[StepExpectNoMatch](data, "op")
+	case "insertMany":
+		return DecodeTagged[StepInsertMany](data, "op")
+	case "upsertMany":
+		return DecodeTagged[StepUpsertMany](data, "op")
 	case "upsert":
 		return DecodeTagged[StepUpsert](data, "op")
 	case "patchByQuery":
@@ -872,12 +957,51 @@ type StepResult struct {
 	Cancelled  *bool   `json:"cancelled,omitempty"`
 	ScheduleID *string `json:"scheduleId,omitempty"`
 	WorkflowID *string `json:"workflowId,omitempty"`
+	// IDs is the insertMany / upsertMany result (wire key "ids"); InsertedMany
+	// is upsertMany's parallel per-doc flags (wire key "inserted", which
+	// collides with Inserted, so both are handled by the custom (un)marshalers).
+	IDs          []string `json:"-"`
+	InsertedMany []bool   `json:"-"`
+}
+
+// UnmarshalJSON decodes the untagged shapes, routing the array-valued
+// "ids"/"inserted" pair (insertMany/upsertMany) away from the scalar fields.
+func (r *StepResult) UnmarshalJSON(b []byte) error {
+	var probe struct {
+		IDs      []string        `json:"ids"`
+		Inserted json.RawMessage `json:"inserted"`
+	}
+	if err := json.Unmarshal(b, &probe); err == nil && probe.IDs != nil {
+		*r = StepResult{IDs: probe.IDs}
+		if len(probe.Inserted) > 0 {
+			var flags []bool
+			if err := json.Unmarshal(probe.Inserted, &flags); err != nil {
+				return err
+			}
+			r.InsertedMany = flags
+		}
+		return nil
+	}
+	type alias StepResult
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	*r = StepResult(a)
+	return nil
 }
 
 // MarshalJSON emits JSON null for a null step result (patch/delete/
 // expect*/undelete steps carry no payload; the server's untagged
 // StepResult::Null serializes as null, never {}).
 func (r StepResult) MarshalJSON() ([]byte, error) {
+	if r.IDs != nil {
+		out := map[string]any{"ids": r.IDs}
+		if r.InsertedMany != nil {
+			out["inserted"] = r.InsertedMany
+		}
+		return json.Marshal(out)
+	}
 	if r.ID == nil && r.Inserted == nil && r.Patched == nil && r.Truncated == nil &&
 		r.Deleted == nil && r.Cancelled == nil && r.ScheduleID == nil && r.WorkflowID == nil {
 		return []byte("null"), nil

@@ -1,0 +1,60 @@
+{
+  "name": "txn-upsert-many-missing-index-field",
+  "$comment": "An upsertMany doc lacking an indexed field of the named index cannot be resolved: BAD_REQUEST for the whole step.",
+  "schema": {
+    "tables": {
+      "items": {
+        "fields": {
+          "sku": {
+            "type": "string"
+          },
+          "qty": {
+            "type": "number"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_sku",
+            "fields": [
+              "sku"
+            ],
+            "unique": true
+          }
+        ]
+      }
+    }
+  },
+  "seed": [],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "upsertMany",
+          "table": "items",
+          "index": "by_sku",
+          "docs": [
+            {
+              "sku": "a",
+              "qty": 1
+            },
+            {
+              "qty": 2
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "expect": {
+    "error": {
+      "code": "BAD_REQUEST"
+    }
+  },
+  "normalize": [
+    "_id",
+    "_creationTime",
+    "_version",
+    "id",
+    "ids"
+  ]
+}

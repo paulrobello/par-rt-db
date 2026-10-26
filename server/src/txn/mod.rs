@@ -492,6 +492,12 @@ pub async fn execute_txn_with_side(
             }
             match step {
                 Step::Insert { table, doc } => step_insert(&mut sctx, table, doc).await?,
+                Step::InsertMany { table, docs } => {
+                    step_insert_many(&mut sctx, table, docs).await?
+                }
+                Step::UpsertMany { table, index, docs } => {
+                    step_upsert_many(&mut sctx, table, index, docs).await?
+                }
                 Step::Patch { table, id, fields } => {
                     step_patch(&mut sctx, table, id, fields).await?
                 }
@@ -661,6 +667,6 @@ pub(crate) use stamp::{
 };
 pub(crate) use steps::{
     StepCtx, step_adjust_counter, step_delete, step_delete_by_query, step_expect_absent,
-    step_expect_fields, step_expect_no_match, step_expect_version, step_insert, step_patch,
-    step_patch_by_query, step_replace, step_undelete, step_upsert,
+    step_expect_fields, step_expect_no_match, step_expect_version, step_insert, step_insert_many,
+    step_patch, step_patch_by_query, step_replace, step_undelete, step_upsert, step_upsert_many,
 };

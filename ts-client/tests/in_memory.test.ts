@@ -4170,6 +4170,45 @@ describe("InMemoryRtDbClient — soft delete (FM-33)", () => {
     });
   });
 
+  it("insertMany inserts past the step cap and rolls back on an invalid doc", async () => {
+    const c = fm33Client(softTasksSchema);
+    const docs = Array.from({ length: 40 }, (_, n) => ({ name: `k${n}`, done: false }));
+    const [r] = await c.mutate(mutation().insertMany("tasks", docs).build());
+    expect((r as { ids: string[] }).ids).toHaveLength(40);
+
+    const bad = docs.map((_d, n) => ({ name: `z${n}`, done: n === 7 ? ("x" as never) : false }));
+    await expect(c.mutate(mutation().insertMany("tasks", bad).build())).rejects.toMatchObject({
+      code: "SCHEMA_VIOLATION",
+    });
+    expect(await rawCount(c, "tasks", "by_name", ["z0"])).toBe(0);
+    const tooMany = Array.from({ length: 1001 }, (_, n) => ({ name: `m${n}`, done: false }));
+    await expect(c.mutate(mutation().insertMany("tasks", tooMany).build())).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+    });
+  });
+
+  it("upsertMany patches existing rows and inserts new ones by index equality", async () => {
+    const c = fm33Client(softTasksSchema);
+    await put(c, "tasks", { name: "a", done: false });
+    const [r] = await c.mutate(
+      mutation()
+        .upsertMany("tasks", "by_name", [
+          { name: "a", done: true },
+          { name: "b", done: false },
+        ])
+        .build(),
+    );
+    expect((r as { inserted: boolean[] }).inserted).toEqual([false, true]);
+    expect(await rawCount(c, "tasks", "by_done", [true])).toBe(1);
+    await expect(
+      c.mutate(
+        mutation()
+          .upsertMany("tasks", "by_name", [{ done: true } as never])
+          .build(),
+      ),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
+
   it("patch/replace/expectVersion see a stamped row as NotFound", async () => {
     const c = fm33Client(softTasksSchema);
     const id = await put(c, "tasks", { name: "n", done: false });

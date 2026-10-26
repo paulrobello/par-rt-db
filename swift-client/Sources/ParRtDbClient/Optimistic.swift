@@ -142,7 +142,7 @@ private func projectUnfilteredArray(
             // nothing unambiguous to overlay — the authoritative update
             // delivers the restored row (ts-client fallthrough).
             continue
-        case .upsert, .adjustCounter:
+        case .upsert, .upsertMany, .insertMany, .adjustCounter:
             return .skip
         case .expectVersion, .expectFields, .expectAbsent, .expectNoMatch, .expectBefore:
             continue
@@ -183,7 +183,7 @@ private func projectFilteredArray(
             // Restores a doc whose body is not in this cached result —
             // nothing unambiguous to overlay (ts-client fallthrough).
             continue
-        case .insert, .patch, .replace, .upsert, .adjustCounter:
+        case .insert, .patch, .replace, .upsert, .upsertMany, .insertMany, .adjustCounter:
             // Membership-ambiguous under a filter.
             return .skip
         case .expectVersion, .expectFields, .expectAbsent, .expectNoMatch, .expectBefore:
@@ -232,7 +232,7 @@ private func projectGet(
                 replacement.removeValue(forKey: "_version")
                 working = .object(replacement)
             }
-        case .upsert, .adjustCounter:
+        case .upsert, .upsertMany, .insertMany, .adjustCounter:
             return .skip
         case .patchByQuery, .deleteByQuery:
             // A by-query step may patch/delete the target row, but the filter
@@ -272,6 +272,8 @@ private extension Step {
              let .expectVersion(table, _, _),
              let .expectFields(table, _, _),
              let .upsert(table, _, _, _, _),
+             let .upsertMany(table, _, _),
+             let .insertMany(table, _),
              let .patchByQuery(table, _, _, _),
              let .deleteByQuery(table, _, _):
             table

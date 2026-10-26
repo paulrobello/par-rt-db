@@ -27,6 +27,21 @@ func (m Mutation) Insert(table string, doc wire.JSONValue) Mutation {
 	return m
 }
 
+// InsertMany queues a bulk insert (at most 1000 docs; atomic); result
+// {"ids": [...]}.
+func (m Mutation) InsertMany(table string, docs []wire.JSONValue) Mutation {
+	m.t.Steps = append(m.t.Steps, wire.StepInsertMany{Table: table, Docs: docs})
+	return m
+}
+
+// UpsertMany queues a bulk upsert resolved per doc through the full equality
+// on index (each doc must carry the indexed fields); result
+// {"ids": [...], "inserted": [...]}.
+func (m Mutation) UpsertMany(table, index string, docs []wire.JSONValue) Mutation {
+	m.t.Steps = append(m.t.Steps, wire.StepUpsertMany{Table: table, Index: index, Docs: docs})
+	return m
+}
+
 // Patch queues a merge-into step; result null.
 func (m Mutation) Patch(table, id string, fields wire.JSONValue) Mutation {
 	m.t.Steps = append(m.t.Steps, wire.StepPatch{Table: table, ID: id, Fields: fields})

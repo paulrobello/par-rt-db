@@ -518,6 +518,21 @@ func stepResultsToWire(results []wire.StepResult) wire.JSONValue {
 	out := make(wire.Array, 0, len(results))
 	for _, r := range results {
 		switch {
+		case r.IDs != nil && r.InsertedMany != nil:
+			ids, flags := make(wire.Array, len(r.IDs)), make(wire.Array, len(r.InsertedMany))
+			for i, id := range r.IDs {
+				ids[i] = wire.String(id)
+			}
+			for i, f := range r.InsertedMany {
+				flags[i] = wire.Bool(f)
+			}
+			out = append(out, wire.Object{"ids": ids, "inserted": flags})
+		case r.IDs != nil:
+			ids := make(wire.Array, len(r.IDs))
+			for i, id := range r.IDs {
+				ids[i] = wire.String(id)
+			}
+			out = append(out, wire.Object{"ids": ids})
 		case r.ID != nil && r.Inserted != nil:
 			out = append(out, wire.Object{"id": wire.String(*r.ID), "inserted": wire.Bool(*r.Inserted)})
 		case r.ID != nil:

@@ -1,0 +1,132 @@
+{
+  "name": "txn-insert-many-invalid-doc-aborts",
+  "$comment": "A schema-invalid doc in the middle of the list fails the whole step with SCHEMA_VIOLATION (the earlier valid docs roll back; rollback itself is pinned by the server integration test).",
+  "schema": {
+    "tables": {
+      "items": {
+        "fields": {
+          "sku": {
+            "type": "string"
+          },
+          "qty": {
+            "type": "number"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_sku",
+            "fields": [
+              "sku"
+            ],
+            "unique": true
+          }
+        ]
+      }
+    }
+  },
+  "seed": [],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "insertMany",
+          "table": "items",
+          "docs": [
+            {
+              "sku": "s0",
+              "qty": 0
+            },
+            {
+              "sku": "s1",
+              "qty": 1
+            },
+            {
+              "sku": "s2",
+              "qty": 2
+            },
+            {
+              "sku": "s3",
+              "qty": 3
+            },
+            {
+              "sku": "s4",
+              "qty": 4
+            },
+            {
+              "sku": "s5",
+              "qty": 5
+            },
+            {
+              "sku": "s6",
+              "qty": 6
+            },
+            {
+              "sku": "s7",
+              "qty": 7
+            },
+            {
+              "sku": "s8",
+              "qty": 8
+            },
+            {
+              "sku": "s9",
+              "qty": 9
+            },
+            {
+              "sku": "s10",
+              "qty": "oops"
+            },
+            {
+              "sku": "s11",
+              "qty": 11
+            },
+            {
+              "sku": "s12",
+              "qty": 12
+            },
+            {
+              "sku": "s13",
+              "qty": 13
+            },
+            {
+              "sku": "s14",
+              "qty": 14
+            },
+            {
+              "sku": "s15",
+              "qty": 15
+            },
+            {
+              "sku": "s16",
+              "qty": 16
+            },
+            {
+              "sku": "s17",
+              "qty": 17
+            },
+            {
+              "sku": "s18",
+              "qty": 18
+            },
+            {
+              "sku": "s19",
+              "qty": 19
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "expect": {
+    "error": {
+      "code": "SCHEMA_VIOLATION"
+    }
+  },
+  "normalize": [
+    "_id",
+    "_creationTime",
+    "_version",
+    "id",
+    "ids"
+  ]
+}

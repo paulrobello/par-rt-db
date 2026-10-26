@@ -47,6 +47,29 @@ pub enum Step {
         /// The document body.
         doc: serde_json::Map<String, serde_json::Value>,
     },
+    /// Insert many documents in one step (bulk import past the per-txn step
+    /// cap). At most 1000 docs; every doc is validated and indexed like
+    /// `Insert`, and any invalid doc aborts the whole transaction. Result is
+    /// `{"ids": [...]}` in doc order.
+    InsertMany {
+        /// Target table.
+        table: String,
+        /// The document bodies.
+        docs: Vec<serde_json::Map<String, serde_json::Value>>,
+    },
+    /// Upsert many documents in one step. Each doc is resolved through the
+    /// full-arity equality on `index` (eq values are the doc's own indexed
+    /// fields): a match is patched with the doc, otherwise the doc is
+    /// inserted. At most 1000 docs. Result is `{"ids": [...], "inserted":
+    /// [bool, ...]}` in doc order.
+    UpsertMany {
+        /// Target table.
+        table: String,
+        /// Index whose full eq-prefix locates each row.
+        index: String,
+        /// The document bodies (each must carry every field of `index`).
+        docs: Vec<serde_json::Map<String, serde_json::Value>>,
+    },
     /// Merge `fields` into an existing document; result is `null`.
     Patch {
         /// Target table.

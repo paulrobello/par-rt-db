@@ -65,6 +65,16 @@ pub const MAX_AFFECTED_ROWS_PER_TXN: usize = 10_000;
 /// `deleteByQuery` step. Over → `conflict`, txn aborts atomically.
 pub const MAX_CASCADE_ROWS: usize = 10_000;
 
+fn check_bulk_len(op: &str, len: usize) -> Result<(), RtDbError> {
+    if len > MAX_BY_QUERY_ROWS as usize {
+        return Err(RtDbError::new(
+            ErrorCode::BadRequest,
+            format!("{op} has {len} docs, exceeding the limit of {MAX_BY_QUERY_ROWS}"),
+        ));
+    }
+    Ok(())
+}
+
 /// SEC-104: total documents a txn could touch in the worst case, capped per
 /// by-query step at [`MAX_BY_QUERY_ROWS`]. Mirrors server
 /// `txn::worst_case_affected`. Used by `execute_transaction`'s
@@ -737,6 +747,8 @@ impl InMemoryRtDbClient {
     fn execute_step(&mut self, step: &Step) -> Result<(StepResult, Vec<String>), RtDbError> {
         match step {
             Step::Insert { table, doc } => self.step_insert(table, doc),
+            Step::InsertMany { table, docs } => self.step_insert_many(table, docs),
+            Step::UpsertMany { table, index, docs } => self.step_upsert_many(table, index, docs),
             Step::Patch { table, id, fields } => self.step_patch(table, id, fields),
             Step::AdjustCounter {
                 table,
@@ -799,6 +811,70 @@ impl InMemoryRtDbClient {
         let table_def = self.require_table(table)?.clone();
         let id = self.do_insert(table, &table_def, doc)?;
         Ok((StepResult::Insert { id }, vec![table.to_string()]))
+    }
+
+    /// `InsertMany` step: insert every doc; any failure aborts the whole
+    /// transaction (the caller restores its snapshot). Result `{ids}`.
+    fn step_insert_many(
+        &mut self,
+        table: &str,
+        docs: &[Map<String, Value>],
+    ) -> Result<(StepResult, Vec<String>), RtDbError> {
+        check_bulk_len("insertMany", docs.len())?;
+        let table_def = self.require_table(table)?.clone();
+        let mut ids = Vec::with_capacity(docs.len());
+        for doc in docs {
+            ids.push(self.do_insert(table, &table_def, doc)?);
+        }
+        Ok((StepResult::InsertMany { ids }, vec![table.to_string()]))
+    }
+
+    /// `UpsertMany` step: per doc, resolve through the full equality on
+    /// `index` (eq values read from the doc), then insert or patch with the
+    /// doc. Result `{ids, inserted}`.
+    fn step_upsert_many(
+        &mut self,
+        table: &str,
+        index: &str,
+        docs: &[Map<String, Value>],
+    ) -> Result<(StepResult, Vec<String>), RtDbError> {
+        check_bulk_len("upsertMany", docs.len())?;
+        let table_def = self.require_table(table)?.clone();
+        let index_fields = table_def
+            .indexes
+            .iter()
+            .find(|def| def.name == index)
+            .map(|def| def.fields.clone())
+            .ok_or_else(|| {
+                RtDbError::new(ErrorCode::BadRequest, format!("unknown index '{index}'"))
+            })?;
+        let mut ids = Vec::with_capacity(docs.len());
+        let mut inserted = Vec::with_capacity(docs.len());
+        for (n, doc) in docs.iter().enumerate() {
+            let mut eq = Vec::with_capacity(index_fields.len());
+            for field in &index_fields {
+                let value = doc.get(field).ok_or_else(|| {
+                    RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!(
+                            "upsertMany docs[{n}] is missing indexed field '{field}' of index '{index}'"
+                        ),
+                    )
+                })?;
+                eq.push(value.clone());
+            }
+            match self.step_upsert(table, index, &eq, doc, doc)?.0 {
+                StepResult::Upsert { id, inserted: ins } => {
+                    ids.push(id);
+                    inserted.push(ins);
+                }
+                _ => return Err(RtDbError::internal("upsert returned an unexpected result")),
+            }
+        }
+        Ok((
+            StepResult::UpsertMany { ids, inserted },
+            vec![table.to_string()],
+        ))
     }
 
     /// `Patch` step: merge `fields` into the row; result `null`.

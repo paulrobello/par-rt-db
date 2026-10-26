@@ -133,6 +133,15 @@ export const MAX_STEPS = 1024;
 /** Hard cap on rows a single `patchByQuery`/`deleteByQuery` step may touch.
  * Mirrors server `txn::MAX_BY_QUERY_ROWS`; a larger match set is truncated. */
 const MAX_BY_QUERY_ROWS = 1000;
+
+function checkBulkLen(op: string, len: number): void {
+  if (len > MAX_BY_QUERY_ROWS) {
+    throw new RtDbError(
+      "BAD_REQUEST",
+      `${op} has ${len} docs, exceeding the limit of ${MAX_BY_QUERY_ROWS}`,
+    );
+  }
+}
 /** SEC-104: hard cap on the count of `patchByQuery`/`deleteByQuery` steps in
  * one txn. Mirrors server `txn::MAX_BY_QUERY_STEPS_PER_TXN`. Without it, 1024
  * by-query steps × 1000 rows each could stall the (server's) single-writer on
@@ -166,7 +175,9 @@ export function worstCaseAffected(txn: TransactionJson): number {
     ) {
       continue; // control-flow/precondition: touches no documents (server counts 0)
     }
-    if (step.op === "patchByQuery" || step.op === "deleteByQuery") {
+    if (step.op === "insertMany" || step.op === "upsertMany") {
+      total += step.docs.length;
+    } else if (step.op === "patchByQuery" || step.op === "deleteByQuery") {
       total += Math.min(step.limit ?? MAX_BY_QUERY_ROWS, MAX_BY_QUERY_ROWS);
     } else {
       total += 1;
@@ -2230,6 +2241,50 @@ export class InMemoryRtDbClient {
           throw new RtDbError("PRECONDITION_FAILED", "filter matched an existing document");
         }
         return { result: null };
+      }
+      case "insertMany": {
+        checkBulkLen("insertMany", step.docs.length);
+        const tableDef = this.requireTable(table);
+        const ids = step.docs.map((doc) => this.doInsert(table, tableDef, doc));
+        return { result: { ids }, table };
+      }
+      case "upsertMany": {
+        checkBulkLen("upsertMany", step.docs.length);
+        const tableDef = this.requireTable(table);
+        const index = requireIndex(tableDef, step.index);
+        const ids: string[] = [];
+        const inserted: boolean[] = [];
+        step.docs.forEach((doc, n) => {
+          const eq = index.fields.map((field) => {
+            if (!(field in doc)) {
+              throw new RtDbError(
+                "BAD_REQUEST",
+                `upsertMany docs[${n}] is missing indexed field '${field}' of index '${step.index}'`,
+              );
+            }
+            return doc[field];
+          });
+          const rows = this.eqLookup(tableDef, table, step.index, eq);
+          if (rows.length > 1) {
+            throw new RtDbError("PRECONDITION_FAILED", "upsert matched multiple documents");
+          }
+          if (rows.length === 0) {
+            ids.push(this.doInsert(table, tableDef, doc));
+            inserted.push(true);
+            return;
+          }
+          const row = rows[0];
+          const merged = applyPatch(
+            tableDef,
+            row.doc,
+            stampUpdatedAt(tableDef, doc, this.now()),
+            this.now(),
+          );
+          this.doUpdate(table, tableDef, row, merged);
+          ids.push(row.id);
+          inserted.push(false);
+        });
+        return { result: { ids, inserted }, table };
       }
       case "upsert": {
         const tableDef = this.requireTable(table);

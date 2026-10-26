@@ -90,6 +90,10 @@ func stepTable(s wire.Step) (string, bool) {
 		return st.Table, true
 	case wire.StepUpsert:
 		return st.Table, true
+	case wire.StepInsertMany:
+		return st.Table, true
+	case wire.StepUpsertMany:
+		return st.Table, true
 	default:
 		return "", false
 	}
@@ -136,7 +140,7 @@ func projectUnfilteredArray(query wire.Query, last wire.JSONValue, txn wire.Tran
 		case wire.StepUndelete:
 			// the restored body is not in the cache; the authoritative
 			// update delivers the restored row
-		case wire.StepUpsert, wire.StepAdjustCounter:
+		case wire.StepUpsert, wire.StepUpsertMany, wire.StepInsertMany, wire.StepAdjustCounter:
 			return Projection{Kind: ProjectionSkip}
 		}
 	}
@@ -205,7 +209,7 @@ func projectGet(query wire.Query, last wire.JSONValue, txn wire.Transaction) Pro
 			}
 		case wire.StepInsert:
 			// a different doc; the point read is unaffected
-		case wire.StepUpsert, wire.StepAdjustCounter:
+		case wire.StepUpsert, wire.StepUpsertMany, wire.StepInsertMany, wire.StepAdjustCounter:
 			return Projection{Kind: ProjectionSkip}
 		}
 	}

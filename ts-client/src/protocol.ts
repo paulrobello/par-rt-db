@@ -443,6 +443,22 @@ export type StepJson =
       filter: FilterExpr;
     }
   | {
+      /** Insert many documents in one step (at most 1000; atomic). Result is
+       * `{ ids }` in doc order. */
+      op: "insertMany";
+      table: string;
+      docs: Record<string, unknown>[];
+    }
+  | {
+      /** Upsert many documents, each resolved through the full equality on
+       * `index` (eq values read from the doc itself); at most 1000. Result is
+       * `{ ids, inserted }` in doc order. */
+      op: "upsertMany";
+      table: string;
+      index: string;
+      docs: Record<string, unknown>[];
+    }
+  | {
       op: "upsert";
       table: string;
       index: string;

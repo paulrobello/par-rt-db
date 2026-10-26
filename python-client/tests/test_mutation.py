@@ -125,6 +125,22 @@ def test_insert_if_emits_expect_no_match_then_insert():
     ]
 
 
+def test_insert_many_and_upsert_many_wire_shape():
+    docs = [{"status": "open"}]
+    m = (
+        Mutation.builder()
+        .insert_many("boxes", docs)
+        .upsert_many("boxes", "by_status", docs)
+        .build()
+    )
+    wire = json.loads(m.model_dump_json(by_alias=True))
+    assert wire["steps"] == [
+        {"op": "insertMany", "table": "boxes", "docs": docs},
+        {"op": "upsertMany", "table": "boxes", "index": "by_status", "docs": docs},
+    ]
+    assert Transaction.model_validate(wire).model_dump(by_alias=True, mode="json") == wire
+
+
 def test_expect_no_match_rejects_unknown_field():
     with pytest.raises(ValidationError):
         Transaction.model_validate(

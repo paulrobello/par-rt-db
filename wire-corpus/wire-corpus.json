@@ -534,6 +534,47 @@
     },
     {
       "type": "mutate",
+      "mutId": "m-insert-many",
+      "txn": {
+        "steps": [
+          {
+            "op": "insertMany",
+            "table": "bookings",
+            "docs": [
+              {
+                "room": "r1",
+                "startsAt": 1
+              },
+              {
+                "room": "r2",
+                "startsAt": 2
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "mutate",
+      "mutId": "m-upsert-many",
+      "txn": {
+        "steps": [
+          {
+            "op": "upsertMany",
+            "table": "bookings",
+            "index": "by_room",
+            "docs": [
+              {
+                "room": "r1",
+                "startsAt": 3
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "mutate",
       "mutId": "m12",
       "txn": {
         "steps": [

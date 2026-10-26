@@ -110,6 +110,19 @@ public struct MutationBuilder: Sendable {
         expectNoMatch(table, filter: filter).insert(table, doc)
     }
 
+    /// Queue a bulk insert of `docs` (at most 1000 per step; atomic).
+    public func insertMany(_ table: String, _ docs: [[String: JSONValue]]) -> MutationBuilder {
+        adding(.insertMany(table: table, docs: docs))
+    }
+
+    /// Queue a bulk upsert: each doc is resolved through the full equality on
+    /// `index` (its own indexed fields) and inserted or merged. At most 1000 docs.
+    public func upsertMany(
+        _ table: String, index: String, _ docs: [[String: JSONValue]]
+    ) -> MutationBuilder {
+        adding(.upsertMany(table: table, index: index, docs: docs))
+    }
+
     /// Queue an insert-or-patch step keyed by an index eq-prefix match.
     public func upsert(
         _ table: String,
@@ -217,20 +230,19 @@ public struct MutationBuilder: Sendable {
             .expectAbsent(table: table, index: index, eq: eq)
         case let .expectNoMatch(table, filter):
             .expectNoMatch(table: table, filter: filter)
+        case let .insertMany(table, docs):
+            .insertMany(table: table, docs: docs)
+        case let .upsertMany(table, index, docs):
+            .upsertMany(table: table, index: index, docs: docs)
         case let .upsert(table, index, eq, insert, patch):
             .upsert(table: table, index: index, eq: eq, insert: insert, patch: patch)
         case let .patchByQuery(table, filter, patch, limit):
             try .patchByQuery(
-                table: table,
-                filter: filter,
-                patch: patch,
-                limit: limit.map { try uint32($0, "patchByQuery limit") }
+                table: table, filter: filter, patch: patch, limit: uint32Opt(limit, "patchByQuery limit")
             )
         case let .deleteByQuery(table, filter, limit):
             try .deleteByQuery(
-                table: table,
-                filter: filter,
-                limit: limit.map { try uint32($0, "deleteByQuery limit") }
+                table: table, filter: filter, limit: uint32Opt(limit, "deleteByQuery limit")
             )
         case let .schedule(when, txn, external):
             .schedule(when: when, txn: txn, external: external)
@@ -262,6 +274,8 @@ private enum PendingStep: Sendable {
     case expectBefore(deadlineMs: Int64)
     case expectAbsent(table: String, index: String, eq: [JSONValue])
     case expectNoMatch(table: String, filter: FilterExpr)
+    case insertMany(table: String, docs: [[String: JSONValue]])
+    case upsertMany(table: String, index: String, docs: [[String: JSONValue]])
     case upsert(
         table: String,
         index: String,

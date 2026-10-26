@@ -132,6 +132,8 @@ type (
 	StepExpectAbsent   = wire.StepExpectAbsent
 	StepExpectNoMatch  = wire.StepExpectNoMatch
 	StepUpsert         = wire.StepUpsert
+	StepInsertMany     = wire.StepInsertMany
+	StepUpsertMany     = wire.StepUpsertMany
 	StepPatchByQuery   = wire.StepPatchByQuery
 	StepDeleteByQuery  = wire.StepDeleteByQuery
 	StepSchedule       = wire.StepSchedule

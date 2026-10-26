@@ -31,6 +31,19 @@ pub enum StepResult {
         /// Whether the step inserted (vs patched).
         inserted: bool,
     },
+    /// `{ids, inserted}` from an upsertMany step (listed before `InsertMany`
+    /// so the untagged decode keeps the `inserted` array).
+    UpsertMany {
+        /// Per-doc ids, in doc order.
+        ids: Vec<String>,
+        /// Per-doc inserted-vs-patched flags, in doc order.
+        inserted: Vec<bool>,
+    },
+    /// `{ids}` from an insertMany step.
+    InsertMany {
+        /// Per-doc ids, in doc order.
+        ids: Vec<String>,
+    },
     /// `{id}` from an insert step.
     Insert {
         /// The inserted row's id.
@@ -119,6 +132,25 @@ impl Mutation {
         self.steps.push(Step::Insert {
             table: table.into(),
             doc: Self::obj(doc),
+        });
+        self
+    }
+    /// Queue a bulk insert of `docs` (at most 1000; atomic). Non-object
+    /// entries are sent as empty objects so the server rejects them.
+    pub fn insert_many(mut self, table: &str, docs: Vec<Value>) -> Self {
+        self.steps.push(Step::InsertMany {
+            table: table.into(),
+            docs: docs.into_iter().map(Self::obj).collect(),
+        });
+        self
+    }
+    /// Queue a bulk upsert of `docs` resolved through the full equality on
+    /// `index` (each doc must carry every indexed field).
+    pub fn upsert_many(mut self, table: &str, index: &str, docs: Vec<Value>) -> Self {
+        self.steps.push(Step::UpsertMany {
+            table: table.into(),
+            index: index.into(),
+            docs: docs.into_iter().map(Self::obj).collect(),
         });
         self
     }

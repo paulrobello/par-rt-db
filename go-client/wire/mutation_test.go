@@ -109,3 +109,39 @@ func TestStepExpectNoMatchRejectsUnknownField(t *testing.T) {
 		t.Fatal("unknown op must still error")
 	}
 }
+
+func TestStepInsertManyUpsertManyRoundTrip(t *testing.T) {
+	txn := Transaction{Steps: []Step{
+		StepInsertMany{Table: "items", Docs: []JSONValue{Object{"name": String("a")}}},
+		StepUpsertMany{Table: "items", Index: "by_name", Docs: []JSONValue{Object{"name": String("a")}}},
+	}}
+	b, err := json.Marshal(txn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"steps":[{"op":"insertMany","table":"items","docs":[{"name":"a"}]},{"op":"upsertMany","table":"items","index":"by_name","docs":[{"name":"a"}]}]}`
+	var got, wantV map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(want), &wantV); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, wantV) {
+		t.Fatalf("wire mismatch:\n got %s\nwant %s", b, want)
+	}
+	var back Transaction
+	if err := json.Unmarshal([]byte(want), &back); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := back.Steps[0].(StepInsertMany); !ok {
+		t.Fatalf("decoded %#v", back.Steps[0])
+	}
+	if _, err := UnmarshalStep([]byte(`{"op":"insertMany","table":"items","docs":[],"extra":1}`)); err == nil {
+		t.Fatal("unknown field must be rejected")
+	}
+	var r StepResult
+	if err := json.Unmarshal([]byte(`{"ids":["x","y"],"inserted":[true,false]}`), &r); err != nil || len(r.IDs) != 2 || len(r.InsertedMany) != 2 {
+		t.Fatalf("result decode: %v %+v", err, r)
+	}
+}

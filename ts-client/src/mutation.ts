@@ -25,6 +25,8 @@ import type { IndexNamesOf, SchemaDefinition, TableNames, WithoutSystemFields } 
  * is just documentation since TS narrows structurally.
  */
 export type StepResult =
+  | StepUpsertManyResult
+  | StepInsertManyResult
   | StepUpsertResult
   | StepInsertResult
   | StepPatchByQueryResult
@@ -33,6 +35,18 @@ export type StepResult =
   | StepCancelScheduleResult
   | StepStartWorkflowResult
   | null;
+
+/** Result of an `insertMany` step: one id per doc, in doc order. */
+export interface StepInsertManyResult {
+  ids: string[];
+}
+
+/** Result of an `upsertMany` step: per-doc ids and inserted-vs-patched flags,
+ * both in doc order. */
+export interface StepUpsertManyResult {
+  ids: string[];
+  inserted: boolean[];
+}
 
 /** Result of an `upsert` step: the doc id and whether the insert branch ran. */
 export interface StepUpsertResult {
@@ -95,6 +109,7 @@ function parseStepResult(value: unknown): StepResult {
   }
   if (typeof value === "object" && value !== null) {
     const v = value as {
+      ids?: unknown;
       id?: unknown;
       inserted?: unknown;
       patched?: unknown;
@@ -104,6 +119,13 @@ function parseStepResult(value: unknown): StepResult {
       cancelled?: unknown;
       workflowId?: unknown;
     };
+    if (Array.isArray(v.ids) && v.ids.every((x) => typeof x === "string")) {
+      const ids = v.ids as string[];
+      if (Array.isArray(v.inserted) && v.inserted.every((x) => typeof x === "boolean")) {
+        return { ids, inserted: v.inserted as boolean[] };
+      }
+      return { ids };
+    }
     if (typeof v.id === "string") {
       if (typeof v.inserted === "boolean") {
         return { id: v.id, inserted: v.inserted };
@@ -128,7 +150,7 @@ function parseStepResult(value: unknown): StepResult {
   }
   throw new RtDbError(
     "INTERNAL",
-    "malformed step result: expected {id}, {id, inserted}, {patched, truncated}, {deleted, truncated}, {scheduleId}, {workflowId}, {cancelled}, or null",
+    "malformed step result: expected {ids}, {ids, inserted}, {id}, {id, inserted}, {patched, truncated}, {deleted, truncated}, {scheduleId}, {workflowId}, {cancelled}, or null",
   );
 }
 
@@ -264,6 +286,31 @@ export class TxnBuilder<S extends SchemaDefinition<any> = SchemaDefinition<any>>
     doc: WithoutSystemFields<S, T>,
   ): this {
     return this.expectNoMatch(table, filter).insert(table, doc);
+  }
+
+  /**
+   * Adds a bulk insert of `docs` (at most 1000 per step; atomic: any invalid
+   * document fails the whole transaction). The step result is `{ ids }` in
+   * doc order. Not subject to the 16-step cap tradeoffs of one-insert-per-doc.
+   */
+  insertMany<T extends TableNames<S>>(table: T, docs: WithoutSystemFields<S, T>[]): this {
+    this.steps.push({ op: "insertMany", table, docs: docs as Record<string, unknown>[] });
+    return this;
+  }
+
+  /**
+   * Adds a bulk upsert: each doc is resolved through the full-arity equality
+   * on `index` (the eq values are the doc's own indexed fields, so every doc
+   * must carry them) and either inserted or merged into the match. At most
+   * 1000 docs; the result is `{ ids, inserted }` in doc order.
+   */
+  upsertMany<T extends TableNames<S>>(
+    table: T,
+    index: IndexNamesOf<S, T>,
+    docs: WithoutSystemFields<S, T>[],
+  ): this {
+    this.steps.push({ op: "upsertMany", table, index, docs: docs as Record<string, unknown>[] });
+    return this;
   }
 
   /**

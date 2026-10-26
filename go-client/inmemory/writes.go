@@ -5,6 +5,7 @@
 package inmemory
 
 import (
+	"fmt"
 	"sort"
 	"strconv"
 
@@ -86,6 +87,10 @@ func worstCaseAffected(txn wire.Transaction) int {
 	total := 0
 	for _, step := range txn.Steps {
 		switch t := step.(type) {
+		case wire.StepInsertMany:
+			total += len(t.Docs)
+		case wire.StepUpsertMany:
+			total += len(t.Docs)
 		case wire.StepPatchByQuery:
 			limit := maxByQueryRows
 			if t.Limit != nil && *t.Limit >= 0 && *t.Limit < limit {
@@ -245,6 +250,10 @@ func executeStep(s *Store, step wire.Step) (wire.StepResult, []string, error) {
 	switch t := step.(type) {
 	case wire.StepInsert:
 		return stepInsert(s, t)
+	case wire.StepInsertMany:
+		return stepInsertMany(s, t)
+	case wire.StepUpsertMany:
+		return stepUpsertMany(s, t)
 	case wire.StepPatch:
 		return stepPatch(s, t)
 	case wire.StepAdjustCounter:
@@ -296,6 +305,79 @@ func stepInsert(s *Store, t wire.StepInsert) (wire.StepResult, []string, error) 
 		return wire.StepResult{}, nil, err
 	}
 	return wire.StepResult{ID: &id}, []string{t.Table}, nil
+}
+
+func checkBulkLen(op string, n int) error {
+	if n > maxByQueryRows {
+		return rtdberrors.New(rtdberrors.CodeBadRequest,
+			fmt.Sprintf("%s has %d docs, exceeding the limit of %d", op, n, maxByQueryRows))
+	}
+	return nil
+}
+
+// stepInsertMany inserts every doc in order; any failure aborts the whole
+// transaction (the caller restores its snapshot).
+func stepInsertMany(s *Store, t wire.StepInsertMany) (wire.StepResult, []string, error) {
+	if err := checkBulkLen("insertMany", len(t.Docs)); err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	tableDef, err := requireTable(s, t.Table)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	ids := make([]string, 0, len(t.Docs))
+	for _, d := range t.Docs {
+		doc, err := wireObject(d)
+		if err != nil {
+			return wire.StepResult{}, nil, err
+		}
+		id, err := doInsert(s, t.Table, tableDef, doc)
+		if err != nil {
+			return wire.StepResult{}, nil, err
+		}
+		ids = append(ids, id)
+	}
+	return wire.StepResult{IDs: ids}, []string{t.Table}, nil
+}
+
+// stepUpsertMany runs executeUpsert per doc with eq read from the doc's own
+// indexed fields and insert == patch == doc.
+func stepUpsertMany(s *Store, t wire.StepUpsertMany) (wire.StepResult, []string, error) {
+	if err := checkBulkLen("upsertMany", len(t.Docs)); err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	tableDef, err := requireTable(s, t.Table)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	index, err := requireIndex(tableDef, t.Index)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	ids := make([]string, 0, len(t.Docs))
+	flags := make([]bool, 0, len(t.Docs))
+	for n, d := range t.Docs {
+		doc, err := wireObject(d)
+		if err != nil {
+			return wire.StepResult{}, nil, err
+		}
+		eq := make([]wire.JSONValue, 0, len(index.Fields))
+		for _, f := range index.Fields {
+			v, ok := doc[f]
+			if !ok {
+				return wire.StepResult{}, nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+					fmt.Sprintf("upsertMany docs[%d] is missing indexed field '%s' of index '%s'", n, f, t.Index))
+			}
+			eq = append(eq, v)
+		}
+		res, _, err := executeUpsert(s, wire.StepUpsert{Table: t.Table, Index: t.Index, Eq: eq, Insert: doc, Patch: doc})
+		if err != nil {
+			return wire.StepResult{}, nil, err
+		}
+		ids = append(ids, *res.ID)
+		flags = append(flags, *res.Inserted)
+	}
+	return wire.StepResult{IDs: ids, InsertedMany: flags}, []string{t.Table}, nil
 }
 
 func stepPatch(s *Store, t wire.StepPatch) (wire.StepResult, []string, error) {

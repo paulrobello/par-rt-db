@@ -33,10 +33,12 @@ from ..mutation import (
     _DeleteByQuery,
     _ExpectBefore,
     _ExpectNoMatch,
+    _InsertMany,
     _is_safe_counter_integer,
     _PatchByQuery,
     _Schedule,
     _StartWorkflow,
+    _UpsertMany,
 )
 from ..query import Query, _terminal_of, parse_result
 from ..schema import (
@@ -154,7 +156,9 @@ def worst_case_affected(txn: Transaction) -> int:
     """
     total = 0
     for step in txn.steps:
-        if isinstance(step, (_PatchByQuery, _DeleteByQuery)):
+        if isinstance(step, (_InsertMany, _UpsertMany)):
+            total += len(step.docs)
+        elif isinstance(step, (_PatchByQuery, _DeleteByQuery)):
             limit_opt = step.limit
             total += MAX_BY_QUERY_ROWS if limit_opt is None else min(limit_opt, MAX_BY_QUERY_ROWS)
         elif isinstance(
@@ -671,6 +675,22 @@ class SubscriptionHandle:
 
     def __exit__(self, *exc: object) -> None:
         self._alive[0] = False
+
+
+def _insert_many_result(ids: list[str]) -> StepResult:
+    return _STEP_RESULT.validate_python({"ids": ids})
+
+
+def _upsert_many_result(ids: list[str], inserted: list[bool]) -> StepResult:
+    return _STEP_RESULT.validate_python({"ids": ids, "inserted": inserted})
+
+
+def _check_bulk_len(op: str, length: int) -> None:
+    if length > MAX_BY_QUERY_ROWS:
+        raise RtDbError(
+            ErrorCode.BAD_REQUEST,
+            f"{op} has {length} docs, exceeding the limit of {MAX_BY_QUERY_ROWS}",
+        )
 
 
 def _insert_result(id: str) -> StepResult:

@@ -165,7 +165,7 @@ def _project_unfiltered_array(
             _replace_by_id(working, step.get("id"), step.get("doc") or {})
         elif op == "delete":
             _remove_by_id(working, step.get("id"))
-        elif op == "upsert":
+        elif op in ("upsert", "upsertMany", "insertMany"):
             return (None, False)
         # expectVersion / expectAbsent / expectNoMatch: preconditions, no data effect.
     return _finalize(working, last_value)
@@ -189,7 +189,7 @@ def _project_filtered_array(
         op = step.get("op")
         if op == "delete":
             _remove_by_id(working, step.get("id"))
-        elif op in ("insert", "patch", "replace", "upsert"):
+        elif op in ("insert", "patch", "replace", "upsert", "upsertMany", "insertMany"):
             # insert/patch/replace/upsert are membership-ambiguous under a filter.
             return (None, False)
         # expectVersion / expectAbsent / expectNoMatch: no data effect.
@@ -233,9 +233,9 @@ def _project_get(
                     new_doc["_creationTime"] = old_ct
                 new_doc.pop("_version", None)
                 working = new_doc
-        elif op == "upsert":
+        elif op in ("upsert", "upsertMany"):
             return (None, False)
-        # insert (fresh id never matches), expectVersion / expectAbsent / expectNoMatch: no-op.
+        # insert/insertMany (fresh id never matches) and the expect* preconditions: no-op.
     return _finalize(working, last_value)
 
 
