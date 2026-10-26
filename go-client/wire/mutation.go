@@ -39,7 +39,7 @@ func (t *Transaction) UnmarshalJSON(b []byte) error {
 
 // Step is one write/control step. Variants: StepInsert/StepPatch/
 // StepAdjustCounter/StepReplace/StepDelete/StepExpectVersion/StepExpectFields/
-// StepExpectAbsent/StepUpsert/StepPatchByQuery/StepDeleteByQuery/
+// StepExpectAbsent/StepExpectNoMatch/StepUpsert/StepPatchByQuery/StepDeleteByQuery/
 // StepSchedule/StepCancelSchedule/StepStartWorkflow/StepCancelWorkflow/
 // StepUndelete.
 type Step interface {
@@ -400,6 +400,36 @@ func (v *StepExpectAbsent) UnmarshalJSON(b []byte) error {
 		eq[i] = v
 	}
 	v.Table, v.Index, v.Eq = r.Table, r.Index, eq
+	return nil
+}
+
+// Mirrors core/src/mutation.rs::Step::ExpectNoMatch — precondition that no
+// visible live row in Table matches Filter; writes nothing.
+type StepExpectNoMatch struct {
+	Table  string     `json:"table"`
+	Filter FilterExpr `json:"filter"`
+}
+
+func (StepExpectNoMatch) isStep() {}
+
+func (v StepExpectNoMatch) MarshalJSON() ([]byte, error) {
+	type alias StepExpectNoMatch
+	return MarshalTagged("op", "expectNoMatch", alias(v))
+}
+
+func (v *StepExpectNoMatch) UnmarshalJSON(b []byte) error {
+	r, err := StrictUnmarshal[struct {
+		Table  string          `json:"table"`
+		Filter json.RawMessage `json:"filter"`
+	}](b)
+	if err != nil {
+		return err
+	}
+	f, err := UnmarshalFilterExpr(r.Filter)
+	if err != nil {
+		return err
+	}
+	v.Table, v.Filter = r.Table, f
 	return nil
 }
 
@@ -782,7 +812,7 @@ func UnmarshalScheduleWhen(data []byte) (ScheduleWhen, error) {
 	}
 }
 
-// UnmarshalStep routes a tagged step to its variant across all 17 ops.
+// UnmarshalStep routes a tagged step to its variant across all 18 ops.
 func UnmarshalStep(data []byte) (Step, error) {
 	tag, err := PeekTag(data, "op")
 	if err != nil {
@@ -809,6 +839,8 @@ func UnmarshalStep(data []byte) (Step, error) {
 		return DecodeTagged[StepExpectBefore](data, "op")
 	case "expectAbsent":
 		return DecodeTagged[StepExpectAbsent](data, "op")
+	case "expectNoMatch":
+		return DecodeTagged[StepExpectNoMatch](data, "op")
 	case "upsert":
 		return DecodeTagged[StepUpsert](data, "op")
 	case "patchByQuery":

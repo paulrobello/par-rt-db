@@ -262,6 +262,35 @@ struct OptimisticTests {
         }
     }
 
+    @Test func aggregateSubscriptionSkips() throws {
+        // A grouped multi-op aggregate result is an array of {keys, values}
+        // rows, not documents: it must never be treated as a collect. No
+        // index here, so without the aggregate exclusion the insert would
+        // append a synthetic doc through the unfiltered-array path.
+        let query = Query(
+            table: "items",
+            aggregate: AggregateSpec(
+                aggregates: ["total": .sum, "n": .count], groupBy: .fields(["status"])
+            )
+        )
+        let last = JSONValue.array([
+            .object([
+                "keys": .array([.string("open")]),
+                "values": .object(["total": .int(15), "n": .int(2)])
+            ])
+        ])
+        let txn = try MutationBuilder()
+            .insert("items", ["status": .string("open"), "total": .int(5)])
+            .patch("items", "a", ["total": .int(2)])
+            .delete("items", "a")
+            .build()
+        guard case .skip = projectOptimisticUpdate(query: query, last: last, txn: txn, now: 99)
+        else {
+            Issue.record("aggregate query should skip")
+            return
+        }
+    }
+
     @Test func tableMismatchAndAmbiguousStepsSkip() throws {
         let query = try collectQuery()
         let last = JSONValue.array([

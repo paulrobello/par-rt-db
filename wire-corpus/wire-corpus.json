@@ -113,6 +113,39 @@
       }
     },
     {
+      "type": "subscribe",
+      "queryId": "q-aggregate-multi",
+      "query": {
+        "table": "workItems",
+        "index": "by_status",
+        "aggregate": {
+          "aggregates": {
+            "total": "sum",
+            "n": "count"
+          },
+          "groupBy": [
+            "status"
+          ]
+        }
+      }
+    },
+    {
+      "type": "subscribe",
+      "queryId": "q-aggregate-legacy",
+      "query": {
+        "table": "workItems",
+        "index": "by_project_status_order",
+        "eq": [
+          "p1",
+          "backlog"
+        ],
+        "aggregate": {
+          "op": "sum",
+          "groupBy": false
+        }
+      }
+    },
+    {
       "type": "unsubscribe",
       "queryId": "q1"
     },
@@ -467,6 +500,40 @@
     },
     {
       "type": "mutate",
+      "mutId": "m-expect-no-match",
+      "txn": {
+        "steps": [
+          {
+            "op": "expectNoMatch",
+            "table": "bookings",
+            "filter": {
+              "op": "and",
+              "exprs": [
+                {
+                  "op": "eq",
+                  "field": "room",
+                  "value": "r1"
+                },
+                {
+                  "op": "exists",
+                  "field": "startsAt"
+                }
+              ]
+            }
+          },
+          {
+            "op": "insert",
+            "table": "bookings",
+            "doc": {
+              "room": "r1",
+              "startsAt": 1
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "mutate",
       "mutId": "m12",
       "txn": {
         "steps": [
@@ -606,6 +673,43 @@
       "type": "queryUpdate",
       "queryId": "q1",
       "result": 42
+    },
+    {
+      "type": "queryUpdate",
+      "queryId": "q1",
+      "result": {
+        "total": 10,
+        "n": 2
+      }
+    },
+    {
+      "type": "queryUpdate",
+      "queryId": "q1",
+      "result": [
+        {
+          "keys": [
+            "backlog"
+          ],
+          "values": {
+            "total": 10,
+            "n": 2
+          }
+        }
+      ]
+    },
+    {
+      "type": "queryUpdate",
+      "queryId": "q1",
+      "result": [
+        {
+          "key": "backlog",
+          "value": 10
+        },
+        {
+          "key": null,
+          "value": null
+        }
+      ]
     },
     {
       "type": "queryUpdate",

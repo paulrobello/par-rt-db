@@ -1005,10 +1005,11 @@ struct WireFilterQueryTests {
         expectDecodingThrows(HybridSearchQuery.self, #"{"query":"x","vector":[1.0],"limit":1,"bogus":true}"#)
     }
 
-    @Test func aggregateSpecOmitsFalseGroupBy() throws {
-        // rust wire.rs AggregateSpec: groupBy omitted when false (client
-        // convention; the server's #[serde(default)] accepts both forms).
-        try expectEncodes(AggregateSpec(op: .sum), as: #"{"op":"sum"}"#)
+    @Test func aggregateSpecEncodesLegacyGroupByExplicitly() throws {
+        // core/src/query.rs AggregateSpec: group_by is ALWAYS serialized
+        // (false included) — the legacy single-op shape is
+        // `{"op":"sum","groupBy":false}` on the wire.
+        try expectEncodes(AggregateSpec(op: .sum), as: #"{"op":"sum","groupBy":false}"#)
         try expectEncodes(AggregateSpec(op: .avg, groupBy: true), as: #"{"op":"avg","groupBy":true}"#)
         expectDecodingThrows(AggregateSpec.self, #"{"op":"sum","zzz":1}"#)
         expectDecodingThrows(AggregateSpec.self, #"{"op":"median"}"#)

@@ -542,6 +542,44 @@ pub(crate) async fn step_patch_by_query(
     Ok(())
 }
 
+/// `ExpectNoMatch` step: abort with `PRECONDITION_FAILED` when any live row the
+/// caller can see matches `filter`. Row scoping (owner/collaborators,
+/// `authorize`, soft delete) comes from `compile_scan_where`, so an invisible
+/// row never counts and the message is fixed (no row data leaks).
+pub(crate) async fn step_expect_no_match(
+    sctx: &mut StepCtx<'_>,
+    table: &str,
+    filter: &crate::query::FilterExpr,
+) -> Result<(), RtDbError> {
+    let pg_schema_name = sctx.pg_schema_name;
+    let table_def = sctx.schema.table(table)?;
+    let (where_sql, binds, _limit_ph) =
+        crate::query::compile_scan_where(table_def, sctx.ctx, sctx.owner, Some(filter))?;
+    let table_ident = pg_table(table);
+    let base = format!("SELECT 1 FROM \"{pg_schema_name}\".\"{table_ident}\"");
+    let sql = if where_sql.is_empty() {
+        format!("{base} LIMIT 1")
+    } else {
+        format!("{base} WHERE {where_sql} LIMIT 1")
+    };
+    let mut query = sqlx::query_as::<_, (i32,)>(sqlx::AssertSqlSafe(sql));
+    for bind in binds {
+        query = match bind {
+            EqBind::Text(v) => query.bind(v),
+            EqBind::Num(v) => query.bind(v),
+            EqBind::Bool(v) => query.bind(v),
+            EqBind::I64(v) => query.bind(v),
+        };
+    }
+    if query.fetch_optional(&mut *sctx.tx).await?.is_some() {
+        return Err(RtDbError::precondition(
+            "filter matched an existing document",
+        ));
+    }
+    sctx.results.push(serde_json::Value::Null);
+    Ok(())
+}
+
 pub(crate) async fn step_delete_by_query(
     sctx: &mut StepCtx<'_>,
     table: &str,

@@ -1330,3 +1330,158 @@ async fn admin_stream_rejects_disallowed_origin() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// Reactive aggregates over /sync: scalar and grouped subscriptions push on an
+// in-window change, stay silent on a change that doesn't move the result, a
+// bad spec is a subscribeErr that keeps the connection open, and an unknown
+// aggregate op is a malformed frame that closes the socket with 4400.
+#[tokio::test]
+async fn subscribe_aggregate_pushes_on_change_over_sync() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+    let proj = "0".repeat(32);
+
+    let insert_item = |order: f64| {
+        json!({"steps": [{"op": "insert", "table": "workItems", "doc": {
+            "projectId": proj, "title": "item", "status": "backlog",
+            "order": order, "completedAt": null
+        }}]})
+    };
+
+    let mut ws = ws_connect(addr).await;
+    auth(&mut ws, &token, &db).await;
+
+    // (a) legacy scalar sum over an empty window -> null.
+    send_json(
+        &mut ws,
+        json!({"type": "subscribe", "queryId": "sum", "query": {
+            "table": "workItems", "index": "by_project_status_order",
+            "eq": [proj, "backlog"], "aggregate": {"op": "sum"}}}),
+    )
+    .await;
+    let msg = recv_json(&mut ws).await;
+    assert_eq!(msg["type"], json!("queryUpdate"));
+    assert_eq!(msg["queryId"], json!("sum"));
+    assert_eq!(msg["result"], Value::Null);
+
+    // (b) in-window insert -> mutateOk + queryUpdate with sum 10.
+    send_json(
+        &mut ws,
+        json!({"type": "mutate", "mutId": "m1", "txn": insert_item(10.0)}),
+    )
+    .await;
+    let mut item_id = None;
+    let mut saw_update = false;
+    for _ in 0..2 {
+        let msg = recv_json(&mut ws).await;
+        match msg["type"].as_str() {
+            Some("mutateOk") => {
+                item_id = Some(msg["results"][0]["id"].as_str().expect("id").to_string());
+            }
+            Some("queryUpdate") => {
+                assert_eq!(msg["queryId"], json!("sum"));
+                assert_eq!(msg["result"].as_f64(), Some(10.0));
+                saw_update = true;
+            }
+            other => panic!("unexpected message type {other:?}"),
+        }
+    }
+    let item_id = item_id.expect("mutateOk");
+    assert!(saw_update, "expected a queryUpdate with the new sum");
+
+    // (c) patching a non-aggregated field leaves the sum unchanged -> only
+    // mutateOk arrives, nothing else within 300ms.
+    send_json(
+        &mut ws,
+        json!({"type": "mutate", "mutId": "m2", "txn": {"steps": [
+            {"op": "patch", "table": "workItems", "id": item_id,
+             "fields": {"title": "renamed"}}]}}),
+    )
+    .await;
+    assert_eq!(recv_json(&mut ws).await["type"], json!("mutateOk"));
+    let drained = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
+    assert!(
+        drained.is_err(),
+        "expected no queryUpdate after a non-aggregated patch, got {drained:?}"
+    );
+
+    // (d) multi-alias grouped aggregate -> {keys, values} rows.
+    send_json(
+        &mut ws,
+        json!({"type": "subscribe", "queryId": "grp", "query": {
+            "table": "workItems", "index": "by_project_status_order",
+            "eq": [proj],
+            "aggregate": {"aggregates": {"total": "sum", "n": "count"}, "groupBy": true}}}),
+    )
+    .await;
+    let msg = recv_json(&mut ws).await;
+    assert_eq!(msg["type"], json!("queryUpdate"));
+    assert_eq!(msg["queryId"], json!("grp"));
+    assert_eq!(
+        msg["result"],
+        json!([{"keys": ["backlog"], "values": {"total": 10, "n": 1}}])
+    );
+
+    send_json(
+        &mut ws,
+        json!({"type": "mutate", "mutId": "m3", "txn": insert_item(5.0)}),
+    )
+    .await;
+    let mut grouped = None;
+    let mut saw_ok = false;
+    // Both live subscriptions move (sum 10 -> 15, group n 1 -> 2): three frames.
+    for _ in 0..3 {
+        let msg = recv_json(&mut ws).await;
+        match (msg["type"].as_str(), msg["queryId"].as_str()) {
+            (Some("mutateOk"), _) => saw_ok = true,
+            (Some("queryUpdate"), Some("grp")) => grouped = Some(msg["result"].clone()),
+            (Some("queryUpdate"), Some("sum")) => {
+                assert_eq!(msg["result"].as_f64(), Some(15.0));
+            }
+            other => panic!("unexpected message {other:?}"),
+        }
+    }
+    assert!(saw_ok);
+    assert_eq!(
+        grouped.expect("grouped queryUpdate"),
+        json!([{"keys": ["backlog"], "values": {"total": 15, "n": 2}}])
+    );
+
+    // (e) `op` together with `aggregates` -> subscribeErr BAD_REQUEST, socket stays open.
+    send_json(
+        &mut ws,
+        json!({"type": "subscribe", "queryId": "bad", "query": {
+            "table": "workItems", "index": "by_project_status_order",
+            "eq": [proj, "backlog"],
+            "aggregate": {"op": "sum", "aggregates": {"n": "count"}}}}),
+    )
+    .await;
+    let msg = recv_json(&mut ws).await;
+    assert_eq!(msg["type"], json!("subscribeErr"));
+    assert_eq!(msg["queryId"], json!("bad"));
+    assert_eq!(msg["error"]["code"], json!("BAD_REQUEST"));
+    send_json(&mut ws, json!({"type": "ping"})).await;
+    assert_eq!(recv_json(&mut ws).await["type"], json!("pong"));
+
+    // (f) unknown aggregate op is a malformed frame: the socket closes with 4400.
+    send_json(
+        &mut ws,
+        json!({"type": "subscribe", "queryId": "median", "query": {
+            "table": "workItems", "index": "by_project_status_order",
+            "eq": [proj, "backlog"], "aggregate": {"op": "median"}}}),
+    )
+    .await;
+    loop {
+        match ws.next().await {
+            Some(Ok(Message::Close(Some(frame)))) => {
+                assert_eq!(u16::from(frame.code), 4400);
+                break;
+            }
+            Some(Ok(Message::Text(_))) => continue,
+            other => panic!("expected a close frame with code 4400, got {other:?}"),
+        }
+    }
+    Ok(())
+}

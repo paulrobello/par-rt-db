@@ -1,0 +1,55 @@
+{
+  "name": "txn-expect-no-match-aborts",
+  "$comment": "expectNoMatch whose filter matches an existing live row aborts the whole transaction with PRECONDITION_FAILED (code only; the message is fixed and carries no row data).",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_name",
+            "fields": [
+              "name"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "seed": [
+    {
+      "name": "a"
+    }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "expectNoMatch",
+          "table": "tasks",
+          "filter": {
+            "op": "eq",
+            "field": "name",
+            "value": "a"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "tasks",
+          "doc": {
+            "name": "b"
+          }
+        }
+      ]
+    }
+  },
+  "expect": {
+    "error": {
+      "code": "PRECONDITION_FAILED"
+    }
+  }
+}

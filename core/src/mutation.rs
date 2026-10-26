@@ -125,6 +125,16 @@ pub enum Step {
         /// The eq-prefix values.
         eq: Vec<serde_json::Value>,
     },
+    /// Precondition: no visible live row in `table` may match `filter` (the
+    /// same `FilterExpr` the by-query steps accept). A match aborts the
+    /// transaction with `PRECONDITION_FAILED`. Writes nothing. Pair with an
+    /// `Insert` for a conditional insert ("insertIf").
+    ExpectNoMatch {
+        /// Target table.
+        table: String,
+        /// Predicate no visible live row may satisfy.
+        filter: FilterExpr,
+    },
     /// Insert-or-patch keyed by an index eq-prefix match.
     Upsert {
         /// Target table.

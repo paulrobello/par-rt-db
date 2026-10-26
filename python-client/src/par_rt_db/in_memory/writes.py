@@ -23,6 +23,7 @@ from ..mutation import (
     _ExpectAbsent,
     _ExpectBefore,
     _ExpectFields,
+    _ExpectNoMatch,
     _ExpectVersion,
     _Insert,
     _is_safe_counter_integer,
@@ -216,6 +217,20 @@ class _WritesEngine(_Core):
                     raise RtDbError(
                         ErrorCode.PRECONDITION_FAILED,
                         f"index '{index}' already has a matching document",
+                    )
+                return None, set()
+            case _ExpectNoMatch(table=table, filter=flt):
+                table_def = self._require_table(table)
+                _validate_filter(flt, table_def, allow_relative_time=True)
+                step_now = self._now()
+                if any(
+                    t == table
+                    and _is_live(row)
+                    and _eval_filter_expr(flt, row.doc, table_def.fields, step_now)
+                    for (t, _id), row in self._docs.items()
+                ):
+                    raise RtDbError(
+                        ErrorCode.PRECONDITION_FAILED, "filter matched an existing document"
                     )
                 return None, set()
             case _Upsert(

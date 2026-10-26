@@ -659,7 +659,14 @@ impl InMemoryRtDbClient {
         let by_query_steps = txn
             .steps
             .iter()
-            .filter(|s| matches!(s, Step::PatchByQuery { .. } | Step::DeleteByQuery { .. }))
+            .filter(|s| {
+                matches!(
+                    s,
+                    Step::PatchByQuery { .. }
+                        | Step::DeleteByQuery { .. }
+                        | Step::ExpectNoMatch { .. }
+                )
+            })
             .count();
         if by_query_steps > MAX_BY_QUERY_STEPS_PER_TXN {
             return Err(RtDbError::new(
@@ -752,6 +759,7 @@ impl InMemoryRtDbClient {
                 expected,
             } => self.step_expect_fields(table, id, expected),
             Step::ExpectAbsent { table, index, eq } => self.step_expect_absent(table, index, eq),
+            Step::ExpectNoMatch { table, filter } => self.step_expect_no_match(table, filter),
             Step::ExpectBefore { .. } => Ok((StepResult::Null, vec![])),
             Step::Upsert {
                 table,
@@ -1055,6 +1063,25 @@ impl InMemoryRtDbClient {
             return Err(RtDbError::new(
                 ErrorCode::PreconditionFailed,
                 format!("index '{index}' already has a matching document"),
+            ));
+        }
+        Ok((StepResult::Null, Vec::new()))
+    }
+
+    /// `ExpectNoMatch` step: precondition that no visible live row matches
+    /// `filter` (same evaluator and soft-delete visibility as the by-query
+    /// scans, so `olderThan` is accepted); writes nothing.
+    fn step_expect_no_match(
+        &self,
+        table: &str,
+        filter: &FilterExpr,
+    ) -> Result<(StepResult, Vec<String>), RtDbError> {
+        let table_def = self.require_table(table)?.clone();
+        let (ids, _) = self.scan_ids_by_filter(&table_def, table, filter, Some(1))?;
+        if !ids.is_empty() {
+            return Err(RtDbError::new(
+                ErrorCode::PreconditionFailed,
+                "filter matched an existing document",
             ));
         }
         Ok((StepResult::Null, Vec::new()))

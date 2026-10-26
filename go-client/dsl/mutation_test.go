@@ -74,3 +74,34 @@ func TestExpectAbsentCarriesTable(t *testing.T) {
 		t.Fatalf("wire mismatch:\n got %s\nwant %s", blob, wantJSON)
 	}
 }
+
+func TestInsertIfEmitsExpectNoMatchThenInsert(t *testing.T) {
+	txn := NewMutation().InsertIf("items", Eq("name", wire.String("a")), map[string]any{"name": "a"}).Build()
+	blob, err := json.Marshal(txn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got, want map[string]any
+	if err := json.Unmarshal(blob, &got); err != nil {
+		t.Fatal(err)
+	}
+	wantJSON := `{"steps":[` +
+		`{"op":"expectNoMatch","table":"items","filter":{"op":"eq","field":"name","value":"a"}},` +
+		`{"op":"insert","table":"items","doc":{"name":"a"}}]}`
+	if err := json.Unmarshal([]byte(wantJSON), &want); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("wire mismatch:\n got %s\nwant %s", blob, wantJSON)
+	}
+}
+
+func TestExpectNoMatchBuilderAlone(t *testing.T) {
+	txn := NewMutation().ExpectNoMatch("items", Eq("name", wire.String("a"))).Build()
+	if len(txn.Steps) != 1 {
+		t.Fatalf("steps: %d", len(txn.Steps))
+	}
+	if st, ok := txn.Steps[0].(wire.StepExpectNoMatch); !ok || st.Table != "items" {
+		t.Fatalf("step: %#v", txn.Steps[0])
+	}
+}

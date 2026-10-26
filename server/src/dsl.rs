@@ -203,6 +203,7 @@ impl StepTableExt for Step {
             | Step::ExpectVersion { table, .. }
             | Step::ExpectFields { table, .. }
             | Step::ExpectAbsent { table, .. }
+            | Step::ExpectNoMatch { table, .. }
             | Step::Upsert { table, .. }
             | Step::PatchByQuery { table, .. }
             | Step::DeleteByQuery { table, .. }

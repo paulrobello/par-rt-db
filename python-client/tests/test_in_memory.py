@@ -2284,6 +2284,86 @@ def test_delete_by_query_truncates_at_limit() -> None:
     assert len(c.run_query(TableQuery("items").build())) == 1
 
 
+def test_expect_no_match_passes_when_nothing_matches() -> None:
+    c = _new_client()
+    c.mutate(
+        Mutation.builder().insert("items", {"name": "a", "status": "todo", "order": 1}).build()
+    )
+    flt = _flt({"op": "eq", "field": "status", "value": "done"})
+    results = c.mutate(Mutation.builder().expect_no_match("items", flt).build())
+    assert results == [None]
+    assert len(c.run_query(TableQuery("items").build())) == 1
+
+
+def test_expect_no_match_aborts_and_rolls_back_when_a_row_matches() -> None:
+    c = _new_client()
+    c.mutate(
+        Mutation.builder().insert("items", {"name": "a", "status": "todo", "order": 1}).build()
+    )
+    flt = _flt({"op": "eq", "field": "status", "value": "todo"})
+    with pytest.raises(RtDbError) as ei:
+        c.mutate(
+            Mutation.builder()
+            .insert("items", {"name": "b", "status": "x", "order": 2})
+            .expect_no_match("items", flt)
+            .build()
+        )
+    assert ei.value.code is ErrorCode.PRECONDITION_FAILED
+    assert ei.value.message == "filter matched an existing document"
+    # The earlier insert in the aborted txn rolled back.
+    assert len(c.run_query(TableQuery("items").build())) == 1
+
+
+def test_insert_if_inserts_once_then_aborts() -> None:
+    c = _new_client()
+    flt = _flt({"op": "eq", "field": "name", "value": "solo"})
+    doc = {"name": "solo", "status": "todo", "order": 1}
+    c.mutate(Mutation.builder().insert_if("items", flt, doc).build())
+    with pytest.raises(RtDbError) as ei:
+        c.mutate(Mutation.builder().insert_if("items", flt, doc).build())
+    assert ei.value.code is ErrorCode.PRECONDITION_FAILED
+    assert len(c.run_query(TableQuery("items").build())) == 1
+
+
+def test_expect_no_match_sees_earlier_steps_in_the_same_txn() -> None:
+    c = _new_client()
+    flt = _flt({"op": "eq", "field": "name", "value": "dup"})
+    doc = {"name": "dup", "status": "todo", "order": 1}
+    with pytest.raises(RtDbError) as ei:
+        c.mutate(Mutation.builder().insert("items", doc).expect_no_match("items", flt).build())
+    assert ei.value.code is ErrorCode.PRECONDITION_FAILED
+    assert c.run_query(TableQuery("items").build()) == []
+
+
+def test_expect_no_match_ignores_soft_deleted_rows() -> None:
+    c = InMemoryRtDbClient()
+    c.push_schema(
+        Schema.builder()
+        .table("notes", lambda tb: tb.field("body", t.string()).soft_delete())
+        .build()
+    )
+    [res] = c.mutate(Mutation.builder().insert("notes", {"body": "hi"}).build())
+    assert res is not None
+    nid = res.id  # type: ignore[union-attr]
+    flt = _flt({"op": "eq", "field": "body", "value": "hi"})
+    with pytest.raises(RtDbError):
+        c.mutate(Mutation.builder().expect_no_match("notes", flt).build())
+    c.mutate(Mutation.builder().delete("notes", nid).build())
+    assert c.mutate(Mutation.builder().expect_no_match("notes", flt).build()) == [None]
+
+
+def test_expect_no_match_counts_toward_the_by_query_step_cap() -> None:
+    c = _new_client()
+    flt = _flt({"op": "eq", "field": "status", "value": "never"})
+    b = Mutation.builder()
+    for _ in range(MAX_BY_QUERY_STEPS_PER_TXN + 1):
+        b.expect_no_match("items", flt)
+    with pytest.raises(RtDbError) as ei:
+        c.mutate(b.build())
+    assert ei.value.code is ErrorCode.BAD_REQUEST
+    assert "by-query steps" in ei.value.message
+
+
 def test_sec104_rejects_over_budget_by_query_step_count() -> None:
     # Mirrors server `sec104_rejects_over_budget_by_query_step_count`. A txn
     # with MAX_BY_QUERY_STEPS_PER_TXN+1 patchByQuery steps is rejected at the
@@ -2585,6 +2665,53 @@ def test_subscribe_delivers_initial_value_and_recomputes_only_on_change() -> Non
             Mutation.builder().insert("items", {"name": "b", "status": "done", "order": 2}).build()
         )
         assert updates == [0, 1], "done insert did not change the todo count"
+    finally:
+        handle.unsubscribe()
+
+
+def test_subscribe_grouped_multi_aggregate_fires_only_on_result_change() -> None:
+    # notifySubs re-runs the query and diffs the canonical result, so a grouped
+    # multi-op aggregate fires on in-window inserts and stays silent on a patch
+    # to a non-indexed field. The in-memory subscribe delivers the raw result
+    # (no model coercion). On the reactive WS client, a scalar aggregate
+    # subscription must pass model=Any/float: the default model=dict makes
+    # _coerce call dict(42) and raise TypeError. That is the documented
+    # contract of parse_result, not a bug.
+    c = _new_client()
+    ids = []
+    for status, order in [("todo", 1), ("todo", 2), ("done", 3)]:
+        res = c.mutate(
+            Mutation.builder()
+            .insert("items", {"name": "n", "status": status, "order": order})
+            .build()
+        )
+        ids.append(_id_of(res[0]))
+    q = (
+        TableQuery("items")
+        .with_index("by_status_and_order")
+        .aggregate(aggregates={"total": "sum", "n": "count"}, group_by=True)
+        .build()
+    )
+    updates: list[Any] = []
+    handle = c.subscribe(q, lambda v: updates.append(v))
+    try:
+        assert updates == [
+            [
+                {"keys": ["done"], "values": {"total": 3.0, "n": 1}},
+                {"keys": ["todo"], "values": {"total": 3.0, "n": 2}},
+            ]
+        ]
+        c.mutate(
+            Mutation.builder().insert("items", {"name": "n", "status": "todo", "order": 5}).build()
+        )
+        assert len(updates) == 2
+        assert updates[1] == [
+            {"keys": ["done"], "values": {"total": 3.0, "n": 1}},
+            {"keys": ["todo"], "values": {"total": 8.0, "n": 3}},
+        ]
+        # Patching a non-indexed field leaves the aggregate unchanged: no fire.
+        c.mutate(Mutation.builder().patch("items", ids[0], {"name": "renamed"}).build())
+        assert len(updates) == 2
     finally:
         handle.unsubscribe()
 

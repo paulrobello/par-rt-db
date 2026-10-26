@@ -289,6 +289,56 @@ def test_rank_and_membership_terminals_all_skip():
         assert not did, f"terminal query should skip: {q}"
 
 
+def test_expect_no_match_has_no_optimistic_effect():
+    # expectNoMatch is a precondition: alone it never overlays, and in an
+    # insertIf pair only the insert contributes.
+    last = [{"_id": "a", "_creationTime": 1, "_version": 1, "title": "x"}]
+    flt = {"op": "eq", "field": "title", "value": "y"}
+    from pydantic import TypeAdapter
+
+    from par_rt_db.wire import FilterExpr
+
+    parsed = TypeAdapter(FilterExpr).validate_python(flt)
+    only = _steps(Mutation.builder().expect_no_match("items", parsed))
+    assert only[0]["op"] == "expectNoMatch"
+    assert project(_collect(), last, only, 99) == (None, False)
+
+    pair = _steps(Mutation.builder().insert_if("items", parsed, {"title": "y"}))
+    value, did = project(_collect(), last, pair, 99)
+    assert did
+    assert isinstance(value, list)
+    assert len(value) == 2
+    assert value[1]["title"] == "y"
+
+    # A different-table precondition does not mask the target-table insert and
+    # does not decline the get(id) / filtered-array projections.
+    get_q = _q(TableQuery("items").get("a"))
+    assert project(get_q, last[0], only, 99) == (None, False)
+    filtered = _q(TableQuery("items").with_index("by_title").eq("x").collect())
+    assert project(filtered, last, only, 99) == (None, False)
+
+
+def test_aggregate_subscription_is_skipped():
+    # An aggregate result (scalar, grouped rows, or multi-op dict) is not a doc
+    # array, so the optimistic layer must decline even though the last value is
+    # a list that would otherwise look like an unfiltered collect.
+    last = [{"key": "todo", "value": 1}]
+    steps = _steps(Mutation.builder().insert("items", {"status": "todo"}))
+    queries = [
+        _q(TableQuery("items").aggregate("count")),
+        _q(TableQuery("items").with_index("by_status_and_order").aggregate("sum", group_by=True)),
+        _q(
+            TableQuery("items")
+            .with_index("by_status_and_order")
+            .aggregate(aggregates={"total": "sum", "n": "count"}, group_by=True)
+        ),
+    ]
+    for q in queries:
+        assert q.get("aggregate") is not None
+        value, did = project(q, last, steps, 99)
+        assert not did, f"aggregate query should skip: {q}"
+
+
 def test_non_array_last_skips():
     # An unfiltered-array projection against a non-list last value declines.
     last = {"not": "a list"}

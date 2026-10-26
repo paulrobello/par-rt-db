@@ -86,7 +86,7 @@ def project(
 
 
 def _is_array_query(q: dict[str, Any]) -> bool:
-    """``get``/``unique``/``first``/``count``/``distinct``/``paginate``/``search``/
+    """``get``/``unique``/``first``/``count``/``distinct``/``aggregate``/``paginate``/``search``/
     ``vectorSearch`` terminals are non-array (or rank-based) shapes whose result
     cannot be projected from cached documents alone. A ``filter`` predicate is NOT
     excluded here: a filtered collect is still an array read, just one whose
@@ -97,6 +97,7 @@ def _is_array_query(q: dict[str, Any]) -> bool:
         and not q.get("first")
         and not q.get("count")
         and not q.get("distinct")
+        and q.get("aggregate") is None
         and q.get("paginate") is None
         and q.get("search") is None
         and q.get("vectorSearch") is None
@@ -119,11 +120,12 @@ def _has_filter(q: dict[str, Any]) -> bool:
 
 
 def _step_table(step: dict[str, Any]) -> str | None:
-    """The table this step targets. Every op except ``expectAbsent`` carries one;
-    ``expectAbsent`` is a precondition with no data effect, so its table is masked
+    """The table this step targets. Every op except ``expectAbsent`` and
+    ``expectNoMatch`` carries one; both are preconditions with no data effect, so
+    their table is masked
     here (returning None makes the per-step table guard skip it, which is harmless
     since the variant is a no-op in every projection)."""
-    if step.get("op") == "expectAbsent":
+    if step.get("op") in ("expectAbsent", "expectNoMatch"):
         return None
     table = step.get("table")
     return table if isinstance(table, str) else None
@@ -165,7 +167,7 @@ def _project_unfiltered_array(
             _remove_by_id(working, step.get("id"))
         elif op == "upsert":
             return (None, False)
-        # expectVersion / expectAbsent: preconditions, no data effect.
+        # expectVersion / expectAbsent / expectNoMatch: preconditions, no data effect.
     return _finalize(working, last_value)
 
 
@@ -190,7 +192,7 @@ def _project_filtered_array(
         elif op in ("insert", "patch", "replace", "upsert"):
             # insert/patch/replace/upsert are membership-ambiguous under a filter.
             return (None, False)
-        # expectVersion / expectAbsent: no data effect.
+        # expectVersion / expectAbsent / expectNoMatch: no data effect.
     return _finalize(working, last_value)
 
 
@@ -233,7 +235,7 @@ def _project_get(
                 working = new_doc
         elif op == "upsert":
             return (None, False)
-        # insert (fresh id never matches), expectVersion / expectAbsent: no-op.
+        # insert (fresh id never matches), expectVersion / expectAbsent / expectNoMatch: no-op.
     return _finalize(working, last_value)
 
 

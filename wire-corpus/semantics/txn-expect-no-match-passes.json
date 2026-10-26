@@ -1,0 +1,74 @@
+{
+  "name": "txn-expect-no-match-passes",
+  "$comment": "expectNoMatch with a filter that matches no live row passes as a null step result, so the following insert (the insertIf idiom) lands. A seed row is present so the emptiness is a real miss.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_name",
+            "fields": [
+              "name"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "seed": [
+    {
+      "name": "a"
+    }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "expectNoMatch",
+          "table": "tasks",
+          "filter": {
+            "op": "eq",
+            "field": "name",
+            "value": "ghost"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "tasks",
+          "doc": {
+            "name": "b"
+          }
+        }
+      ]
+    }
+  },
+  "expect": [
+    null,
+    {}
+  ],
+  "then": {
+    "query": {
+      "table": "tasks"
+    },
+    "expect": [
+      {
+        "name": "a"
+      },
+      {
+        "name": "b"
+      }
+    ],
+    "unordered": true
+  },
+  "normalize": [
+    "_id",
+    "_creationTime",
+    "_version",
+    "id"
+  ]
+}

@@ -540,3 +540,109 @@ func TestSubscriberCallbackMayReenterStore(t *testing.T) {
 		t.Fatal("deadlock: subscriber callback re-entered the store")
 	}
 }
+
+func expectNoMatchAbort(t *testing.T, err error) {
+	t.Helper()
+	re, ok := err.(*rtdberrors.RtDbError)
+	if !ok || re.Code != rtdberrors.CodePreconditionFailed || re.Message != "filter matched an existing document" {
+		t.Fatalf("want PRECONDITION_FAILED 'filter matched an existing document', got %v", err)
+	}
+}
+
+func countItemsNamed(s *Store, name string) int {
+	n := 0
+	for key, row := range s.docs {
+		if key.Table == "items" && row.DeletedAt == nil && jsonEq(row.Doc["name"], wire.String(name)) {
+			n++
+		}
+	}
+	return n
+}
+
+func TestExpectNoMatchPassesWhenNothingMatches(t *testing.T) {
+	s := newTestStore(t)
+	res, err := ApplyTxn(s, dsl.NewMutation().
+		InsertIf("items", dsl.Eq("name", wire.String("a")),
+			map[string]any{"name": "a", "status": "todo", "order": 1}).Build(), "")
+	if err != nil {
+		t.Fatalf("insertIf on empty table: %v", err)
+	}
+	if len(res) != 2 || res[0].ID != nil || res[1].ID == nil {
+		t.Fatalf("results: %+v", res)
+	}
+	if countItemsNamed(s, "a") != 1 {
+		t.Fatal("row not inserted")
+	}
+}
+
+func TestExpectNoMatchAbortsAndRollsBack(t *testing.T) {
+	s := newTestStore(t)
+	seedRow(t, s, "items", 100, docObj("name", "a", "status", "todo", "order", int64(1)))
+	_, err := ApplyTxn(s, dsl.NewMutation().
+		Insert("items", docObj("name", "b", "status", "todo", "order", 2)).
+		InsertIf("items", dsl.Eq("name", wire.String("a")),
+			map[string]any{"name": "a", "status": "todo", "order": 3}).Build(), "")
+	expectNoMatchAbort(t, err)
+	if countItemsNamed(s, "a") != 1 || countItemsNamed(s, "b") != 0 {
+		t.Fatal("txn did not roll back")
+	}
+}
+
+func TestExpectNoMatchSeesEarlierStepsInSameTxn(t *testing.T) {
+	s := newTestStore(t)
+	_, err := ApplyTxn(s, dsl.NewMutation().
+		Insert("items", docObj("name", "a", "status", "todo", "order", 1)).
+		ExpectNoMatch("items", dsl.Eq("name", wire.String("a"))).Build(), "")
+	expectNoMatchAbort(t, err)
+	if countItemsNamed(s, "a") != 0 {
+		t.Fatal("txn did not roll back")
+	}
+}
+
+func TestExpectNoMatchIgnoresSoftDeletedRows(t *testing.T) {
+	s := NewStore()
+	if err := s.PushSchema(buildSchema(func(b *dsl.SchemaBuilder) {
+		b.Table("notes", func(tb *dsl.TableBuilder) {
+			tb.Field("text", dsl.Str()).SoftDelete().Index("by_text", "text")
+		})
+	})); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	table := s.SchemaSnapshot().Tables["notes"]
+	id, _ := doInsert(s, "notes", table, docObj("text", "hi"))
+	if err := doSoftDelete(s, "notes", id); err != nil {
+		t.Fatalf("soft delete: %v", err)
+	}
+	if _, err := ApplyTxn(s, dsl.NewMutation().
+		ExpectNoMatch("notes", dsl.Eq("text", wire.String("hi"))).Build(), ""); err != nil {
+		t.Fatalf("soft-deleted row must be invisible: %v", err)
+	}
+}
+
+func TestExpectNoMatchAcceptsOlderThan(t *testing.T) {
+	s := newTestStore(t)
+	seedRow(t, s, "items", 100, docObj("name", "a", "status", "todo", "order", int64(1)))
+	// olderThan matches rows whose field < now-ms. order=1 is far below now,
+	// so a zero window matches and aborts.
+	_, err := ApplyTxn(s, dsl.NewMutation().
+		ExpectNoMatch("items", dsl.OlderThan("order", 0)).Build(), "")
+	expectNoMatchAbort(t, err)
+	// A window reaching back past order=1 matches nothing.
+	if _, err := ApplyTxn(s, dsl.NewMutation().
+		ExpectNoMatch("items", dsl.OlderThan("order", 1<<50)).Build(), ""); err != nil {
+		t.Fatalf("wide olderThan window should not match: %v", err)
+	}
+}
+
+func TestExpectNoMatchCountsTowardByQueryStepCap(t *testing.T) {
+	s := newTestStore(t)
+	m := dsl.NewMutation()
+	for i := 0; i <= maxByQueryStepsPerTxn; i++ {
+		m = m.ExpectNoMatch("items", dsl.Eq("name", wire.String("zz")))
+	}
+	_, err := ApplyTxn(s, m.Build(), "")
+	re, ok := err.(*rtdberrors.RtDbError)
+	if !ok || re.Code != rtdberrors.CodeBadRequest || !strings.Contains(re.Message, "by-query steps") {
+		t.Fatalf("want BAD_REQUEST by-query cap, got %v", err)
+	}
+}

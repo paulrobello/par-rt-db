@@ -649,6 +649,34 @@ describe("InMemoryRtDbClient — subscribe", () => {
     expect(updates).toEqual([0, 1]); // unsubscribed: no further updates
   });
 
+  it("re-fires a grouped multi-op aggregate subscription only when an aggregated value changes", async () => {
+    const c = newClient();
+    await c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
+    const [res] = await c.mutate(
+      mutation().insert("items", { name: "b", status: "todo", order: 2 }).build(),
+    );
+    const id = (res as { id: string }).id;
+
+    const updates: unknown[] = [];
+    c.subscribe(
+      api.items
+        .query()
+        .withIndex("by_status_and_order", [])
+        .aggregates({ total: "sum", n: "count" }, ["status"]),
+      (v) => updates.push(v),
+    );
+    expect(updates).toEqual([[{ keys: ["todo"], values: { total: 3, n: 2 } }]]);
+
+    // An in-window insert changes the group's aggregates: the subscription fires.
+    await c.mutate(mutation().insert("items", { name: "c", status: "todo", order: 4 }).build());
+    expect(updates).toHaveLength(2);
+    expect(updates[1]).toEqual([{ keys: ["todo"], values: { total: 7, n: 3 } }]);
+
+    // Patching a field outside the aggregate (name) leaves the result identical: no fire.
+    await c.mutate(mutation().patch("items", id, { name: "renamed" }).build());
+    expect(updates).toHaveLength(2);
+  });
+
   it("skips a failing subscriber query without aborting the write or other listeners", async () => {
     const c = newClient();
     await c.mutate(mutation().insert("items", { name: "a", status: "todo", order: 1 }).build());
@@ -4081,6 +4109,65 @@ describe("InMemoryRtDbClient — soft delete (FM-33)", () => {
 
     await c.mutate(mutation().delete("tasks", id).build());
     await c.mutate(mutation().expectAbsent("tasks", "by_name", ["live"]).build()); // resolves
+  });
+
+  it("expectNoMatch passes when no row matches and aborts when one does", async () => {
+    const c = fm33Client(softTasksSchema);
+    const filter = { op: "eq", field: "name", value: "k" } as const;
+    const [r] = await c.mutate(mutation().expectNoMatch("tasks", filter).build());
+    expect(r).toBeNull();
+
+    await put(c, "tasks", { name: "k", done: false });
+    await expect(c.mutate(mutation().expectNoMatch("tasks", filter).build())).rejects.toMatchObject(
+      { name: "RtDbError", code: "PRECONDITION_FAILED" },
+    );
+  });
+
+  it("expectNoMatch sees rows written by earlier steps of the same txn", async () => {
+    const c = fm33Client(softTasksSchema);
+    const filter = { op: "eq", field: "name", value: "k" } as const;
+    await expect(
+      c.mutate(
+        mutation()
+          .insert("tasks", { name: "k", done: false })
+          .expectNoMatch("tasks", filter)
+          .build(),
+      ),
+    ).rejects.toMatchObject({ code: "PRECONDITION_FAILED" });
+    // The aborted txn rolled the insert back.
+    expect(await rawCount(c, "tasks", "by_name", ["k"])).toBe(0);
+  });
+
+  it("expectNoMatch ignores soft-deleted rows", async () => {
+    const c = fm33Client(softTasksSchema);
+    const filter = { op: "eq", field: "name", value: "k" } as const;
+    const id = await put(c, "tasks", { name: "k", done: false });
+    await c.mutate(mutation().delete("tasks", id).build());
+    await c.mutate(mutation().expectNoMatch("tasks", filter).build()); // resolves
+  });
+
+  it("insertIf inserts once, then aborts a second attempt with PRECONDITION_FAILED", async () => {
+    const c = fm33Client(softTasksSchema);
+    const filter = { op: "eq", field: "name", value: "k" } as const;
+    const txn = mutation().insertIf("tasks", filter, { name: "k", done: false }).build();
+    const [pre, ins] = await c.mutate(txn);
+    expect(pre).toBeNull();
+    expect(ins).toEqual({ id: expect.any(String) });
+    await expect(c.mutate(txn)).rejects.toMatchObject({ code: "PRECONDITION_FAILED" });
+    expect(await rawCount(c, "tasks", "by_name", ["k"])).toBe(1);
+  });
+
+  it("expectNoMatch counts toward the by-query step cap", async () => {
+    const c = fm33Client(softTasksSchema);
+    const filter = { op: "eq", field: "name", value: "k" } as const;
+    let b = mutation();
+    for (let i = 0; i <= MAX_BY_QUERY_STEPS_PER_TXN; i++) {
+      b = b.expectNoMatch("tasks", filter);
+    }
+    await expect(c.mutate(b.build())).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      message: expect.stringContaining("by-query steps"),
+    });
   });
 
   it("patch/replace/expectVersion see a stamped row as NotFound", async () => {

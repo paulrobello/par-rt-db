@@ -96,6 +96,20 @@ public struct MutationBuilder: Sendable {
         adding(.expectAbsent(table: table, index: index, eq: eq))
     }
 
+    /// Queue a filter-absence precondition: the transaction aborts with
+    /// `PRECONDITION_FAILED` when any visible live row of `table` matches `filter`.
+    public func expectNoMatch(_ table: String, filter: FilterExpr) -> MutationBuilder {
+        adding(.expectNoMatch(table: table, filter: filter))
+    }
+
+    /// Conditional insert: an `expectNoMatch(table, filter:)` step followed by
+    /// an `insert` of `doc`.
+    public func insertIf(
+        _ table: String, filter: FilterExpr, _ doc: [String: JSONValue]
+    ) -> MutationBuilder {
+        expectNoMatch(table, filter: filter).insert(table, doc)
+    }
+
     /// Queue an insert-or-patch step keyed by an index eq-prefix match.
     public func upsert(
         _ table: String,
@@ -201,6 +215,8 @@ public struct MutationBuilder: Sendable {
             .expectBefore(deadlineMs: deadlineMs)
         case let .expectAbsent(table, index, eq):
             .expectAbsent(table: table, index: index, eq: eq)
+        case let .expectNoMatch(table, filter):
+            .expectNoMatch(table: table, filter: filter)
         case let .upsert(table, index, eq, insert, patch):
             .upsert(table: table, index: index, eq: eq, insert: insert, patch: patch)
         case let .patchByQuery(table, filter, patch, limit):
@@ -245,6 +261,7 @@ private enum PendingStep: Sendable {
     case expectFields(table: String, id: String, expected: [FieldExpectation])
     case expectBefore(deadlineMs: Int64)
     case expectAbsent(table: String, index: String, eq: [JSONValue])
+    case expectNoMatch(table: String, filter: FilterExpr)
     case upsert(
         table: String,
         index: String,

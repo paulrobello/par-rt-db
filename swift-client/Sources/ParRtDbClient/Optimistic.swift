@@ -71,7 +71,7 @@ public func projectOptimisticUpdate(
     return projectUnfilteredArray(query, last, txn, now)
 }
 
-/// `get` point-read, `unique`/`first`/`count`/`distinct`, `paginate`, and the
+/// `get` point-read, `unique`/`first`/`count`/`distinct`/`aggregate`, `paginate`, and the
 /// `search`/`vectorSearch` terminals are non-array shapes (or rank-based)
 /// whose result cannot be projected from cached documents alone. A `filter`
 /// predicate is NOT excluded here: a filtered collect is still an array
@@ -82,6 +82,7 @@ private func isArrayQuery(_ query: Query) -> Bool {
         && !query.first
         && !query.count
         && !query.distinct
+        && query.aggregate == nil
         && query.paginate == nil
         && query.search == nil
         && query.vectorSearch == nil
@@ -143,7 +144,7 @@ private func projectUnfilteredArray(
             continue
         case .upsert, .adjustCounter:
             return .skip
-        case .expectVersion, .expectFields, .expectAbsent, .expectBefore:
+        case .expectVersion, .expectFields, .expectAbsent, .expectNoMatch, .expectBefore:
             continue
         case .patchByQuery, .deleteByQuery:
             // By-query steps match an unbounded set of rows by a filter this
@@ -185,7 +186,7 @@ private func projectFilteredArray(
         case .insert, .patch, .replace, .upsert, .adjustCounter:
             // Membership-ambiguous under a filter.
             return .skip
-        case .expectVersion, .expectFields, .expectAbsent, .expectBefore:
+        case .expectVersion, .expectFields, .expectAbsent, .expectNoMatch, .expectBefore:
             continue
         case .patchByQuery, .deleteByQuery:
             return .skip
@@ -237,7 +238,8 @@ private func projectGet(
             // A by-query step may patch/delete the target row, but the filter
             // is unevaluable here — decline rather than guess.
             return .skip
-        case .insert, .expectVersion, .expectFields, .expectAbsent, .expectBefore, .undelete,
+        case .insert, .expectVersion, .expectFields, .expectAbsent, .expectNoMatch, .expectBefore,
+             .undelete,
              .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
             // Insert (fresh id never matches a pre-existing get target),
             // Expect*/preconditions (no data effect), undelete (the restored
@@ -254,7 +256,7 @@ private func projectGet(
 
 private extension Step {
     /// The table this step targets (rust's `Step::table`). Every variant
-    /// except `expectAbsent` and the schedule/workflow steps carries one;
+    /// except `expectAbsent`, `expectNoMatch` and the schedule/workflow steps carries one;
     /// `expectAbsent` is a precondition with no data effect, so its table is
     /// masked here (the per-step table guard then skips it — harmless, since
     /// the variant is a no-op in every projection). Schedule/workflow steps
@@ -273,7 +275,7 @@ private extension Step {
              let .patchByQuery(table, _, _, _),
              let .deleteByQuery(table, _, _):
             table
-        case .expectBefore, .expectAbsent, .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
+        case .expectBefore, .expectAbsent, .expectNoMatch, .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
             nil
         }
     }

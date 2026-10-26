@@ -214,3 +214,102 @@ async fn subscribe_projected_ignores_non_projected_field_writes() {
         assert!(doc.get("order").is_none());
     }
 }
+
+/// A reactive grouped multi-op aggregate (`total:sum` + `n:count`, grouped by
+/// `status`) delivers its rows initially, fires on an insert that changes a
+/// group's values, and stays silent for a patch to a field the aggregate does
+/// not read (the re-run result is canonical-equal).
+#[tokio::test]
+async fn subscribe_grouped_multi_op_aggregate_fires_only_on_value_change() {
+    use crate::wire::GroupBy;
+    use std::collections::BTreeMap;
+
+    let mut c = new_client();
+    let mut ids = Vec::new();
+    for (status, order) in [("todo", 1_i64), ("todo", 2), ("done", 5)] {
+        let r = c
+            .mutate(
+                &Mutation::new()
+                    .insert(
+                        "items",
+                        json!({"name": "n", "status": status, "order": order}),
+                    )
+                    .build(),
+                None,
+            )
+            .await
+            .expect("seed insert");
+        let StepResult::Insert { id } = &r[0] else {
+            panic!("expected Insert step result");
+        };
+        ids.push(id.clone());
+    }
+
+    let aggregates: BTreeMap<String, AggregateOp> = [
+        ("total".to_string(), AggregateOp::Sum),
+        ("n".to_string(), AggregateOp::Count),
+    ]
+    .into();
+    let updates: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let updates_clone = updates.clone();
+    let _unsub = c.subscribe(
+        TableQuery::new("items")
+            .with_index("by_status_and_order", &[])
+            .aggregate_many(aggregates, GroupBy::Fields(vec!["status".into()])),
+        move |v| updates_clone.lock().expect("not poisoned").push(v),
+    );
+    let rows = |v: &Value| -> Vec<(String, f64, i64)> {
+        v.as_array()
+            .expect("grouped rows")
+            .iter()
+            .map(|r| {
+                (
+                    r["keys"][0].as_str().expect("key").to_string(),
+                    r["values"]["total"].as_f64().expect("total"),
+                    r["values"]["n"].as_i64().expect("n"),
+                )
+            })
+            .collect()
+    };
+    {
+        let guard = updates.lock().expect("not poisoned");
+        assert_eq!(guard.len(), 1, "initial value delivered synchronously");
+        assert_eq!(
+            rows(&guard[0]),
+            vec![("done".into(), 5.0, 1), ("todo".into(), 3.0, 2)]
+        );
+    }
+
+    // In-window insert changes the todo group: fires with new values.
+    c.mutate(
+        &Mutation::new()
+            .insert("items", json!({"name": "n", "status": "todo", "order": 4}))
+            .build(),
+        None,
+    )
+    .await
+    .expect("insert todo");
+    {
+        let guard = updates.lock().expect("not poisoned");
+        assert_eq!(guard.len(), 2, "insert re-emitted");
+        assert_eq!(
+            rows(&guard[1]),
+            vec![("done".into(), 5.0, 1), ("todo".into(), 7.0, 3)]
+        );
+    }
+
+    // Patch a field the aggregate does not read: result unchanged, no push.
+    c.mutate(
+        &Mutation::new()
+            .patch("items", &ids[0], json!({"name": "renamed"}))
+            .build(),
+        None,
+    )
+    .await
+    .expect("patch name");
+    assert_eq!(
+        updates.lock().expect("not poisoned").len(),
+        2,
+        "non-aggregated patch did not re-emit"
+    );
+}

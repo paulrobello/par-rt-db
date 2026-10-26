@@ -3,10 +3,10 @@
 //! Defines the WS client/server message envelopes (`ClientMessage`/
 //! `ServerMessage`) plus the `Query`, `Transaction`, and schedule shapes consumed
 //! by the WS handler (`ws`) and the one-shot HTTP handler (`http_api`). Mirrored
-//! verbatim by the three client SDKs (`ts-client`, `rust-client`,
-//! `python-client`): the serde tags and field casing are load-bearing and
-//! deliberately non-uniform, so any change here must be reflected in all four
-//! implementations.
+//! verbatim by the five client SDKs (`ts-client`, `rust-client`,
+//! `python-client`, `swift-client`, `go-client`): the serde tags and field casing
+//! are load-bearing and deliberately non-uniform, so any change here must be
+//! reflected in all six implementations.
 
 use crate::dsl::{Query, Transaction};
 use crate::error::RtDbError;

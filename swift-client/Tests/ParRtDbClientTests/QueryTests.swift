@@ -86,14 +86,14 @@ struct QueryTests {
         ])
     }
 
-    @Test func aggregateTerminalOmitsGroupByFalse() throws {
+    @Test func aggregateTerminalEncodesLegacyGroupByExplicitly() throws {
         let obj = try TableQuery("items").withIndex("by_project_and_order")
             .eq(.string("p1")).aggregate(.sum).build().wireObject()
         #expect(obj == [
             "table": .string("items"),
             "index": .string("by_project_and_order"),
             "eq": .array([.string("p1")]),
-            "aggregate": .object(["op": .string("sum")])
+            "aggregate": .object(["op": .string("sum"), "groupBy": .bool(false)])
         ])
     }
 

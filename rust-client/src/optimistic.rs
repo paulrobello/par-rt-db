@@ -75,8 +75,8 @@ pub fn project_optimistic_update(
     }
 }
 
-/// `get`-point-read, `unique`/`first`/`count`/`distinct`/`paginate`, and the
-/// `search`/`vector_search` terminals are non-array shapes (or rank-based)
+/// `get`-point-read, `unique`/`first`/`count`/`distinct`/`aggregate`/`paginate`,
+/// and the `search`/`vector_search` terminals are non-array shapes (or rank-based)
 /// whose result we cannot project from cached documents alone. A `filter`
 /// predicate is NOT excluded here: a filtered collect is still an array read,
 /// just one whose membership we cannot evaluate (handled by `has_filter`).
@@ -86,6 +86,7 @@ fn is_array_query(q: &Query) -> bool {
         && !q.first
         && !q.count
         && !q.distinct
+        && q.aggregate.is_none()
         && q.paginate.is_none()
         && q.search.is_none()
         && q.vector_search.is_none()
@@ -147,6 +148,7 @@ fn project_unfiltered_array(
             Step::ExpectVersion { .. }
             | Step::ExpectFields { .. }
             | Step::ExpectAbsent { .. }
+            | Step::ExpectNoMatch { .. }
             | Step::ExpectBefore { .. } => {}
             // By-query steps match an unbounded set of rows by a filter this
             // projection can't evaluate (no table store, no schema) — the effect
@@ -190,6 +192,7 @@ fn project_filtered_array(query: &Query, last: &Value, txn: &Transaction) -> Opt
             Step::ExpectVersion { .. }
             | Step::ExpectFields { .. }
             | Step::ExpectAbsent { .. }
+            | Step::ExpectNoMatch { .. }
             | Step::ExpectBefore { .. } => {}
             // By-query steps match rows by a filter we can't evaluate here —
             // the effect on the filtered result is ambiguous, so decline.
@@ -247,7 +250,7 @@ fn project_get(query: &Query, last: &Value, txn: &Transaction) -> OptimisticProj
                 return OptimisticProjection::Skip;
             }
             // Insert (fresh id never matches a pre-existing get target),
-            // ExpectVersion/ExpectAbsent (preconditions, no data effect),
+            // ExpectVersion/ExpectAbsent/ExpectNoMatch (preconditions, no data effect),
             // Undelete (FM-33: the restored body is not the cached value, and
             // restoring a live target is a no-op), and non-target
             // Patch/Replace/Delete: nothing to do here.
@@ -268,8 +271,8 @@ trait OptimisticStepTable {
 }
 
 impl OptimisticStepTable for Step {
-    /// The table this step targets. Every variant except `ExpectAbsent` and the
-    /// schedule/workflow steps carries one; `ExpectAbsent` is a precondition
+    /// The table this step targets. Every variant except `ExpectAbsent`, `ExpectNoMatch`
+    /// and the schedule/workflow steps carries one; `ExpectAbsent` is a precondition
     /// with no data effect, so its table is masked here (returning `None` makes
     /// the per-step table guard skip it, which is harmless since the variant is
     /// a no-op in every projection). Schedule/CancelSchedule and the workflow
@@ -289,6 +292,7 @@ impl OptimisticStepTable for Step {
             | Step::DeleteByQuery { table, .. } => Some(table.as_str()),
             Step::ExpectBefore { .. }
             | Step::ExpectAbsent { .. }
+            | Step::ExpectNoMatch { .. }
             | Step::Schedule { .. }
             | Step::CancelSchedule { .. }
             | Step::StartWorkflow { .. }
@@ -529,6 +533,54 @@ mod tests {
                     OptimisticProjection::Skip
                 ),
                 "terminal query should skip: {:?}",
+                q
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_subscription_is_skipped() {
+        // An aggregate result is a scalar / `{key,value}` / `{keys,values}`
+        // row set, not cacheable documents: every aggregate shape must Skip
+        // even when the txn would overlay on a plain collect.
+        use crate::wire::{AggregateOp, GroupBy};
+        use std::collections::BTreeMap;
+        let txn = Mutation::new()
+            .insert("items", json!({ "title": "y" }))
+            .delete("items", "a")
+            .build();
+        let many: BTreeMap<String, AggregateOp> = [
+            ("total".to_string(), AggregateOp::Sum),
+            ("n".to_string(), AggregateOp::Count),
+        ]
+        .into();
+        let cases: Vec<(Query, Value)> = vec![
+            (
+                TableQuery::new("items")
+                    .with_index("by_status_and_order", &[])
+                    .aggregate(AggregateOp::Sum, true),
+                json!([{ "key": "a", "value": 3 }]),
+            ),
+            (
+                TableQuery::new("items")
+                    .with_index("by_status_and_order", &[json!("todo")])
+                    .aggregate(AggregateOp::Count, false),
+                json!(3),
+            ),
+            (
+                TableQuery::new("items")
+                    .with_index("by_status_and_order", &[])
+                    .aggregate_many(many, GroupBy::Fields(vec!["status".into()])),
+                json!([{ "_id": "a", "keys": ["todo"], "values": { "n": 1, "total": 2 } }]),
+            ),
+        ];
+        for (q, last) in cases {
+            assert!(
+                matches!(
+                    project_optimistic_update(&q, &last, &txn, 99),
+                    OptimisticProjection::Skip
+                ),
+                "aggregate query should skip: {:?}",
                 q
             );
         }

@@ -243,6 +243,30 @@ export class TxnBuilder<S extends SchemaDefinition<any> = SchemaDefinition<any>>
   }
 
   /**
+   * Adds a check that no live row of `table` matches `filter`; the
+   * transaction aborts `PRECONDITION_FAILED` otherwise. Sees rows written by
+   * earlier steps of the same transaction. Accepts the by-query filter
+   * surface, including `olderThan`.
+   */
+  expectNoMatch<T extends TableNames<S>>(table: T, filter: FilterExpr): this {
+    this.steps.push({ op: "expectNoMatch", table, filter });
+    return this;
+  }
+
+  /**
+   * Conditional insert: adds an {@link TxnBuilder.expectNoMatch} step followed
+   * by an insert, so the document is written only when no live row of `table`
+   * matches `filter`.
+   */
+  insertIf<T extends TableNames<S>>(
+    table: T,
+    filter: FilterExpr,
+    doc: WithoutSystemFields<S, T>,
+  ): this {
+    return this.expectNoMatch(table, filter).insert(table, doc);
+  }
+
+  /**
    * Adds an upsert step to the transaction.
    *
    * `eq` follows the same full-index rule as {@link TxnBuilder.expectAbsent}:

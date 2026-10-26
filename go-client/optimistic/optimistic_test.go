@@ -76,6 +76,20 @@ func TestNonArrayQuerySkips(t *testing.T) {
 	}
 }
 
+func TestAggregateQuerySkips(t *testing.T) {
+	q := wire.Query{Table: "items", Aggregate: &wire.AggregateSpec{
+		Aggregates: map[string]wire.AggregateOp{"total": wire.AggSum, "n": wire.AggCount},
+		GroupBy:    wire.GroupByFields{"status"},
+	}}
+	cached := wire.Array{}
+	txn := wire.Transaction{Steps: []wire.Step{
+		wire.StepInsert{Table: "items", Doc: wire.Object(map[string]wire.JSONValue{"status": wire.String("todo")})},
+	}}
+	if proj := Project(q, cached, txn, 1000); proj.Kind != ProjectionSkip {
+		t.Fatalf("aggregate query must skip, got %v", proj.Kind)
+	}
+}
+
 type failingApplier struct{ err error }
 
 func (f failingApplier) Mutate(ctx context.Context, txn wire.Transaction, idem string) ([]wire.StepResult, error) {
@@ -89,4 +103,28 @@ func mustKey(t *testing.T, q wire.Query) string {
 		t.Fatal(err)
 	}
 	return k
+}
+
+func TestExpectNoMatchHasNoDataEffect(t *testing.T) {
+	q := wire.Query{Table: "items"}
+	cached := wire.Array{doc("a", wire.Number("1"))}
+	txn := wire.Transaction{Steps: []wire.Step{
+		wire.StepExpectNoMatch{Table: "items", Filter: wire.FilterEq{Field: "n", Value: wire.Number("9")}},
+		wire.StepDelete{Table: "items", ID: "a"},
+	}}
+	proj := Project(q, cached, txn, 1000)
+	if proj.Kind != ProjectionOverlaid {
+		t.Fatalf("expectNoMatch must not force a skip: kind %v", proj.Kind)
+	}
+	if arr := proj.Value.(wire.Array); len(arr) != 0 {
+		t.Fatalf("delete should still apply: %v", arr)
+	}
+	// Alone, it leaves the cached array untouched.
+	only := wire.Transaction{Steps: []wire.Step{
+		wire.StepExpectNoMatch{Table: "items", Filter: wire.FilterEq{Field: "n", Value: wire.Number("9")}},
+	}}
+	got := Project(q, cached, only, 1000)
+	if got.Kind != ProjectionOverlaid || len(got.Value.(wire.Array)) != 1 {
+		t.Fatalf("unexpected projection: %+v", got)
+	}
 }

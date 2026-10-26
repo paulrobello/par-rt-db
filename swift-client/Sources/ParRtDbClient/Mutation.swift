@@ -66,6 +66,10 @@ public enum Step: Equatable, Codable, Sendable {
     case expectBefore(deadlineMs: Int64)
     /// Precondition: no row may match the index eq-prefix.
     case expectAbsent(table: String, index: String, eq: [JSONValue])
+    /// Precondition: no visible live row of `table` may match `filter`
+    /// (`PRECONDITION_FAILED` otherwise). Writes nothing; pair with an
+    /// `insert` for a conditional insert.
+    case expectNoMatch(table: String, filter: FilterExpr)
     /// Insert-or-patch keyed by an index eq-prefix match.
     case upsert(
         table: String, index: String, eq: [JSONValue],
@@ -187,6 +191,15 @@ public enum Step: Equatable, Codable, Sendable {
                 table: container.decode(String.self, forKey: .table),
                 index: container.decode(String.self, forKey: .index),
                 eq: container.decode([JSONValue].self, forKey: .eq)
+            )
+        case "expectNoMatch":
+            try rejectUnknownVariantFields(
+                "Step", variant: payload.tag, keys: payload.keys,
+                allowed: ["op", "table", "filter"]
+            )
+            self = try .expectNoMatch(
+                table: container.decode(String.self, forKey: .table),
+                filter: container.decode(FilterExpr.self, forKey: .filter)
             )
         case "upsert":
             try rejectUnknownVariantFields(
@@ -317,6 +330,10 @@ public enum Step: Equatable, Codable, Sendable {
             try container.encode(table, forKey: .table)
             try container.encode(index, forKey: .index)
             try container.encode(eq, forKey: .eq)
+        case let .expectNoMatch(table, filter):
+            try container.encode("expectNoMatch", forKey: .op)
+            try container.encode(table, forKey: .table)
+            try container.encode(filter, forKey: .filter)
         case let .upsert(table, index, eq, insert, patch):
             try container.encode("upsert", forKey: .op)
             try container.encode(table, forKey: .table)

@@ -1844,7 +1844,9 @@ public struct AggregateSpec: Equatable, Codable, Sendable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encodeIfPresent(op, forKey: .op)
         try container.encodeIfPresent(aggregates, forKey: .aggregates)
-        if groupBy != .false {
+        // The server's legacy single-op shape serializes groupBy explicitly
+        // (`{op, groupBy:false}`); only the v2 default may omit it.
+        if groupBy != .false || op != nil {
             try container.encode(groupBy, forKey: .groupBy)
         }
     }

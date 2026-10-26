@@ -381,7 +381,14 @@ pub async fn execute_txn_with_side(
         let by_query_steps = txn
             .steps
             .iter()
-            .filter(|s| matches!(s, Step::PatchByQuery { .. } | Step::DeleteByQuery { .. }))
+            .filter(|s| {
+                matches!(
+                    s,
+                    Step::PatchByQuery { .. }
+                        | Step::DeleteByQuery { .. }
+                        | Step::ExpectNoMatch { .. }
+                )
+            })
             .count();
         if by_query_steps > MAX_BY_QUERY_STEPS_PER_TXN {
             return Err(RtDbError::bad_request(format!(
@@ -522,6 +529,9 @@ pub async fn execute_txn_with_side(
                 Step::ExpectAbsent { table, index, eq } => {
                     step_expect_absent(&mut sctx, table, index, eq).await?
                 }
+                Step::ExpectNoMatch { table, filter } => {
+                    step_expect_no_match(&mut sctx, table, filter).await?
+                }
                 Step::Upsert {
                     table,
                     index,
@@ -651,6 +661,6 @@ pub(crate) use stamp::{
 };
 pub(crate) use steps::{
     StepCtx, step_adjust_counter, step_delete, step_delete_by_query, step_expect_absent,
-    step_expect_fields, step_expect_version, step_insert, step_patch, step_patch_by_query,
-    step_replace, step_undelete, step_upsert,
+    step_expect_fields, step_expect_no_match, step_expect_version, step_insert, step_patch,
+    step_patch_by_query, step_replace, step_undelete, step_upsert,
 };

@@ -255,7 +255,7 @@ compression.
 | `GET /sync` | first WS frame | WebSocket upgrade. Speaks the realtime protocol (auth, subscribe, mutate, schedule, ping). |
 | `POST /api/query` | Bearer token | One-shot query against a database; see [Query shape](#query-shape). |
 | `POST /api/query-batch` | Bearer token | Fans out N queries in one round trip (per-query error isolation); each slot returns `{ok, result}` or `{ok:false, error}`. |
-| `POST /api/mutate` | Bearer token | One-shot transaction (`insert`/`patch`/`replace`/`delete`/`undelete`/`expectVersion`/`expectFields`/`expectAbsent`/`expectBefore`/`upsert`/`adjustCounter` + `patchByQuery`/`deleteByQuery` + `schedule`/`cancelSchedule` + `startWorkflow`/`cancelWorkflow` steps). |
+| `POST /api/mutate` | Bearer token | One-shot transaction (`insert`/`patch`/`replace`/`delete`/`undelete`/`expectVersion`/`expectFields`/`expectAbsent`/`expectNoMatch`/`expectBefore`/`upsert`/`adjustCounter` + `patchByQuery`/`deleteByQuery` + `schedule`/`cancelSchedule` + `startWorkflow`/`cancelWorkflow` steps). |
 | `POST /api/mutate-batch` | Bearer token | Fans out N independent transactions in one round trip (per-entry error isolation, deliberately not atomic); each positional slot returns `{ok, results}` or `{ok:false, error}`. Entries may carry their own `idempotencyKey` (per-entry dedup/replay). |
 | `POST /api/schedule` | Bearer token | Schedules a transaction: `afterMs`/`runAt` one-shot, `cron` (5-field, min-first, UTC unless `tz` is given), or `interval` (fixed `everyMs`); returns `{id}`. Pass `"external": true` to create an external-claim job (never internally executed; claimed by an app worker via `/api/schedule/claim` with a fencing token). |
 | `POST /api/schedule/claim` | Bearer token | Atomically claims up to `limit` due external jobs (`leaseMs` lease each), returning `ClaimedSchedule[]` with per-job monotonic `leaseGeneration` fencing tokens. |
@@ -631,7 +631,7 @@ mirrored as the HTTP `Retry-After` header); every other code omits it:
 | `FORBIDDEN`           | 403         | Per-row `ownerField`/`authorize` denial; anonymous auth disabled; signed-URL verification failure. |
 | `NOT_FOUND`           | 404         | Unknown document/file/route; cross-db storage mismatch is reported as 404 (no existence disclosure). |
 | `CONFLICT`            | 409         | `UNIQUE` index violation (`unique_violation`, SQLSTATE 23505) at `CREATE UNIQUE INDEX` time or on a colliding write. |
-| `PRECONDITION_FAILED` | 409         | `expectVersion` / `expectFields` / `expectAbsent` / `expectBefore` guard failed. |
+| `PRECONDITION_FAILED` | 409         | `expectVersion` / `expectFields` / `expectAbsent` / `expectNoMatch` / `expectBefore` guard failed. |
 | `SCHEMA_VIOLATION`    | 422         | Schema push / type-coercion rejection. |
 | `RATE_LIMITED`        | 429         | Per-token or per-db rate limit hit (HTTP and WS frames). Carries `retryAfter`. The WS connection stays open for this error; the separate per-connection frame-rate limit below closes it instead. |
 | `INTERNAL`            | 500         | Unexpected server error (generic message; detail logged via `tracing`). |
@@ -723,7 +723,7 @@ shared core type); pinned by the `lookup-*` semantics-corpus cases.
 
 `{"steps": [...]}` where each step is tagged by `"op"`: `insert`, `patch`,
 `replace`, `delete`, `undelete` (softDelete tables only — clears the
-`deleted_at` stamp), `expectVersion`, `expectFields`, `expectAbsent`, `upsert` (per-id, one
+`deleted_at` stamp), `expectVersion`, `expectFields`, `expectAbsent`, `expectNoMatch`, `upsert` (per-id, one
 document each), `adjustCounter` (atomically adds a safe-integer delta to a
 declared numeric field, with optional `min`/`max` bounds and `expected` row
 fields — see [`docs/atomic-counter.md`](docs/atomic-counter.md)), the
@@ -743,6 +743,13 @@ missing/terminal run — a no-op, not an error) — see `server/src/txn.rs`.
 `expectFields(table, id, expected)` checks exact values at selected object-key paths without writing the live row or advancing its version. Unasserted fields may change. Missing and null remain distinct, selected objects compare in full, and existing visibility/table scopes apply. See [row-field guards](docs/transaction-field-guards.md) for bounds, ordering, retries and SDK methods.
 
 `expectAbsent` and `upsert` resolve rows through the named index and require **full-index equality**: `eq` carries exactly one value per declared index field, in declaration order. Unlike queries — whose `eq` prefix binds may be followed by range predicates — a prefix is not accepted, and an arity mismatch fails with `BAD_REQUEST` (e.g. "index 'by_room_actor' expects 3 eq value(s), got 2") before any step executes. To guard on a shorter key, declare a second nonunique index over exactly those fields.
+
+The `expectNoMatch` step (`{"op":"expectNoMatch","table":...,"filter":{...}}`) is a predicate-driven precondition: if any live row in `table` that the caller can see matches `filter` (the same `FilterExpr` the by-query steps accept, including `olderThan`), the whole transaction aborts with `PRECONDITION_FAILED` and the fixed message "filter matched an existing document". Otherwise it writes nothing and its step result is `null`. Steps run in order, so an `insert` earlier in the same transaction counts. Client builders expose the idiom as `insertIf(table, doc, { expectNoMatch: filter })`, which emits `expectNoMatch` followed by `insert`. Because the committer serializes writes per database, concurrent overlapping inserts (for example room bookings) admit exactly one. Notes:
+
+- **Visibility, not global exclusivity.** Only rows visible to the caller count (soft-deleted rows, rows hidden by `ownerField`/`collaboratorsField`, and rows failing `authorize` are ignored). On an owner-scoped table two users can therefore both pass for the same predicate. For cross-owner exclusivity use an unscoped table or a machine/scheduled principal, which sees every row.
+- **Step cap.** `expectNoMatch` counts toward the same 16-step per-transaction cap as `patchByQuery`/`deleteByQuery`; a seventeenth fails with `BAD_REQUEST` before any step runs.
+- **Index the predicate fields.** The probe is `SELECT 1 ... LIMIT 1` inside the single-writer turn. An unindexed filter scans the table, bounded only by `LIMIT 1`, the step cap, and the 60s statement timeout.
+- Host-capability (par-mesh) principals are denied this step.
 
 The `expectBefore` step adds an exclusive server-clock epoch-ms deadline. The earliest guard is checked after queue wait and at the final commit decision, after asynchronous work. Expiry rolls back the complete transaction with `PRECONDITION_FAILED`; malformed deadlines fail with `BAD_REQUEST`. Combine the stored lease deadline with room-version and ownership guards when fencing a lease. See [transaction deadlines](docs/transaction-deadlines.md) for scheduling, replay and SDK semantics.
 
@@ -1138,6 +1145,12 @@ The WS surface adds `schedule` / `cancelSchedule` / `pauseSchedule` /
 `resumeSchedule` / `listSchedules` messages (tagged by `"type"`), with replies
 `scheduleOk` / `scheduleErr` / `scheduleAck` / `listSchedulesOk`. Authorization is
 re-run on every op, not just at connect.
+
+Aggregate queries (`aggregate`, including the `aggregates` map and `groupBy`
+forms) subscribe live over `/sync` like row queries: the subscription pushes a
+`queryUpdate` with the new scalar, `{alias: value}` object, or grouped rows only
+when a write moves the result. Grouped results are silently truncated at
+`MAX_TAKE` (4096) groups by design, matching `collect`.
 
 ## Durable workflows
 

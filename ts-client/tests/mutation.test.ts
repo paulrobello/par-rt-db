@@ -41,6 +41,21 @@ describe("transaction builder", () => {
     });
   });
 
+  it("builds an expectNoMatch step and an insertIf step pair", () => {
+    const filter = { op: "eq", field: "title", value: "dup" } as const;
+    expect(mutation().expectNoMatch("items", filter).build()).toEqual({
+      steps: [{ op: "expectNoMatch", table: "items", filter }],
+    });
+    expect(mutation().insertIf("items", filter, { projectId: "p1", title: "dup" }).build()).toEqual(
+      {
+        steps: [
+          { op: "expectNoMatch", table: "items", filter },
+          { op: "insert", table: "items", doc: { projectId: "p1", title: "dup" } },
+        ],
+      },
+    );
+  });
+
   it("produces an empty txn when nothing is added", () => {
     expect(mutation().build()).toEqual({ steps: [] });
   });

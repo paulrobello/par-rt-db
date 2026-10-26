@@ -1,4 +1,4 @@
-"""Transaction DSL: ``Step`` (17 ops), ``StepResult``, ``Transaction``,
+"""Transaction DSL: ``Step`` (18 ops), ``StepResult``, ``Transaction``,
 and the ``Mutation`` builder.
 
 Mirrors ``server/src/txn.rs`` (the ``Step`` enum + ``Transaction`` struct +
@@ -9,7 +9,7 @@ Wire shapes (load-bearing — match the server exactly):
 
 * ``Step`` is tagged by ``op`` (camelCase variants: ``insert``/``patch``/``adjustCounter``/
   ``replace``/``delete``/``undelete``/``expectVersion``/``expectFields``/``expectBefore``/``expectAbsent``/
-  ``upsert``/``patchByQuery``/``deleteByQuery``/``schedule``/
+  ``expectNoMatch``/``upsert``/``patchByQuery``/``deleteByQuery``/``schedule``/
   ``cancelSchedule``/``startWorkflow``/``cancelWorkflow``) with
   ``deny_unknown_fields`` mirrored via ``extra="forbid"``.
 * ``Transaction`` is ``{"steps": Step[]}``; the server caps at 1024 steps —
@@ -159,6 +159,17 @@ class _ExpectAbsent(_Step):
     eq: list[Any]
 
 
+class _ExpectNoMatch(_Step):
+    """Precondition: no visible live row in ``table`` may match ``filter`` (the
+    same ``FilterExpr`` the by-query steps accept, ``olderThan`` included). A
+    match aborts the transaction with ``PRECONDITION_FAILED``. Writes nothing;
+    step result is ``None``."""
+
+    op: Literal["expectNoMatch"] = "expectNoMatch"
+    table: str
+    filter: FilterExpr
+
+
 class _Upsert(_Step):
     op: Literal["upsert"] = "upsert"
     table: str
@@ -251,7 +262,7 @@ class _CancelWorkflow(_Step):
     id: str
 
 
-#: Discriminated union of all 17 step ops. The ``op`` literal drives dispatch;
+#: Discriminated union of all 18 step ops. The ``op`` literal drives dispatch;
 #: ``deny_unknown_fields`` is per-variant via ``extra="forbid"`` on ``_Step``.
 Step = Annotated[
     (
@@ -265,6 +276,7 @@ Step = Annotated[
         | _ExpectFields
         | _ExpectBefore
         | _ExpectAbsent
+        | _ExpectNoMatch
         | _Upsert
         | _PatchByQuery
         | _DeleteByQuery
@@ -497,6 +509,20 @@ class _MutationBuilder:
         matches the ``index``/``eq`` equality prefix."""
         self._steps.append(_ExpectAbsent(table=table, index=index, eq=eq))
         return self
+
+    def expect_no_match(self, table: str, filter: FilterExpr) -> _MutationBuilder:
+        """Expect-no-match precondition: the transaction aborts with
+        ``PRECONDITION_FAILED`` when any visible live row in ``table`` matches
+        ``filter`` (same predicate language as :meth:`delete_by_query`). Counts
+        toward the per-transaction by-query step cap."""
+        self._steps.append(_ExpectNoMatch(table=table, filter=filter))
+        return self
+
+    def insert_if(self, table: str, filter: FilterExpr, doc: dict[str, Any]) -> _MutationBuilder:
+        """Conditional insert: ``expect_no_match(table, filter)`` followed by
+        ``insert(table, doc)`` (two steps). The insert only happens when no
+        visible live row matches ``filter``."""
+        return self.expect_no_match(table, filter).insert(table, doc)
 
     def expect_fields(
         self, table: str, id: str, expected: list[FieldExpectation]

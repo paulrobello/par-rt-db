@@ -69,7 +69,7 @@ public func worstCaseAffected(_ txn: Transaction) -> Int {
         switch step {
         case let .patchByQuery(_, _, _, limit), let .deleteByQuery(_, _, limit):
             total += min(Int(limit ?? UInt32(InMemoryLimits.maxByQueryRows)), InMemoryLimits.maxByQueryRows)
-        case .expectBefore, .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
+        case .expectBefore, .expectNoMatch, .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
             continue // control-flow: touches no documents
         default:
             total += 1
@@ -990,7 +990,7 @@ public final class InMemoryRtDbClient: MigrationStore {
         var byQuerySteps = 0
         for step in txn.steps {
             switch step {
-            case .patchByQuery, .deleteByQuery:
+            case .patchByQuery, .deleteByQuery, .expectNoMatch:
                 byQuerySteps += 1
             default:
                 break
@@ -1635,7 +1635,8 @@ public final class InMemoryRtDbClient: MigrationStore {
         case .expectBefore, .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
             try executeControlFlowStep(step)
         case .insert, .patch, .adjustCounter, .replace, .delete, .undelete,
-             .expectVersion, .expectFields, .expectAbsent, .upsert, .patchByQuery, .deleteByQuery:
+             .expectVersion, .expectFields, .expectAbsent, .expectNoMatch, .upsert, .patchByQuery,
+             .deleteByQuery:
             try executeTableStep(step)
         }
     }
@@ -1654,7 +1655,8 @@ public final class InMemoryRtDbClient: MigrationStore {
         case let .cancelWorkflow(id):
             return stepCancelWorkflow(id)
         case .insert, .patch, .adjustCounter, .replace, .delete, .undelete,
-             .expectVersion, .expectFields, .expectAbsent, .upsert, .patchByQuery, .deleteByQuery:
+             .expectVersion, .expectFields, .expectAbsent, .expectNoMatch, .upsert, .patchByQuery,
+             .deleteByQuery:
             throw RtDbError(code: .internal, message: "table steps handled by executeTableStep")
         }
     }
@@ -1677,7 +1679,8 @@ public final class InMemoryRtDbClient: MigrationStore {
             return try stepDelete(table, id)
         case let .undelete(table, id):
             return try stepUndelete(table, id)
-        case .expectVersion, .expectFields, .expectAbsent, .upsert, .patchByQuery, .deleteByQuery:
+        case .expectVersion, .expectFields, .expectAbsent, .expectNoMatch, .upsert, .patchByQuery,
+             .deleteByQuery:
             return try executeLookupStep(step)
         case .expectBefore, .schedule, .cancelSchedule, .startWorkflow, .cancelWorkflow:
             throw RtDbError(code: .internal, message: "control-flow steps handled above")
@@ -1697,6 +1700,8 @@ public final class InMemoryRtDbClient: MigrationStore {
             return StepExecution(result: .null, table: nil, extraTables: [])
         case let .expectAbsent(table, index, eq):
             return try stepExpectAbsent(table, index, eq)
+        case let .expectNoMatch(table, filter):
+            return try stepExpectNoMatch(table, filter)
         case let .upsert(table, index, eq, insert, patch):
             return try stepUpsert(table, index, eq, insert, patch)
         case let .patchByQuery(table, filter, patch, limit):
@@ -1798,6 +1803,22 @@ public final class InMemoryRtDbClient: MigrationStore {
             throw RtDbError(
                 code: .preconditionFailed,
                 message: "index '\(index)' already has a matching document"
+            )
+        }
+        return StepExecution(result: .null, table: nil, extraTables: [])
+    }
+
+    /// `expectNoMatch`: aborts when any visible live row matches `filter`
+    /// (same scan and soft-delete visibility as the by-query steps, so
+    /// `olderThan` is accepted); writes nothing.
+    private func stepExpectNoMatch(
+        _ table: String, _ filter: FilterExpr
+    ) throws -> StepExecution {
+        let tableDef = try requireTable(table)
+        let (rows, _) = try scanByQuery(tableDef, table, filter, 1)
+        if !rows.isEmpty {
+            throw RtDbError(
+                code: .preconditionFailed, message: "filter matched an existing document"
             )
         }
         return StepExecution(result: .null, table: nil, extraTables: [])

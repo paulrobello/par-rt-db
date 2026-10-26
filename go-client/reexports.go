@@ -130,6 +130,7 @@ type (
 	FieldExpectation   = wire.FieldExpectation
 	StepExpectFields   = wire.StepExpectFields
 	StepExpectAbsent   = wire.StepExpectAbsent
+	StepExpectNoMatch  = wire.StepExpectNoMatch
 	StepUpsert         = wire.StepUpsert
 	StepPatchByQuery   = wire.StepPatchByQuery
 	StepDeleteByQuery  = wire.StepDeleteByQuery

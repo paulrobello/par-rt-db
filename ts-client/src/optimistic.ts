@@ -36,7 +36,14 @@ const SKIP: OptimisticProjection = { overlaid: false };
 let syntheticIdCounter = 0;
 
 function isArrayQuery(q: QueryJson): boolean {
-  return q.get === undefined && !q.unique && !q.first && !q.count && q.paginate === undefined;
+  return (
+    q.get === undefined &&
+    !q.unique &&
+    !q.first &&
+    !q.count &&
+    q.paginate === undefined &&
+    q.aggregate === undefined
+  );
 }
 
 /** A query with an eq/range filter whose membership we cannot evaluate without the schema. */
@@ -151,7 +158,7 @@ function projectUnfilteredArray(
         return SKIP;
       case "upsert":
         return SKIP;
-      // expectVersion / expectAbsent are preconditions with no data effect.
+      // expectVersion / expectAbsent / expectNoMatch are preconditions with no data effect.
     }
   }
   return canonical(working) === canonical(last) ? SKIP : { overlaid: true, value: working };
@@ -189,7 +196,7 @@ function projectFilteredArray(
     ) {
       return SKIP;
     }
-    // expectVersion / expectAbsent: no data effect.
+    // expectVersion / expectAbsent / expectNoMatch: no data effect.
   }
   return canonical(working) === canonical(last) ? SKIP : { overlaid: true, value: working };
 }

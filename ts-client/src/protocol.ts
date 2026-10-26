@@ -435,6 +435,14 @@ export type StepJson =
   | { op: "expectBefore"; deadlineMs: number }
   | { op: "expectAbsent"; table: string; index: string; eq: unknown[] }
   | {
+      /** Abort with `PRECONDITION_FAILED` when ANY live row of `table` matches
+       * `filter` (including rows written by earlier steps of the same txn).
+       * The filter surface is the by-query one, so `olderThan` is allowed. */
+      op: "expectNoMatch";
+      table: string;
+      filter: FilterExpr;
+    }
+  | {
       op: "upsert";
       table: string;
       index: string;

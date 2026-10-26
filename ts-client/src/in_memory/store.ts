@@ -33,7 +33,6 @@ import type {
 } from "../admin.js";
 import { canonical } from "../canonical.js";
 import { RtDbError } from "../errors.js";
-import { checkFieldExpectations, validateFieldGuardShapes } from "./field-guard.js";
 import type { FileMetadata, UploadInput, UploadResult } from "../http.js";
 import { parseStepResults, type StepResult } from "../mutation.js";
 import type {
@@ -60,6 +59,7 @@ import type {
 } from "../protocol.js";
 import type { RtQuery } from "../query.js";
 import type { SchemaDefinition } from "../schema.js";
+import { checkFieldExpectations, validateFieldGuardShapes } from "./field-guard.js";
 import {
   applyMigrationDirective,
   detectDestructiveChanges,
@@ -158,12 +158,13 @@ export function worstCaseAffected(txn: TransactionJson): number {
   for (const step of txn.steps) {
     if (
       step.op === "expectBefore" ||
+      step.op === "expectNoMatch" ||
       step.op === "schedule" ||
       step.op === "cancelSchedule" ||
       step.op === "startWorkflow" ||
       step.op === "cancelWorkflow"
     ) {
-      continue; // control-flow: touches no documents (server counts 0)
+      continue; // control-flow/precondition: touches no documents (server counts 0)
     }
     if (step.op === "patchByQuery" || step.op === "deleteByQuery") {
       total += Math.min(step.limit ?? MAX_BY_QUERY_ROWS, MAX_BY_QUERY_ROWS);
@@ -1341,7 +1342,8 @@ export class InMemoryRtDbClient {
           throw new RtDbError("BAD_REQUEST", "deadlineMs must be a nonnegative safe integer");
         deadline = deadline === undefined ? step.deadlineMs : Math.min(deadline, step.deadlineMs);
       }
-      if (step.op === "patchByQuery" || step.op === "deleteByQuery") byQuerySteps += 1;
+      if (step.op === "patchByQuery" || step.op === "deleteByQuery" || step.op === "expectNoMatch")
+        byQuerySteps += 1;
     }
     if (byQuerySteps > MAX_BY_QUERY_STEPS_PER_TXN) {
       throw new RtDbError(
@@ -2218,6 +2220,14 @@ export class InMemoryRtDbClient {
             "PRECONDITION_FAILED",
             `index '${step.index}' already has a matching document`,
           );
+        }
+        return { result: null };
+      }
+      case "expectNoMatch": {
+        const tableDef = this.requireTable(table);
+        const { rows } = this.scanByQuery(tableDef, table, step.filter, 1);
+        if (rows.length > 0) {
+          throw new RtDbError("PRECONDITION_FAILED", "filter matched an existing document");
         }
         return { result: null };
       }

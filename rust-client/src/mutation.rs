@@ -203,6 +203,20 @@ impl Mutation {
         });
         self
     }
+    /// Queue a filter-absence precondition: no visible live row in `table`
+    /// may match `filter`, else the transaction aborts with `PRECONDITION_FAILED`.
+    pub fn expect_no_match(mut self, table: &str, filter: FilterExpr) -> Self {
+        self.steps.push(Step::ExpectNoMatch {
+            table: table.into(),
+            filter,
+        });
+        self
+    }
+    /// Conditional insert: queue `expect_no_match(table, filter)` followed by
+    /// an insert of `doc` (the insert only runs when nothing matches).
+    pub fn insert_if(self, table: &str, filter: FilterExpr, doc: Value) -> Self {
+        self.expect_no_match(table, filter).insert(table, doc)
+    }
     /// Queue an upsert step keyed by the index eq-prefix.
     pub fn upsert(
         mut self,
@@ -389,6 +403,29 @@ mod tests {
                     {"op":"expectVersion","table":"items","id":"i3","version":7},
                     {"op":"expectAbsent","table":"items","index":"by_project_and_title","eq":["p1","dup"]},
                     {"op":"upsert","table":"items","index":"by_project","eq":["p1"],"insert":{"projectId":"p1"},"patch":{"title":"u"}}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn builder_serializes_expect_no_match_and_insert_if() {
+        let filter = FilterExpr::Eq {
+            field: "title".into(),
+            value: json!("dup"),
+        };
+        let txn = Mutation::new()
+            .expect_no_match("items", filter.clone())
+            .insert_if("items", filter, json!({"title":"dup"}))
+            .build();
+        let eq = json!({"op":"eq","field":"title","value":"dup"});
+        assert_eq!(
+            serde_json::to_value(&txn).unwrap(),
+            json!({
+                "steps": [
+                    {"op":"expectNoMatch","table":"items","filter":eq},
+                    {"op":"expectNoMatch","table":"items","filter":eq},
+                    {"op":"insert","table":"items","doc":{"title":"dup"}}
                 ]
             })
         );

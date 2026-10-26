@@ -275,3 +275,22 @@ describe("olderThan in by-query steps (execution-time cutoff)", () => {
     }
   });
 });
+
+describe("olderThan in expectNoMatch", () => {
+  it("aborts only when a row older than now - ms exists", async () => {
+    const c = newClient(numberSchema());
+    await seed(c, "future", FUTURE);
+    const step: StepJson = {
+      op: "expectNoMatch",
+      table: "tasks",
+      filter: olderThan("updatedAt", SWEEP_MS),
+    };
+    const [res] = await c.mutate({ steps: [step] }); // only a future row: no match
+    expect(res).toBeNull();
+
+    await seed(c, "old", OLD);
+    await expect(c.mutate({ steps: [step] })).rejects.toMatchObject({
+      code: "PRECONDITION_FAILED",
+    });
+  });
+});

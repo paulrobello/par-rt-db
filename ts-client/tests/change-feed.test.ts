@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from "vitest";
-import { RtDbError } from "../src/errors.js";
 import { RtDbHttpClient } from "../src/http.js";
 import type { ChangeOp } from "../src/protocol.js";
 

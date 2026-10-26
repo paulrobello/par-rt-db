@@ -1,0 +1,48 @@
+{
+  "name": "txn-expect-no-match-unknown-field",
+  "$comment": "expectNoMatch validates its filter like a read: a leaf referencing an undeclared field fails with BAD_REQUEST.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_name",
+            "fields": [
+              "name"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "seed": [
+    {
+      "name": "a"
+    }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "expectNoMatch",
+          "table": "tasks",
+          "filter": {
+            "op": "eq",
+            "field": "bogus",
+            "value": 1
+          }
+        }
+      ]
+    }
+  },
+  "expect": {
+    "error": {
+      "code": "BAD_REQUEST"
+    }
+  }
+}

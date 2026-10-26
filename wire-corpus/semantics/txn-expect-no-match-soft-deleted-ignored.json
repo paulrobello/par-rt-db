@@ -1,0 +1,82 @@
+{
+  "name": "txn-expect-no-match-soft-deleted-ignored",
+  "$comment": "A soft-deleted row is not a live row: delete it in an earlier step of the same txn and expectNoMatch on its value passes, so the replacement insert lands.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_name",
+            "fields": [
+              "name"
+            ]
+          }
+        ],
+        "softDelete": true
+      }
+    }
+  },
+  "seed": [
+    {
+      "$id": "gone",
+      "doc": {
+        "name": "a"
+      }
+    }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "delete",
+          "table": "tasks",
+          "id": {
+            "$idRef": "gone"
+          }
+        },
+        {
+          "op": "expectNoMatch",
+          "table": "tasks",
+          "filter": {
+            "op": "eq",
+            "field": "name",
+            "value": "a"
+          }
+        },
+        {
+          "op": "insert",
+          "table": "tasks",
+          "doc": {
+            "name": "a"
+          }
+        }
+      ]
+    }
+  },
+  "expect": [
+    null,
+    null,
+    {}
+  ],
+  "then": {
+    "query": {
+      "table": "tasks"
+    },
+    "expect": [
+      {
+        "name": "a"
+      }
+    ]
+  },
+  "normalize": [
+    "_id",
+    "_creationTime",
+    "_version",
+    "id"
+  ]
+}

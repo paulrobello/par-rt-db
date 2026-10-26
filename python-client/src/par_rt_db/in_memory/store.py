@@ -32,6 +32,7 @@ from ..mutation import (
     _CancelWorkflow,
     _DeleteByQuery,
     _ExpectBefore,
+    _ExpectNoMatch,
     _is_safe_counter_integer,
     _PatchByQuery,
     _Schedule,
@@ -157,7 +158,15 @@ def worst_case_affected(txn: Transaction) -> int:
             limit_opt = step.limit
             total += MAX_BY_QUERY_ROWS if limit_opt is None else min(limit_opt, MAX_BY_QUERY_ROWS)
         elif isinstance(
-            step, (_ExpectBefore, _Schedule, _CancelSchedule, _StartWorkflow, _CancelWorkflow)
+            step,
+            (
+                _ExpectBefore,
+                _ExpectNoMatch,
+                _Schedule,
+                _CancelSchedule,
+                _StartWorkflow,
+                _CancelWorkflow,
+            ),
         ):
             # Control-flow steps touch no documents (server counts 0) —
             # workflow steps included (txn::worst_case_affected).
@@ -1632,7 +1641,9 @@ class _InMemoryStoreCore:
             )
         # SEC-104: bound the worst-case row count before any step applies so an
         # over-budget txn rolls back nothing. Mirrors server ``execute_txn``.
-        by_query_steps = sum(1 for s in txn.steps if isinstance(s, (_PatchByQuery, _DeleteByQuery)))
+        by_query_steps = sum(
+            1 for s in txn.steps if isinstance(s, (_PatchByQuery, _DeleteByQuery, _ExpectNoMatch))
+        )
         if by_query_steps > MAX_BY_QUERY_STEPS_PER_TXN:
             raise RtDbError(
                 ErrorCode.BAD_REQUEST,

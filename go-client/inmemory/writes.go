@@ -98,7 +98,7 @@ func worstCaseAffected(txn wire.Transaction) int {
 				limit = *t.Limit
 			}
 			total += limit
-		case wire.StepExpectBefore, wire.StepSchedule, wire.StepCancelSchedule,
+		case wire.StepExpectBefore, wire.StepExpectNoMatch, wire.StepSchedule, wire.StepCancelSchedule,
 			wire.StepStartWorkflow, wire.StepCancelWorkflow:
 			// Control-flow steps touch no documents.
 		default:
@@ -128,7 +128,7 @@ func executeTransaction(s *Store, txn wire.Transaction) ([]wire.StepResult, erro
 	byQuerySteps := 0
 	for _, step := range txn.Steps {
 		switch step.(type) {
-		case wire.StepPatchByQuery, wire.StepDeleteByQuery:
+		case wire.StepPatchByQuery, wire.StepDeleteByQuery, wire.StepExpectNoMatch:
 			byQuerySteps++
 		}
 	}
@@ -263,6 +263,8 @@ func executeStep(s *Store, step wire.Step) (wire.StepResult, []string, error) {
 		return wire.StepResult{}, nil, nil
 	case wire.StepExpectAbsent:
 		return stepExpectAbsent(s, t)
+	case wire.StepExpectNoMatch:
+		return stepExpectNoMatch(s, t)
 	case wire.StepUpsert:
 		return executeUpsert(s, t)
 	case wire.StepPatchByQuery:
@@ -380,6 +382,26 @@ func stepExpectAbsent(s *Store, t wire.StepExpectAbsent) (wire.StepResult, []str
 	if len(rows) > 0 {
 		return wire.StepResult{}, nil, rtdberrors.New(rtdberrors.CodePreconditionFailed,
 			"index '"+t.Index+"' already has a matching document")
+	}
+	return wire.StepResult{}, nil, nil
+}
+
+// stepExpectNoMatch aborts PRECONDITION_FAILED when any visible live row
+// matches the filter; reuses the by-query scan (olderThan accepted, soft-
+// deleted rows invisible). Writes nothing.
+func stepExpectNoMatch(s *Store, t wire.StepExpectNoMatch) (wire.StepResult, []string, error) {
+	tableDef, err := requireTable(s, t.Table)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	one := 1
+	ids, _, err := scanIDsByFilter(s, tableDef, t.Table, t.Filter, &one)
+	if err != nil {
+		return wire.StepResult{}, nil, err
+	}
+	if len(ids) > 0 {
+		return wire.StepResult{}, nil, rtdberrors.New(rtdberrors.CodePreconditionFailed,
+			"filter matched an existing document")
 	}
 	return wire.StepResult{}, nil, nil
 }

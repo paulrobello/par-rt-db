@@ -5,7 +5,11 @@ package dsl
 // producing wire.Transaction. Consume it as
 // dsl.NewMutation().Insert(...).Build().
 
-import "github.com/paulrobello/par-rt-db/go-client/wire"
+import (
+	"encoding/json"
+
+	"github.com/paulrobello/par-rt-db/go-client/wire"
+)
 
 // Mutation is the chainable transaction builder.
 type Mutation struct {
@@ -79,6 +83,20 @@ func (m Mutation) ExpectAbsent(table, index string, eq ...wire.JSONValue) Mutati
 	return m
 }
 
+// ExpectNoMatch queues the filter-absence precondition: no visible live row
+// in table may match filter, else the transaction aborts PRECONDITION_FAILED.
+func (m Mutation) ExpectNoMatch(table string, filter wire.FilterExpr) Mutation {
+	m.t.Steps = append(m.t.Steps, wire.StepExpectNoMatch{Table: table, Filter: filter})
+	return m
+}
+
+// InsertIf queues a conditional insert: ExpectNoMatch(table, filter) followed
+// by an insert of doc. A doc that is not JSON-encodable is a programming
+// error and panics.
+func (m Mutation) InsertIf(table string, filter wire.FilterExpr, doc map[string]any) Mutation {
+	return m.ExpectNoMatch(table, filter).Insert(table, anyObject(doc))
+}
+
 // Upsert queues the insert-or-patch step keyed by an index eq-prefix.
 func (m Mutation) Upsert(table, index string, eq []wire.JSONValue, insert, patch wire.JSONValue) Mutation {
 	m.t.Steps = append(m.t.Steps, wire.StepUpsert{Table: table, Index: index, Eq: eq, Insert: insert, Patch: patch})
@@ -134,4 +152,17 @@ func (m Mutation) CancelWorkflow(id string) Mutation {
 // Build returns the wire transaction (shallow copy).
 func (m Mutation) Build() wire.Transaction {
 	return m.t
+}
+
+// anyObject converts a plain Go map to a wire object via its JSON encoding.
+func anyObject(doc map[string]any) wire.JSONValue {
+	b, err := json.Marshal(doc)
+	if err != nil {
+		panic("dsl: InsertIf doc is not JSON-encodable: " + err.Error())
+	}
+	v, err := wire.UnmarshalJSON(b)
+	if err != nil {
+		panic("dsl: InsertIf doc: " + err.Error())
+	}
+	return v
 }

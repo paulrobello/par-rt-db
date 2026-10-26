@@ -1,0 +1,81 @@
+{
+  "name": "txn-expect-no-match-older-than",
+  "$comment": "expectNoMatch accepts the olderThan leaf (like the by-query steps). The only seed row's timestamp is far in the future, so it is not older than the cutoff and nothing matches.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": {
+            "type": "string"
+          },
+          "expiresAt": {
+            "type": "number"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_name",
+            "fields": [
+              "name"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "seed": [
+    {
+      "name": "a",
+      "expiresAt": 9000000000000000
+    }
+  ],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "expectNoMatch",
+          "table": "tasks",
+          "filter": {
+            "op": "olderThan",
+            "field": "expiresAt",
+            "ms": 1000000000000
+          }
+        },
+        {
+          "op": "insert",
+          "table": "tasks",
+          "doc": {
+            "name": "b",
+            "expiresAt": 2000000000000
+          }
+        }
+      ]
+    }
+  },
+  "expect": [
+    null,
+    {}
+  ],
+  "then": {
+    "query": {
+      "table": "tasks"
+    },
+    "expect": [
+      {
+        "name": "a",
+        "expiresAt": 9000000000000000
+      },
+      {
+        "name": "b",
+        "expiresAt": 2000000000000
+      }
+    ],
+    "unordered": true
+  },
+  "normalize": [
+    "_id",
+    "_creationTime",
+    "_version",
+    "id"
+  ]
+}

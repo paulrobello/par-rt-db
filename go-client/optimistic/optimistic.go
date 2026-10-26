@@ -57,11 +57,11 @@ func Project(query wire.Query, last wire.JSONValue, txn wire.Transaction, now in
 }
 
 // isArrayQuery reports whether the query's result is a plain doc array.
-// get/unique/first/count/distinct/paginate/search/vectorSearch are
+// get/unique/first/count/distinct/aggregate/paginate/search/vectorSearch are
 // non-array or rank-based shapes we cannot project.
 func isArrayQuery(q wire.Query) bool {
 	return q.Get == nil &&
-		!q.Unique && !q.First && !q.Count && !q.Distinct &&
+		!q.Unique && !q.First && !q.Count && !q.Distinct && q.Aggregate == nil &&
 		q.Paginate == nil && q.Search == nil && q.VectorSearch == nil
 }
 

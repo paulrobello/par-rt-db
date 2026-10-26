@@ -18,6 +18,7 @@ mod aggregate;
 mod cascade;
 mod computed;
 mod constraints;
+mod expect_no_match;
 mod filter;
 mod lookup;
 // Every migrate test (and its fixture) is `#[cfg(feature = "admin")]` — the

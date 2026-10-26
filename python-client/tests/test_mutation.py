@@ -1,4 +1,4 @@
-"""Tests for ``par_rt_db.mutation``: ``Step`` (17 ops), ``StepResult``, ``Transaction``,
+"""Tests for ``par_rt_db.mutation``: ``Step`` (18 ops), ``StepResult``, ``Transaction``,
 and the ``Mutation`` builder.
 
 Mirrors ``server/src/txn.rs`` (the ``Step`` enum + ``Transaction`` struct +
@@ -8,7 +8,7 @@ untagged ``StepResult``) and the builder ergonomics of
 Wire shapes (load-bearing — match the server exactly):
 
 * ``Step`` is tagged by ``op`` (camelCase variants: ``insert``/``patch``/``adjustCounter``/
-  ``replace``/``delete``/``undelete``/``expectVersion``/``expectFields``/``expectBefore``/``expectAbsent``/
+  ``replace``/``delete``/``undelete``/``expectVersion``/``expectFields``/``expectBefore``/``expectAbsent``/``expectNoMatch``/
   ``upsert``/``patchByQuery``/``deleteByQuery``/``schedule``/``cancelSchedule``/
   ``startWorkflow``/``cancelWorkflow``).
 * ``Transaction`` is ``{"steps": Step[]}``; the server caps at 1024 steps.
@@ -94,6 +94,51 @@ def test_expect_version_and_expect_absent():
         "index": "by_owner",
         "eq": ["p9"],
     }
+
+
+def test_expect_no_match_and_insert_if_wire_shape():
+    flt = _flt({"op": "eq", "field": "status", "value": "open"})
+    m = Mutation.builder().expect_no_match("boxes", flt).build()
+    wire = json.loads(m.model_dump_json(by_alias=True))
+    assert wire["steps"] == [
+        {
+            "op": "expectNoMatch",
+            "table": "boxes",
+            "filter": {"op": "eq", "field": "status", "value": "open"},
+        }
+    ]
+    # Round-trips through the Step union.
+    assert Transaction.model_validate(wire).model_dump(by_alias=True, mode="json") == wire
+
+
+def test_insert_if_emits_expect_no_match_then_insert():
+    flt = _flt({"op": "eq", "field": "status", "value": "open"})
+    m = Mutation.builder().insert_if("boxes", flt, {"status": "open"}).build()
+    wire = json.loads(m.model_dump_json(by_alias=True))
+    assert wire["steps"] == [
+        {
+            "op": "expectNoMatch",
+            "table": "boxes",
+            "filter": {"op": "eq", "field": "status", "value": "open"},
+        },
+        {"op": "insert", "table": "boxes", "doc": {"status": "open"}},
+    ]
+
+
+def test_expect_no_match_rejects_unknown_field():
+    with pytest.raises(ValidationError):
+        Transaction.model_validate(
+            {
+                "steps": [
+                    {
+                        "op": "expectNoMatch",
+                        "table": "t",
+                        "filter": {"op": "eq", "field": "x", "value": 1},
+                        "bogus": 1,
+                    }
+                ]
+            }
+        )
 
 
 def test_step_rejects_unknown_op():
@@ -199,6 +244,8 @@ def test_mutation_builder_returns_self():
     assert b.delete("t", "i") is b
     assert b.expect_version("t", "i", 1) is b
     assert b.expect_absent("t", "idx", ["v"]) is b
+    assert b.expect_no_match("t", flt) is b
+    assert b.insert_if("t", flt, {"x": 1}) is b
     assert b.upsert("t", "idx", ["v"], {"x": 1}, {"x": 2}) is b
     assert b.patch_by_query("t", flt, {"x": 1}) is b
     assert b.delete_by_query("t", flt) is b

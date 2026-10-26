@@ -4,6 +4,7 @@ package wire
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -66,3 +67,45 @@ func TestStepResultDecode(t *testing.T) {
 }
 
 func bytesHas(b []byte, s string) bool { return bytes.Contains(b, []byte(s)) }
+
+func TestStepExpectNoMatchRoundTrip(t *testing.T) {
+	txn := Transaction{Steps: []Step{
+		StepExpectNoMatch{Table: "items", Filter: FilterEq{Field: "name", Value: String("a")}},
+	}}
+	b, err := json.Marshal(txn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"steps":[{"op":"expectNoMatch","table":"items","filter":{"op":"eq","field":"name","value":"a"}}]}`
+	var got, wantV map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(want), &wantV); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, wantV) {
+		t.Fatalf("wire mismatch:\n got %s\nwant %s", b, want)
+	}
+	step, err := UnmarshalStep([]byte(`{"op":"expectNoMatch","table":"items","filter":{"op":"eq","field":"name","value":"a"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec, ok := step.(StepExpectNoMatch)
+	if !ok || dec.Table != "items" {
+		t.Fatalf("decoded %#v", step)
+	}
+	if _, ok := dec.Filter.(FilterEq); !ok {
+		t.Fatalf("filter not decoded: %#v", dec.Filter)
+	}
+}
+
+func TestStepExpectNoMatchRejectsUnknownField(t *testing.T) {
+	_, err := UnmarshalStep([]byte(`{"op":"expectNoMatch","table":"items","filter":{"op":"eq","field":"a","value":1},"extra":1}`))
+	if err == nil {
+		t.Fatal("unknown field must be rejected")
+	}
+	if _, err := UnmarshalStep([]byte(`{"op":"noSuchStep"}`)); err == nil {
+		t.Fatal("unknown op must still error")
+	}
+}

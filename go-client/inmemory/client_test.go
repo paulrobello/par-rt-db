@@ -250,6 +250,78 @@ func TestSubscribeFiresOnChange(t *testing.T) {
 	}
 }
 
+func TestSubscribeGroupedMultiOpAggregate(t *testing.T) {
+	// Post-increment clock: a constant clock would mint colliding ids.
+	var clock int64 = 1000
+	c := New(Options{Now: func() int64 { clock++; return clock }})
+	if err := c.PushSchema(testSchema()); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	ins := func(name, status string, order int) string {
+		res, err := c.Mutate(ctx, wire.Transaction{Steps: []wire.Step{wire.StepInsert{
+			Table: "items", Doc: docObj("name", name, "status", status, "order", order),
+		}}}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return *res[0].ID
+	}
+	idA := ins("a", "todo", 1)
+	ins("b", "todo", 2)
+	ins("c", "done", 5)
+
+	q := dsl.NewTableQuery("items").
+		WithIndex("by_status_and_order").
+		Aggregates(map[string]wire.AggregateOp{"total": wire.AggSum, "n": wire.AggCount},
+			wire.GroupByFields{"status"})
+	sub := c.Subscribe(q)
+	defer sub.Unsubscribe()
+
+	next := func() string {
+		t.Helper()
+		select {
+		case snap := <-sub.Updates():
+			return canonical(snap)
+		case <-time.After(time.Second):
+			t.Fatal("no update")
+			return ""
+		}
+	}
+	want := func(done, todo string) string {
+		return canonical(wire.Array{
+			wire.Object{"keys": wire.Array{wire.String("done")}, "values": wire.Object{"total": wire.Number(done), "n": wire.Number("1")}},
+			wire.Object{"keys": wire.Array{wire.String("todo")}, "values": wire.Object{"total": wire.Number(todo), "n": wire.Number("2")}},
+		})
+	}
+	if got := next(); got != want("5", "3") {
+		t.Fatalf("initial rows: %s", got)
+	}
+
+	// An in-window insert changes the aggregate and fires.
+	ins("d", "todo", 4)
+	got := next()
+	wantInsert := canonical(wire.Array{
+		wire.Object{"keys": wire.Array{wire.String("done")}, "values": wire.Object{"total": wire.Number("5"), "n": wire.Number("1")}},
+		wire.Object{"keys": wire.Array{wire.String("todo")}, "values": wire.Object{"total": wire.Number("7"), "n": wire.Number("3")}},
+	})
+	if got != wantInsert {
+		t.Fatalf("post-insert rows: %s", got)
+	}
+
+	// Patching a field outside the aggregate leaves the result unchanged: no fire.
+	if _, err := c.Mutate(ctx, wire.Transaction{Steps: []wire.Step{wire.StepPatch{
+		Table: "items", ID: idA, Fields: docObj("note", "hello"),
+	}}}, ""); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case snap := <-sub.Updates():
+		t.Fatalf("non-aggregated patch fired: %s", canonical(snap))
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func TestPresenceJoinSnapshotExpire(t *testing.T) {
 	rooms := NewPresenceRooms()
 	var clock int64 = 1000

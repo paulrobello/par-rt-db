@@ -177,6 +177,44 @@ describe("projectOptimisticUpdate", () => {
     ).toBe(false);
   });
 
+  it("does not overlay aggregate queries (scalar, alias-map, or grouped rows are not cacheable docs)", () => {
+    const insert = txn([{ op: "insert", table: "items", doc: { n: 1 } }]);
+    const del = txn([{ op: "delete", table: "items", id: "a" }]);
+    const grouped = [{ keys: ["todo"], values: { total: 3, n: 2 } }];
+    expect(
+      projectOptimisticUpdate({ table: "items", aggregate: { op: "sum" } }, 5, insert).overlaid,
+    ).toBe(false);
+    expect(
+      projectOptimisticUpdate(
+        { table: "items", aggregate: { aggregates: { total: "sum", n: "count" } } },
+        { total: 3, n: 2 },
+        insert,
+      ).overlaid,
+    ).toBe(false);
+    // An array-valued grouped result must not be treated as cacheable rows,
+    // even by a delete (which is otherwise overlaid on any array query).
+    expect(
+      projectOptimisticUpdate(
+        {
+          table: "items",
+          aggregate: { aggregates: { total: "sum", n: "count" }, groupBy: ["status"] },
+        },
+        grouped,
+        insert,
+      ).overlaid,
+    ).toBe(false);
+    expect(
+      projectOptimisticUpdate(
+        {
+          table: "items",
+          aggregate: { aggregates: { total: "sum", n: "count" }, groupBy: ["status"] },
+        },
+        grouped,
+        del,
+      ).overlaid,
+    ).toBe(false);
+  });
+
   it("ignores steps on other tables (no overlay)", () => {
     const out = projectOptimisticUpdate(
       { table: "items" },

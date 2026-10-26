@@ -1,0 +1,51 @@
+{
+  "name": "txn-expect-no-match-sees-earlier-step",
+  "$comment": "Steps run in order inside one transaction: an insert earlier in the same txn is visible to a later expectNoMatch, which therefore fails with PRECONDITION_FAILED.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_name",
+            "fields": [
+              "name"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "seed": [],
+  "op": {
+    "txn": {
+      "steps": [
+        {
+          "op": "insert",
+          "table": "tasks",
+          "doc": {
+            "name": "a"
+          }
+        },
+        {
+          "op": "expectNoMatch",
+          "table": "tasks",
+          "filter": {
+            "op": "eq",
+            "field": "name",
+            "value": "a"
+          }
+        }
+      ]
+    }
+  },
+  "expect": {
+    "error": {
+      "code": "PRECONDITION_FAILED"
+    }
+  }
+}

@@ -141,6 +141,19 @@ def test_patch_by_query_older_than_takes_the_int64_column_path() -> None:
     assert doc["updatedAt"] == str(FUTURE)
 
 
+def test_expect_no_match_older_than_aborts_only_when_an_old_row_exists() -> None:
+    c = _new_client(_number_schema())
+    _seed(c, "future", FUTURE)
+    flt = _older_than("updatedAt", SWEEP_MS)
+    # Only a future row: nothing is older than the cutoff, so the guard passes.
+    assert c.mutate(Mutation.builder().expect_no_match("tasks", flt).build()) == [None]
+    _seed(c, "old", OLD)
+    with pytest.raises(RtDbError) as ei:
+        c.mutate(Mutation.builder().expect_no_match("tasks", flt).build())
+    assert ei.value.code is ErrorCode.PRECONDITION_FAILED
+    assert ei.value.message == "filter matched an existing document"
+
+
 def test_read_query_filter_older_than_is_rejected() -> None:
     c = _new_client(_number_schema())
     with pytest.raises(RtDbError) as ei:
