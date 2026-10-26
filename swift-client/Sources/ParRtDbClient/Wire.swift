@@ -205,6 +205,13 @@ public enum ClientMessage: Equatable, Codable, Sendable {
     case presenceState(room: String, state: JSONValue, ttlMs: UInt64?)
     /// Leave a presence room.
     case leavePresence(room: String)
+    /// Open a change-feed push channel. `since` omitted = start at the head;
+    /// `tables` is omitted from the wire when empty (all tables).
+    case feedSubscribe(feedId: String, since: Int64?, feedEpoch: String?, tables: [String])
+    /// Flow-control ack: every op with `seq <= seq` has been processed.
+    case feedAck(feedId: String, seq: Int64)
+    /// Close a change-feed channel.
+    case feedUnsubscribe(feedId: String)
     /// Keepalive; the server replies `pong`.
     case ping
 
@@ -213,6 +220,7 @@ public enum ClientMessage: Equatable, Codable, Sendable {
         case scheduleId, when, id, workflowId, spec, status, name, payload
         case external
         case room, state, ttlMs
+        case feedId, since, feedEpoch, tables, seq
     }
 
     // swiftlint:disable:next cyclomatic_complexity function_body_length
@@ -362,6 +370,32 @@ public enum ClientMessage: Equatable, Codable, Sendable {
                 allowed: ["type", "room"]
             )
             self = try .leavePresence(room: container.decode(String.self, forKey: .room))
+        case "feedSubscribe":
+            try rejectUnknownVariantFields(
+                "ClientMessage", variant: payload.tag, keys: payload.keys,
+                allowed: ["type", "feedId", "since", "feedEpoch", "tables"]
+            )
+            self = try .feedSubscribe(
+                feedId: container.decode(String.self, forKey: .feedId),
+                since: container.decodeIfPresent(Int64.self, forKey: .since),
+                feedEpoch: container.decodeIfPresent(String.self, forKey: .feedEpoch),
+                tables: container.decodeIfPresent([String].self, forKey: .tables) ?? []
+            )
+        case "feedAck":
+            try rejectUnknownVariantFields(
+                "ClientMessage", variant: payload.tag, keys: payload.keys,
+                allowed: ["type", "feedId", "seq"]
+            )
+            self = try .feedAck(
+                feedId: container.decode(String.self, forKey: .feedId),
+                seq: container.decode(Int64.self, forKey: .seq)
+            )
+        case "feedUnsubscribe":
+            try rejectUnknownVariantFields(
+                "ClientMessage", variant: payload.tag, keys: payload.keys,
+                allowed: ["type", "feedId"]
+            )
+            self = try .feedUnsubscribe(feedId: container.decode(String.self, forKey: .feedId))
         case "ping":
             try rejectUnknownVariantFields(
                 "ClientMessage", variant: payload.tag, keys: payload.keys,
@@ -450,6 +484,21 @@ public enum ClientMessage: Equatable, Codable, Sendable {
         case let .leavePresence(room):
             try container.encode("leavePresence", forKey: .type)
             try container.encode(room, forKey: .room)
+        case let .feedSubscribe(feedId, since, feedEpoch, tables):
+            try container.encode("feedSubscribe", forKey: .type)
+            try container.encode(feedId, forKey: .feedId)
+            try container.encodeIfPresent(since, forKey: .since)
+            try container.encodeIfPresent(feedEpoch, forKey: .feedEpoch)
+            if !tables.isEmpty {
+                try container.encode(tables, forKey: .tables)
+            }
+        case let .feedAck(feedId, seq):
+            try container.encode("feedAck", forKey: .type)
+            try container.encode(feedId, forKey: .feedId)
+            try container.encode(seq, forKey: .seq)
+        case let .feedUnsubscribe(feedId):
+            try container.encode("feedUnsubscribe", forKey: .type)
+            try container.encode(feedId, forKey: .feedId)
         case .ping:
             try container.encode("ping", forKey: .type)
         }
@@ -512,6 +561,12 @@ public enum ServerMessage: Equatable, Codable, Sendable {
     )
     /// Presence operation failed.
     case presenceErr(room: String, error: RtDbError)
+    /// One batch of durable change ops for a feed (oldest first,
+    /// at-least-once); dedupe on `(feedEpoch, op.seq)`. The first frame after
+    /// `feedSubscribe` always arrives (possibly empty) to confirm it.
+    case feedEvents(feedId: String, feedEpoch: String, ops: [ChangeOp], head: Int64)
+    /// Terminal for the feed; `CURSOR_EXPIRED` means resync over HTTP.
+    case feedErr(feedId: String, error: RtDbError)
     /// Reply to `ping`.
     case pong
 
@@ -519,6 +574,7 @@ public enum ServerMessage: Equatable, Codable, Sendable {
         case type, user, error, queryId, result, mutId, results, schedules
         case scheduleId, id, ok, workflowId, info, workflows, room, members
         case protocolVersion, seq, joined, left, stateChanged
+        case feedId, feedEpoch, ops, head
     }
 
     // swiftlint:disable:next cyclomatic_complexity function_body_length
@@ -611,6 +667,18 @@ public enum ServerMessage: Equatable, Codable, Sendable {
         case "presenceErr":
             self = try .presenceErr(
                 room: container.decode(String.self, forKey: .room),
+                error: container.decode(RtDbError.self, forKey: .error)
+            )
+        case "feedEvents":
+            self = try .feedEvents(
+                feedId: container.decode(String.self, forKey: .feedId),
+                feedEpoch: container.decode(String.self, forKey: .feedEpoch),
+                ops: container.decode([ChangeOp].self, forKey: .ops),
+                head: container.decode(Int64.self, forKey: .head)
+            )
+        case "feedErr":
+            self = try .feedErr(
+                feedId: container.decode(String.self, forKey: .feedId),
                 error: container.decode(RtDbError.self, forKey: .error)
             )
         case "pong":
@@ -708,6 +776,16 @@ public enum ServerMessage: Equatable, Codable, Sendable {
         case let .presenceErr(room, error):
             try container.encode("presenceErr", forKey: .type)
             try container.encode(room, forKey: .room)
+            try container.encode(error, forKey: .error)
+        case let .feedEvents(feedId, feedEpoch, ops, head):
+            try container.encode("feedEvents", forKey: .type)
+            try container.encode(feedId, forKey: .feedId)
+            try container.encode(feedEpoch, forKey: .feedEpoch)
+            try container.encode(ops, forKey: .ops)
+            try container.encode(head, forKey: .head)
+        case let .feedErr(feedId, error):
+            try container.encode("feedErr", forKey: .type)
+            try container.encode(feedId, forKey: .feedId)
             try container.encode(error, forKey: .error)
         case .pong:
             try container.encode("pong", forKey: .type)

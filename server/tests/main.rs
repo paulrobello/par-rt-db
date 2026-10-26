@@ -84,4 +84,5 @@ mod vector_test;
 mod webhook_test;
 mod wire_corpus;
 mod workflows_test;
+mod ws_feed_test;
 mod ws_test;

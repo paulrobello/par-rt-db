@@ -230,7 +230,7 @@ pub(crate) async fn append(
 /// One committed change as the read path returns it. `doc` mirrors the stored
 /// post-image (`None` when the row carries no end-state — the consumer
 /// re-fetches).
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChangeRow {
     pub seq: i64,
@@ -256,32 +256,44 @@ pub async fn read_page(
     table: Option<&str>,
     limit: i64,
 ) -> Result<Page, RtDbError> {
+    let tables: Vec<String> = table.map(str::to_string).into_iter().collect();
+    read_page_tables(pool, db, since, &tables, limit).await
+}
+
+/// [`read_page`] with a multi-table filter: an empty `tables` slice means
+/// every table. Shared by the WebSocket change-feed channel (`ws_feed`).
+pub async fn read_page_tables(
+    pool: &PgPool,
+    db: &str,
+    since: i64,
+    tables: &[String],
+    limit: i64,
+) -> Result<Page, RtDbError> {
     let schema = pg_schema(db);
     let min = min_seq(pool, db).await?;
-    let query = match table {
-        Some(_) => {
-            format!(
-                "SELECT seq, table_name, doc_id, kind, doc, ts
-                 FROM \"{schema}\".changes
-                 WHERE seq > $1 AND table_name = $2
-                 ORDER BY seq LIMIT $3"
-            )
-        }
-        None => format!(
+    let query = if tables.is_empty() {
+        format!(
             "SELECT seq, table_name, doc_id, kind, doc, ts
              FROM \"{schema}\".changes
              WHERE seq > $1
              ORDER BY seq LIMIT $2"
-        ),
+        )
+    } else {
+        format!(
+            "SELECT seq, table_name, doc_id, kind, doc, ts
+             FROM \"{schema}\".changes
+             WHERE seq > $1 AND table_name = ANY($3)
+             ORDER BY seq LIMIT $2"
+        )
     };
     let mut q = sqlx::query_as::<_, (i64, String, String, String, Option<Value>, i64)>(
         sqlx::AssertSqlSafe(query),
     )
-    .bind(since);
-    if let Some(table) = table {
-        q = q.bind(table);
+    .bind(since)
+    .bind(limit);
+    if !tables.is_empty() {
+        q = q.bind(tables.to_vec());
     }
-    q = q.bind(limit);
     let rows = q.fetch_all(pool).await?;
     Ok(Page {
         ops: rows

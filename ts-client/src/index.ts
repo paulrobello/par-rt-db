@@ -84,9 +84,11 @@ export type {
 export { RtDbAdminClient } from "./admin.js";
 export type {
   AuthState,
+  ChangeBatchMeta,
   ConnectionState,
   OfflineQueueStatus,
   RtDbClientOptions,
+  SubscribeChangesOptions,
   WebSocketLike,
 } from "./client.js";
 export { RtDbClient } from "./client.js";

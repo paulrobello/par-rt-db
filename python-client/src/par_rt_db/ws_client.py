@@ -28,6 +28,7 @@ from .optimistic import project as _project_optimistic
 from .query import _dump_query, _terminal_of, parse_result
 from .wire import (
     AuthedUser,
+    ChangeOp,
     PresenceMember,
     ScheduleInfo,
     ScheduleWhen,
@@ -37,6 +38,9 @@ from .wire import (
     WorkflowStatus,
     _ClientCancelSchedule,
     _ClientCancelWorkflow,
+    _ClientFeedAck,
+    _ClientFeedSubscribe,
+    _ClientFeedUnsubscribe,
     _ClientLeavePresence,
     _ClientListSchedules,
     _ClientListWorkflows,
@@ -211,6 +215,32 @@ class _PresenceRoom:
     cond: asyncio.Condition = field(default_factory=asyncio.Condition)
 
 
+@dataclass
+class _Feed:
+    """Internal per-feed state for ``watch_changes``. ``last_seq`` is the
+    dedupe watermark within ``epoch`` (advanced on frame arrival) and the
+    ``since`` replayed on reconnect. ``queue`` carries ``ChangeBatch`` items
+    and, terminally, an ``RtDbError``."""
+
+    feed_id: str
+    tables: list[str]
+    last_seq: int | None = None
+    epoch: str | None = None
+    closed: bool = False
+    queue: asyncio.Queue[ChangeBatch | RtDbError | None] = field(default_factory=asyncio.Queue)
+
+
+@dataclass(frozen=True)
+class ChangeBatch:
+    """One batch of change-feed ops yielded by :class:`ChangeFeed`, after
+    dedupe. ``feed_epoch`` equals the HTTP feed's ``logId``; ``head`` is the log
+    head when the frame was produced."""
+
+    ops: list[ChangeOp]
+    feed_epoch: str
+    head: int
+
+
 class RtDbClient:
     """Reactive par-rt-db client.
 
@@ -268,6 +298,8 @@ class RtDbClient:
         self._overlays: dict[str, set[str]] = {}
         # ENH-015 presence: one entry per joined room, keyed by room name.
         self._presence_by_room: dict[str, _PresenceRoom] = {}
+        # Change-feed push channels (``watch_changes``), keyed by feed id.
+        self._feeds: dict[str, _Feed] = {}
 
     def status(self) -> ClientStatus:
         """Return the current connection state and authenticated user (``None``
@@ -484,6 +516,9 @@ class RtDbClient:
         # (a pre-auth update_presence advances it, so the replay stays fresh).
         for room in list(self._presence_by_room):
             await self._send(_presence_join_frame(room, self._presence_by_room[room].join_state))
+        # Resume every change feed from its last processed seq.
+        for feed in list(self._feeds.values()):
+            await self._send(_feed_subscribe_frame(feed))
 
     # --- dispatch (forward-compatible; Tasks 3-4 fill the maps) --------
 
@@ -509,6 +544,10 @@ class RtDbClient:
             self._on_presence_delta(msg)
         elif tag == "presenceErr":
             self._on_presence_err(msg)
+        elif tag == "feedEvents":
+            self._on_feed_events(msg)
+        elif tag == "feedErr":
+            self._on_feed_err(msg)
         # authOk/authErr are handled in _await_auth; unknown tags ignored.
 
     # --- subscriptions (Task 3) ----------------------------------------
@@ -967,6 +1006,80 @@ class RtDbClient:
         with contextlib.suppress(RuntimeError):
             asyncio.get_running_loop().create_task(_wake())
 
+    # --- change feed (WebSocket push of the HTTP changes log) -------------
+
+    def watch_changes(
+        self,
+        *,
+        tables: list[str] | None = None,
+        since: int | None = None,
+        feed_epoch: str | None = None,
+    ) -> ChangeFeed:
+        """Stream committed document ops as ``async for batch in
+        client.watch_changes(...)`` (each ``batch`` is a :class:`ChangeBatch`).
+
+        ``since=None`` starts at the current head; ``since=N`` streams ops with
+        ``seq > N``. ``feed_epoch`` (the HTTP feed's ``logId``) makes the server
+        reject a cursor from a replaced database. Delivery is at-least-once: the
+        client drops replays (``seq <= last seq`` within the epoch), re-sends
+        ``feedSubscribe`` with the last seq on every reconnect, and acks a batch
+        when the consumer asks for the next one. A server ``feedErr`` (e.g.
+        ``CURSOR_EXPIRED``) raises :class:`RtDbError` from the iterator and is
+        NOT retried; resync over the HTTP changes path. Closing the handle sends
+        ``feedUnsubscribe``.
+        """
+        self._counter += 1
+        feed = _Feed(
+            feed_id=f"feed-{self._counter}",
+            tables=list(tables or []),
+            last_seq=since,
+            epoch=feed_epoch,
+        )
+        self._feeds[feed.feed_id] = feed
+        if self._state is ConnectionState.CONNECTED:
+            asyncio.get_running_loop().create_task(self._send(_feed_subscribe_frame(feed)))
+        return ChangeFeed(self, feed)
+
+    def _close_feed(self, feed: _Feed) -> None:
+        if feed.closed:
+            return
+        feed.closed = True
+        feed.queue.put_nowait(None)
+        if (
+            self._feeds.pop(feed.feed_id, None) is not None
+            and self._state is ConnectionState.CONNECTED
+        ):
+            frame = _ClientFeedUnsubscribe(feed_id=feed.feed_id).model_dump_json(by_alias=True)
+            with contextlib.suppress(RuntimeError):
+                asyncio.get_running_loop().create_task(self._send(frame))
+
+    def _on_feed_events(self, msg: Any) -> None:
+        feed = self._feeds.get(msg.feed_id)
+        if feed is None or feed.closed:
+            return
+        if feed.epoch is not None and feed.epoch != msg.feed_epoch:
+            # Seqs from a different log are not comparable: restart the watermark.
+            feed.last_seq = None
+        feed.epoch = msg.feed_epoch
+        floor = feed.last_seq
+        ops = [op for op in msg.ops if floor is None or op.seq > floor]
+        if ops:
+            feed.last_seq = max(op.seq for op in ops)
+            feed.queue.put_nowait(ChangeBatch(ops=ops, feed_epoch=msg.feed_epoch, head=msg.head))
+        elif not msg.ops and (floor is None or msg.head > floor):
+            # An empty frame (the subscribe confirmation, or a quiet page) means
+            # nothing matching exists up to ``head``: pin the resume cursor so a
+            # reconnect does not restart at a later head and skip the gap.
+            feed.last_seq = msg.head
+
+    def _on_feed_err(self, msg: Any) -> None:
+        feed = self._feeds.pop(msg.feed_id, None)
+        if feed is None or feed.closed:
+            return
+        # Terminal: dropped from the registry so a reconnect never re-subscribes.
+        feed.closed = True
+        feed.queue.put_nowait(RtDbError.from_envelope(msg.error.model_dump()))
+
     def _reject_inflight(self, reason: str) -> None:
         # Only in-flight (sent) entries die on a reconnectable drop; queued
         # entries survive so ``_flush_on_auth`` can resend them on reconnect.
@@ -1178,6 +1291,60 @@ class Presence:
         self._iter_version = room.version
         # current() is non-None here because version advanced past 0.
         return room.members or []
+
+
+class ChangeFeed:
+    """Handle returned by :meth:`RtDbClient.watch_changes`: an async iterator of
+    :class:`ChangeBatch` and an async context manager. The previous batch is
+    acked (``feedAck`` with its max seq) when the next one is requested, so a
+    consumer that dies mid-batch gets it replayed. Closing sends
+    ``feedUnsubscribe``."""
+
+    def __init__(self, client: RtDbClient, feed: _Feed) -> None:
+        self._client = client
+        self._feed = feed
+        self._pending_ack: int | None = None
+
+    def close(self) -> None:
+        """Stop the feed and send ``feedUnsubscribe`` (idempotent)."""
+        self._client._close_feed(self._feed)
+
+    unsubscribe = close
+
+    async def __aenter__(self) -> ChangeFeed:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        self.close()
+
+    def __aiter__(self) -> ChangeFeed:
+        return self
+
+    async def __anext__(self) -> ChangeBatch:
+        feed = self._feed
+        if self._pending_ack is not None:
+            seq, self._pending_ack = self._pending_ack, None
+            if not feed.closed and self._client._state is ConnectionState.CONNECTED:
+                frame = _ClientFeedAck(feed_id=feed.feed_id, seq=seq).model_dump_json(by_alias=True)
+                await self._client._send(frame)
+        while True:
+            item = await feed.queue.get()
+            if item is None:
+                feed.queue.put_nowait(None)  # keep later calls terminating
+                raise StopAsyncIteration
+            if isinstance(item, RtDbError):
+                raise item
+            self._pending_ack = max(op.seq for op in item.ops)
+            return item
+
+
+def _feed_subscribe_frame(feed: _Feed) -> str:
+    return _ClientFeedSubscribe(
+        feed_id=feed.feed_id,
+        since=feed.last_seq,
+        feed_epoch=feed.epoch,
+        tables=feed.tables,
+    ).model_dump_json(by_alias=True)
 
 
 def _tag(msg: Any) -> str:

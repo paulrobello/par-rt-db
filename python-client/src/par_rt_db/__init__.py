@@ -71,7 +71,7 @@ if TYPE_CHECKING:
     )
     from .aio_http_client import RtDbAsyncHttpClient
     from .http_client import RtDbHttpClient
-    from .ws_client import Presence, RtDbClient, Subscription
+    from .ws_client import ChangeBatch, ChangeFeed, Presence, RtDbClient, Subscription
 
 if "pdoc" in sys.modules:
     from .admin import (
@@ -90,7 +90,7 @@ if "pdoc" in sys.modules:
     )
     from .aio_http_client import RtDbAsyncHttpClient
     from .http_client import RtDbHttpClient
-    from .ws_client import Presence, RtDbClient, Subscription
+    from .ws_client import ChangeBatch, ChangeFeed, Presence, RtDbClient, Subscription
 
 __all__ = [
     "Mutation",
@@ -130,6 +130,8 @@ __all__ = [
     "RtDbClient",
     "Subscription",
     "Presence",
+    "ChangeFeed",
+    "ChangeBatch",
     "RtDbAdminClient",
     "AsyncRtDbAdminClient",
     "MintedToken",
@@ -159,7 +161,7 @@ def __getattr__(name: str) -> Any:
         from . import http_client
 
         return http_client.RtDbHttpClient
-    if name in ("RtDbClient", "Subscription", "Presence"):
+    if name in ("RtDbClient", "Subscription", "Presence", "ChangeFeed", "ChangeBatch"):
         from . import ws_client
 
         return getattr(ws_client, name)

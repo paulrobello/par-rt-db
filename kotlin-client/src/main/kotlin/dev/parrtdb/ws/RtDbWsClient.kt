@@ -2,6 +2,7 @@ package dev.parrtdb.ws
 
 import dev.parrtdb.errors.ErrorCode
 import dev.parrtdb.errors.RtDbException
+import dev.parrtdb.wire.ChangeOp
 import dev.parrtdb.wire.ClientMessage
 import dev.parrtdb.wire.ErrorEnvelope
 import dev.parrtdb.wire.PROTOCOL_VERSION
@@ -37,6 +38,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonElement
+
+/** One `feedEvents` frame's new ops (already deduplicated, in seq order) with the server's log head. */
+data class ChangeFeedBatch(val feedEpoch: String, val ops: List<ChangeOp>, val head: Long)
 
 /** Tunables for [RtDbWsClient]. */
 data class WsOptions(
@@ -82,6 +86,8 @@ class RtDbWsClient(
         var last: List<PresenceMember>? = null
     }
 
+    private class Feed(val id: String, val tables: List<String>, var epoch: String?, var lastSeq: Long?, val batches: Channel<ChangeFeedBatch>)
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val lock = Any()
     private var conn: WsConnection? = null
@@ -89,6 +95,7 @@ class RtDbWsClient(
     private var manager: Job? = null
     private val subs = HashMap<String, Sub>()
     private val rooms = HashMap<String, Room>()
+    private val feeds = HashMap<String, Feed>()
     private val pending = HashMap<String, CompletableDeferred<ServerMessage>>()
 
     /** Dials, authenticates and starts the manager. Throws [RtDbException] on authErr. */
@@ -109,8 +116,10 @@ class RtDbWsClient(
                 conn = null
                 Quad(c, subs.values.toList(), rooms.values.toList(), pending.values.toList())
             }
+        val feedList = synchronized(lock) { feeds.values.toList() }
         waiting.forEach { it.completeExceptionally(WsClosedException(1000, "client closed")) }
         subList.forEach { it.updates.close() }
+        feedList.forEach { it.batches.close() }
         roomList.forEach { r -> r.collectors.toList().forEach { it.close() } }
         scope.cancel()
         c?.close()
@@ -197,7 +206,15 @@ class RtDbWsClient(
     }
 
     private suspend fun replay(c: WsConnection) {
-        val (subList, roomList) = synchronized(lock) { subs.values.toList() to rooms.values.toList() }
+        val (subList, roomList, feedFrames) =
+            synchronized(lock) {
+                Triple(
+                    subs.values.toList(),
+                    rooms.values.toList(),
+                    feeds.values.map { ClientMessage.FeedSubscribe(it.id, it.lastSeq, it.epoch, it.tables) },
+                )
+            }
+        for (f in feedFrames) runCatching { c.send(WireJson.encode(f.toJson())) }
         for (s in subList) runCatching { c.send(WireJson.encode(ClientMessage.Subscribe(s.id, s.query).toJson())) }
         for (r in roomList) runCatching { c.send(WireJson.encode(ClientMessage.Presence(r.name, r.state).toJson())) }
     }
@@ -222,8 +239,34 @@ class RtDbWsClient(
             is ServerMessage.PresenceDelta -> presenceFrame(msg.room) { it.fold.delta(msg) }
             is ServerMessage.PresenceErr ->
                 synchronized(lock) { rooms[msg.room]?.collectors?.toList() }?.forEach { it.close(msg.error.toException()) }
+            is ServerMessage.FeedEvents -> feedEvents(msg)
+            is ServerMessage.FeedErr -> synchronized(lock) { feeds.remove(msg.feedId) }?.batches?.close(msg.error.toException())
             is ServerMessage.AuthOk, is ServerMessage.AuthErr, ServerMessage.Pong -> Unit
         }
+    }
+
+    private suspend fun feedEvents(msg: ServerMessage.FeedEvents) {
+        var ackSeq: Long? = null
+        synchronized(lock) {
+            val f = feeds[msg.feedId] ?: return
+            if (f.epoch != msg.feedEpoch) {
+                // A different epoch is a different log: its seqs are not comparable with the old cursor.
+                f.epoch = msg.feedEpoch
+                f.lastSeq = null
+            }
+            val floor = f.lastSeq
+            val fresh = if (floor == null) msg.ops else msg.ops.filter { it.seq > floor }
+            if (fresh.isNotEmpty()) {
+                f.lastSeq = fresh.maxOf { it.seq }
+                f.batches.trySend(ChangeFeedBatch(msg.feedEpoch, fresh, msg.head))
+            } else {
+                if (msg.ops.isNotEmpty()) ackSeq = msg.ops.maxOf { it.seq }
+                // Confirmation frame of a live-tail subscribe: pin the cursor so a reconnect resumes here.
+                if (msg.ops.isEmpty() && f.lastSeq == null) f.lastSeq = msg.head
+            }
+        }
+        // Fully duplicate frames never reach the collector, so release the server's window here.
+        ackSeq?.let { s -> runCatching { send(ClientMessage.FeedAck(msg.feedId, s)) } }
     }
 
     private fun reply(corr: String, msg: ServerMessage) {
@@ -291,6 +334,41 @@ class RtDbWsClient(
             } finally {
                 synchronized(lock) { subs.remove(id) }
                 withContext(NonCancellable) { runCatching { send(ClientMessage.Unsubscribe(id)) } }
+            }
+        }
+
+    // ---- change feed ---------------------------------------------------------------------
+
+    /**
+     * Streams the durable change feed on collect (`feedSubscribe`). [since] = null starts at the
+     * current head, otherwise ops with `seq > since` are streamed; [feedEpoch] (the HTTP feed's
+     * `logId`) guards the resume. The client remembers the last delivered `(feedEpoch, seq)`, resumes
+     * from it on every reconnect, drops already-seen ops and acks each emitted batch. A `feedErr`
+     * ends the flow with an [RtDbException] (`CURSOR_EXPIRED` means: resync over the HTTP changes path)
+     * and is never retried. Cancelling collection sends `feedUnsubscribe`. Delivery is at-least-once
+     * across epochs; dedupe key is `(feedEpoch, seq)`.
+     */
+    fun watchChanges(tables: List<String> = emptyList(), since: Long? = null, feedEpoch: String? = null): Flow<ChangeFeedBatch> =
+        flow {
+            val id = newCorrelationId()
+            val feed = Feed(id, tables.toList(), feedEpoch, since, Channel(Channel.UNLIMITED))
+            synchronized(lock) {
+                check(!closed) { "client is closed" }
+                feeds[id] = feed
+            }
+            try {
+                try {
+                    send(ClientMessage.FeedSubscribe(id, since, feedEpoch, feed.tables))
+                } catch (e: WsClosedException) {
+                    if (synchronized(lock) { closed }) throw e
+                }
+                for (b in feed.batches) {
+                    emit(b)
+                    runCatching { send(ClientMessage.FeedAck(id, b.ops.maxOf { it.seq })) }
+                }
+            } finally {
+                val live = synchronized(lock) { feeds.remove(id) != null }
+                if (live) withContext(NonCancellable) { runCatching { send(ClientMessage.FeedUnsubscribe(id)) } }
             }
         }
 

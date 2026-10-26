@@ -254,7 +254,7 @@ compression.
 | `GET /healthz` | none | Liveness: `{status:"ok"\|"degraded", started_at, uptime_seconds, postgres}`. 503 when Postgres is unreachable. The build fingerprint fields (`version`, `git_commit`, `build_timestamp`) are admin-only — included just when the request carries a valid admin bearer (SEC-129). |
 | `GET /privacy` | none | par-rt-db's own privacy policy as static HTML (compile-time-embedded from `server/src/static/privacy.html`), so an OAuth consent screen's required privacy URL can point at the deployment itself. Public and stateless; works in API-only mode. |
 | `GET /metrics` | none | Prometheus text-exposition scrape endpoint. Content-negotiated on `Accept`: a browser (`text/html`) is served the SPA's `index.html` when `RTDB_STATIC_DIR` is set; everything else (Prometheus sends `application/openmetrics-text`, curl, API-only deploys) gets Prometheus text. Aggregate-only (no per-db, no principal data), same posture as `/healthz`. The admin JSON snapshot stays at `GET /admin/metrics`. |
-| `GET /sync` | first WS frame | WebSocket upgrade. Speaks the realtime protocol (auth, subscribe, mutate, schedule, ping). |
+| `GET /sync` | first WS frame | WebSocket upgrade. Speaks the realtime protocol (auth, subscribe, mutate, schedule, presence, change-feed push, ping). |
 | `POST /api/query` | Bearer token | One-shot query against a database; see [Query shape](#query-shape). |
 | `POST /api/query-batch` | Bearer token | Fans out N queries in one round trip (per-query error isolation); each slot returns `{ok, result}` or `{ok:false, error}`. |
 | `POST /api/mutate` | Bearer token | One-shot transaction (`insert`/`patch`/`replace`/`delete`/`undelete`/`expectVersion`/`expectFields`/`expectAbsent`/`expectNoMatch`/`expectBefore`/`upsert`/`adjustCounter` + bulk `insertMany`/`upsertMany` + `patchByQuery`/`deleteByQuery` + `schedule`/`cancelSchedule` + `startWorkflow`/`cancelWorkflow` steps). |
@@ -1321,6 +1321,64 @@ The consumer contract:
 All five client SDKs expose the feed (`listChanges` in TS, `changes()` in
 Rust/Python/Swift/Go) and the admin twin (`adminChanges` in TS/Swift,
 `admin_changes` in Rust/Python, `AdminChanges` in Go).
+
+### Pushed change feed over WebSocket
+
+A machine-token consumer that already holds a `/sync` socket can receive the
+same durable feed as pushed frames instead of polling. The channel reads the
+durable `changes` log directly (the identical rows `GET /api/db/{db}/changes`
+serves), so a resume cursor is honored across reconnects and server restarts.
+
+```jsonc
+// -> open (or resume) a feed. since = last PROCESSED seq; omitted = current head.
+{"type": "feedSubscribe", "feedId": "f1", "since": 41,
+ "feedEpoch": "0a1b2c3d4e5f6071", "tables": ["tasks"]}
+
+// <- one frame per batch (oldest first). The first frame always arrives, with
+//    zero ops if nothing is pending, to confirm the feed and carry feedEpoch/head.
+{"type": "feedEvents", "feedId": "f1", "feedEpoch": "0a1b2c3d4e5f6071",
+ "ops": [{"seq": 42, "table": "tasks", "docId": "d42", "kind": "patch",
+          "doc": {"title": "Buy milk"}, "ts": 1758300000001}],
+ "head": 57}
+
+// -> flow control: everything with seq <= 42 is processed
+{"type": "feedAck", "feedId": "f1", "seq": 42}
+
+// <- terminal failure for this feed (the socket stays open)
+{"type": "feedErr", "feedId": "f1",
+ "error": {"code": "CURSOR_EXPIRED", "message": "cursor 3 predates the retention window ..."}}
+
+// -> {"type": "feedUnsubscribe", "feedId": "f1"}
+```
+
+- **At-least-once, dedupable.** A consumer that reconnects with its last
+  *processed* seq receives exactly the ops after it, so ops it received but
+  never processed are redelivered. `(feedEpoch, op.seq)` is the stable identity:
+  `feedEpoch` is the log's `logId`. The SDKs drop already-seen seqs for you.
+- **Server-side table filter.** `tables` (omitted when empty = all) is applied
+  in the log query, so non-matching ops are never sent. It is intersected with
+  the token's table allowlist; a request naming only tables the token cannot
+  see yields no ops, never a widened feed.
+- **Replay bounds.** Replay is bounded by the change log's retention window
+  (`RTDB_CHANGE_LOG_MAX_ROWS`, default 100 000), not by the in-memory op-feed
+  ring. A cursor older than the window, ahead of the log, or paired with a
+  `feedEpoch` that does not match (database recreated) answers `feedErr` with
+  `CURSOR_EXPIRED` (the code the HTTP feed uses as `410`). Resync over
+  `GET /api/db/{db}/changes?since=0`, then open a new feed from its `nextSeq`.
+- **Backpressure.** The server keeps at most 2 000 unacknowledged ops in
+  flight per feed and pauses until a `feedAck` arrives.
+- **Authorization.** Machine tokens only (a user or admin session gets
+  `FORBIDDEN`), re-checked per batch so revocation stops the stream; the
+  per-token RPM bucket is charged once per `feedSubscribe`. Host-capability
+  tokens cannot open feeds, matching the HTTP route.
+- **Read side only.** No new write path; the committer is untouched.
+
+Client APIs: TS `subscribeChanges()` / `changes()` (async iterable), Rust
+`watch_changes()` (`ChangeFeed::next`), Python `watch_changes()` (async
+iterator), Swift `watchChanges()` (`AsyncThrowingStream`), Go `WatchChanges()`
+(channel), Kotlin `watchChanges()` (`Flow`). Each re-sends `feedSubscribe` with
+its last delivered `(feedEpoch, seq)` on reconnect, acks each batch, and treats
+`feedErr` as terminal (no auto-retry).
 
 ## Append-only tables (`insertOnly`)
 

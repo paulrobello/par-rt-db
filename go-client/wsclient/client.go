@@ -57,6 +57,10 @@ type Client struct {
 	presenceJoins map[string]wire.JSONValue
 	presenceFolds map[string]*presenceFold
 
+	// live change-feed handles by feed id; replayed on reconnect.
+	feedsMu sync.Mutex
+	feeds   map[string]*Feed
+
 	wg sync.WaitGroup
 }
 
@@ -305,6 +309,7 @@ func (c *Client) ensureConnected(ctx context.Context) error {
 	for _, s := range live {
 		s.resubscribe(ctx, tr)
 	}
+	c.replayFeeds(ctx, tr)
 	return nil
 }
 
@@ -337,6 +342,7 @@ func (c *Client) dispatch(ctx context.Context, msg wire.ServerMessage) {
 		hook(msg)
 	}
 	c.routeReply(msg)
+	c.routeFeed(msg)
 	switch m := msg.(type) {
 	case wire.ServerQueryUpdate:
 		c.subsMu.Lock()
@@ -391,6 +397,7 @@ func (c *Client) Close() error {
 	if tr != nil {
 		_ = tr.Close()
 	}
+	c.failFeeds()
 	c.wg.Wait()
 	return nil
 }

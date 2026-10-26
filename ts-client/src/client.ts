@@ -5,6 +5,7 @@ import { parseStepResults, type StepResult } from "./mutation.js";
 import { projectOptimisticUpdate } from "./optimistic.js";
 import type {
   AuthedUser,
+  ChangeOp,
   ClientMessage,
   PresenceMember,
   QueryJson,
@@ -250,6 +251,33 @@ function httpToWs(url: string): string {
   return url.replace(/^http/, "ws").replace(/\/+$/, "");
 }
 
+/** Options for {@link RtDbClient.subscribeChanges}. */
+export interface SubscribeChangesOptions {
+  /** Restrict the feed to these tables (omitted/empty = all tables). */
+  tables?: string[];
+  /** Resume cursor: deliver ops with `seq > since`. Omitted = start at the current head. */
+  since?: number;
+  /** Epoch (`logId`) the `since` cursor was taken from; a mismatch yields `CURSOR_EXPIRED`. */
+  feedEpoch?: string;
+}
+
+/** Per-batch metadata passed to a {@link RtDbClient.subscribeChanges} callback. */
+export interface ChangeBatchMeta {
+  /** Epoch of the log the ops belong to (same value as the HTTP feed's `logId`). */
+  feedEpoch: string;
+  /** The log head at send time. */
+  head: number;
+}
+
+interface ChangeFeedSub {
+  feedId: string;
+  tables: string[];
+  since: number | undefined;
+  feedEpoch: string | undefined;
+  onBatch: (ops: ChangeOp[], meta: ChangeBatchMeta) => void;
+  onError: ((err: RtDbError) => void) | undefined;
+}
+
 /** Reactive WebSocket client: one connection, serialized subscriptions, correlated mutations. */
 export class RtDbClient {
   private readonly options: RtDbClientOptions;
@@ -309,6 +337,9 @@ export class RtDbClient {
     string,
     { members: PresenceMember[]; lastSeq: number | null }
   >();
+  /** Active change-feed subscriptions by feedId. `since`/`feedEpoch` advance as
+   * batches are processed, so a reconnect resumes from the last processed seq. */
+  private readonly changeFeeds = new Map<string, ChangeFeedSub>();
   /** mutId → subscriptions whose last result this mutation optimistically overlaid. */
   private readonly optimisticOverlays = new Map<string, Set<Subscription>>();
   private readonly optimistic: boolean;
@@ -830,6 +861,151 @@ export class RtDbClient {
     }
   }
 
+  // ---- change feed ----------------------------------------------------------
+
+  /**
+   * Subscribes to the per-db change feed over the WebSocket. `onBatch` receives
+   * ops in `seq` order, deduplicated by `(feedEpoch, seq)` (delivery is
+   * at-least-once, so replays after a reconnect are dropped), then the client
+   * acks the batch. The first frame after subscribing may carry no ops; it is
+   * not delivered. On every (re)connect the feed re-subscribes from the last
+   * processed seq. A `feedErr` (e.g. `CURSOR_EXPIRED`, meaning resync over the
+   * HTTP changes path) is passed to `onError` as an {@link RtDbError} and the
+   * feed is torn down with no automatic retry. Returns an unsubscribe.
+   */
+  subscribeChanges(
+    opts: SubscribeChangesOptions,
+    onBatch: (ops: ChangeOp[], meta: ChangeBatchMeta) => void,
+    onError?: (err: RtDbError) => void,
+  ): () => void {
+    const feedId = `feed-${++this.counter}`;
+    const sub: ChangeFeedSub = {
+      feedId,
+      tables: opts.tables ? [...opts.tables] : [],
+      since: opts.since,
+      feedEpoch: opts.feedEpoch,
+      onBatch,
+      onError,
+    };
+    this.changeFeeds.set(feedId, sub);
+    if (this.authState === "authenticated") {
+      this.sendFeedSubscribe(sub);
+    }
+    return () => {
+      if (this.changeFeeds.delete(feedId) && this.authState === "authenticated") {
+        this.send({ type: "feedUnsubscribe", feedId });
+      }
+    };
+  }
+
+  /**
+   * Async-iterable wrapper over {@link subscribeChanges}: yields each delivered
+   * batch. A `feedErr` rejects the pending/next `next()`; `return()` (or
+   * breaking out of `for await`) unsubscribes.
+   */
+  changes(opts: SubscribeChangesOptions = {}): AsyncIterableIterator<{
+    ops: ChangeOp[];
+    meta: ChangeBatchMeta;
+  }> {
+    type Item = { ops: ChangeOp[]; meta: ChangeBatchMeta };
+    const queue: Item[] = [];
+    let failure: RtDbError | null = null;
+    let done = false;
+    let wake: (() => void) | null = null;
+    const notify = () => {
+      const w = wake;
+      wake = null;
+      w?.();
+    };
+    const unsubscribe = this.subscribeChanges(
+      opts,
+      (ops, meta) => {
+        queue.push({ ops, meta });
+        notify();
+      },
+      (err) => {
+        failure = err;
+        notify();
+      },
+    );
+    const it: AsyncIterableIterator<Item> = {
+      [Symbol.asyncIterator]: () => it,
+      next: async () => {
+        for (;;) {
+          const item = queue.shift();
+          if (item) {
+            return { value: item, done: false };
+          }
+          if (failure) {
+            const err = failure;
+            failure = null;
+            done = true;
+            throw err;
+          }
+          if (done) {
+            return { value: undefined, done: true };
+          }
+          await new Promise<void>((resolve) => {
+            wake = resolve;
+          });
+        }
+      },
+      return: async () => {
+        done = true;
+        unsubscribe();
+        notify();
+        return { value: undefined, done: true };
+      },
+    };
+    return it;
+  }
+
+  private sendFeedSubscribe(sub: ChangeFeedSub): void {
+    const frame: ClientMessage = { type: "feedSubscribe", feedId: sub.feedId };
+    if (sub.since !== undefined) {
+      frame.since = sub.since;
+    }
+    if (sub.feedEpoch !== undefined) {
+      frame.feedEpoch = sub.feedEpoch;
+    }
+    if (sub.tables.length > 0) {
+      frame.tables = sub.tables;
+    }
+    this.send(frame);
+  }
+
+  private onFeedFrame(msg: Extract<ServerMessage, { type: "feedEvents" | "feedErr" }>): void {
+    const sub = this.changeFeeds.get(msg.feedId);
+    if (!sub) {
+      return;
+    }
+    if (msg.type === "feedErr") {
+      this.changeFeeds.delete(msg.feedId);
+      sub.onError?.(RtDbError.fromEnvelope(msg.error));
+      return;
+    }
+    // An epoch change means the log was recreated: seqs restart, so the old
+    // cursor no longer applies to this stream.
+    const sameEpoch = sub.feedEpoch === undefined || sub.feedEpoch === msg.feedEpoch;
+    const lastSeq = sameEpoch ? (sub.since ?? Number.NEGATIVE_INFINITY) : Number.NEGATIVE_INFINITY;
+    const fresh = msg.ops.filter((op) => op.seq > lastSeq);
+    sub.feedEpoch = msg.feedEpoch;
+    if (sub.since === undefined && msg.ops.length === 0) {
+      // Started at the head: pin the cursor so a reconnect resumes from here
+      // instead of skipping whatever committed while disconnected.
+      sub.since = msg.head;
+    }
+    if (fresh.length > 0) {
+      sub.onBatch(fresh, { feedEpoch: msg.feedEpoch, head: msg.head });
+      sub.since = Math.max(...fresh.map((o) => o.seq));
+    }
+    if (msg.ops.length > 0 && this.changeFeeds.get(msg.feedId) === sub) {
+      // Ack even a fully-deduped batch so the server's flow-control window advances.
+      const ackSeq = Math.max(...msg.ops.map((o) => o.seq));
+      this.send({ type: "feedAck", feedId: msg.feedId, seq: ackSeq });
+    }
+  }
+
   /** Mints a `sch-${n}` correlation id and either dispatches (when authenticated)
    * or queues the request for the next `authOk`, exactly like `mutate`. */
   private queueSchedule<T>(msg: ScheduleMsg): Promise<T> {
@@ -1131,6 +1307,10 @@ export class RtDbClient {
       case "presenceErr":
         this.onPresence(msg);
         break;
+      case "feedEvents":
+      case "feedErr":
+        this.onFeedFrame(msg);
+        break;
       case "pong":
         this.lastPongAt = this.now();
         break;
@@ -1346,6 +1526,9 @@ export class RtDbClient {
   private flushOnAuth(): void {
     for (const sub of this.subsByKey.values()) {
       this.send({ type: "subscribe", queryId: sub.queryId, query: sub.query });
+    }
+    for (const feed of this.changeFeeds.values()) {
+      this.sendFeedSubscribe(feed);
     }
     // Replay buffered presence joins, mirroring subscription replay above.
     for (const [room, state] of this.joinedRooms) {

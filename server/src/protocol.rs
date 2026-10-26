@@ -143,6 +143,29 @@ pub enum ClientMessage {
     LeavePresence {
         room: String,
     },
+    /// Opens a push channel over the durable change feed. `since` is the last
+    /// seq the consumer processed (the server streams strictly after it);
+    /// omitted = start at the current head. `feedEpoch` is the `feedEpoch` a
+    /// previous session saw: a mismatch (database dropped and recreated)
+    /// answers `CURSOR_EXPIRED`. `tables` filters server-side (empty = all).
+    FeedSubscribe {
+        feed_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feed_epoch: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tables: Vec<String>,
+    },
+    /// Flow-control acknowledgement: every op with `seq <= seq` is processed.
+    /// The server keeps at most a few unacked batches in flight.
+    FeedAck {
+        feed_id: String,
+        seq: i64,
+    },
+    FeedUnsubscribe {
+        feed_id: String,
+    },
     Ping,
 }
 
@@ -262,6 +285,22 @@ pub enum ServerMessage {
     },
     PresenceErr {
         room: String,
+        error: RtDbError,
+    },
+    /// One batch of durable change ops for a feed (oldest first, at-least-once).
+    /// `feedEpoch` is the change log's identity (`logId`): dedupe on
+    /// `(feedEpoch, op.seq)`. The first frame after `feedSubscribe` always
+    /// arrives (possibly with no ops) to confirm the subscription and carry
+    /// the epoch and head.
+    FeedEvents {
+        feed_id: String,
+        feed_epoch: String,
+        ops: Vec<crate::change_log::ChangeRow>,
+        head: i64,
+    },
+    /// Terminal for the feed: `CURSOR_EXPIRED` means resync over HTTP.
+    FeedErr {
+        feed_id: String,
         error: RtDbError,
     },
     Pong,

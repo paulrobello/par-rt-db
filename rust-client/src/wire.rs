@@ -168,6 +168,35 @@ pub enum ClientMessage {
         /// Room to leave.
         room: String,
     },
+    /// Open a push channel over the durable change feed. `since` is the last
+    /// processed seq (omitted = start at the current head); `feed_epoch` is
+    /// the epoch a previous session saw (a mismatch answers
+    /// `CURSOR_EXPIRED`); `tables` filters server-side (empty = all).
+    FeedSubscribe {
+        /// Client-chosen feed id echoed on every reply frame.
+        feed_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Resume cursor.
+        since: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Epoch of the log the cursor belongs to.
+        feed_epoch: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        /// Server-side table filter.
+        tables: Vec<String>,
+    },
+    /// Flow-control acknowledgement: every op with `seq <= seq` is processed.
+    FeedAck {
+        /// Which feed.
+        feed_id: String,
+        /// Highest processed seq.
+        seq: i64,
+    },
+    /// Close a feed.
+    FeedUnsubscribe {
+        /// Which feed.
+        feed_id: String,
+    },
     /// Keepalive; the server replies `Pong`.
     Ping,
 }
@@ -325,6 +354,26 @@ pub enum ServerMessage {
     PresenceErr {
         /// Which room.
         room: String,
+        /// Why.
+        error: RtDbError,
+    },
+    /// One batch of durable change ops (oldest first, at-least-once). Dedupe
+    /// on `(feed_epoch, op.seq)`. The first frame after `FeedSubscribe` may
+    /// carry no ops (confirmation + head).
+    FeedEvents {
+        /// Which feed.
+        feed_id: String,
+        /// The change log's identity (`logId`).
+        feed_epoch: String,
+        /// The ops, oldest first.
+        ops: Vec<ChangeOp>,
+        /// The log's end when the batch was read.
+        head: i64,
+    },
+    /// Terminal feed failure; `CURSOR_EXPIRED` means resync over HTTP.
+    FeedErr {
+        /// Which feed.
+        feed_id: String,
         /// Why.
         error: RtDbError,
     },

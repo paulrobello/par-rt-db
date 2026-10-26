@@ -754,6 +754,18 @@ export type ClientMessage =
   | { type: "presence"; room: string; state?: unknown }
   | { type: "presenceState"; room: string; state: unknown; ttlMs?: number }
   | { type: "leavePresence"; room: string }
+  | {
+      type: "feedSubscribe";
+      feedId: string;
+      /** Stream ops with `seq > since`; omitted = start at the current head. */
+      since?: number;
+      /** The `feedEpoch` the cursor came from; a mismatch answers `CURSOR_EXPIRED`. */
+      feedEpoch?: string;
+      /** Table filter; omitted on the wire when empty (= all tables). */
+      tables?: string[];
+    }
+  | { type: "feedAck"; feedId: string; seq: number }
+  | { type: "feedUnsubscribe"; feedId: string }
   | { type: "ping" };
 
 /** Server -> client WS vocabulary. Tags/fields match server `protocol::ServerMessage`. */
@@ -786,6 +798,8 @@ export type ServerMessage =
       stateChanged?: PresenceMember[];
     }
   | { type: "presenceErr"; room: string; error: RtDbErrorEnvelope }
+  | { type: "feedEvents"; feedId: string; feedEpoch: string; ops: ChangeOp[]; head: number }
+  | { type: "feedErr"; feedId: string; error: RtDbErrorEnvelope }
   | { type: "pong" };
 
 /** Mirrors server `schema::FieldType` (tag `type`). */

@@ -57,6 +57,7 @@ pub mod value_expr;
 pub mod webhook;
 pub mod workflows;
 pub mod ws;
+pub mod ws_feed;
 
 use std::path::Path;
 use std::sync::atomic::AtomicBool;

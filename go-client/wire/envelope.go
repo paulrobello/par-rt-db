@@ -364,6 +364,48 @@ func (v *ClientPing) UnmarshalJSON(b []byte) error {
 	return err
 }
 
+// Mirrors server/src/protocol.rs::ClientMessage::FeedSubscribe — Since is
+// a pointer so 0 is distinguishable from absent (absent = start at head);
+// Tables is omitted when empty.
+type ClientFeedSubscribe struct {
+	FeedID    string   `json:"feedId"`
+	Since     *int64   `json:"since,omitempty"`
+	FeedEpoch *string  `json:"feedEpoch,omitempty"`
+	Tables    []string `json:"tables,omitempty"`
+}
+
+func (ClientFeedSubscribe) isClientMessage() {}
+
+func (v ClientFeedSubscribe) MarshalJSON() ([]byte, error) {
+	type alias ClientFeedSubscribe
+	return MarshalTagged("type", "feedSubscribe", alias(v))
+}
+
+// Mirrors server/src/protocol.rs::ClientMessage::FeedAck
+type ClientFeedAck struct {
+	FeedID string `json:"feedId"`
+	Seq    int64  `json:"seq"`
+}
+
+func (ClientFeedAck) isClientMessage() {}
+
+func (v ClientFeedAck) MarshalJSON() ([]byte, error) {
+	type alias ClientFeedAck
+	return MarshalTagged("type", "feedAck", alias(v))
+}
+
+// Mirrors server/src/protocol.rs::ClientMessage::FeedUnsubscribe
+type ClientFeedUnsubscribe struct {
+	FeedID string `json:"feedId"`
+}
+
+func (ClientFeedUnsubscribe) isClientMessage() {}
+
+func (v ClientFeedUnsubscribe) MarshalJSON() ([]byte, error) {
+	type alias ClientFeedUnsubscribe
+	return MarshalTagged("type", "feedUnsubscribe", alias(v))
+}
+
 // UnmarshalClientMessage routes a WS frame to its client variant.
 func UnmarshalClientMessage(data []byte) (ClientMessage, error) {
 	tag, err := PeekTag(data, "type")
@@ -403,6 +445,12 @@ func UnmarshalClientMessage(data []byte) (ClientMessage, error) {
 		return DecodeTagged[ClientPresenceState](data, "type")
 	case "leavePresence":
 		return DecodeTagged[ClientLeavePresence](data, "type")
+	case "feedSubscribe":
+		return DecodeTagged[ClientFeedSubscribe](data, "type")
+	case "feedAck":
+		return DecodeTagged[ClientFeedAck](data, "type")
+	case "feedUnsubscribe":
+		return DecodeTagged[ClientFeedUnsubscribe](data, "type")
 	case "ping":
 		return DecodeTagged[ClientPing](data, "type")
 	default:
@@ -694,6 +742,52 @@ func (v ServerPresenceErr) MarshalJSON() ([]byte, error) {
 	return MarshalTagged("type", "presenceErr", alias(v))
 }
 
+// Mirrors server/src/protocol.rs::ServerMessage::FeedEvents — ops is always
+// present on the wire (empty on the confirming first frame).
+type ServerFeedEvents struct {
+	FeedID    string     `json:"feedId"`
+	FeedEpoch string     `json:"feedEpoch"`
+	Ops       []ChangeOp `json:"ops"`
+	Head      int64      `json:"head"`
+}
+
+func (ServerFeedEvents) isServerMessage() {}
+
+func (v ServerFeedEvents) MarshalJSON() ([]byte, error) {
+	type alias ServerFeedEvents
+	if v.Ops == nil {
+		v.Ops = []ChangeOp{}
+	}
+	return MarshalTagged("type", "feedEvents", alias(v))
+}
+
+func (v *ServerFeedEvents) UnmarshalJSON(b []byte) error {
+	type alias ServerFeedEvents
+	r, err := StrictUnmarshal[alias](b)
+	if err != nil {
+		return err
+	}
+	if r.Ops == nil {
+		r.Ops = []ChangeOp{}
+	}
+	*v = ServerFeedEvents(r)
+	return nil
+}
+
+// Mirrors server/src/protocol.rs::ServerMessage::FeedErr — terminal for the
+// feed; CURSOR_EXPIRED means resync over the HTTP changes path.
+type ServerFeedErr struct {
+	FeedID string        `json:"feedId"`
+	Error  ErrorEnvelope `json:"error"`
+}
+
+func (ServerFeedErr) isServerMessage() {}
+
+func (v ServerFeedErr) MarshalJSON() ([]byte, error) {
+	type alias ServerFeedErr
+	return MarshalTagged("type", "feedErr", alias(v))
+}
+
 // Mirrors server/src/protocol.rs::ServerMessage::Pong — unit variant.
 type ServerPong struct{}
 
@@ -749,6 +843,10 @@ func UnmarshalServerMessage(data []byte) (ServerMessage, error) {
 		return DecodeTagged[ServerPresenceDelta](data, "type")
 	case "presenceErr":
 		return DecodeTagged[ServerPresenceErr](data, "type")
+	case "feedEvents":
+		return DecodeTagged[ServerFeedEvents](data, "type")
+	case "feedErr":
+		return DecodeTagged[ServerFeedErr](data, "type")
 	case "pong":
 		return DecodeTagged[ServerPong](data, "type")
 	default:

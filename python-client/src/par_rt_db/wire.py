@@ -922,6 +922,41 @@ class _ClientLeavePresence(_Camel):
     room: str
 
 
+class _ClientFeedSubscribe(_Camel):
+    """Open (or resume) a change-feed push channel. ``since``, ``feedEpoch``
+    and ``tables`` are omitted on the wire when ``None``/empty (mirrors the
+    server's ``skip_serializing_if``)."""
+
+    type: Literal["feedSubscribe"] = "feedSubscribe"
+    feed_id: str
+    since: int | None = None
+    feed_epoch: str | None = None
+    tables: list[str] = []
+
+    @model_serializer(mode="wrap")
+    def _drop_defaults(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        for alias in ("since", "feedEpoch"):
+            if out.get(alias) is None:
+                out.pop(alias, None)
+        if out.get("tables") == []:
+            out.pop("tables", None)
+        return out
+
+
+class _ClientFeedAck(_Camel):
+    """Acknowledge every op with ``seq <= seq`` on feed ``feed_id``."""
+
+    type: Literal["feedAck"] = "feedAck"
+    feed_id: str
+    seq: int
+
+
+class _ClientFeedUnsubscribe(_Camel):
+    type: Literal["feedUnsubscribe"] = "feedUnsubscribe"
+    feed_id: str
+
+
 ClientMessage = Annotated[
     (
         _ClientAuth
@@ -940,6 +975,9 @@ ClientMessage = Annotated[
         | _ClientPresence
         | _ClientPresenceState
         | _ClientLeavePresence
+        | _ClientFeedSubscribe
+        | _ClientFeedAck
+        | _ClientFeedUnsubscribe
         | _ClientPing
     ),
     Field(discriminator="type"),
@@ -1225,6 +1263,26 @@ class _ServerPresenceErr(_Camel):
     error: _ErrorEnvelope
 
 
+class _ServerFeedEvents(_Camel):
+    """A page of change-feed ops (server→client). The first frame after a
+    ``feedSubscribe`` always arrives, possibly with empty ``ops``. Dedupe key
+    is ``(feed_epoch, op.seq)``."""
+
+    type: Literal["feedEvents"] = "feedEvents"
+    feed_id: str
+    feed_epoch: str
+    ops: list[ChangeOp]
+    head: int
+
+
+class _ServerFeedErr(_Camel):
+    """Terminal error for one feed (``CURSOR_EXPIRED`` means resync over HTTP)."""
+
+    type: Literal["feedErr"] = "feedErr"
+    feed_id: str
+    error: _ErrorEnvelope
+
+
 class _ServerPong(_Camel):
     type: Literal["pong"] = "pong"
 
@@ -1248,6 +1306,8 @@ ServerMessage = Annotated[
         | _ServerPresenceSnapshot
         | _ServerPresenceDelta
         | _ServerPresenceErr
+        | _ServerFeedEvents
+        | _ServerFeedErr
         | _ServerPong
     ),
     Field(discriminator="type"),

@@ -370,6 +370,29 @@
       "room": "doc:1"
     },
     {
+      "type": "feedSubscribe",
+      "feedId": "f1"
+    },
+    {
+      "type": "feedSubscribe",
+      "feedId": "f2",
+      "since": 41,
+      "feedEpoch": "0a1b2c3d4e5f6071",
+      "tables": [
+        "tasks",
+        "projects"
+      ]
+    },
+    {
+      "type": "feedAck",
+      "feedId": "f2",
+      "seq": 42
+    },
+    {
+      "type": "feedUnsubscribe",
+      "feedId": "f2"
+    },
+    {
       "type": "ping"
     },
     {
@@ -1042,6 +1065,47 @@
       "error": {
         "code": "FORBIDDEN",
         "message": "presence not enabled"
+      }
+    },
+    {
+      "type": "feedEvents",
+      "feedId": "f2",
+      "feedEpoch": "0a1b2c3d4e5f6071",
+      "ops": [
+        {
+          "seq": 42,
+          "table": "tasks",
+          "docId": "d42",
+          "kind": "patch",
+          "doc": {
+            "title": "Buy milk"
+          },
+          "ts": 1758300000001
+        },
+        {
+          "seq": 43,
+          "table": "tasks",
+          "docId": "d43",
+          "kind": "delete",
+          "doc": null,
+          "ts": 1758300000002
+        }
+      ],
+      "head": 57
+    },
+    {
+      "type": "feedEvents",
+      "feedId": "f1",
+      "feedEpoch": "0a1b2c3d4e5f6071",
+      "ops": [],
+      "head": 0
+    },
+    {
+      "type": "feedErr",
+      "feedId": "f2",
+      "error": {
+        "code": "CURSOR_EXPIRED",
+        "message": "cursor 3 predates the retention window (oldest retained seq 10) - resync from 0"
       }
     },
     {

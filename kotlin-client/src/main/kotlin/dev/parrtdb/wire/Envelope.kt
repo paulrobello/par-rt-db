@@ -373,6 +373,30 @@ sealed interface ClientMessage {
         override fun toJson() = jsonObj("type" to jsonStr("leavePresence"), "room" to jsonStr(room))
     }
 
+    data class FeedSubscribe(
+        val feedId: String,
+        val since: Long? = null,
+        val feedEpoch: String? = null,
+        val tables: List<String> = emptyList(),
+    ) : ClientMessage {
+        override fun toJson() =
+            jsonObj(
+                "type" to jsonStr("feedSubscribe"),
+                "feedId" to jsonStr(feedId),
+                "since" to since?.let { jsonNum(it) },
+                "feedEpoch" to feedEpoch?.let { jsonStr(it) },
+                "tables" to tables.takeIf { it.isNotEmpty() }?.let { jsonStrArr(it) },
+            )
+    }
+
+    data class FeedAck(val feedId: String, val seq: Long) : ClientMessage {
+        override fun toJson() = jsonObj("type" to jsonStr("feedAck"), "feedId" to jsonStr(feedId), "seq" to jsonNum(seq))
+    }
+
+    data class FeedUnsubscribe(val feedId: String) : ClientMessage {
+        override fun toJson() = jsonObj("type" to jsonStr("feedUnsubscribe"), "feedId" to jsonStr(feedId))
+    }
+
     data object Ping : ClientMessage {
         override fun toJson() = jsonObj("type" to jsonStr("ping"))
     }
@@ -400,6 +424,9 @@ sealed interface ClientMessage {
                     "presence" -> Presence(o.str("room"), o.opt("state"))
                     "presenceState" -> PresenceState(o.str("room"), o.req("state"), o.optLong("ttlMs"))
                     "leavePresence" -> LeavePresence(o.str("room"))
+                    "feedSubscribe" -> FeedSubscribe(o.str("feedId"), o.optLong("since"), o.optStr("feedEpoch"), o.optStrList("tables") ?: emptyList())
+                    "feedAck" -> FeedAck(o.str("feedId"), o.long("seq"))
+                    "feedUnsubscribe" -> FeedUnsubscribe(o.str("feedId"))
                     "ping" -> Ping
                     else -> wireFail("unknown client tag `$tag`")
                 }
@@ -499,6 +526,21 @@ sealed interface ServerMessage {
         override fun toJson() = jsonObj("type" to jsonStr("presenceErr"), "room" to jsonStr(room), "error" to error.toJson())
     }
 
+    data class FeedEvents(val feedId: String, val feedEpoch: String, val ops: List<ChangeOp>, val head: Long) : ServerMessage {
+        override fun toJson() =
+            jsonObj(
+                "type" to jsonStr("feedEvents"),
+                "feedId" to jsonStr(feedId),
+                "feedEpoch" to jsonStr(feedEpoch),
+                "ops" to jsonArr(ops.map { it.toJson() }),
+                "head" to jsonNum(head),
+            )
+    }
+
+    data class FeedErr(val feedId: String, val error: ErrorEnvelope) : ServerMessage {
+        override fun toJson() = jsonObj("type" to jsonStr("feedErr"), "feedId" to jsonStr(feedId), "error" to error.toJson())
+    }
+
     data object Pong : ServerMessage {
         override fun toJson() = jsonObj("type" to jsonStr("pong"))
     }
@@ -533,6 +575,8 @@ sealed interface ServerMessage {
                             o.optArr("stateChanged")?.map { PresenceMember.fromJson(it) } ?: emptyList(),
                         )
                     "presenceErr" -> PresenceErr(o.str("room"), ErrorEnvelope.fromJson(o.req("error")))
+                    "feedEvents" -> FeedEvents(o.str("feedId"), o.str("feedEpoch"), o.arr("ops").map { ChangeOp.fromJson(it) }, o.long("head"))
+                    "feedErr" -> FeedErr(o.str("feedId"), ErrorEnvelope.fromJson(o.req("error")))
                     "pong" -> Pong
                     else -> wireFail("unknown server tag `$tag`")
                 }

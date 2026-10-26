@@ -18,7 +18,11 @@ implementations honest against each other. Three artifacts live here:
   queries that every wire implementation must encode/decode value-identically —
   and the same unknown fields must be rejected. Run by the server and all six
   clients (ts/rust/python/swift/go/kotlin), so a drifted wire type fails whichever
-  package drifted.
+  package drifted. The WS change-feed frames (`feedSubscribe`/`feedAck`/
+  `feedUnsubscribe`, `feedEvents`/`feedErr`) live in `client_messages` and
+  `server_messages`; the feed's streamed resume/filter behavior is pinned by
+  server integration tests rather than `semantics/` cases, which model
+  single-operation request/result scenarios.
 - [`error-codes.json`](error-codes.json) — the **error-code parity corpus**
   (ARC-017): the full `{code, httpStatus}` list for every `RtDbError` wire
   code, generated from `server/src/error.rs`'s `ErrorCode` enum. The

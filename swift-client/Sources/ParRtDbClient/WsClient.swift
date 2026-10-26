@@ -375,7 +375,7 @@ public actor RtDbClient {
     private let random: @Sendable () -> Double
 
     // Lifecycle state — only touched on the actor.
-    private var state: WsState = .idle
+    var state: WsState = .idle
     private var user: AuthedUser?
     /// Terminal flag: `close()` or a 4401/authErr. Nothing further, ever.
     private var terminal = false
@@ -384,7 +384,9 @@ public actor RtDbClient {
     /// guard against stale sessions (rust `generation`).
     private var generation = 0
     private var runLoopTask: Task<Void, Never>?
-    private var currentTransport: (any WebSocketTransport)?
+    var currentTransport: (any WebSocketTransport)?
+    /// Live change-feed channels by `feedId` (see ChangeFeed.swift).
+    var feedStates: [String: ChangeFeedState] = [:]
     /// Set when `connect()` pokes a loop that has not reached its park point
     /// yet — closes the lost-wakeup window (rust `wait_for_poke`).
     private var pendingPokes = 0
@@ -892,6 +894,7 @@ public actor RtDbClient {
             guard
                 await replaySubscriptions(on: transport),
                 await replayPresenceRooms(on: transport),
+                await replayFeeds(on: transport),
                 await flushQueuedOps(on: transport)
             else {
                 return .reconnect
@@ -1594,7 +1597,7 @@ public actor RtDbClient {
     /// shape's sinks, op replies to their pending calls by correlation id.
     /// Unknown ids (late or duplicate replies) are dropped, exactly like
     /// rust's `if let` guards.
-    private func route(_ message: ServerMessage) {
+    private func route(_ message: ServerMessage) async {
         switch message {
         case .queryUpdate, .subscribeErr:
             onQueryUpdate(message)
@@ -1608,6 +1611,10 @@ public actor RtDbClient {
             break // lifecycle-owned — the receive loop never dispatches these
         case .presenceSnapshot, .presenceDelta, .presenceErr:
             onPresence(message)
+        case let .feedEvents(feedId, epoch, ops, head):
+            await onFeedEvents(feedId: feedId, epoch: epoch, ops: ops, head: head)
+        case let .feedErr(feedId, error):
+            onFeedErr(feedId: feedId, error: error)
         }
     }
 
@@ -1932,6 +1939,7 @@ public actor RtDbClient {
         }
         presenceRooms.removeAll()
         presenceOrder.removeAll()
+        finishAllFeeds()
     }
 
     /// Test seam (Task 14): queued-but-unsent mutation count, so tests can
@@ -2011,7 +2019,7 @@ public actor RtDbClient {
         return UInt64(Double(raw) * (0.5 + random() * 0.5))
     }
 
-    private static func frame(_ message: ClientMessage) throws -> String {
+    static func frame(_ message: ClientMessage) throws -> String {
         let data = try JSONEncoder().encode(message)
         guard let text = String(data: data, encoding: .utf8) else {
             throw RtDbError(code: .internal, message: "encoded frame is not UTF-8")

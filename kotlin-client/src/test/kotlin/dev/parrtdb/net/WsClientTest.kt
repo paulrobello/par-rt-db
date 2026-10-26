@@ -232,4 +232,76 @@ class WsClientTest {
             c.close()
         }
     }
+
+    private fun op(seq: Long) = """{"seq":$seq,"table":"t","docId":"d$seq","kind":"insert","doc":{"n":$seq},"ts":1}"""
+
+    private fun events(fid: String, epoch: String, seqs: List<Long>, head: Long) =
+        """{"type":"feedEvents","feedId":"$fid","feedEpoch":"$epoch","ops":[${seqs.joinToString(",") { op(it) }}],"head":$head}"""
+
+    @Test
+    fun `watchChanges sends tables, acks batches and unsubscribes on cancel`() = run10 {
+        FakeWsServer().use { srv ->
+            val c = connected(srv)
+            c.connectAuthed(srv)
+            val got = async { c.watchChanges(tables = listOf("a", "b"), since = 5, feedEpoch = "e1").take(2).toList() }
+            val sub = obj(srv.next())
+            assertEquals("feedSubscribe", sub["type"]!!.jsonPrimitive.content)
+            assertEquals("5", sub["since"]!!.jsonPrimitive.content)
+            assertEquals("e1", sub["feedEpoch"]!!.jsonPrimitive.content)
+            assertEquals(2, (sub["tables"] as kotlinx.serialization.json.JsonArray).size)
+            val fid = sub["feedId"]!!.jsonPrimitive.content
+            srv.send(events(fid, "e1", listOf(6, 7), 7))
+            val ack = obj(srv.next())
+            assertEquals("feedAck", ack["type"]!!.jsonPrimitive.content)
+            assertEquals("7", ack["seq"]!!.jsonPrimitive.content)
+            srv.send(events(fid, "e1", listOf(8), 8))
+            val batches = got.await()
+            assertEquals(listOf(6L, 7L), batches[0].ops.map { it.seq })
+            assertEquals("feedUnsubscribe", type(srv.next()))
+            c.close()
+        }
+    }
+
+    @Test
+    fun `watchChanges omits tables when empty and resumes from last seq with dedupe after reconnect`() = run10 {
+        FakeWsServer().use { srv ->
+            val c = connected(srv, WsOptions(backoffBaseMs = 20, backoffMaxMs = 50, heartbeatMs = 100))
+            c.connectAuthed(srv)
+            val got = async { c.watchChanges().take(2).toList() }
+            val sub = obj(srv.next())
+            assertTrue("tables" !in sub && "since" !in sub && "feedEpoch" !in sub)
+            val fid = sub["feedId"]!!.jsonPrimitive.content
+            srv.send(events(fid, "e1", emptyList(), 10))
+            srv.send(events(fid, "e1", listOf(11, 12), 12))
+            assertEquals("feedAck", type(srv.next()))
+            srv.dropClient()
+            assertEquals("auth", type(srv.next()))
+            srv.send(AUTH_OK)
+            val re = obj(srv.next())
+            assertEquals("feedSubscribe", re["type"]!!.jsonPrimitive.content)
+            assertEquals(fid, re["feedId"]!!.jsonPrimitive.content)
+            assertEquals("12", re["since"]!!.jsonPrimitive.content)
+            assertEquals("e1", re["feedEpoch"]!!.jsonPrimitive.content)
+            // At-least-once redelivery: 12 is a duplicate and must be dropped.
+            srv.send(events(fid, "e1", listOf(12, 13), 13))
+            val batches = got.await()
+            assertEquals(listOf(11L, 12L), batches[0].ops.map { it.seq })
+            assertEquals(listOf(13L), batches[1].ops.map { it.seq })
+            c.close()
+        }
+    }
+
+    @Test
+    fun `watchChanges surfaces CURSOR_EXPIRED and does not retry`() = run10 {
+        FakeWsServer().use { srv ->
+            val c = connected(srv)
+            c.connectAuthed(srv)
+            val r = async { runCatching { c.watchChanges(since = 1).toList() } }
+            val fid = obj(srv.next())["feedId"]!!.jsonPrimitive.content
+            srv.send("""{"type":"feedErr","feedId":"$fid","error":{"code":"CURSOR_EXPIRED","message":"resync"}}""")
+            assertEquals(ErrorCode.CURSOR_EXPIRED, (r.await().exceptionOrNull() as RtDbException).code)
+            assertTrue(srv.received.poll(300, java.util.concurrent.TimeUnit.MILLISECONDS) == null, "no resubscribe or unsubscribe after feedErr")
+            c.close()
+        }
+    }
 }

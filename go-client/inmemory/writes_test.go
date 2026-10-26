@@ -700,3 +700,22 @@ func TestUpsertManyPatchesExistingAndInsertsNew(t *testing.T) {
 		t.Fatalf("want BAD_REQUEST, got %v", err)
 	}
 }
+
+func TestDefaultEngineMintsDistinctIDsInSameMillisecond(t *testing.T) {
+	// Default engine: constant 0.5 RNG. Pin the clock so both mints land in
+	// the same millisecond.
+	s := NewStore().WithClock(func() int64 { return 1_700_000_000_000 })
+	s.mu.Lock()
+	seen := map[string]bool{}
+	for i := 0; i < 1000; i++ {
+		id := s.newIDLocked()
+		if len(id) != 32 || id[12] != '7' {
+			t.Fatalf("id %q is not 32-char uuidv7-shaped", id)
+		}
+		if seen[id] {
+			t.Fatalf("duplicate id %q at mint %d", id, i)
+		}
+		seen[id] = true
+	}
+	s.mu.Unlock()
+}

@@ -30,6 +30,7 @@ use crate::rate_limit::{RateDecision, evaluate, evaluate_mutate};
 use crate::scheduler;
 use crate::subs::{ConnId, next_conn_id};
 use crate::workflows;
+use crate::ws_feed::{self, Feeds};
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -135,6 +136,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, headers: Hea
     };
     state.runtime.metrics.ws_connect();
 
+    let feeds = ws_feed::new_registry();
     let mut rate_limiter = ConnRateLimiter::new();
     let mut last_activity = Instant::now();
     let mut ping_timer = interval(PING_INTERVAL);
@@ -165,6 +167,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, headers: Hea
                             conn_id,
                             protocol_version,
                             out_tx: &out_tx,
+                            feeds: &feeds,
                         };
                         let should_close =
                             handle_text_frame(&mut socket, &fctx, &mut rate_limiter, &text).await;
@@ -196,6 +199,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, headers: Hea
         }
     }
 
+    ws_feed::shutdown(&feeds).await;
     state.realtime.subs.remove_conn(&db, conn_id).await;
     state.realtime.presence.remove_conn(&db, conn_id).await;
     state.runtime.metrics.ws_disconnect();
@@ -354,6 +358,7 @@ struct FrameCtx<'a> {
     /// to everything else (ARC-013 gate, protocol.rs).
     protocol_version: Option<u32>,
     out_tx: &'a UnboundedSender<ServerMessage>,
+    feeds: &'a Feeds,
 }
 
 /// Validates and dispatches one post-auth text frame. Returns whether the
@@ -438,6 +443,20 @@ async fn handle_text_frame(
         } => handle_mutate(fctx, mut_id, idempotency_key, txn).await,
         ClientMessage::Ping => {
             let _ = fctx.out_tx.send(ServerMessage::Pong);
+            false
+        }
+        ClientMessage::FeedSubscribe {
+            feed_id,
+            since,
+            feed_epoch,
+            tables,
+        } => handle_feed_subscribe(fctx, feed_id, since, feed_epoch, tables).await,
+        ClientMessage::FeedAck { feed_id, seq } => {
+            ws_feed::ack(fctx.feeds, &feed_id, seq).await;
+            false
+        }
+        ClientMessage::FeedUnsubscribe { feed_id } => {
+            ws_feed::unsubscribe(fctx.feeds, &feed_id).await;
             false
         }
         ClientMessage::Schedule {
@@ -640,6 +659,36 @@ async fn handle_subscribe(
             let _ = out_tx.send(ServerMessage::SubscribeErr { query_id, error });
         }
     }
+    false
+}
+
+/// `FeedSubscribe` arm: authorize and rate-limit like `Subscribe`, then hand
+/// the stream to [`ws_feed`].
+async fn handle_feed_subscribe(
+    fctx: &FrameCtx<'_>,
+    feed_id: String,
+    since: Option<i64>,
+    feed_epoch: Option<String>,
+    tables: Vec<String>,
+) -> bool {
+    let (state, principal, db) = (fctx.state, fctx.principal, fctx.db);
+    let gate = match authorize_op(&state.pool, principal, db).await {
+        Ok(_) => check_rate_limit(state, principal, db)
+            .await
+            .map_err(RtDbError::rate_limited),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = gate {
+        let _ = fctx.out_tx.send(ServerMessage::FeedErr { feed_id, error });
+        return false;
+    }
+    let req = ws_feed::Subscribe {
+        feed_id,
+        since,
+        feed_epoch,
+        tables,
+    };
+    ws_feed::subscribe(fctx.feeds, state, principal, db, fctx.out_tx, req).await;
     false
 }
 

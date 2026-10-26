@@ -50,7 +50,8 @@ type Store struct {
 	// (absent = never; the first stamp lazily initializes from the stored
 	// max). Persists across additive schema pushes.
 	autoIncrementCounters map[string]int64
-	idCounter             uint64
+	// idCounter is the monotonic suffix of minted ids (see newIDLocked).
+	idCounter uint64
 	// mutID -> cached results; the idempotency short-circuit.
 	idempotency map[string][]wire.StepResult
 	// readOnly is the per-database read-only freeze (server
@@ -129,11 +130,18 @@ func defaultNow() int64 {
 
 // newIDLocked mints a uuidv7-shaped id: 12 hex chars of the low 48 bits of
 // the epoch-millis timestamp, a constant 7 version nibble, then 19 random
-// hex chars — 32 chars total. Caller holds s.mu.
+// hex chars — 32 chars total. The last 6 of those are a per-store monotonic
+// counter (13 random + 6 counter), so ids minted in the same millisecond
+// never collide even under the constant default RNG or an injected constant
+// one. The counter wraps modulo 2^24: a repeat needs 16M mints within one
+// millisecond with an identical random prefix. Mirrors ts-client newId.
+// Caller holds s.mu.
 func (s *Store) newIDLocked() string {
 	ts := uint64(s.now()) & 0xFFFF_FFFF_FFFF
-	rand := s.randomHexLocked(19)
-	return fmt.Sprintf("%012x7%s", ts, rand)
+	rand := s.randomHexLocked(13)
+	n := s.idCounter % 0x1000000
+	s.idCounter++
+	return fmt.Sprintf("%012x7%s%06x", ts, rand, n)
 }
 
 // randomHexLocked draws count lowercase hex chars from the injected RNG.

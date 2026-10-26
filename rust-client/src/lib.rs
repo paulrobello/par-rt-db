@@ -69,6 +69,9 @@ mod http_common;
 pub mod in_memory;
 
 #[cfg(feature = "ws")]
+pub mod feed;
+
+#[cfg(feature = "ws")]
 pub mod ws;
 
 pub use error::{ErrorCode, ErrorEnvelope, RtDbError, retry_on_precondition};
@@ -131,3 +134,6 @@ pub use wire::admin::{
 
 #[cfg(feature = "admin")]
 pub use migration::Migration;
+
+#[cfg(feature = "ws")]
+pub use feed::{ChangeBatch, ChangeFeed, ChangeFeedOptions};

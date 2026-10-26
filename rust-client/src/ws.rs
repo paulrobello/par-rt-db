@@ -17,6 +17,7 @@
 #![cfg(feature = "ws")]
 
 use crate::error::{ErrorCode, RtDbError};
+use crate::feed::{self, ChangeFeed, ChangeFeedOptions, FeedMaps, FeedState};
 use crate::mutation::{StepResult, Transaction};
 use crate::optimistic::{OptimisticProjection, project_optimistic_update};
 use crate::query::Query;
@@ -396,6 +397,13 @@ enum Cmd {
     /// [`Cmd::PresenceJoin`] precisely so the session's `sent_rooms` dedup
     /// cannot swallow it.
     PresenceResync { room: String },
+    /// Open a change feed (bookkeeping already done; the driver sends
+    /// `feedSubscribe` with the feed's current cursor).
+    FeedOpen { feed_id: String },
+    /// Close a change feed (handle dropped).
+    FeedClose { feed_id: String },
+    /// Acknowledge processed ops of a feed.
+    FeedAck { feed_id: String, seq: i64 },
     /// Tear the driver down.
     Shutdown,
 }
@@ -437,12 +445,15 @@ struct ClientInner {
     /// Joined presence rooms. The driver replays these on each (re)connect,
     /// mirroring how it re-establishes subscriptions from `subs`.
     presence: Mutex<PresenceMaps>,
+    /// Open change feeds; replayed on each (re)connect from their cursors.
+    feeds: Mutex<FeedMaps>,
     /// Bumped on every (re)open and on `close()`; async wakeups capture the value
     /// they were scheduled under and abort if it has advanced — the guard that
     /// keeps a stale token resolution from opening a duplicate socket.
     generation: Arc<AtomicU64>,
     closed: Arc<AtomicBool>,
     sub_counter: AtomicU64,
+    feed_counter: AtomicU64,
     mut_counter: AtomicU64,
     sched_counter: AtomicU64,
     wf_counter: AtomicU64,
@@ -631,9 +642,11 @@ impl RtDbClient {
             status_tx,
             subs: Mutex::new(SubMaps::default()),
             presence: Mutex::new(PresenceMaps::default()),
+            feeds: Mutex::new(FeedMaps::default()),
             generation: Arc::new(AtomicU64::new(0)),
             closed: Arc::new(AtomicBool::new(false)),
             sub_counter: AtomicU64::new(1),
+            feed_counter: AtomicU64::new(1),
             mut_counter: AtomicU64::new(1),
             sched_counter: AtomicU64::new(1),
             wf_counter: AtomicU64::new(1),
@@ -781,6 +794,38 @@ impl RtDbClient {
             rx,
             room: room.to_string(),
         }
+    }
+
+    /// Open a durable change-feed push channel (`feedSubscribe`). Batches arrive
+    /// oldest first, at-least-once across reconnects; the client dedupes by
+    /// `(feedEpoch, seq)` and acknowledges each delivered batch. A terminal
+    /// error (e.g. `CURSOR_EXPIRED`) is yielded once and never retried. Drop the
+    /// returned handle to close the feed.
+    pub fn watch_changes(&self, opts: ChangeFeedOptions) -> ChangeFeed {
+        let feed_id = format!(
+            "feed-{}",
+            self.inner.feed_counter.fetch_add(1, Ordering::Relaxed)
+        );
+        let (state, rx) = FeedState::new(feed_id.clone(), opts);
+        self.inner
+            .feeds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(state);
+        let _ = self.inner.cmd_tx.send(Cmd::FeedOpen {
+            feed_id: feed_id.clone(),
+        });
+        let cmd_tx = self.inner.cmd_tx.clone();
+        let close_id = feed_id.clone();
+        ChangeFeed::new(
+            rx,
+            feed_id,
+            Box::new(move || {
+                let _ = cmd_tx.send(Cmd::FeedClose {
+                    feed_id: close_id.clone(),
+                });
+            }),
+        )
     }
 
     /// Broadcast updated `state` for this connection in `room`. The server fans
@@ -1345,6 +1390,21 @@ async fn run_session(
         }
     }
 
+    // Replay open change feeds from their cursors: the server lost this
+    // connection's feeds on disconnect, and the cursor makes the replay resume
+    // exactly after the last delivered op.
+    let feed_frames = driver
+        .inner
+        .feeds
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .replay_frames();
+    for frame in &feed_frames {
+        if send_text(&mut sink, frame).await.is_err() {
+            return SessionOutcome::Reconnect;
+        }
+    }
+
     // Flush mutations queued while disconnected.
     while let Some(q) = queues.mutate.unsent.pop_front() {
         match deliver_mutate(&mut sink, q, &mut queues.mutate.by_id).await {
@@ -1432,6 +1492,46 @@ async fn run_session(
                             queues.workflow.unsent.push_back(q);
                             return SessionOutcome::Reconnect;
                         }
+                    }
+                }
+                Some(Cmd::FeedOpen { feed_id }) => {
+                    // A feed opened mid-session; the session-start replay
+                    // covers feeds that already existed.
+                    let frame = driver
+                        .inner
+                        .feeds
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .frame_for(&feed_id);
+                    if let Some(frame) = frame
+                        && !feed_frames.iter().any(|f| matches!(
+                            (f, &frame),
+                            (
+                                ClientMessage::FeedSubscribe { feed_id: a, .. },
+                                ClientMessage::FeedSubscribe { feed_id: b, .. },
+                            ) if a == b
+                        ))
+                        && send_text(&mut sink, &frame).await.is_err()
+                    {
+                        return SessionOutcome::Reconnect;
+                    }
+                }
+                Some(Cmd::FeedClose { feed_id }) => {
+                    driver
+                        .inner
+                        .feeds
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&feed_id);
+                    let frame = ClientMessage::FeedUnsubscribe { feed_id };
+                    if send_text(&mut sink, &frame).await.is_err() {
+                        return SessionOutcome::Reconnect;
+                    }
+                }
+                Some(Cmd::FeedAck { feed_id, seq }) => {
+                    let frame = ClientMessage::FeedAck { feed_id, seq };
+                    if send_text(&mut sink, &frame).await.is_err() {
+                        return SessionOutcome::Reconnect;
                     }
                 }
                 Some(Cmd::PresenceJoin { room, state }) => {
@@ -1701,6 +1801,11 @@ fn apply_server_message(inner: &Arc<ClientInner>, msg: ServerMessage, queues: &m
         | ServerMessage::PresenceErr { .. }
         | ServerMessage::PresenceDelta { .. } => {
             on_presence(inner, msg);
+        }
+        ServerMessage::FeedEvents { .. } | ServerMessage::FeedErr { .. } => {
+            if let Some((feed_id, seq)) = feed::on_server_message(&inner.feeds, msg) {
+                let _ = inner.cmd_tx.send(Cmd::FeedAck { feed_id, seq });
+            }
         }
         // Pong is handled by the session loop; AuthOk/AuthErr arrive only at the
         // handshake, never mid-session.
@@ -2421,9 +2526,11 @@ mod tests {
             status_tx,
             subs: Mutex::new(SubMaps::default()),
             presence: Mutex::new(PresenceMaps::default()),
+            feeds: Mutex::new(FeedMaps::default()),
             generation: Arc::new(AtomicU64::new(0)),
             closed: Arc::new(AtomicBool::new(false)),
             sub_counter: AtomicU64::new(1),
+            feed_counter: AtomicU64::new(1),
             mut_counter: AtomicU64::new(1),
             sched_counter: AtomicU64::new(1),
             wf_counter: AtomicU64::new(1),
@@ -2565,9 +2672,11 @@ mod tests {
             status_tx,
             subs: Mutex::new(SubMaps::default()),
             presence: Mutex::new(PresenceMaps::default()),
+            feeds: Mutex::new(FeedMaps::default()),
             generation: Arc::new(AtomicU64::new(0)),
             closed: Arc::new(AtomicBool::new(false)),
             sub_counter: AtomicU64::new(1),
+            feed_counter: AtomicU64::new(1),
             mut_counter: AtomicU64::new(1),
             sched_counter: AtomicU64::new(1),
             wf_counter: AtomicU64::new(1),

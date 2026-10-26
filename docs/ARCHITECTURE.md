@@ -1155,6 +1155,41 @@ Retention (`changeLogMaxRows`, trimmed by the per-db cleanup loop) keeps the
 newest rows only, so an empty `changes` table still means "nothing was ever
 committed".
 
+### The WebSocket change-feed channel reads the durable log, not the ring
+
+`feedSubscribe` on `/sync` (`ws_feed.rs`) pushes the change log to machine-token
+consumers. Two replay sources were possible, and the channel uses the durable
+`changes` table:
+
+- **Op-feed ring (rejected for replay).** `op_feed::OpFeed` holds the last 500
+  events per process, assigns its own `(feedEpoch, seq)` as events enter the
+  ring, resets on restart, and drops events for a lagging broadcast receiver.
+  Its `seq` is not the change log's `seq`, so a consumer cursor from it would
+  be meaningless after a restart and could silently skip events. It is built
+  for the dashboard's "recent activity" view, which tolerates loss.
+- **Durable change log (chosen).** Replay bound equals the retention window
+  (`changeLogMaxRows`, default 100 000), the same bound the HTTP feed uses, so
+  the two paths agree on what `CURSOR_EXPIRED` means and a consumer can resync
+  from one to the other. Cursors survive restarts and failover because they are
+  log seqs, and `feedEpoch` is the log's `logId`, which detects a database
+  recreated under the same name.
+
+Mechanics. Each `feedSubscribe` spawns one task per feed, owned by the
+connection and aborted on `feedUnsubscribe` or disconnect. The task validates
+the cursor (epoch match, not ahead of head, not before the oldest retained
+row), then loops: read a page of up to 500 ops after the cursor
+(`change_log::read_page_tables`, `table_name = ANY($tables)` over the
+`(table_name, seq)` index), drop rows the token's allowlist forbids, send a
+`feedEvents` frame, and advance the cursor. It sleeps on the op-feed broadcast
+as a wake-up hint (which also carries peer-replica writes under
+`RTDB_MULTI_INSTANCE`) with a 1 s poll as the backstop, so a missed broadcast
+costs latency, never correctness. `head` is read before each page so an empty
+frame's `head` is a safe resume cursor. The sender pauses once 2 000 ops are
+unacknowledged and resumes on `feedAck`. Principal authorization is re-run per
+batch, so a revoked token ends the stream with a `feedErr`. The channel never
+writes, so the single-committer invariant is untouched. The first frame after
+subscribe is always sent (possibly with no ops) so clients learn `feedEpoch`.
+
 Any future code path that commits a document txn must call `publish_taps` too,
 or the op-feed (and `/admin/stream`) will silently miss those writes. Add new
 tap sites to this table.

@@ -80,3 +80,34 @@ async fn ws_subscribe_and_live_update() {
 
     client.close();
 }
+
+#[tokio::test]
+#[ignore = "set RTDB_TEST_SERVER_URL + RTDB_TEST_ADMIN_KEY and run with --ignored"]
+async fn ws_change_feed_pushes_writes_after_cursor() {
+    let Some((url, _admin)) = env() else {
+        return;
+    };
+    let ctx = setup().await;
+    let token = ctx.token.clone();
+    let client = RtDbClient::new(&url, &ctx.db, move || {
+        let t = token.clone();
+        async move { Some(t) }
+    });
+    client.connect();
+
+    let mut feed = client.watch_changes(par_rt_db_client::ChangeFeedOptions {
+        tables: vec!["items".to_string()],
+        ..Default::default()
+    });
+    let txn = par_rt_db_client::Mutation::new()
+        .insert("items", json!({"name":"feed-live","n":1}))
+        .build();
+    client.mutate(&txn, None).await.expect("ws mutate");
+
+    let batch = timeout(Duration::from_secs(10), feed.next())
+        .await
+        .expect("a feedEvents batch")
+        .expect("feed open")
+        .expect("no feedErr");
+    assert!(batch.ops.iter().any(|op| op.table == "items"));
+}
