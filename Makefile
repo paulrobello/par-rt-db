@@ -38,6 +38,8 @@ SWIFT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(1),$(SW
 	host-reserve host-release host-reservation-check \
 	go-client-install go-client-fmt go-client-fmt-check go-client-lint go-client-test \
 	go-client-typecheck go-client-checkall \
+	kotlin-client-install kotlin-client-build kotlin-client-lint kotlin-client-typecheck \
+	kotlin-client-test kotlin-client-checkall \
 	swift-client-build swift-client-test swift-client-lint swift-client-fmt \
 	swift-client-fmt-check swift-client-typecheck swift-client-checkall \
 	swift-client-deps audit-deps \
@@ -63,6 +65,7 @@ build: ts-client-build go-client-install
 	cd rust-client && cargo build --all-features
 	cd cli && cargo build --all-features
 	cd dashboard && bun run build
+	cd kotlin-client && ./gradlew --console=plain build -x test
 	$(call SWIFT_IF_DARWIN,swift build)
 
 fmt:
@@ -92,6 +95,7 @@ lint:
 	cd python-client && uv run ruff check .
 	cd go-client && go vet ./...
 	cd go-client && go vet -tags live ./...
+	cd kotlin-client && ./gradlew --console=plain compileKotlin compileTestKotlin
 	$(call SWIFT_IF_DARWIN,swiftlint --strict)
 
 # ARC-014: workspace-level typecheck. The former `cargo check --workspace
@@ -104,6 +108,7 @@ typecheck: ts-client-build
 	cd dashboard && bun run typecheck
 	cd python-client && uv run pyright
 	cd go-client && go vet ./...
+	cd kotlin-client && ./gradlew --console=plain compileKotlin compileTestKotlin
 	$(call SWIFT_IF_DARWIN,swift build)
 
 dev-db-up:
@@ -179,6 +184,7 @@ endif
 	cd dashboard && bun run test
 	cd python-client && uv run pytest -q
 	cd go-client && go test ./...
+	cd kotlin-client && ./gradlew --console=plain test
 	$(call SWIFT_IF_DARWIN,swift test)
 
 # ENH-050: measured line coverage, report-only — no thresholds, and never part
@@ -281,6 +287,27 @@ go-client-test:
 	cd go-client && go test -race ./...
 
 go-client-checkall: go-client-fmt-check go-client-lint go-client-typecheck go-client-test
+
+# Kotlin/JVM client. The Gradle wrapper pins Gradle itself; the only host
+# requirement is a JDK 17+ (CI installs Temurin 21). Compiler warnings are
+# errors (build.gradle.kts), so compile doubles as lint and typecheck, and the
+# Gradle `test` task runs the semantics corpus, golden vector and wire corpus
+# with zero skips (SemanticsCorpusTest fails if any case skips kotlin).
+kotlin-client-install:
+	cd kotlin-client && ./gradlew --console=plain --version
+
+kotlin-client-build:
+	cd kotlin-client && ./gradlew --console=plain build -x test
+
+kotlin-client-lint:
+	cd kotlin-client && ./gradlew --console=plain compileKotlin compileTestKotlin
+
+kotlin-client-typecheck: kotlin-client-lint
+
+kotlin-client-test:
+	cd kotlin-client && ./gradlew --console=plain test
+
+kotlin-client-checkall: kotlin-client-lint kotlin-client-test
 
 # Darwin-guarded (see SWIFT_IF_DARWIN at the top): `swift build` doubles as
 # typecheck — the Swift compiler has no separate check-only surface in SPM.

@@ -168,6 +168,18 @@ jobs:
       # A fresh CI checkout has no node_modules, no .venv, and no Go module
       # cache. These targets are NOT prerequisites of the make gate — the
       # Makefile assumes they have already been run once (see CLAUDE.md).
+      # kotlin-client runs under the Gradle wrapper; only a JDK is required.
+      # setup-java pinned to the v5.7.0 tag's commit (verified to resolve).
+      - name: Set up JDK (kotlin-client)
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+          cache-dependency-path: |
+            kotlin-client/*.gradle.kts
+            kotlin-client/gradle/wrapper/gradle-wrapper.properties
+
       - name: Install go-client deps
         run: make go-client-install
 
@@ -210,6 +222,18 @@ jobs:
         with:
           go-version: "1.27"
           cache-dependency-path: go-client/go.sum
+
+      # kotlin-client runs under the Gradle wrapper; only a JDK is required.
+      # setup-java pinned to the v5.7.0 tag's commit (verified to resolve).
+      - name: Set up JDK (kotlin-client)
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+          cache-dependency-path: |
+            kotlin-client/*.gradle.kts
+            kotlin-client/gradle/wrapper/gradle-wrapper.properties
 
       - name: Install go-client deps
         run: make go-client-install
@@ -272,6 +296,18 @@ jobs:
         with:
           go-version: "1.27"
           cache-dependency-path: go-client/go.sum
+
+      # kotlin-client runs under the Gradle wrapper; only a JDK is required.
+      # setup-java pinned to the v5.7.0 tag's commit (verified to resolve).
+      - name: Set up JDK (kotlin-client)
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+          cache-dependency-path: |
+            kotlin-client/*.gradle.kts
+            kotlin-client/gradle/wrapper/gradle-wrapper.properties
 
       - name: Install go-client deps
         run: make go-client-install

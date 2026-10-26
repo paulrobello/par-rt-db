@@ -40,8 +40,8 @@ implementations honest against each other. Three artifacts live here:
   checkers with one evaluator that reads this table. See
   [Query combination rules](#query-combination-rules) below.
 
-**Runner scope:** the server and all five client in-memory engines
-(`ts-client`, `rust-client`, `python-client`, `swift-client`, `go-client`) execute
+**Runner scope:** the server and all six client in-memory engines
+(`ts-client`, `rust-client`, `python-client`, `swift-client`, `go-client`, `kotlin-client`) execute
 `golden-vector.json` and `semantics/`; every client also runs
 `wire-corpus.json` (the swift client has since it landed; the semantics and
 golden-vector runners shipped with its in-memory engine on 2026-08-19).
@@ -97,11 +97,12 @@ the authoring rule above.
 
 ## Every wire section must be consumed
 
-Every top-level section in `wire-corpus.json` must be consumed by all six
+Every top-level section in `wire-corpus.json` must be consumed by all seven
 runners (`server/tests/wire_corpus.rs`, `rust-client/tests/wire_corpus.rs`,
 `ts-client/tests/wire-corpus.test.ts`, `python-client/tests/test_wire_parity.py`,
 `swift-client/Tests/ParRtDbClientTests/WireCorpusTests.swift`,
-`go-client/wire/wire_corpus_test.go`), decoded through that runner's own wire
+`go-client/wire/wire_corpus_test.go`,
+`kotlin-client/src/test/kotlin/dev/parrtdb/corpus/CorpusTests.kt`), decoded through that runner's own wire
 type where one exists — a decode through the real type catches field renames a
 raw `JSON.parse` round-trip cannot. A section may stay raw JSON only when the
 wire value is deliberately untyped on that client (e.g. `query_results`, since
@@ -139,7 +140,7 @@ JSON object:
 | `normalize` | no | Keys projected out of both the actual and expected trees before comparison — the projection applies RECURSIVELY to every object in both trees (docs nested inside `paginate.docs`, step results, ...). Defaults to `["_id", "_creationTime", "_version"]` when absent; a present list REPLACES the default (txn cases add `"id"` for minted step-result ids). |
 | `expect_next_cursor` | paginate cases | `true`/`false`: assert the `paginate` result carries (or omits) a `nextCursor`. The cursor value itself is generated and never compared. Required on every paginate case whose `expect` is a result (a paginate error case asserts the error instead and carries no `expect_next_cursor`). |
 | `then` | no | `{"query": <Query DSL>, "expect": ..., "unordered"?, "normalize"?}` — a follow-up read executed after `op` succeeds and its `expect` has been checked. For write-then-read visibility cases (soft delete, defaults, upsert-patch). Inherits the case-level `normalize` unless it gives its own. `then` runs only after `op` SUCCEEDS; an error case (`expect` is `{"error": ...}`) must not carry `then` (runners do not execute it there). |
-| `skip` | no | `{"ts" \| "rust" \| "python" \| "server" \| "swift" \| "go": "reason"}` — a named runner may skip the case, loudly, until the gap is closed. Absent means every runner must execute the case. |
+| `skip` | no | `{"ts" \| "rust" \| "python" \| "server" \| "swift" \| "go" \| "kotlin": "reason"}` — a named runner may skip the case, loudly, until the gap is closed. Absent means every runner must execute the case. |
 
 ### `expect` shapes
 
@@ -312,7 +313,7 @@ same commit, and a matching update to every client's error-code type
 (`ts-client/src/errors.ts`, `rust-client/src/error.rs`,
 `python-client/src/par_rt_db/errors.py`,
 `swift-client/Sources/ParRtDbClient/Errors.swift`, and the Go client's
-`go-client/errors/errors.go`). This mirrors the semantics
+`go-client/errors/errors.go`, and `kotlin-client/src/main/kotlin/dev/parrtdb/errors/Errors.kt`). This mirrors the semantics
 corpus's authoring rule above.
 
 **Enforcement:**
@@ -322,11 +323,12 @@ corpus's authoring rule above.
   catch-all arm — so adding a variant fails the crate to compile until the
   match (and `RtDbError::status`, itself already exhaustive) is updated; the
   test then diffs the regenerated table against the committed JSON.
-- **Clients**: each of the five client corpus test files
+- **Clients**: each of the six client corpus test files
   (`rust-client/tests/wire_corpus.rs`, `ts-client/tests/wire-corpus.test.ts`,
   `python-client/tests/test_wire_parity.py`,
   `swift-client/Tests/ParRtDbClientTests/WireCorpusTests.swift`,
-  `go-client/wire/wire_corpus_test.go` + `go-client/wire/error_codes_test.go`) asserts every
+  `go-client/wire/wire_corpus_test.go` + `go-client/wire/error_codes_test.go`,
+  `kotlin-client/src/test/kotlin/dev/parrtdb/corpus/CorpusTests.kt`) asserts every
   corpus code is known to that client's error-code type, and vice versa
   (Python's `StrEnum` and Swift's `CaseIterable` enumerate their own variants
   automatically; TS and Rust hand-maintain a parallel `ALL` list, so a
