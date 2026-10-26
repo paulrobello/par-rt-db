@@ -690,8 +690,16 @@ field return the exact decimal string — the int64 wire convention, exact past
 2^53 where a JSON number is an IEEE-754 double (a `sum` of satoshis or byte
 counts is not silently rounded); `avg` over any numeric field stays a JSON
 number (documented f64 form — a fractional mean has no int64 representation);
-`count` is an integer; a `number` field's aggregates are JSON numbers. An
-optional `fields` array projects each result doc to the
+`count` is an integer; a `number` field's aggregates are JSON numbers. A grouped
+aggregate may carry `having: {name: {eq?, ne?, gt?, gte?, lt?, lte?}}`, a
+post-group filter over aggregate values (`count >= 2`, `sum > 100`): `name` is an
+`aggregates` alias or, for a single-`op` spec, the lowercase op name; bounds on
+one name and across names AND together; it compiles to SQL `HAVING` on the
+server and post-filters identically in every in-memory engine. `having` needs a
+grouped spec, a numeric aggregate (`count`, or `sum`/`avg`/`min`/`max` over a
+numeric field), at least one bound per name, and a known name — otherwise
+`BAD_REQUEST`. Failing groups are dropped before the `MAX_TAKE` group cap, and
+a NULL aggregate never satisfies a bound. An optional `fields` array projects each result doc to the
 listed user fields — the system fields (`_id`/`_creationTime`/`_version`) and
 synthetic fields (`_searchSnippet`) are always kept, `fields: []` is an
 ids-only view, names are validated against the schema (`BAD_REQUEST` on an
@@ -1164,8 +1172,13 @@ re-run on every op, not just at connect.
 Aggregate queries (`aggregate`, including the `aggregates` map and `groupBy`
 forms) subscribe live over `/sync` like row queries: the subscription pushes a
 `queryUpdate` with the new scalar, `{alias: value}` object, or grouped rows only
-when a write moves the result. Grouped results are silently truncated at
-`MAX_TAKE` (4096) groups by design, matching `collect`.
+when a write moves the result. Grouped results are capped at `MAX_TAKE` (4096)
+groups, ordered by group key ascending, and a capped result says so: it is
+`{"groups": [...], "truncated": true}` instead of the bare row array (the
+marker is omitted under the cap, so under-cap bytes are unchanged). A client
+can therefore tell a live subscription is missing groups past the cap. With
+`having`, the cap applies after the filter, so `truncated` reflects only the
+groups that pass it.
 
 ## Durable workflows
 

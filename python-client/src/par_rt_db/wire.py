@@ -535,6 +535,25 @@ class AggregateOp:
     COUNT = "count"
 
 
+class HavingCmp(_Camel):
+    """Comparison bounds for one ``having`` entry (server ``HavingCmp``).
+
+    Bounds on one name AND together; at least one is required. Numeric
+    aggregates only. Unset bounds are omitted on the wire.
+    """
+
+    eq: float | None = None
+    ne: float | None = None
+    gt: float | None = None
+    gte: float | None = None
+    lt: float | None = None
+    lte: float | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_unset_bounds(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        return {k: v for k, v in handler(self).items() if v is not None}
+
+
 class AggregateSpec(_Camel):
     """Aggregate terminal spec supporting legacy and v2 forms.
 
@@ -546,6 +565,7 @@ class AggregateSpec(_Camel):
     op: Literal["sum", "avg", "min", "max", "count"] | None = None
     aggregates: dict[str, Literal["sum", "avg", "min", "max", "count"]] | None = None
     group_by: bool | list[str] = False
+    having: dict[str, HavingCmp] | None = None
 
     @model_validator(mode="after")
     def _validate_variant(self) -> AggregateSpec:
@@ -570,6 +590,8 @@ class AggregateSpec(_Camel):
             out.pop("aggregates", None)
         if out.get("groupBy") is False:
             out.pop("groupBy", None)
+        if out.get("having") is None:
+            out.pop("having", None)
         return out
 
 
@@ -588,6 +610,15 @@ class AggregateMultiGroup(_Camel):
 
     keys: list[Any]
     values: dict[str, Any]
+
+
+class AggregateGroupsTruncated(_Camel):
+    """A grouped aggregate result that hit the ``MAX_TAKE`` group cap:
+    ``{"groups": [...], "truncated": true}``. Under the cap the result stays a
+    bare array, so a plain list means "not truncated"."""
+
+    groups: list[Any]
+    truncated: bool = True
 
 
 class LookupSpec(BaseModel):

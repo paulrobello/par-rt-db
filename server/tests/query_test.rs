@@ -2684,6 +2684,7 @@ fn agg(op: AggregateOp) -> AggregateSpec {
         op: Some(op),
         group_by: GroupBy::Bool(false),
         aggregates: None,
+        having: None,
     }
 }
 
@@ -3081,6 +3082,7 @@ async fn aggregate_group_by_returns_one_row_per_group() -> anyhow::Result<()> {
                 op: Some(AggregateOp::Sum),
                 group_by: GroupBy::Bool(true),
                 aggregates: None,
+                having: None,
             },
             |_| {},
         ),
@@ -3134,6 +3136,7 @@ async fn aggregate_group_by_with_one_field_beyond_prefix_is_bad_request() -> any
                 op: Some(AggregateOp::Sum),
                 group_by: GroupBy::Bool(true),
                 aggregates: None,
+                having: None,
             },
             |_| {},
         ),
@@ -3242,6 +3245,7 @@ async fn aggregate_count_grouped_by_status() -> anyhow::Result<()> {
                 op: Some(AggregateOp::Count),
                 group_by: GroupBy::Bool(true),
                 aggregates: None,
+                having: None,
             },
             |_| {},
         ),
@@ -4506,6 +4510,7 @@ async fn int64_index_count_and_aggregate() -> anyhow::Result<()> {
                 op: Some(AggregateOp::Sum),
                 group_by: GroupBy::Bool(false),
                 aggregates: None,
+                having: None,
             }),
         },
         &PrincipalCtx::bypass(),
@@ -4616,6 +4621,7 @@ async fn int64_aggregate_sum_min_max_exact_past_2p53() -> anyhow::Result<()> {
             ("hi".to_string(), AggregateOp::Max),
             ("n".to_string(), AggregateOp::Count),
         ])),
+        having: None,
     };
     let r = execute_query(
         &pool,

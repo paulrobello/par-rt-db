@@ -227,6 +227,44 @@ type AggregateSpec struct {
 	Op         AggregateOp            `json:"op,omitempty"`
 	Aggregates map[string]AggregateOp `json:"aggregates,omitempty"`
 	GroupBy    GroupBy                `json:"groupBy"`
+	// Having is the post-group filter over aggregate values (name -> bounds);
+	// requires a grouped spec. Omitted when nil.
+	Having map[string]HavingCmp `json:"having,omitempty"`
+}
+
+// HavingCmp mirrors server HavingCmp (deny_unknown_fields): comparison bounds
+// for one `having` entry. At least one is required; bounds AND together.
+// Numeric aggregates only. Unset bounds are omitted on the wire.
+type HavingCmp struct {
+	Eq  *float64 `json:"eq,omitempty"`
+	Ne  *float64 `json:"ne,omitempty"`
+	Gt  *float64 `json:"gt,omitempty"`
+	Gte *float64 `json:"gte,omitempty"`
+	Lt  *float64 `json:"lt,omitempty"`
+	Lte *float64 `json:"lte,omitempty"`
+}
+
+// Matches reports whether v satisfies every set bound.
+func (h HavingCmp) Matches(v float64) bool {
+	return (h.Eq == nil || v == *h.Eq) &&
+		(h.Ne == nil || v != *h.Ne) &&
+		(h.Gt == nil || v > *h.Gt) &&
+		(h.Gte == nil || v >= *h.Gte) &&
+		(h.Lt == nil || v < *h.Lt) &&
+		(h.Lte == nil || v <= *h.Lte)
+}
+
+// HasBound reports whether at least one bound is set.
+func (h HavingCmp) HasBound() bool {
+	return h.Eq != nil || h.Ne != nil || h.Gt != nil || h.Gte != nil || h.Lt != nil || h.Lte != nil
+}
+
+// AggregateGroupsTruncated mirrors the server shape of a grouped aggregate
+// result that hit the MAX_TAKE group cap: {"groups": [...], "truncated": true}.
+// Under the cap the result is the bare array (marker omitted).
+type AggregateGroupsTruncated[T any] struct {
+	Groups    []T  `json:"groups"`
+	Truncated bool `json:"truncated"`
 }
 
 // MarshalJSON encodes AggregateSpec, defaulting a nil GroupBy to the legacy
@@ -247,6 +285,7 @@ func (a *AggregateSpec) UnmarshalJSON(b []byte) error {
 		Op         AggregateOp            `json:"op,omitempty"`
 		Aggregates map[string]AggregateOp `json:"aggregates,omitempty"`
 		GroupBy    json.RawMessage        `json:"groupBy,omitempty"`
+		Having     map[string]HavingCmp   `json:"having,omitempty"`
 	}](b)
 	if err != nil {
 		return err
@@ -255,7 +294,7 @@ func (a *AggregateSpec) UnmarshalJSON(b []byte) error {
 	if err != nil {
 		return err
 	}
-	a.Op, a.Aggregates, a.GroupBy = r.Op, r.Aggregates, groupBy
+	a.Op, a.Aggregates, a.GroupBy, a.Having = r.Op, r.Aggregates, groupBy, r.Having
 	return nil
 }
 

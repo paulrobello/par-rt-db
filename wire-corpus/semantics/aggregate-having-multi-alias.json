@@ -1,0 +1,116 @@
+{
+  "name": "aggregate-having-multi-alias",
+  "$comment": "having over named multi-op aliases: two aliases ANDed, two bounds on one alias. groupBy:true groups by status and aggregates the next index field n: done total(sum n)=7 n(count)=3, todo total=4 n=3, wip total=1 n=1. having total>2 AND total<=7 AND n>=2 keeps done and todo, drops wip.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "status": {
+            "type": "string"
+          },
+          "n": {
+            "type": "number"
+          },
+          "order": {
+            "type": "number"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_status_n_order",
+            "fields": [
+              "status",
+              "n",
+              "order"
+            ]
+          },
+          {
+            "name": "by_n",
+            "fields": [
+              "n"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "seed": [
+    {
+      "status": "todo",
+      "n": 1,
+      "order": 1
+    },
+    {
+      "status": "todo",
+      "n": 1,
+      "order": 2
+    },
+    {
+      "status": "todo",
+      "n": 2,
+      "order": 10
+    },
+    {
+      "status": "done",
+      "n": 1,
+      "order": 5
+    },
+    {
+      "status": "done",
+      "n": 3,
+      "order": 7
+    },
+    {
+      "status": "done",
+      "n": 3,
+      "order": 8
+    },
+    {
+      "status": "wip",
+      "n": 1,
+      "order": 4
+    }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "index": "by_status_n_order",
+      "aggregate": {
+        "aggregates": {
+          "total": "sum",
+          "n": "count"
+        },
+        "groupBy": true,
+        "having": {
+          "total": {
+            "gt": 2,
+            "lte": 7
+          },
+          "n": {
+            "gte": 2
+          }
+        }
+      }
+    }
+  },
+  "expect": [
+    {
+      "keys": [
+        "done"
+      ],
+      "values": {
+        "total": 7,
+        "n": 3
+      }
+    },
+    {
+      "keys": [
+        "todo"
+      ],
+      "values": {
+        "total": 4,
+        "n": 3
+      }
+    }
+  ]
+}

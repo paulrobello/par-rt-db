@@ -74,8 +74,8 @@ pub mod ws;
 pub use error::{ErrorCode, ErrorEnvelope, RtDbError, retry_on_precondition};
 pub use mutation::{FieldExpectation, Mutation, StepResult, Transaction, WorkflowStepSpecExt};
 pub use query::{
-    HybridSearchOpts, LookupSpec, Order, Paginate, Paginated, Query, SearchOpts, TableQuery,
-    VectorSearchOpts,
+    HybridSearchOpts, LookupSpec, Order, Paginate, Paginated, Query, QueryHavingExt, SearchOpts,
+    TableQuery, VectorSearchOpts,
 };
 pub use schema::{
     DistanceMetric, FieldType, IndexDef, OnDeleteAction, SchemaBuilderExt, SchemaDef, TableDef,
@@ -85,11 +85,12 @@ pub use value_expr::{CaseWhen, Cast, ValueExpr};
 #[cfg(feature = "http")]
 pub use wire::enrollment::RedeemedGrant;
 pub use wire::{
-    AggregateGroup, AggregateOp, AggregateSpec, AuthedUser, AwaitSignalSpec, ChangeFeedResponse,
-    ChangeOp, ClaimedSchedule, ClientMessage, FilterExpr, HostCapability, OutcomeStatus,
-    PresenceMember, ScheduleInfo, ScheduleKind, ScheduleStatus, ScheduleWhen, SearchMode,
-    SearchQuery, ServerMessage, StepOutcome, StepRetry, UserKind, VectorSearchQuery, WorkflowInfo,
-    WorkflowInfoFull, WorkflowSpec, WorkflowStatus, WorkflowStepSpec,
+    AggregateGroup, AggregateGroupsTruncated, AggregateOp, AggregateSpec, AuthedUser,
+    AwaitSignalSpec, ChangeFeedResponse, ChangeOp, ClaimedSchedule, ClientMessage, FilterExpr,
+    HavingCmp, HostCapability, OutcomeStatus, PresenceMember, ScheduleInfo, ScheduleKind,
+    ScheduleStatus, ScheduleWhen, SearchMode, SearchQuery, ServerMessage, StepOutcome, StepRetry,
+    UserKind, VectorSearchQuery, WorkflowInfo, WorkflowInfoFull, WorkflowSpec, WorkflowStatus,
+    WorkflowStepSpec,
 };
 
 #[cfg(feature = "http")]

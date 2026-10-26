@@ -674,6 +674,7 @@ type aggregatePlan struct {
 	legacy      bool
 	aggField    string
 	aggFieldPg  PgType
+	having      map[string]wire.HavingCmp
 }
 
 // planAggregate validates an AggregateSpec against the scan plan and resolves
@@ -815,7 +816,11 @@ func planAggregate(agg *wire.AggregateSpec, table *TableDef, plan *scanPlan) (*a
 	for i, f := range groupFields {
 		groupPgs[i] = plan.fieldPg(table, f)
 	}
+	if err := validateHaving(agg.Having, ops, len(groupFields) > 0, aggFieldPg); err != nil {
+		return nil, err
+	}
 	return &aggregatePlan{
+		having:      agg.Having,
 		ops:         ops,
 		groupFields: groupFields,
 		groupPgs:    groupPgs,
@@ -823,6 +828,41 @@ func planAggregate(agg *wire.AggregateSpec, table *TableDef, plan *scanPlan) (*a
 		aggField:    aggField,
 		aggFieldPg:  aggFieldPg,
 	}, nil
+}
+
+// validateHaving applies the server's build_having BAD_REQUEST gates:
+// requires a grouped spec, a non-empty map, known names, at least one bound
+// each, and a numeric aggregate for the field-bearing ops.
+func validateHaving(having map[string]wire.HavingCmp, ops []aggregateOpAlias, grouped bool, aggPg PgType) error {
+	if having == nil {
+		return nil
+	}
+	bad := func(msg string) error { return rtdberrors.New(rtdberrors.CodeBadRequest, msg) }
+	if !grouped {
+		return bad("aggregate having requires groupBy")
+	}
+	if len(having) == 0 {
+		return bad("aggregate having must not be empty")
+	}
+	for name, cmp := range having {
+		var op wire.AggregateOp
+		found := false
+		for _, o := range ops {
+			if o.alias == name {
+				op, found = o.op, true
+			}
+		}
+		if !found {
+			return bad("aggregate having references unknown aggregate '" + name + "'")
+		}
+		if !cmp.HasBound() {
+			return bad("aggregate having '" + name + "' needs at least one bound")
+		}
+		if op != wire.AggCount && aggPg != PgNumber && aggPg != PgInt64 {
+			return bad("aggregate having '" + name + "' requires a numeric aggregate")
+		}
+	}
+	return nil
 }
 
 // executeAggregateTerminal ports ts-client's unified `executeAggregateTerminal`
@@ -897,25 +937,55 @@ func aggregateGrouped(ap *aggregatePlan, filtered []*StoredRow, evaluate func([]
 		}
 		return false
 	})
-	if len(groups) > maxTake {
-		groups = groups[:maxTake]
-	}
-	if ap.legacy {
-		out := make(wire.Array, 0, len(groups))
-		for _, g := range groups {
-			out = append(out, wire.Object{"key": g.keys[0], "value": evaluate(g.rows, ap.ops[0].op)})
-		}
-		return out
-	}
 	out := make(wire.Array, 0, len(groups))
 	for _, g := range groups {
-		values := wire.Object{}
-		for _, o := range ap.ops {
-			values[o.alias] = evaluate(g.rows, o.op)
+		var row wire.Object
+		if ap.legacy {
+			row = wire.Object{"key": g.keys[0], "value": evaluate(g.rows, ap.ops[0].op)}
+		} else {
+			values := wire.Object{}
+			for _, o := range ap.ops {
+				values[o.alias] = evaluate(g.rows, o.op)
+			}
+			row = wire.Object{"keys": wire.Array(g.keys), "values": values}
 		}
-		out = append(out, wire.Object{"keys": wire.Array(g.keys), "values": values})
+		if havingKeeps(ap.having, row) {
+			out = append(out, row)
+		}
+	}
+	// The cap applies AFTER having; a capped result carries the marker.
+	if len(out) > maxTake {
+		return wire.Object{"groups": out[:maxTake], "truncated": wire.Bool(true)}
 	}
 	return out
+}
+
+// havingKeeps reports whether a grouped row satisfies every having entry. A
+// non-numeric (null) aggregate fails, like SQL.
+func havingKeeps(having map[string]wire.HavingCmp, row wire.Object) bool {
+	for name, cmp := range having {
+		cell, ok := row["value"]
+		if values, multi := row["values"].(wire.Object); multi {
+			cell, ok = values[name]
+		}
+		if !ok {
+			return false
+		}
+		var f float64
+		var err error
+		switch c := cell.(type) {
+		case wire.Number:
+			f, err = strconv.ParseFloat(string(c), 64)
+		case wire.String:
+			f, err = strconv.ParseFloat(string(c), 64)
+		default:
+			return false
+		}
+		if err != nil || !cmp.Matches(f) {
+			return false
+		}
+	}
+	return true
 }
 
 // aggregateScalar shapes the ungrouped result: a single evaluated object

@@ -354,6 +354,7 @@ async fn lookups_with_docless_terminals_are_bad_request() {
                 op: Some(AggregateOp::Count),
                 aggregates: None,
                 group_by: crate::wire::GroupBy::Bool(false),
+                having: None,
             })
         },
     ] {

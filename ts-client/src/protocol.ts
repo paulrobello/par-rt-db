@@ -143,6 +143,28 @@ export interface AggregateSpec {
   /** Wire v2 alias-to-operation map. */
   aggregates?: Record<string, AggregateOp>;
   groupBy?: AggregateGroupBy;
+  /** Post-group filter over aggregate values: name to comparison bounds. A name
+   * is an `aggregates` alias or, for a single-`op` spec, the op name. Requires
+   * `groupBy`; failing groups are dropped before the `MAX_TAKE` group cap. */
+  having?: Record<string, AggregateHavingCmp>;
+}
+
+/** Mirrors server `query::HavingCmp` (deny_unknown_fields). Bounds on one name
+ * AND together; at least one is required. Numeric aggregates only. */
+export interface AggregateHavingCmp {
+  eq?: number;
+  ne?: number;
+  gt?: number;
+  gte?: number;
+  lt?: number;
+  lte?: number;
+}
+
+/** A grouped aggregate result that hit the `MAX_TAKE` group cap:
+ * `{groups, truncated: true}`. Under the cap the result is the bare array. */
+export interface AggregateGroupsTruncated<T> {
+  groups: T[];
+  truncated: true;
 }
 
 /** Mirrors server `query::AggregateGroup` byte-for-byte (camelCase). One row
@@ -378,9 +400,12 @@ export type QueryResultJson =
   | { type: "count"; value: number }
   | { type: "distinct"; value: unknown[] }
   | { type: "aggregate"; value: unknown }
-  | { type: "aggregateGroups"; value: AggregateGroup[] }
+  | { type: "aggregateGroups"; value: AggregateGroup[] | AggregateGroupsTruncated<AggregateGroup> }
   | { type: "aggregateMulti"; value: Record<string, unknown> }
-  | { type: "aggregateMultiGroups"; value: AggregateMultiGroup[] }
+  | {
+      type: "aggregateMultiGroups";
+      value: AggregateMultiGroup[] | AggregateGroupsTruncated<AggregateMultiGroup>;
+    }
   | { type: "paginated"; value: PaginatedResultJson };
 
 /**

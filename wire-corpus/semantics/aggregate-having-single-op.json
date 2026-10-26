@@ -1,0 +1,99 @@
+{
+  "name": "aggregate-having-single-op",
+  "$comment": "having on the legacy single-op grouped form: the having name is the lowercase op name. Groups by status (field after the empty eq prefix), counts rows per group: done=3, todo=3, wip=1. having count>=2 drops wip. Dropped groups are absent; no truncated marker.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "status": {
+            "type": "string"
+          },
+          "n": {
+            "type": "number"
+          },
+          "order": {
+            "type": "number"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_status_n_order",
+            "fields": [
+              "status",
+              "n",
+              "order"
+            ]
+          },
+          {
+            "name": "by_n",
+            "fields": [
+              "n"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "seed": [
+    {
+      "status": "todo",
+      "n": 1,
+      "order": 1
+    },
+    {
+      "status": "todo",
+      "n": 1,
+      "order": 2
+    },
+    {
+      "status": "todo",
+      "n": 2,
+      "order": 10
+    },
+    {
+      "status": "done",
+      "n": 1,
+      "order": 5
+    },
+    {
+      "status": "done",
+      "n": 3,
+      "order": 7
+    },
+    {
+      "status": "done",
+      "n": 3,
+      "order": 8
+    },
+    {
+      "status": "wip",
+      "n": 1,
+      "order": 4
+    }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "index": "by_status_n_order",
+      "aggregate": {
+        "op": "count",
+        "groupBy": true,
+        "having": {
+          "count": {
+            "gte": 2
+          }
+        }
+      }
+    }
+  },
+  "expect": [
+    {
+      "key": "done",
+      "value": 3
+    },
+    {
+      "key": "todo",
+      "value": 3
+    }
+  ]
+}

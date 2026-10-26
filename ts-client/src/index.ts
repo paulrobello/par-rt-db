@@ -125,6 +125,8 @@ export { decodeCursor, encodeCursor } from "./pagination.js";
 export type {
   AggregateGroup,
   AggregateGroupBy,
+  AggregateGroupsTruncated,
+  AggregateHavingCmp,
   AggregateMultiGroup,
   AggregateOp,
   AggregateSpec,

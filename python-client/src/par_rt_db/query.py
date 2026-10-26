@@ -41,9 +41,11 @@ from pydantic_core.core_schema import SerializerFunctionWrapHandler
 
 from .wire import (
     AggregateGroup,
+    AggregateGroupsTruncated,
     AggregateMultiGroup,
     AggregateSpec,
     FilterExpr,
+    HavingCmp,
     HybridSearchQuery,
     LookupSpec,
     SearchMode,
@@ -364,6 +366,7 @@ class TableQuery:
         *,
         aggregates: dict[str, Literal["sum", "avg", "min", "max", "count"]] | None = None,
         group_by: bool | list[str] = False,
+        having: dict[str, HavingCmp | dict[str, float]] | None = None,
     ) -> TableQuery:
         """Aggregate terminal: runs ``<op>`` (SUM/AVG/MIN/MAX/COUNT) over the
         index field after the eq prefix. With ``group_by=True``, groups by that
@@ -374,8 +377,14 @@ class TableQuery:
         rejects non-numeric, no-index, or no-field-beyond-prefix cases for the
         field-bearing ops. Mutually exclusive with every other terminal except
         ``eq``/range bounds/``filter``; ``take`` is also rejected — group count
-        is capped internally by MAX_TAKE."""
+        is capped internally by MAX_TAKE (a capped result is
+        ``AggregateGroupsTruncated``). ``having`` maps an aggregate name (an
+        ``aggregates`` alias, or the op name for a single ``op``) to bounds
+        (``HavingCmp`` or a dict of eq/ne/gt/gte/lt/lte); it requires
+        ``group_by`` and drops failing groups BEFORE the cap."""
         payload: dict[str, Any] = {"groupBy": group_by}
+        if having is not None:
+            payload["having"] = having
         if op is not None:
             payload["op"] = op
         if aggregates is not None:
@@ -544,7 +553,8 @@ def parse_result(model: type[Any], terminal: str, value: Any) -> Any:
         returns an integer and is never ``None`` — it yields ``0`` over an empty
         set);
         ``aggregateGroups`` → ``list[AggregateGroup]`` (the ``{key, value}``
-        rows from a grouped aggregate);
+        rows from a grouped aggregate), or ``AggregateGroupsTruncated`` when the
+        group cap was hit (same for ``aggregateMultiGroups``);
         ``paginate`` → ``Paginated[model]``.
 
     Raises:
@@ -566,10 +576,20 @@ def parse_result(model: type[Any], terminal: str, value: Any) -> Any:
         # `str`, or `Any` for the scalar shape.
         return None if value is None else _coerce(model, value)
     if terminal == "aggregateGroups":
+        if isinstance(value, dict):
+            return AggregateGroupsTruncated(
+                groups=[AggregateGroup.model_validate(v) for v in value["groups"]],
+                truncated=bool(value.get("truncated", True)),
+            )
         return [AggregateGroup.model_validate(v) for v in value]
     if terminal == "aggregateMulti":
         return dict(value)
     if terminal == "aggregateMultiGroups":
+        if isinstance(value, dict):
+            return AggregateGroupsTruncated(
+                groups=[AggregateMultiGroup.model_validate(v) for v in value["groups"]],
+                truncated=bool(value.get("truncated", True)),
+            )
         return [AggregateMultiGroup.model_validate(v) for v in value]
     if terminal == "paginate":
         docs = [_coerce(model, v) for v in value.get("docs", [])]

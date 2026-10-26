@@ -1,0 +1,96 @@
+{
+  "name": "error-aggregate-having-unknown-aggregate",
+  "$comment": "having must name an aggregates alias (or the op name of a single-op spec); an unknown name is BAD_REQUEST.",
+  "schema": {
+    "tables": {
+      "tasks": {
+        "fields": {
+          "status": {
+            "type": "string"
+          },
+          "n": {
+            "type": "number"
+          },
+          "order": {
+            "type": "number"
+          }
+        },
+        "indexes": [
+          {
+            "name": "by_status_n_order",
+            "fields": [
+              "status",
+              "n",
+              "order"
+            ]
+          },
+          {
+            "name": "by_n",
+            "fields": [
+              "n"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "seed": [
+    {
+      "status": "todo",
+      "n": 1,
+      "order": 1
+    },
+    {
+      "status": "todo",
+      "n": 1,
+      "order": 2
+    },
+    {
+      "status": "todo",
+      "n": 2,
+      "order": 10
+    },
+    {
+      "status": "done",
+      "n": 1,
+      "order": 5
+    },
+    {
+      "status": "done",
+      "n": 3,
+      "order": 7
+    },
+    {
+      "status": "done",
+      "n": 3,
+      "order": 8
+    },
+    {
+      "status": "wip",
+      "n": 1,
+      "order": 4
+    }
+  ],
+  "op": {
+    "query": {
+      "table": "tasks",
+      "index": "by_status_n_order",
+      "aggregate": {
+        "aggregates": {
+          "total": "sum"
+        },
+        "groupBy": true,
+        "having": {
+          "nope": {
+            "gte": 1
+          }
+        }
+      }
+    }
+  },
+  "expect": {
+    "error": {
+      "code": "BAD_REQUEST"
+    }
+  }
+}

@@ -19,6 +19,8 @@
 import { RtDbError } from "../errors.js";
 import { decodeCursor, encodeCursor } from "../pagination.js";
 import type {
+  AggregateGroupsTruncated,
+  AggregateHavingCmp,
   AggregateOp,
   IndexJson,
   Order,
@@ -1268,7 +1270,66 @@ function planAggregate(
       );
     }
   }
+  validateHaving(q.aggregate?.having, ops, resolvedGroups.length > 0, aggregateField, isNumeric);
   return { ops, groupFields: resolvedGroups, legacy, aggregateField };
+}
+
+const HAVING_BOUNDS = ["eq", "ne", "gt", "gte", "lt", "lte"] as const;
+
+/** BAD_REQUEST gates for `having`, mirroring the server's `build_having`. */
+function validateHaving(
+  having: Record<string, AggregateHavingCmp> | undefined,
+  ops: Array<[string, AggregateOp]>,
+  grouped: boolean,
+  aggregateField: string | null,
+  isNumeric: (field: string) => boolean,
+): void {
+  if (having === undefined) return;
+  if (!grouped) throw new RtDbError("BAD_REQUEST", "aggregate having requires groupBy");
+  const entries = Object.entries(having);
+  if (entries.length === 0) {
+    throw new RtDbError("BAD_REQUEST", "aggregate having must not be empty");
+  }
+  for (const [name, cmp] of entries) {
+    const found = ops.find(([alias]) => alias === name);
+    if (!found) {
+      throw new RtDbError("BAD_REQUEST", `aggregate having references unknown aggregate '${name}'`);
+    }
+    if (!HAVING_BOUNDS.some((bound) => cmp[bound] !== undefined)) {
+      throw new RtDbError("BAD_REQUEST", `aggregate having '${name}' needs at least one bound`);
+    }
+    if (found[1] !== "count" && (aggregateField === null || !isNumeric(aggregateField))) {
+      throw new RtDbError("BAD_REQUEST", `aggregate having '${name}' requires a numeric aggregate`);
+    }
+  }
+}
+
+/** True when `cell` (a number, or an int64 decimal string) satisfies every
+ *  bound of every `having` entry. A null aggregate fails, like SQL. */
+function havingKeeps(
+  having: Record<string, AggregateHavingCmp>,
+  cellOf: (name: string) => unknown,
+): boolean {
+  return Object.entries(having).every(([name, cmp]) => {
+    const cell = cellOf(name);
+    if (typeof cell !== "number" && typeof cell !== "string") return false;
+    const n = Number(cell);
+    if (Number.isNaN(n)) return false;
+    return (
+      (cmp.eq === undefined || n === cmp.eq) &&
+      (cmp.ne === undefined || n !== cmp.ne) &&
+      (cmp.gt === undefined || n > cmp.gt) &&
+      (cmp.gte === undefined || n >= cmp.gte) &&
+      (cmp.lt === undefined || n < cmp.lt) &&
+      (cmp.lte === undefined || n <= cmp.lte)
+    );
+  });
+}
+
+/** Caps grouped rows at MAX_TAKE (AFTER `having`); a capped result is
+ *  `{groups, truncated: true}`, an under-cap one stays the bare array. */
+function capGroups<T>(rows: T[]): T[] | AggregateGroupsTruncated<T> {
+  return rows.length > MAX_TAKE ? { groups: rows.slice(0, MAX_TAKE), truncated: true } : rows;
 }
 
 function executeAggregateTerminal(
@@ -1293,19 +1354,20 @@ function executeAggregateTerminal(
     return applyAggregate(aggregateOp, values, indexColumnType(tableDef.fields[aggregateField]).pg);
   };
   if (plan.groupFields.length > 0) {
-    return aggregateGrouped(plan, tableDef, filtered, evaluate);
+    return aggregateGrouped(plan, tableDef, filtered, evaluate, q.aggregate?.having);
   }
   return aggregateScalar(plan, filtered, evaluate);
 }
 
 /** Shapes the grouped result: one row per group sorted by key ascending
  * (legacy boolean groupBy emits `{key, value}`; wire-v2 emits `{keys,
- * values}`), capped by MAX_TAKE. */
+ * values}`), capped by MAX_TAKE after `having`. */
 function aggregateGrouped(
   plan: AggregatePlan,
   tableDef: TableJson,
   filtered: StoredRow[],
   evaluate: (rows: StoredRow[], op: AggregateOp) => unknown,
+  having: Record<string, AggregateHavingCmp> | undefined,
 ): unknown {
   const sorted = groupRows(plan.groupFields, tableDef, filtered);
   if (plan.legacy) {
@@ -1313,19 +1375,27 @@ function aggregateGrouped(
     if (legacyOp === undefined) {
       throw new RtDbError("BAD_REQUEST", "aggregate requires op or aggregates");
     }
-    return sorted.map(({ keys, rows }) => ({ key: keys[0], value: evaluate(rows, legacyOp) }));
+    return capGroups(
+      sorted
+        .map(({ keys, rows }) => ({ key: keys[0], value: evaluate(rows, legacyOp) }))
+        .filter((row) => having === undefined || havingKeeps(having, () => row.value)),
+    );
   }
-  return sorted.map(({ keys, rows }) => ({
-    keys,
-    values: Object.fromEntries(
-      plan.ops.map(([alias, aggregateOp]) => [alias, evaluate(rows, aggregateOp)]),
-    ),
-  }));
+  return capGroups(
+    sorted
+      .map(({ keys, rows }) => ({
+        keys,
+        values: Object.fromEntries(
+          plan.ops.map(([alias, aggregateOp]) => [alias, evaluate(rows, aggregateOp)]),
+        ),
+      }))
+      .filter((row) => having === undefined || havingKeeps(having, (name) => row.values[name])),
+  );
 }
 
 /** Groups `filtered` rows by the resolved groupBy fields (rows missing a
  * field form the SQL NULL group), sorts groups by key ascending per
- * `compareIndexValues`, and caps the group count at MAX_TAKE. */
+ * `compareIndexValues`. The MAX_TAKE cap is applied by the caller. */
 function groupRows(
   groupFields: string[],
   tableDef: TableJson,
@@ -1339,16 +1409,14 @@ function groupRows(
     if (existing) existing.rows.push(row);
     else groups.set(key, { keys, rows: [row] });
   }
-  return [...groups.values()]
-    .sort((a, b) => {
-      for (let i = 0; i < groupFields.length; i++) {
-        const pg = indexColumnType(tableDef.fields[groupFields[i]]).pg;
-        const cmp = compareIndexValues(a.keys[i], b.keys[i], pg);
-        if (cmp !== 0) return cmp;
-      }
-      return 0;
-    })
-    .slice(0, MAX_TAKE);
+  return [...groups.values()].sort((a, b) => {
+    for (let i = 0; i < groupFields.length; i++) {
+      const pg = indexColumnType(tableDef.fields[groupFields[i]]).pg;
+      const cmp = compareIndexValues(a.keys[i], b.keys[i], pg);
+      if (cmp !== 0) return cmp;
+    }
+    return 0;
+  });
 }
 
 /** Shapes the ungrouped result: the bare evaluated value (legacy) or one

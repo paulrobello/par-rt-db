@@ -511,6 +511,74 @@ def _is_number(value: Any) -> bool:
     return isinstance(value, float | int) and not isinstance(value, bool)
 
 
+def _finish_groups(
+    agg: Any,
+    rows: list[dict[str, Any]],
+    operations: dict[str, Any],
+    agg_pg: _PgType,
+    grouped: bool,
+) -> Any:
+    """Finish a grouped aggregate: validate and apply ``having`` (dropping
+    failing groups BEFORE the cap), then cap at ``MAX_TAKE``. A capped result is
+    ``{"groups": [...], "truncated": True}``; an under-cap one stays the bare
+    list. Mirrors the server's ``HAVING`` + ``LIMIT MAX_TAKE + 1``. ``having``
+    on an ungrouped spec is BAD_REQUEST (``grouped`` False, ``rows`` empty).
+    """
+    having = agg.having
+    if having is not None:
+        if not grouped:
+            raise RtDbError(ErrorCode.BAD_REQUEST, "aggregate having requires groupBy")
+        if not having:
+            raise RtDbError(ErrorCode.BAD_REQUEST, "aggregate having must not be empty")
+        for name, cmp in having.items():
+            if name not in operations:
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    f"aggregate having references unknown aggregate '{name}'",
+                )
+            if all(getattr(cmp, b) is None for b in _HAVING_BOUNDS):
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST, f"aggregate having '{name}' needs at least one bound"
+                )
+            if operations[name] != AggregateOp.COUNT and agg_pg not in (_NUMBER, _INT64):
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    f"aggregate having '{name}' requires a numeric aggregate",
+                )
+
+        def keeps(row: dict[str, Any]) -> bool:
+            for name, cmp in having.items():
+                cell = row["values"][name] if "values" in row else row["value"]
+                if isinstance(cell, bool) or not isinstance(cell, (int, float, str)):
+                    return False
+                try:
+                    num = float(cell)
+                except ValueError:
+                    return False
+                if not _having_matches(cmp, num):
+                    return False
+            return True
+
+        rows = [row for row in rows if keeps(row)]
+    if len(rows) > MAX_TAKE:
+        return {"groups": rows[:MAX_TAKE], "truncated": True}
+    return rows
+
+
+_HAVING_BOUNDS = ("eq", "ne", "gt", "gte", "lt", "lte")
+
+
+def _having_matches(cmp: Any, num: float) -> bool:
+    return (
+        (cmp.eq is None or num == cmp.eq)
+        and (cmp.ne is None or num != cmp.ne)
+        and (cmp.gt is None or num > cmp.gt)
+        and (cmp.gte is None or num >= cmp.gte)
+        and (cmp.lt is None or num < cmp.lt)
+        and (cmp.lte is None or num <= cmp.lte)
+    )
+
+
 def _apply_aggregate(op: str, values: list[Any], pg: _PgType) -> Any:
     """Apply one aggregate op over a non-empty list of non-null values, mirroring
     the server's SQL semantics and the TS/Rust harnesses. SUM over an int64
@@ -1547,7 +1615,8 @@ class _QueryEngine(_Core):
                     return 0
 
                 out.sort(key=cmp_to_key(_compare_keys))
-                return out[:MAX_TAKE]
+                return _finish_groups(agg, out, operations, agg_pg, True)
+            _finish_groups(agg, [], operations, agg_pg, False)
             return {alias: values(filtered, op) for alias, op in operations.items()}
         # `count` aggregates rows and consumes no aggregate field.
         op = agg.op
@@ -1630,7 +1699,8 @@ class _QueryEngine(_Core):
             out.sort(
                 key=cmp_to_key(lambda a, b: _compare_index_values(a["key"], b["key"], group_pg))
             )
-            return out[:MAX_TAKE]
+            return _finish_groups(agg, out, {op: op}, agg_pg, True)
+        _finish_groups(agg, [], {op: op}, agg_pg, False)
         # Scalar path: count returns the matching-row count (0 if none);
         # the field-bearing ops reduce their non-null agg values (None if empty).
         if op == AggregateOp.COUNT:

@@ -352,6 +352,7 @@ impl TableQuery {
             op: Some(op),
             aggregates: None,
             group_by: crate::wire::GroupBy::Bool(group_by),
+            having: None,
         });
         self.q
     }
@@ -367,6 +368,7 @@ impl TableQuery {
             op: None,
             aggregates: Some(aggregates),
             group_by,
+            having: None,
         });
         self.q
     }
@@ -379,9 +381,11 @@ impl TableQuery {
             group_by: crate::wire::GroupBy::Fields(
                 fields.iter().map(|field| (*field).to_string()).collect(),
             ),
+            having: None,
         });
         self.q
     }
+
     /// Finish with the cursor-pagination terminal. Pass the previous page's
     /// `next_cursor` (or `None` to start) and the page size. Chains after a
     /// ranked terminal too (ENH-030) — `.search(..).paginate(..)`,
@@ -398,6 +402,26 @@ impl TableQuery {
     /// Finish with no terminal wrapper — return the raw `Query`.
     pub fn build(self) -> Query {
         self.q
+    }
+}
+
+/// Adds a post-group `having` to a query built by one of the `aggregate*`
+/// terminals ([`Query`] is a core type, so this is an extension trait).
+pub trait QueryHavingExt {
+    /// Bound the named aggregate (an `aggregates` alias, or the lowercase op
+    /// name for a single-`op` spec). Groups failing it are dropped before the
+    /// group cap. A no-op on a query with no `aggregate` spec.
+    fn having(self, name: &str, cmp: crate::wire::HavingCmp) -> Query;
+}
+
+impl QueryHavingExt for Query {
+    fn having(mut self, name: &str, cmp: crate::wire::HavingCmp) -> Query {
+        if let Some(spec) = self.aggregate.as_mut() {
+            spec.having
+                .get_or_insert_with(Default::default)
+                .insert(name.to_string(), cmp);
+        }
+        self
     }
 }
 

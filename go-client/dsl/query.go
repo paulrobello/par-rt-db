@@ -130,6 +130,25 @@ func (q TableQuery) Aggregates(aggregates map[string]wire.AggregateOp, groupBy w
 	return q
 }
 
+// Having adds a post-group filter for the named aggregate (an Aggregates alias,
+// or the lowercase op name for a single-op spec). Call after an Aggregate*
+// terminal with a grouped spec; groups failing the bounds are dropped BEFORE
+// the MAX_TAKE group cap. A no-op when no aggregate is set.
+func (q TableQuery) Having(name string, cmp wire.HavingCmp) TableQuery {
+	if q.q.Aggregate == nil {
+		return q
+	}
+	spec := *q.q.Aggregate
+	having := make(map[string]wire.HavingCmp, len(spec.Having)+1)
+	for k, v := range spec.Having {
+		having[k] = v
+	}
+	having[name] = cmp
+	spec.Having = having
+	q.q.Aggregate = &spec
+	return q
+}
+
 // PaginateCursor enables pagination with a prior cursor ("" = first page).
 func (q TableQuery) PaginateCursor(cursor string, numItems int) TableQuery {
 	p := wire.Paginate{NumItems: numItems}

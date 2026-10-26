@@ -29,8 +29,9 @@ pub use par_rt_db_core::wire::FilterExpr;
 // Server-only behavior lives in the extension traits below — the orphan rule
 // forbids inherent impls on these foreign types.
 pub use par_rt_db_core::query::{
-    AggregateGroup, AggregateMultiGroup, AggregateOp, AggregateSpec, GroupBy, HybridSearchQuery,
-    Order, Paginate, Query, SearchMode, SearchQuery, VectorSearchQuery,
+    AggregateGroup, AggregateGroupsTruncated, AggregateMultiGroup, AggregateOp, AggregateSpec,
+    GroupBy, HavingCmp, HybridSearchQuery, Order, Paginate, Query, SearchMode, SearchQuery,
+    VectorSearchQuery,
 };
 
 /// Server-side extension methods on the core [`Query`] (orphan rule: an
@@ -164,6 +165,11 @@ pub enum QueryResult {
     /// alias (or, for a single-`op` spec, the lowercase op name) to its
     /// aggregate. Ordered by group keys ascending, capped by `MAX_TAKE`.
     AggregateMultiGroups(Vec<AggregateMultiGroup>),
+    /// A legacy grouped aggregate that hit the `MAX_TAKE` group cap:
+    /// `{groups, truncated: true}`. Under the cap the bare array is returned.
+    AggregateGroupsTruncated(AggregateGroupsTruncated<AggregateGroup>),
+    /// The wire-v2 grouped analogue of [`QueryResult::AggregateGroupsTruncated`].
+    AggregateMultiGroupsTruncated(AggregateGroupsTruncated<AggregateMultiGroup>),
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

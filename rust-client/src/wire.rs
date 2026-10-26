@@ -611,8 +611,8 @@ pub struct WorkflowInfoFull {
 // `AggregateSpec.group_by` now ALWAYS serializes (`false` included), matching
 // the server and the Go client's "groupBy must always serialize" test.
 pub use par_rt_db_core::query::{
-    AggregateGroup, AggregateMultiGroup, AggregateOp, AggregateSpec, GroupBy, HybridSearchQuery,
-    SearchMode, SearchQuery, VectorSearchQuery,
+    AggregateGroup, AggregateGroupsTruncated, AggregateMultiGroup, AggregateOp, AggregateSpec,
+    GroupBy, HavingCmp, HybridSearchQuery, SearchMode, SearchQuery, VectorSearchQuery,
 };
 
 /// One slot of a mutate-batch response.

@@ -22,9 +22,9 @@ use crate::auth::{PrincipalCtx, authorize_table};
 use crate::db::validate_db_name;
 use crate::ddl::{pg_col, pg_schema, pg_table};
 use crate::dsl::{
-    AggregateGroup, AggregateMultiGroup, AggregateOp, AggregateOpSqlExt, AggregateSpec,
-    AggregateSpecOpsExt, EqBind, GroupBy, Order, Paginate, PaginatedResult, Query, QueryResult,
-    eq_bind_for, eq_binds, filter_matches, row_visible_to,
+    AggregateGroup, AggregateGroupsTruncated, AggregateMultiGroup, AggregateOp, AggregateOpSqlExt,
+    AggregateSpec, AggregateSpecOpsExt, EqBind, GroupBy, Order, Paginate, PaginatedResult, Query,
+    QueryResult, eq_bind_for, eq_binds, filter_matches, row_visible_to,
 };
 use crate::error::RtDbError;
 use crate::pagination::{decode_cursor, encode_cursor};
@@ -709,6 +709,17 @@ fn compile_aggregate_terminal(
         where_conditions,
         filter_binds,
     };
+    let having = build_having(
+        agg,
+        &ops,
+        &expr_for,
+        agg_field_name
+            .as_deref()
+            .and_then(|name| table_def.fields.get(name)),
+        !group_fields.is_empty(),
+        limit_placeholder,
+    )?;
+    let limit_placeholder = having.limit_placeholder;
     // Legacy routing: a single-`op` spec keeps the pre-v2 shapes byte-for-byte.
     if agg.op.is_some()
         && let GroupBy::Bool(grouped) = agg.group_by
@@ -724,6 +735,7 @@ fn compile_aggregate_terminal(
                 group_col,
                 expr_for(ops[0].1),
                 filter,
+                having,
                 limit_placeholder,
                 &pg_schema_name,
                 &table_ident,
@@ -751,6 +763,7 @@ fn compile_aggregate_terminal(
         group_fields.iter().map(|f| pg_col(f)).collect::<Vec<_>>(),
         values_json,
         filter,
+        having,
         limit_placeholder,
         &pg_schema_name,
         &table_ident,
@@ -801,6 +814,7 @@ fn compile_aggregate_multi_groups(
     group_cols: Vec<String>,
     values_json: String,
     filter: FilterBinds,
+    having: HavingSql,
     limit_placeholder: usize,
     pg_schema_name: &str,
     table_ident: &str,
@@ -830,23 +844,93 @@ fn compile_aggregate_multi_groups(
         .collect::<Vec<_>>()
         .join(", ");
     sql.push_str(&format!(
-        " GROUP BY {group_list} ORDER BY {order} LIMIT ${limit_placeholder}",
+        " GROUP BY {group_list}{having} ORDER BY {order} LIMIT ${limit_placeholder}",
         group_list = group_cols
             .iter()
             .map(|c| format!("\"{c}\""))
             .collect::<Vec<_>>()
-            .join(", ")
+            .join(", "),
+        having = having.clause,
     ));
-    let mut all = Vec::with_capacity(binds.len() + range_binds.len() + filter_binds.len() + 1);
+    let mut all = Vec::with_capacity(binds.len() + range_binds.len() + filter_binds.len() + 2);
     all.extend(binds);
     all.extend(range_binds);
     all.extend(filter_binds);
-    all.push(EqBind::I64(i64::from(MAX_TAKE)));
+    all.extend(having.binds);
+    // One past the cap: an extra row is how execution detects truncation.
+    all.push(EqBind::I64(i64::from(MAX_TAKE) + 1));
     Ok(CompiledQuery {
         sql,
         binds: all,
         terminal: "aggregate_multi_groups",
     })
+}
+
+/// The compiled `HAVING` clause (empty when the spec has none), its binds, and
+/// the LIMIT placeholder number that follows them.
+struct HavingSql {
+    clause: String,
+    binds: Vec<EqBind>,
+    limit_placeholder: usize,
+}
+
+/// Compile `agg.having` into `" HAVING CAST(expr AS double precision) op $n …"`.
+/// Names resolve against the evaluated `(alias, op)` pairs. The cast compares
+/// int64 `sum`/`min`/`max` numerically rather than through their `::text`
+/// wire projection. A NULL aggregate fails every bound, like SQL.
+fn build_having(
+    agg: &AggregateSpec,
+    ops: &[(String, AggregateOp)],
+    expr_for: &dyn Fn(AggregateOp) -> String,
+    agg_field_type: Option<&FieldType>,
+    grouped: bool,
+    first_placeholder: usize,
+) -> Result<HavingSql, RtDbError> {
+    let mut out = HavingSql {
+        clause: String::new(),
+        binds: Vec::new(),
+        limit_placeholder: first_placeholder,
+    };
+    let Some(having) = &agg.having else {
+        return Ok(out);
+    };
+    if !grouped {
+        return Err(RtDbError::bad_request("aggregate having requires groupBy"));
+    }
+    if having.is_empty() {
+        return Err(RtDbError::bad_request("aggregate having must not be empty"));
+    }
+    let mut conds = Vec::new();
+    for (name, cmp) in having {
+        let Some((_, op)) = ops.iter().find(|(alias, _)| alias == name) else {
+            return Err(RtDbError::bad_request(format!(
+                "aggregate having references unknown aggregate '{name}'"
+            )));
+        };
+        let bounds = cmp.bounds();
+        if bounds.is_empty() {
+            return Err(RtDbError::bad_request(format!(
+                "aggregate having '{name}' needs at least one bound"
+            )));
+        }
+        if !matches!(op, AggregateOp::Count) && !agg_field_type.is_some_and(is_numeric_index_field)
+        {
+            return Err(RtDbError::bad_request(format!(
+                "aggregate having '{name}' requires a numeric aggregate"
+            )));
+        }
+        for (sql_op, bound) in bounds {
+            out.binds.push(EqBind::Num(bound));
+            conds.push(format!(
+                "CAST({} AS double precision) {sql_op} ${}",
+                expr_for(*op),
+                first_placeholder + out.binds.len() - 1
+            ));
+        }
+    }
+    out.clause = format!(" HAVING {}", conds.join(" AND "));
+    out.limit_placeholder = first_placeholder + out.binds.len();
+    Ok(out)
 }
 
 /// The eq/range/filter binds and their WHERE clause, carved out of
@@ -872,6 +956,7 @@ fn compile_aggregate_grouped(
     group_col: String,
     agg_expr: String,
     filter: FilterBinds,
+    having: HavingSql,
     limit_placeholder: usize,
     pg_schema_name: &str,
     table_ident: &str,
@@ -890,13 +975,16 @@ fn compile_aggregate_grouped(
         sql.push_str(&where_conditions.join(" AND "));
     }
     sql.push_str(&format!(
-        " GROUP BY \"{group_col}\" ORDER BY k LIMIT ${limit_placeholder}"
+        " GROUP BY \"{group_col}\"{having} ORDER BY k LIMIT ${limit_placeholder}",
+        having = having.clause,
     ));
-    let mut all = Vec::with_capacity(binds.len() + range_binds.len() + filter_binds.len() + 1);
+    let mut all = Vec::with_capacity(binds.len() + range_binds.len() + filter_binds.len() + 2);
     all.extend(binds);
     all.extend(range_binds);
     all.extend(filter_binds);
-    all.push(EqBind::I64(i64::from(MAX_TAKE)));
+    all.extend(having.binds);
+    // One past the cap: an extra row is how execution detects truncation.
+    all.push(EqBind::I64(i64::from(MAX_TAKE) + 1));
     Ok(CompiledQuery {
         sql,
         binds: all,
@@ -969,7 +1057,9 @@ pub(crate) async fn execute_aggregate_terminal(
                     EqBind::I64(v) => query.bind(v),
                 };
             }
-            let rows = query.fetch_all(pool).await?;
+            let mut rows = query.fetch_all(pool).await?;
+            let truncated = rows.len() > MAX_TAKE as usize;
+            rows.truncate(MAX_TAKE as usize);
             let groups: Vec<AggregateGroup> = rows
                 .into_iter()
                 .map(|(k, v)| AggregateGroup {
@@ -977,7 +1067,14 @@ pub(crate) async fn execute_aggregate_terminal(
                     value: v,
                 })
                 .collect();
-            Ok(QueryResult::AggregateGroups(groups))
+            Ok(if truncated {
+                QueryResult::AggregateGroupsTruncated(AggregateGroupsTruncated {
+                    groups,
+                    truncated: true,
+                })
+            } else {
+                QueryResult::AggregateGroups(groups)
+            })
         }
         "aggregate" => {
             let _ = terminal; // shape encoded by SQL; tag unused on this path
@@ -1020,7 +1117,9 @@ pub(crate) async fn execute_aggregate_terminal(
                     EqBind::I64(v) => query.bind(v),
                 };
             }
-            let rows = query.fetch_all(pool).await?;
+            let mut rows = query.fetch_all(pool).await?;
+            let truncated = rows.len() > MAX_TAKE as usize;
+            rows.truncate(MAX_TAKE as usize);
             let mut groups = Vec::with_capacity(rows.len());
             for (row,) in rows {
                 let mut parts = match row {
@@ -1045,7 +1144,14 @@ pub(crate) async fn execute_aggregate_terminal(
                     values,
                 });
             }
-            Ok(QueryResult::AggregateMultiGroups(groups))
+            Ok(if truncated {
+                QueryResult::AggregateMultiGroupsTruncated(AggregateGroupsTruncated {
+                    groups,
+                    truncated: true,
+                })
+            } else {
+                QueryResult::AggregateMultiGroups(groups)
+            })
         }
         other => Err(RtDbError::internal(format!(
             "unknown aggregate terminal tag '{other}'"

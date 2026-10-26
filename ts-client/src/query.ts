@@ -1,5 +1,7 @@
 import type {
   AggregateGroup,
+  AggregateGroupsTruncated,
+  AggregateHavingCmp,
   AggregateMultiGroup,
   AggregateOp,
   AggregateSpec,
@@ -224,12 +226,25 @@ export class TableQuery<DocT, Indexes extends string> {
    * no-field-beyond-prefix cases for the field-bearing ops. Mutually exclusive
    * with every other terminal except `eq`/range bounds/`filter` (which narrow
    * the matching set); `take` is also rejected — group count is capped
-   * internally by MAX_TAKE. */
+   * internally by MAX_TAKE (a capped result is `{groups, truncated: true}`).
+   * `having` drops groups whose aggregate fails the bounds BEFORE the cap. */
   aggregate(
     op: AggregateOp,
     groupBy: boolean | string[] = false,
-  ): RtQuery<unknown> | RtQuery<AggregateGroup[] | AggregateMultiGroup[]> {
-    const spec: AggregateSpec = { op, ...(groupBy === false ? {} : { groupBy }) };
+    having?: Record<string, AggregateHavingCmp>,
+  ):
+    | RtQuery<unknown>
+    | RtQuery<
+        | AggregateGroup[]
+        | AggregateMultiGroup[]
+        | AggregateGroupsTruncated<AggregateGroup>
+        | AggregateGroupsTruncated<AggregateMultiGroup>
+      > {
+    const spec: AggregateSpec = {
+      op,
+      ...(groupBy === false ? {} : { groupBy }),
+      ...(having === undefined ? {} : { having }),
+    };
     return { json: { ...this.json, aggregate: spec } };
   }
 
@@ -238,8 +253,15 @@ export class TableQuery<DocT, Indexes extends string> {
   aggregates(
     aggregates: Record<string, AggregateOp>,
     groupBy: boolean | string[] = false,
-  ): RtQuery<Record<string, unknown> | AggregateMultiGroup[]> {
-    const spec: AggregateSpec = { aggregates, ...(groupBy === false ? {} : { groupBy }) };
+    having?: Record<string, AggregateHavingCmp>,
+  ): RtQuery<
+    Record<string, unknown> | AggregateMultiGroup[] | AggregateGroupsTruncated<AggregateMultiGroup>
+  > {
+    const spec: AggregateSpec = {
+      aggregates,
+      ...(groupBy === false ? {} : { groupBy }),
+      ...(having === undefined ? {} : { having }),
+    };
     return { json: { ...this.json, aggregate: spec } };
   }
 

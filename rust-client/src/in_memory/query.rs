@@ -749,6 +749,7 @@ impl InMemoryRtDbClient {
             .and_then(|ty| index_column_type(ty).ok())
             .map(|it| it.pg)
             .unwrap_or(PgType::Text);
+        let numeric_agg = matches!(agg_pg, PgType::Number | PgType::Int64);
         let eval = |op: AggregateOp, values: &[Value]| {
             if matches!(op, AggregateOp::Count) {
                 Value::Number(serde_json::Number::from(values.len() as i64))
@@ -759,6 +760,7 @@ impl InMemoryRtDbClient {
             }
         };
         if group_fields.is_empty() {
+            finish_groups(agg, Vec::new(), true, false)?;
             let values = agg_field
                 .as_deref()
                 .map(|field| {
@@ -801,9 +803,8 @@ impl InMemoryRtDbClient {
                 .find(|ordering| *ordering != std::cmp::Ordering::Equal)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let rows = output
+        let rows: Vec<Value> = output
             .into_iter()
-            .take(MAX_TAKE)
             .map(|(keys, rows)| {
                 let mut values = std::collections::BTreeMap::new();
                 for (alias, op) in &ops {
@@ -837,7 +838,7 @@ impl InMemoryRtDbClient {
                 Value::Object(object)
             })
             .collect();
-        Ok(Value::Array(rows))
+        finish_groups(agg, rows, numeric_agg, true)
     }
 
     /// Legacy scalar-op arm: one `op` over the index field after the eq
@@ -870,7 +871,7 @@ impl InMemoryRtDbClient {
             }
         };
         if matches!(op, AggregateOp::Count) {
-            return self.legacy_count(group_by, idx, eq_len, table_def, filtered);
+            return self.legacy_count(agg, group_by, idx, eq_len, table_def, filtered);
         }
         let (group_field, agg_field) = if group_by {
             if eq_len + 1 >= idx.fields.len() {
@@ -962,9 +963,10 @@ impl InMemoryRtDbClient {
                 })
                 .collect();
             out.sort_by(|a, b| compare_index_values(&a["key"], &b["key"], group_field_pg));
-            let out: Vec<Value> = out.into_iter().take(MAX_TAKE).collect();
-            return Ok(Value::Array(out));
+            let numeric = matches!(agg_field_pg, PgType::Number | PgType::Int64);
+            return finish_groups(agg, out, numeric, true);
         }
+        finish_groups(agg, Vec::new(), true, false)?;
         // Scalar aggregate.
         let values: Vec<Value> = filtered
             .iter()
@@ -983,6 +985,7 @@ impl InMemoryRtDbClient {
     /// scalar count is the number of matching rows.
     fn legacy_count(
         &self,
+        agg: &crate::wire::AggregateSpec,
         group_by: bool,
         idx: &IndexDef,
         eq_len: usize,
@@ -990,6 +993,7 @@ impl InMemoryRtDbClient {
         filtered: &[StoredRow],
     ) -> Result<Value, RtDbError> {
         if !group_by {
+            finish_groups(agg, Vec::new(), true, false)?;
             return Ok(Value::Number(serde_json::Number::from(
                 filtered.len() as i64
             )));
@@ -1042,8 +1046,7 @@ impl InMemoryRtDbClient {
             })
             .collect();
         out.sort_by(|a, b| compare_index_values(&a["key"], &b["key"], group_field_pg));
-        let out: Vec<Value> = out.into_iter().take(MAX_TAKE).collect();
-        Ok(Value::Array(out))
+        finish_groups(agg, out, true, true)
     }
 
     /// `collect` tail of `run_query` — the fallthrough after every standalone
@@ -2691,4 +2694,79 @@ pub(super) fn require_index<'a>(
         .iter()
         .find(|i| i.name == name)
         .ok_or_else(|| RtDbError::new(ErrorCode::BadRequest, format!("index '{name}' not found")))
+}
+
+/// Finish a grouped aggregate result: apply `agg.having` (dropping failing
+/// groups BEFORE the cap), cap at `MAX_TAKE`, and wrap as
+/// `{groups, truncated: true}` only when groups were dropped by the cap.
+/// `having` on an ungrouped spec is BadRequest (`grouped == false`, rows
+/// empty). Rows are `{key, value}` (single op, named by its lowercase op) or
+/// `{keys, values}`. Mirrors the server's HAVING + `LIMIT MAX_TAKE + 1`.
+fn finish_groups(
+    agg: &crate::wire::AggregateSpec,
+    mut rows: Vec<Value>,
+    numeric_agg: bool,
+    grouped: bool,
+) -> Result<Value, RtDbError> {
+    let bad = |msg: String| RtDbError::new(ErrorCode::BadRequest, msg);
+    if let Some(having) = &agg.having {
+        if !grouped {
+            return Err(bad("aggregate having requires groupBy".into()));
+        }
+        if having.is_empty() {
+            return Err(bad("aggregate having must not be empty".into()));
+        }
+        let single = agg.op.map(|op| match op {
+            AggregateOp::Sum => "sum",
+            AggregateOp::Avg => "avg",
+            AggregateOp::Min => "min",
+            AggregateOp::Max => "max",
+            AggregateOp::Count => "count",
+        });
+        for (name, cmp) in having {
+            let op = match (&agg.aggregates, single) {
+                (Some(map), _) => map.get(name).copied(),
+                (None, Some(single)) if single == name => agg.op,
+                _ => None,
+            };
+            let Some(op) = op else {
+                return Err(bad(format!(
+                    "aggregate having references unknown aggregate '{name}'"
+                )));
+            };
+            if cmp.bounds().is_empty() {
+                return Err(bad(format!(
+                    "aggregate having '{name}' needs at least one bound"
+                )));
+            }
+            if !matches!(op, AggregateOp::Count) && !numeric_agg {
+                return Err(bad(format!(
+                    "aggregate having '{name}' requires a numeric aggregate"
+                )));
+            }
+        }
+        rows.retain(|row| {
+            having.iter().all(|(name, cmp)| {
+                let cell = row
+                    .get("values")
+                    .and_then(|values| values.get(name))
+                    .or_else(|| row.get("value"));
+                let number = match cell {
+                    Some(Value::Number(n)) => n.as_f64(),
+                    Some(Value::String(s)) => s.parse::<f64>().ok(),
+                    _ => None,
+                };
+                number.is_some_and(|n| cmp.matches(n))
+            })
+        });
+    }
+    let truncated = rows.len() > MAX_TAKE;
+    rows.truncate(MAX_TAKE);
+    if truncated {
+        let mut object = Map::new();
+        object.insert("groups".to_string(), Value::Array(rows));
+        object.insert("truncated".to_string(), Value::Bool(true));
+        return Ok(Value::Object(object));
+    }
+    Ok(Value::Array(rows))
 }

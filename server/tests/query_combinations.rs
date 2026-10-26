@@ -866,6 +866,7 @@ fn solo_aggregate(q: &mut Query) {
         op: Some(AggregateOp::Min),
         group_by: GroupBy::Bool(false),
         aggregates: None,
+        having: None,
     });
     q.index = Some("by_title".to_string());
 }
@@ -1034,6 +1035,7 @@ fn aggregate_min(q: &mut Query) {
         op: Some(AggregateOp::Min),
         group_by: GroupBy::Bool(false),
         aggregates: None,
+        having: None,
     });
     q.index = Some("by_title".to_string());
 }
@@ -1089,6 +1091,7 @@ fn aggregate_eq(q: &mut Query) {
         op: Some(AggregateOp::Sum),
         group_by: GroupBy::Bool(false),
         aggregates: None,
+        having: None,
     });
     q.index = Some("by_title_count".to_string());
     q.eq.push(json!("x"));
@@ -1098,6 +1101,7 @@ fn aggregate_filter(q: &mut Query) {
         op: Some(AggregateOp::Min),
         group_by: GroupBy::Bool(false),
         aggregates: None,
+        having: None,
     });
     q.index = Some("by_title".to_string());
     q.filter = Some(filter_eq_title_x());
@@ -1303,6 +1307,7 @@ fn hs_aggregate(q: &mut Query) {
         op: Some(AggregateOp::Min),
         group_by: GroupBy::Bool(false),
         aggregates: None,
+        having: None,
     });
 }
 fn hs_paginate(q: &mut Query) {

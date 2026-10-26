@@ -177,6 +177,7 @@ async fn distinct_rejects_conflicting_terminals() {
                     op: Some(AggregateOp::Sum),
                     aggregates: None,
                     group_by: crate::wire::GroupBy::Bool(false),
+                    having: None,
                 }),
                 ..base()
             },
@@ -464,6 +465,7 @@ async fn aggregate_rejects_conflicting_terminals() {
         op: Some(AggregateOp::Sum),
         aggregates: None,
         group_by: crate::wire::GroupBy::Bool(false),
+        having: None,
     };
     // ENH-028: the table-driven evaluator's `terminal-exclusive` rule covers
     // every pair among {aggregate,count,distinct,first,get,paginate,take,

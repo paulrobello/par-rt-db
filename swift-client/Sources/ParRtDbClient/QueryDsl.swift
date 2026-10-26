@@ -230,16 +230,22 @@ public struct TableQuery: Sendable {
     }
 
     /// Aggregate terminal: `op` over the index field after the eq prefix.
+    /// `having` (grouped specs only) drops groups failing the bounds BEFORE the
+    /// group cap; a capped result is `{groups, truncated: true}`.
     /// `groupBy: true` shifts to a grouped aggregate returning `[{key, value}]`.
-    public func aggregate(_ op: AggregateOp, groupBy: Bool = false) -> TableQuery {
-        with { $0.aggregate = AggregateSpec(op: op, groupBy: groupBy) }
+    public func aggregate(
+        _ op: AggregateOp, groupBy: Bool = false, having: [String: HavingCmp]? = nil
+    ) -> TableQuery {
+        with { $0.aggregate = AggregateSpec(op: op, groupBy: groupBy, having: having) }
     }
 
     /// Aggregate terminal with wire-v2 composite groupBy: `op` grouped by the
     /// listed declared index fields (each at or beyond the eq prefix),
     /// returning `[AggregateMultiGroup]` rows keyed by the lowercase op name.
-    public func aggregate(_ op: AggregateOp, groupByFields fields: String...) -> TableQuery {
-        with { $0.aggregate = AggregateSpec(op: op, groupBy: .fields(fields)) }
+    public func aggregate(
+        _ op: AggregateOp, having: [String: HavingCmp]? = nil, groupByFields fields: String...
+    ) -> TableQuery {
+        with { $0.aggregate = AggregateSpec(op: op, groupBy: .fields(fields), having: having) }
     }
 
     /// Wire-v2 multi-op aggregate terminal: several named ops evaluated in
@@ -247,9 +253,10 @@ public struct TableQuery: Sendable {
     /// (`[String: JSONValue]`); with `groupBy: true` or a field list, returns
     /// `[AggregateMultiGroup]` rows.
     public func aggregates(
-        _ aggregates: [String: AggregateOp], groupBy: AggregateGroupBy = .false
+        _ aggregates: [String: AggregateOp], groupBy: AggregateGroupBy = .false,
+        having: [String: HavingCmp]? = nil
     ) -> TableQuery {
-        with { $0.aggregate = AggregateSpec(aggregates: aggregates, groupBy: groupBy) }
+        with { $0.aggregate = AggregateSpec(aggregates: aggregates, groupBy: groupBy, having: having) }
     }
 
     /// Cursor-pagination terminal. Pass the previous page's `nextCursor` (nil
@@ -707,6 +714,19 @@ public func parseResult<T: Codable & Sendable>(
     }
 }
 
+/// A grouped aggregate is a bare array, or `{groups: [...], truncated: true}`
+/// when the `MAX_TAKE` group cap was hit.
+private func isGroupedAggregateShape(_ value: JSONValue) -> Bool {
+    if case .array = value {
+        return true
+    }
+    if case let .object(object) = value, case .array? = object["groups"] {
+        return true
+    }
+    return false
+}
+
+// swiftlint:disable cyclomatic_complexity
 /// Shape gate for `parseResult` — nil when `value` matches the terminal's
 /// `QueryResult` variant, an `RtDbError` describing the mismatch otherwise.
 private func resultShapeError(_ value: JSONValue, terminal: QueryTerminal) -> RtDbError? {
@@ -719,8 +739,9 @@ private func resultShapeError(_ value: JSONValue, terminal: QueryTerminal) -> Rt
     switch terminal {
     case .get, .unique, .first:
         return (value == .null || value.objectValue != nil) ? nil : invalid("an object or null")
-    case .collect, .take, .search, .vectorSearch, .hybridSearch, .distinct, .aggregateGroups,
-         .aggregateMultiGroups:
+    case .aggregateGroups, .aggregateMultiGroups:
+        return isGroupedAggregateShape(value) ? nil : invalid("an array or a {groups, truncated} object")
+    case .collect, .take, .search, .vectorSearch, .hybridSearch, .distinct:
         if case .array = value {
             return nil
         }
@@ -741,6 +762,8 @@ private func resultShapeError(_ value: JSONValue, terminal: QueryTerminal) -> Rt
         return invalid("an object with a docs array")
     }
 }
+
+// swiftlint:enable cyclomatic_complexity
 
 private func describe(_ value: JSONValue) -> String {
     switch value {

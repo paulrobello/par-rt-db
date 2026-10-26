@@ -315,6 +315,79 @@ pub struct AggregateSpec {
     /// (`false` included) — see the struct doc.
     #[serde(default)]
     pub group_by: GroupBy,
+    /// Post-group filter over aggregate values: name → comparison bounds.
+    /// A name is an `aggregates` alias or, for a single-`op` spec, the
+    /// lowercase op name. Bounds on one name AND together, as do names.
+    /// Requires `groupBy`; groups failing it are dropped BEFORE the
+    /// `MAX_TAKE` cap. A NULL aggregate never satisfies a bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub having: Option<std::collections::BTreeMap<String, HavingCmp>>,
+}
+
+/// Comparison bounds for one `having` entry. At least one bound is required;
+/// the aggregate is compared as an `f64`, so only numeric aggregates
+/// (`count`, or `sum`/`avg`/`min`/`max` over a numeric index field) qualify.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HavingCmp {
+    /// Equal to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eq: Option<f64>,
+    /// Not equal to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ne: Option<f64>,
+    /// Greater than.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gt: Option<f64>,
+    /// Greater than or equal to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gte: Option<f64>,
+    /// Less than.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lt: Option<f64>,
+    /// Less than or equal to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lte: Option<f64>,
+}
+
+impl HavingCmp {
+    /// The set bounds as `(sql_operator, bound)` pairs in a fixed order.
+    pub fn bounds(&self) -> Vec<(&'static str, f64)> {
+        [
+            ("=", self.eq),
+            ("<>", self.ne),
+            (">", self.gt),
+            (">=", self.gte),
+            ("<", self.lt),
+            ("<=", self.lte),
+        ]
+        .into_iter()
+        .filter_map(|(op, v)| v.map(|v| (op, v)))
+        .collect()
+    }
+
+    /// True when `value` satisfies every set bound (in-memory engines).
+    pub fn matches(&self, value: f64) -> bool {
+        self.bounds().into_iter().all(|(op, b)| match op {
+            "=" => value == b,
+            "<>" => value != b,
+            ">" => value > b,
+            ">=" => value >= b,
+            "<" => value < b,
+            _ => value <= b,
+        })
+    }
+}
+
+/// Wire shape of a grouped aggregate result that hit the `MAX_TAKE` group cap:
+/// `{"groups": [...], "truncated": true}`. Under the cap the result stays a
+/// bare array (marker omitted), so legacy bytes are unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AggregateGroupsTruncated<T> {
+    /// The first `MAX_TAKE` groups, ordered by group key ascending.
+    pub groups: Vec<T>,
+    /// Always `true` on this shape.
+    pub truncated: bool,
 }
 
 /// One `{key, value}` row from a legacy grouped `aggregate` (`groupBy: true`)
@@ -448,6 +521,7 @@ mod tests {
             op: Some(AggregateOp::Sum),
             aggregates: None,
             group_by: GroupBy::Bool(false),
+            having: None,
         };
         assert_eq!(
             serde_json::to_value(&spec).unwrap(),

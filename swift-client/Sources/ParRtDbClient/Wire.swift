@@ -1791,6 +1791,59 @@ extension AggregateGroupBy: Codable {
     }
 }
 
+/// Mirrors server `HavingCmp` (unknown fields rejected): comparison bounds for
+/// one `having` entry. Bounds on one name AND together; at least one is
+/// required; numeric aggregates only. Unset bounds are omitted on the wire.
+public struct HavingCmp: Equatable, Codable, Sendable {
+    public var eq: Double?
+    public var ne: Double?
+    public var gt: Double?
+    public var gte: Double?
+    public var lt: Double?
+    public var lte: Double?
+
+    public init(
+        eq: Double? = nil, ne: Double? = nil, gt: Double? = nil,
+        gte: Double? = nil, lt: Double? = nil, lte: Double? = nil
+    ) {
+        self.eq = eq
+        self.ne = ne
+        self.gt = gt
+        self.gte = gte
+        self.lt = lt
+        self.lte = lte
+    }
+
+    enum CodingKeys: String, CodingKey, CaseIterable {
+        case eq, ne, gt, gte, lt, lte
+    }
+
+    public init(from decoder: Decoder) throws {
+        try decoder.rejectUnknownKeys("HavingCmp", as: CodingKeys.self)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        eq = try container.decodeIfPresent(Double.self, forKey: .eq)
+        ne = try container.decodeIfPresent(Double.self, forKey: .ne)
+        gt = try container.decodeIfPresent(Double.self, forKey: .gt)
+        gte = try container.decodeIfPresent(Double.self, forKey: .gte)
+        lt = try container.decodeIfPresent(Double.self, forKey: .lt)
+        lte = try container.decodeIfPresent(Double.self, forKey: .lte)
+    }
+}
+
+/// A grouped aggregate result that hit the `MAX_TAKE` group cap:
+/// `{"groups": [...], "truncated": true}`. Under the cap the result stays the
+/// bare array, so decode the `[AggregateGroup]` / `[AggregateMultiGroup]`
+/// array first and fall back to this shape (see `QueryTerminal`).
+public struct AggregateGroupsTruncated<Row: Codable & Equatable & Sendable>: Codable, Equatable, Sendable {
+    public var groups: [Row]
+    public var truncated: Bool
+
+    public init(groups: [Row], truncated: Bool = true) {
+        self.groups = groups
+        self.truncated = truncated
+    }
+}
+
 /// Mirrors server/src/dsl.rs::AggregateSpec — camelCase, unknown fields
 /// rejected. Wire v2: exactly one of `op` (legacy single scalar op) or
 /// `aggregates` (alias -> op map, evaluated in one pass) must be set — both
@@ -1806,30 +1859,40 @@ public struct AggregateSpec: Equatable, Codable, Sendable {
     public var aggregates: [String: AggregateOp]?
     /// Legacy bool or wire-v2 explicit field list; defaults to `.false`.
     public var groupBy: AggregateGroupBy
+    /// Post-group filter over aggregate values: name -> bounds. A name is an
+    /// `aggregates` alias or, for a single-`op` spec, the lowercase op name.
+    /// Requires a grouped spec; failing groups are dropped BEFORE the cap.
+    public var having: [String: HavingCmp]?
 
     /// Legacy single-op constructor.
-    public init(op: AggregateOp, groupBy: Bool = false) {
+    public init(op: AggregateOp, groupBy: Bool = false, having: [String: HavingCmp]? = nil) {
         self.op = op
         aggregates = nil
         self.groupBy = .bool(groupBy)
+        self.having = having
     }
 
     /// Wire-v2 multi-op constructor: several named ops in one pass.
-    public init(aggregates: [String: AggregateOp], groupBy: AggregateGroupBy = .false) {
+    public init(
+        aggregates: [String: AggregateOp], groupBy: AggregateGroupBy = .false,
+        having: [String: HavingCmp]? = nil
+    ) {
         op = nil
         self.aggregates = aggregates
         self.groupBy = groupBy
+        self.having = having
     }
 
     /// Wire-v2 single-op with composite groupBy constructor.
-    public init(op: AggregateOp, groupBy: AggregateGroupBy) {
+    public init(op: AggregateOp, groupBy: AggregateGroupBy, having: [String: HavingCmp]? = nil) {
         self.op = op
         aggregates = nil
         self.groupBy = groupBy
+        self.having = having
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
-        case op, aggregates, groupBy
+        case op, aggregates, groupBy, having
     }
 
     public init(from decoder: Decoder) throws {
@@ -1838,6 +1901,7 @@ public struct AggregateSpec: Equatable, Codable, Sendable {
         op = try container.decodeIfPresent(AggregateOp.self, forKey: .op)
         aggregates = try container.decodeIfPresent([String: AggregateOp].self, forKey: .aggregates)
         groupBy = try container.decodeIfPresent(AggregateGroupBy.self, forKey: .groupBy) ?? .false
+        having = try container.decodeIfPresent([String: HavingCmp].self, forKey: .having)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -1849,5 +1913,6 @@ public struct AggregateSpec: Equatable, Codable, Sendable {
         if groupBy != .false || op != nil {
             try container.encode(groupBy, forKey: .groupBy)
         }
+        try container.encodeIfPresent(having, forKey: .having)
     }
 }

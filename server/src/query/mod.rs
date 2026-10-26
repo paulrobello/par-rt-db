@@ -43,9 +43,9 @@ use terminals::{
 // now; re-exported so every `crate::query::` path (and the integration
 // tests' `rtdb_server::query::` paths) keep resolving unchanged.
 pub use crate::dsl::{
-    AggregateGroup, AggregateMultiGroup, AggregateOp, AggregateSpec, FilterExpr, GroupBy,
-    HybridSearchQuery, Order, Paginate, PaginatedResult, Query, QueryResult, SearchMode,
-    SearchQuery, VectorSearchQuery, filter_matches,
+    AggregateGroup, AggregateGroupsTruncated, AggregateMultiGroup, AggregateOp, AggregateSpec,
+    FilterExpr, GroupBy, HavingCmp, HybridSearchQuery, Order, Paginate, PaginatedResult, Query,
+    QueryResult, SearchMode, SearchQuery, VectorSearchQuery, filter_matches,
 };
 // ARC-203: the compile/execute surface that used to live in this single file.
 pub(crate) use filter::{compile_filter, compile_filter_literal, compile_scan_where};

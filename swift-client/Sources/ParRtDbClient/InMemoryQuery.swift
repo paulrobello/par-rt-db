@@ -1393,6 +1393,10 @@ private func executeAggregateTerminal(
         }
     }
     let aggFieldPg: PgType? = try aggField.map { try indexColumnType(requireFieldType(tableDef, $0)).pg }
+    try validateHaving(
+        aggregate.having, ops: ops.map { ($0.alias, $0.op) }, grouped: !groupFields.isEmpty,
+        numericAgg: aggField.map(isNumeric) ?? false
+    )
 
     func evaluate(_ rows: [StoredRow], _ op: AggregateOp) -> JSONValue {
         if op == .count {
@@ -1432,19 +1436,18 @@ private func executeAggregateTerminal(
             }
             return false
         }
-        let sorted = groups.prefix(maxQueryTake)
         if legacy, case .bool(true) = aggregate.groupBy {
-            return .array(sorted.map { group in
+            return finishGroups(groups.map { group in
                 .object(["key": group.keys[0], "value": evaluate(group.rows, ops[0].op)])
-            })
+            }, having: aggregate.having)
         }
-        return .array(sorted.map { group in
+        return finishGroups(groups.map { group in
             var values: [String: JSONValue] = [:]
             for entry in ops {
                 values[entry.alias] = evaluate(group.rows, entry.op)
             }
             return .object(["keys": .array(group.keys), "values": .object(values)])
-        })
+        }, having: aggregate.having)
     }
     if legacy {
         return evaluate(filtered, ops[0].op)

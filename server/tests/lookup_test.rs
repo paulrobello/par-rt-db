@@ -511,6 +511,7 @@ async fn lookups_with_docless_terminals_are_bad_request() {
         op: Some(rtdb_server::query::AggregateOp::Count),
         aggregates: None,
         group_by: rtdb_server::query::GroupBy::Bool(false),
+        having: None,
     });
     assert_eq!(
         err_code(run_query(&state, &db.0, &base, &PrincipalCtx::bypass()).await),

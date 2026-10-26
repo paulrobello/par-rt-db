@@ -59,6 +59,7 @@ type (
 	AggregateOp       = wire.AggregateOp
 	AggregateSpec     = wire.AggregateSpec
 	AggregateGroup    = wire.AggregateGroup
+	HavingCmp         = wire.HavingCmp
 	PaginatedResult   = wire.PaginatedResult
 )
 
