@@ -55,6 +55,7 @@ Full detail and reasoning: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The one
 - **Hot config is live**: runtime-mutable settings live on `AppState` as `Arc<ArcSwap<HotConfig>>` (`config/`, hot row in `config/hot.rs`); every consumer reads `state.runtime.hot.load()`.
 - No `unwrap()`/`expect()` outside `#[cfg(test)]`, enforced by clippy. Zero clippy warnings under `-D warnings`.
 - **Keep docs in sync**: when a feature lands or changes, update `FEATURE_MATRIX.md`, the relevant README(s)/docs, and any skill that documents par-rt-db's surface. A stale doc that contradicts the code is a bug.
+- **Keep the published feature-spec artifact in sync** (same trigger as the docs rule): the public-facing spec + comparison page lives in par-artifacts as `01a17926157b7422ab378097590cd5d5` ("par-rt-db — Feature Spec & Database Landscape"). When a behavior- or surface-changing change lands, refresh it in the same session: pull the current HTML with `bun skill/publish-artifact/cli.ts cat 01a17926157b7422ab378097590cd5d5 > /tmp/par-rt-db-spec/index.html` (run from `~/Repos/par-artifacts`, which provides the `.env`), edit the relevant sections (TL;DR chips/stats, feature cards, comparison tables), and republish with `bun skill/publish-artifact/cli.ts update 01a17926157b7422ab378097590cd5d5 /tmp/par-rt-db-spec/index.html`. Doc-only changes don't need it.
 
 ## Deployment
 
