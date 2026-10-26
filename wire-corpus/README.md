@@ -6,7 +6,7 @@ implementations honest against each other. Three artifacts live here:
 - [`golden-vector.json`](golden-vector.json) — the **wire/behavior parity
   vector** for the query DSL over one shared seeded dataset (added by
   QA-001/QA-103). Catches wire-shape, sort-comparator, boundary, terminal, and
-  filter-semantics divergence across the six implementations.
+  filter-semantics divergence across the seven implementations.
 - [`semantics/`](semantics/) — the **behavioral-semantics corpus** (ENH-023):
   one JSON file per case, each self-contained (own schema + seed + operation +
   expected result), covering behavior the golden vector does not — transactions
@@ -16,14 +16,14 @@ implementations honest against each other. Three artifacts live here:
 - [`wire-corpus.json`](wire-corpus.json) — the **wire-shape parity corpus**
   (ARC-008): client/server messages, authed users, schedule whens/infos, and
   queries that every wire implementation must encode/decode value-identically —
-  and the same unknown fields must be rejected. Run by the server and all five
-  clients (ts/rust/python/swift/go), so a drifted wire type fails whichever
+  and the same unknown fields must be rejected. Run by the server and all six
+  clients (ts/rust/python/swift/go/kotlin), so a drifted wire type fails whichever
   package drifted.
 - [`error-codes.json`](error-codes.json) — the **error-code parity corpus**
   (ARC-017): the full `{code, httpStatus}` list for every `RtDbError` wire
   code, generated from `server/src/error.rs`'s `ErrorCode` enum. The
-  `ErrorCode` enum is a seventh hand-mirrored surface (server + five clients);
-  this corpus is what checks the six lists actually agree, so a code added to
+  `ErrorCode` enum is an eighth hand-mirrored surface (server + six clients);
+  this corpus is what checks the seven lists actually agree, so a code added to
   the server can't silently go unknown to a client. See
   [Error-code parity](#error-code-parity) below.
 - [`query-combinations.json`](query-combinations.json) — the **query
@@ -36,7 +36,7 @@ implementations honest against each other. Three artifacts live here:
   pins* the rules every runner's hand-written checker already enforces
   (`compile_query` on the server; `check_query_combinations`/
   `checkQueryCombinations`/`_check_query_combinations` plus each engine's
-  terminal executors on the five clients) — a later phase replaces those six
+  terminal executors on the six clients) — a later phase replaces those seven
   checkers with one evaluator that reads this table. See
   [Query combination rules](#query-combination-rules) below.
 
@@ -74,7 +74,7 @@ for the other five engines. A semantics change without a fixture fails review
 the same way an untested code change does.
 
 When a behavior is already pinned by a case, CHANGE the existing case in the
-same commit as the server change — all six runners consume the files directly,
+same commit as the server change — all seven runners consume the files directly,
 so a deliberate semantic flip turns exactly the cases that pinned the old
 behavior red until the fixture is updated. Never delete a case to make a runner
 green; either the client is wrong or the fixture is stale.
@@ -342,7 +342,7 @@ TS and Rust don't model an HTTP status per code,
 
 `query-combinations.json` is the declarative source of truth for which
 clauses of the read `Query` DSL may not be set together — the rule set that
-`server/src/query/mod.rs`/`terminals.rs`'s `compile_query`, the five clients'
+`server/src/query/mod.rs`/`terminals.rs`'s `compile_query`, the six clients'
 `check_query_combinations`/`checkQueryCombinations`/
 `_check_query_combinations` (plus, in every client, the `get`/`vectorSearch`/
 `hybridSearch`/`search` terminal-executor guards those functions don't own)
