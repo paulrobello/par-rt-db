@@ -180,9 +180,9 @@ private func loadFixture() throws -> GoldenFixture {
 
 // MARK: - Dataset construction
 
+// swiftformat:disable redundantReturn
 /// Translate the fixture's field-type shorthand into a `FieldType`. Only the
 /// types the fixture uses are implemented; a new shorthand fails loudly.
-// swiftformat:disable redundantReturn
 private func fieldType(fromShorthand shorthand: String) throws -> FieldType {
     switch shorthand {
     case "string": return .string

@@ -161,7 +161,11 @@ keys projected out:
     (Postgres `GROUP BY` includes the SQL NULL group under `NULLS LAST`), and
     a group whose aggregate input is entirely NULL aggregates to
     `value: null` (SQL aggregates ignore NULL rows, so a partially-present
-    group aggregates the present values)
+    group aggregates the present values). An optional `having` map filters
+    groups by a predicate over aggregate values (compiled to SQL `HAVING`;
+    the result cap applies after it), and a grouped result at the result cap
+    comes back as `{"groups": [...], "truncated": true}` instead of a bare
+    array — under the cap the bare array form is unchanged
 - **txn op** — array of per-step results: `insert` → `{"id"}`; `patch`,
   `replace`, `delete`, `undelete`, `expectVersion`, `expectAbsent` → `null`;
   `upsert` → `{"id", "inserted"}`; `patchByQuery` → `{"patched", "truncated"}`;
