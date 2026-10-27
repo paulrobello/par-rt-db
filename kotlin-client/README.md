@@ -10,9 +10,10 @@ build schema values that serialize to the exact server `SchemaDef`.
 JVM-first: Kotlin Multiplatform is deferred. The core layers (wire, DSL,
 in-memory engine, admin DTOs) are pure Kotlin + kotlinx-serialization; the
 network layer (`RtDbHttpClient`, `AdminClient`, `RtDbWsClient`) uses
-`java.net.http`, so Android support requires API 26+ (`java.util.Base64`)
-or a transport adapter (OkHttp/Ktor) — API 26 is the current support floor;
-a pluggable adapter is tracked as follow-up work on the board.
+`java.net.http`, which Android does not provide at any API level. Android
+network support therefore requires a transport adapter such as OkHttp or
+Ktor. The cursor codec also requires API 26+ (`java.util.Base64`) unless
+backported. The current network clients are JVM-only.
 
 ## Surfaces
 
