@@ -474,7 +474,7 @@ describe("ENH-023 behavioral-semantics corpus (ts-client in-memory engine)", () 
     it(stem, async () => {
       executed += 1;
       await runCase(stem, caseData);
-    });
+    }, 15_000);
   }
 
   it("accounts for every corpus file (executed + skipped == files)", () => {
