@@ -1,6 +1,7 @@
 package dev.parrtdb.ws
 
 import dev.parrtdb.http.await
+import dev.parrtdb.transport.WsSession
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.WebSocket
@@ -17,10 +18,10 @@ class WsClosedException(val code: Int, val reason: String, cause: Throwable? = n
  * Fragmented frames (`last == false`) are reassembled before delivery. The channel closes with a
  * [WsClosedException] cause when the socket ends.
  */
-internal class WsConnection private constructor(private val ws: WebSocket, val incoming: Channel<String>) {
+internal class WsConnection private constructor(private val ws: WebSocket, override val incoming: Channel<String>) : WsSession {
     private val writeLock = kotlinx.coroutines.sync.Mutex()
 
-    suspend fun send(text: String) {
+    override suspend fun send(text: String) {
         try {
             writeLock.withLockCompat { ws.sendText(text, true).await() }
         } catch (e: java.io.IOException) {
@@ -33,12 +34,12 @@ internal class WsConnection private constructor(private val ws: WebSocket, val i
      * Liveness probe for the heartbeat. The JDK client does not always call the listener when the peer
      * drops the TCP connection without a close frame, so a closed input or output side is reported here.
      */
-    fun checkAlive() {
+    override fun checkAlive() {
         if (ws.isInputClosed || ws.isOutputClosed) incoming.close(WsClosedException(1006, "connection lost"))
     }
 
     /** Best-effort graceful close, then abort so a silent peer cannot hold the socket open. */
-    suspend fun close() {
+    override suspend fun close() {
         withTimeoutOrNull(1000) { runCatching { ws.sendClose(WebSocket.NORMAL_CLOSURE, "").await() } }
         ws.abort()
     }

@@ -8,12 +8,27 @@ an admin control-plane client and an in-memory test engine. No codegen: you
 build schema values that serialize to the exact server `SchemaDef`.
 
 JVM-first: Kotlin Multiplatform is deferred. The core layers (wire, DSL,
-in-memory engine, admin DTOs) are pure Kotlin + kotlinx-serialization; the
-network layer (`RtDbHttpClient`, `AdminClient`, `RtDbWsClient`) uses
-`java.net.http`, which Android does not provide at any API level. Android
-network support therefore requires a transport adapter such as OkHttp or
-Ktor. The cursor codec also requires API 26+ (`java.util.Base64`) unless
-backported. The current network clients are JVM-only.
+in-memory engine, admin DTOs) are pure Kotlin + kotlinx-serialization. The
+network layer (`RtDbHttpClient`, `AdminClient`, `RtDbWsClient`) runs over a
+pluggable transport (`dev.parrtdb.transport`): `JdkTransport` (the default,
+`java.net.http`, JVM only) or `OkHttpTransport` (OkHttp 4.x).
+
+**Android: supported at minSdk 26.** `java.net.http` does not exist on Android
+at any API level, so pass an `OkHttpTransport` to every network client. The
+floor is 26 because the cursor codec uses `java.util.Base64`. OkHttp is a
+`compileOnly` dependency of this library: add `com.squareup.okhttp3:okhttp:4.12.0`
+(or newer 4.x) to your app.
+
+```kotlin
+val transport = OkHttpTransport(okHttpClient) // your configured OkHttpClient
+val db = RtDbHttpClient(baseUrl, "app", token, transport)
+val admin = AdminClient(baseUrl, adminKey, transport)
+val ws = RtDbWsClient(wsUrl, "app", { token }, WsOptions(), transport)
+```
+
+Custom transports implement `HttpTransport` (one buffered request/response)
+and/or `WsTransport`/`WsSession`. The `java.net.http.HttpClient` constructor
+overloads remain for JVM callers.
 
 ## Surfaces
 
@@ -22,7 +37,8 @@ backported. The current network clients are JVM-only.
 | `wire` | The wire vocabulary: strict-decoding JSON values, envelope types, `Query`/`FilterExpr`/`ValueExpr`, `Transaction`/`Step`, errors. Unknown fields rejected on decode, mirroring the server's `deny_unknown_fields`. |
 | `dsl` | Builders: table queries, filter/value-expr constructors, `MutationBuilder`, schema DSL, cursor codec. |
 | `errors` | The `ErrorCode` enum mirroring `server/src/error.rs`, `{code, message}` `RtDbError`. |
-| `http` | One-shot HTTP client (queries, mutate, schedules, storage) over `java.net.http`. |
+| `http` | One-shot HTTP client (queries, mutate, schedules, storage) over a pluggable transport. |
+| `transport` | `HttpTransport`/`WsTransport` interfaces, `JdkTransport` (default) and `OkHttpTransport` (Android). |
 | `ws` | Reactive WebSocket client over `/sync`: `Flow` live-query subscriptions, presence, mutate-over-WS. |
 | `admin` | The `/admin/*` control plane: db lifecycle, schema push, tokens, admin query/mutate, workflows, schedules. |
 | `inmemory` | The in-memory engine — server-identical semantics for tests (schema validation, queries, transactions, presence, subscriptions). |

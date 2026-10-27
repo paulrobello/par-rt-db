@@ -26,6 +26,8 @@ import dev.parrtdb.wire.jsonBool
 import dev.parrtdb.wire.jsonNum
 import dev.parrtdb.wire.jsonObj
 import dev.parrtdb.wire.jsonStr
+import dev.parrtdb.transport.HttpTransport
+import dev.parrtdb.transport.JdkTransport
 import java.net.http.HttpClient
 import kotlinx.serialization.json.JsonElement
 
@@ -34,8 +36,11 @@ import kotlinx.serialization.json.JsonElement
  * Dynamic path segments are injected raw (like Go), so callers must pass trusted db names and ids.
  * Failures with status >= 400 throw [RtDbException].
  */
-class AdminClient(baseUrl: String, adminKey: String, http: HttpClient = HttpClient.newHttpClient()) {
-    internal val core = HttpCore(baseUrl, adminKey, http)
+class AdminClient(baseUrl: String, adminKey: String, transport: HttpTransport = JdkTransport()) {
+    /** JVM convenience: runs over the given `java.net.http` client. */
+    constructor(baseUrl: String, adminKey: String, http: HttpClient) : this(baseUrl, adminKey, JdkTransport(http))
+
+    internal val core = HttpCore(baseUrl, adminKey, transport)
 
     private suspend fun ack(method: String, path: String, body: JsonElement? = null) {
         if (!okOf(core.json(method, path, body), "admin ack")) throw RtDbException(ErrorCode.INTERNAL, "admin request returned ok=false")

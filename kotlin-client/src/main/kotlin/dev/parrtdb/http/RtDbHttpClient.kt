@@ -2,6 +2,8 @@ package dev.parrtdb.http
 
 import dev.parrtdb.errors.ErrorCode
 import dev.parrtdb.errors.RtDbException
+import dev.parrtdb.transport.HttpTransport
+import dev.parrtdb.transport.JdkTransport
 import dev.parrtdb.wire.AuthedUser
 import dev.parrtdb.wire.ChangeFeedResponse
 import dev.parrtdb.wire.Query
@@ -34,9 +36,12 @@ class RtDbHttpClient(
     baseUrl: String,
     val db: String,
     token: String,
-    http: HttpClient = HttpClient.newHttpClient(),
+    transport: HttpTransport = JdkTransport(),
 ) {
-    private val core = HttpCore(baseUrl, token, http)
+    /** JVM convenience: runs over the given `java.net.http` client. */
+    constructor(baseUrl: String, db: String, token: String, http: HttpClient) : this(baseUrl, db, token, JdkTransport(http))
+
+    private val core = HttpCore(baseUrl, token, transport)
     private val baseUrl: String get() = core.baseUrl
 
     // ---- queries -------------------------------------------------------------------------

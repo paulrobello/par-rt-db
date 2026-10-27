@@ -4,10 +4,9 @@ import dev.parrtdb.errors.ErrorCode
 import dev.parrtdb.errors.RtDbException
 import dev.parrtdb.wire.PROTOCOL_VERSION
 import dev.parrtdb.wire.WireJson
-import java.net.URI
-import java.net.http.HttpClient
-import java.net.http.HttpRequest
-import java.net.http.HttpResponse
+import dev.parrtdb.transport.HttpTransport
+import dev.parrtdb.transport.TransportRequest
+import dev.parrtdb.transport.TransportResponse
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -18,7 +17,7 @@ import kotlinx.serialization.json.JsonPrimitive
  * every status >= 400 response decodes the `{code,message,retryAfter}` envelope into an
  * [RtDbException].
  */
-internal class HttpCore(baseUrl: String, private val token: String, private val http: HttpClient) {
+internal class HttpCore(baseUrl: String, private val token: String, private val http: HttpTransport) {
     val baseUrl: String = baseUrl.trimEnd('/')
 
     suspend fun execute(
@@ -27,13 +26,12 @@ internal class HttpCore(baseUrl: String, private val token: String, private val 
         body: ByteArray?,
         contentType: String?,
         bearer: String? = token,
-    ): HttpResponse<ByteArray> {
-        val publisher = if (body != null) HttpRequest.BodyPublishers.ofByteArray(body) else HttpRequest.BodyPublishers.noBody()
-        val builder = HttpRequest.newBuilder(URI.create(baseUrl + path)).method(method, publisher)
-        if (bearer != null) builder.header("Authorization", "Bearer $bearer")
-        builder.header("X-Rtdb-Protocol", PROTOCOL_VERSION.toString())
-        if (contentType != null) builder.header("Content-Type", contentType)
-        return http.sendAsync(builder.build(), HttpResponse.BodyHandlers.ofByteArray()).await()
+    ): TransportResponse {
+        val headers = LinkedHashMap<String, String>()
+        if (bearer != null) headers["Authorization"] = "Bearer $bearer"
+        headers["X-Rtdb-Protocol"] = PROTOCOL_VERSION.toString()
+        if (contentType != null) headers["Content-Type"] = contentType
+        return http.send(TransportRequest(method, baseUrl + path, headers, body))
     }
 
     /** Sends and returns the 2xx body bytes undecoded. */
@@ -45,8 +43,8 @@ internal class HttpCore(baseUrl: String, private val token: String, private val 
         bearer: String? = token,
     ): ByteArray {
         val resp = execute(method, path, body, contentType, bearer)
-        if (resp.statusCode() >= 400) throw envelopeError(resp.statusCode(), resp.body())
-        return resp.body()
+        if (resp.status >= 400) throw envelopeError(resp.status, resp.body)
+        return resp.body
     }
 
     /** Sends an optional JSON body and decodes the 2xx JSON response. */

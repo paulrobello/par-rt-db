@@ -112,7 +112,7 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 | **Python client** | [`python-client/`](python-client) | Python (`par-rt-db`, uv) | Python SDK: wire + schema/mutation/query DSL + sync HTTP/admin/storage + reactive WS |
 | **Swift client** | [`swift-client/`](swift-client) | Swift 6 (`ParRtDbClient`/`ParRtDbUI`, SPM) | iOS 17+/macOS 14 SDK: wire + query/mutation/schema DSL + HTTP + reactive WS + SwiftUI `LiveQuery` (Darwin only) |
 | **Go client** | [`go-client/`](go-client) | Go 1.23+ (`github.com/paulrobello/par-rt-db/go-client`) | Go SDK: wire + schema DSL + typed HTTP queries + reactive WS + admin client + in-memory engine |
-| **Kotlin client** | [`kotlin-client/`](kotlin-client) | Kotlin 2.4 (JVM 17+ bytecode, Gradle) | JVM/Android-core SDK: wire + query/mutation/schema DSL + HTTP + reactive WS (`Flow`) + admin client + in-memory engine |
+| **Kotlin client** | [`kotlin-client/`](kotlin-client) | Kotlin 2.4 (JVM 17+ bytecode, Gradle) | JVM + Android (minSdk 26, via the OkHttp transport) SDK: wire + query/mutation/schema DSL + HTTP + reactive WS (`Flow`) + admin client + in-memory engine |
 | **Dashboard** | [`dashboard/`](dashboard) | Vite + React 19 + TS (bun) | Operator console SPA served same-origin at `RTDB_STATIC_DIR` |
 | **`rtdb` CLI** | [`cli/`](cli) | Rust (`rtdb` binary, cargo) | Operator/CI wrapper around `par-rt-db-client`: list/create dbs, push schema, query/mutate, mint/revoke tokens |
 

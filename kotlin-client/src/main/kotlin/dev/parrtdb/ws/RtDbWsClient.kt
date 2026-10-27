@@ -17,7 +17,9 @@ import dev.parrtdb.wire.WireJson
 import dev.parrtdb.wire.WorkflowInfo
 import dev.parrtdb.wire.WorkflowSpec
 import dev.parrtdb.wire.WorkflowStatus
-import java.net.URI
+import dev.parrtdb.transport.JdkTransport
+import dev.parrtdb.transport.WsSession
+import dev.parrtdb.transport.WsTransport
 import java.net.http.HttpClient
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
@@ -76,8 +78,12 @@ class RtDbWsClient(
     private val db: String,
     private val tokens: suspend () -> String,
     private val options: WsOptions = WsOptions(),
-    private val http: HttpClient = HttpClient.newHttpClient(),
+    private val transport: WsTransport = JdkTransport(),
 ) {
+    /** JVM convenience: runs over the given `java.net.http` client. */
+    constructor(wsUrl: String, db: String, tokens: suspend () -> String, options: WsOptions, http: HttpClient) :
+        this(wsUrl, db, tokens, options, JdkTransport(http))
+
     private class Sub(val id: String, val query: Query, val updates: Channel<JsonElement>)
 
     private class Room(val name: String, var state: JsonElement?) {
@@ -90,7 +96,7 @@ class RtDbWsClient(
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val lock = Any()
-    private var conn: WsConnection? = null
+    private var conn: WsSession? = null
     private var closed = false
     private var manager: Job? = null
     private val subs = HashMap<String, Sub>()
@@ -129,9 +135,9 @@ class RtDbWsClient(
 
     private data class Quad<A, B, C, D>(val a: A, val b: B, val c: C, val d: D)
 
-    private suspend fun establish(): WsConnection {
+    private suspend fun establish(): WsSession {
         val token = tokens()
-        val c = WsConnection.dial(http, URI.create(wsUrl))
+        val c = transport.connect(wsUrl)
         try {
             c.send(ClientMessage.Auth(token, db, PROTOCOL_VERSION).toJson().let { WireJson.encode(it) })
             val first = withTimeout(options.authTimeoutMs) { c.incoming.receive() }
@@ -146,8 +152,8 @@ class RtDbWsClient(
         }
     }
 
-    private suspend fun run(first: WsConnection) {
-        var c: WsConnection = first
+    private suspend fun run(first: WsSession) {
+        var c: WsSession = first
         val base = options.backoffBaseMs
         while (scope.isActive) {
             val hb = scope.launch { heartbeat() }
@@ -182,7 +188,7 @@ class RtDbWsClient(
     }
 
     /** Reads frames until the socket ends; returns the loss reason. */
-    private suspend fun pump(c: WsConnection): Throwable {
+    private suspend fun pump(c: WsSession): Throwable {
         try {
             for (text in c.incoming) {
                 val msg = try { ServerMessage.fromJson(WireJson.parse(text)) } catch (e: Exception) { continue }
@@ -205,7 +211,7 @@ class RtDbWsClient(
         }
     }
 
-    private suspend fun replay(c: WsConnection) {
+    private suspend fun replay(c: WsSession) {
         val (subList, roomList, feedFrames) =
             synchronized(lock) {
                 Triple(
