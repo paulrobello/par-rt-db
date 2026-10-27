@@ -220,6 +220,18 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     .execute(&mut *conn)
     .await?;
 
+    // Stable, non-reusable creation identity minted per `create_database`. A
+    // deleted-and-recreated name gets a fresh value, so `drop_database_if` can
+    // refuse to delete a replacement. The volatile default populates existing
+    // rows (each distinct) when the column is first added.
+    sqlx::query(
+        "ALTER TABLE rtdb_auth.databases \
+         ADD COLUMN IF NOT EXISTS creation_id text NOT NULL \
+         DEFAULT replace(gen_random_uuid()::text, '-', '')",
+    )
+    .execute(&mut *conn)
+    .await?;
+
     // Per-database read-only freeze: when TRUE, the committer's Mutate arm
     // rejects every client-plane document write with READ_ONLY while reads,
     // subscriptions, admin surfaces, and system writes (scheduled fires,
@@ -675,8 +687,9 @@ pub const EXTENSION_LOCK_KEY: i64 = 727_002;
 
 /// Registers a new tenant database: validates `name`, creates its Postgres schema
 /// and `meta` table, and records it in the `rtdb_auth.databases` registry, all in
-/// one transaction.
-pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError> {
+/// one transaction. Returns the database's creation identity (see
+/// `rtdb_auth.databases.creation_id`).
+pub async fn create_database(pool: &PgPool, name: &str) -> Result<String, RtDbError> {
     validate_db_name(name)?;
 
     let mut tx = pool.begin().await?;
@@ -836,15 +849,29 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
     .execute(&mut *tx)
     .await?;
 
-    sqlx::query("INSERT INTO rtdb_auth.databases (name, created_at) VALUES ($1, $2)")
-        .bind(name)
-        .bind(now_ms())
-        .execute(&mut *tx)
-        .await
-        .map_err(map_duplicate_database_error)?;
+    let creation_id = new_id();
+    sqlx::query(
+        "INSERT INTO rtdb_auth.databases (name, created_at, creation_id) VALUES ($1, $2, $3)",
+    )
+    .bind(name)
+    .bind(now_ms())
+    .bind(&creation_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_duplicate_database_error)?;
 
     tx.commit().await?;
-    Ok(())
+    Ok(creation_id)
+}
+
+/// The creation identity of a registered database, or `None` if unregistered.
+pub async fn creation_id(pool: &PgPool, name: &str) -> Result<Option<String>, RtDbError> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT creation_id FROM rtdb_auth.databases WHERE name = $1")
+            .bind(name)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(id,)| id))
 }
 
 /// Drops a tenant database: validates `name`, requires it exists, then in one
@@ -858,17 +885,36 @@ pub async fn create_database(pool: &PgPool, name: &str) -> Result<(), RtDbError>
 /// subscriptions, committer channel) is the caller's responsibility — see
 /// `admin::delete_db`. Durable cleanup only happens here.
 pub async fn drop_database(pool: &PgPool, name: &str) -> Result<(), RtDbError> {
+    drop_database_if(pool, name, None).await
+}
+
+/// [`drop_database`] with an optional expected creation identity. The check
+/// reads the registry row under the same `FOR UPDATE` lock the drop
+/// transaction holds, so no delete-and-recreate can slip between check and
+/// drop. A mismatch returns `CONFLICT` and deletes nothing.
+pub async fn drop_database_if(
+    pool: &PgPool,
+    name: &str,
+    expected_creation_id: Option<&str>,
+) -> Result<(), RtDbError> {
     validate_db_name(name)?;
 
     let mut tx = pool.begin().await?;
 
     let existing: Option<(String,)> =
-        sqlx::query_as("SELECT name FROM rtdb_auth.databases WHERE name = $1 FOR UPDATE")
+        sqlx::query_as("SELECT creation_id FROM rtdb_auth.databases WHERE name = $1 FOR UPDATE")
             .bind(name)
             .fetch_optional(&mut *tx)
             .await?;
-    if existing.is_none() {
+    let Some((current_id,)) = existing else {
         return Err(RtDbError::not_found("database not found"));
+    };
+    if let Some(expected) = expected_creation_id
+        && expected != current_id
+    {
+        return Err(RtDbError::conflict(
+            "database creation identity does not match; it was deleted and recreated",
+        ));
     }
 
     let schema_name = pg_schema(name);

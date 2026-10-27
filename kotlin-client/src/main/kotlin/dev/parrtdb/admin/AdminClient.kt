@@ -52,10 +52,27 @@ class AdminClient(baseUrl: String, adminKey: String, transport: HttpTransport = 
 
     // ---- databases, schema, tokens ----------------------------------------------------
 
-    suspend fun createDb(name: String) = ack("POST", "/admin/create-db", jsonObj("name" to jsonStr(name)))
+    /** Creates the database and returns its creation identity (pass it to [deleteDb] as [expectedCreationId]). */
+    suspend fun createDb(name: String): String {
+        val resp = core.json("POST", "/admin/create-db", jsonObj("name" to jsonStr(name)))
+        if (!okOf(resp, "admin ack")) throw RtDbException(ErrorCode.INTERNAL, "admin request returned ok=false")
+        return StrictObj.of(resp, "createDb").str("creationId")
+    }
 
-    /** The server rejects unless [confirm] equals [name] exactly. */
-    suspend fun deleteDb(name: String, confirm: String) = ack("POST", "/admin/delete-db", jsonObj("name" to jsonStr(name), "confirm" to jsonStr(confirm)))
+    /**
+     * The server rejects unless [confirm] equals [name] exactly. A non-null [expectedCreationId] that differs
+     * from the database's current creation identity fails with CONFLICT and deletes nothing.
+     */
+    suspend fun deleteDb(name: String, confirm: String, expectedCreationId: String? = null) =
+        ack(
+            "POST",
+            "/admin/delete-db",
+            jsonObj(
+                "name" to jsonStr(name),
+                "confirm" to jsonStr(confirm),
+                *listOfNotNull(expectedCreationId?.let { "expectedCreationId" to jsonStr(it) }).toTypedArray(),
+            ),
+        )
 
     suspend fun pushSchema(db: String, schema: JsonElement) = ack("POST", "/admin/push-schema", jsonObj("db" to jsonStr(db), "schema" to schema))
 

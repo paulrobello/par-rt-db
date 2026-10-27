@@ -885,14 +885,28 @@ def test_create_db_posts_name_and_expects_ok() -> None:
         captured["path"] = request.url.path
         captured["auth"] = request.headers["authorization"]
         captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"ok": True})
+        return httpx.Response(200, json={"ok": True, "creationId": "c1"})
 
     with _sync_client(handler) as c:
-        c.create_db("mydb")
+        assert c.create_db("mydb") == "c1"
     assert captured["method"] == "POST"
     assert captured["path"] == "/admin/create-db"
     assert captured["auth"] == ADMIN_BEARER
     assert captured["body"] == {"name": "mydb"}
+
+
+def test_delete_db_sends_expected_creation_id_only_when_given() -> None:
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True})
+
+    with _sync_client(handler) as c:
+        c.delete_db("mydb", "mydb", expected_creation_id="c1")
+        c.delete_db("mydb", "mydb")
+    assert bodies[0] == {"name": "mydb", "confirm": "mydb", "expectedCreationId": "c1"}
+    assert bodies[1] == {"name": "mydb", "confirm": "mydb"}
 
 
 def test_list_dbs_gets_databases_list() -> None:
@@ -1266,6 +1280,7 @@ def test_db_stats_parses_table_stats() -> None:
                         "storageUsedBytes": 4096,
                         "subsQuota": 50,
                         "subsUsed": 3,
+                        "creationId": "c1",
                     },
                 )
             }
@@ -1380,7 +1395,7 @@ async def test_async_create_db_posts_name() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         captured["path"] = request.url.path
         captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"ok": True})
+        return httpx.Response(200, json={"ok": True, "creationId": "c1"})
 
     async with _async_client(handler) as c:
         await c.create_db("adb")

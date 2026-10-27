@@ -43,9 +43,18 @@ public actor RtDbAdminClient {
 
     // MARK: Database lifecycle
 
-    /// `POST /admin/create-db` `{name}` → `{ok:true}`.
-    public func createDb(_ name: String) async throws {
-        try await postForOk("create db", "/admin/create-db", CreateDbRequest(name: name))
+    /// `POST /admin/create-db` `{name}` → `{ok:true, creationId}`. Returns the
+    /// database's creation identity; pass it to `deleteDb(_:confirm:expectedCreationId:)`
+    /// for a delete-then-recreate-safe delete.
+    @discardableResult
+    public func createDb(_ name: String) async throws -> String {
+        let response: CreateDbResponse = try await postJson(
+            "create db", "/admin/create-db", CreateDbRequest(name: name)
+        )
+        guard response.ok else {
+            throw RtDbError(code: .internal, message: "admin request returned ok=false")
+        }
+        return response.creationId
     }
 
     /// `POST /admin/delete-db` `{name, confirm}` → `{ok:true}`. The server
@@ -53,9 +62,14 @@ public actor RtDbAdminClient {
     /// confirmation guard against accidental deletion. Drops the db's
     /// Postgres schema (CASCADE) and every per-db row (registry, tokens,
     /// allowlist, storage index).
-    public func deleteDb(_ name: String, confirm: String) async throws {
+    /// A non-nil `expectedCreationId` that differs from the database's current
+    /// creation identity fails with CONFLICT and deletes nothing.
+    public func deleteDb(
+        _ name: String, confirm: String, expectedCreationId: String? = nil
+    ) async throws {
         try await postForOk(
-            "delete db", "/admin/delete-db", DeleteDbRequest(name: name, confirm: confirm)
+            "delete db", "/admin/delete-db",
+            DeleteDbRequest(name: name, confirm: confirm, expectedCreationId: expectedCreationId)
         )
     }
 
@@ -1144,9 +1158,15 @@ private struct CreateDbRequest: Encodable {
     let name: String
 }
 
+private struct CreateDbResponse: Decodable {
+    let ok: Bool
+    let creationId: String
+}
+
 private struct DeleteDbRequest: Encodable {
     let name: String
     let confirm: String
+    let expectedCreationId: String?
 }
 
 private struct PushSchemaRequest: Encodable {

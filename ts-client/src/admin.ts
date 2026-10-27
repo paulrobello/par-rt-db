@@ -101,6 +101,8 @@ export interface DbStats {
   storageUsedBytes: number;
   subsQuota: number;
   subsUsed: number;
+  /** Stable creation identity of the database (changes if the name is deleted and recreated). */
+  creationId: string;
 }
 /**
  * A versioned, host-scoped capability attached to a machine token, tagged with
@@ -751,15 +753,25 @@ export class RtDbAdminClient {
     return this.cookieMode ? { credentials: "include" } : {};
   }
 
-  /** Creates a new, empty database with no schema pushed yet. */
-  async createDb(name: string): Promise<void> {
-    await this.request("POST", "/admin/create-db", { name });
+  /** Creates a new, empty database with no schema pushed yet. Resolves to the
+   *  database's creation identity (stable, never reused for a recreated name);
+   *  pass it to {@link deleteDb} as `expectedCreationId` for a race-safe delete. */
+  async createDb(name: string): Promise<string> {
+    const body = await this.request("POST", "/admin/create-db", { name });
+    return (body as { creationId: string }).creationId;
   }
 
   /** Delete a database (schema + all per-db state). `confirm` must equal `name`
-   *  exactly — the server's typed guard against accidental deletion. */
-  async deleteDb(name: string, confirm: string): Promise<void> {
-    await this.request("POST", "/admin/delete-db", { name, confirm });
+   *  exactly — the server's typed guard against accidental deletion. When
+   *  `expectedCreationId` is given and differs from the database's current
+   *  creation identity (it was deleted and recreated), the server fails with
+   *  CONFLICT and deletes nothing. */
+  async deleteDb(name: string, confirm: string, expectedCreationId?: string): Promise<void> {
+    await this.request("POST", "/admin/delete-db", {
+      name,
+      confirm,
+      ...(expectedCreationId === undefined ? {} : { expectedCreationId }),
+    });
   }
 
   /** Applies an additive-only schema push to `db`: new tables, fields, and

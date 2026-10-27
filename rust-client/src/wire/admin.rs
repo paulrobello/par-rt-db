@@ -20,9 +20,18 @@ pub(crate) struct CreateDbRequest<'a> {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct DeleteDbRequest<'a> {
     pub(crate) name: &'a str,
     pub(crate) confirm: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) expected_creation_id: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CreateDbResponse {
+    pub(crate) creation_id: String,
 }
 
 #[derive(Serialize)]
@@ -220,6 +229,10 @@ pub struct DbStats {
     pub subs_quota: i64,
     /// Live subscriptions.
     pub subs_used: i64,
+    /// Stable creation identity of the database; changes if the name is deleted
+    /// and recreated. Empty when talking to an older server.
+    #[serde(default)]
+    pub creation_id: String,
 }
 
 /// One row of `TokenInfo` returned by `GET /admin/tokens?db=...`. ARC-130 response-shaped.

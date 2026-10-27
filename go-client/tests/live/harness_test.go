@@ -50,7 +50,7 @@ func (e *liveEnv) setup() {
 		e.t.Fatalf("rand: %v", err)
 	}
 	e.db = "t" + hex.EncodeToString(suffix)
-	if err := e.admin.CreateDB(ctx, e.db); err != nil {
+	if _, err := e.admin.CreateDB(ctx, e.db); err != nil {
 		e.t.Fatalf("CreateDB(%s): %v", e.db, err)
 	}
 	e.t.Cleanup(func() {

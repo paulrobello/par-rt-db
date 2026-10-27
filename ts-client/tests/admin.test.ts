@@ -237,6 +237,7 @@ describe("RtDbAdminClient — new endpoints", () => {
       storageUsedBytes: 4096,
       subsQuota: 50,
       subsUsed: 3,
+      creationId: "c1",
     };
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse(stats));
     const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
@@ -494,6 +495,27 @@ describe("RtDbAdminClient — new endpoints", () => {
     expect(init.method).toBe("POST");
     expect(init.headers.Authorization).toBe("Bearer k");
     expect(JSON.parse(init.body)).toEqual({ name: "kanban", confirm: "kanban" });
+  });
+
+  it("createDb returns the creationId and deleteDb sends expectedCreationId only when given", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ ok: true, creationId: "c1" }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.createDb("kanban")).resolves.toBe("c1");
+    await admin.deleteDb("kanban", "kanban", "c1");
+    await admin.deleteDb("kanban", "kanban");
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({
+      name: "kanban",
+      confirm: "kanban",
+      expectedCreationId: "c1",
+    });
+    expect(JSON.parse(fetchMock.mock.calls[2][1].body)).toEqual({
+      name: "kanban",
+      confirm: "kanban",
+    });
   });
 
   it("deleteDb surfaces a 400 confirmation-mismatch envelope as RtDbError", async () => {

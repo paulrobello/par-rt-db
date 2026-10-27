@@ -26,15 +26,29 @@ pub(super) async fn create_db(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
     ApiJson(body): ApiJson<CreateDbRequest>,
-) -> Result<Json<OkResponse>, RtDbError> {
-    db::create_database(&state.pool, &body.name).await?;
-    Ok(Json(OkResponse { ok: true }))
+) -> Result<Json<CreateDbResponse>, RtDbError> {
+    let creation_id = db::create_database(&state.pool, &body.name).await?;
+    Ok(Json(CreateDbResponse {
+        ok: true,
+        creation_id,
+    }))
+}
+
+#[derive(Serialize)]
+pub(super) struct CreateDbResponse {
+    ok: bool,
+    #[serde(rename = "creationId")]
+    creation_id: String,
 }
 
 #[derive(Deserialize)]
 pub(super) struct DeleteDbRequest {
     name: String,
     confirm: String,
+    /// Optional: refuse (CONFLICT, nothing deleted) unless the database's
+    /// current creation identity equals this.
+    #[serde(default, rename = "expectedCreationId")]
+    expected_creation_id: Option<String>,
 }
 
 /// `POST /admin/delete-db` — admin-gated, typed-confirmation-guarded deletion
@@ -55,7 +69,12 @@ pub(super) async fn delete_db(
             "confirmation does not match database name",
         ));
     }
-    db::drop_database(&state.pool, &body.name).await?;
+    db::drop_database_if(
+        &state.pool,
+        &body.name,
+        body.expected_creation_id.as_deref(),
+    )
+    .await?;
     state.schemas.invalidate(&body.name).await;
     state.realtime.subs.drop_db(&body.name).await;
     state.realtime.committers.drop_db(&body.name).await;
@@ -242,6 +261,8 @@ pub(super) struct DbStatsResponse {
     subs_quota: usize,
     #[serde(rename = "subsUsed")]
     subs_used: usize,
+    #[serde(rename = "creationId")]
+    creation_id: String,
 }
 
 pub(super) async fn db_stats(
@@ -298,6 +319,9 @@ pub(super) async fn db_stats(
         storage_used_bytes,
         subs_quota: hot.max_subs_per_db,
         subs_used,
+        creation_id: db::creation_id(&state.pool, &db)
+            .await?
+            .ok_or_else(|| RtDbError::not_found("unknown database"))?,
     }))
 }
 

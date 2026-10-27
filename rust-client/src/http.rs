@@ -1144,7 +1144,7 @@ impl RtDbHttpClient {
     /// Deprecated ARC-121 shim — delegates to
     /// [`RtDbAdminClient::create_db`](crate::admin::RtDbAdminClient::create_db).
     pub async fn create_db(&self, name: &str) -> Result<(), RtDbError> {
-        self.admin_client().create_db(name).await
+        self.admin_client().create_db(name).await.map(|_| ())
     }
 
     #[deprecated(note = "use RtDbAdminClient")]

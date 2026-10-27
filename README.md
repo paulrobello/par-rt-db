@@ -335,8 +335,8 @@ curl -s -X DELETE "$RTDB_URL/api/db/mydb/share-grants/<64-hex>" -H "Authorizatio
 | --- | --- | --- |
 | `POST /admin/login` | Bearer admin key | Validates the admin key and mints a short-lived admin session token (used by the dashboard's login form). |
 | `POST /admin/logout` | Bearer admin key | Invalidates the admin session token. |
-| `POST /admin/create-db` | Bearer admin key | Creates a new database. |
-| `POST /admin/delete-db` | Bearer admin key | Deletes a database. Body `{ name, confirm }` where `confirm` must equal the db name (typed guard). Retires the per-db committer/scheduler/reaper tasks cleanly. |
+| `POST /admin/create-db` | Bearer admin key | Creates a new database. Returns `{ ok, creationId }` — a stable identity minted at creation and never reused for a recreated name (also exposed as `creationId` on `GET /admin/dbs/{db}/stats`). |
+| `POST /admin/delete-db` | Bearer admin key | Deletes a database. Body `{ name, confirm, expectedCreationId? }` where `confirm` must equal the db name (typed guard). When `expectedCreationId` is given and differs from the db's current `creationId` (it was deleted and recreated), fails `CONFLICT` and deletes nothing; the check runs under the same row lock as the drop, so it is race-free. Retires the per-db committer/scheduler/reaper tasks cleanly. |
 | `POST /admin/clone-db` | Bearer admin key | Clones an existing database's schema into a new db name (no data). |
 | `POST /admin/push-schema` | Bearer admin key | Applies additive schema DDL to a database. |
 | `POST /admin/db/{db}/schema/preview` | Bearer admin key | Previews the DDL a `push-schema` would run, without applying. |

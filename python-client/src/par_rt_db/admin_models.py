@@ -186,8 +186,10 @@ class TableStat(_Wire):
 class DbStats(_Wire):
     """``GET /admin/dbs/{db}/stats`` response — per-table row counts + sizes
     plus the ENH-011 per-db quota/usage triple (``0`` = unlimited). The server
-    always emits all eight fields; ``extra='forbid'`` means a response missing
-    any would be rejected, matching the server's non-optional ``DbStatsResponse``.
+    always emits the eight quota/usage fields plus ``creation_id``;
+    ``extra='forbid'`` means a response missing any would be rejected, matching
+    the server's non-optional ``DbStatsResponse``
+    (``creation_id`` alone is defaulted for older servers).
     """
 
     tables: list[TableStat]
@@ -198,6 +200,9 @@ class DbStats(_Wire):
     storage_used_bytes: int
     subs_quota: int
     subs_used: int
+    # Defaulted so a client built against this server still decodes an older
+    # server's response, which lacks the field.
+    creation_id: str = ""
 
 
 class LatencyStats(_Wire):

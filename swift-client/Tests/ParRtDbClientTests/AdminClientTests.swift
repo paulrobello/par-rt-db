@@ -128,9 +128,25 @@ struct AdminClientTests {
             try demand(request.url?.path == "/admin/create-db", "expected /admin/create-db")
             let body = try jsonObjectBody(request)
             try demand(body["name"] as? String == "app2", "name mismatch: \(body)")
+            return (200, Data(#"{"ok":true,"creationId":"c1"}"#.utf8))
+        }
+        let id = try await makeAdminClient().createDb("app2")
+        #expect(id == "c1")
+    }
+
+    @Test func deleteDbSendsExpectedCreationIdOnlyWhenGiven() async throws {
+        StubProtocol.handler = { request in
+            let body = try jsonObjectBody(request)
+            try demand(body["expectedCreationId"] as? String == "c1", "missing expectedCreationId: \(body)")
             return (200, Data(#"{"ok":true}"#.utf8))
         }
-        try await makeAdminClient().createDb("app2")
+        try await makeAdminClient().deleteDb("app", confirm: "app", expectedCreationId: "c1")
+        StubProtocol.handler = { request in
+            let body = try jsonObjectBody(request)
+            try demand(body["expectedCreationId"] == nil, "unexpected expectedCreationId: \(body)")
+            return (200, Data(#"{"ok":true}"#.utf8))
+        }
+        try await makeAdminClient().deleteDb("app", confirm: "app")
     }
 
     /// ARC-013: every admin call sends `X-Rtdb-Protocol`, not just the data
@@ -142,7 +158,7 @@ struct AdminClientTests {
                 request.value(forHTTPHeaderField: "X-Rtdb-Protocol") == String(WireProtocol.version),
                 "expected X-Rtdb-Protocol: \(WireProtocol.version)"
             )
-            return (200, Data(#"{"ok":true}"#.utf8))
+            return (200, Data(#"{"ok":true,"creationId":"c1"}"#.utf8))
         }
         try await makeAdminClient().createDb("app2")
     }
@@ -368,7 +384,7 @@ struct AdminClientTests {
             let stats = """
             {"tables":[{"name":"users","rowCount":7,"sizeBytes":8192}],"totalSizeBytes":8192,
             "tablesQuota":10,"tablesUsed":1,"storageQuotaBytes":0,"storageUsedBytes":0,
-            "subsQuota":100,"subsUsed":3}
+            "subsQuota":100,"subsUsed":3,"creationId":"c1"}
             """
             return (200, Data(stats.utf8))
         }
@@ -376,6 +392,7 @@ struct AdminClientTests {
         #expect(stats.tables == [TableStat(name: "users", rowCount: 7, sizeBytes: 8192)])
         #expect(stats.tablesQuota == 10)
         #expect(stats.subsUsed == 3)
+        #expect(stats.creationId == "c1")
     }
 
     // MARK: admin change feed

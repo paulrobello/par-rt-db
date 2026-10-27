@@ -2437,3 +2437,165 @@ async fn sec004_admin_logout_revokes_server_session() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+async fn create_with_id(addr: SocketAddr, name: &str) -> anyhow::Result<String> {
+    let resp = admin_post(addr, "/admin/create-db", serde_json::json!({"name": name})).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["ok"], true);
+    Ok(body["creationId"]
+        .as_str()
+        .expect("create-db returns creationId")
+        .to_string())
+}
+
+async fn schema_exists(pool: &sqlx::PgPool, name: &str) -> anyhow::Result<bool> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.schemata WHERE schema_name = $1",
+    )
+    .bind(format!("db_{name}"))
+    .fetch_one(pool)
+    .await?;
+    Ok(n == 1)
+}
+
+// create-db returns a creation identity, stats exposes the same one, and a
+// delete carrying the matching identity succeeds.
+#[tokio::test]
+async fn delete_db_with_matching_creation_id_succeeds() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_name();
+    let id = create_with_id(addr, &name).await?;
+    admin_post(
+        addr,
+        "/admin/push-schema",
+        serde_json::json!({"db": name, "schema": kanban_schema_json()}),
+    )
+    .await;
+
+    let stats: serde_json::Value = admin_get(addr, &format!("/admin/dbs/{name}/stats"))
+        .await
+        .json()
+        .await?;
+    assert_eq!(stats["creationId"], id.as_str());
+
+    let resp = admin_post(
+        addr,
+        "/admin/delete-db",
+        serde_json::json!({"name": name, "confirm": name, "expectedCreationId": id}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert!(!schema_exists(&pool, &name).await?);
+    Ok(())
+}
+
+// A mismatched identity is refused with CONFLICT and nothing is deleted.
+#[tokio::test]
+async fn delete_db_with_mismatched_creation_id_conflicts_and_keeps_data() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_name();
+    let id = create_with_id(addr, &name).await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO \"db_{name}\".meta (key, value) VALUES ('probe', '1'::jsonb)"
+    )))
+    .execute(&pool)
+    .await?;
+
+    let resp = admin_post(
+        addr,
+        "/admin/delete-db",
+        serde_json::json!({"name": name, "confirm": name, "expectedCreationId": "not-the-id"}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], "CONFLICT");
+
+    assert!(schema_exists(&pool, &name).await?);
+    let probes: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM \"db_{name}\".meta WHERE key = 'probe'"
+    )))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(probes, 1, "data must be intact after a refused delete");
+    assert_eq!(
+        db::creation_id(&pool, &name).await?.as_deref(),
+        Some(id.as_str())
+    );
+
+    admin_post(
+        addr,
+        "/admin/delete-db",
+        serde_json::json!({"name": name, "confirm": name}),
+    )
+    .await;
+    Ok(())
+}
+
+// The delete-then-recreate race: a conditional delete expecting the original
+// identity must refuse once the name has been recreated, leaving the
+// replacement intact.
+#[tokio::test]
+async fn delete_db_expecting_old_creation_id_refuses_recreated_database() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_name();
+
+    let id_a = create_with_id(addr, &name).await?;
+    let resp = admin_post(
+        addr,
+        "/admin/delete-db",
+        serde_json::json!({"name": name, "confirm": name}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let id_b = create_with_id(addr, &name).await?;
+    assert_ne!(id_a, id_b, "a recreated name must get a fresh identity");
+
+    let resp = admin_post(
+        addr,
+        "/admin/delete-db",
+        serde_json::json!({"name": name, "confirm": name, "expectedCreationId": id_a}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(schema_exists(&pool, &name).await?);
+    assert_eq!(
+        db::creation_id(&pool, &name).await?.as_deref(),
+        Some(id_b.as_str())
+    );
+
+    let resp = admin_post(
+        addr,
+        "/admin/delete-db",
+        serde_json::json!({"name": name, "confirm": name, "expectedCreationId": id_b}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    Ok(())
+}
+
+// Omitting expectedCreationId keeps the unconditional behavior.
+#[tokio::test]
+async fn delete_db_without_creation_id_still_deletes() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_name();
+    create_with_id(addr, &name).await?;
+    let resp = admin_post(
+        addr,
+        "/admin/delete-db",
+        serde_json::json!({"name": name, "confirm": name}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert!(!schema_exists(&pool, &name).await?);
+    Ok(())
+}

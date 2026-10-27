@@ -268,6 +268,7 @@ fn db_stats_round_trip() {
         storage_used_bytes: u64,
         subs_quota: usize,
         subs_used: usize,
+        creation_id: String,
     }
     let corpus = load_corpus();
     for (i, entry) in section(&corpus, "db_stats").iter().enumerate() {

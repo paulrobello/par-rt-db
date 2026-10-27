@@ -114,10 +114,21 @@ func TestRedeliverFailed(t *testing.T) {
 func TestCreateDB(t *testing.T) {
 	body := `{"name":"app"}`
 	c := &capture{t: t, method: "POST", path: "/admin/create-db", bearer: wantStr(testAdminKey), body: &body,
+		status: 200, respBody: `{"ok":true,"creationId":"c1"}`}
+	client := stub(t, c.handler)
+	id, err := client.CreateDB(context.Background(), "app")
+	if err != nil || id != "c1" {
+		t.Fatalf("CreateDB: id=%q err=%v", id, err)
+	}
+}
+
+func TestDeleteDBIfSendsExpectedCreationID(t *testing.T) {
+	body := `{"confirm":"app","expectedCreationId":"c1","name":"app"}`
+	c := &capture{t: t, method: "POST", path: "/admin/delete-db", body: &body,
 		status: 200, respBody: `{"ok":true}`}
 	client := stub(t, c.handler)
-	if err := client.CreateDB(context.Background(), "app"); err != nil {
-		t.Fatalf("CreateDB: %v", err)
+	if err := client.DeleteDBIf(context.Background(), "app", "app", "c1"); err != nil {
+		t.Fatalf("DeleteDBIf: %v", err)
 	}
 }
 
@@ -273,7 +284,7 @@ func TestEnvelopeErrorSurfaces(t *testing.T) {
 		body:   wantStr(`{"name":"app"}`),
 		status: 403, respBody: `{"code":"FORBIDDEN","message":"no"}`}
 	client := stub(t, c.handler)
-	err := client.CreateDB(context.Background(), "app")
+	_, err := client.CreateDB(context.Background(), "app")
 	if !rtdberrors.IsCode(err, rtdberrors.CodeForbidden) {
 		t.Fatalf("want FORBIDDEN, got %v", err)
 	}

@@ -760,17 +760,18 @@ class RtDbHttpClient:
     # :class:`par_rt_db.admin.RtDbAdminClient`; see the ``_op_*`` builders there
     # for the authoritative request-construction and response-parsing logic.
 
-    def create_db(self, name: str) -> None:
-        """``POST /admin/create-db`` ``{name}`` → ``{ok:true}``."""
-        self._admin_executor.run(_op_create_db(name))
+    def create_db(self, name: str) -> str:
+        """``POST /admin/create-db`` ``{name}`` → creation identity."""
+        return self._admin_executor.run(_op_create_db(name))
 
-    def delete_db(self, name: str, confirm: str) -> None:
-        """``POST /admin/delete-db`` ``{name, confirm}`` → ``{ok:true}``.
+    def delete_db(self, name: str, confirm: str, expected_creation_id: str | None = None) -> None:
+        """``POST /admin/delete-db`` ``{name, confirm[, expectedCreationId]}`` → ``{ok:true}``.
 
         The server rejects with ``BAD_REQUEST`` unless ``confirm == name``
         exactly — the typed confirmation guard against accidental deletion.
+        A mismatched ``expected_creation_id`` fails with ``CONFLICT``, deleting nothing.
         """
-        self._admin_executor.run(_op_delete_db(name, confirm))
+        self._admin_executor.run(_op_delete_db(name, confirm, expected_creation_id))
 
     def push_schema(self, db: str, schema: SchemaDef) -> None:
         """``POST /admin/push-schema`` ``{db, schema}`` → ``{ok:true}``."""

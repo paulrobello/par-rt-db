@@ -54,15 +54,19 @@ impl RtDbAdminClient {
             client,
         }
     }
-    /// `POST /admin/create-db` `{name}` → `{ok:true}`.
-    pub async fn create_db(&self, name: &str) -> Result<(), RtDbError> {
+    /// `POST /admin/create-db` `{name}` → `{ok:true, creationId}`. Returns the
+    /// database's creation identity; pass it to
+    /// [`delete_db_if`](Self::delete_db_if) for a delete-then-recreate-safe delete.
+    pub async fn create_db(&self, name: &str) -> Result<String, RtDbError> {
         let resp = self
             .post_json(
                 "/admin/create-db",
                 &crate::wire::admin::CreateDbRequest { name },
             )
             .await?;
-        self.expect_ok(resp).await
+        let parsed: crate::wire::admin::CreateDbResponse =
+            crate::http_common::deserialize(resp).await?;
+        Ok(parsed.creation_id)
     }
 
     /// `POST /admin/delete-db` `{name, confirm}` → `{ok:true}`. The server
@@ -71,10 +75,27 @@ impl RtDbAdminClient {
     /// schema (CASCADE) and every per-db row (registry, tokens, allowlist,
     /// storage_index).
     pub async fn delete_db(&self, name: &str, confirm: &str) -> Result<(), RtDbError> {
+        self.delete_db_if(name, confirm, None).await
+    }
+
+    /// [`delete_db`](Self::delete_db) with an optional `expectedCreationId`
+    /// (as returned by [`create_db`](Self::create_db)). If it differs from the
+    /// database's current creation identity the server fails with `CONFLICT`
+    /// and deletes nothing.
+    pub async fn delete_db_if(
+        &self,
+        name: &str,
+        confirm: &str,
+        expected_creation_id: Option<&str>,
+    ) -> Result<(), RtDbError> {
         let resp = self
             .post_json(
                 "/admin/delete-db",
-                &crate::wire::admin::DeleteDbRequest { name, confirm },
+                &crate::wire::admin::DeleteDbRequest {
+                    name,
+                    confirm,
+                    expected_creation_id,
+                },
             )
             .await?;
         self.expect_ok(resp).await

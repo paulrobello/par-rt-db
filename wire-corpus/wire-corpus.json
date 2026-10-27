@@ -1948,7 +1948,7 @@
   ],
   "db_stats": [
     {
-      "$comment": "ARC-112: GET /admin/dbs/{db}/stats response (DbStatsResponse, server/src/admin/dbs.rs). camelCase byte-for-byte; the six quota/usage fields are ENH-011, always emitted by the server. Consumer round-trips land with QA-103; the entry is the byte-authoritative shape clients must deserialize.",
+      "$comment": "ARC-112: GET /admin/dbs/{db}/stats response (DbStatsResponse, server/src/admin/dbs.rs). camelCase byte-for-byte; the six quota/usage fields are ENH-011, always emitted by the server; creationId is the database's stable creation identity. Consumer round-trips land with QA-103; the entry is the byte-authoritative shape clients must deserialize.",
       "tables": [
         {
           "name": "items",
@@ -1967,7 +1967,8 @@
       "storageQuotaBytes": 1048576,
       "storageUsedBytes": 36864,
       "subsQuota": 50,
-      "subsUsed": 3
+      "subsUsed": 3,
+      "creationId": "0190a1b2c3d47e5f8a9b0c1d2e3f4a5b"
     },
     {
       "tables": [],
@@ -1977,7 +1978,8 @@
       "storageQuotaBytes": 0,
       "storageUsedBytes": 0,
       "subsQuota": 0,
-      "subsUsed": 0
+      "subsUsed": 0,
+      "creationId": "0190a1b2c3d47e5f8a9b0c1d2e3f4a5c"
     }
   ],
   "change_feed_responses": [

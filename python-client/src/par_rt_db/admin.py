@@ -269,17 +269,22 @@ def _require_json_object(resp: httpx.Response, path: str) -> None:
 # façade classes below delegate to these via the executors.
 
 
+def _parse_create_db(resp: httpx.Response) -> str:
+    _parse_expect_ok(resp)
+    return str(resp.json()["creationId"])
+
+
 def _op_create_db(name: str) -> _AdminRequest:
-    return _AdminRequest("POST", "/admin/create-db", {"json": {"name": name}}, _parse_expect_ok)
+    return _AdminRequest("POST", "/admin/create-db", {"json": {"name": name}}, _parse_create_db)
 
 
-def _op_delete_db(name: str, confirm: str) -> _AdminRequest:
-    return _AdminRequest(
-        "POST",
-        "/admin/delete-db",
-        {"json": {"name": name, "confirm": confirm}},
-        _parse_expect_ok,
-    )
+def _op_delete_db(
+    name: str, confirm: str, expected_creation_id: str | None = None
+) -> _AdminRequest:
+    body: dict[str, Any] = {"name": name, "confirm": confirm}
+    if expected_creation_id is not None:
+        body["expectedCreationId"] = expected_creation_id
+    return _AdminRequest("POST", "/admin/delete-db", {"json": body}, _parse_expect_ok)
 
 
 def _op_list_dbs() -> _AdminRequest:
@@ -1343,17 +1348,23 @@ class RtDbAdminClient:
 
     # --- db lifecycle ---
 
-    def create_db(self, name: str) -> None:
-        """``POST /admin/create-db`` ``{name}`` → ``{ok:true}``."""
-        self._executor.run(_op_create_db(name))
+    def create_db(self, name: str) -> str:
+        """``POST /admin/create-db`` ``{name}`` → ``{ok:true, creationId}``.
 
-    def delete_db(self, name: str, confirm: str) -> None:
-        """``POST /admin/delete-db`` ``{name, confirm}`` → ``{ok:true}``.
+        Returns the database's creation identity; pass it to :meth:`delete_db`
+        as ``expected_creation_id`` for a delete-then-recreate-safe delete.
+        """
+        return self._executor.run(_op_create_db(name))
+
+    def delete_db(self, name: str, confirm: str, expected_creation_id: str | None = None) -> None:
+        """``POST /admin/delete-db`` ``{name, confirm[, expectedCreationId]}`` → ``{ok:true}``.
 
         The server rejects with ``BAD_REQUEST`` unless ``confirm == name``
         exactly — the typed confirmation guard against accidental deletion.
+        When ``expected_creation_id`` differs from the database's current
+        creation identity the server fails with ``CONFLICT`` and deletes nothing.
         """
-        self._executor.run(_op_delete_db(name, confirm))
+        self._executor.run(_op_delete_db(name, confirm, expected_creation_id))
 
     def list_dbs(self) -> list[str]:
         """``GET /admin/dbs`` → ``{databases:[...]}``."""
@@ -2268,16 +2279,19 @@ class AsyncRtDbAdminClient:
 
     # --- db lifecycle ---
 
-    async def create_db(self, name: str) -> None:
-        """``POST /admin/create-db`` ``{name}`` → ``{ok:true}`` (async)."""
-        await self._executor.run(_op_create_db(name))
+    async def create_db(self, name: str) -> str:
+        """``POST /admin/create-db`` ``{name}`` → creation identity (async)."""
+        return await self._executor.run(_op_create_db(name))
 
-    async def delete_db(self, name: str, confirm: str) -> None:
-        """``POST /admin/delete-db`` ``{name, confirm}`` → ``{ok:true}`` (async).
+    async def delete_db(
+        self, name: str, confirm: str, expected_creation_id: str | None = None
+    ) -> None:
+        """``POST /admin/delete-db`` (async).
 
-        See :meth:`RtDbAdminClient.delete_db` for the typed-confirm guard.
+        See :meth:`RtDbAdminClient.delete_db` for the typed-confirm guard and
+        the ``expected_creation_id`` condition.
         """
-        await self._executor.run(_op_delete_db(name, confirm))
+        await self._executor.run(_op_delete_db(name, confirm, expected_creation_id))
 
     async def list_dbs(self) -> list[str]:
         """``GET /admin/dbs`` → ``{databases:[...]}`` (async)."""

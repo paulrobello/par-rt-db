@@ -126,6 +126,9 @@ type DbStats struct {
 	StorageUsedBytes  int64       `json:"storageUsedBytes"`
 	SubsQuota         int64       `json:"subsQuota"`
 	SubsUsed          int64       `json:"subsUsed"`
+	// CreationID is the database's stable creation identity (empty from an
+	// older server).
+	CreationID string `json:"creationId"`
 }
 
 // TokenInfo is one row of ListTokens. HostCapability is absent-optional on

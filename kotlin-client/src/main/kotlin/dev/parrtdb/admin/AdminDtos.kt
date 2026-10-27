@@ -68,6 +68,8 @@ data class DbStats(
     val storageUsedBytes: Long,
     val subsQuota: Long,
     val subsUsed: Long,
+    /** Stable creation identity; empty when the server predates it. */
+    val creationId: String = "",
 ) {
     fun toJson(): JsonObject =
         jsonObj(
@@ -79,6 +81,7 @@ data class DbStats(
             "storageUsedBytes" to jsonNum(storageUsedBytes),
             "subsQuota" to jsonNum(subsQuota),
             "subsUsed" to jsonNum(subsUsed),
+            "creationId" to jsonStr(creationId),
         )
 
     companion object {
@@ -93,6 +96,7 @@ data class DbStats(
                     it.l("storageUsedBytes"),
                     it.l("subsQuota"),
                     it.l("subsUsed"),
+                    it.optStr("creationId") ?: "",
                 )
             }
     }

@@ -13,15 +13,38 @@ import (
 	"github.com/paulrobello/par-rt-db/go-client/wire"
 )
 
-// CreateDB: POST /admin/create-db {name} → {ok:true}.
-func (c *AdminClient) CreateDB(ctx context.Context, name string) error {
-	return c.ok(ctx, methodPost, "/admin/create-db", map[string]any{"name": name})
+// CreateDB: POST /admin/create-db {name} → {ok:true, creationId}. Returns the
+// database's creation identity; pass it to DeleteDBIf for a
+// delete-then-recreate-safe delete.
+func (c *AdminClient) CreateDB(ctx context.Context, name string) (string, error) {
+	var resp struct {
+		OK         bool   `json:"ok"`
+		CreationID string `json:"creationId"`
+	}
+	if err := c.api.Call(ctx, methodPost, "/admin/create-db", map[string]any{"name": name}, &resp); err != nil {
+		return "", err
+	}
+	if !resp.OK {
+		return "", rtdberrors.New(rtdberrors.CodeInternal, "admin request returned ok=false")
+	}
+	return resp.CreationID, nil
 }
 
 // DeleteDB: POST /admin/delete-db {name, confirm} → {ok:true}. The server
 // rejects unless confirm == name exactly.
 func (c *AdminClient) DeleteDB(ctx context.Context, name, confirm string) error {
-	return c.ok(ctx, methodPost, "/admin/delete-db", map[string]any{"name": name, "confirm": confirm})
+	return c.DeleteDBIf(ctx, name, confirm, "")
+}
+
+// DeleteDBIf is DeleteDB with an expected creation identity (as returned by
+// CreateDB). A non-empty expectedCreationID that differs from the database's
+// current identity fails with CONFLICT and deletes nothing; "" omits the check.
+func (c *AdminClient) DeleteDBIf(ctx context.Context, name, confirm, expectedCreationID string) error {
+	body := map[string]any{"name": name, "confirm": confirm}
+	if expectedCreationID != "" {
+		body["expectedCreationId"] = expectedCreationID
+	}
+	return c.ok(ctx, methodPost, "/admin/delete-db", body)
 }
 
 // PushSchema: POST /admin/push-schema {db, schema} → {ok:true}.

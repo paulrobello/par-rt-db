@@ -26,10 +26,32 @@ async fn create_db_posts_name() {
         .and(path("/admin/create-db"))
         .and(header("authorization", BEARER))
         .and(body_partial_json(json!({"name": "kanban"})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"ok": true, "creationId": "c1"})),
+        )
+        .mount(&server)
+        .await;
+    assert_eq!(client.create_db("kanban").await.unwrap(), "c1");
+}
+
+#[tokio::test]
+async fn delete_db_if_sends_expected_creation_id_only_when_given() {
+    let (server, client) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/admin/delete-db"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
         .mount(&server)
         .await;
-    client.create_db("kanban").await.unwrap();
+    client
+        .delete_db_if("kanban", "kanban", Some("c1"))
+        .await
+        .unwrap();
+    client.delete_db("kanban", "kanban").await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let conditional: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(conditional["expectedCreationId"], "c1");
+    let plain: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert!(plain.get("expectedCreationId").is_none());
 }
 
 #[tokio::test]
@@ -385,7 +407,8 @@ async fn db_stats_returns_table_stats() {
             "storageQuotaBytes": 1048576,
             "storageUsedBytes": 100,
             "subsQuota": 50,
-            "subsUsed": 3
+            "subsUsed": 3,
+            "creationId": "c1"
         })))
         .mount(&server)
         .await;
@@ -401,6 +424,7 @@ async fn db_stats_returns_table_stats() {
     assert_eq!(stats.storage_used_bytes, 100);
     assert_eq!(stats.subs_quota, 50);
     assert_eq!(stats.subs_used, 3);
+    assert_eq!(stats.creation_id, "c1");
 }
 
 #[tokio::test]
@@ -2836,7 +2860,9 @@ async fn every_admin_request_carries_the_protocol_header() {
     let (server, client) = setup().await;
     Mock::given(method("POST"))
         .and(path("/admin/create-db"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"ok": true, "creationId": "c1"})),
+        )
         .mount(&server)
         .await;
     Mock::given(method("GET"))

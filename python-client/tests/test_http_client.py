@@ -714,10 +714,10 @@ def test_admin_create_db_posts_name() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         captured["body"] = json.loads(request.content)
         captured["auth"] = request.headers["authorization"]
-        return httpx.Response(200, json={"ok": True})
+        return httpx.Response(200, json={"ok": True, "creationId": "c1"})
 
     client = _admin_client(handler)
-    client.create_db("kanban")
+    assert client.create_db("kanban") == "c1"
     assert captured["body"] == {"name": "kanban"}
     assert captured["auth"] == ADMIN_BEARER
 
@@ -1072,6 +1072,7 @@ def test_admin_db_stats_returns_table_stats() -> None:
                         "storageUsedBytes": 4096,
                         "subsQuota": 50,
                         "subsUsed": 3,
+                        "creationId": "c1",
                     },
                 )
             }

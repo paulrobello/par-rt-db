@@ -66,6 +66,8 @@ public struct DbStats: Equatable, Codable, Sendable {
     public var subsQuota: Int64
     /// Live subscriptions.
     public var subsUsed: Int64
+    /// Stable creation identity; empty when the server predates it.
+    public var creationId: String
 
     public init(
         tables: [TableStat],
@@ -75,7 +77,8 @@ public struct DbStats: Equatable, Codable, Sendable {
         storageQuotaBytes: Int64,
         storageUsedBytes: Int64,
         subsQuota: Int64,
-        subsUsed: Int64
+        subsUsed: Int64,
+        creationId: String = ""
     ) {
         self.tables = tables
         self.totalSizeBytes = totalSizeBytes
@@ -85,11 +88,25 @@ public struct DbStats: Equatable, Codable, Sendable {
         self.storageUsedBytes = storageUsedBytes
         self.subsQuota = subsQuota
         self.subsUsed = subsUsed
+        self.creationId = creationId
     }
 
     enum CodingKeys: String, CodingKey {
         case tables, totalSizeBytes, tablesQuota, tablesUsed
-        case storageQuotaBytes, storageUsedBytes, subsQuota, subsUsed
+        case storageQuotaBytes, storageUsedBytes, subsQuota, subsUsed, creationId
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        tables = try container.decode([TableStat].self, forKey: .tables)
+        totalSizeBytes = try container.decode(Int64.self, forKey: .totalSizeBytes)
+        tablesQuota = try container.decode(Int64.self, forKey: .tablesQuota)
+        tablesUsed = try container.decode(Int64.self, forKey: .tablesUsed)
+        storageQuotaBytes = try container.decode(Int64.self, forKey: .storageQuotaBytes)
+        storageUsedBytes = try container.decode(Int64.self, forKey: .storageUsedBytes)
+        subsQuota = try container.decode(Int64.self, forKey: .subsQuota)
+        subsUsed = try container.decode(Int64.self, forKey: .subsUsed)
+        creationId = try container.decodeIfPresent(String.self, forKey: .creationId) ?? ""
     }
 }
 
