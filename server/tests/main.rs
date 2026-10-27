@@ -39,6 +39,7 @@ mod idle_reclaim_test;
 mod image_transform_test;
 mod insert_many_test;
 mod insert_only_test;
+mod json_schema_test;
 mod lookup_test;
 mod merge_test;
 mod migration_test;

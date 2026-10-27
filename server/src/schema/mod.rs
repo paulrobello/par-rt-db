@@ -16,6 +16,7 @@
 
 mod computed;
 mod filter;
+mod json_schema;
 mod types;
 mod validate;
 mod value;
@@ -25,6 +26,7 @@ mod tests;
 
 pub use computed::*;
 pub use filter::*;
+pub use json_schema::export_json_schema;
 pub use types::*;
 pub(crate) use validate::*;
 pub use validate::{SchemaDefExt, TableDefExt};

@@ -147,6 +147,12 @@ public actor RtDbAdminClient {
         try await getJson("get schema", "/admin/dbs/\(encodePath(db))/schema")
     }
 
+    /// `GET /admin/db/{db}/schema/json-schema` → the pushed schema compiled to a
+    /// JSON Schema (draft 2020-12) document, one `$defs` entry per table.
+    public func getJsonSchema(_ db: String) async throws -> JSONValue {
+        try await getJson("get json schema", "/admin/db/\(encodePath(db))/schema/json-schema")
+    }
+
     /// `GET /admin/db/{db}/schema/history?limit=&offset=` → newest-first list
     /// of captured schema snapshots (summaries, no `schema` blob). `limit` /
     /// `offset` are optional paging params (server defaults: limit 100

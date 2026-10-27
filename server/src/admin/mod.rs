@@ -352,6 +352,7 @@ pub fn admin_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             get(list_admins).post(add_admin).delete(remove_admin),
         )
         .route("/admin/dbs/{db}/schema", get(get_schema))
+        .route("/admin/db/{db}/schema/json-schema", get(get_json_schema))
         .route("/admin/db/{db}/schema/preview", post(preview_schema))
         .route("/admin/db/{db}/schema/history", get(schema_history_list))
         .route(

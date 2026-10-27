@@ -27,6 +27,20 @@ pub(super) async fn get_schema(
     Ok(Json((*schema).clone()))
 }
 
+/// `GET /admin/db/{db}/schema/json-schema` — the pushed schema compiled to a
+/// JSON Schema (draft 2020-12) document, one `$defs` entry per table.
+pub(super) async fn get_json_schema(
+    State(state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    Path(db): Path<String>,
+) -> Result<Json<serde_json::Value>, RtDbError> {
+    if !db::database_exists(&state.pool, &db).await? {
+        return Err(RtDbError::not_found("unknown database"));
+    }
+    let schema = state.schemas.get(&state.pool, &db).await?;
+    Ok(Json(crate::schema::export_json_schema(&schema)))
+}
+
 #[derive(Deserialize)]
 pub(super) struct HistoryParams {
     #[serde(default)]

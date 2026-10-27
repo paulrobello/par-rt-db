@@ -607,6 +607,16 @@ describe("RtDbAdminClient — new endpoints", () => {
     expect(init.headers.Authorization).toBe("Bearer k");
   });
 
+  it("getJsonSchema GETs /admin/db/{db}/schema/json-schema and returns the document", async () => {
+    const doc = { $schema: "https://json-schema.org/draft/2020-12/schema", $defs: { items: {} } };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(doc));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    await expect(admin.getJsonSchema("kanban")).resolves.toEqual(doc);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/db/kanban/schema/json-schema");
+    expect(init.method).toBe("GET");
+  });
+
   it("restoreSchema POSTs {version, confirm} to /admin/db/{db}/schema/restore and unwraps {ok, restoredTo}", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ ok: true, restoredTo: 2 }));
     const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });

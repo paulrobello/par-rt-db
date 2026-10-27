@@ -388,6 +388,13 @@ impl RtDbAdminClient {
         self.get_json(&format!("/admin/dbs/{db}/schema"), &[]).await
     }
 
+    /// `GET /admin/db/{db}/schema/json-schema` → the pushed schema compiled to a
+    /// JSON Schema (draft 2020-12) document, one `$defs` entry per table.
+    pub async fn get_json_schema(&self, db: &str) -> Result<serde_json::Value, RtDbError> {
+        self.get_json(&format!("/admin/db/{db}/schema/json-schema"), &[])
+            .await
+    }
+
     /// `GET /admin/db/{db}/schema/history?limit=&offset=` → newest-first list of
     /// captured schema snapshots (summaries, no `schema` blob). Mirrors server
     /// `schema_history::list`. `limit`/`offset` are optional paging params

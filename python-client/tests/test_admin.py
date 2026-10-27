@@ -977,6 +977,17 @@ def test_get_schema_version_returns_entry_with_schema_blob() -> None:
     assert entry.schema_["tables"]["notes"]["fields"]["body"]["type"] == "string"
 
 
+def test_get_json_schema_returns_document() -> None:
+    doc = {"$schema": "https://json-schema.org/draft/2020-12/schema", "$defs": {"t": {}}}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/admin/db/kanban/schema/json-schema"
+        return httpx.Response(200, json=doc)
+
+    with _sync_client(handler) as c:
+        assert c.get_json_schema("kanban") == doc
+
+
 def test_restore_schema_posts_version_and_confirm() -> None:
     captured: dict[str, Any] = {}
 

@@ -218,6 +218,20 @@ func TestGetSchemaDecodes(t *testing.T) {
 	}
 }
 
+func TestGetJSONSchemaDecodes(t *testing.T) {
+	c := &capture{t: t, method: "GET", path: "/admin/db/app/schema/json-schema",
+		status: 200, respBody: `{"$schema":"https://json-schema.org/draft/2020-12/schema","$defs":{"t":{"type":"object"}}}`}
+	client := stub(t, c.handler)
+	s, err := client.GetJSONSchema(context.Background(), "app")
+	if err != nil {
+		t.Fatalf("GetJSONSchema: %v", err)
+	}
+	m, ok := s.(wire.Object)
+	if !ok || len(m["$defs"].(wire.Object)) != 1 {
+		t.Fatalf("got %v", s)
+	}
+}
+
 func TestDBStatsUnknownFieldRejected(t *testing.T) {
 	c := &capture{t: t, method: "GET", path: "/admin/dbs/app/stats",
 		status: 200, respBody: `{"tables":[],"totalSizeBytes":1,"bogus":2}`}

@@ -344,6 +344,7 @@ curl -s -X DELETE "$RTDB_URL/api/db/mydb/share-grants/<64-hex>" -H "Authorizatio
 | `GET /admin/dbs` | Bearer admin key | Lists all databases. |
 | `GET /admin/dbs/{db}/schema` | Bearer admin key | Returns the pushed schema for a database. |
 | `GET /admin/dbs/{db}/stats` | Bearer admin key | Per-table row counts and storage sizes; includes quota usage and caps (ENH-011). |
+| `GET /admin/db/{db}/schema/json-schema` | Bearer admin key | Compiles the pushed schema to a JSON Schema (draft 2020-12) document, one `$defs` entry per table, for external codegen/validation. Plain JSON, no envelope. See [JSON Schema export](#json-schema-export). |
 | `GET /admin/db/{db}/schema/history` | Bearer admin key | Lists schema-change snapshots newest-first (`?limit=`/`?offset=`). See [Schema change history](#schema-change-history). |
 | `GET /admin/db/{db}/schema/history/{version}` | Bearer admin key | Returns one full schema snapshot by version. |
 | `POST /admin/db/{db}/schema/restore` | Bearer admin key | Reconciles the db to a prior snapshot's shape. Body `{ version, confirm }`, `confirm` = db name. |
@@ -371,6 +372,36 @@ invariant as `handle_mutate`. `changeType` takes a closed `cast`
 substitutes for un-coercible rows (without it one bad value rolls the whole
 migrate back atomically). Spec:
 [`docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md`](docs/superpowers/specs/2026-07-31-schema-migration-backfill-design.md).
+
+#### JSON Schema export
+
+`GET /admin/db/{db}/schema/json-schema` returns `{ "$schema": "https://json-schema.org/draft/2020-12/schema", "$defs": { "<table>": {...} } }`
+with one definition per table (reference one with `#/$defs/<table>`). Each definition describes a document
+as read back from the server: the system fields `_id` (32-char lowercase hex), `_creationTime` and `_version`
+(integers) plus the declared fields, `additionalProperties: false`, and `required` listing every field that
+is not `optional`. Table `description` and `fieldDescriptions` become the JSON Schema `description` keyword;
+`defaults` become `default`; `constraints` become `minimum`/`maximum`/`minLength`/`maxLength`/`pattern`.
+
+| Schema type | JSON Schema |
+| --- | --- |
+| `string` | `{"type":"string"}` |
+| `number` | `{"type":"number"}` |
+| `boolean`, `null` | `{"type":"boolean"}`, `{"type":"null"}` |
+| `int64` | `{"type":"string","pattern":"^-?[0-9]+$","format":"int64"}` — an exact decimal STRING, never a JSON number (the int64 wire convention, so values past 2^53 keep precision). A generated client must parse it into a 64-bit integer type. |
+| `id` (table `T`) | `{"type":"string","pattern":"^[0-9a-f]{32}$","x-rtdb-table":"T"}` — JSON Schema cannot express referential integrity, so the target table is carried in the `x-rtdb-table` extension keyword and the description. |
+| `bytes` | `{"type":"string","contentEncoding":"base64","pattern":...}` — base64 text. |
+| `literal` | `{"const": value}` |
+| `union` | `{"anyOf":[...members]}` |
+| `optional` (`T`) | `{"anyOf":[T, {"type":"null"}]}` and the field is omitted from the parent's `required`. The server accepts both an absent key and an explicit `null`. |
+| `array` | `{"type":"array","items":...}` |
+| `object` | `{"type":"object","properties":...,"required":[non-optional keys],"additionalProperties":false}` |
+| `record` | `{"type":"object","additionalProperties":<value type>}` |
+| `vector` | `{"type":"array","items":{"type":"number"},"minItems":N,"maxItems":N}` |
+| `any` | `{}` |
+
+Unknown database returns the standard `NOT_FOUND` error envelope. The admin clients expose it as
+`getJsonSchema` (TS, Swift, Kotlin), `get_json_schema` (Rust, Python sync + async), and `GetJSONSchema` (Go),
+returning the document as untyped JSON.
 
 #### Schema change history
 

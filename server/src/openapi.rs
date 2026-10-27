@@ -658,6 +658,12 @@ pub fn document() -> Value {
             "Admin Schema",
         ),
         (
+            "get",
+            "/admin/db/{db}/schema/json-schema",
+            "Pushed schema as JSON Schema (draft 2020-12)",
+            "Admin Schema",
+        ),
+        (
             "post",
             "/admin/db/{db}/schema/preview",
             "Advisory schema diff (applies nothing)",

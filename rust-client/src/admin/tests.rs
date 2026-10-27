@@ -314,6 +314,22 @@ async fn schema_history_lists_summaries() {
 }
 
 #[tokio::test]
+async fn get_json_schema_returns_document() {
+    let (server, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/admin/db/kanban/schema/json-schema"))
+        .and(header("authorization", BEARER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": {"notes": {"type": "object"}}
+        })))
+        .mount(&server)
+        .await;
+    let doc = client.get_json_schema("kanban").await.unwrap();
+    assert_eq!(doc["$defs"]["notes"]["type"], "object");
+}
+
+#[tokio::test]
 async fn schema_history_get_returns_entry_with_schema_blob() {
     let (server, client) = setup().await;
     Mock::given(method("GET"))

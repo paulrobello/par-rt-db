@@ -297,6 +297,19 @@ struct AdminClientTests {
         #expect(schema.tables["users"]?.fields["name"] == .string)
     }
 
+    @Test func getJsonSchemaHitsExportRoute() async throws {
+        let client = makeAdminClient()
+        StubProtocol.handler = { request in
+            try demand(
+                request.url?.path == "/admin/db/app/schema/json-schema",
+                "expected /admin/db/app/schema/json-schema"
+            )
+            return (200, Data(#"{"$defs":{"t":{"type":"object"}}}"#.utf8))
+        }
+        let exported = try await client.getJsonSchema("app")
+        #expect(exported.objectValue?["$defs"] != nil)
+    }
+
     @Test func schemaHistoryAndRestoreHitTheirRoutes() async throws {
         let client = makeAdminClient()
         StubProtocol.handler = { request in

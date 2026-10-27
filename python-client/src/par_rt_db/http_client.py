@@ -62,6 +62,7 @@ from .admin import (
     _op_download_backup,
     _op_export_db,
     _op_get_config,
+    _op_get_json_schema,
     _op_get_schema,
     _op_import_db,
     _op_list_backups,
@@ -853,6 +854,10 @@ class RtDbHttpClient:
     def get_schema(self, db: str) -> SchemaDef:
         """``GET /admin/dbs/{db}/schema`` → the database's pushed ``SchemaDef``."""
         return self._admin_executor.run(_op_get_schema(db))
+
+    def get_json_schema(self, db: str) -> dict[str, Any]:
+        """``GET /admin/db/{db}/schema/json-schema`` → JSON Schema (draft 2020-12) export."""
+        return self._admin_executor.run(_op_get_json_schema(db))
 
     def db_stats(self, db: str) -> DbStats:
         """``GET /admin/dbs/{db}/stats`` → per-table row counts + storage sizes."""

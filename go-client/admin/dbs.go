@@ -144,6 +144,12 @@ func (c *AdminClient) GetSchema(ctx context.Context, db string) (wire.JSONValue,
 	return c.jsonValue(ctx, fmt.Sprintf("/admin/dbs/%s/schema", db), nil)
 }
 
+// GetJSONSchema: GET /admin/db/{db}/schema/json-schema → the pushed schema as a
+// JSON Schema (draft 2020-12) document, one $defs entry per table.
+func (c *AdminClient) GetJSONSchema(ctx context.Context, db string) (wire.JSONValue, error) {
+	return c.jsonValue(ctx, fmt.Sprintf("/admin/db/%s/schema/json-schema", db), nil)
+}
+
 // SchemaHistory: GET /admin/db/{db}/schema/history → newest-first snapshot
 // summaries; limit/offset optional paging.
 func (c *AdminClient) SchemaHistory(ctx context.Context, db string, limit, offset *int64) ([]SchemaHistorySummary, error) {

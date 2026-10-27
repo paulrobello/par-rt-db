@@ -10,6 +10,7 @@ import dev.parrtdb.admin.TableFilter
 import dev.parrtdb.admin.WebhookEditOptions
 import dev.parrtdb.errors.ErrorCode
 import dev.parrtdb.errors.RtDbException
+import kotlinx.serialization.json.jsonObject
 import dev.parrtdb.http.HostCapability
 import dev.parrtdb.wire.WireJson
 import dev.parrtdb.wire.jsonObj
@@ -111,6 +112,17 @@ class AdminClientTest {
             assertEquals("""[{"op":"dropField","table":"t","field":"f"},{"op":"renameTable","from":"a","to":"b"}]""", b["directives"].toString())
             assertEquals(2, r.directives[0].affectedRows)
             assertEquals(JsonNull, r.directives[0].castFailures!![0].value)
+        }
+    }
+
+    @Test
+    fun `json schema export route decodes`() = run10 {
+        TestHttpServer().use { srv ->
+            val a = AdminClient(srv.baseUrl, "k")
+            srv.reply(200, """{"${'$'}schema":"https://json-schema.org/draft/2020-12/schema","${'$'}defs":{"t":{}}}""")
+            val r = a.getJsonSchema("app")
+            assertEquals("/admin/db/app/schema/json-schema", srv.requests.last().path)
+            assertEquals(true, r.jsonObject.containsKey("${'$'}defs"))
         }
     }
 

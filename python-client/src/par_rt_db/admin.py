@@ -308,6 +308,10 @@ def _op_get_schema(db: str) -> _AdminRequest:
     return _AdminRequest("GET", f"/admin/dbs/{db}/schema", {}, _parse_model(SchemaDef))
 
 
+def _op_get_json_schema(db: str) -> _AdminRequest:
+    return _AdminRequest("GET", f"/admin/db/{db}/schema/json-schema", {}, _parse_json_object)
+
+
 def _op_migrate_schema(
     db: str,
     directives: list[Directive] | MigrateRequest,
@@ -1377,6 +1381,11 @@ class RtDbAdminClient:
         """``GET /admin/dbs/{db}/schema`` → the database's pushed ``SchemaDef``."""
         return self._executor.run(_op_get_schema(db))
 
+    def get_json_schema(self, db: str) -> dict[str, Any]:
+        """``GET /admin/db/{db}/schema/json-schema`` → the pushed schema as a JSON Schema
+        (draft 2020-12) document, one ``$defs`` entry per table."""
+        return self._executor.run(_op_get_json_schema(db))
+
     def migrate_schema(
         self,
         db: str,
@@ -2286,6 +2295,10 @@ class AsyncRtDbAdminClient:
         See :meth:`RtDbAdminClient.preview_schema` for diff semantics.
         """
         return await self._executor.run(_op_preview_schema(db, schema))
+
+    async def get_json_schema(self, db: str) -> dict[str, Any]:
+        """``GET /admin/db/{db}/schema/json-schema``; see the sync client."""
+        return await self._executor.run(_op_get_json_schema(db))
 
     async def get_schema(self, db: str) -> SchemaDef:
         """``GET /admin/dbs/{db}/schema`` → the database's pushed ``SchemaDef`` (async)."""

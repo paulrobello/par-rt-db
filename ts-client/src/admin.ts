@@ -1300,6 +1300,16 @@ export class RtDbAdminClient {
     return (body as { entries: SchemaHistoryEntrySummary[] }).entries;
   }
 
+  /** The pushed schema compiled to a JSON Schema (draft 2020-12) document, one
+   *  `$defs` entry per table (GET /admin/db/{db}/schema/json-schema). int64 is an
+   *  exact decimal string, bytes is base64, ids are 32-char hex strings. */
+  async getJsonSchema(db: string): Promise<Record<string, unknown>> {
+    return (await this.request(
+      "GET",
+      `/admin/db/${encodeURIComponent(db)}/schema/json-schema`,
+    )) as Record<string, unknown>;
+  }
+
   /** One full schema snapshot (GET /admin/db/{db}/schema/history/{version}),
    *  including the `schema` blob. */
   async getSchemaVersion(db: string, version: number): Promise<SchemaHistoryEntry> {

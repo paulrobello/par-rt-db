@@ -90,6 +90,8 @@ class AdminClient(baseUrl: String, adminKey: String, http: HttpClient = HttpClie
 
     suspend fun getSchema(db: String): JsonElement = get("/admin/dbs/$db/schema")
 
+    suspend fun getJsonSchema(db: String): JsonElement = get("/admin/db/$db/schema/json-schema")
+
     suspend fun schemaHistory(db: String, limit: Long? = null, offset: Long? = null): List<SchemaHistorySummary> =
         StrictObj.of(get("/admin/db/$db/schema/history", listOfNotNull(opt("limit", limit), opt("offset", offset))), "schemaHistory")
             .list("entries") { SchemaHistorySummary.fromJson(it) }
