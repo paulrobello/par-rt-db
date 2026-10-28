@@ -457,13 +457,15 @@ it defaults to `false`. See `.env.example` for the full set.
 ## Tracing (OpenTelemetry / OTLP, ENH-018)
 
 `/metrics` answers "how much"; OTLP tracing answers "why was *this* request
-slow." It is opt-in at two layers: the docker image must be built with the
-`otel` cargo feature, and `RTDB_OTEL_ENABLED=true` must be set at runtime. The
-shipped `Dockerfile` does **not** build with `--features otel` by default (the
-default build carries no OTel code and is byte-compatible with tracing off), so
-enabling tracing is a `Dockerfile` one-line change (`cargo build --features
-otel --release`) plus the four `RTDB_OTEL_*` vars already forwarded by
-`docker-compose.yml`:
+slow." It is opt-in at two layers: the `otel` cargo feature must be compiled
+in, and `RTDB_OTEL_ENABLED=true` must be set at runtime. The shipped
+`Dockerfile` builds `--features otel`, so docker deploys carry the exporter;
+source builds need the feature flag. `RTDB_OTEL_ENABLED` (default `false`)
+still gates the layer at runtime, so the default deploy makes zero OTLP calls.
+`docker-compose.yml` additionally forwards the standard
+`OTEL_EXPORTER_OTLP_HEADERS` var — the opentelemetry-otlp crate reads it
+natively (comma-separated `key=value` pairs, values URL-decoded) — which is
+how a bearer-gated collector receives `authorization=Bearer <token>`:
 
 | Var | Default | Meaning |
 |---|---|---|
@@ -471,6 +473,7 @@ otel --release`) plus the four `RTDB_OTEL_*` vars already forwarded by
 | `RTDB_OTEL_ENDPOINT` | `http://127.0.0.1:4317` | OTLP/gRPC collector endpoint (4317 is the standard port). |
 | `RTDB_OTEL_SERVICE_NAME` | `par-rt-db` | `service.name` resource attribute on every span. |
 | `RTDB_OTEL_SAMPLE_RATIO` | `0.05` | Head sampler ratio in `[0.0, 1.0]`; a malformed value fails boot. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | *(empty)* | Standard OTLP headers var, read by the crate, not the server. Bearer-gated collectors need `authorization=Bearer <token>`. |
 
 Point `RTDB_OTEL_ENDPOINT` at a collector (e.g. an `otel/opentelemetry-collector`
 sidecar or a hosted backend). The spans worth alerting on:
@@ -487,9 +490,60 @@ sidecar or a hosted backend). The spans worth alerting on:
   is slow".
 
 Span attributes are bounded (`db`, `table`, `terminal`, `steps`,
-`queue_wait_ms`) — never document ids, user ids, or content — so cardinality
+`queue_wait_ms`) — never document ids, no user ids, no content — so cardinality
 stays safe under the head sampler. The exporter flushes on SIGTERM, so a
 `compose down` does not drop the last in-flight batch.
+
+### Reaching the shared collector (deploy-site wiring)
+
+A collector run by another compose project (this deployment exports to the
+observability stack's LGTM collector on the same host) is reachable only after
+the server container joins that stack's Docker network. That is deployment-site
+topology, not repo config: compose has no optional-external-network syntax
+(`required` on service networks is rejected by current compose), so the attach
+lives in a host-local `docker-compose.override.yml` next to the tracked
+compose file. Because the file name is gitignored, `make deploy`'s
+`rsync --delete --filter=':- .gitignore'` protects it from deletion and the
+CI path's `git checkout -f` leaves it alone — the attach survives both deploy
+paths and every container recreation. Shape (network name and container DNS
+name are deployment-site values):
+
+```yaml
+services:
+  server:
+    networks:
+      default:
+      otel-collector:
+networks:
+  otel-collector:
+    external: true
+    name: <collector-stack-network>
+```
+
+With the attach in place the collector is reachable at its container DNS name
+on that network, e.g. `RTDB_OTEL_ENDPOINT=http://<collector-container>:4317`.
+The bearer token itself ships in the deploy-host `.env`
+(`OTEL_EXPORTER_OTLP_HEADERS=authorization=Bearer <token>`; the deploy
+`.env.example` does not carry the real token).
+
+### Enablement checklist
+
+1. Deploy-host `.env`: set `RTDB_OTEL_ENABLED=true`, `RTDB_OTEL_ENDPOINT` to
+   the collector's container DNS name on the shared network, and
+   `OTEL_EXPORTER_OTLP_HEADERS=authorization=Bearer <token>`.
+2. Install the `docker-compose.override.yml` network attach (shape above).
+3. Deploy. On the next `compose up` the container is created with the network
+   attached and otel on.
+4. Verify: `docker exec` into the server container, resolve the collector
+   name and TCP-connect to 4317; then confirm spans arrive (the collector
+   backend should show `service.name=par-rt-db`).
+
+### Enablement checklist (manual/local)
+
+For a local collector: no override needed — set the four `RTDB_OTEL_*` vars,
+point `RTDB_OTEL_ENDPOINT` at the local collector's published loopback port,
+and `docker compose up -d` (the compose file itself has no external-network
+dependency).
 
 ## Secrets (`/docker/par-rt-db/.env`, not committed)
 

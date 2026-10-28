@@ -165,6 +165,12 @@ services:
       RTDB_OTEL_ENDPOINT: ${RTDB_OTEL_ENDPOINT:-http://127.0.0.1:4317}
       RTDB_OTEL_SERVICE_NAME: ${RTDB_OTEL_SERVICE_NAME:-par-rt-db}
       RTDB_OTEL_SAMPLE_RATIO: ${RTDB_OTEL_SAMPLE_RATIO:-0.05}
+      # Standard OTLP exporter headers (the opentelemetry-otlp crate reads this
+      # env var natively; comma-separated key=value pairs, values URL-decoded).
+      # A bearer-gated collector needs authorization=Bearer <token> here.
+      # Empty = no extra headers. Reaching a collector on another compose
+      # project's network is deploy-site wiring — see deploy/README.md Tracing.
+      OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
       # Stdout log format: text (default) or json (one JSON object per line,
       # for container log pipelines). Forwarded so env-drift-check passes.
       RTDB_LOG_FORMAT: ${RTDB_LOG_FORMAT:-text}

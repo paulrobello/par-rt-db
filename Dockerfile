@@ -63,7 +63,7 @@ RUN mkdir -p server/src server/benches rust-client/src rust-client/tests rust-cl
               server/benches/compile_query.rs server/benches/value_expr.rs \
               server/benches/validate_doc.rs server/benches/migrate_validate.rs \
     && touch cli/tests/live.rs \
-    && cargo build --release --locked --manifest-path server/Cargo.toml --bin rtdb-server \
+    && cargo build --release --locked --features otel --manifest-path server/Cargo.toml --bin rtdb-server \
     && rm -rf server/src
 # Bake the live git sha into /healthz. The build context has no .git (rsync
 # excludes it), so build.rs falls back to this arg; "unknown" if unset.
@@ -77,7 +77,10 @@ COPY server/src ./server/src
 # stage. `--bin rtdb-server` only compiles the binary, never the test targets,
 # so the tests dir is dead weight here AND a test-only edit would invalidate
 # this COPY layer's cache, forcing a full re-compile of the release binary.
-RUN cargo build --release --locked --manifest-path server/Cargo.toml --bin rtdb-server
+# `--features otel` compiles the ENH-018 OTLP exporter into the shipped image;
+# RTDB_OTEL_ENABLED still gates it at runtime, so the default deploy makes
+# zero OTLP calls.
+RUN cargo build --release --locked --features otel --manifest-path server/Cargo.toml --bin rtdb-server
 
 # ── Dashboard build stage ────────────────────────────────────────────────────
 # Bundles the operator console SPA (Vite + React + TS) and the @par-rt-db/client

@@ -122,6 +122,18 @@ alter observable behavior on upgrade.
 
 ### Added
 
+- **The shipped Docker image now builds the server `--features otel`, and the
+  compose file forwards the standard `OTEL_EXPORTER_OTLP_HEADERS` var
+  (feature-built image, bearer-header export, collector network path).** The
+  ENH-018 exporter existed but the deployed image never compiled it and had
+  no header surface for a bearer-gated collector. The image change compiles
+  the ENH-018 exporter into the release binary (`RTDB_OTEL_ENABLED` still
+  gates it at runtime); the compose forwarding lets a deploy set
+  `authorization=Bearer <token>` for a collector that bearer-gates OTLP/gRPC.
+  Reaching a collector on another compose project's network stays deploy-site
+  wiring via a gitignored host-local `docker-compose.override.yml` — see
+  `deploy/README.md` Tracing for the enablement checklist. Server-side only:
+  no wire, DSL, or client change.
 - **Nested optional-object widening on push-schema.** Adding an optional
   field inside `array<object>` element shapes (or a directly-nested `object`
   field) is now accepted as an additive widening on push — no destructive

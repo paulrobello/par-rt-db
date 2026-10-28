@@ -77,3 +77,9 @@ bench/results/
 
 # pytest-cov data file (python-client)
 .coverage
+
+# Host-local compose override (e.g. the observability network attach on the
+# deploy host — see deploy/README.md Tracing). Never committed: deployment-site
+# topology is not repo config. Also protects the file from `make deploy`'s
+# rsync --delete, which honors gitignore rules.
+docker-compose.override.yml
