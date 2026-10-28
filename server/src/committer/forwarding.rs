@@ -32,11 +32,13 @@ pub(in crate::committer) fn forward_write_of(
             idempotency_key,
             txn,
             principal_ctx,
+            admission_epoch,
             ..
         } => Some(crate::forward::ForwardWrite::Mutate {
             idempotency_key: idempotency_key.clone(),
             txn: txn.clone(),
             principal: principal_ctx.clone(),
+            admission_epoch: *admission_epoch,
         }),
         CommitterRequest::RunMigrate { request, .. } => {
             Some(crate::forward::ForwardWrite::Migrate {

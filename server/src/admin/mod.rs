@@ -376,6 +376,10 @@ pub fn admin_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             get(get_readonly).patch(patch_readonly),
         )
         .route(
+            "/admin/db/{db}/quiesce",
+            get(get_quiesce).post(quiesce_db).delete(unquiesce_db),
+        )
+        .route(
             "/admin/db/{db}/storage",
             get(admin_storage_list)
                 .post(admin_storage_upload)
@@ -469,7 +473,11 @@ pub fn admin_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // SEC-108: gate every admin route at the router layer. Login/logout/
         // stream are exempt (see `require_admin_mw`). Runs inside the CSRF
         // guard so a cookie-authenticated CSRF attack is caught first.
-        .layer(from_fn_with_state(state, require_admin_mw))
+        .layer(from_fn_with_state(state.clone(), require_admin_mw))
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::http_api::stamp_admission_epoch,
+        ))
         // SEC-106: require the admin-CSRF double-submit nonce on cookie-
         // authenticated mutating requests. Login/logout and bearer-authenticated
         // requests skip the check (see `admin_csrf_guard`).

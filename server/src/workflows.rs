@@ -318,8 +318,26 @@ pub async fn claim_due(
     now: i64,
     batch: i64,
 ) -> Result<Vec<WorkflowRow>, RtDbError> {
+    let admission_epoch = crate::db::admission_epoch(pool).await?;
+    claim_due_with_epoch(pool, db, now, batch, admission_epoch).await
+}
+
+pub async fn claim_due_with_epoch(
+    pool: &PgPool,
+    db: &str,
+    now: i64,
+    batch: i64,
+    admission_epoch: i64,
+) -> Result<Vec<WorkflowRow>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(crate::db::quiesce_key(db))
+        .execute(&mut *tx)
+        .await?;
+    crate::db::ensure_admission_epoch(&mut tx, db, admission_epoch).await?;
+    crate::db::ensure_quiesce_open(&mut tx, db).await?;
     let rows: Vec<ClaimRow> = sqlx::query_as(AssertSqlSafe(format!(
         "UPDATE \"{schema}\".workflows
              SET status = 'running', started_at = COALESCE(started_at, $2), updated_at = $2
@@ -335,8 +353,9 @@ pub async fn claim_due(
     .bind(now)
     .bind(now)
     .bind(batch)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
     rows.into_iter()
         .map(
             |(

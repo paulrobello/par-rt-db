@@ -200,6 +200,61 @@ async fn revoke_token(addr: &SocketAddr, state: &Arc<AppState>, db: &str, token:
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+async fn quiesce_http(addr: SocketAddr, db: &str) -> i64 {
+    let response = admin_post(addr, &format!("/admin/db/{db}/quiesce"), json!({})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response
+        .json::<serde_json::Value>()
+        .await
+        .expect("quiesce json")["generation"]
+        .as_i64()
+        .expect("quiesce generation")
+}
+
+async fn unquiesce_http(addr: SocketAddr, db: &str, generation: i64) {
+    let response = reqwest::Client::new()
+        .delete(format!("http://{addr}/admin/db/{db}/quiesce"))
+        .bearer_auth("test-admin-key")
+        .header("x-rtdb-quiesce-generation", generation.to_string())
+        .send()
+        .await
+        .expect("unquiesce");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn quiesce_rejects_storage_writes_and_reopens_them() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+    let id = upload(&addr, &db, &token, b"quiesce-storage").await;
+    let generation = quiesce_http(addr, &db).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/storage/{db}"))
+        .bearer_auth(&token)
+        .body(b"blocked".to_vec())
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response.json::<serde_json::Value>().await?["code"],
+        json!("READ_ONLY")
+    );
+    let direct = storage::put(&state.pool, &db, "blocked", 7, None, None, b"blocked").await;
+    assert_eq!(
+        direct
+            .expect_err("direct storage write must be fenced")
+            .code,
+        rtdb_server::error::ErrorCode::ReadOnly
+    );
+
+    unquiesce_http(addr, &db, generation).await;
+    assert!(storage::delete(&state.pool, &db, &id).await?);
+    Ok(())
+}
+
 #[tokio::test]
 async fn upload_returns_id_sha_size_and_content_type() -> anyhow::Result<()> {
     let state = test_state().await;

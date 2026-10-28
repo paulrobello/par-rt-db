@@ -434,3 +434,69 @@ pub(super) async fn patch_readonly(
     tracing::info!(db = %db, readOnly = body.read_only, "readonly freeze toggled");
     Ok(Json(OkResponse { ok: true }))
 }
+
+#[derive(Serialize)]
+pub(super) struct QuiesceResponse {
+    quiesced: bool,
+    generation: i64,
+}
+
+/// `GET /admin/db/{db}/quiesce` — read the quiesce state and generation, so
+/// an operator can discover a persisted fence across a restart (404 for an
+/// unregistered database).
+pub(super) async fn get_quiesce(
+    State(state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    Path(db): Path<String>,
+) -> Result<Json<QuiesceResponse>, RtDbError> {
+    let Some((quiesced, generation)) = crate::db::quiesce_state(&state.pool, &db).await? else {
+        return Err(RtDbError::not_found("database not found"));
+    };
+    Ok(Json(QuiesceResponse {
+        quiesced,
+        generation,
+    }))
+}
+
+/// `POST /admin/db/{db}/quiesce` — close local client-write admission and
+/// place a barrier behind all work already queued for this database. This
+/// first implementation is intentionally single-instance only; multi-instance
+/// callers receive CONFLICT until the generation is coordinated across owners.
+pub(super) async fn quiesce_db(
+    State(state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    Path(db): Path<String>,
+) -> Result<Json<QuiesceResponse>, RtDbError> {
+    // Detach the lifecycle from this request future: an admin client that
+    // disconnects mid-quiesce must not cancel the sequence between the
+    // persisted fence and the lease bookkeeping.
+    let committers = state.realtime.committers.clone();
+    let generation = tokio::spawn(async move { committers.quiesce(&db).await })
+        .await
+        .map_err(|error| RtDbError::internal(format!("quiesce task failed: {error}")))??;
+    Ok(Json(QuiesceResponse {
+        quiesced: true,
+        generation,
+    }))
+}
+
+/// `DELETE /admin/db/{db}/quiesce` — reopen local client-write admission.
+pub(super) async fn unquiesce_db(
+    State(state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    Path(db): Path<String>,
+) -> Result<Json<QuiesceResponse>, RtDbError> {
+    let generation = _headers
+        .get("x-rtdb-quiesce-generation")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .ok_or_else(|| RtDbError::bad_request("x-rtdb-quiesce-generation is required"))?;
+    let committers = state.realtime.committers.clone();
+    tokio::spawn(async move { committers.unquiesce(&db, generation).await })
+        .await
+        .map_err(|error| RtDbError::internal(format!("unquiesce task failed: {error}")))??;
+    Ok(Json(QuiesceResponse {
+        quiesced: false,
+        generation,
+    }))
+}

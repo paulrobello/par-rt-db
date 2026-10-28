@@ -22,7 +22,7 @@ use sqlx::PgPool;
 use tracing::Instrument;
 
 use crate::auth::{PrincipalCtx, authorize_table};
-use crate::db::{now_ms, validate_db_name};
+use crate::db::{now_ms, quiesce_key, validate_db_name};
 use crate::ddl::pg_schema;
 use crate::dsl::StepTableExt;
 use crate::error::{ErrorCode, RtDbError};
@@ -344,7 +344,7 @@ pub struct TxnSideWrites {
 /// every preamble round trip used to be taken out of its write throughput; the
 /// combined statement (see `execute_txn_with_side`) now answers both in the
 /// `BEGIN` → first-statement round trip the turn already paid.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct MutatePreamble<'a> {
     /// The caller's idempotency key, when present. A still-live cached result
     /// for it replays INSTEAD of executing (and before the freeze check).
@@ -353,6 +353,23 @@ pub struct MutatePreamble<'a> {
     /// system arms (scheduled fires, workflow advances, TTL reaping), which are
     /// exempt from the freeze by construction.
     pub check_freeze: bool,
+    /// Quiescence applies to client and system document writes alike. Unlike
+    /// the read-only freeze, it is the cutover admission fence.
+    pub check_quiesce: bool,
+    /// Admission epoch captured at transport ingress. `None` is used by
+    /// internal producers, which capture their own epoch at execution.
+    pub admission_epoch: Option<i64>,
+}
+
+impl Default for MutatePreamble<'_> {
+    fn default() -> Self {
+        Self {
+            idem_key: None,
+            check_freeze: false,
+            check_quiesce: true,
+            admission_epoch: None,
+        }
+    }
 }
 
 /// Executes all of `txn`'s steps plus, when `side` requests them, the audit
@@ -442,7 +459,25 @@ pub async fn execute_txn_with_side(
         let mut results = Vec::with_capacity(txn.steps.len());
         let mut write_set = WriteSet::default();
 
+        let admission_epoch = preamble.admission_epoch;
+        let admission_generation = if preamble.check_quiesce {
+            let (quiesced, generation) = crate::db::quiesce_admission(pool, db).await?;
+            if quiesced {
+                return Err(RtDbError::read_only());
+            }
+            Some(generation)
+        } else {
+            None
+        };
+
         let mut tx = pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(quiesce_key(db))
+            .execute(&mut *tx)
+            .await?;
+        if let Some(epoch) = admission_epoch {
+            crate::db::ensure_admission_epoch(&mut tx, db, epoch).await?;
+        }
         // SEC-104: bound every statement in this committer turn. A pathological
         // scan (e.g. a filter over an unindexed field that escapes the row budget)
         // aborts this transaction rather than stalling the single-writer for the
@@ -458,7 +493,7 @@ pub async fn execute_txn_with_side(
         // nothing commits. System arms (`check_freeze = false`, no key) fall
         // back to the plain set_config so the combined query is not wasted on
         // subselects they would ignore.
-        if preamble.idem_key.is_none() && !preamble.check_freeze {
+        if preamble.idem_key.is_none() && !preamble.check_freeze && admission_generation.is_none() {
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SET LOCAL statement_timeout = {STATEMENT_TIMEOUT_MS}"
             )))
@@ -468,17 +503,19 @@ pub async fn execute_txn_with_side(
             let combined = format!(
                 "SELECT set_config('statement_timeout', $1, true), \
                  COALESCE((SELECT read_only FROM rtdb_auth.databases WHERE name = $2), FALSE), \
+                 COALESCE((SELECT quiesced FROM rtdb_auth.databases WHERE name = $2), FALSE), \
+                 COALESCE((SELECT quiesce_generation FROM rtdb_auth.databases WHERE name = $2), 0), \
                  (SELECT result FROM \"{pg_schema_name}\".mutation_cache_v2 \
                   WHERE mut_id = $3 AND expires_at > $4)"
             );
-            let row: (String, bool, Option<serde_json::Value>) = sqlx::query_as(sqlx::AssertSqlSafe(combined))
+            let row: (String, bool, bool, i64, Option<serde_json::Value>) = sqlx::query_as(sqlx::AssertSqlSafe(combined))
                 .bind(STATEMENT_TIMEOUT_MS.to_string())
                 .bind(db)
                 .bind(preamble.idem_key)
                 .bind(now_ms())
                 .fetch_one(&mut *tx)
                 .await?;
-            if let Some(value) = row.2 {
+            if let Some(value) = row.4 {
                 let results: Vec<serde_json::Value> = serde_json::from_value(value).map_err(|err| {
                     tracing::error!(error = %err, db, "failed to deserialize cached mutation result");
                     RtDbError::internal("failed to read cached mutation result")
@@ -489,7 +526,16 @@ pub async fn execute_txn_with_side(
                     write_set: WriteSet::default(),
                 });
             }
-            if row.1 {
+            // The freeze exemption is client-plane only (ENH-048): system
+            // arms (`check_freeze = false`) ignore `read_only` exactly as
+            // they did when this branch was reserved for client arms. The
+            // quiesce fence is the cutover barrier and stops system writes
+            // too, as does any generation change behind the admission's back.
+            let frozen_client_write = row.1 && preamble.check_freeze;
+            if frozen_client_write
+                || row.2
+                || admission_generation.is_some_and(|generation| row.3 != generation)
+            {
                 tx.rollback().await?;
                 return Err(RtDbError::read_only());
             }

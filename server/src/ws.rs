@@ -708,6 +708,13 @@ async fn handle_mutate(
     let principal = fctx.principal;
     let db = fctx.db;
     let out_tx = fctx.out_tx;
+    let admission_epoch = match crate::db::admission_epoch(&state.pool).await {
+        Ok(epoch) => Some(epoch),
+        Err(error) => {
+            let _ = out_tx.send(ServerMessage::MutateErr { mut_id, error });
+            return false;
+        }
+    };
 
     match authorize_op(&state.pool, principal, db).await {
         Ok((principal_ctx, admin)) => {
@@ -741,7 +748,7 @@ async fn handle_mutate(
             match state
                 .realtime
                 .committers
-                .mutate(db, idempotency_key, txn, principal_ctx)
+                .mutate_with_admission(db, idempotency_key, txn, principal_ctx, admission_epoch)
                 .await
             {
                 Ok(outcome) => {

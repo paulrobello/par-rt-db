@@ -92,6 +92,7 @@ async fn ws_query_update(
 
 /// The next `MutateOk`/`MutateErr` for `mut_id`, panicking with context if
 /// neither arrives within `within`.
+#[cfg(feature = "test-support")]
 async fn ws_mutate_reply(ws: &mut WsClient, mut_id: &str, within: Duration) -> ServerMessage {
     ws_next(ws, within, |m| {
         matches!(
@@ -138,7 +139,7 @@ async fn subscribe_and_snapshot(
 /// re-runs it, and B's client gets its `queryUpdate`.
 #[tokio::test]
 async fn owner_http_mutate_pushes_query_update_to_b_subscriber() -> anyhow::Result<()> {
-    let cluster = Cluster::two(items_schema()).await;
+    let mut cluster = Cluster::two(items_schema()).await;
     assert_eq!(cluster.owner().await, ReplicaId::A, "A owns after push");
 
     // The subscription lives on B, which owns nothing.
@@ -160,6 +161,37 @@ async fn owner_http_mutate_pushes_query_update_to_b_subscriber() -> anyhow::Resu
         pushed[0].get("title").and_then(|t| t.as_str()),
         Some("owner-http-write")
     );
+    cluster.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn multi_instance_quiesce_requires_coordination_and_does_not_fence_locally()
+-> anyhow::Result<()> {
+    let mut cluster = Cluster::two(items_schema()).await;
+    let db = cluster.db.as_str();
+
+    for replica in [ReplicaId::A, ReplicaId::B] {
+        let response = crate::common::admin_post(
+            cluster.replica(replica).addr,
+            &format!("/admin/db/{db}/quiesce"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+        let body: serde_json::Value = response.json().await?;
+        assert_eq!(body["code"], serde_json::json!("CONFLICT"));
+    }
+
+    let outcome = cluster
+        .mutate_http(ReplicaId::B, insert_item("multi-instance-still-open"))
+        .await;
+    assert_eq!(outcome.results.len(), 1);
+    assert_eq!(
+        items_count(&cluster.replica(ReplicaId::B).state.pool, db).await?,
+        1
+    );
+    cluster.shutdown().await;
     Ok(())
 }
 
@@ -170,7 +202,7 @@ async fn owner_http_mutate_pushes_query_update_to_b_subscriber() -> anyhow::Resu
 async fn owner_scheduled_write_pushes_b_subscriber() -> anyhow::Result<()> {
     const SCHED_ID: &str = "s-subs-1";
 
-    let cluster = Cluster::two(items_schema()).await;
+    let mut cluster = Cluster::two(items_schema()).await;
     let mut ws_b = cluster.ws(ReplicaId::B).await;
     subscribe_and_snapshot(&mut ws_b, "q-sched", 0).await;
 
@@ -194,19 +226,36 @@ async fn owner_scheduled_write_pushes_b_subscriber() -> anyhow::Result<()> {
     })
     .await
     .expect("schedule ack");
-    assert!(
-        matches!(ack, ServerMessage::ScheduleOk { .. }),
-        "schedule rejected: {ack:?}"
-    );
+    let job_id = match ack {
+        ServerMessage::ScheduleOk { id, .. } => id,
+        other => panic!("schedule rejected: {other:?}"),
+    };
 
-    let pushed = ws_query_update(&mut ws_b, "q-sched", SCHEDULER_WAIT)
-        .await
-        .expect("B's subscription re-ran for the scheduled write");
+    let pushed = match ws_query_update(&mut ws_b, "q-sched", SCHEDULER_WAIT).await {
+        Some(result) => result,
+        None => {
+            let schedules = rtdb_server::scheduler::list(
+                &cluster.replica(ReplicaId::B).state.pool,
+                &cluster.db,
+            )
+            .await;
+            let items = items_count(&cluster.replica(ReplicaId::B).state.pool, &cluster.db).await;
+            let owner = cluster.owner().await;
+            #[cfg(feature = "test-support")]
+            let trace = rtdb_server::scheduler::test_scheduler_trace(&cluster.db);
+            #[cfg(not(feature = "test-support"))]
+            let trace: Vec<String> = Vec::new();
+            panic!(
+                "B's subscription re-ran for the scheduled write: job_id={job_id}, owner={owner:?}, schedules={schedules:?}, items={items:?}, scheduler_trace={trace:?}"
+            );
+        }
+    };
     assert_eq!(docs_len(&pushed), 1, "B sees the scheduled insert");
     assert_eq!(
         pushed[0].get("title").and_then(|t| t.as_str()),
         Some("from-scheduler")
     );
+    cluster.shutdown().await;
     Ok(())
 }
 
@@ -216,7 +265,7 @@ async fn owner_scheduled_write_pushes_b_subscriber() -> anyhow::Result<()> {
 /// returns an 81-table schema — a reply far past the cap — intact.
 #[tokio::test]
 async fn large_forwarded_mutate_and_reply_round_trip() -> anyhow::Result<()> {
-    let cluster = Cluster::two(items_schema()).await;
+    let mut cluster = Cluster::two(items_schema()).await;
     let b = cluster.replica(ReplicaId::B).state.clone();
     let pool = b.pool.clone();
     let db = cluster.db.as_str().to_string();
@@ -302,6 +351,7 @@ async fn large_forwarded_mutate_and_reply_round_trip() -> anyhow::Result<()> {
         81,
         "the owner's full schema came back through the reply spool"
     );
+    cluster.shutdown().await;
     Ok(())
 }
 
@@ -350,6 +400,7 @@ async fn dropped_replies_commit_once_and_replay_after_takeover() -> anyhow::Resu
         1,
         "reply loss + takeover + server-minted replay must net exactly one row"
     );
+    cluster.shutdown().await;
     Ok(())
 }
 
@@ -430,5 +481,67 @@ async fn owner_kill_midstream_subscription_survives_takeover() -> anyhow::Result
         3,
         "two owner writes + one post-takeover write, no duplicates"
     );
+    cluster.shutdown().await;
+    Ok(())
+}
+
+/// Card criterion 3, multi-instance form: a quiesce fence persisted out-of-
+/// band (as from a single-instance era) stays authoritative across every
+/// replica. A write forwarded from the shadow carrying a pre-quiesce
+/// admission epoch is rejected by the executing owner while quiesced, stays
+/// rejected after release (the fence never rolls back), and a fresh-epoch
+/// write from the same replica lands normally.
+#[tokio::test]
+async fn forwarded_stale_epoch_is_rejected_by_the_owner_across_release() -> anyhow::Result<()> {
+    let mut cluster = Cluster::two(items_schema()).await;
+    assert_eq!(cluster.owner().await, ReplicaId::A, "A owns after push");
+    let pool_b = cluster.replica(ReplicaId::B).state.pool.clone();
+    let db = cluster.db.as_str().to_string();
+
+    let stale_epoch = rtdb_server::db::admission_epoch(&pool_b).await?;
+    let generation = rtdb_server::db::quiesce_database(&pool_b, &db)
+        .await?
+        .expect("database registered");
+
+    async fn forward_stale(
+        cluster: &Cluster,
+        db: &str,
+        stale_epoch: i64,
+    ) -> Result<rtdb_server::txn::TxnOutcome, rtdb_server::error::RtDbError> {
+        cluster
+            .replica(ReplicaId::B)
+            .state
+            .realtime
+            .committers
+            .mutate_with_admission(
+                db,
+                None,
+                insert_item("stale-forward"),
+                rtdb_server::auth::PrincipalCtx::bypass(),
+                Some(stale_epoch),
+            )
+            .await
+    }
+
+    let rejected = forward_stale(&cluster, &db, stale_epoch)
+        .await
+        .expect_err("stale forwarded write must be rejected while quiesced");
+    assert_eq!(rejected.code, ErrorCode::ReadOnly);
+
+    assert!(rtdb_server::db::clear_quiesce(&pool_b, &db, generation).await?);
+    let still = forward_stale(&cluster, &db, stale_epoch)
+        .await
+        .expect_err("the fence outlives release for the stale epoch");
+    assert_eq!(still.code, ErrorCode::ReadOnly);
+
+    cluster
+        .mutate_http(ReplicaId::B, insert_item("fresh-after-release"))
+        .await;
+    assert_eq!(
+        items_count(&pool_b, &db).await?,
+        1,
+        "fresh-epoch write from the same replica lands after release"
+    );
+    cluster.shutdown().await;
     Ok(())
 }

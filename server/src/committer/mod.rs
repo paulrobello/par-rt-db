@@ -9,7 +9,7 @@
 //! and publishes the write arms at the four tap sites (subscription fan-out,
 //! op-feed, audit log, webhooks). Never add a second writer.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -103,6 +103,7 @@ pub enum CommitterRequest {
         idempotency_key: Option<String>,
         txn: Transaction,
         principal_ctx: PrincipalCtx,
+        admission_epoch: Option<i64>,
         /// Monotonic instant the request was enqueued (ENH-018). Subtracted
         /// from `Instant::now()` at dequeue to produce `queue_wait_ms` on the
         /// `committer.mutate` span — the gap between enqueue and execution is
@@ -136,6 +137,7 @@ pub enum CommitterRequest {
         /// SEC-001: the enqueuing user, when a `User` enqueued the job.
         /// `None` (system/machine) fires as the bypass principal.
         enqueuer: Option<crate::auth::EnqueuerIdentity>,
+        admission_epoch: i64,
     },
     /// Apply a declarative schema migration on this database. Serialized through
     /// the per-db committer like `Mutate`, so the migration's DDL+DML and the
@@ -162,13 +164,14 @@ pub enum CommitterRequest {
     /// reaper task does not wait for a reply. The committer runs the batch
     /// delete inside its serialized turn and publishes through the four tap
     /// sites with `source = "ttl"`.
-    RunReaper,
+    RunReaper { admission_epoch: i64 },
     /// A claimed workflow run is due for advancement (FM-29). Fire-and-forget
     /// like `RunReaper`: the scheduler claims the row; the committer executes
     /// the current step's txn and writes the bookkeeping inside its serialized
     /// turn (single-writer invariant — the scheduler never executes a step).
     RunWorkflowAdvance {
         row: Box<crate::workflows::WorkflowRow>,
+        admission_epoch: i64,
     },
     /// FM-27: re-stamp every principal-bearing field referencing `anon_id` to
     /// `real_id` across this db's tables, inside the serialized committer turn.
@@ -186,6 +189,11 @@ pub enum CommitterRequest {
     RunRestoreSchema {
         target_version: i64,
         reply: oneshot::Sender<Result<i64, RtDbError>>,
+    },
+    /// A barrier placed behind every already-queued request. Once this arm
+    /// replies, client-plane work admitted before the barrier has completed.
+    Quiesce {
+        reply: oneshot::Sender<Result<(), RtDbError>>,
     },
     /// Best-effort immediate retirement of all five per-db tasks. Enqueued by
     /// `drop_db` behind any in-flight work so the committer exits once the
@@ -247,6 +255,7 @@ pub struct Committers {
     /// falls back to the local takeover attempt.
     forwarder: Option<Arc<crate::forward::Forwarder>>,
     channels: Arc<Mutex<HashMap<String, ChannelEntry>>>,
+    quiesce_leases: Arc<Mutex<HashMap<String, sqlx::PgConnection>>>,
 }
 
 /// One entry in the per-db channel map: the committer's sender plus the last
@@ -374,6 +383,7 @@ impl Committers {
             multi_instance: cfg.multi_instance,
             forwarder: cfg.forwarder,
             channels: Arc::new(Mutex::new(HashMap::new())),
+            quiesce_leases: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -473,6 +483,109 @@ impl Committers {
         }
         let (sender, _) = self.channel_for(db, false).await?;
         self.send_and_evict(db, sender, req).await
+    }
+
+    /// Stop admitting new client-plane writes, then place a barrier behind all
+    /// work already queued for this database. Multi-instance coordination is
+    /// deliberately refused until the quiesce generation is shared across
+    /// replicas; callers must not mistake a local barrier for global proof.
+    pub async fn barrier(&self, db: &str) -> Result<(), RtDbError> {
+        if self.multi_instance {
+            return Err(RtDbError::conflict(
+                "per-database quiesce requires coordinated replica support",
+            ));
+        }
+        let (sender, _) = self.channel_for(db, false).await?;
+        let (reply, reply_rx) = oneshot::channel();
+        self.send_and_evict(db, sender, CommitterRequest::Quiesce { reply })
+            .await?;
+        reply_rx
+            .await
+            .map_err(|_| RtDbError::internal("quiesce barrier dropped"))?
+    }
+
+    pub async fn quiesce(&self, db: &str) -> Result<i64, RtDbError> {
+        if self.multi_instance {
+            return Err(RtDbError::conflict(
+                "per-database quiesce requires coordinated replica support",
+            ));
+        }
+        let mut leases = self.quiesce_leases.lock().await;
+        if leases.contains_key(db) {
+            return Err(RtDbError::conflict(
+                "database is already quiesced by this instance",
+            ));
+        }
+        let generation = crate::db::quiesce_database(&self.pool, db)
+            .await?
+            .ok_or_else(|| RtDbError::not_found("database is not registered"))?;
+        if let Err(error) = self.barrier(db).await {
+            let _ = crate::db::clear_quiesce(&self.pool, db, generation).await;
+            return Err(error);
+        }
+        let lease = match crate::db::acquire_quiesce_lock(&self.pool, db).await {
+            Ok(lease) => lease,
+            Err(error) => {
+                let _ = crate::db::clear_quiesce(&self.pool, db, generation).await;
+                return Err(error);
+            }
+        };
+        leases.insert(db.to_owned(), lease);
+        Ok(generation)
+    }
+
+    pub async fn unquiesce(&self, db: &str, generation: i64) -> Result<(), RtDbError> {
+        let mut leases = self.quiesce_leases.lock().await;
+        // Validate and clear while still holding the lease that guards this
+        // database: the locally held connection when this instance owns the
+        // quiesce, otherwise a transient take of the Postgres advisory lock.
+        // The recovery path serves releases after a process restart or a
+        // cancelled quiesce — the owning Postgres session is gone, so the
+        // lock is free; `pg_try_advisory_lock` takes it only when no other
+        // owner still holds it, preserving cross-instance mutual exclusion.
+        let held_locally = leases.contains_key(db);
+        let mut lease = match leases.remove(db) {
+            Some(lease) => lease,
+            None => crate::db::try_acquire_quiesce_lock(&self.pool, db)
+                .await?
+                .ok_or_else(|| RtDbError::conflict("quiesce lease is held by another owner"))?,
+        };
+        let current: Option<(bool, i64)> = sqlx::query_as(
+            "SELECT quiesced, quiesce_generation FROM rtdb_auth.databases WHERE name = $1",
+        )
+        .bind(db)
+        .fetch_optional(&mut lease)
+        .await?;
+        let valid = current == Some((true, generation)) || current == Some((false, generation));
+        let cleared = if !valid {
+            None
+        } else if current == Some((true, generation)) {
+            Some(crate::db::clear_quiesce_on_connection(&mut lease, db, generation).await?)
+        } else {
+            Some(true)
+        };
+        match (cleared, held_locally) {
+            (Some(true), true) => crate::db::release_quiesce_lock(lease, db).await,
+            (Some(true), false) => {
+                let _ = crate::db::release_quiesce_lock(lease, db).await;
+                Ok(())
+            }
+            // Validation failed or the generation moved under the clear: a
+            // local lease stays recorded for its owner; a transient recovery
+            // lease is handed straight back.
+            (Some(false), true) | (None, true) => {
+                leases.insert(db.to_owned(), lease);
+                Err(RtDbError::conflict(
+                    "quiesce generation is stale or database is not quiesced",
+                ))
+            }
+            (Some(false), false) | (None, false) => {
+                let _ = crate::db::release_quiesce_lock(lease, db).await;
+                Err(RtDbError::conflict(
+                    "quiesce generation is stale or database is not quiesced",
+                ))
+            }
+        }
     }
 
     /// Owner-side submit used by the forward listener (`forward.rs`): the
@@ -999,6 +1112,22 @@ impl Committers {
         txn: Transaction,
         principal_ctx: PrincipalCtx,
     ) -> Result<TxnOutcome, RtDbError> {
+        self.mutate_with_admission(db, idempotency_key, txn, principal_ctx, None)
+            .await
+    }
+
+    pub async fn mutate_with_admission(
+        &self,
+        db: &str,
+        idempotency_key: Option<String>,
+        txn: Transaction,
+        principal_ctx: PrincipalCtx,
+        admission_epoch: Option<i64>,
+    ) -> Result<TxnOutcome, RtDbError> {
+        let admission_epoch = match admission_epoch {
+            Some(epoch) => Some(epoch),
+            None => Some(crate::db::admission_epoch(&self.pool).await?),
+        };
         let (reply, reply_rx) = oneshot::channel();
         // ENH-018: stamp the enqueue instant so the committer's dequeue can
         // derive `queue_wait_ms` on the `committer.mutate` span.
@@ -1009,6 +1138,7 @@ impl Committers {
                 idempotency_key,
                 txn,
                 principal_ctx,
+                admission_epoch,
                 enqueued_at,
                 reply,
             },
@@ -1343,6 +1473,7 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                 idempotency_key,
                 txn,
                 principal_ctx,
+                admission_epoch,
                 enqueued_at,
                 reply,
             } => {
@@ -1359,9 +1490,10 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                     queue_wait_ms,
                     steps = txn.steps.len(),
                 );
-                let outcome = handle_mutate(&ctx, idempotency_key, txn, principal_ctx)
-                    .instrument(span)
-                    .await;
+                let outcome =
+                    handle_mutate(&ctx, idempotency_key, txn, principal_ctx, admission_epoch)
+                        .instrument(span)
+                        .await;
                 let _ = reply.send(outcome);
             }
             CommitterRequest::Subscribe {
@@ -1387,6 +1519,7 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                 tz,
                 due_at,
                 enqueuer,
+                admission_epoch,
             } => {
                 let span = tracing::info_span!(
                     "committer.scheduled",
@@ -1394,10 +1527,20 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                     kind,
                     id,
                 );
-                let outcome =
-                    handle_scheduled(&ctx, id, kind, *txn, cron, every_ms, tz, due_at, enqueuer)
-                        .instrument(span)
-                        .await;
+                let outcome = handle_scheduled(
+                    &ctx,
+                    id,
+                    kind,
+                    *txn,
+                    cron,
+                    every_ms,
+                    tz,
+                    due_at,
+                    enqueuer,
+                    admission_epoch,
+                )
+                .instrument(span)
+                .await;
                 if let Err(err) = outcome {
                     tracing::error!(db = %ctx.db, error = %err, "scheduled job handling failed");
                 }
@@ -1419,17 +1562,22 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                 let result = handle_push_schema(&ctx, schema).instrument(span).await;
                 let _ = reply.send(result);
             }
-            CommitterRequest::RunReaper => {
+            CommitterRequest::RunReaper { admission_epoch } => {
                 let span = tracing::info_span!("committer.reaper", db = %ctx.db);
-                let outcome = handle_reaper(&ctx).instrument(span).await;
+                let outcome = handle_reaper(&ctx, admission_epoch).instrument(span).await;
                 if let Err(err) = outcome {
                     tracing::error!(db = %ctx.db, error = %err, "ttl reaper handling failed");
                 }
             }
-            CommitterRequest::RunWorkflowAdvance { row } => {
+            CommitterRequest::RunWorkflowAdvance {
+                row,
+                admission_epoch,
+            } => {
                 let id = row.id.clone();
                 let span = tracing::info_span!("committer.workflow", db = %ctx.db, id);
-                let outcome = handle_workflow_advance(&ctx, *row).instrument(span).await;
+                let outcome = handle_workflow_advance(&ctx, *row, admission_epoch)
+                    .instrument(span)
+                    .await;
                 if let Err(err) = outcome {
                     tracing::error!(db = %ctx.db, error = %err, "workflow advance failed");
                 }
@@ -1461,6 +1609,9 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                     .instrument(span)
                     .await;
                 let _ = reply.send(outcome);
+            }
+            CommitterRequest::Quiesce { reply } => {
+                let _ = reply.send(Ok(()));
             }
             CommitterRequest::Shutdown => {
                 // ARC-125: best-effort retirement requested by `drop_db`.

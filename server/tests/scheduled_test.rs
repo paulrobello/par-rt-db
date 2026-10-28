@@ -14,7 +14,7 @@ use sqlx::PgPool;
 
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::committer::{CommitterConfig, Committers};
-use rtdb_server::db::SchemaCache;
+use rtdb_server::db::{self, SchemaCache};
 use rtdb_server::ddl;
 use rtdb_server::error::ErrorCode;
 use rtdb_server::metrics::Metrics;
@@ -153,6 +153,54 @@ async fn claim_due_and_finalize() {
     assert_eq!(listed[0].id, cron);
     assert_eq!(listed[0].fired_count, 1);
     assert_eq!(listed[0].status, ScheduleStatus::Pending);
+}
+
+#[tokio::test]
+async fn stale_and_equal_fence_epochs_cannot_claim_schedule() {
+    let pool = test_pool().await;
+    let db = unique_db(&pool).await;
+    scheduler::ensure_table(&pool, &db).await.unwrap();
+    scheduler::insert(
+        &pool,
+        &db,
+        "oneshot",
+        1,
+        &empty_txn(),
+        None,
+        None,
+        None,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let stale_epoch = db::admission_epoch(&pool).await.unwrap();
+    let generation = db::quiesce_database(&pool, &db)
+        .await
+        .unwrap()
+        .expect("fresh database quiesced");
+    let equal_fence_epoch = db::admission_epoch(&pool).await.unwrap();
+
+    let stale = scheduler::claim_due_with_epoch(&pool, &db, i64::MAX, 1, stale_epoch)
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code, ErrorCode::ReadOnly);
+    let equal = scheduler::claim_due_with_epoch(&pool, &db, i64::MAX, 1, equal_fence_epoch)
+        .await
+        .unwrap_err();
+    assert_eq!(equal.code, ErrorCode::ReadOnly);
+    assert_eq!(
+        scheduler::list(&pool, &db).await.unwrap()[0].status,
+        ScheduleStatus::Pending
+    );
+
+    assert!(db::clear_quiesce(&pool, &db, generation).await.unwrap());
+    let current_epoch = db::admission_epoch(&pool).await.unwrap();
+    let claimed = scheduler::claim_due_with_epoch(&pool, &db, i64::MAX, 1, current_epoch)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
 }
 
 #[tokio::test]

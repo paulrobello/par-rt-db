@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::AppState;
-use crate::http_api::{authed, client_ip_key};
+use crate::http_api::{AdmissionEpoch, authed, client_ip_key};
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Path, Query as AxumQuery, Request, State};
+use axum::extract::{ConnectInfo, Extension, Path, Query as AxumQuery, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 
@@ -34,12 +34,16 @@ pub(crate) struct UploadResponse {
 pub(crate) async fn upload_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(admission_epoch): Extension<AdmissionEpoch>,
     Path(db): Path<String>,
     request: Request,
 ) -> Result<Json<UploadResponse>, RtDbError> {
     let principal = authed(&state, &headers, &db).await?;
     if principal.is_read_only() {
         return Err(RtDbError::forbidden("read-only token cannot mutate"));
+    }
+    if crate::db::is_quiesced(&state.pool, &db).await? {
+        return Err(RtDbError::read_only());
     }
     check_http_rate_limits(&state, &principal, &db).await?;
     storage::ensure_table(&state.pool, &db).await?; // revive storage for old dbs
@@ -108,7 +112,7 @@ pub(crate) async fn upload_handler(
         }
     };
     let body_stream = request.into_body().into_data_stream();
-    let result = storage::put_stream(
+    let result = storage::put_stream_with_epoch(
         &state.pool,
         &db,
         content_type.as_deref(),
@@ -116,6 +120,7 @@ pub(crate) async fn upload_handler(
         limit as u64,
         quota_check,
         body_stream,
+        Some(admission_epoch.0),
     )
     .await?;
     // ENH-011: best-effort post-upload refresh of the storage cache so the next
@@ -712,11 +717,15 @@ pub(crate) struct OkResponse {
 pub(crate) async fn delete_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(admission_epoch): Extension<AdmissionEpoch>,
     Path((db, id)): Path<(String, String)>,
 ) -> Result<Json<OkResponse>, RtDbError> {
     let principal = authed(&state, &headers, &db).await?;
     if principal.is_read_only() {
         return Err(RtDbError::forbidden("read-only token cannot mutate"));
+    }
+    if crate::db::is_quiesced(&state.pool, &db).await? {
+        return Err(RtDbError::read_only());
     }
     check_http_rate_limits(&state, &principal, &db).await?;
     // SEC-118: per-row owner check before the destructive op. A missing row
@@ -724,7 +733,7 @@ pub(crate) async fn delete_handler(
     // id is not disclosed to a non-owner.
     if let Some(meta) = storage::get_meta(&state.pool, &db, &id).await? {
         enforce_blob_owner(&principal, &meta.owner_id)?;
-        storage::delete(&state.pool, &db, &id).await?;
+        storage::delete_with_epoch(&state.pool, &db, &id, Some(admission_epoch.0)).await?;
     }
     Ok(Json(OkResponse { ok: true }))
 }

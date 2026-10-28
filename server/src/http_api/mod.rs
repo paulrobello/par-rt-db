@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, FromRequest, Path, Request, State};
 use axum::http::HeaderMap;
+use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 
@@ -88,6 +89,49 @@ async fn authed(
 /// Shared with `admin.rs` so malformed admin bodies get the same envelope.
 pub(crate) struct ApiJson<T>(pub(crate) T);
 
+#[derive(Clone, Copy)]
+pub(crate) struct AdmissionEpoch(pub(crate) i64);
+
+#[cfg(any(test, feature = "test-support"))]
+type AdmissionProbe = std::sync::Arc<
+    dyn Fn(&Request, i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+#[cfg(any(test, feature = "test-support"))]
+static ADMISSION_PROBE: std::sync::OnceLock<std::sync::Mutex<Option<AdmissionProbe>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(any(test, feature = "test-support"))]
+static ADMISSION_PROBE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(any(test, feature = "test-support"))]
+pub struct AdmissionProbeGuard {
+    id: u64,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for AdmissionProbeGuard {
+    fn drop(&mut self) {
+        if let Some(slot) = ADMISSION_PROBE.get() {
+            let mut slot = slot.lock().unwrap_or_else(|error| error.into_inner());
+            if self.id == ADMISSION_PROBE_ID.load(std::sync::atomic::Ordering::Relaxed) {
+                *slot = None;
+            }
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn install_admission_probe(probe: AdmissionProbe) -> AdmissionProbeGuard {
+    let id = ADMISSION_PROBE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let slot = ADMISSION_PROBE.get_or_init(|| std::sync::Mutex::new(None));
+    *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(probe);
+    ADMISSION_PROBE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+    AdmissionProbeGuard { id }
+}
+
 impl<T, S> FromRequest<S> for ApiJson<T>
 where
     T: serde::de::DeserializeOwned,
@@ -161,10 +205,32 @@ pub fn http_api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // Mint a signed, time-limited URL — same auth as authed serve; the
         // holder fetches via `GET /storage/{id}?exp=&sig=` until expiry.
         .route("/api/storage/{db}/{id}/signed-url", get(signed_url_handler))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            stamp_admission_epoch,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             state,
             host_surface_guard,
         ))
+}
+
+pub(crate) async fn stamp_admission_epoch(
+    State(state): State<Arc<AppState>>,
+    mut request: Request,
+    next: axum::middleware::Next,
+) -> Result<Response, RtDbError> {
+    let epoch = crate::db::admission_epoch(&state.pool).await?;
+    request.extensions_mut().insert(AdmissionEpoch(epoch));
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(probe) = ADMISSION_PROBE.get().and_then(|slot| {
+        slot.lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }) {
+        probe(&request, epoch).await;
+    }
+    Ok(next.run(request).await)
 }
 
 /// Blob byte-serving routes, kept OUT of the router-wide gzip layer in

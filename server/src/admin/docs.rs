@@ -5,11 +5,12 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::RtDbError;
+use crate::http_api::AdmissionEpoch;
 use crate::http_api::ApiJson;
 use crate::query::{Query, QueryResult, execute_query};
 use crate::txn::{Transaction, worst_case_affected};
@@ -81,6 +82,7 @@ pub(super) struct AdminMutateResponse {
 pub(super) async fn admin_mutate(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
+    Extension(admission_epoch): Extension<AdmissionEpoch>,
     Path(db): Path<String>,
     ApiJson(body): ApiJson<AdminMutateRequest>,
 ) -> Result<Json<AdminMutateResponse>, RtDbError> {
@@ -97,11 +99,12 @@ pub(super) async fn admin_mutate(
     let outcome = state
         .realtime
         .committers
-        .mutate(
+        .mutate_with_admission(
             &db,
             body.idempotency_key,
             body.txn,
             crate::auth::PrincipalCtx::admin_bypass(),
+            Some(admission_epoch.0),
         )
         .await?;
     state.runtime.metrics.record_mutation();

@@ -190,8 +190,11 @@ pub(in crate::committer) async fn reply_ownership_conflict(
         CommitterRequest::RunRestoreSchema { reply, .. } => {
             let _ = reply.send(Err(err));
         }
+        CommitterRequest::Quiesce { reply } => {
+            let _ = reply.send(Err(err));
+        }
         CommitterRequest::RunScheduled { .. }
-        | CommitterRequest::RunReaper
+        | CommitterRequest::RunReaper { .. }
         | CommitterRequest::RunWorkflowAdvance { .. } => {
             tracing::warn!(
                 db = %ctx.db,
@@ -211,10 +214,21 @@ pub(in crate::committer) fn request_needs_write(req: &CommitterRequest) -> bool 
         CommitterRequest::Mutate { .. }
             | CommitterRequest::RunScheduled { .. }
             | CommitterRequest::RunMigrate { .. }
-            | CommitterRequest::RunReaper
+            | CommitterRequest::RunReaper { .. }
             | CommitterRequest::RunWorkflowAdvance { .. }
             | CommitterRequest::RunMergeUsers { .. }
             | CommitterRequest::RunPushSchema { .. }
             | CommitterRequest::RunRestoreSchema { .. }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::db_ownership_key;
+
+    #[test]
+    fn quiesce_and_ownership_keys_use_distinct_namespaces() {
+        let db = "tadvisory_namespace_probe";
+        assert_ne!(db_ownership_key(db), crate::db::quiesce_key(db));
+    }
 }

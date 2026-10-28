@@ -5,11 +5,12 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, Request, State};
+use axum::extract::{Extension, Path, Request, State};
 use axum::http::{HeaderMap, header::CONTENT_TYPE};
 use serde::Serialize;
 
 use crate::error::RtDbError;
+use crate::http_api::AdmissionEpoch;
 use crate::{AppState, db, storage};
 
 use super::OkResponse;
@@ -49,11 +50,15 @@ pub(super) async fn admin_storage_list(
 pub(super) async fn admin_storage_upload(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
+    Extension(admission_epoch): Extension<AdmissionEpoch>,
     Path(db): Path<String>,
     request: Request,
 ) -> Result<Json<AdminStorageUploadResponse>, RtDbError> {
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
+    }
+    if db::is_quiesced(&state.pool, &db).await? {
+        return Err(RtDbError::read_only());
     }
     storage::ensure_table(&state.pool, &db).await?;
     let limit = crate::config::HARD_MAX_FILE_SIZE.min(state.runtime.hot.load().max_file_size);
@@ -66,7 +71,7 @@ pub(super) async fn admin_storage_upload(
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let id = storage::put(
+    let id = storage::put_with_epoch(
         &state.pool,
         &db,
         &sha256,
@@ -77,6 +82,7 @@ pub(super) async fn admin_storage_upload(
         // this route bypass per-row enforcement either way.
         None,
         &bytes,
+        Some(admission_epoch.0),
     )
     .await?;
     state.runtime.metrics.record_upload();
@@ -89,11 +95,15 @@ pub(super) async fn admin_storage_upload(
 pub(super) async fn admin_storage_delete(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
+    Extension(admission_epoch): Extension<AdmissionEpoch>,
     Path((db, id)): Path<(String, String)>,
 ) -> Result<Json<OkResponse>, RtDbError> {
     if !db::database_exists(&state.pool, &db).await? {
         return Err(RtDbError::not_found("unknown database"));
     }
-    storage::delete(&state.pool, &db, &id).await?;
+    if db::is_quiesced(&state.pool, &db).await? {
+        return Err(RtDbError::read_only());
+    }
+    storage::delete_with_epoch(&state.pool, &db, &id, Some(admission_epoch.0)).await?;
     Ok(Json(OkResponse { ok: true }))
 }

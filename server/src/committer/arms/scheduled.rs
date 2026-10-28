@@ -19,6 +19,7 @@ pub(in crate::committer) async fn handle_scheduled(
     tz: Option<String>,
     due_at: i64,
     enqueuer: Option<crate::auth::EnqueuerIdentity>,
+    admission_epoch: i64,
 ) -> Result<(), RtDbError> {
     // SEC-001: resolve the stored enqueuer to a fire-time principal. `None`
     // (system/machine enqueue) keeps the bypass exactly as before; `Some` is
@@ -81,7 +82,10 @@ pub(in crate::committer) async fn handle_scheduled(
         None,
         side,
         // ENH-048: system arm — no idem key, exempt from the freeze gate.
-        crate::txn::MutatePreamble::default(),
+        crate::txn::MutatePreamble {
+            admission_epoch: Some(admission_epoch),
+            ..Default::default()
+        },
     )
     .await
     {

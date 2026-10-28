@@ -216,6 +216,7 @@ pub enum ForwardWrite {
         idempotency_key: Option<String>,
         txn: Transaction,
         principal: PrincipalCtx,
+        admission_epoch: Option<i64>,
     },
     Migrate {
         request: MigrateRequest,
@@ -497,6 +498,7 @@ async fn execute_as_owner(
             idempotency_key,
             txn,
             principal,
+            admission_epoch,
         } => {
             let (reply, reply_rx) = oneshot::channel();
             committers
@@ -506,6 +508,7 @@ async fn execute_as_owner(
                         idempotency_key,
                         txn,
                         principal_ctx: principal,
+                        admission_epoch,
                         enqueued_at: std::time::Instant::now(),
                         reply,
                     },
@@ -867,6 +870,7 @@ mod tests {
                     enqueuer: None,
                     admin: false,
                 },
+                admission_epoch: None,
             },
             ForwardWrite::MergeUsers {
                 anon_id: "anon".into(),

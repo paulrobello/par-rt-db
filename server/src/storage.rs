@@ -19,7 +19,7 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use sqlx::{AssertSqlSafe, PgPool};
 
-use crate::db::{new_id, now_ms, validate_db_name};
+use crate::db::{new_id, now_ms, quiesce_key, validate_db_name};
 use crate::ddl::pg_schema;
 use crate::error::RtDbError;
 
@@ -164,10 +164,39 @@ pub async fn put(
     owner_id: Option<&str>,
     bytes: &[u8],
 ) -> Result<String, RtDbError> {
+    put_with_epoch(pool, db, sha256, size, content_type, owner_id, bytes, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn put_with_epoch(
+    pool: &PgPool,
+    db: &str,
+    sha256: &str,
+    size: i64,
+    content_type: Option<&str>,
+    owner_id: Option<&str>,
+    bytes: &[u8],
+    admission_epoch: Option<i64>,
+) -> Result<String, RtDbError> {
     validate_db_name(db)?;
+    let admission_epoch = match admission_epoch {
+        Some(epoch) => epoch,
+        None => crate::db::admission_epoch(pool).await?,
+    };
+    let (quiesced_at_admission, admission_generation) =
+        crate::db::quiesce_admission(pool, db).await?;
+    if quiesced_at_admission {
+        return Err(RtDbError::read_only());
+    }
     let schema = pg_schema(db);
     let id = new_id();
     let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(quiesce_key(db))
+        .execute(&mut *tx)
+        .await?;
+    crate::db::ensure_quiesce_generation(&mut tx, db, admission_generation).await?;
+    crate::db::ensure_admission_epoch(&mut tx, db, admission_epoch).await?;
     let inserted: Option<(String,)> = sqlx::query_as(AssertSqlSafe(format!(
         "INSERT INTO \"{schema}\".storage (id, sha256, size, content_type, bytes, created_at, owner_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -244,10 +273,55 @@ where
     S: futures::Stream<Item = Result<Bytes, E>>,
     E: std::fmt::Display,
 {
+    put_stream_with_epoch(
+        pool,
+        db,
+        content_type,
+        owner_id,
+        limit,
+        quota_check,
+        chunk_stream,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn put_stream_with_epoch<F, Fut, S, E>(
+    pool: &PgPool,
+    db: &str,
+    content_type: Option<&str>,
+    owner_id: Option<&str>,
+    limit: u64,
+    quota_check: F,
+    chunk_stream: S,
+    admission_epoch: Option<i64>,
+) -> Result<StreamPutResult, RtDbError>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = Result<(), RtDbError>>,
+    S: futures::Stream<Item = Result<Bytes, E>>,
+    E: std::fmt::Display,
+{
     validate_db_name(db)?;
+    let admission_epoch = match admission_epoch {
+        Some(epoch) => epoch,
+        None => crate::db::admission_epoch(pool).await?,
+    };
+    let (quiesced_at_admission, admission_generation) =
+        crate::db::quiesce_admission(pool, db).await?;
+    if quiesced_at_admission {
+        return Err(RtDbError::read_only());
+    }
     let schema = pg_schema(db);
     let provisional_id = new_id();
     let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(quiesce_key(db))
+        .execute(&mut *tx)
+        .await?;
+    crate::db::ensure_quiesce_generation(&mut tx, db, admission_generation).await?;
+    crate::db::ensure_admission_epoch(&mut tx, db, admission_epoch).await?;
     // Insert each 1 MiB accumulation as a chunk row under the provisional id.
     let mut hasher = Sha256::new();
     let mut buf: Vec<u8> = Vec::with_capacity(STORAGE_CHUNK_BYTES);
@@ -696,12 +770,36 @@ fn storage_meta_to_file_meta(
 /// Deletes a blob and its index row. Returns true if a blob row was removed.
 /// ENH-021: also drops any `storage_chunks` rows for the blob (chunked layout).
 pub async fn delete(pool: &PgPool, db: &str, id: &str) -> Result<bool, RtDbError> {
+    delete_with_epoch(pool, db, id, None).await
+}
+
+pub async fn delete_with_epoch(
+    pool: &PgPool,
+    db: &str,
+    id: &str,
+    admission_epoch: Option<i64>,
+) -> Result<bool, RtDbError> {
     validate_db_name(db)?;
+    let admission_epoch = match admission_epoch {
+        Some(epoch) => epoch,
+        None => crate::db::admission_epoch(pool).await?,
+    };
+    let (quiesced_at_admission, admission_generation) =
+        crate::db::quiesce_admission(pool, db).await?;
+    if quiesced_at_admission {
+        return Err(RtDbError::read_only());
+    }
     let schema = pg_schema(db);
     // Atomic with `put`: the per-db blob delete, the per-db chunk delete, and
     // the global index delete are one transaction, so a failure between them
     // can't leave orphan chunk rows or an index row pointing at a gone blob.
     let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(quiesce_key(db))
+        .execute(&mut *tx)
+        .await?;
+    crate::db::ensure_quiesce_generation(&mut tx, db, admission_generation).await?;
+    crate::db::ensure_admission_epoch(&mut tx, db, admission_epoch).await?;
     let res = sqlx::query(AssertSqlSafe(format!(
         "DELETE FROM \"{schema}\".storage WHERE id = $1"
     )))

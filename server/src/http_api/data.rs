@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 
 use crate::AppState;
@@ -255,6 +255,7 @@ pub(crate) struct MutateResponse {
 pub(crate) async fn mutate_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(admission_epoch): Extension<crate::http_api::AdmissionEpoch>,
     ApiJson(body): ApiJson<MutateRequest>,
 ) -> Result<Json<MutateResponse>, RtDbError> {
     let principal = authed(&state, &headers, &body.db).await?;
@@ -273,11 +274,12 @@ pub(crate) async fn mutate_handler(
     let outcome = state
         .realtime
         .committers
-        .mutate(
+        .mutate_with_admission(
             &body.db,
             body.idempotency_key,
             body.txn,
             principal.row_ctx(),
+            Some(admission_epoch.0),
         )
         .await?;
     state
@@ -348,6 +350,7 @@ pub(crate) struct BatchMutateResponse {
 pub(crate) async fn mutate_batch_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Extension(admission_epoch): Extension<crate::http_api::AdmissionEpoch>,
     ApiJson(body): ApiJson<BatchMutateRequest>,
 ) -> Result<Json<BatchMutateResponse>, RtDbError> {
     if body.txns.is_empty() {
@@ -374,7 +377,13 @@ pub(crate) async fn mutate_batch_handler(
         let outcome = match state
             .realtime
             .committers
-            .mutate(&body.db, entry.idempotency_key, entry.txn, ctx.clone())
+            .mutate_with_admission(
+                &body.db,
+                entry.idempotency_key,
+                entry.txn,
+                ctx.clone(),
+                Some(admission_epoch.0),
+            )
             .await
         {
             Ok(committed) => BatchMutateOutcome {

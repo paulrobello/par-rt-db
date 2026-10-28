@@ -17,7 +17,7 @@ use arc_swap::ArcSwap;
 use rtdb_server::AppState;
 use rtdb_server::auth::PrincipalCtx;
 use rtdb_server::committer::{CommitterConfig, Committers};
-use rtdb_server::db::{SchemaCache, now_ms};
+use rtdb_server::db::{self, SchemaCache, now_ms};
 use rtdb_server::error::ErrorCode;
 use rtdb_server::metrics::Metrics;
 use rtdb_server::op_feed::OpFeed;
@@ -77,6 +77,44 @@ async fn insert_claim_reset_roundtrip() {
     assert_eq!(full.info.status, WorkflowStatus::Cancelled);
     assert!(full.step_outcomes.is_empty());
     assert!(workflows::delete(&pool, &db, &id).await.unwrap());
+}
+
+#[tokio::test]
+async fn stale_and_equal_fence_epochs_cannot_claim_workflow() {
+    let state = test_state().await;
+    let pool = state.pool.clone();
+    let db = fresh_db(&state).await;
+    workflows::ensure_table(&pool, &db).await.unwrap();
+    workflows::insert(&pool, &db, &one_step_spec("quiesce-claim"), None)
+        .await
+        .unwrap();
+
+    let stale_epoch = db::admission_epoch(&pool).await.unwrap();
+    let generation = db::quiesce_database(&pool, &db)
+        .await
+        .unwrap()
+        .expect("fresh database quiesced");
+    let equal_fence_epoch = db::admission_epoch(&pool).await.unwrap();
+
+    let stale = workflows::claim_due_with_epoch(&pool, &db, now_ms(), 1, stale_epoch)
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code, ErrorCode::ReadOnly);
+    let equal = workflows::claim_due_with_epoch(&pool, &db, now_ms(), 1, equal_fence_epoch)
+        .await
+        .unwrap_err();
+    assert_eq!(equal.code, ErrorCode::ReadOnly);
+    assert_eq!(
+        workflows::list(&pool, &db, None, 10).await.unwrap()[0].status,
+        WorkflowStatus::Pending
+    );
+
+    assert!(db::clear_quiesce(&pool, &db, generation).await.unwrap());
+    let current_epoch = db::admission_epoch(&pool).await.unwrap();
+    let claimed = workflows::claim_due_with_epoch(&pool, &db, now_ms(), 1, current_epoch)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
 }
 
 /// Task 2: the awaitSignal side-table lifecycle — park (visibility columns +

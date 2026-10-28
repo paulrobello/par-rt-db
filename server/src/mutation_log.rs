@@ -91,6 +91,12 @@ pub async fn check(pool: &PgPool, db: &str, mut_id: &str) -> Result<Option<Vec<V
 /// Returns the number of rows deleted so the caller can back off when idle.
 pub async fn cleanup_expired(pool: &PgPool, db: &str) -> Result<u64, RtDbError> {
     validate_db_name(db)?;
+    // A quiesced database is a cutover barrier: maintenance deletions pause
+    // alongside document writes (change-log trimming rides this sweep too).
+    // `Ok(0)` reads as idle to the caller, so the loop just backs off.
+    if crate::db::is_quiesced(pool, db).await? {
+        return Ok(0);
+    }
     let schema = pg_schema(db);
     let now = now_ms();
     let res = sqlx::query(AssertSqlSafe(format!(

@@ -720,6 +720,24 @@ pub fn document() -> Value {
         ),
         (
             "get",
+            "/admin/db/{db}/quiesce",
+            "Read the quiesce state and generation",
+            "Admin",
+        ),
+        (
+            "post",
+            "/admin/db/{db}/quiesce",
+            "Close client-write admission and drain the database",
+            "Admin",
+        ),
+        (
+            "delete",
+            "/admin/db/{db}/quiesce",
+            "Reopen client-write admission after a quiesce",
+            "Admin",
+        ),
+        (
+            "get",
             "/admin/db/{db}/storage",
             "List db blobs",
             "Admin Storage",

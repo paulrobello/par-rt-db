@@ -7,6 +7,7 @@ pub(in crate::committer) async fn handle_mutate(
     idempotency_key: Option<String>,
     txn: Transaction,
     principal_ctx: PrincipalCtx,
+    admission_epoch: Option<i64>,
 ) -> Result<TxnOutcome, RtDbError> {
     // The op-feed / audit / webhook tap sites carry the caller's uid as the
     // write's `principal` — same value the pre-Task-5 `owner` carried.
@@ -63,6 +64,8 @@ pub(in crate::committer) async fn handle_mutate(
     let preamble = crate::txn::MutatePreamble {
         idem_key: idempotency_key.as_deref(),
         check_freeze: true,
+        check_quiesce: true,
+        admission_epoch,
     };
     // ENH-047: the audit and webhook side-writes run INSIDE execute_txn's
     // transaction (the outbox guarantee), so this arm's tap skips them.

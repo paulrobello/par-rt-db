@@ -46,7 +46,18 @@ pub async fn run_reaper(
                 if !has_ttl_tables(&schemas, &pool, &db).await {
                     continue;
                 }
-                if committer_tx.send(CommitterRequest::RunReaper).await.is_err() {
+                let admission_epoch = match crate::db::admission_epoch(&pool).await {
+                    Ok(epoch) => epoch,
+                    Err(error) => {
+                        tracing::warn!(db = %db, error = %error, "ttl reaper: admission epoch read failed");
+                        continue;
+                    }
+                };
+                if committer_tx
+                    .send(CommitterRequest::RunReaper { admission_epoch })
+                    .await
+                    .is_err()
+                {
                     tracing::debug!(db = %db, "ttl reaper: committer channel closed, exiting");
                     return;
                 }

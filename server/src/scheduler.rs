@@ -684,8 +684,26 @@ pub async fn claim_due(
     now: i64,
     batch: i64,
 ) -> Result<Vec<ClaimedJob>, RtDbError> {
+    let admission_epoch = crate::db::admission_epoch(pool).await?;
+    claim_due_with_epoch(pool, db, now, batch, admission_epoch).await
+}
+
+pub async fn claim_due_with_epoch(
+    pool: &PgPool,
+    db: &str,
+    now: i64,
+    batch: i64,
+    admission_epoch: i64,
+) -> Result<Vec<ClaimedJob>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(crate::db::quiesce_key(db))
+        .execute(&mut *tx)
+        .await?;
+    crate::db::ensure_admission_epoch(&mut tx, db, admission_epoch).await?;
+    crate::db::ensure_quiesce_open(&mut tx, db).await?;
     // Column order matches the RETURNING list below.
     type ClaimRow = (
         String,
@@ -713,8 +731,9 @@ pub async fn claim_due(
     )))
     .bind(now)
     .bind(batch)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
     rows.into_iter()
         .map(
             |(id, kind, txn_json, cron, tz, every_ms, due_at, enqueuer)| {
@@ -1116,6 +1135,75 @@ use tokio::time::Duration;
 
 use crate::committer::CommitterRequest;
 
+#[cfg(any(test, feature = "test-support"))]
+static SCHEDULER_READY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(any(test, feature = "test-support"))]
+static SCHEDULER_TRACE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(any(test, feature = "test-support"))]
+fn trace_scheduler(db: &str, event: impl Into<String>) {
+    let mut traces = SCHEDULER_TRACE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let entries = traces.entry(db.to_string()).or_default();
+    entries.push(event.into());
+    if entries.len() > 128 {
+        entries.remove(0);
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_scheduler_trace(db: &str) -> Vec<String> {
+    SCHEDULER_TRACE
+        .get()
+        .and_then(|traces| {
+            traces
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(db)
+                .cloned()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn mark_scheduler_ready(db: &str) {
+    SCHEDULER_READY
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(db.to_string());
+    trace_scheduler(
+        db,
+        format!("ready thread={:?}", std::thread::current().id()),
+    );
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn wait_scheduler_ready(db: &str, timeout: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let ready = SCHEDULER_READY.get().is_some_and(|slot| {
+            slot.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains(db)
+        });
+        if ready {
+            return true;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        tokio::time::sleep((deadline - now).min(std::time::Duration::from_millis(10))).await;
+    }
+}
+
 /// Maximum sleep between wakes when a db has at least one pending (future) job.
 /// Bounds the latency of a job inserted with a sooner `due_at` than the current
 /// sleep target (the loop re-reads the min `due_at` each wake, so this only
@@ -1153,6 +1241,8 @@ pub async fn run_scheduler(pool: PgPool, db: String, committer_tx: Sender<Commit
     if let Err(err) = crate::workflows::reset_running(&pool, &db).await {
         tracing::error!(db = %db, error = %err, "scheduler: workflows reset_running failed");
     }
+    #[cfg(any(test, feature = "test-support"))]
+    mark_scheduler_ready(&db);
     loop {
         // `claim_sched`/`claim_wf` are true only when THAT table actually has
         // something due; in all other cases its claim_due query is skipped
@@ -1160,6 +1250,14 @@ pub async fn run_scheduler(pool: PgPool, db: String, committer_tx: Sender<Commit
         // nearest due times.
         let sched_next = next_due(&pool, &db).await;
         let wf_next = crate::workflows::next_due(&pool, &db).await;
+        #[cfg(any(test, feature = "test-support"))]
+        trace_scheduler(
+            &db,
+            format!(
+                "poll now={} sched={sched_next:?} workflows={wf_next:?}",
+                now_ms()
+            ),
+        );
         // Per-table error handling mirrors the single-table loop this
         // replaced: a failed read may mean the db was dropped (DROP SCHEMA)
         // out from under this scheduler — exit cleanly in that case; else
@@ -1207,18 +1305,40 @@ pub async fn run_scheduler(pool: PgPool, db: String, committer_tx: Sender<Commit
             }
         }
         if claim_sched {
-            let now = now_ms();
-            let claimed = match claim_due(&pool, &db, now, CLAIM_BATCH).await {
-                Ok(jobs) => jobs,
+            let admission_epoch = match crate::db::admission_epoch(&pool).await {
+                Ok(epoch) => epoch,
                 Err(err) => {
-                    if matches!(crate::db::database_exists(&pool, &db).await, Ok(false)) {
-                        tracing::info!(db = %db, "scheduler: database removed, exiting");
-                        return;
-                    }
-                    tracing::error!(db = %db, error = %err, "scheduler: claim_due failed");
+                    tracing::warn!(db = %db, error = %err, "scheduler: admission epoch read failed");
                     continue;
                 }
             };
+            let now = now_ms();
+            #[cfg(any(test, feature = "test-support"))]
+            trace_scheduler(
+                &db,
+                format!(
+                    "claim_start now={now} epoch={admission_epoch} quiesce={:?}",
+                    crate::db::quiesce_admission(&pool, &db).await
+                ),
+            );
+            let claimed =
+                match claim_due_with_epoch(&pool, &db, now, CLAIM_BATCH, admission_epoch).await {
+                    Ok(jobs) => {
+                        #[cfg(any(test, feature = "test-support"))]
+                        trace_scheduler(&db, format!("claim_ok count={}", jobs.len()));
+                        jobs
+                    }
+                    Err(err) => {
+                        #[cfg(any(test, feature = "test-support"))]
+                        trace_scheduler(&db, format!("claim_error {err:?}"));
+                        if matches!(crate::db::database_exists(&pool, &db).await, Ok(false)) {
+                            tracing::info!(db = %db, "scheduler: database removed, exiting");
+                            return;
+                        }
+                        tracing::error!(db = %db, error = %err, "scheduler: claim_due failed");
+                        continue;
+                    }
+                };
             for job in claimed {
                 let req = CommitterRequest::RunScheduled {
                     id: job.id,
@@ -1229,6 +1349,7 @@ pub async fn run_scheduler(pool: PgPool, db: String, committer_tx: Sender<Commit
                     tz: job.tz,
                     due_at: job.due_at,
                     enqueuer: job.enqueuer,
+                    admission_epoch,
                 };
                 if committer_tx.send(req).await.is_err() {
                     // Committer task is gone; this scheduler is now useless.
@@ -1238,8 +1359,23 @@ pub async fn run_scheduler(pool: PgPool, db: String, committer_tx: Sender<Commit
             }
         }
         if claim_wf {
+            let admission_epoch = match crate::db::admission_epoch(&pool).await {
+                Ok(epoch) => epoch,
+                Err(err) => {
+                    tracing::warn!(db = %db, error = %err, "scheduler: admission epoch read failed");
+                    continue;
+                }
+            };
             let now = now_ms();
-            let claimed_wf = match crate::workflows::claim_due(&pool, &db, now, CLAIM_BATCH).await {
+            let claimed_wf = match crate::workflows::claim_due_with_epoch(
+                &pool,
+                &db,
+                now,
+                CLAIM_BATCH,
+                admission_epoch,
+            )
+            .await
+            {
                 Ok(rows) => rows,
                 Err(err) => {
                     if matches!(crate::db::database_exists(&pool, &db).await, Ok(false)) {
@@ -1251,7 +1387,10 @@ pub async fn run_scheduler(pool: PgPool, db: String, committer_tx: Sender<Commit
                 }
             };
             for row in claimed_wf {
-                let req = CommitterRequest::RunWorkflowAdvance { row: Box::new(row) };
+                let req = CommitterRequest::RunWorkflowAdvance {
+                    row: Box::new(row),
+                    admission_epoch,
+                };
                 if committer_tx.send(req).await.is_err() {
                     tracing::warn!(db = %db, "scheduler: committer channel closed, exiting");
                     return;

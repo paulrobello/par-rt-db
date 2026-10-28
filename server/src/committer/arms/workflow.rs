@@ -16,6 +16,7 @@ use crate::committer::*;
 pub(in crate::committer) async fn handle_workflow_advance(
     ctx: &CommitterCtx,
     mut row: crate::workflows::WorkflowRow,
+    admission_epoch: i64,
 ) -> Result<(), RtDbError> {
     // SEC-001: resolve the stored enqueuer to a fire-time principal. `None`
     // (system/machine start) keeps the bypass exactly as before; `Some` is
@@ -221,7 +222,10 @@ pub(in crate::committer) async fn handle_workflow_advance(
                     None,
                     side,
                     // ENH-048: system arm — no idem key, exempt from the freeze gate.
-                    crate::txn::MutatePreamble::default(),
+                    crate::txn::MutatePreamble {
+                        admission_epoch: Some(admission_epoch),
+                        ..Default::default()
+                    },
                 )
                 .await
             }

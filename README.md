@@ -431,7 +431,8 @@ loss is `DROP TABLE` for tables absent from the target snapshot, and migrate dat
 | `POST /admin/db/{db}/workflows/{id}/cancel` | Bearer admin key | Cancels a non-terminal run (admin-scoped; `{ok:false}` = unknown/terminal). |
 | `POST /admin/db/{db}/workflows/{id}/signal` | Bearer admin key | Delivers a named signal to a `waiting` run (admin-scoped; `{name, payload?}` → `{ok}`) — the route the dashboard's send-signal form and `rtdb workflows signal` ride. |
 | `GET|PATCH /admin/db/{db}/anonymous-access` | Bearer admin key | Per-database anonymous-auth toggle (SEC-103), on top of the instance-wide `RTDB_AUTH_ANONYMOUS_ENABLED` boot gate. |
-| `GET|PATCH /admin/db/{db}/readonly` | Bearer admin key | Per-database read-only freeze. While frozen, every client-plane document write — WS, HTTP, mutate-batch, admin direct mutate, any principal — is rejected with `409 READ_ONLY`; reads, subscriptions, admin surfaces, and system writes (scheduled fires, workflow advances, TTL reaping) are unaffected. New scheduled jobs, workflow starts, and signal delivery are also rejected (they are future writes); in-flight work drains. An idempotent retry of an already-committed write still replays its cached result. |
+| `GET|PATCH /admin/db/{db}/readonly` | Bearer admin key | Per-database read-only freeze. While frozen, every client-plane document write — WS, HTTP, mutate-batch, admin direct mutate, any principal — is rejected with `409 READ_ONLY`; reads, subscriptions, admin surfaces, and system writes (scheduled fires, workflow advances, TTL reaping) are unaffected. New scheduled jobs, workflow starts, and signal delivery are also rejected (they are future writes); an already-admitted transaction may still finish. An idempotent retry of an already-committed write still replays its cached result. |
+| `GET|POST|DELETE /admin/db/{db}/quiesce` | Bearer admin key | Per-database cutover barrier (see [Per-database quiescence](#per-database-quiescence-cutover)). `GET` reads state `{quiesced, generation}`; `POST` closes client-write admission and drains already-queued committer work; `DELETE` reopens, requiring the `x-rtdb-quiesce-generation` header. Stale generations are `409`; state and generation persist across restart. Multi-instance deployments get `409` until replica coordination exists. |
 | `GET /admin/db/{db}/storage` | Bearer admin key | Lists blobs stored in a database (id, sha256, size, contentType, createdAt). |
 | `POST /admin/db/{db}/storage` | Bearer admin key | Uploads a blob (admin-scoped; same shape as `POST /api/storage/{db}`). |
 | `DELETE /admin/db/{db}/storage/{id}` | Bearer admin key | Deletes a blob (admin-scoped). |
@@ -465,6 +466,39 @@ loss is `DROP TABLE` for tables absent from the target snapshot, and migrate dat
 | `GET /admin/export-db?db=` | Bearer admin key | Snapshot export: schema line + one JSONL doc line per document. |
 | `POST /admin/import-db?db=` | Bearer admin key | Snapshot import: applies the schema line, replays each doc with original id/timestamp/version. Requires an empty target — importing into a database that already holds documents is `409 CONFLICT` (clone-db and restore always target fresh databases). |
 | `POST /admin/merge-users` | Bearer admin key | Runs the anon→real account merge synchronously and returns the full report. Body `{ anonUserId, realUserId, confirm }`, `confirm` must equal `realUserId`; 404 when the anon row does not exist. Operator escape hatch (crash-window cleanup, manual consolidation) — the OAuth callback merges automatically on sign-in. |
+
+#### Per-database quiescence (cutover)
+
+`POST /admin/db/{db}/quiesce` closes one database for client-plane writes and
+drains it for a safe cutover; `DELETE` with the `x-rtdb-quiesce-generation`
+header reopens it. The operational contract:
+
+1. **Fence.** Quiescing bumps a global, persisted admission epoch and stamps
+   the database's `admission_fence_epoch` with it. Every write path — committer
+   mutations (WS, HTTP, admin, forwarded), storage put/stream/delete,
+   scheduled and workflow claims, TTL reaping — captures the epoch at
+   admission and validates it against the fence inside its write transaction,
+   after acquiring the per-db quiesce lock. A write admitted before the
+   quiesce that has not finished by then is rejected with `409 READ_ONLY`
+   even after release; the fence never rolls back.
+2. **Drain.** After the fence is set, `POST` places a barrier behind every
+   already-queued committer request for that database. When the call returns,
+   every write that was mid-flight has committed and everything else already
+   queued has been rejected — that is drained: the database's last accepted
+   write is durable and no new admission can succeed. Reads, subscriptions,
+   admin surfaces, and unrelated databases stay fully served.
+3. **Release.** `DELETE` validates the generation while still holding the
+   quiesce lease, so a stale header is `409` and can never release a newer
+   session. State and generation persist across restart; an instance that
+   comes back after the quiescing process died recovers the lease via
+   `pg_try_advisory_lock` (the old owner's Postgres session ended with the
+   process), so the operator can always release using the generation from
+   `GET /admin/db/{db}/quiesce`.
+4. **Scope.** Single-instance only for now: under `RTDB_MULTI_INSTANCE` both
+   lifecycle endpoints return `409` until the quiesce generation is
+   coordinated across replicas. The admission-fence machinery itself is
+   instance-agnostic — a fence persisted out-of-band still excludes stale
+   epochs on every replica, including forwarded writes executed by the owner.
 
 ### Auth (OAuth + sessions)
 

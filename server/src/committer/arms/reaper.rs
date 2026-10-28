@@ -1,6 +1,7 @@
 //! The `RunReaper` arm: TTL expiry sweeps, which are durable writes.
 
 use crate::committer::*;
+use std::collections::HashSet;
 
 /// Runs one TTL reaper sweep. For each table with `ttl`, batch-deletes expired
 /// rows and publishes through the four tap sites with `source = "ttl"`. TTL
@@ -14,7 +15,15 @@ use crate::committer::*;
 /// expiry is not a client mutation — there is no idempotency key, no owner
 /// pre-check, and no per-step result to return. A delete captures no
 /// `doc_values`, so `fan_out` table-level re-runs (sound over-approximation).
-pub(in crate::committer) async fn handle_reaper(ctx: &CommitterCtx) -> Result<(), RtDbError> {
+pub(in crate::committer) async fn handle_reaper(
+    ctx: &CommitterCtx,
+    admission_epoch: i64,
+) -> Result<(), RtDbError> {
+    let (quiesced_at_admission, admission_generation) =
+        crate::db::quiesce_admission(&ctx.read_pool, &ctx.db).await?;
+    if quiesced_at_admission {
+        return Ok(());
+    }
     let schema = ctx.schemas.get(&ctx.pool, &ctx.db).await?;
     let now = now_ms();
     let mut write_set = WriteSet::default();
@@ -68,6 +77,7 @@ pub(in crate::committer) async fn handle_reaper(ctx: &CommitterCtx) -> Result<()
             // per initiating delete).
             let mut visited: HashSet<(String, String)> = HashSet::new();
             for (id,) in ids {
+                crate::db::ensure_admission_epoch(&mut conn, &ctx.db, admission_epoch).await?;
                 let mut cascade_rows = 0usize;
                 if let Err(e) = crate::txn::delete_row_cascade(
                     &mut conn,
@@ -106,6 +116,28 @@ pub(in crate::committer) async fn handle_reaper(ctx: &CommitterCtx) -> Result<()
         let Ok(mut tx) = ctx.pool.begin().await else {
             continue;
         };
+        if sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::db::quiesce_key(&ctx.db))
+            .execute(&mut *tx)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        if crate::db::ensure_quiesce_generation(&mut tx, &ctx.db, admission_generation)
+            .await
+            .is_err()
+        {
+            let _ = tx.rollback().await;
+            return Ok(());
+        }
+        if crate::db::ensure_admission_epoch(&mut tx, &ctx.db, admission_epoch)
+            .await
+            .is_err()
+        {
+            let _ = tx.rollback().await;
+            return Ok(());
+        }
         let rows: Vec<(String,)> = match sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "DELETE FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE id IN (
                  SELECT id FROM \"{pg_schema_name}\".\"{table_ident}\"

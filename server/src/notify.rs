@@ -74,6 +74,44 @@ use crate::txn::{DocOp, OpKind, WriteSet};
 /// instance — all replicas LISTEN and NOTIFY on the same channel.
 pub const OP_FEED_CHANNEL: &str = "rtdb_ops";
 
+#[cfg(any(test, feature = "test-support"))]
+static LISTENER_READY: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(any(test, feature = "test-support"))]
+fn mark_listener_ready(instance_id: &str, channel: &str) {
+    LISTENER_READY
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert((instance_id.to_string(), channel.to_string()));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn wait_listener_ready(
+    instance_id: &str,
+    channel: &str,
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let ready = LISTENER_READY.get().is_some_and(|slot| {
+            slot.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains(&(instance_id.to_string(), channel.to_string()))
+        });
+        if ready {
+            return true;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        tokio::time::sleep((deadline - now).min(std::time::Duration::from_millis(10))).await;
+    }
+}
+
 /// Postgres NOTIFY channel name for cross-instance presence gossip
 /// (ENH-022 Stage 3). Fixed across every instance — all replicas LISTEN and
 /// NOTIFY on the same channel. The payload is a [`PresenceNotifyPayload`]:
@@ -454,6 +492,8 @@ pub async fn run_write_set_listener(
             WRITE_SET_CHANNEL,
             own_instance_id
         );
+        #[cfg(any(test, feature = "test-support"))]
+        mark_listener_ready(&own_instance_id, WRITE_SET_CHANNEL);
         loop {
             let notif = match listener.recv().await {
                 Ok(n) => n,

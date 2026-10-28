@@ -118,6 +118,13 @@ impl Cluster {
             .await
             .expect("cluster push_schema failed");
 
+        #[cfg(feature = "test-support")]
+        assert!(
+            rtdb_server::scheduler::wait_scheduler_ready(&cluster.db, Duration::from_secs(5)).await,
+            "owner scheduler did not become ready for {}",
+            cluster.db
+        );
+
         // Wait until ownership is settled.
         cluster.wait_owner_settled().await;
         cluster
@@ -134,7 +141,24 @@ impl Cluster {
         let a = spawn_replica(&pool, &name, a_opts).await;
         let b = spawn_replica(&pool, &name, b_opts).await;
 
-        // Let background PgListeners connect and LISTEN to PG channels.
+        // Wait for the actual cross-replica subscription invalidation listeners
+        // instead of relying on a timing sleep. A scheduled write can publish
+        // its one-shot NOTIFY immediately after the test subscribes; if B's
+        // LISTEN has not completed yet, the notification is intentionally lost.
+        #[cfg(feature = "test-support")]
+        for replica in [&a, &b] {
+            assert!(
+                rtdb_server::notify::wait_listener_ready(
+                    &replica.instance_id,
+                    rtdb_server::notify::WRITE_SET_CHANNEL,
+                    Duration::from_secs(5),
+                )
+                .await,
+                "write-set listener did not become ready for {}",
+                replica.instance_id
+            );
+        }
+        #[cfg(not(feature = "test-support"))]
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         Cluster {
@@ -245,6 +269,19 @@ impl Cluster {
 
         // 5. Drop state Arc (releases the remaining database connection clones).
         drop(replica);
+    }
+
+    /// Stop every replica before the next cluster test starts. Healthy
+    /// replicas otherwise keep their per-db committer, scheduler and poller
+    /// tasks alive after `Replica::Drop`, leaking pool connections into later
+    /// tests and making scheduled jobs depend on test order.
+    pub async fn shutdown(&mut self) {
+        if self.a.is_some() {
+            self.kill(ReplicaId::A).await;
+        }
+        if self.b.is_some() {
+            self.kill(ReplicaId::B).await;
+        }
     }
 
     pub async fn wait_takeover(&self, id: ReplicaId) {
@@ -477,9 +514,16 @@ pub async fn replica(
 
 pub async fn shared_pool() -> PgPool {
     let config = crate::common::test_config();
-    crate::common::test_shared_pool(&config.database_url, 30)
+    let pool = crate::common::test_shared_pool(&config.database_url, 30)
         .await
-        .expect("connect to shared cluster test postgres")
+        .expect("connect to shared cluster test postgres");
+    // Cluster tests can run as the first integration module in a fresh
+    // process. Bootstrap the registry here instead of depending on another
+    // test having initialized rtdb_auth first.
+    rtdb_server::db::bootstrap(&pool)
+        .await
+        .expect("bootstrap shared cluster test postgres");
+    pool
 }
 
 pub fn insert_item(title: &str) -> Transaction {
