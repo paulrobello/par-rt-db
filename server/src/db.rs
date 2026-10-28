@@ -48,7 +48,7 @@ const BOOTSTRAP_LOCK_KEY: i64 = 727_001;
 /// DDL (and its locks) only ever runs on a genuinely stale or fresh cluster.
 /// Bump the version when changing the DDL of its bootstrap fn, or the new
 /// statements will be skipped on already-bootstrapped clusters.
-const RTDB_AUTH_BOOTSTRAP_VERSION: &str = "3";
+const RTDB_AUTH_BOOTSTRAP_VERSION: &str = "4";
 const AUDIT_LOG_BOOTSTRAP_VERSION: &str = "1";
 const WEBHOOKS_BOOTSTRAP_VERSION: &str = "1";
 
