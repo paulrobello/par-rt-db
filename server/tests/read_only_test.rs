@@ -67,6 +67,32 @@ async fn mint_token(addr: SocketAddr, db: &str) -> String {
     body["token"].as_str().expect("token").to_string()
 }
 
+/// Revokes a minted machine token via the admin surface (the normal
+/// application path).
+async fn revoke_machine_token(
+    addr: &SocketAddr,
+    state: &Arc<rtdb_server::AppState>,
+    db: &str,
+    token: &str,
+) {
+    let principal = rtdb_server::auth::resolve_bearer(&state.pool, token)
+        .await
+        .expect("resolve token");
+    let token_id = match principal {
+        rtdb_server::auth::Principal::Machine {
+            token_id,
+            db: token_db,
+            ..
+        } => {
+            assert_eq!(token_db, db, "token not minted for this db");
+            token_id
+        }
+        _ => panic!("expected machine principal"),
+    };
+    let resp = admin_post(*addr, "/admin/revoke-token", json!({"tokenId": token_id})).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
 async fn ws_connect(addr: SocketAddr) -> WsStream {
     let (ws, _) = connect_async(format!("ws://{addr}/sync"))
         .await
@@ -297,6 +323,189 @@ async fn stale_http_admission_is_rejected_after_body_is_released() -> anyhow::Re
     assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
     assert_eq!(response.json::<Value>().await?["code"], json!("READ_ONLY"));
     quiesce(addr, &db, false, generation).await;
+    Ok(())
+}
+
+/// A token revoked while its request sits parked at the admission probe must
+/// come out safely rejected, never committed, and leave the drain unblocked.
+#[tokio::test]
+async fn revoked_token_write_is_rejected_while_quiesced() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let token = mint_token(addr, &db).await;
+    http_mutate(addr, &token, &db, insert_work_item_txn()).await;
+
+    let probe_marker = uuid::Uuid::now_v7().to_string();
+    let entered = Arc::new(Notify::new());
+    let entered_for_probe = Arc::clone(&entered);
+    let release = Arc::new(Notify::new());
+    let release_for_probe = Arc::clone(&release);
+    let marker_for_probe = probe_marker.clone();
+    let _probe =
+        rtdb_server::http_api::install_admission_probe(Arc::new(move |request, _epoch| {
+            let matches = request
+                .headers()
+                .get("x-rtdb-test-probe")
+                .and_then(|value| value.to_str().ok())
+                == Some(marker_for_probe.as_str());
+            let entered = Arc::clone(&entered_for_probe);
+            let release = Arc::clone(&release_for_probe);
+            Box::pin(async move {
+                if matches {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+            })
+        }));
+
+    let request_db = db.to_string();
+    let request_token = token.clone();
+    let request_marker = probe_marker.clone();
+    let request = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("http://{addr}/api/mutate"))
+            .header(TOKEN_HEADER, format!("Bearer {request_token}"))
+            .header("x-rtdb-test-probe", request_marker)
+            .json(&json!({"db": request_db, "txn": insert_work_item_txn()}))
+            .send()
+            .await
+    });
+
+    entered.notified().await;
+    let generation = quiesce(addr, &db, true, None).await;
+    revoke_machine_token(&addr, &state, &db, &token).await;
+    release.notify_one();
+    let response = request.await??;
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let persisted: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM \"db_{db}\".t_workItems"
+    )))
+    .fetch_one(&state.pool)
+    .await?;
+    assert_eq!(persisted, 1, "the revoked write must not commit");
+    quiesce(addr, &db, false, generation).await;
+    Ok(())
+}
+
+/// Authorization is admission-time: a write already inside the committer still
+/// drains to a durable commit even if its token is revoked mid-flight.
+#[tokio::test]
+async fn admitted_write_survives_token_revocation_during_drain() -> anyhow::Result<()> {
+    let config = test_config();
+    let pool = test_shared_pool(&config.database_url, 4).await?;
+    db::bootstrap(&pool).await?;
+    let state = rtdb_server::AppState::new(pool.clone(), config, test_hot());
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let db_name = db.to_string();
+    let token = mint_token(addr, &db_name).await;
+    let admission_epoch = db::admission_epoch(&pool).await?;
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db_name,
+            None,
+            insert_work_item_transaction("warmup"),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+
+    let principal = rtdb_server::auth::resolve_bearer(&pool, &token).await?;
+    let row_ctx = principal.row_ctx();
+
+    let mut blocker = pool.begin().await?;
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT seq FROM \"db_{db_name}\".change_head WHERE ok = TRUE FOR UPDATE"
+    )))
+    .execute(&mut *blocker)
+    .await?;
+
+    let committers = state.realtime.committers.clone();
+    let write_db = db_name.clone();
+    let write = tokio::spawn(async move {
+        committers
+            .mutate_with_admission(
+                &write_db,
+                None,
+                insert_work_item_transaction("in-flight"),
+                row_ctx,
+                Some(admission_epoch),
+            )
+            .await
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut waiter: Option<(i32, String)> = None;
+    while tokio::time::Instant::now() < deadline {
+        waiter = sqlx::query_as::<_, (i32, String)>(
+            "SELECT a.pid, a.query
+             FROM pg_stat_activity AS a
+             WHERE a.wait_event_type = 'Lock'
+               AND $1 = ANY(pg_blocking_pids(a.pid))
+               AND a.query LIKE '%change_head%'
+             LIMIT 1",
+        )
+        .bind(blocker_pid)
+        .fetch_optional(&pool)
+        .await?;
+        if waiter.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let Some((waiter_pid, waiter_statement)) = waiter else {
+        panic!("mutation never reached the change_head lock");
+    };
+    assert_ne!(waiter_pid, blocker_pid);
+    assert!(waiter_statement.contains("change_head"));
+
+    let quiesce_committers = state.realtime.committers.clone();
+    let quiesce_db = db_name.clone();
+    let quiesce = tokio::spawn(async move { quiesce_committers.quiesce(&quiesce_db).await });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut quiesced = false;
+    while tokio::time::Instant::now() < deadline {
+        quiesced = db::quiesce_state(&pool, &db_name)
+            .await?
+            .is_some_and(|(active, _)| active);
+        if quiesced {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(quiesced, "quiesce did not close admission");
+    assert!(
+        !quiesce.is_finished(),
+        "quiesce returned before the blocked mutation drained"
+    );
+
+    revoke_machine_token(&addr, &state, &db_name, &token).await;
+    blocker.rollback().await?;
+    write.await??;
+    let generation = quiesce.await??;
+    assert_eq!(
+        db::quiesce_state(&pool, &db_name).await?,
+        Some((true, generation))
+    );
+    let persisted: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM \"db_{db_name}\".t_workItems WHERE doc->>'title' = 'in-flight'"
+    )))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        persisted, 1,
+        "the admitted mutation must commit despite the mid-flight revocation"
+    );
+    state
+        .realtime
+        .committers
+        .unquiesce(&db_name, generation)
+        .await?;
     Ok(())
 }
 
