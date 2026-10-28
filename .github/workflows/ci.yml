@@ -661,7 +661,12 @@ jobs:
     # docs is excluded: it self-skips on plain main pushes (heavy artifact
     # tiering), and a needs on a skipped job skips this job too.
     needs: [drift, lint, typecheck, test, features, swift]
-    timeout-minutes: 45
+    # 90: the first post-feature build compiles the otel dependency tree
+    # (tonic/prost/opentelemetry) on the throttled 2-CPU deploy builder — a
+    # one-time ~50 min cost that exceeded the previous 45-min job cap and got
+    # the deploy cancelled mid-build (2026-10-28). Once the buildkit cache
+    # holds those layers, only the app crate recompiles (~10 min).
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
