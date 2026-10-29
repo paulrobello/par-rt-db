@@ -102,6 +102,15 @@ async fn main() {
                             Ok(_) => {}
                             Err(err) => tracing::warn!(error = %err, "oauth state sweep failed"),
                         }
+                        match auth::session::sweep_revoked_tombstones(&sweep_pool).await {
+                            Ok(n) if n > 0 => {
+                                tracing::debug!(pruned = n, "session tombstone sweep: pruned rows");
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                tracing::warn!(error = %err, "session tombstone sweep failed")
+                            }
+                        }
                     }
                 } => {}
             }

@@ -461,6 +461,14 @@ pub fn document() -> Value {
     );
     add(
         &mut paths,
+        "/auth/session/revoke",
+        &[(
+            "post",
+            op("Revoke one OAuth session by capability pair", "Auth"),
+        )],
+    );
+    add(
+        &mut paths,
         "/auth/logout",
         &[("post", op("End the session", "Auth"))],
     );

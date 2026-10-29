@@ -7,7 +7,11 @@
 //! revoke secret at begin (delivered only in the begin response body; only
 //! its sha256 verifier is persisted) — `POST /auth/state/revoke` requires
 //! `{state, revokeSecret}` together, because `state` alone transits the
-//! provider redirect URL and is not a revocation capability. A lost begin
+//! provider redirect URL and is not a revocation capability. The same
+//! verifier is also stamped onto the session row at settlement, where
+//! `POST /auth/session/revoke` `{sessionId, revokeSecret}` revokes the
+//! minted session for its actual lifetime (bounded by the session TTL, not
+//! the 10-minute state window). A lost begin
 //! response means the flow was never navigated and the pending row simply
 //! ages out via the TTL sweep — correct, nothing to clean.
 
@@ -295,17 +299,19 @@ fn unconfigured_response(name: &str) -> Response {
 /// matches zero rows and returns `None`. On success returns the row's
 /// `anon_user_id` binding (FM-27): `Some(id)` when the login began from an
 /// anonymous session, `None` otherwise — plus the row's credential delivery
-/// mode, which the callback honors when closing the popup.
+/// mode, which the callback honors when closing the popup, and the row's
+/// begin-minted revoke-secret verifier, which the callback stamps onto the
+/// session row as the durable capability hash (bearer deliveries only).
 async fn claim_pending(
     state: &Arc<AppState>,
     state_token: &str,
     expected_provider: &'static str,
-) -> Option<(Option<String>, String)> {
+) -> Option<(Option<String>, String, Option<String>)> {
     let now = now_ms();
-    let row: Option<(Option<String>, String)> = sqlx::query_as(
+    let row: Option<(Option<String>, String, Option<String>)> = sqlx::query_as(
         "UPDATE rtdb_auth.oauth_states SET status = $1 \
          WHERE state = $2 AND provider = $3 AND status = $4 AND expires_at > $5 \
-         RETURNING anon_user_id, delivery",
+         RETURNING anon_user_id, delivery, revoke_secret_verifier",
     )
     .bind(STATUS_CLAIMING)
     .bind(state_token)
@@ -466,6 +472,22 @@ async fn roll_forward_into_revocation(state: &Arc<AppState>, state_token: &str, 
     }
 }
 
+/// Bearer deliveries stamp the durable session-revoke capability onto the
+/// minted session BEFORE the terminal outcome is recorded — the one-shot poll
+/// delivers `sessionId`, so it must exist by poll time. `session_id` is a
+/// fresh random identifier; the begin-time verifier becomes the stored hash
+/// `POST /auth/session/revoke` compares against. Failure is non-fatal (the
+/// session works; it is just not capability-revocable — the same posture as
+/// every pre-existing session) and the poll then simply omits `sessionId`.
+async fn stamp_session_capability(state: &Arc<AppState>, token: &str, verifier: &str) {
+    let session_id = random_token();
+    if let Err(err) =
+        session::stamp_revoke_capability(&state.pool, token, &session_id, verifier).await
+    {
+        tracing::warn!(error = %err, "oauth: failed to stamp the session revoke capability");
+    }
+}
+
 enum PollResult {
     Pending,
     /// `cookie_mode` (SEC-207): the login began with `mode=cookie`, so the
@@ -474,6 +496,10 @@ enum PollResult {
         token: String,
         user: AuthedUser,
         cookie_mode: bool,
+        /// The durable capability identifier stamped at settlement (bearer
+        /// logins only); `None` when the session predates the feature or the
+        /// stamp failed.
+        session_id: Option<String>,
     },
     Failed,
     Expired,
@@ -513,11 +539,20 @@ async fn poll_login(state: &Arc<AppState>, state_token: &str) -> PollResult {
         if status == STATUS_COMPLETED {
             return match token {
                 Some(t) => match resolve_bearer(&state.pool, &t).await {
-                    Ok(principal @ Principal::User { .. }) => PollResult::Complete {
-                        token: t,
-                        user: authed_user(&principal),
-                        cookie_mode: delivery == DELIVERY_COOKIE,
-                    },
+                    Ok(principal @ Principal::User { .. }) => {
+                        // The capability identifier rides the same one-shot
+                        // delivery as the token; a session without a stamped
+                        // capability (cookie/default, pre-upgrade) omits it.
+                        let session_id = session::lookup_session_id(&state.pool, &t)
+                            .await
+                            .unwrap_or(None);
+                        PollResult::Complete {
+                            token: t,
+                            user: authed_user(&principal),
+                            cookie_mode: delivery == DELIVERY_COOKIE,
+                            session_id,
+                        }
+                    }
                     _ => PollResult::Expired, // token did not resolve — treat as gone
                 },
                 None => PollResult::Expired,
@@ -787,10 +822,11 @@ async fn provider_callback<P: OAuthProvider>(
         }
     }
 
-    let (anon_user_id, delivery) = match claim_pending(&state, &params.state, P::name()).await {
-        Some((anon, delivery)) => (anon, delivery),
-        None => return RtDbError::bad_request("invalid or expired state").into_response(),
-    };
+    let (anon_user_id, delivery, revoke_verifier) =
+        match claim_pending(&state, &params.state, P::name()).await {
+            Some((anon, delivery, verifier)) => (anon, delivery, verifier),
+            None => return RtDbError::bad_request("invalid or expired state").into_response(),
+        };
 
     let Some(provider) = P::from_config(&state.config) else {
         set_outcome(&state, &params.state, None).await;
@@ -805,6 +841,14 @@ async fn provider_callback<P: OAuthProvider>(
             // terminal outcome is recorded (see merge_anon_into_real).
             if let Some(anon_id) = &anon_user_id {
                 merge_anon_into_real(&state, anon_id, &token).await;
+            }
+            // Bearer deliveries stamp the durable session-revoke capability
+            // BEFORE the terminal outcome — the one-shot poll delivers
+            // `sessionId`, so it must exist by poll time. Failure is non-fatal
+            // (the session works; it is just not capability-revocable, the
+            // same posture as every pre-existing session).
+            if let Some(verifier) = revoke_verifier.as_deref() {
+                stamp_session_capability(&state, &token, verifier).await;
             }
             set_outcome(&state, &params.state, Some(&token)).await;
             if delivery == DELIVERY_BEARER {
@@ -841,9 +885,9 @@ async fn apple_callback(
         }
     }
 
-    let (anon_user_id, delivery) =
+    let (anon_user_id, delivery, revoke_verifier) =
         match claim_pending(&state, &form.state, AppleProvider::name()).await {
-            Some((anon, delivery)) => (anon, delivery),
+            Some((anon, delivery, verifier)) => (anon, delivery, verifier),
             None => return RtDbError::bad_request("invalid or expired state").into_response(),
         };
 
@@ -860,6 +904,12 @@ async fn apple_callback(
             // terminal outcome is recorded (see merge_anon_into_real).
             if let Some(anon_id) = &anon_user_id {
                 merge_anon_into_real(&state, anon_id, &token).await;
+            }
+            // Bearer deliveries stamp the durable capability (see
+            // stamp_session_capability); see the GET callback for the ordering
+            // and failure posture.
+            if let Some(verifier) = revoke_verifier.as_deref() {
+                stamp_session_capability(&state, &token, verifier).await;
             }
             set_outcome(&state, &form.state, Some(&token)).await;
             if delivery == DELIVERY_BEARER {
@@ -952,13 +1002,18 @@ enum StateResponse {
     /// SEC-207: `token` is omitted entirely for a cookie-mode login — the
     /// HttpOnly session cookie set at the callback is the only credential
     /// carrier, so the poll body never exposes a script-readable copy.
-    /// The revoke capability is NOT carried here: `revokeSecret` was delivered
-    /// once in the begin response (client-only channel) and only its sha256
-    /// verifier is stored server-side.
+    /// `revokeSecret` is likewise NOT carried here: it was delivered once in
+    /// the begin response (client-only channel) and only its sha256 verifier
+    /// is stored server-side. `sessionId` (bearer logins only) is the
+    /// non-secret half of the durable session-revoke capability — the client
+    /// pairs it with the begin response's `revokeSecret` for
+    /// `POST /auth/session/revoke`.
     Complete {
         #[serde(skip_serializing_if = "Option::is_none")]
         token: Option<String>,
         user: AuthedUser,
+        #[serde(rename = "sessionId", skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
     Expired,
     Error,
@@ -991,9 +1046,20 @@ async fn auth_state(
             token,
             user,
             cookie_mode,
+            session_id,
         } => {
             let token = if cookie_mode { None } else { Some(token) };
-            Json(StateResponse::Complete { token, user }).into_response()
+            // The capability identifier is bearer-only: a cookie-mode login
+            // carries no stamped capability, so never leak its absence as a
+            // field. (lookup_session_id returns None for those rows anyway —
+            // this also keeps a hypothetical stamp failure from leaking mode.)
+            let session_id = if cookie_mode { None } else { session_id };
+            Json(StateResponse::Complete {
+                token,
+                user,
+                session_id,
+            })
+            .into_response()
         }
         PollResult::Failed => Json(StateResponse::Error).into_response(),
         PollResult::Expired => Json(StateResponse::Expired).into_response(),
@@ -1257,6 +1323,190 @@ async fn state_revoke(
     }
 }
 
+/// Body of `POST /auth/session/revoke`. `sessionId` is the non-secret
+/// identifier the one-shot poll delivered alongside the token; `revokeSecret`
+/// is the begin response's client-only secret — the same preimage whose
+/// sha256 verifier secures `POST /auth/state/revoke`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionRevokeBody {
+    session_id: String,
+    revoke_secret: Option<String>,
+}
+
+/// Response of `POST /auth/session/revoke`. `revoked` is a CONFIRMED fence:
+/// the session matching the (sessionId, revokeSecret) capability is verifiably
+/// dead — its `revoked_at` marker was set (or was already a tombstone, or the
+/// row was past expiry and got pruned) inside the same transaction that
+/// proved the capability. `unknown` means no row matched: never-stamped
+/// session (cookie/default deliveries, pre-upgrade rows), wrong or missing
+/// secret, or an identifier that never existed — indistinguishable by design
+/// (no existence leak). There is no `unconfirmed` here: unlike the state flow
+/// there is no ambiguous-insert window — the capability is stamped on a row
+/// that provably exists, so absence after a confirmed fence is durable.
+/// The-cube client rule carries over: any non-`revoked` outcome is treated as
+/// unconfirmed and retried.
+#[derive(serde::Serialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+enum SessionRevokeResponse {
+    Revoked,
+    Unknown,
+}
+
+/// Per-IP budget for `/auth/session/revoke` — same limiter, key shape, and
+/// sizing rationale as `STATE_REVOKE_PER_IP_RPM` (30/min covers legitimate
+/// retries many times over while capping a garbage-capability flood).
+const SESSION_REVOKE_PER_IP_RPM: u32 = 30;
+/// Total-body bound: same 4 KiB rationale as the state-revoke gate.
+const SESSION_REVOKE_MAX_BODY_BYTES: usize = 4096;
+/// Per-field bound (`sessionId`, `revokeSecret`): 43-char random tokens.
+const SESSION_REVOKE_MAX_FIELD_CHARS: usize = 256;
+
+/// `POST /auth/session/revoke` `{sessionId, revokeSecret}`: durably revokes
+/// ONE OAuth session for its actual lifetime — the capability the 10-minute
+/// state window cannot provide. The client stores the poll response's
+/// `sessionId` next to the begin response's `revokeSecret` and needs neither
+/// the bearer nor any admin credential to sign the session out later.
+///
+/// Mechanics mirror `state_revoke`: unauthenticated (capability = the pair),
+/// per-IP fixed-window guard, strict body gate before any transaction,
+/// constant-time digest compare under a `FOR UPDATE` row lock, one atomic
+/// transaction. Revocation sets `revoked_at` — the marker every session
+/// resolver excludes, so the session dies everywhere immediately — while the
+/// row stays as a tombstone carrying the capability, so a retry after a lost
+/// response or a concurrent duplicate answers `revoked` (idempotent, no
+/// ambiguity). An already-expired row is pruned in the same transaction; the
+/// tombstone itself is bounded by the session TTL and swept on the background
+/// loop. This endpoint sets no cookies and never touches a browser's
+/// pre-existing `rtdb_session`.
+async fn session_revoke(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    req: Request,
+) -> Response {
+    let ip_key = crate::http_api::client_ip_key(&headers, addr.ip(), state.config.trusted_proxy);
+    match state
+        .limits
+        .rate_limiter
+        .check(
+            crate::rate_limit::RateKey::Ip {
+                route: "session_revoke",
+                ip: ip_key,
+            },
+            SESSION_REVOKE_PER_IP_RPM,
+        )
+        .await
+    {
+        crate::rate_limit::RateDecision::Allowed => {}
+        crate::rate_limit::RateDecision::Denied { .. } => {
+            return Json(SessionRevokeResponse::Unknown).into_response();
+        }
+    }
+
+    let bytes = match axum::body::to_bytes(req.into_body(), SESSION_REVOKE_MAX_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return Json(SessionRevokeResponse::Unknown).into_response(),
+    };
+    let body: SessionRevokeBody = match serde_json::from_slice(&bytes) {
+        Ok(body) => body,
+        Err(_) => return Json(SessionRevokeResponse::Unknown).into_response(),
+    };
+    if body.session_id.len() > SESSION_REVOKE_MAX_FIELD_CHARS
+        || body
+            .revoke_secret
+            .as_deref()
+            .is_some_and(|s| s.len() > SESSION_REVOKE_MAX_FIELD_CHARS)
+    {
+        return Json(SessionRevokeResponse::Unknown).into_response();
+    }
+
+    let now = now_ms();
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            tracing::warn!(error = %err, "oauth: session revoke tx begin failed");
+            return RtDbError::internal("failed to revoke session").into_response();
+        }
+    };
+    // Lock the capability row first, decide in Rust (constant-time compare is
+    // not expressible in SQL), mutate under the same lock.
+    type CapabilityRow = (Option<i64>, Option<String>, i64);
+    let row: Result<Option<CapabilityRow>, sqlx::Error> = sqlx::query_as(
+        "SELECT revoked_at, revoke_secret_hash, expires_at \
+         FROM rtdb_auth.sessions \
+         WHERE session_id = $1 \
+         FOR UPDATE",
+    )
+    .bind(&body.session_id)
+    .fetch_optional(&mut *tx)
+    .await;
+    let row = match row {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(error = %err, "oauth: session revoke query failed");
+            return RtDbError::internal("failed to revoke session").into_response();
+        }
+    };
+    let Some((revoked_at, stored_hash, expires_at)) = row else {
+        return Json(SessionRevokeResponse::Unknown).into_response();
+    };
+
+    let secret_ok = body
+        .revoke_secret
+        .as_deref()
+        .zip(stored_hash.as_deref())
+        .is_some_and(|(presented, stored)| {
+            bool::from(
+                crate::db::sha256_hex(presented)
+                    .as_bytes()
+                    .ct_eq(stored.as_bytes()),
+            )
+        });
+    if !secret_ok {
+        return Json(SessionRevokeResponse::Unknown).into_response();
+    }
+
+    if expires_at <= now {
+        // Already expired: prove the capability, prune the row, answer
+        // `revoked` — the caller's goal (the session must not authenticate
+        // anyone) already holds and stays held.
+        if let Err(err) = sqlx::query("DELETE FROM rtdb_auth.sessions WHERE session_id = $1")
+            .bind(&body.session_id)
+            .execute(&mut *tx)
+            .await
+        {
+            tracing::warn!(error = %err, "oauth: session revoke expired-row prune failed");
+            return RtDbError::internal("failed to revoke session").into_response();
+        }
+    } else if revoked_at.is_none() {
+        // Live session: set the revoked marker that every session resolver
+        // excludes, in the same transaction that proved the capability — the
+        // fence. The dead token_hash stays (it is the PRIMARY KEY and just a
+        // digest). A crash or failure rolls the fence back, leaving the row
+        // live so a retry re-runs the whole cleanup.
+        if let Err(err) =
+            sqlx::query("UPDATE rtdb_auth.sessions SET revoked_at = $2 WHERE session_id = $1")
+                .bind(&body.session_id)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+        {
+            tracing::warn!(error = %err, "oauth: session revoke fence failed");
+            return RtDbError::internal("failed to revoke session").into_response();
+        }
+    }
+    // else: already a tombstone (revoked_at set, unexpired) — the previous
+    // revoke committed; re-answer `revoked` as the retryable confirmation.
+    match tx.commit().await {
+        Ok(()) => Json(SessionRevokeResponse::Revoked).into_response(),
+        Err(err) => {
+            tracing::warn!(error = %err, "oauth: session revoke commit failed");
+            RtDbError::internal("failed to revoke session").into_response()
+        }
+    }
+}
+
 #[derive(serde::Serialize)]
 struct OkResponse {
     ok: bool,
@@ -1488,6 +1738,7 @@ pub fn auth_routes() -> Router<Arc<AppState>> {
         .route("/auth/enroll", post(crate::auth::enrollment::enroll))
         .route("/auth/state", get(auth_state))
         .route("/auth/state/revoke", post(state_revoke))
+        .route("/auth/session/revoke", post(session_revoke))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
         .route("/auth/validate", get(validate))

@@ -120,7 +120,7 @@ pub async fn resolve_session(pool: &PgPool, token: &str) -> Result<Option<Princi
     let row: Option<SessionUserRow> = sqlx::query_as(
         "SELECT s.user_id, s.expires_at, u.email, u.github_id, u.login, u.anonymous, u.name \
          FROM rtdb_auth.sessions s JOIN rtdb_auth.users u ON u.id = s.user_id \
-         WHERE s.token_hash = $1",
+         WHERE s.token_hash = $1 AND s.revoked_at IS NULL",
     )
     .bind(&hash)
     .fetch_optional(pool)
@@ -220,11 +220,13 @@ pub async fn list_sessions(
         // User-filtered listing: only that user's OAuth sessions. Admin-key
         // sessions carry no user_id and don't belong to any user, so they are
         // excluded from a filtered query (they DO appear in the unfiltered list).
+        // Revoked tombstones (kept so capability retries confirm) are
+        // bookkeeping, not sessions — never listed.
         sqlx::query_as(
             "SELECT s.token_hash, s.user_id, u.email, u.name, u.login, u.anonymous, \
                     s.created_at, s.expires_at \
              FROM rtdb_auth.sessions s JOIN rtdb_auth.users u ON u.id = s.user_id \
-             WHERE s.user_id = $1 OR u.email = $1 \
+             WHERE (s.user_id = $1 OR u.email = $1) AND s.revoked_at IS NULL \
              ORDER BY s.created_at DESC LIMIT $2",
         )
         .bind(u)
@@ -236,6 +238,7 @@ pub async fn list_sessions(
             "SELECT s.token_hash, s.user_id, u.email, u.name, u.login, u.anonymous, \
                     s.created_at, s.expires_at \
              FROM rtdb_auth.sessions s JOIN rtdb_auth.users u ON u.id = s.user_id \
+             WHERE s.revoked_at IS NULL \
              UNION ALL \
              SELECT token_hash, '(admin key)', NULL, NULL, 'Admin key', false, \
                     created_at, expires_at \
@@ -307,4 +310,61 @@ pub async fn delete_expired_sessions(pool: &PgPool) -> Result<u64, RtDbError> {
         .execute(pool)
         .await?;
     Ok(r1.rows_affected() + r2.rows_affected())
+}
+
+/// Stamps the durable revoke capability onto a freshly minted OAuth session.
+/// Called from the bearer-mode settlement path only: `session_id` is a fresh
+/// random token (the capability's non-secret identifier) and
+/// `revoke_secret_hash` is the sha256 verifier already stored on the login's
+/// `oauth_states` row — the same verifier `POST /auth/state/revoke` compares
+/// against, so no plaintext secret exists anywhere server-side beyond what
+/// begin/persist already held. Rows that never get stamped (cookie/default
+/// logins, pre-upgrade sessions) carry NULLs and answer `unknown` to
+/// `POST /auth/session/revoke`.
+pub async fn stamp_revoke_capability(
+    pool: &PgPool,
+    token: &str,
+    session_id: &str,
+    revoke_secret_hash: &str,
+) -> Result<(), RtDbError> {
+    let hash = sha256_hex(token);
+    sqlx::query(
+        "UPDATE rtdb_auth.sessions \
+         SET session_id = $1, revoke_secret_hash = $2 \
+         WHERE token_hash = $3",
+    )
+    .bind(session_id)
+    .bind(revoke_secret_hash)
+    .bind(&hash)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The `session_id` for a live session token, for the one-shot poll delivery.
+/// `None` when the token does not resolve or the row carries no capability
+/// (never stamped — cookie/default logins and pre-upgrade rows).
+pub async fn lookup_session_id(pool: &PgPool, token: &str) -> Result<Option<String>, RtDbError> {
+    let hash = sha256_hex(token);
+    let session_id: Option<Option<String>> =
+        sqlx::query_scalar("SELECT session_id FROM rtdb_auth.sessions WHERE token_hash = $1")
+            .bind(&hash)
+            .fetch_optional(pool)
+            .await?;
+    Ok(session_id.flatten())
+}
+
+/// Prunes revoked-session tombstones (`revoked_at` set by
+/// `POST /auth/session/revoke`) whose `expires_at` has passed, so revoked
+/// capability rows do not accumulate past the session TTL they are bounded by.
+/// Runs on the same gated background loop as `sweep_oauth_states`.
+pub async fn sweep_revoked_tombstones(pool: &PgPool) -> Result<u64, RtDbError> {
+    let now = now_ms();
+    let r = sqlx::query(
+        "DELETE FROM rtdb_auth.sessions WHERE revoked_at IS NOT NULL AND expires_at <= $1",
+    )
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
 }

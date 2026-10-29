@@ -318,17 +318,23 @@ export const OAUTH_POLL_TIMEOUT_MS = 180_000;
  *  set by the callback is the credential, and the server omits the token from
  *  the body. A transient fetch failure or malformed body keeps polling
  *  (returns `{ done: false }`); only a terminal `expired`/`error` status
- *  rejects. */
+ *  rejects. `sessionId` (bearer-mode logins only) is the non-secret half of
+ *  the durable session-revoke capability; the server omits it otherwise. */
 async function pollOAuthState(
   apiBase: string,
   state: string,
   cookieMode: boolean,
-): Promise<{ done: true; token: string | undefined } | { done: false }> {
+): Promise<
+  { done: true; token: string | undefined; sessionId: string | undefined } | { done: false }
+> {
   let resp: Response;
   try {
-    // SEC-121: send credentials so the `rtdb-oauth-state` cookie (set at /begin,
-    // same value as `state`) is attached. Without it the server rejects the poll
-    // as if the flow had expired — a leaked `state` URL alone cannot poll.
+    // SEC-121: send credentials so the `rtdb-oauth-state` cookie (set at
+    // /begin, same value as `state`) is attached. Without it the server
+    // rejects the poll as if the flow had expired — a leaked `state` URL
+    // alone cannot poll. A browser flow here is default/cookie delivery, so
+    // `sessionId` is simply absent from the body; types stay truthful either
+    // way.
     resp = await fetch(`${apiBase}/auth/state?state=${encodeURIComponent(state)}`, {
       credentials: "include",
     });
@@ -336,14 +342,14 @@ async function pollOAuthState(
     return { done: false };
   }
   if (!resp.ok) return { done: false };
-  let data: { status?: string; token?: string };
+  let data: { status?: string; token?: string; sessionId?: string };
   try {
-    data = (await resp.json()) as { status?: string; token?: string };
+    data = (await resp.json()) as { status?: string; token?: string; sessionId?: string };
   } catch {
     return { done: false };
   }
   if (data.status === "complete" && (cookieMode || typeof data.token === "string")) {
-    return { done: true, token: data.token };
+    return { done: true, token: data.token, sessionId: data.sessionId };
   }
   if (data.status === "expired" || data.status === "error") {
     throw new Error(data.status === "expired" ? "sign-in expired" : "sign-in failed");
@@ -443,4 +449,27 @@ export function signInWithMicrosoft(baseUrl: string): Promise<string> {
  *  dedicated POST `/auth/apple/callback`. */
 export function signInWithApple(baseUrl: string): Promise<string> {
   return signInWithOAuth(baseUrl, "apple");
+}
+
+/** Durably revokes ONE OAuth session by its capability pair — `sessionId`
+ *  (delivered once in the `/auth/state` poll body for bearer-mode logins)
+ *  paired with the begin response's `revokeSecret`. Unlike `/auth/logout`
+ *  this needs neither the bearer token nor any admin credential, and unlike
+ *  `/auth/state/revoke` it is not bounded by the 10-minute state window —
+ *  the capability lives for the session's TTL. `"revoked"` is a confirmed
+ *  fence (also the idempotent retry answer); `"unknown"` means the pair did
+ *  not match anything (treat as unconfirmed and retry). */
+export async function revokeOAuthSession(
+  baseUrl: string,
+  sessionId: string,
+  revokeSecret: string,
+): Promise<"revoked" | "unknown"> {
+  const api = baseUrl.replace(/\/+$/, "");
+  const resp = await fetch(`${api}/auth/session/revoke`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ sessionId, revokeSecret }),
+  });
+  const body = (await resp.json()) as { status?: string };
+  return body.status === "revoked" ? "revoked" : "unknown";
 }

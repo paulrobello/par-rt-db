@@ -48,7 +48,7 @@ const BOOTSTRAP_LOCK_KEY: i64 = 727_001;
 /// DDL (and its locks) only ever runs on a genuinely stale or fresh cluster.
 /// Bump the version when changing the DDL of its bootstrap fn, or the new
 /// statements will be skipped on already-bootstrapped clusters.
-const RTDB_AUTH_BOOTSTRAP_VERSION: &str = "7";
+const RTDB_AUTH_BOOTSTRAP_VERSION: &str = "9";
 const AUDIT_LOG_BOOTSTRAP_VERSION: &str = "1";
 const WEBHOOKS_BOOTSTRAP_VERSION: &str = "1";
 
@@ -383,8 +383,41 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
             token_hash text PRIMARY KEY,
             user_id text NOT NULL REFERENCES rtdb_auth.users(id),
             expires_at bigint NOT NULL,
-            created_at bigint NOT NULL
+            created_at bigint NOT NULL,
+            session_id text NULL,
+            revoke_secret_hash text NULL,
+            revoked_at bigint NULL
         )",
+    )
+    .execute(&mut *conn)
+    .await?;
+
+    // Durable per-session revoke capability (opt-in, bearer-mode logins only):
+    // the identifier and the sha256 verifier of the begin-time revoke secret
+    // are stamped onto the row at settlement; `revoked_at` marks the fence.
+    // NULL on every pre-existing row and every non-bearer login — those
+    // sessions answer `unknown` to the capability endpoint, exactly as before
+    // this feature. A revoked row KEEPS its token_hash (the PRIMARY KEY cannot
+    // be nulled and the digest is harmless) and becomes a tombstone: every
+    // session resolver excludes `revoked_at IS NOT NULL`, so the token is dead
+    // everywhere, while the retained capability answers revocation retries
+    // until the TTL sweep prunes the row. `session_id` is a fresh random token
+    // per login, so the unique index never collides and Postgres treats its
+    // NULLs as distinct.
+    sqlx::query("ALTER TABLE rtdb_auth.sessions ADD COLUMN IF NOT EXISTS session_id text NULL")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query(
+        "ALTER TABLE rtdb_auth.sessions ADD COLUMN IF NOT EXISTS revoke_secret_hash text NULL",
+    )
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query("ALTER TABLE rtdb_auth.sessions ADD COLUMN IF NOT EXISTS revoked_at bigint NULL")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS sessions_session_id_idx \
+         ON rtdb_auth.sessions (session_id)",
     )
     .execute(&mut *conn)
     .await?;

@@ -1129,3 +1129,293 @@ async fn revoke_shape_gate_and_rate_budget_are_uniform() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// --- /auth/session/revoke: durable per-session capability --------------------
+
+/// Revokes a session by capability pair. `None` secret simulates the
+/// missing-secret case.
+async fn revoke_session(
+    addr: SocketAddr,
+    session_id: &str,
+    revoke_secret: Option<&str>,
+) -> reqwest::Response {
+    let body = match revoke_secret {
+        Some(secret) => json!({"sessionId": session_id, "revokeSecret": secret}),
+        None => json!({"sessionId": session_id}),
+    };
+    reqwest::Client::new()
+        .post(format!("http://{addr}/auth/session/revoke"))
+        .json(&body)
+        .send()
+        .await
+        .expect("send session revoke")
+}
+
+/// Live (non-tombstone) session rows for this test's user — a revoked
+/// capability tombstone still joins by user, so the plain count would lie.
+async fn live_session_count_for_email(state: &Arc<AppState>, email: &str) -> i64 {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM rtdb_auth.sessions s \
+         JOIN rtdb_auth.users u ON u.id = s.user_id \
+         WHERE u.email = $1 AND s.revoked_at IS NULL",
+    )
+    .bind(email)
+    .fetch_one(&state.pool)
+    .await
+    .expect("count live sessions");
+    count
+}
+
+/// Bearer login end to end: returns `(session_token, session_id, revoke_secret)`
+/// — the full client-side triple after the one-shot poll.
+async fn bearer_login(client: &reqwest::Client, addr: SocketAddr) -> (String, String, String) {
+    let (state_token, secret) = begin_bearer(client, addr).await;
+    let cb = callback(client, addr, &state_token).await;
+    assert_eq!(cb.status(), reqwest::StatusCode::OK);
+    let pv = poll_state(client, addr, &state_token).await;
+    assert_eq!(pv["status"], json!("complete"));
+    let token = pv["token"].as_str().expect("bearer token").to_string();
+    let session_id = pv["sessionId"]
+        .as_str()
+        .expect("bearer poll carries sessionId")
+        .to_string();
+    (token, session_id, secret)
+}
+
+// Confirmed path: the poll delivers `sessionId` (bearer only), the capability
+// pair revokes durably, the delivered token dies, and a repeat answers
+// `revoked` — the tombstone keeps retry/idempotency semantics.
+#[tokio::test]
+async fn session_revoke_confirmed_end_to_end() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let email = unique_email("sesrev");
+    mount_github_mocks(&mock, unique_github_id(), "paul", &email, Duration::ZERO, 1).await;
+    let (state, addr) = bearer_state(&mock).await;
+
+    let client = no_redirect_client();
+    let (token, session_id, secret) = bearer_login(&client, addr).await;
+    assert_eq!(live_session_count_for_email(&state, &email).await, 1);
+
+    let me = reqwest::Client::new()
+        .get(format!("http://{addr}/auth/me"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    assert_eq!(me.status(), reqwest::StatusCode::OK);
+
+    let resp = revoke_session(addr, &session_id, Some(&secret)).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .count(),
+        0,
+        "session/revoke must never emit Set-Cookie headers"
+    );
+    assert_eq!(resp.json::<Value>().await?, json!({"status": "revoked"}));
+
+    // The delivered token is dead everywhere; the tombstone persists as the
+    // durable retry anchor (it lives in Postgres, so it survives restarts).
+    let me = reqwest::Client::new()
+        .get(format!("http://{addr}/auth/me"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    assert_eq!(me.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(live_session_count_for_email(&state, &email).await, 0);
+
+    // Repeated + lost-response retries re-confirm from the tombstone.
+    for _ in 0..2 {
+        let again = revoke_session(addr, &session_id, Some(&secret)).await;
+        assert_eq!(again.json::<Value>().await?, json!({"status": "revoked"}));
+    }
+    Ok(())
+}
+
+// Invalid capabilities answer `unknown` without touching anything: wrong
+// secret, missing secret, never-minted identifier, and a never-stamped
+// cookie-mode session.
+#[tokio::test]
+async fn session_revoke_invalid_capabilities_are_unknown() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let email = unique_email("sesrevbad");
+    mount_github_mocks(&mock, unique_github_id(), "paul", &email, Duration::ZERO, 2).await;
+    let (state, addr) = bearer_state(&mock).await;
+
+    let client = no_redirect_client();
+    let (_token, session_id, secret) = bearer_login(&client, addr).await;
+
+    for (label, sid, sec) in [
+        ("wrong secret", session_id.as_str(), Some("wrong")),
+        ("missing secret", session_id.as_str(), None),
+        ("unknown sessionId", "no-such-session", Some(&secret)),
+    ] {
+        let resp = revoke_session(addr, sid, sec).await;
+        assert_eq!(
+            resp.json::<Value>().await?,
+            json!({"status": "unknown"}),
+            "{label}"
+        );
+    }
+    assert_eq!(live_session_count_for_email(&state, &email).await, 1);
+
+    // A cookie-mode login mints NO capability: its poll omits `sessionId`, and
+    // the session answers `unknown` even to its own (state-scoped) secret.
+    let cookie_state = begin_login(&client, addr, Some("cookie")).await;
+    let cb = callback(&client, addr, &cookie_state).await;
+    assert_eq!(cb.status(), reqwest::StatusCode::OK);
+    let pv = poll_state(&client, addr, &cookie_state).await;
+    assert_eq!(pv["status"], json!("complete"));
+    assert!(
+        pv.get("sessionId").is_none(),
+        "cookie-mode poll must not carry sessionId"
+    );
+    // No capability exists for the cookie-mode session — there is no
+    // sessionId to present — and the bearer session stays live.
+    assert_eq!(live_session_count_for_email(&state, &email).await, 2);
+    Ok(())
+}
+
+// Cross-session refusal: session A's identifier with session B's secret must
+// not revoke anything; each correct pair revokes exactly its own session.
+#[tokio::test]
+async fn session_revoke_cross_session_capability_refused() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let email = unique_email("sesrevcross");
+    mount_github_mocks(&mock, unique_github_id(), "paul", &email, Duration::ZERO, 2).await;
+    let (state, addr) = bearer_state(&mock).await;
+
+    let client = no_redirect_client();
+    let (_token_a, session_id_a, secret_a) = bearer_login(&client, addr).await;
+    let (_token_b, session_id_b, secret_b) = bearer_login(&client, addr).await;
+
+    let resp = revoke_session(addr, &session_id_a, Some(&secret_b)).await;
+    assert_eq!(resp.json::<Value>().await?, json!({"status": "unknown"}));
+    assert_eq!(live_session_count_for_email(&state, &email).await, 2);
+
+    let resp = revoke_session(addr, &session_id_a, Some(&secret_a)).await;
+    assert_eq!(resp.json::<Value>().await?, json!({"status": "revoked"}));
+    assert_eq!(live_session_count_for_email(&state, &email).await, 1);
+
+    let resp = revoke_session(addr, &session_id_b, Some(&secret_b)).await;
+    assert_eq!(resp.json::<Value>().await?, json!({"status": "revoked"}));
+    assert_eq!(live_session_count_for_email(&state, &email).await, 0);
+    Ok(())
+}
+
+// Concurrency: two simultaneous revokes of one session serialize on the row
+// lock and BOTH answer `revoked` (one fences the live row, one confirms the
+// tombstone).
+#[tokio::test]
+async fn session_revoke_concurrent_both_confirm() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let email = unique_email("sesrevconc");
+    mount_github_mocks(&mock, unique_github_id(), "paul", &email, Duration::ZERO, 1).await;
+    let (state, addr) = bearer_state(&mock).await;
+
+    let client = no_redirect_client();
+    let (_token, session_id, secret) = bearer_login(&client, addr).await;
+
+    let (sid_a, secret_a2, sid_b, secret_b2) = (
+        session_id.clone(),
+        secret.clone(),
+        session_id.clone(),
+        secret.clone(),
+    );
+    let a = tokio::spawn(async move {
+        let r = revoke_session(addr, &sid_a, Some(&secret_a2)).await;
+        r.json::<Value>().await.expect("revoke a json")
+    });
+    let b = tokio::spawn(async move {
+        let r = revoke_session(addr, &sid_b, Some(&secret_b2)).await;
+        r.json::<Value>().await.expect("revoke b json")
+    });
+    let (a, b) = tokio::join!(a, b);
+    assert_eq!(a?, json!({"status": "revoked"}));
+    assert_eq!(b?, json!({"status": "revoked"}));
+    assert_eq!(live_session_count_for_email(&state, &email).await, 0);
+    Ok(())
+}
+
+// Expired row: capability still proves, the row is pruned in the same
+// transaction, and the answer is `revoked` (the goal holds and stays held).
+#[tokio::test]
+async fn session_revoke_on_expired_row_prunes_and_confirms() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let email = unique_email("sesrevexp");
+    mount_github_mocks(&mock, unique_github_id(), "paul", &email, Duration::ZERO, 1).await;
+    let (state, addr) = bearer_state(&mock).await;
+
+    let client = no_redirect_client();
+    let (_token, session_id, secret) = bearer_login(&client, addr).await;
+    sqlx::query("UPDATE rtdb_auth.sessions SET expires_at = 1 WHERE session_id = $1")
+        .bind(&session_id)
+        .execute(&state.pool)
+        .await
+        .expect("expire session row");
+
+    let resp = revoke_session(addr, &session_id, Some(&secret)).await;
+    assert_eq!(resp.json::<Value>().await?, json!({"status": "revoked"}));
+
+    let (left,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM rtdb_auth.sessions WHERE session_id = $1")
+            .bind(&session_id)
+            .fetch_one(&state.pool)
+            .await
+            .expect("count rows");
+    assert_eq!(left, 0, "expired row must be physically pruned");
+    Ok(())
+}
+
+// Tombstone lifecycle: the background sweep prunes expired tombstones and
+// never touches live or unexpired ones.
+#[tokio::test]
+async fn session_tombstone_sweep_prunes_only_expired() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let email = unique_email("sesrevsweep");
+    mount_github_mocks(&mock, unique_github_id(), "paul", &email, Duration::ZERO, 2).await;
+    let (state, addr) = bearer_state(&mock).await;
+
+    let client = no_redirect_client();
+    let (_token_a, session_id_a, secret_a) = bearer_login(&client, addr).await;
+    let (_token_b, _session_id_b, _secret_b) = bearer_login(&client, addr).await;
+
+    let resp = revoke_session(addr, &session_id_a, Some(&secret_a)).await;
+    assert_eq!(resp.json::<Value>().await?, json!({"status": "revoked"}));
+
+    // Age only the tombstone past its TTL.
+    sqlx::query("UPDATE rtdb_auth.sessions SET expires_at = 1 WHERE session_id = $1")
+        .bind(&session_id_a)
+        .execute(&state.pool)
+        .await
+        .expect("age tombstone");
+
+    let pruned = rtdb_server::auth::session::sweep_revoked_tombstones(&state.pool).await?;
+    assert_eq!(pruned, 1, "exactly the expired tombstone is pruned");
+    assert_eq!(live_session_count_for_email(&state, &email).await, 1);
+    Ok(())
+}
+
+// Default-flow regression: the poll body of a default (cookie + token) login
+// carries no `sessionId` — the capability is bearer-only and its absence must
+// not leak into the historical contract.
+#[tokio::test]
+async fn default_flow_poll_omits_session_id() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let email = unique_email("sesrevdef");
+    mount_github_mocks(&mock, unique_github_id(), "paul", &email, Duration::ZERO, 1).await;
+    let (_state, addr) = bearer_state(&mock).await;
+
+    let client = no_redirect_client();
+    let state_token = begin_login(&client, addr, None).await;
+    let cb = callback(&client, addr, &state_token).await;
+    assert_eq!(cb.status(), reqwest::StatusCode::OK);
+    let pv = poll_state(&client, addr, &state_token).await;
+    assert_eq!(pv["status"], json!("complete"));
+    assert!(
+        pv.get("sessionId").is_none(),
+        "default-flow poll must not carry sessionId"
+    );
+    Ok(())
+}
