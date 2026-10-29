@@ -5,8 +5,13 @@ import dev.parrtdb.errors.RtDbException
 import dev.parrtdb.wire.PROTOCOL_VERSION
 import dev.parrtdb.wire.WireJson
 import dev.parrtdb.transport.HttpTransport
+import dev.parrtdb.transport.StreamingHttpTransport
+import dev.parrtdb.transport.StreamingRequest
 import dev.parrtdb.transport.TransportRequest
 import dev.parrtdb.transport.TransportResponse
+import java.io.InputStream
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -47,6 +52,35 @@ internal class HttpCore(baseUrl: String, private val token: String, private val 
         return resp.body
     }
 
+    /**
+     * Streaming counterpart of [bytes]: the request body is pulled from [body] while sending and a 2xx response
+     * body is returned unread. The caller must close the returned stream. A status >= 400 reads at most
+     * [ERROR_BODY_LIMIT] bytes of the envelope, closes the stream and throws.
+     */
+    suspend fun stream(
+        method: String,
+        path: String,
+        body: InputStream? = null,
+        contentType: String? = null,
+    ): InputStream {
+        val streaming = http as? StreamingHttpTransport ?: throw UnsupportedOperationException("transport does not support streaming bodies")
+        val headers = LinkedHashMap<String, String>()
+        headers["Authorization"] = "Bearer $token"
+        headers["X-Rtdb-Protocol"] = PROTOCOL_VERSION.toString()
+        if (contentType != null) headers["Content-Type"] = contentType
+        val resp = try {
+            streaming.sendStreaming(StreamingRequest(method, baseUrl + path, headers, body))
+        } catch (e: Throwable) {
+            body?.close()
+            throw e
+        }
+        if (resp.status >= 400) {
+            val data = withContext(Dispatchers.IO) { resp.body.use { it.readNBytes(ERROR_BODY_LIMIT) } }
+            throw envelopeError(resp.status, data)
+        }
+        return resp.body
+    }
+
     /** Sends an optional JSON body and decodes the 2xx JSON response. */
     suspend fun json(method: String, path: String, body: JsonElement? = null, bearer: String? = token): JsonElement =
         WireJson.parse(String(jsonBytes(method, path, body, bearer), Charsets.UTF_8))
@@ -59,6 +93,8 @@ internal class HttpCore(baseUrl: String, private val token: String, private val 
     private suspend fun jsonBytes(method: String, path: String, body: JsonElement?, bearer: String?): ByteArray =
         bytes(method, path, body?.let { WireJson.encode(it).toByteArray(Charsets.UTF_8) }, if (body != null) "application/json" else null, bearer)
 }
+
+private const val ERROR_BODY_LIMIT = 64 * 1024
 
 private fun truncate(s: String, n: Int): String = if (s.length <= n) s else s.substring(0, n) + "…"
 

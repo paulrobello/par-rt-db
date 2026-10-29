@@ -19,6 +19,8 @@ public actor RtDbAdminClient {
     let baseUrl: String
     let adminKey: String
     private let session: URLSession
+    /// Chunk size for the streaming export/import paths (also the bound-stream buffer).
+    private static let streamChunkBytes = 64 * 1024
 
     // Admin op-feed stream (AdminStream.swift) injection points — internal so
     // AdminStreamTests can script transports and shrink backoff; production
@@ -104,6 +106,93 @@ public actor RtDbAdminClient {
             body: Data(jsonl.utf8), contentType: "application/x-ndjson",
             query: [URLQueryItem(name: "db", value: db)]
         )
+    }
+
+    /// Streaming companion to `exportDb(_:)` (`GET /admin/export-db?db=<db>`):
+    /// the same JSONL bytes, delivered as chunks (at most 64 KiB each) while
+    /// the response is still arriving, so exporting a large database never
+    /// holds the whole snapshot in memory. Non-2xx statuses throw before the
+    /// stream is returned; a transport failure mid-body finishes the stream
+    /// with an `RtDbError`. Cancelling the consuming task stops the download.
+    public func exportDbStream(_ db: String) async throws -> AsyncThrowingStream<Data, any Error> {
+        let request = try makeRequest(
+            "export db", method: "GET", path: "/admin/export-db",
+            query: [URLQueryItem(name: "db", value: db)]
+        )
+        let bytes: URLSession.AsyncBytes
+        let response: URLResponse
+        do {
+            (bytes, response) = try await session.bytes(for: request)
+        } catch {
+            throw RtDbError(
+                code: .internal, message: "export db request failed: \(String(describing: error))"
+            )
+        }
+        guard let http = response as? HTTPURLResponse else {
+            throw RtDbError(code: .internal, message: "export db returned a non-HTTP response")
+        }
+        guard (200 ..< 300).contains(http.statusCode) else {
+            var body = Data()
+            do {
+                for try await byte in bytes {
+                    body.append(byte)
+                }
+            } catch {}
+            throw RtDbError.decodeEnvelope(from: body)
+                ?? RtDbError(code: .badRequest, message: "HTTP \(http.statusCode)")
+        }
+        return Self.chunked(bytes)
+    }
+
+    /// Streaming companion to `importDb(_:jsonl:)`
+    /// (`POST /admin/import-db?db=<db>`, `application/x-ndjson`): uploads the
+    /// chunks of `body` as they are produced instead of requiring the whole
+    /// snapshot as one `String`, so imports of large databases stay bounded in
+    /// client memory. The chunks are concatenated verbatim, so they need not
+    /// align to line boundaries. If `body` throws, the upload is aborted and
+    /// that error is rethrown.
+    public func importDbStream<S: AsyncSequence & Sendable>(
+        _ db: String, body: S
+    ) async throws where S.Element == Data {
+        var request = try makeRequest(
+            "import db", method: "POST", path: "/admin/import-db",
+            contentType: "application/x-ndjson",
+            query: [URLQueryItem(name: "db", value: db)]
+        )
+        var input: InputStream?
+        var output: OutputStream?
+        Stream.getBoundStreams(
+            withBufferSize: Self.streamChunkBytes, inputStream: &input, outputStream: &output
+        )
+        guard let input, let output else {
+            throw RtDbError(code: .internal, message: "import db could not open an upload stream")
+        }
+        request.httpBodyStream = input
+        let session = session
+        let upload = Task { () throws -> (Data, URLResponse) in
+            try await session.data(for: request)
+        }
+        output.open()
+        let writer = StreamWriter(output)
+        do {
+            try await Self.pump(body, into: writer)
+        } catch {
+            upload.cancel()
+            output.close()
+            _ = await upload.result
+            throw error
+        }
+        output.close()
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await upload.value
+        } catch {
+            throw RtDbError(
+                code: .internal, message: "import db request failed: \(String(describing: error))"
+            )
+        }
+        try checkImportResponse(data, response)
     }
 
     /// `POST /admin/clone-db?from=<from>&to=<to>` → `{ok:true}`. Clones
@@ -1109,16 +1198,72 @@ extension RtDbAdminClient {
         }
     }
 
-    /// Issue a request; returns `(status, body)`. Transport failures wrap as
-    /// `RtDbError(internal)` — raw URL errors never escape to callers.
-    private func execute(
+    private nonisolated static func chunked(_ bytes: URLSession.AsyncBytes) -> AsyncThrowingStream<Data, any Error> {
+        AsyncThrowingStream { continuation in
+            let pump = Task {
+                var chunk = Data()
+                chunk.reserveCapacity(streamChunkBytes)
+                do {
+                    for try await byte in bytes {
+                        chunk.append(byte)
+                        if chunk.count >= streamChunkBytes {
+                            continuation.yield(chunk)
+                            chunk = Data()
+                            chunk.reserveCapacity(streamChunkBytes)
+                        }
+                    }
+                    if !chunk.isEmpty {
+                        continuation.yield(chunk)
+                    }
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: RtDbError(
+                        code: .internal,
+                        message: "export db stream failed: \(String(describing: error))"
+                    ))
+                }
+            }
+            continuation.onTermination = { _ in pump.cancel() }
+        }
+    }
+
+    private func checkImportResponse(_ data: Data, _ response: URLResponse) throws {
+        guard let http = response as? HTTPURLResponse else {
+            throw RtDbError(code: .internal, message: "import db returned a non-HTTP response")
+        }
+        guard (200 ..< 300).contains(http.statusCode) else {
+            throw RtDbError.decodeEnvelope(from: data)
+                ?? RtDbError(code: .badRequest, message: "HTTP \(http.statusCode)")
+        }
+        let ok: OkResponse
+        do {
+            ok = try JSONDecoder().decode(OkResponse.self, from: data)
+        } catch {
+            throw RtDbError(code: .internal, message: "invalid response body: \(error)")
+        }
+        try requireOk(ok)
+    }
+
+    private nonisolated static func pump<S: AsyncSequence>(
+        _ body: S, into writer: StreamWriter
+    ) async throws where S.Element == Data {
+        for try await chunk in body {
+            try Task.checkCancellation()
+            try await writer.write(chunk)
+        }
+    }
+
+    /// Build an authenticated admin request (bearer + ARC-013 protocol header).
+    private func makeRequest(
         _ what: String,
         method: String,
         path: String,
         body: Data? = nil,
         contentType: String? = nil,
         query: [URLQueryItem] = []
-    ) async throws -> (status: Int, data: Data) {
+    ) throws -> URLRequest {
         var components = URLComponents(string: baseUrl + path)
         if !query.isEmpty {
             components?.queryItems = query
@@ -1136,6 +1281,22 @@ extension RtDbAdminClient {
             request.setValue(contentType, forHTTPHeaderField: "Content-Type")
         }
         request.httpBody = body
+        return request
+    }
+
+    /// Issue a request; returns `(status, body)`. Transport failures wrap as
+    /// `RtDbError(internal)` — raw URL errors never escape to callers.
+    private func execute(
+        _ what: String,
+        method: String,
+        path: String,
+        body: Data? = nil,
+        contentType: String? = nil,
+        query: [URLQueryItem] = []
+    ) async throws -> (status: Int, data: Data) {
+        let request = try makeRequest(
+            what, method: method, path: path, body: body, contentType: contentType, query: query
+        )
         do {
             let (data, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse else {
@@ -1409,4 +1570,50 @@ private struct AnonymousAccessResponse: Decodable {
 
 private struct ReadOnlyResponse: Decodable {
     let readOnly: Bool
+}
+
+/// Blocking writes into the bound stream backing a streaming upload. The
+/// write parks on a private queue until URLSession drains the pipe, which is
+/// the backpressure that keeps the upload's memory bounded.
+private final class StreamWriter: @unchecked Sendable {
+    private let output: OutputStream
+    private let queue = DispatchQueue(label: "par-rt-db.admin.import-writer")
+
+    init(_ output: OutputStream) {
+        self.output = output
+    }
+
+    func write(_ data: Data) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            queue.async {
+                var offset = 0
+                let total = data.count
+                data.withUnsafeBytes { raw in
+                    guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+                    while offset < total {
+                        let written = self.output.write(base + offset, maxLength: total - offset)
+                        if written < 0 {
+                            break
+                        }
+                        if written == 0 {
+                            // Pipe full or reader not open yet: wait for the consumer to drain.
+                            if self.output.streamStatus == .error || self.output.streamStatus == .closed {
+                                break
+                            }
+                            Thread.sleep(forTimeInterval: 0.002)
+                            continue
+                        }
+                        offset += written
+                    }
+                }
+                if offset < total {
+                    continuation.resume(throwing: RtDbError(
+                        code: .internal, message: "import db upload stream closed early"
+                    ))
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
+    }
 }

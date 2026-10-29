@@ -387,6 +387,64 @@ impl RtDbAdminClient {
         self.expect_ok(resp).await
     }
 
+    /// Streaming companion to [`export_db`](Self::export_db): same
+    /// `GET /admin/export-db?db=<db>` request and identical JSONL bytes, but the
+    /// response body is handed back chunk by chunk (transport-decompressed when
+    /// the server gzipped the wire) instead of buffered whole, so client memory
+    /// stays bounded by one chunk regardless of database size. Status errors
+    /// surface before the stream is returned; a transport failure mid-body
+    /// arrives as an `Err` item. Chunk boundaries are arbitrary, not line-aligned.
+    pub async fn export_db_stream(
+        &self,
+        db: &str,
+    ) -> Result<futures_util::stream::BoxStream<'static, Result<bytes::Bytes, RtDbError>>, RtDbError>
+    {
+        use futures_util::StreamExt;
+        let resp = self
+            .client
+            .get(format!("{}/admin/export-db", self.url))
+            .authed(&self.token)
+            .query(&[("db", db)])
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("export_db_stream request failed: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(self.error_response(resp).await);
+        }
+        Ok(resp
+            .bytes_stream()
+            .map(|chunk| {
+                chunk.map_err(|e| RtDbError::internal(format!("export_db_stream body failed: {e}")))
+            })
+            .boxed())
+    }
+
+    /// Streaming companion to [`import_db`](Self::import_db): same
+    /// `POST /admin/import-db?db=<db>` with an `application/x-ndjson` body, but
+    /// the snapshot is forwarded to reqwest as `stream` yields chunks (e.g. the
+    /// output of [`export_db_stream`](Self::export_db_stream)) rather than held
+    /// whole, so large imports occupy one chunk of client memory at a time. A
+    /// streamed body cannot be replayed, so reqwest will not retry or follow a
+    /// body-preserving redirect.
+    pub async fn import_db_stream<S>(&self, db: &str, stream: S) -> Result<(), RtDbError>
+    where
+        S: futures_util::stream::TryStream + Send + 'static,
+        bytes::Bytes: From<S::Ok>,
+        S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let resp = self
+            .client
+            .post(format!("{}/admin/import-db", self.url))
+            .authed(&self.token)
+            .query(&[("db", db)])
+            .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
+            .body(reqwest::Body::wrap_stream(stream))
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("import_db_stream request failed: {e}")))?;
+        self.expect_ok(resp).await
+    }
+
     /// `POST /admin/clone-db?from=<from>&to=<to>` → `{ok:true}`. Clones `from`
     /// (schema + documents) into a freshly created `to` in one server-side step
     /// (see server `admin::dbs::clone_db`, ENH-009). `to` must not already exist;

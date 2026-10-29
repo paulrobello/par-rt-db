@@ -1808,3 +1808,20 @@ def test_signal_workflow_posts_name_and_payload_returns_bool() -> None:
     # payload rides the body verbatim and is omitted when not supplied.
     assert captured[0]["body"] == {"db": DB, "name": "approve", "payload": {"ok": True}}
     assert captured[1]["body"] == {"db": DB, "name": "approve"}
+
+
+def test_admin_export_import_stream_facade_round_trips() -> None:
+    chunks = [b'{"kind":"schema","schema":{"tables":{}}}\n', b'{"kind":"doc"}\n']
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            seen["body"] = request.content
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(200, content=iter(chunks))
+
+    client = _admin_client(handler)
+    with client.export_db_stream("kanban") as it:
+        data = b"".join(it)
+    client.import_db_stream("kanban2", iter([data]))
+    assert seen["body"] == b"".join(chunks)

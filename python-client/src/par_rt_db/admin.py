@@ -81,7 +81,17 @@ from __future__ import annotations
 import json
 import random
 import time
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterable,
+    AsyncIterator,
+    Callable,
+    Generator,
+    Iterable,
+    Iterator,
+    Mapping,
+)
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlencode
@@ -385,6 +395,22 @@ def _op_import_db(db: str, jsonl: str) -> _AdminRequest:
         {
             "params": {"db": db},
             "content": jsonl,
+            "headers": {"Content-Type": "application/x-ndjson"},
+        },
+        _parse_expect_ok,
+    )
+
+
+def _op_import_db_stream(db: str, body: Iterable[bytes] | AsyncIterable[bytes]) -> _AdminRequest:
+    """Streaming twin of :func:`_op_import_db`: same endpoint, headers and
+    response; ``content`` is an iterable of byte chunks sent chunked instead of
+    one materialized string."""
+    return _AdminRequest(
+        "POST",
+        "/admin/import-db",
+        {
+            "params": {"db": db},
+            "content": body,
             "headers": {"Content-Type": "application/x-ndjson"},
         },
         _parse_expect_ok,
@@ -1083,6 +1109,19 @@ class _SyncAdminExecutor:
             _require_json_object(resp, f"admin request to {req.path}")
         return req.parse(resp)
 
+    @contextmanager
+    def stream(self, req: _AdminRequest) -> Generator[Iterator[bytes]]:
+        """Open ``req`` as a streamed response and yield its body chunks.
+
+        A non-2xx status is read in full and raised as :class:`RtDbError`
+        before anything is yielded; the connection closes on context exit.
+        """
+        with self._client.stream(req.method, req.path, **req.request_kwargs) as resp:
+            if not resp.is_success:
+                resp.read()
+                raise RtDbError.from_http(resp.status_code, resp.content)
+            yield resp.iter_bytes()
+
 
 class _AsyncAdminExecutor:
     """Async admin request executor over a long-lived :class:`httpx.AsyncClient`.
@@ -1103,6 +1142,15 @@ class _AsyncAdminExecutor:
         if not req.raw_body and resp.status_code not in (202, 204):
             _require_json_object(resp, f"admin request to {req.path}")
         return req.parse(resp)
+
+    @asynccontextmanager
+    async def stream(self, req: _AdminRequest) -> AsyncGenerator[AsyncIterator[bytes]]:
+        """Async twin of :meth:`_SyncAdminExecutor.stream`."""
+        async with self._client.stream(req.method, req.path, **req.request_kwargs) as resp:
+            if not resp.is_success:
+                await resp.aread()
+                raise RtDbError.from_http(resp.status_code, resp.content)
+            yield resp.aiter_bytes()
 
 
 # ---------------------------------------------------------------------------
@@ -1460,6 +1508,21 @@ class RtDbAdminClient:
     def import_db(self, db: str, jsonl: str) -> None:
         """``POST /admin/import-db?db=<db>`` with an ``application/x-ndjson`` body."""
         self._executor.run(_op_import_db(db, jsonl))
+
+    @contextmanager
+    def export_db_stream(self, db: str) -> Generator[Iterator[bytes]]:
+        """Streaming companion to :meth:`export_db`: a context manager yielding
+        the snapshot JSONL as an iterator of byte chunks (transport-decompressed)
+        without buffering the whole export. Same bytes as :meth:`export_db`.
+        """
+        with self._executor.stream(_op_export_db(db)) as chunks:
+            yield chunks
+
+    def import_db_stream(self, db: str, chunks: Iterable[bytes]) -> None:
+        """Streaming companion to :meth:`import_db`: uploads JSONL byte chunks as
+        they are produced (chunked request body) so client memory stays bounded.
+        """
+        self._executor.run(_op_import_db_stream(db, chunks))
 
     def clone_db(self, from_: str, to: str) -> None:
         """``POST /admin/clone-db?from=<from>&to=<to>`` → ``{ok:true}``.
@@ -2369,6 +2432,20 @@ class AsyncRtDbAdminClient:
     async def import_db(self, db: str, jsonl: str) -> None:
         """``POST /admin/import-db?db=<db>`` with an ``application/x-ndjson`` body (async)."""
         await self._executor.run(_op_import_db(db, jsonl))
+
+    @asynccontextmanager
+    async def export_db_stream(self, db: str) -> AsyncGenerator[AsyncIterator[bytes]]:
+        """Async streaming companion to :meth:`export_db`: an async context manager
+        yielding the snapshot JSONL as an async iterator of byte chunks.
+        """
+        async with self._executor.stream(_op_export_db(db)) as chunks:
+            yield chunks
+
+    async def import_db_stream(self, db: str, chunks: AsyncIterable[bytes]) -> None:
+        """Async streaming companion to :meth:`import_db`: uploads JSONL byte chunks
+        as a chunked request body.
+        """
+        await self._executor.run(_op_import_db_stream(db, chunks))
 
     async def clone_db(self, from_: str, to: str) -> None:
         """``POST /admin/clone-db?from=<from>&to=<to>`` → ``{ok:true}`` (async).

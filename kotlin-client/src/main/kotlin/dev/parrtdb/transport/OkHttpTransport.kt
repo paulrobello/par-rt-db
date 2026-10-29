@@ -12,17 +12,20 @@ import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import okio.BufferedSink
+import okio.source
 
 /**
  * OkHttp-backed transport, the one to use on Android (where `java.net.http` does not exist). OkHttp
  * 4.x is a `compileOnly` dependency of this library: add `com.squareup.okhttp3:okhttp` to your app.
  * Configure timeouts, TLS and proxies on the [client] you pass in.
  */
-class OkHttpTransport(private val client: OkHttpClient = OkHttpClient()) : HttpTransport, WsTransport {
+class OkHttpTransport(private val client: OkHttpClient = OkHttpClient()) : StreamingHttpTransport, WsTransport {
     override suspend fun send(request: TransportRequest): TransportResponse {
         var contentType: String? = null
         val builder = Request.Builder().url(request.url)
@@ -44,6 +47,36 @@ class OkHttpTransport(private val client: OkHttpClient = OkHttpClient()) : HttpT
                         } catch (e: IOException) {
                             cont.resumeWithException(e)
                         }
+                    }
+                },
+            )
+        }
+    }
+
+    override suspend fun sendStreaming(request: StreamingRequest): StreamingResponse {
+        var contentType: String? = null
+        val builder = Request.Builder().url(request.url)
+        for ((k, v) in request.headers) if (k.equals("Content-Type", ignoreCase = true)) contentType = v else builder.header(k, v)
+        val source = request.body
+        val body: RequestBody? =
+            when {
+                source != null -> InputStreamBody(source, contentType?.toMediaTypeOrNull())
+                request.method == "GET" || request.method == "HEAD" -> null
+                else -> ByteArray(0).toRequestBody(contentType?.toMediaTypeOrNull())
+            }
+        builder.method(request.method, body)
+        val call = client.newCall(builder.build())
+        return suspendCancellableCoroutine { cont ->
+            cont.invokeOnCancellation { call.cancel() }
+            call.enqueue(
+                object : Callback {
+                    override fun onFailure(call: Call, e: IOException) {
+                        cont.resumeWithException(e)
+                    }
+
+                    // The Response is deliberately left open: closing the returned stream closes it.
+                    override fun onResponse(call: Call, response: Response) {
+                        cont.resume(StreamingResponse(response.code, response.body?.byteStream() ?: java.io.ByteArrayInputStream(ByteArray(0))))
                     }
                 },
             )
@@ -109,5 +142,16 @@ private class OkHttpWsSession(private val ws: WebSocket, private val channel: Ch
     override suspend fun close() {
         ws.close(1000, null)
         ws.cancel()
+    }
+}
+
+/** A one-shot request body copied from [input] while sending, so the payload is never materialized. */
+private class InputStreamBody(private val input: java.io.InputStream, private val type: okhttp3.MediaType?) : RequestBody() {
+    override fun contentType() = type
+
+    override fun isOneShot() = true
+
+    override fun writeTo(sink: BufferedSink) {
+        input.use { sink.writeAll(it.source()) }
     }
 }

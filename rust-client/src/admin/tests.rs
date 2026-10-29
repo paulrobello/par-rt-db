@@ -3119,3 +3119,87 @@ async fn revoke_enrollment_grant_posts_grant_id() {
         .await;
     client.revoke_enrollment_grant("g1").await.unwrap();
 }
+
+#[tokio::test]
+async fn export_db_stream_yields_same_bytes_as_buffered() {
+    use futures_util::StreamExt;
+    let (server, client) = setup().await;
+    let jsonl = "{\"kind\":\"schema\",\"schema\":{\"tables\":{}}}\n{\"kind\":\"doc\",\"n\":1}\n";
+    Mock::given(method("GET"))
+        .and(path("/admin/export-db"))
+        .and(query_param("db", "kanban"))
+        .and(header("authorization", BEARER))
+        .respond_with(ResponseTemplate::new(200).set_body_string(jsonl))
+        .mount(&server)
+        .await;
+    let mut stream = client.export_db_stream("kanban").await.unwrap();
+    let mut got: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        got.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(got, jsonl.as_bytes());
+    assert_eq!(client.export_db("kanban").await.unwrap(), jsonl);
+}
+
+#[tokio::test]
+async fn export_db_stream_surfaces_error_envelope_before_streaming() {
+    let (server, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/admin/export-db"))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_json(json!({"code": "NOT_FOUND", "message": "unknown database"})),
+        )
+        .mount(&server)
+        .await;
+    let err = client.export_db_stream("missing").await.err().unwrap();
+    assert_eq!(err.code, ErrorCode::NotFound);
+    assert_eq!(err.message, "unknown database");
+}
+
+#[tokio::test]
+async fn import_db_stream_posts_chunked_ndjson_body() {
+    use bytes::Bytes;
+    use futures_util::stream;
+    let (server, client) = setup().await;
+    let jsonl = "{\"kind\":\"schema\",\"schema\":{\"tables\":{}}}\n{\"kind\":\"doc\",\"n\":1}\n";
+    Mock::given(method("POST"))
+        .and(path("/admin/import-db"))
+        .and(query_param("db", "kanban"))
+        .and(header("authorization", BEARER))
+        .and(header("content-type", "application/x-ndjson"))
+        .and(body_bytes(jsonl.as_bytes().to_vec()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (a, b) = jsonl.as_bytes().split_at(10);
+    let chunks: Vec<Result<Bytes, std::io::Error>> =
+        vec![Ok(Bytes::copy_from_slice(a)), Ok(Bytes::copy_from_slice(b))];
+    client
+        .import_db_stream("kanban", stream::iter(chunks))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn export_stream_pipes_into_import_stream() {
+    let (server, client) = setup().await;
+    let jsonl = "{\"kind\":\"schema\",\"schema\":{\"tables\":{}}}\n{\"kind\":\"doc\",\"n\":1}\n";
+    Mock::given(method("GET"))
+        .and(path("/admin/export-db"))
+        .and(query_param("db", "src"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(jsonl))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/admin/import-db"))
+        .and(query_param("db", "dst"))
+        .and(body_bytes(jsonl.as_bytes().to_vec()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let out = client.export_db_stream("src").await.unwrap();
+    client.import_db_stream("dst", out).await.unwrap();
+}

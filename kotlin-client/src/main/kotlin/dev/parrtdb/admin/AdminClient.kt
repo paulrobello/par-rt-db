@@ -28,7 +28,10 @@ import dev.parrtdb.wire.jsonObj
 import dev.parrtdb.wire.jsonStr
 import dev.parrtdb.transport.HttpTransport
 import dev.parrtdb.transport.JdkTransport
+import java.io.InputStream
 import java.net.http.HttpClient
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonElement
 
 /**
@@ -136,6 +139,24 @@ class AdminClient(baseUrl: String, adminKey: String, transport: HttpTransport = 
     /** Imports an [exportDb] snapshot (`application/x-ndjson`). */
     suspend fun importDb(db: String, jsonl: String) {
         val data = core.bytes("POST", withQuery("/admin/import-db", listOf("db" to db)), jsonl.toByteArray(Charsets.UTF_8), "application/x-ndjson")
+        if (!okOf(WireJson.parse(String(data, Charsets.UTF_8)), "import ack")) throw RtDbException(ErrorCode.INTERNAL, "admin request returned ok=false")
+    }
+
+    /**
+     * Streaming companion to [exportDb]: the same JSONL bytes, returned as a stream read as they arrive from the
+     * server so a large database is never held in memory. The caller must close the stream. Prefer this over
+     * [exportDb] for big databases. Requires a [dev.parrtdb.transport.StreamingHttpTransport] (both bundled
+     * transports qualify), otherwise throws [UnsupportedOperationException].
+     */
+    suspend fun exportDbStream(db: String): InputStream = core.stream("GET", withQuery("/admin/export-db", listOf("db" to db)))
+
+    /**
+     * Streaming companion to [importDb]: uploads the JSONL read from [jsonl] as it is sent, with no full-size
+     * buffer. [jsonl] is closed when the call ends, success or failure. Same transport requirement as [exportDbStream].
+     */
+    suspend fun importDbStream(db: String, jsonl: InputStream) {
+        val ack = core.stream("POST", withQuery("/admin/import-db", listOf("db" to db)), jsonl, "application/x-ndjson")
+        val data = withContext(Dispatchers.IO) { ack.use { it.readAllBytes() } }
         if (!okOf(WireJson.parse(String(data, Charsets.UTF_8)), "import ack")) throw RtDbException(ErrorCode.INTERNAL, "admin request returned ok=false")
     }
 

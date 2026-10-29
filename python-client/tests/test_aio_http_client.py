@@ -9,7 +9,7 @@ sync client, so ``_handler_map`` is unchanged.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import httpx
@@ -1730,3 +1730,25 @@ async def test_signal_workflow_posts_name_and_payload_returns_bool() -> None:
     # payload rides the body verbatim and is omitted when not supplied.
     assert captured[0]["body"] == {"db": DB, "name": "approve", "payload": {"ok": True}}
     assert captured[1]["body"] == {"db": DB, "name": "approve"}
+
+
+async def _agen(chunks: list[bytes]) -> AsyncIterator[bytes]:
+    for chunk in chunks:
+        yield chunk
+
+
+async def test_admin_export_import_stream_facade_round_trips() -> None:
+    chunks = [b'{"kind":"schema","schema":{"tables":{}}}\n', b'{"kind":"doc"}\n']
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            seen["body"] = request.content
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(200, content=_agen(chunks))
+
+    async with _admin_client(handler) as c:
+        async with c.export_db_stream("kanban") as it:
+            data = b"".join([chunk async for chunk in it])
+        await c.import_db_stream("kanban2", _agen([data]))
+    assert seen["body"] == b"".join(chunks)

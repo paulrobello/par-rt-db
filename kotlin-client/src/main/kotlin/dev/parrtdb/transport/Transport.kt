@@ -13,6 +13,21 @@ interface HttpTransport {
     suspend fun send(request: TransportRequest): TransportResponse
 }
 
+/** A one-shot HTTP request whose body is read from [body] as it is sent instead of being held in memory. */
+class StreamingRequest(val method: String, val url: String, val headers: Map<String, String>, val body: java.io.InputStream?)
+
+/** A response whose [body] is read incrementally. The caller must close [body], which also releases the connection. */
+class StreamingResponse(val status: Int, val body: java.io.InputStream)
+
+/**
+ * An [HttpTransport] that can also stream request and response bodies. Both bundled transports implement it;
+ * a custom [HttpTransport] that does not is rejected by the streaming admin calls with [UnsupportedOperationException].
+ */
+interface StreamingHttpTransport : HttpTransport {
+    /** Request body bytes are pulled from [StreamingRequest.body] while sending, and the response body is not buffered. */
+    suspend fun sendStreaming(request: StreamingRequest): StreamingResponse
+}
+
 /** Dials WebSocket connections. */
 interface WsTransport {
     /** Dials [url]; [headers] are added to the upgrade request. */

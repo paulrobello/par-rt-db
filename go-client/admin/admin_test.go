@@ -380,6 +380,102 @@ func TestImportDBOKFalseIsError(t *testing.T) {
 	}
 }
 
+// The streaming export hands back the body before the server finishes: the
+// handler holds the second chunk until the client has read the first.
+func TestExportDBStreamDeliversIncrementally(t *testing.T) {
+	gate := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/admin/export-db" || r.URL.Query().Get("db") != "app" {
+			t.Errorf("got %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+		_, _ = w.Write([]byte("line1\n"))
+		w.(http.Flusher).Flush()
+		<-gate
+		_, _ = w.Write([]byte("line2\n"))
+	}))
+	defer srv.Close()
+	client := NewAdminClient(srv.URL, testAdminKey)
+	rc, err := client.ExportDBStream(context.Background(), "app")
+	if err != nil {
+		t.Fatalf("ExportDBStream: %v", err)
+	}
+	defer rc.Close()
+	buf := make([]byte, 6)
+	if _, err := io.ReadFull(rc, buf); err != nil || string(buf) != "line1\n" {
+		t.Fatalf("first chunk: %q %v", buf, err)
+	}
+	close(gate)
+	rest, err := io.ReadAll(rc)
+	if err != nil || string(rest) != "line2\n" {
+		t.Fatalf("rest: %q %v", rest, err)
+	}
+}
+
+func TestExportDBStreamErrorEnvelope(t *testing.T) {
+	c := &capture{t: t, method: "GET", path: "/admin/export-db",
+		status: 404, respBody: `{"code":"NOT_FOUND","message":"no such db"}`}
+	client := stub(t, c.handler)
+	if _, err := client.ExportDBStream(context.Background(), "app"); !rtdberrors.IsCode(err, rtdberrors.CodeNotFound) {
+		t.Fatalf("want NOT_FOUND, got %v", err)
+	}
+}
+
+// Round trip: streaming export feeds streaming import byte-for-byte, and the
+// upload is sent chunked (no Content-Length) from an io.Pipe, proving the
+// body is not buffered client-side.
+func TestStreamingExportImportRoundTrip(t *testing.T) {
+	snapshot := "schema\n{\"_id\":\"1\"}\n{\"_id\":\"2\"}\n"
+	var got string
+	var length int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/admin/export-db":
+			_, _ = w.Write([]byte(snapshot))
+		case "/admin/import-db":
+			if r.Header.Get("Content-Type") != "application/x-ndjson" {
+				t.Errorf("content-type %q", r.Header.Get("Content-Type"))
+			}
+			length = r.ContentLength
+			b, _ := io.ReadAll(r.Body)
+			got = string(b)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}
+	}))
+	defer srv.Close()
+	client := NewAdminClient(srv.URL, testAdminKey)
+	rc, err := client.ExportDBStream(context.Background(), "app")
+	if err != nil {
+		t.Fatalf("ExportDBStream: %v", err)
+	}
+	defer rc.Close()
+	pr, pw := io.Pipe()
+	go func() {
+		_, err := io.Copy(pw, rc)
+		pw.CloseWithError(err)
+	}()
+	if err := client.ImportDBStream(context.Background(), "app2", pr); err != nil {
+		t.Fatalf("ImportDBStream: %v", err)
+	}
+	if got != snapshot {
+		t.Fatalf("imported %q, want %q", got, snapshot)
+	}
+	if length != -1 {
+		t.Fatalf("ContentLength = %d, want -1 (chunked)", length)
+	}
+}
+
+func TestImportDBStreamOKFalseIsError(t *testing.T) {
+	c := &capture{t: t, method: "POST", path: "/admin/import-db",
+		ctype:  wantStr("application/x-ndjson"),
+		body:   wantStr("line1\n"),
+		status: 200, respBody: `{"ok":false}`}
+	client := stub(t, c.handler)
+	err := client.ImportDBStream(context.Background(), "app", strings.NewReader("line1\n"))
+	if !rtdberrors.IsCode(err, rtdberrors.CodeInternal) {
+		t.Fatalf("want INTERNAL on ok=false, got %v", err)
+	}
+}
+
 func TestGetSignedUrlMintsWithTransformQuery(t *testing.T) {
 	var gotQuery url.Values
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 
 	rtdberrors "github.com/paulrobello/par-rt-db/go-client/errors"
@@ -252,6 +254,11 @@ func (c *AdminClient) ImportDB(ctx context.Context, db, jsonl string) error {
 	if err != nil {
 		return err
 	}
+	return decodeImportAck(data)
+}
+
+// decodeImportAck decodes the {ok:true} import ack; ok=false is INTERNAL.
+func decodeImportAck(data []byte) error {
 	var resp struct {
 		OK bool `json:"ok"`
 	}
@@ -262,6 +269,35 @@ func (c *AdminClient) ImportDB(ctx context.Context, db, jsonl string) error {
 		return rtdberrors.New(rtdberrors.CodeInternal, "admin request returned ok=false")
 	}
 	return nil
+}
+
+// ExportDBStream: GET /admin/export-db?db= → the same JSONL bytes as ExportDB,
+// returned as an open stream the server fills incrementally. The caller must
+// Close it. Prefer this over ExportDB for large databases: memory stays
+// bounded by the reader's own buffering.
+func (c *AdminClient) ExportDBStream(ctx context.Context, db string) (io.ReadCloser, error) {
+	return c.api.RawStream(ctx, methodGet, withQuery("/admin/export-db", url.Values{"db": {db}}), "", nil)
+}
+
+// ImportDBStream is the streaming companion to ImportDB: body (an ExportDB
+// snapshot as JSONL) is uploaded as it is read, never buffered whole, so
+// imports of large databases stay bounded in client memory. The {ok:true} ack
+// is checked like ImportDB's.
+func (c *AdminClient) ImportDBStream(ctx context.Context, db string, body io.Reader) error {
+	if body == nil {
+		body = http.NoBody
+	}
+	rc, err := c.api.RawStream(ctx, methodPost, withQuery("/admin/import-db", url.Values{"db": {db}}),
+		"application/x-ndjson", body)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(io.LimitReader(rc, 1<<20))
+	if err != nil {
+		return fmt.Errorf("admin: read import ack: %w", err)
+	}
+	return decodeImportAck(data)
 }
 
 // CloneDB: POST /admin/clone-db?from=&to= → {ok:true}. Clones schema +

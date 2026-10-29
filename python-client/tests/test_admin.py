@@ -14,7 +14,7 @@ the pydantic model mapping on the response.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import httpx
@@ -2943,3 +2943,102 @@ async def test_async_anonymous_access_ops() -> None:
         enabled = await c.get_anonymous_access("kanban")
         await c.set_anonymous_access("kanban", True)
     assert enabled is False
+
+
+# --- streaming export / import ---------------------------------------------
+
+_SNAPSHOT = [
+    b'{"kind":"schema","schema":{"tables":{}}}\n',
+    b'{"kind":"doc","table":"t","doc":{"_id":"1","n":1}}\n',
+    b'{"kind":"doc","table":"t","doc":{"_id":"2","n":2}}\n',
+]
+
+
+async def _aiter(chunks: list[bytes]) -> AsyncIterator[bytes]:
+    for chunk in chunks:
+        yield chunk
+
+
+def test_export_db_stream_yields_same_bytes_as_buffered() -> None:
+    body = b"".join(_SNAPSHOT)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/admin/export-db"
+        assert dict(request.url.params) == {"db": "kanban"}
+        assert request.headers["authorization"] == ADMIN_BEARER
+        return httpx.Response(200, content=iter(_SNAPSHOT))
+
+    c = _sync_client(handler)
+    with c.export_db_stream("kanban") as chunks:
+        assert b"".join(chunks) == body
+    assert c.export_db("kanban").encode() == body
+
+
+def test_export_db_stream_raises_error_envelope_before_yielding() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"code": "NOT_FOUND", "message": "no such db"})
+
+    c = _sync_client(handler)
+    with pytest.raises(RtDbError) as ei, c.export_db_stream("nope"):
+        pytest.fail("must not yield on error status")
+    assert ei.value.code == ErrorCode.NOT_FOUND
+
+
+def test_import_db_stream_round_trips_snapshot() -> None:
+    store: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            assert request.url.path == "/admin/import-db"
+            assert dict(request.url.params) == {"db": "copy"}
+            assert request.headers["content-type"] == "application/x-ndjson"
+            store["body"] = request.content
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(200, content=iter([store["body"]]))
+
+    c = _sync_client(handler)
+    c.import_db_stream("copy", iter(_SNAPSHOT))  # generator, never joined client-side
+    assert store["body"] == b"".join(_SNAPSHOT)
+    with c.export_db_stream("copy") as chunks:
+        assert b"".join(chunks) == b"".join(_SNAPSHOT)
+
+
+def test_import_db_stream_surfaces_error_envelope() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"code": "BAD_REQUEST", "message": "malformed line"})
+
+    with pytest.raises(RtDbError) as ei:
+        _sync_client(handler).import_db_stream("copy", iter(_SNAPSHOT))
+    assert ei.value.code == ErrorCode.BAD_REQUEST
+
+
+async def test_async_export_import_stream_round_trip() -> None:
+    store: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            store["body"] = request.content
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(200, content=_aiter(_SNAPSHOT))
+
+    async def produce() -> AsyncIterator[bytes]:
+        for chunk in _SNAPSHOT:
+            yield chunk
+
+    async with _async_client(handler) as c:
+        await c.import_db_stream("copy", produce())
+        assert store["body"] == b"".join(_SNAPSHOT)
+        async with c.export_db_stream("copy") as chunks:
+            got = b"".join([chunk async for chunk in chunks])
+        assert got == b"".join(_SNAPSHOT)
+
+
+async def test_async_export_db_stream_raises_error_envelope() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"code": "FORBIDDEN", "message": "admin only"})
+
+    async with _async_client(handler) as c:
+        with pytest.raises(RtDbError) as ei:
+            async with c.export_db_stream("x"):
+                pytest.fail("must not yield on error status")
+    assert ei.value.code == ErrorCode.FORBIDDEN

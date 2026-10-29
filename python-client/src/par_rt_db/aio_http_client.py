@@ -19,7 +19,8 @@ sync/async × data-plane/admin clients. ``[aio]`` is kept as an alias for
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterable, AsyncIterator, Iterable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable, Mapping
+from contextlib import asynccontextmanager
 from typing import IO, TYPE_CHECKING, Any, Literal
 
 from ._http_common import build_transform_url
@@ -44,6 +45,7 @@ from .admin import (
     _op_get_json_schema,
     _op_get_schema,
     _op_import_db,
+    _op_import_db_stream,
     _op_list_backups,
     _op_list_dbs,
     _op_list_tokens,
@@ -703,6 +705,20 @@ class RtDbAsyncHttpClient:
     async def import_db(self, db: str, jsonl: str) -> None:
         """``POST /admin/import-db?db=<db>`` with an ``application/x-ndjson`` body (async)."""
         await self._admin_executor.run(_op_import_db(db, jsonl))
+
+    @asynccontextmanager
+    async def export_db_stream(self, db: str) -> AsyncGenerator[AsyncIterator[bytes]]:
+        """Async streaming companion to :meth:`export_db`: an async context manager
+        yielding the snapshot JSONL as an async iterator of byte chunks.
+        """
+        async with self._admin_executor.stream(_op_export_db(db)) as chunks:
+            yield chunks
+
+    async def import_db_stream(self, db: str, chunks: AsyncIterable[bytes]) -> None:
+        """Async streaming companion to :meth:`import_db`: uploads JSONL byte chunks
+        as a chunked request body.
+        """
+        await self._admin_executor.run(_op_import_db_stream(db, chunks))
 
     async def allowlist_add(self, db: str, email: str) -> None:
         """``POST /admin/allowlist`` ``{db, action:"add", email}`` → ``{ok:true}`` (async)."""

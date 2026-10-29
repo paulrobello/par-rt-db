@@ -15,6 +15,12 @@ import dev.parrtdb.http.HostCapability
 import dev.parrtdb.wire.WireJson
 import dev.parrtdb.wire.jsonObj
 import dev.parrtdb.wire.jsonStr
+import dev.parrtdb.transport.HttpTransport
+import dev.parrtdb.transport.JdkTransport
+import dev.parrtdb.transport.OkHttpTransport
+import dev.parrtdb.transport.TransportRequest
+import dev.parrtdb.transport.TransportResponse
+import java.io.ByteArrayInputStream
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -166,6 +172,56 @@ class AdminClientTest {
             a.editWebhook("app", 7, WebhookEditOptions(rotateSecret = true))
             assertEquals("""{"rotateSecret":true}""", srv.requests.last().body)
         }
+    }
+
+    @Test
+    fun `streaming export import round trips a snapshot over both transports`() = run10 {
+        val snapshot = (0 until 20_000).joinToString("") { """{"i":$it,"pad":"xxxxxxxxxxxxxxxxxxxxxxxx"}""" + "\n" }
+        for ((name, transport) in listOf("jdk" to JdkTransport(), "okhttp" to OkHttpTransport())) {
+            TestHttpServer().use { srv ->
+                val a = AdminClient(srv.baseUrl, "k", transport)
+                srv.respond = { Triple(200, snapshot, "application/x-ndjson") }
+                val streamed = a.exportDbStream("app").use { String(it.readAllBytes(), Charsets.UTF_8) }
+                assertEquals(snapshot, streamed, name)
+                assertEquals(streamed, a.exportDb("app"), name)
+                assertEquals("GET", srv.requests.first().method)
+                assertEquals("/admin/export-db", srv.requests.first().path)
+                assertEquals("db=app", srv.requests.first().query)
+                assertEquals("Bearer k", srv.requests.first().header("Authorization"))
+
+                srv.reply(200, """{"ok":true}""")
+                a.importDbStream("app", ByteArrayInputStream(snapshot.toByteArray(Charsets.UTF_8)))
+                val rec = srv.requests.last()
+                assertEquals("POST", rec.method)
+                assertEquals("/admin/import-db", rec.path)
+                assertEquals("application/x-ndjson", rec.header("Content-Type"), name)
+                assertEquals(snapshot, rec.body, name)
+                a.importDb("app", snapshot)
+                assertEquals(snapshot, srv.requests.last().body, name)
+            }
+        }
+    }
+
+    @Test
+    fun `streaming export import map error envelopes and ok false`() = run10 {
+        TestHttpServer().use { srv ->
+            val a = AdminClient(srv.baseUrl, "k")
+            srv.reply(404, """{"code":"NOT_FOUND","message":"no such db"}""")
+            assertEquals(ErrorCode.NOT_FOUND, assertFailsWith<RtDbException> { a.exportDbStream("nope") }.code)
+            srv.reply(409, """{"code":"CONFLICT","message":"not empty"}""")
+            assertEquals(ErrorCode.CONFLICT, assertFailsWith<RtDbException> { a.importDbStream("app", ByteArrayInputStream(ByteArray(3))) }.code)
+            srv.reply(200, """{"ok":false}""")
+            assertEquals(ErrorCode.INTERNAL, assertFailsWith<RtDbException> { a.importDbStream("app", ByteArrayInputStream(ByteArray(3))) }.code)
+        }
+    }
+
+    @Test
+    fun `streaming admin calls reject a non streaming transport`() = run10 {
+        val plain = object : HttpTransport {
+            override suspend fun send(request: TransportRequest) = TransportResponse(200, ByteArray(0))
+        }
+        val a = AdminClient("http://127.0.0.1:1", "k", plain)
+        assertFailsWith<UnsupportedOperationException> { a.exportDbStream("app") }
     }
 
     @Test

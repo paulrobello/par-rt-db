@@ -39,7 +39,8 @@ as ``from par_rt_db import <Model>`` (locked down by
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Generator, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from typing import IO, TYPE_CHECKING, Any, Literal
 
 from pydantic import TypeAdapter
@@ -65,6 +66,7 @@ from .admin import (
     _op_get_json_schema,
     _op_get_schema,
     _op_import_db,
+    _op_import_db_stream,
     _op_list_backups,
     _op_list_dbs,
     _op_list_tokens,
@@ -815,6 +817,21 @@ class RtDbHttpClient:
     def import_db(self, db: str, jsonl: str) -> None:
         """``POST /admin/import-db?db=<db>`` with an ``application/x-ndjson`` body."""
         self._admin_executor.run(_op_import_db(db, jsonl))
+
+    @contextmanager
+    def export_db_stream(self, db: str) -> Generator[Iterator[bytes]]:
+        """Streaming companion to :meth:`export_db`: a context manager yielding
+        the snapshot JSONL as an iterator of byte chunks (transport-decompressed)
+        without buffering the whole export. Same bytes as :meth:`export_db`.
+        """
+        with self._admin_executor.stream(_op_export_db(db)) as chunks:
+            yield chunks
+
+    def import_db_stream(self, db: str, chunks: Iterable[bytes]) -> None:
+        """Streaming companion to :meth:`import_db`: uploads JSONL byte chunks as
+        they are produced (chunked request body) so client memory stays bounded.
+        """
+        self._admin_executor.run(_op_import_db_stream(db, chunks))
 
     def allowlist_add(self, db: str, email: str) -> None:
         """``POST /admin/allowlist`` ``{db, action:"add", email}`` → ``{ok:true}``."""

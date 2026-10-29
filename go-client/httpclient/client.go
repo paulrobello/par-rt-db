@@ -95,6 +95,35 @@ func (c *Client) RawCall(ctx context.Context, method, path, contentType string, 
 	return data, nil
 }
 
+// RawStream is RawCall's streaming seam: body is sent as-is (a non-nil
+// reader goes out chunked, never buffered) and, on 2xx, the response body is
+// returned still open for the caller to read incrementally and Close. Error
+// statuses are drained and decoded into the usual envelope error.
+func (c *Client) RawStream(ctx context.Context, method, path, contentType string, body io.Reader) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
+	if err != nil {
+		return nil, fmt.Errorf("httpclient: build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("X-Rtdb-Protocol", strconv.FormatUint(uint64(wire.PROTOCOL_VERSION), 10))
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("httpclient: transport: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		defer resp.Body.Close()
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("httpclient: read response: %w", err)
+		}
+		return nil, envelopeError(resp.StatusCode, data)
+	}
+	return resp.Body, nil
+}
+
 // do performs one request through the auth seam and decodes the response.
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
 	return c.doWithAuth(ctx, method, path, body, out, c.token)

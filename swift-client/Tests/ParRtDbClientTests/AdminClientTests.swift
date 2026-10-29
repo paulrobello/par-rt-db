@@ -75,6 +75,24 @@ private func stubRequestBody(_ request: URLRequest) -> Data {
     return data
 }
 
+/// Drains a request body stream to EOF with blocking reads. `stubRequestBody`
+/// stops at the first momentarily-empty read, which truncates a bound-stream
+/// upload that is still being produced.
+private func stubStreamedRequestBody(_ request: URLRequest) -> Data {
+    guard let stream = request.httpBodyStream else { return request.httpBody ?? Data() }
+    stream.open()
+    defer { stream.close() }
+    var data = Data()
+    let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
+    defer { buffer.deallocate() }
+    while true {
+        let read = stream.read(buffer, maxLength: 4096)
+        guard read > 0 else { break }
+        data.append(buffer, count: read)
+    }
+    return data
+}
+
 private func jsonObjectBody(_ request: URLRequest) throws -> [String: Any] {
     let data = stubRequestBody(request)
     do {
@@ -108,6 +126,18 @@ private func adminAuth(_ request: URLRequest) throws {
         request.value(forHTTPHeaderField: "X-Rtdb-Protocol") == String(WireProtocol.version),
         "missing X-Rtdb-Protocol header"
     )
+}
+
+private final class CapturedBody: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+    func set(_ value: Data) {
+        lock.withLock { data = value }
+    }
+
+    func get() -> Data {
+        lock.withLock { data }
+    }
 }
 
 // MARK: - Tests
@@ -216,6 +246,108 @@ struct AdminClientTests {
             return (200, Data(#"{"ok":true}"#.utf8))
         }
         try await makeAdminClient().importDb("app", jsonl: #"{"kind":"schema"}"#)
+    }
+
+    /// A snapshot big enough to span several 64 KiB stream chunks.
+    private static let bigSnapshot: String = {
+        var lines = [#"{"kind":"schema"}"#]
+        for index in 0 ..< 6000 {
+            lines.append(#"{"t":"docs","i":\#(index),"pad":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}"#)
+        }
+        return lines.joined(separator: "\n") + "\n"
+    }()
+
+    @Test func exportDbStreamMatchesBufferedBytes() async throws {
+        let snapshot = Self.bigSnapshot
+        StubProtocol.handler = { request in
+            try adminAuth(request)
+            try demand(request.url?.path == "/admin/export-db", "expected /admin/export-db")
+            try demand(request.url?.query == "db=app", "query mismatch")
+            return (200, Data(snapshot.utf8))
+        }
+        let client = makeAdminClient()
+        var streamed = Data()
+        var chunks = 0
+        for try await chunk in try await client.exportDbStream("app") {
+            #expect(chunk.count <= 64 * 1024)
+            streamed.append(chunk)
+            chunks += 1
+        }
+        #expect(chunks > 1)
+        #expect(String(data: streamed, encoding: .utf8) == snapshot)
+        #expect(try await client.exportDb("app") == snapshot)
+    }
+
+    @Test func exportDbStreamThrowsEnvelopeOnError() async throws {
+        StubProtocol.handler = { _ in
+            (404, Data(#"{"code":"NOT_FOUND","message":"no such db"}"#.utf8))
+        }
+        do {
+            _ = try await makeAdminClient().exportDbStream("nope")
+            Issue.record("expected throw")
+        } catch let error as RtDbError {
+            #expect(error.code == .notFound)
+        }
+    }
+
+    @Test func importDbStreamUploadsChunksVerbatim() async throws {
+        let snapshot = Self.bigSnapshot
+        let seen = Data(snapshot.utf8)
+        StubProtocol.handler = { request in
+            try adminAuth(request)
+            try demand(request.httpMethod == "POST", "expected POST")
+            try demand(request.url?.path == "/admin/import-db", "expected /admin/import-db")
+            try demand(request.url?.query == "db=app", "query mismatch")
+            try demand(
+                request.value(forHTTPHeaderField: "Content-Type") == "application/x-ndjson",
+                "Content-Type mismatch"
+            )
+            try demand(stubStreamedRequestBody(request) == seen, "streamed body mismatch")
+            return (200, Data(#"{"ok":true}"#.utf8))
+        }
+        // Chunks deliberately split mid-line.
+        let chunks = stride(from: 0, to: seen.count, by: 10007).map {
+            seen.subdata(in: $0 ..< min($0 + 10007, seen.count))
+        }
+        let body = AsyncStream<Data> { continuation in
+            for chunk in chunks {
+                continuation.yield(chunk)
+            }
+            continuation.finish()
+        }
+        try await makeAdminClient().importDbStream("app", body: body)
+    }
+
+    @Test func importDbStreamRoundTripsExport() async throws {
+        let snapshot = Self.bigSnapshot
+        let captured = CapturedBody()
+        StubProtocol.handler = { request in
+            if request.url?.path == "/admin/export-db" {
+                return (200, Data(snapshot.utf8))
+            }
+            captured.set(stubStreamedRequestBody(request))
+            return (200, Data(#"{"ok":true}"#.utf8))
+        }
+        let client = makeAdminClient()
+        try await client.importDbStream("copy", body: client.exportDbStream("app"))
+        #expect(captured.get() == Data(snapshot.utf8))
+    }
+
+    @Test func importDbStreamSurfacesErrorEnvelope() async throws {
+        StubProtocol.handler = { request in
+            _ = stubStreamedRequestBody(request)
+            return (400, Data(#"{"code":"BAD_REQUEST","message":"bad snapshot"}"#.utf8))
+        }
+        let body = AsyncStream<Data> { continuation in
+            continuation.yield(Data("garbage\n".utf8))
+            continuation.finish()
+        }
+        do {
+            try await makeAdminClient().importDbStream("app", body: body)
+            Issue.record("expected throw")
+        } catch let error as RtDbError {
+            #expect(error.code == .badRequest)
+        }
     }
 
     @Test func cloneDbPostsFromToQuery() async throws {
