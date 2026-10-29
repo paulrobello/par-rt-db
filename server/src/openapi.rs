@@ -453,6 +453,14 @@ pub fn document() -> Value {
     );
     add(
         &mut paths,
+        "/auth/state/revoke",
+        &[(
+            "post",
+            op("Revoke an OAuth login state (fenced cleanup)", "Auth"),
+        )],
+    );
+    add(
+        &mut paths,
         "/auth/logout",
         &[("post", op("End the session", "Auth"))],
     );

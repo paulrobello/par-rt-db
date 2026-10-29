@@ -3,14 +3,20 @@
 //! (stored in `rtdb_auth.oauth_states`, so a login begun on one replica
 //! completes on another), login-CSRF is a double-submit nonce cookie
 //! constant-time-verified at `/callback`, and the anonymous mint is gated and
-//! rate-limited.
+//! rate-limited. Bearer-delivery logins additionally mint a client-only
+//! revoke secret at begin (delivered only in the begin response body; only
+//! its sha256 verifier is persisted) — `POST /auth/state/revoke` requires
+//! `{state, revokeSecret}` together, because `state` alone transits the
+//! provider redirect URL and is not a revocation capability. A lost begin
+//! response means the flow was never navigated and the pending row simply
+//! ages out via the TTL sweep — correct, nothing to clean.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::Json;
 use axum::Router;
-use axum::extract::{ConnectInfo, Form, Query as QueryParams, State};
+use axum::extract::{ConnectInfo, Form, Query as QueryParams, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::SET_COOKIE};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -43,6 +49,32 @@ const STATUS_PENDING: &str = "pending";
 const STATUS_CLAIMING: &str = "claiming";
 const STATUS_COMPLETED: &str = "completed";
 const STATUS_FAILED: &str = "failed";
+/// Terminal state recorded by `POST /auth/state/revoke` (the state token is
+/// the capability). Nothing reads a `revoked` row back to life: `claim_pending`
+/// only claims `pending`, the poll only consumes `completed`/`failed`, and
+/// `set_outcome` refuses to overwrite `revoked` — a callback that was mid-mint
+/// when the revoke landed rolls forward into the cancellation instead, deleting
+/// the session it just minted. Rows age out via the ordinary TTL sweep.
+const STATUS_REVOKED: &str = "revoked";
+
+/// Credential delivery for a login, persisted per `oauth_states` row (the
+/// `delivery` column; the legacy `cookie_mode` bool stays as a mirror of
+/// `delivery == "cookie"`).
+///
+/// - `default` (the historical flow): the callback sets the HttpOnly
+///   `rtdb_session` cookie + SEC-106 admin-CSRF nonce AND records the token
+///   for the one-shot poll — the credential reaches the browser twice.
+/// - `cookie` (SEC-207): the poll omits the token; the cookie is the only
+///   carrier.
+/// - `bearer` (opt-in, cross-tab hardening): the inverse of `cookie` — the
+///   one-shot poll is the ONLY carrier. The callback sets no `rtdb_session`
+///   cookie and mints no admin-CSRF nonce (it still clears the login-CSRF
+///   nonce), so other same-origin tabs cannot adopt the session via the
+///   shared cookie, and revoking this login's own state cannot disturb a
+///   pre-existing cookie-backed session.
+const DELIVERY_DEFAULT: &str = "default";
+const DELIVERY_COOKIE: &str = "cookie";
+const DELIVERY_BEARER: &str = "bearer";
 
 /// Cap on concurrently-pending OAuth state entries. `/begin` mints one per
 /// login attempt and rows are swept after `STATE_TTL_MS`; this bound is a
@@ -256,24 +288,24 @@ fn unconfigured_response(name: &str) -> Response {
 }
 
 /// `pending → claiming` for the first caller; `None` for a replay, an
-/// already-terminal/expired row, or a cross-provider claim (SEC-132: the
-/// state's minting provider must match the callback's provider). Single-use is
-/// enforced by the database — the `WHERE status = 'pending'` predicate means a
-/// second callback (a replay, or a concurrent race across two replicas) matches
-/// zero rows and returns `None`. This is the row-level claim that makes a
-/// replayed or cross-provider callback reject. On success returns the row's
+/// already-terminal/revoked/expired row, or a cross-provider claim (SEC-132:
+/// the state's minting provider must match the callback's provider). Single-use
+/// is enforced by the database — the `WHERE status = 'pending'` predicate means
+/// a second callback (a replay, or a concurrent race across two replicas)
+/// matches zero rows and returns `None`. On success returns the row's
 /// `anon_user_id` binding (FM-27): `Some(id)` when the login began from an
-/// anonymous session, `None` otherwise.
+/// anonymous session, `None` otherwise — plus the row's credential delivery
+/// mode, which the callback honors when closing the popup.
 async fn claim_pending(
     state: &Arc<AppState>,
     state_token: &str,
     expected_provider: &'static str,
-) -> Option<Option<String>> {
+) -> Option<(Option<String>, String)> {
     let now = now_ms();
-    let row: Option<(Option<String>,)> = sqlx::query_as(
+    let row: Option<(Option<String>, String)> = sqlx::query_as(
         "UPDATE rtdb_auth.oauth_states SET status = $1 \
          WHERE state = $2 AND provider = $3 AND status = $4 AND expires_at > $5 \
-         RETURNING anon_user_id",
+         RETURNING anon_user_id, delivery",
     )
     .bind(STATUS_CLAIMING)
     .bind(state_token)
@@ -284,7 +316,7 @@ async fn claim_pending(
     .await
     .ok()
     .flatten();
-    row.map(|(anon_user_id,)| anon_user_id)
+    row
 }
 
 /// FM-27: after a successful provider login whose state row was minted from
@@ -318,22 +350,119 @@ async fn merge_anon_into_real(state: &Arc<AppState>, anon_id: &str, session_toke
 /// `consumed_at` — consumption is the poll's act (one-shot retrieval by the
 /// client), so a completed-but-unpolled row remains consumable.
 async fn set_outcome(state: &Arc<AppState>, state_token: &str, completed: Option<&str>) {
+    let now = now_ms();
     let (status, token): (&str, Option<&str>) = match completed {
         Some(t) => (STATUS_COMPLETED, Some(t)),
         None => (STATUS_FAILED, None),
     };
-    if let Err(err) = sqlx::query(
+    // Fence: a row revoked while this callback was in flight (`POST
+    // /auth/state/revoke` landing during the provider exchange) must not be
+    // resurrected. Matching zero rows means the row is `revoked` or already
+    // TTL-swept, so the just-minted session rolls forward into the
+    // cancellation instead of going live. The same statement records durable
+    // callback-settlement evidence (`callback_settled_at`) — the response
+    // mapping in `state_revoke` treats settlement as provable cleanup only
+    // from this marker, never from token absence or elapsed time. A mid-flight
+    // TTL sweep has the same effect: the poll is already dead for a swept row,
+    // so nobody ever legitimately holds that token.
+    match sqlx::query(
         "UPDATE rtdb_auth.oauth_states \
-         SET status = $1, session_token = $2 \
-         WHERE state = $3",
+         SET status = $1, session_token = $2, callback_settled_at = $3 \
+         WHERE state = $4 AND status <> $5",
     )
     .bind(status)
     .bind(token)
+    .bind(now)
     .bind(state_token)
+    .bind(STATUS_REVOKED)
     .execute(&state.pool)
     .await
     {
-        tracing::warn!(error = %err, "oauth: failed to record terminal outcome");
+        Ok(res) if res.rows_affected() > 0 => {}
+        Ok(_) => {
+            if let Some(t) = completed {
+                roll_forward_into_revocation(state, state_token, t).await;
+            } else {
+                // Failed outcome on a revoked/swept row: record settlement so
+                // retries see the callback finished (still `unconfirmed` —
+                // session absence is not provable).
+                let _ = sqlx::query(
+                    "UPDATE rtdb_auth.oauth_states \
+                     SET status = 'failed', callback_settled_at = $1 \
+                     WHERE state = $2 AND status = $3",
+                )
+                .bind(now)
+                .bind(state_token)
+                .bind(STATUS_REVOKED)
+                .execute(&state.pool)
+                .await;
+            }
+        }
+        Err(err) => tracing::warn!(error = %err, "oauth: failed to record terminal outcome"),
+    }
+}
+
+/// Roll-forward for a session minted by a callback whose state row was revoked
+/// mid-mint. Marker-first: the token AND the settlement marker are written
+/// together and that UPDATE commits BEFORE the delete is attempted, so a crash
+/// after the mint but before the delete leaves a durable, retry-recoverable
+/// debt rather than an orphaned session. Deleting zero rows is fine (already
+/// cleaned); on delete success the recorded plaintext is cleared while the
+/// settlement marker stays (a historical fact).
+async fn roll_forward_into_revocation(state: &Arc<AppState>, state_token: &str, token: &str) {
+    let now = now_ms();
+    let marker = sqlx::query(
+        "UPDATE rtdb_auth.oauth_states \
+         SET session_token = $1, callback_settled_at = $2 \
+         WHERE state = $3 AND status = $4",
+    )
+    .bind(token)
+    .bind(now)
+    .bind(state_token)
+    .bind(STATUS_REVOKED)
+    .execute(&state.pool)
+    .await;
+    match marker {
+        Ok(res) if res.rows_affected() > 0 => {
+            // Row present and revoked — delete, then clear the recorded
+            // plaintext. On delete failure the marker STAYS: the next
+            // state/revoke retry deletes the session and confirms.
+            if let Err(err) = session::delete_session(&state.pool, token).await {
+                tracing::warn!(
+                    error = %err,
+                    "oauth: failed to delete a session minted after revoke; token left recorded for revoke-retry cleanup"
+                );
+                return;
+            }
+            if let Err(err) = sqlx::query(
+                "UPDATE rtdb_auth.oauth_states \
+                 SET session_token = NULL \
+                 WHERE state = $1 AND status = $2",
+            )
+            .bind(state_token)
+            .bind(STATUS_REVOKED)
+            .execute(&state.pool)
+            .await
+            {
+                tracing::warn!(error = %err, "oauth: failed to clear a rolled-forward token");
+            }
+        }
+        Ok(_) => {
+            // Row already swept/missing — the poll was dead anyway; clean up
+            // best-effort so no live session lingers.
+            if let Err(err) = session::delete_session(&state.pool, token).await {
+                tracing::warn!(error = %err, "oauth: failed to delete a session minted after a swept revoke");
+            }
+        }
+        Err(err) => {
+            // Marker query itself failed — fall through to the delete so the
+            // fence's cleanup intent still applies. Settlement stays unset, so
+            // retries keep answering `unconfirmed` (honest: untracked debt).
+            tracing::warn!(error = %err, "oauth: roll-forward marker write failed");
+            if let Err(derr) = session::delete_session(&state.pool, token).await {
+                tracing::warn!(error = %derr, "oauth: failed to delete a session after a failed marker");
+            }
+        }
     }
 }
 
@@ -362,14 +491,14 @@ async fn poll_login(state: &Arc<AppState>, state_token: &str) -> PollResult {
     let now = now_ms();
     // The single-use consume: only an unconsumed, unexpired, terminal row
     // matches, so only the first poll after completion wins it.
-    let consumed: Option<(Option<String>, String, bool)> = sqlx::query_as(
+    let consumed: Option<(Option<String>, String, String)> = sqlx::query_as(
         "UPDATE rtdb_auth.oauth_states \
          SET consumed_at = $1 \
          WHERE state = $2 \
            AND status IN ($3, $4) \
            AND consumed_at IS NULL \
            AND expires_at > $1 \
-         RETURNING session_token, status, cookie_mode",
+         RETURNING session_token, status, delivery",
     )
     .bind(now)
     .bind(state_token)
@@ -380,14 +509,14 @@ async fn poll_login(state: &Arc<AppState>, state_token: &str) -> PollResult {
     .ok()
     .flatten();
 
-    if let Some((token, status, cookie_mode)) = consumed {
+    if let Some((token, status, delivery)) = consumed {
         if status == STATUS_COMPLETED {
             return match token {
                 Some(t) => match resolve_bearer(&state.pool, &t).await {
                     Ok(principal @ Principal::User { .. }) => PollResult::Complete {
                         token: t,
                         user: authed_user(&principal),
-                        cookie_mode,
+                        cookie_mode: delivery == DELIVERY_COOKIE,
                     },
                     _ => PollResult::Expired, // token did not resolve — treat as gone
                 },
@@ -436,9 +565,10 @@ pub async fn sweep_oauth_states(pool: &sqlx::PgPool) -> Result<u64, RtDbError> {
 #[derive(Deserialize)]
 struct BeginParams {
     origin: String,
-    /// SEC-207: `mode=cookie` marks a cookie-mode login — the poll response
-    /// omits the session token so no script-readable copy ever exists. Absent
-    /// (or any other value) is the historical token-delivering behavior.
+    /// Credential delivery for this login: absent (historical default — token
+    /// via poll AND cookie), `cookie` (SEC-207 — cookie only), or `bearer`
+    /// (opt-in — poll only, no cookie is ever set). Any other value rejects
+    /// with `400`.
     mode: Option<String>,
 }
 
@@ -447,6 +577,15 @@ struct BeginParams {
 struct BeginResponse {
     authorize_url: String,
     state: String,
+    /// Client-only revoke capability for bearer-mode logins: minted at begin,
+    /// delivered ONLY in this response body — never in a URL, cookie,
+    /// provider redirect, or proxy log. Only its sha256 verifier is stored
+    /// server-side. Omitted (field absent) for default/cookie deliveries,
+    /// keeping those responses byte-identical. If this response is lost the
+    /// flow was never navigated and the row simply ages out pending until the
+    /// TTL sweep — correct, nothing to clean.
+    #[serde(rename = "revokeSecret", skip_serializing_if = "Option::is_none")]
+    revoke_secret: Option<String>,
 }
 
 /// `GET /auth/{provider}/begin?origin=<parent origin>`: validates the origin
@@ -511,11 +650,15 @@ async fn provider_begin<P: OAuthProvider>(
 
     // SEC-207: a declared value, not a free-form flag — an unrecognized mode
     // is a client bug and rejects rather than silently delivering the token.
-    let cookie_mode = match params.mode.as_deref() {
-        None => false,
-        Some("cookie") => true,
-        Some(_) => return RtDbError::bad_request("mode must be 'cookie'").into_response(),
+    let delivery = match params.mode.as_deref() {
+        None => DELIVERY_DEFAULT,
+        Some("cookie") => DELIVERY_COOKIE,
+        Some("bearer") => DELIVERY_BEARER,
+        Some(_) => {
+            return RtDbError::bad_request("mode must be 'cookie' or 'bearer'").into_response();
+        }
     };
+    let cookie_mode = delivery == DELIVERY_COOKIE;
 
     let state_token = random_token();
     let now = now_ms();
@@ -558,10 +701,16 @@ async fn provider_begin<P: OAuthProvider>(
         },
         None => None,
     };
+    // Client-only revoke capability, minted only for bearer rows (the state
+    // token transits the provider redirect URL; this secret never does). Only
+    // the sha256 verifier is persisted — the plaintext rides the begin
+    // response exactly once.
+    let revoke_secret = (delivery == DELIVERY_BEARER).then(random_token);
+    let revoke_secret_verifier = revoke_secret.as_deref().map(crate::db::sha256_hex);
     if let Err(err) = sqlx::query(
         "INSERT INTO rtdb_auth.oauth_states \
-         (state, provider, status, created_at, expires_at, anon_user_id, cookie_mode) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+         (state, provider, status, created_at, expires_at, anon_user_id, cookie_mode, delivery, revoke_secret_verifier) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(&state_token)
     .bind(P::name())
@@ -570,6 +719,8 @@ async fn provider_begin<P: OAuthProvider>(
     .bind(now + STATE_TTL_MS)
     .bind(&anon_user_id)
     .bind(cookie_mode)
+    .bind(delivery)
+    .bind(&revoke_secret_verifier)
     .execute(&state.pool)
     .await
     {
@@ -582,6 +733,7 @@ async fn provider_begin<P: OAuthProvider>(
     let mut response = Json(BeginResponse {
         authorize_url,
         state: state_token.clone(),
+        revoke_secret: revoke_secret.clone(),
     })
     .into_response();
     // Login-CSRF: bind this `state` to the initiating browser so a callback the
@@ -635,8 +787,8 @@ async fn provider_callback<P: OAuthProvider>(
         }
     }
 
-    let anon_user_id = match claim_pending(&state, &params.state, P::name()).await {
-        Some(binding) => binding,
+    let (anon_user_id, delivery) = match claim_pending(&state, &params.state, P::name()).await {
+        Some((anon, delivery)) => (anon, delivery),
         None => return RtDbError::bad_request("invalid or expired state").into_response(),
     };
 
@@ -655,7 +807,11 @@ async fn provider_callback<P: OAuthProvider>(
                 merge_anon_into_real(&state, anon_id, &token).await;
             }
             set_outcome(&state, &params.state, Some(&token)).await;
-            callback_close_response(&token, secure)
+            if delivery == DELIVERY_BEARER {
+                bearer_callback_close_response()
+            } else {
+                callback_close_response(&token, secure)
+            }
         }
         Err(err) => {
             set_outcome(&state, &params.state, None).await;
@@ -685,10 +841,11 @@ async fn apple_callback(
         }
     }
 
-    let anon_user_id = match claim_pending(&state, &form.state, AppleProvider::name()).await {
-        Some(binding) => binding,
-        None => return RtDbError::bad_request("invalid or expired state").into_response(),
-    };
+    let (anon_user_id, delivery) =
+        match claim_pending(&state, &form.state, AppleProvider::name()).await {
+            Some((anon, delivery)) => (anon, delivery),
+            None => return RtDbError::bad_request("invalid or expired state").into_response(),
+        };
 
     let Some(provider) = AppleProvider::from_config(&state.config) else {
         set_outcome(&state, &form.state, None).await;
@@ -705,7 +862,11 @@ async fn apple_callback(
                 merge_anon_into_real(&state, anon_id, &token).await;
             }
             set_outcome(&state, &form.state, Some(&token)).await;
-            callback_close_response(&token, secure)
+            if delivery == DELIVERY_BEARER {
+                bearer_callback_close_response()
+            } else {
+                callback_close_response(&token, secure)
+            }
         }
         Err(err) => {
             set_outcome(&state, &form.state, None).await;
@@ -722,17 +883,21 @@ struct AppleCallbackForm {
     state: String,
 }
 
-/// The popup-closing HTML the callback returns on success. Nothing is
-/// interpolated (no `origin`, no token) — the token rides the HttpOnly
-/// `Set-Cookie`, so there is no self-XSS surface (SEC-005 fully retired by
-/// SEC-012) and the parent learns of completion by polling `/auth/state`, not
-/// via `window.opener` postMessage.
+/// The popup-closing HTML shared by every delivery mode. Nothing is
+/// interpolated (no `origin`, no token) — SEC-005 stays retired: the token
+/// never appears in the body regardless of how the response carries it.
+fn callback_close_html() -> &'static str {
+    "<!doctype html><html><head><meta charset=\"utf-8\"><title>Signed in</title>\
+     </head><body><script>window.close();</script>\
+     <p style=\"font-family:sans-serif\">Sign-in complete. You may close this window.</p>\
+     </body></html>"
+}
+
+/// Close response for the historical default and SEC-207 cookie deliveries:
+/// identical popup HTML + CSP, plus the HttpOnly `rtdb_session` cookie, the
+/// SEC-106 admin-CSRF nonce, and the login-CSRF nonce clear.
 fn callback_close_response(token: &str, secure: bool) -> Response {
-    let html = "<!doctype html><html><head><meta charset=\"utf-8\"><title>Signed in</title>\
-                </head><body><script>window.close();</script>\
-                <p style=\"font-family:sans-serif\">Sign-in complete. You may close this window.</p>\
-                </body></html>";
-    let mut response = Html(html).into_response();
+    let mut response = Html(callback_close_html()).into_response();
     response.headers_mut().insert(
         HeaderName::from_static("content-security-policy"),
         HeaderValue::from_static("default-src 'none'; script-src 'unsafe-inline'"),
@@ -757,6 +922,24 @@ fn callback_close_response(token: &str, secure: bool) -> Response {
     }
 }
 
+/// Close response for the opt-in bearer delivery (`mode=bearer`): the same
+/// popup-closing HTML + CSP, but NO `rtdb_session` cookie and NO admin-CSRF
+/// nonce — the one-shot `/auth/state` poll is the only credential carrier, so
+/// other same-origin tabs cannot adopt the session via the shared cookie. The
+/// login-CSRF nonce is still cleared (same one-shot hygiene as the default
+/// path).
+fn bearer_callback_close_response() -> Response {
+    let mut response = Html(callback_close_html()).into_response();
+    response.headers_mut().insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static("default-src 'none'; script-src 'unsafe-inline'"),
+    );
+    response
+        .headers_mut()
+        .append(SET_COOKIE, crate::auth::cookie::clear_oauth_csrf_cookie());
+    response
+}
+
 #[derive(Deserialize)]
 struct StateQuery {
     state: String,
@@ -769,6 +952,9 @@ enum StateResponse {
     /// SEC-207: `token` is omitted entirely for a cookie-mode login — the
     /// HttpOnly session cookie set at the callback is the only credential
     /// carrier, so the poll body never exposes a script-readable copy.
+    /// The revoke capability is NOT carried here: `revokeSecret` was delivered
+    /// once in the begin response (client-only channel) and only its sha256
+    /// verifier is stored server-side.
     Complete {
         #[serde(skip_serializing_if = "Option::is_none")]
         token: Option<String>,
@@ -811,6 +997,264 @@ async fn auth_state(
         }
         PollResult::Failed => Json(StateResponse::Error).into_response(),
         PollResult::Expired => Json(StateResponse::Expired).into_response(),
+    }
+}
+
+/// Body of `POST /auth/state/revoke`. `revokeSecret` is required: `state`
+/// transits the provider redirect URL (browser history, referrers, proxy
+/// logs, provider telemetry), so state alone is not a revocation capability —
+/// the secret is a client-only channel value.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StateRevokeBody {
+    state: String,
+    revoke_secret: Option<String>,
+}
+
+/// Response of `POST /auth/state/revoke`. `revoked` is a CONFIRMED fence: a
+/// live bearer row (pending/claiming/completed/consumed — or a previously
+/// revoked one still owed cleanup) was transitioned to `revoked` and its
+/// tracked session was verifiably deleted (or provably never existed) in the
+/// same transaction. `unconfirmed` is the FAILED-state answer: the state is
+/// terminal-dead (the poll can never deliver), but `complete_login` returning
+/// Err does not prove no session row was committed (the ambiguous-insert
+/// case — a minted session whose plaintext was dropped when the error
+/// surfaced), so session absence is not provable. `unknown` means no bearer
+/// row matched the presented (state, revokeSecret) pair — never minted, a
+/// `default`/`cookie` delivery (revoke is scoped to the bearer flow), wrong
+/// or missing secret, or past its TTL / swept; the caller cannot distinguish
+/// these (no existence leak). The-cube's client rule holds: any non-`revoked`
+/// outcome is treated as unconfirmed.
+#[derive(serde::Serialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+enum StateRevokeResponse {
+    Revoked,
+    Unconfirmed,
+    Unknown,
+}
+
+/// `POST /auth/state/revoke` `{state, revokeSecret}`: state AND revoke secret
+/// together are the capability (only sha256(presented) is stored). Scoped to BEARER-delivery rows — a revoke
+/// racing a default/cookie callback would make `set_outcome` delete a session
+/// whose token `callback_close_response` was about to set as the browser's
+/// `rtdb_session` cookie, replacing a live cookie with a dead one; non-bearer
+/// rows answer the same `unknown`-shaped body as never-minted (no
+/// mode-leaking distinction). Atomically transitions a live bearer row
+/// (`pending`/`claiming`/`completed`) to `revoked` and deletes its tracked
+/// session in ONE transaction — a crash or failure between the fence and the
+/// delete rolls the fence back, leaving the row unconsumed so a retry re-runs
+/// the whole cleanup.
+///
+/// Response mapping (durable settlement evidence, never inferred): a
+/// `pending` row is cancelled before claim and answers `revoked` (the
+/// callback can never claim it); `claiming` is fenced but answers
+/// `unconfirmed` — the mint may already be committed with the plaintext still
+/// in flight; `completed` deletes its tracked session and answers `revoked`;
+/// an already-`revoked` row answers `revoked` only once
+/// `callback_settled_at` is set, deleting any owed token first, and stays
+/// `unconfirmed` before that — including forever after a crash between the
+/// session INSERT and the settlement/marker write (never inferred from token
+/// absence or elapsed time); `failed` answers `unconfirmed` (ambiguous-insert
+/// is not provably clean). The-cube client rule: any non-`revoked` outcome is
+/// unconfirmed. Expired or TTL-swept rows, wrong or missing secrets, and
+/// non-bearer deliveries all answer `unknown`. The digest compare is
+/// constant-time (`ct_eq`, same hygiene as the CSRF gates). This
+/// endpoint sets no cookies, so it never disturbs a browser's pre-existing
+/// `rtdb_session` — unlike `POST /auth/logout`, which always attaches
+/// cookie-clearing headers (suppressing those when the request presented no
+/// cookie is a separate, deferred follow-up card).
+///
+/// The route is unauthenticated (capability = state + secret), so it carries
+/// the same SEC-003-style per-IP fixed-window guard as `/begin` (30 rpm,
+/// tighter than begin's configurable ceiling) and a strict body-shape gate
+/// BEFORE any transaction: bodies over 4 KiB, non-object JSON, non-string or
+/// over-length `state`/`revokeSecret` fields, and limiter denials ALL answer
+/// the same unknown-shaped 200 — garbage capabilities never reach the fence,
+/// never open a transaction, and leak nothing about what failed.
+/// Per-IP budget for `/auth/state/revoke` (fixed-window rpm, same limiter and
+/// key shape as `/begin`'s SEC-003 guard). Sized for legitimate retry
+/// capacity: the real client re-sends a handful of times on `unconfirmed`
+/// outcomes, so 30/min per IP is several times the retry need while still
+/// capping a garbage-capability flood — every request past it pays only the
+/// limiter check, never a DB transaction.
+const STATE_REVOKE_PER_IP_RPM: u32 = 30;
+/// Total-body bound for the revoke request. The capability pair is two ~43
+/// char strings; 4 KiB bounds parser work per request while dwarfing any
+/// legitimate body.
+const STATE_REVOKE_MAX_BODY_BYTES: usize = 4096;
+/// Per-field bound (`state`, `revokeSecret`): real values are 43-char random
+/// tokens; anything longer is shape-garbage and answers the uniform response.
+const STATE_REVOKE_MAX_FIELD_CHARS: usize = 256;
+
+async fn state_revoke(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    req: Request,
+) -> Response {
+    // SEC-003-style per-IP guard, mirroring `/begin`: garbage capabilities
+    // must not consume DB connections. Same key shape, fixed-window mechanism,
+    // a tighter const budget. Denied requests answer the SAME unknown-shaped
+    // 200 as everything else (uniformity — no distinct error envelope, no
+    // confirmation of any capability).
+    let ip_key = crate::http_api::client_ip_key(&headers, addr.ip(), state.config.trusted_proxy);
+    match state
+        .limits
+        .rate_limiter
+        .check(
+            crate::rate_limit::RateKey::Ip {
+                route: "state_revoke",
+                ip: ip_key,
+            },
+            STATE_REVOKE_PER_IP_RPM,
+        )
+        .await
+    {
+        crate::rate_limit::RateDecision::Allowed => {}
+        crate::rate_limit::RateDecision::Denied { .. } => {
+            return Json(StateRevokeResponse::Unknown).into_response();
+        }
+    }
+
+    // Body shape gate BEFORE any transaction: read at most
+    // `STATE_REVOKE_MAX_BODY_BYTES`, require a JSON object with string
+    // `state`/`revokeSecret` fields in bounds — any failure answers the same
+    // unknown-shaped 200 (no new status codes, no shape leakage).
+    let bytes = match axum::body::to_bytes(req.into_body(), STATE_REVOKE_MAX_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return Json(StateRevokeResponse::Unknown).into_response(),
+    };
+    let body: StateRevokeBody = match serde_json::from_slice(&bytes) {
+        Ok(body) => body,
+        Err(_) => return Json(StateRevokeResponse::Unknown).into_response(),
+    };
+    if body.state.len() > STATE_REVOKE_MAX_FIELD_CHARS
+        || body
+            .revoke_secret
+            .as_deref()
+            .is_some_and(|s| s.len() > STATE_REVOKE_MAX_FIELD_CHARS)
+    {
+        return Json(StateRevokeResponse::Unknown).into_response();
+    }
+
+    let now = now_ms();
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            tracing::warn!(error = %err, "oauth: state revoke tx begin failed");
+            return RtDbError::internal("failed to revoke state").into_response();
+        }
+    };
+    // Lock the row first (FOR UPDATE), then decide in Rust — the secret
+    // compare must be constant-time, which SQL cannot express, and the
+    // row lock keeps the fence atomic through the compare.
+    type RevokeRow = (String, Option<String>, Option<String>, String, Option<i64>);
+    let row: Result<Option<RevokeRow>, sqlx::Error> = sqlx::query_as(
+        "SELECT status, session_token, revoke_secret_verifier, delivery, callback_settled_at \
+         FROM rtdb_auth.oauth_states \
+         WHERE state = $1 AND expires_at > $2 \
+         FOR UPDATE",
+    )
+    .bind(&body.state)
+    .bind(now)
+    .fetch_optional(&mut *tx)
+    .await;
+
+    let row = match row {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(error = %err, "oauth: state revoke query failed");
+            return RtDbError::internal("failed to revoke state").into_response();
+        }
+    };
+    let Some((status, session_token, stored_verifier, delivery, settled_at)) = row else {
+        // No row — roll back (a no-op) and answer unknown.
+        return Json(StateRevokeResponse::Unknown).into_response();
+    };
+
+    // Capability check: sha256(presented secret) must match the stored
+    // verifier, constant-time (same digest hygiene as sessions.token_hash).
+    // A missing/wrong secret answers the same unknown-shaped body regardless
+    // of whether the state exists (no existence leak). Revocation is also
+    // scoped to bearer deliveries.
+    let secret_ok = body
+        .revoke_secret
+        .as_deref()
+        .zip(stored_verifier.as_deref())
+        .is_some_and(|(presented, stored)| {
+            bool::from(
+                crate::db::sha256_hex(presented)
+                    .as_bytes()
+                    .ct_eq(stored.as_bytes()),
+            )
+        });
+    if !secret_ok || delivery != DELIVERY_BEARER || status == STATUS_FAILED {
+        if status == STATUS_FAILED && secret_ok && delivery == DELIVERY_BEARER {
+            // Terminal-dead but session absence is not provable
+            // (ambiguous-insert) — a distinct, honest answer.
+            return Json(StateRevokeResponse::Unconfirmed).into_response();
+        }
+        return Json(StateRevokeResponse::Unknown).into_response();
+    }
+
+    let confirmed = status == STATUS_PENDING || settled_at.is_some();
+    // The fence: flip status under the row lock we already hold. Already-
+    // revoked rows re-match (retryable cleanup); RETURNING is not needed —
+    // the token came from the locked read.
+    let fenced = sqlx::query(
+        "UPDATE rtdb_auth.oauth_states \
+         SET status = $1, callback_settled_at = $3 \
+         WHERE state = $2",
+    )
+    .bind(STATUS_REVOKED)
+    .bind(&body.state)
+    .bind(if status == STATUS_PENDING {
+        Some(now)
+    } else {
+        settled_at
+    })
+    .execute(&mut *tx)
+    .await;
+    if let Err(err) = fenced {
+        tracing::warn!(error = %err, "oauth: state revoke fence failed");
+        return RtDbError::internal("failed to revoke state").into_response();
+    }
+    if let Some(token) = session_token {
+        // Same transaction as the fence: a crash or failure here rolls the
+        // fence back, leaving the row unconsumed so a retry re-runs the
+        // cleanup. Zero deleted rows is fine (the session was already gone —
+        // the caller's goal holds either way).
+        let hash = crate::db::sha256_hex(&token);
+        if let Err(err) = sqlx::query("DELETE FROM rtdb_auth.sessions WHERE token_hash = $1")
+            .bind(&hash)
+            .execute(&mut *tx)
+            .await
+        {
+            tracing::warn!(error = %err, "oauth: state revoke session delete failed");
+            return RtDbError::internal("failed to revoke state").into_response();
+        }
+        // Hygiene: drop the recorded plaintext token in the same transaction.
+        if let Err(err) =
+            sqlx::query("UPDATE rtdb_auth.oauth_states SET session_token = NULL WHERE state = $1")
+                .bind(&body.state)
+                .execute(&mut *tx)
+                .await
+        {
+            tracing::warn!(error = %err, "oauth: state revoke token clear failed");
+            return RtDbError::internal("failed to revoke state").into_response();
+        }
+    }
+    match tx.commit().await {
+        Ok(()) => Json(if confirmed {
+            StateRevokeResponse::Revoked
+        } else {
+            StateRevokeResponse::Unconfirmed
+        })
+        .into_response(),
+        Err(err) => {
+            tracing::warn!(error = %err, "oauth: state revoke commit failed");
+            RtDbError::internal("failed to revoke state").into_response()
+        }
     }
 }
 
@@ -1039,6 +1483,7 @@ pub fn auth_routes() -> Router<Arc<AppState>> {
         .route("/auth/anonymous", post(anonymous))
         .route("/auth/enroll", post(crate::auth::enrollment::enroll))
         .route("/auth/state", get(auth_state))
+        .route("/auth/state/revoke", post(state_revoke))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
         .route("/auth/validate", get(validate))

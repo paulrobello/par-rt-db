@@ -55,7 +55,10 @@ working with zero providers configured.
   `/begin` was called with `&mode=cookie` (SEC-207), in which case the poll's
   completion carries no token at all and the HttpOnly cookie is the only
   carrier (the ts-client's cookie-mode sign-in and the operator dashboard
-  begin this way). The poll
+  begin this way). With `&mode=bearer` (opt-in, [bearer
+  delivery](#bearer-delivery-opt-in)), it is the inverse: the callback sets no
+  session cookie and no admin-CSRF nonce, and the one-shot poll is the only
+  carrier. The poll
   is keyed on the `state` token plus a `SameSite=None` `rtdb-oauth-state` cookie
   set at `/begin` (SEC-121 — a leaked state URL alone cannot poll), which is
   what makes cross-origin SDK login work where the `SameSite=Lax` session
@@ -484,6 +487,48 @@ or integrate with par-rt-db:
   hook, a service worker, an extension) ever holds the credential. Any other
   `mode` value rejects with `400`. This is how the ts-client's cookie-mode
   `signIn` and the dashboard's OAuth popup begin.
+- **Bearer delivery (opt-in).** A begin that carries `&mode=bearer` persists
+  `delivery = 'bearer'` on the `oauth_states` row (additive column; the legacy
+  `cookie_mode` bool stays as a mirror of `delivery = 'cookie'`), and the
+  callback sets NO `rtdb_session` cookie and mints NO `rtdb-admin-csrf` nonce —
+  the one-shot `/auth/state` poll is the only credential carrier. Other
+  same-origin tabs can therefore never adopt the session via the shared cookie,
+  and revoking this login cannot disturb a pre-existing cookie-backed session.
+  Bearer-mode minted sessions are ordinary `rtdb_auth.sessions` rows (TTL,
+  admin list/revoke-all apply); a dashboard admin should use the default flow
+  (no admin-CSRF nonce is minted in bearer mode). The minted login is cleaned
+  up with `POST /auth/state/revoke` `{state, revokeSecret}` — state AND the
+  client-only secret together are the capability (the plaintext secret rides
+  the begin response only; server-side only its sha256 verifier is stored),
+  and the endpoint is scoped to bearer rows (a `default`/`cookie` state, a
+  wrong or missing secret, or an unknown state all answer the same
+  `unknown`-shaped body — no existence leak). It atomically fences the row in
+  ONE transaction — a crash between the fence and the delete rolls the fence
+  back, so the row stays unconsumed and a retry re-runs the cleanup. A revoke
+  landing while the callback is mid-mint fences the completion and answers
+  `{ status: "unconfirmed" }` until the callback durably settles
+  (`callback_settled_at`); retries answer `revoked` once the tracked session
+  deletion has committed, and stay `unconfirmed` forever after a crash
+  between the session INSERT and the settlement marker (never inferred from
+  elapsed time or token absence). A `failed` callback also answers
+  `unconfirmed` — the ambiguous-insert case means session absence is not
+  provable. The-cube client rule: any non-`revoked` outcome is treated as
+  unconfirmed. `{ status: "unknown" }` is reserved for never-minted,
+  non-bearer, wrong/missing-secret, and TTL-swept states. The endpoint sets
+  no cookies. The unauthenticated route carries the same per-IP fixed-window
+  guard as `/begin` (30 rpm, tighter than begin's ceiling) and validates the
+  body shape (4 KiB cap, object with string fields) BEFORE any transaction —
+  shape-invalid bodies and limiter denials answer the same `unknown` body and
+  never reach the fence.
+  **Inherited scope:** one concurrent login flow per browser at a time — the
+  `rtdb-oauth-csrf` and `rtdb-oauth-state` cookies are per-origin, so a second
+  `begin` poisons the first tab's in-flight flow (its callback fails the CSRF
+  gate and its poll answers `expired` without consuming the state row,
+  fail-closed, leaving any pre-existing cookie-backed session untouched).
+  Unlike `POST /auth/logout` (which always attaches cookie-clearing
+  `Set-Cookie` headers), state/revoke never emits cookies; suppressing the
+  logout headers when no cookie was presented is a separate, deferred
+  follow-up card.
 
 ## Troubleshooting
 

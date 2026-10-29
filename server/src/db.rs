@@ -48,7 +48,7 @@ const BOOTSTRAP_LOCK_KEY: i64 = 727_001;
 /// DDL (and its locks) only ever runs on a genuinely stale or fresh cluster.
 /// Bump the version when changing the DDL of its bootstrap fn, or the new
 /// statements will be skipped on already-bootstrapped clusters.
-const RTDB_AUTH_BOOTSTRAP_VERSION: &str = "5";
+const RTDB_AUTH_BOOTSTRAP_VERSION: &str = "7";
 const AUDIT_LOG_BOOTSTRAP_VERSION: &str = "1";
 const WEBHOOKS_BOOTSTRAP_VERSION: &str = "1";
 
@@ -520,7 +520,10 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
             created_at  bigint NOT NULL,
             expires_at  bigint NOT NULL,
             consumed_at bigint,
-            cookie_mode boolean NOT NULL DEFAULT false
+            cookie_mode boolean NOT NULL DEFAULT false,
+            delivery    text NOT NULL DEFAULT 'default',
+            revoke_secret_verifier text,
+            callback_settled_at bigint
         )",
     )
     .execute(&mut *conn)
@@ -535,6 +538,37 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     // the `/auth/state` poll body (the HttpOnly cookie is the only carrier).
     sqlx::query(
         "ALTER TABLE rtdb_auth.oauth_states ADD COLUMN IF NOT EXISTS cookie_mode boolean NOT NULL DEFAULT false",
+    )
+    .execute(&mut *conn)
+    .await?;
+    // Bearer delivery (opt-in cross-tab hardening): additive retrofit —
+    // `delivery` generalizes `cookie_mode` ('default' | 'cookie' | 'bearer').
+    // Existing rows read 'default', byte-identical to their old
+    // cookie_mode=false behavior; `cookie_mode` stays NOT NULL and is kept in
+    // sync on INSERT with delivery='cookie' so a rolling multi-instance
+    // deploy's older replicas (still reading the bool) see the right value.
+    sqlx::query(
+        "ALTER TABLE rtdb_auth.oauth_states ADD COLUMN IF NOT EXISTS delivery text NOT NULL DEFAULT 'default'",
+    )
+    .execute(&mut *conn)
+    .await?;
+    // Client-only revoke capability for bearer rows: the plaintext secret is
+    // minted at /begin and delivered ONLY in the begin response body (never a
+    // URL, cookie, provider redirect, or proxy log); only its sha256 verifier
+    // is stored — same convention as `sessions.token_hash`. NULL for
+    // non-bearer rows.
+    sqlx::query(
+        "ALTER TABLE rtdb_auth.oauth_states ADD COLUMN IF NOT EXISTS revoke_secret_verifier text",
+    )
+    .execute(&mut *conn)
+    .await?;
+    // Durable callback-settlement evidence: set by `set_outcome` (the
+    // callback finished, outcome recorded) and by the fenced roll-forward
+    // (mint recorded AND its tracked session deleted). A revoked row with
+    // this NULL may still be mid-mint — revocation retries answer
+    // `unconfirmed` until it is set; never inferred from elapsed time.
+    sqlx::query(
+        "ALTER TABLE rtdb_auth.oauth_states ADD COLUMN IF NOT EXISTS callback_settled_at bigint",
     )
     .execute(&mut *conn)
     .await?;
