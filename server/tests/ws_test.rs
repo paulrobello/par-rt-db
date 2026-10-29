@@ -1091,6 +1091,97 @@ async fn revoked_session_is_rejected_on_next_ws_op_over_open_connection() -> any
     Ok(())
 }
 
+// The SAME per-op rejection, driven through the real capability endpoint: a
+// session tombstoned by POST /auth/session/revoke (row retained with
+// revoked_at set) is rejected on the NEXT mutate over an open socket — the
+// tombstone must not pass session_still_valid's liveness check. Regression for
+// the b5c27c3 source finding (EXISTS by token_hash alone saw the tombstone as
+// live).
+#[tokio::test]
+async fn capability_revoked_session_is_rejected_on_next_ws_op() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let suffix = uuid::Uuid::now_v7().simple();
+    let user_id = format!("u-rev-{suffix}");
+    let email = format!("rev-{suffix}@example.com");
+
+    let token = mint_user_session(&state.pool, &user_id, &email).await;
+    let add = admin_post(
+        addr,
+        "/admin/allowlist",
+        json!({"db": db.as_str(), "action": "add", "email": email}),
+    )
+    .await;
+    assert_eq!(add.status(), reqwest::StatusCode::OK);
+
+    // Stamp the durable capability exactly as the bearer settlement path does.
+    let session_id = rtdb_server::db::random_token();
+    let secret = rtdb_server::db::random_token();
+    rtdb_server::auth::session::stamp_revoke_capability(
+        &state.pool,
+        &token,
+        &session_id,
+        &rtdb_server::db::sha256_hex(&secret),
+    )
+    .await?;
+
+    let mut ws = ws_connect(addr).await;
+    let auth_msg = auth(&mut ws, &token, db.as_str()).await;
+    assert_eq!(auth_msg["type"], json!("authOk"));
+
+    send_json(
+        &mut ws,
+        json!({"type": "subscribe", "queryId": "q1", "query": {"table": "workItems"}}),
+    )
+    .await;
+    recv_json(&mut ws).await; // initial queryUpdate
+
+    // mutate succeeds while the session is live
+    send_json(
+        &mut ws,
+        json!({"type": "mutate", "mutId": "m1", "txn": insert_work_item_txn()}),
+    )
+    .await;
+    let mut saw_ok = false;
+    for _ in 0..2 {
+        let m = recv_json(&mut ws).await;
+        if m["type"] == json!("mutateOk") {
+            saw_ok = true;
+        }
+    }
+    assert!(saw_ok, "expected mutateOk before capability revocation");
+
+    // Revoke through the HTTP capability endpoint (tombstone, not delete).
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/auth/session/revoke"))
+        .json(&json!({"sessionId": session_id, "revokeSecret": secret}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await?["status"],
+        json!("revoked")
+    );
+
+    // the NEXT mutate on the SAME open connection is now rejected
+    send_json(
+        &mut ws,
+        json!({"type": "mutate", "mutId": "m2", "txn": insert_work_item_txn()}),
+    )
+    .await;
+    let err_msg = recv_json(&mut ws).await;
+    assert_eq!(err_msg["type"], json!("mutateErr"));
+    assert_eq!(err_msg["mutId"], json!("m2"));
+    assert_eq!(err_msg["error"]["code"], json!("UNAUTHORIZED"));
+
+    // connection stays open (revocation errors the op, does not close)
+    send_json(&mut ws, json!({"type": "ping"})).await;
+    assert_eq!(recv_json(&mut ws).await["type"], json!("pong"));
+
+    Ok(())
+}
+
 // An admin OAuth session bypasses per-db `authorize` (the WS Subscribe/Mutate
 // arms take the `if admin` branch), so the per-op session-liveness check must
 // run on the admin branch too: revoking an admin's session rejects the next

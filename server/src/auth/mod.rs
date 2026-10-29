@@ -352,21 +352,26 @@ pub async fn authorize(pool: &PgPool, principal: &Principal, db: &str) -> Result
 }
 
 /// Live check that the session backing `principal` still exists (has not been
-/// revoked via the admin surface). Mirrors the machine-token per-op re-check:
-/// a session deleted mid-connection must be denied on its very next op over an
-/// already-open `/sync`. `Ok(())` for principals with no session hash. Errors
-/// `Unauthorized` ("session revoked") when the row is gone. Expiry is handled
-/// separately by the cached `expires_at` comparison in `authorize`; this check
-/// is purely for revocation (row deletion).
+/// revoked via the admin surface, or tombstoned by
+/// `POST /auth/session/revoke` — the tombstone keeps the row (and the
+/// capability) but every live check excludes it via `revoked_at`). Mirrors the
+/// machine-token per-op re-check: a session revoked mid-connection must be
+/// denied on its very next op over an already-open `/sync`. `Ok(())` for
+/// principals with no session hash. Errors `Unauthorized` ("session revoked")
+/// when the row is gone or revoked. Expiry is handled separately by the cached
+/// `expires_at` comparison in `authorize`; this check is purely for
+/// revocation.
 pub async fn session_still_valid(pool: &PgPool, principal: &Principal) -> Result<(), RtDbError> {
     let Some(hash) = principal.session_hash() else {
         return Ok(());
     };
-    let (live,): (bool,) =
-        sqlx::query_as("SELECT EXISTS(SELECT 1 FROM rtdb_auth.sessions WHERE token_hash = $1)")
-            .bind(hash)
-            .fetch_one(pool)
-            .await?;
+    let (live,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM rtdb_auth.sessions \
+         WHERE token_hash = $1 AND revoked_at IS NULL)",
+    )
+    .bind(hash)
+    .fetch_one(pool)
+    .await?;
     if live {
         Ok(())
     } else {
