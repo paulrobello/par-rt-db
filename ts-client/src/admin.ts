@@ -704,6 +704,22 @@ function readAdminCsrfCookie(): string | null {
   return match ? match[1] : null;
 }
 
+/** Adapts an async iterable of byte chunks to a ReadableStream for streaming
+ *  request bodies on runtimes without `ReadableStream.from`. */
+function readableStreamFrom(chunks: AsyncIterable<Uint8Array>): ReadableStream<Uint8Array> {
+  const iter = chunks[Symbol.asyncIterator]();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const { done, value } = await iter.next();
+      if (done) {
+        controller.close();
+      } else {
+        controller.enqueue(value);
+      }
+    },
+  });
+}
+
 /** Control-plane client for `/admin/*`. Authorize either with the instance
  *  admin key (bearer mode — CLI/automation) or, when `adminKey` is omitted, via
  *  the HttpOnly session cookie (cookie mode — same-origin browser consumers like
@@ -957,6 +973,60 @@ export class RtDbAdminClient {
         ...this.creds,
         body: jsonl,
       },
+    );
+    if (!response.ok) {
+      await this.throwFromResponse(response);
+    }
+  }
+
+  /**
+   * Streams `db`'s snapshot as JSONL bytes without buffering the whole export
+   * (see server `snapshot::export_stream`). Returns the response body stream —
+   * transport-decompressed when the server gzipped the wire — so large
+   * databases can be piped or line-split as they arrive. Prefer this over the
+   * buffered `exportDb` for big databases.
+   */
+  async exportDbStream(db: string): Promise<ReadableStream<Uint8Array>> {
+    const response = await this.fetchImpl(
+      `${this.url}/admin/export-db?db=${encodeURIComponent(db)}`,
+      {
+        method: "GET",
+        headers: this.authHeaders(),
+        ...this.creds,
+      },
+    );
+    if (!response.ok) {
+      await this.throwFromResponse(response);
+    }
+    if (!response.body) {
+      throw new RtDbError("INTERNAL", "export-db returned an empty body stream");
+    }
+    return response.body;
+  }
+
+  /**
+   * Streaming companion to `importDb` (see server `snapshot::import_stream`):
+   * uploads JSONL bytes as they arrive instead of buffering the whole
+   * snapshot, so imports of large databases stay bounded in client memory.
+   * `body` is a `ReadableStream<Uint8Array>` or an async iterable of byte
+   * chunks. Streaming request bodies are not available in browsers — use the
+   * buffered `importDb` there.
+   */
+  async importDbStream(
+    db: string,
+    body: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>,
+  ): Promise<void> {
+    const stream =
+      "getReader" in body ? (body as ReadableStream<Uint8Array>) : readableStreamFrom(body);
+    const response = await this.fetchImpl(
+      `${this.url}/admin/import-db?db=${encodeURIComponent(db)}`,
+      {
+        method: "POST",
+        headers: { ...this.authHeaders(), "content-type": "application/x-ndjson" },
+        ...this.creds,
+        body: stream,
+        duplex: "half",
+      } as RequestInit,
     );
     if (!response.ok) {
       await this.throwFromResponse(response);

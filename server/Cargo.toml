@@ -13,6 +13,15 @@ autotests = false
 name = "main"
 path = "tests/main.rs"
 
+# Acceptance roundtrip for the streaming snapshot endpoints lives in its own
+# test target (own process) so its process-wide RSS sampler measures only its
+# own server — in-suite concurrency inflates the reading. #[ignore]d by
+# default; CI stays lean, run it with `cargo test --test snapshot_acceptance
+# -- --ignored`.
+[[test]]
+name = "snapshot_acceptance"
+path = "tests/snapshot_acceptance_test.rs"
+
 [features]
 # Default build carries no OpenTelemetry code (ENH-018). `otel` pulls in the
 # OTLP exporter + tracing-opentelemetry bridge; the subscriber layer in main.rs
@@ -99,6 +108,11 @@ futures = { workspace = true }
 # streaming download path (ENH-021): a background task drains the chunk rows
 # and forwards each over a channel, so a 1 GiB download never materializes.
 tokio-stream = "0.1"
+# Snapshot export streaming: the `try_stream!` generator owns its per-table
+# keyset-paginated batch cursor (sqlx `fetch` streams cannot carry an owned
+# per-table SQL string at 'static — the lifetime wall the combinator approach
+# hit), so export memory is bounded by the batch, never by table size.
+async-stream = "0.3"
 # OpenTelemetry / OTLP tracing export (ENH-018). Optional + feature-gated behind
 # `otel` (default off). The exact versions are pinned because the
 # opentelemetry / tracing-opentelemetry pairing breaks across minor versions

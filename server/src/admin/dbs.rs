@@ -133,9 +133,11 @@ pub(super) struct ExportDbParams {
     db: String,
 }
 
-/// Streams `db`'s current schema and every document in every table as JSONL (see
-/// `snapshot::export_database`); a plain app-level companion to host-level
-/// `pg_dump` for seed data and clone-to-dev workflows.
+/// Streams `db`'s current schema and every document in every table as JSONL
+/// (see `snapshot::export_stream` — bounded memory via a keyset-paginated
+/// batch cursor, byte-identical to the buffered `snapshot::export_database`
+/// that `clone-db` uses); a plain app-level companion to host-level `pg_dump`
+/// for seed data and clone-to-dev workflows.
 pub(super) async fn export_db(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
@@ -145,11 +147,11 @@ pub(super) async fn export_db(
         return Err(RtDbError::not_found("unknown database"));
     }
     let schema = state.schemas.get(&state.pool, &params.db).await?;
-    let body = snapshot::export_database(&state.pool, &params.db, &schema).await?;
+    let stream = snapshot::export_stream(state.pool.clone(), params.db.clone(), (*schema).clone())?;
 
     Response::builder()
         .header(axum::http::header::CONTENT_TYPE, "application/x-ndjson")
-        .body(Body::from(body))
+        .body(Body::from_stream(stream))
         .map_err(|err| RtDbError::internal(format!("failed to build export response: {err}")))
 }
 
@@ -159,8 +161,16 @@ pub(super) struct ImportDbParams {
 }
 
 /// Loads a JSONL snapshot produced by `export_db` back into `db` (see
-/// `snapshot::import_database`), refreshing the schema cache with whatever schema
+/// `snapshot::import_lines`), refreshing the schema cache with whatever schema
 /// the snapshot applied.
+///
+/// The body is consumed line-by-line through `snapshot::jsonl_lines`, so server
+/// memory stays bounded by the per-line cap (`snapshot::MAX_SNAPSHOT_LINE_BYTES`)
+/// instead of the whole snapshot — a body of any size imports in bounded
+/// memory, and a transport-interrupted body (hyper detects truncation on
+/// declared-length/chunked framing) aborts with the transaction rolled back.
+/// A close at a full-record boundary is indistinguishable from completion
+/// without a manifest; the line cap catches over-long lines as `BAD_REQUEST`.
 ///
 /// ARC-002: the target must be EMPTY — no schema with table rows. Import bypasses
 /// the per-db committer (it writes document tables directly), so importing into a
@@ -172,10 +182,11 @@ pub(super) async fn import_db(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
     QueryParams(params): QueryParams<ImportDbParams>,
-    body: String,
+    body: Body,
 ) -> Result<Json<OkResponse>, RtDbError> {
     snapshot::ensure_target_empty(&state.pool, &params.db).await?;
-    match snapshot::import_database(&state.pool, &params.db, &body).await {
+    let mut lines = snapshot::jsonl_lines(body.into_data_stream());
+    match snapshot::import_lines(&state.pool, &params.db, &mut lines).await {
         Ok(applied) => {
             state.schemas.put(&params.db, applied).await;
             Ok(Json(OkResponse { ok: true }))

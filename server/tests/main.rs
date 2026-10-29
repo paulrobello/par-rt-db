@@ -74,6 +74,7 @@ mod semantics_corpus_test;
 mod sessions_test;
 mod share_grants_test;
 mod shutdown_drain_test;
+mod snapshot_stream_test;
 mod storage_signed_url_test;
 mod storage_test;
 mod sub_invalidation_test;

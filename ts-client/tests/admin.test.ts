@@ -1890,3 +1890,72 @@ describe("RtDbAdminClient adminChanges (admin change feed)", () => {
     await expect(result).rejects.toMatchObject({ code: "CURSOR_EXPIRED", status: 410 });
   });
 });
+describe("RtDbAdminClient — streaming snapshot I/O", () => {
+  it("exportDbStream returns the response body stream without buffering", async () => {
+    const jsonl =
+      '{"kind":"schema","schema":{"tables":{}}}\n{"kind":"doc","table":"notes","id":"a","doc":{"body":"hi"},"createdAt":1,"version":1}\n';
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(jsonl, { status: 200, headers: { "content-type": "application/x-ndjson" } }),
+      );
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+
+    const stream = await admin.exportDbStream("kanban");
+    const decoder = TextDecoder ? new TextDecoder() : null;
+    if (!decoder) throw new Error("TextDecoder unavailable");
+    let text = "";
+    for await (const chunk of stream) {
+      text += decoder.decode(chunk, { stream: true });
+    }
+    text += decoder.decode();
+    expect(text).toBe(jsonl);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/export-db?db=kanban");
+    expect(init.method).toBe("GET");
+    expect(init.headers.Authorization).toBe("Bearer k");
+  });
+
+  it("exportDbStream throws RtDbError on an error envelope", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ code: "NOT_FOUND", message: "unknown database" }, 404));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+
+    await expect(admin.exportDbStream("missing")).rejects.toThrow("unknown database");
+  });
+
+  it("importDbStream posts a streaming ReadableStream body with duplex half", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ ok: true }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    const jsonl = '{"kind":"schema","schema":{"tables":{}}}\n';
+    const body = new Blob([jsonl]).stream();
+
+    await admin.importDbStream("kanban", body);
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/import-db?db=kanban");
+    expect(init.method).toBe("POST");
+    expect(init.headers["content-type"]).toBe("application/x-ndjson");
+    expect((init as RequestInit & { duplex?: string }).duplex).toBe("half");
+    expect(init.body).toBe(body);
+    const sent = await new Response(init.body).text();
+    expect(sent).toBe(jsonl);
+  });
+
+  it("importDbStream wraps an async iterable into a streaming request body", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ ok: true }));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+    const iter = (async function* () {
+      yield new TextEncoder().encode("line1\n");
+      yield new TextEncoder().encode("line2\n");
+    })();
+
+    await admin.importDbStream("kanban", iter);
+
+    const [, init] = fetchMock.mock.calls[0];
+    expect(init.body).toBeInstanceOf(ReadableStream);
+    const sent = await new Response(init.body).text();
+    expect(sent).toBe("line1\nline2\n");
+  });
+});
