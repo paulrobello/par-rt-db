@@ -414,7 +414,7 @@ async fn mint_requires_db_authorization() -> anyhow::Result<()> {
 async fn share_signed_url_serves_under_require_signed_mode() -> anyhow::Result<()> {
     let mut config = test_config();
     config.storage.share_grants_enabled = true;
-    config.storage.require_signed_urls = true;
+    config.storage.require_signed_urls = rtdb_server::config::SignedUrlsScope::All;
     let pool = test_pool(&config.database_url)
         .await
         .expect("connect to test postgres");

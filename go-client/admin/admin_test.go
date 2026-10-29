@@ -646,6 +646,7 @@ func TestPatchConfigCarriesRateLimitCeilings(t *testing.T) {
 	resp := `{"port":8300,"publicUrl":"http://x","githubBaseUrl":"","githubApiUrl":"",
 	"databaseUrlConfigured":true,"adminKeyConfigured":true,"githubConfigured":false,
 	"googleConfigured":false,"gitlabConfigured":false,"oidcConfigured":false,
+	"storageSignedUrls":{"mode":"databases","databases":["app"]},
 	"hot":{"allowedOrigins":[],"sessionTtlDays":30,"maxFileSize":1000,
 	"idempotencyTtlMs":10,"changeLogMaxRows":100000,"maxTablesPerDb":0,
 	"maxStorageBytesPerDb":0,"maxSubsPerDb":0,"perTokenRpm":1200,"perDbRpm":9000},
@@ -662,6 +663,9 @@ func TestPatchConfigCarriesRateLimitCeilings(t *testing.T) {
 	}
 	if cfg.Hot.PerTokenRPM != 1200 || cfg.Hot.PerDbRPM != 9000 {
 		t.Fatalf("got hot %+v", cfg.Hot)
+	}
+	if cfg.StorageSignedURLs.Mode != "databases" || len(cfg.StorageSignedURLs.Databases) != 1 || cfg.StorageSignedURLs.Databases[0] != "app" {
+		t.Fatalf("got storageSignedUrls %+v", cfg.StorageSignedURLs)
 	}
 }
 

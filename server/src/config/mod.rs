@@ -22,7 +22,7 @@ pub use multi_instance::MultiInstanceConfig;
 pub use oauth::{
     AppleOAuth, GithubOAuth, GitlabOAuth, GoogleOAuth, MicrosoftOAuth, OAuthConfig, OidcProvider,
 };
-pub use storage::{ImageTransformConfig, StorageConfig};
+pub use storage::{ImageTransformConfig, SignedUrlsScope, StorageConfig};
 
 /// Minimum admin-key length enforced at boot (SEC-110). 16 chars is the floor
 /// below which a key is brute-forceable over the public `POST /admin/login`

@@ -1173,6 +1173,7 @@ _CONFIG_RESPONSE_BODY: dict[str, Any] = {
         "maxFileSize": 52428800,
         "idempotencyTtlMs": 300000,
     },
+    "storageSignedUrls": {"mode": "off", "databases": []},
     "version": "0.1.0",
     "gitCommit": "abc1234",
     "admins": [{"email": "admin@example.com"}],

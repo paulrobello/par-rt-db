@@ -878,6 +878,7 @@ struct AdminClientTests {
             "githubApiUrl":"https://api","databaseUrlConfigured":true,
             "adminKeyConfigured":true,"githubConfigured":false,"googleConfigured":false,
             "gitlabConfigured":false,"oidcConfigured":false,
+            "storageSignedUrls":{"mode":"databases","databases":["app"]},
             "hot":{"allowedOrigins":[],"sessionTtlDays":7,"maxFileSize":1000,
             "idempotencyTtlMs":10,"maxTablesPerDb":10,"maxStorageBytesPerDb":0,"maxSubsPerDb":0,
             "changeLogMaxRows":100000,"perTokenRpm":600,"perDbRpm":6000},
@@ -888,6 +889,7 @@ struct AdminClientTests {
         let config = try await makeAdminClient().patchConfig(
             HotConfigPatch(sessionTtlDays: 7, perTokenRpm: 600, perDbRpm: 6000)
         )
+        #expect(config.storageSignedUrls == StorageSignedUrls(mode: "databases", databases: ["app"]))
         #expect(config.hot.sessionTtlDays == 7)
         #expect(config.hot.perTokenRpm == 600)
         #expect(config.hot.perDbRpm == 6000)
@@ -908,6 +910,7 @@ struct AdminClientTests {
             "githubApiUrl":"https://api","databaseUrlConfigured":true,
             "adminKeyConfigured":true,"githubConfigured":false,"googleConfigured":false,
             "gitlabConfigured":false,"oidcConfigured":false,
+            "storageSignedUrls":{"mode":"databases","databases":["app"]},
             "hot":{"allowedOrigins":[],"sessionTtlDays":30,"maxFileSize":1000,
             "idempotencyTtlMs":10,"maxTablesPerDb":0,"maxStorageBytesPerDb":0,"maxSubsPerDb":0,
             "changeLogMaxRows":100000,"perTokenRpm":0,"perDbRpm":1200},

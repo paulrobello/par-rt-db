@@ -57,6 +57,7 @@ export type {
   MergeConflict,
   MergeDbResult,
   MergeReport,
+  StorageSignedUrls,
   MetricsSnapshot,
   MintTokenOptions,
   OpEvent,

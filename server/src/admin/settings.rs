@@ -28,10 +28,21 @@ pub(super) struct ConfigResponse {
     google_configured: bool,
     gitlab_configured: bool,
     oidc_configured: bool,
+    storage_signed_urls: SignedUrlsView,
     hot: crate::config::HotConfig,
     version: &'static str,
     git_commit: &'static str,
     admins: Vec<AdminMember>,
+}
+
+/// Read-only view of the boot-pinned `RTDB_STORAGE_REQUIRE_SIGNED_URLS` scope.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SignedUrlsView {
+    /// `off`, `all`, or `databases`.
+    mode: &'static str,
+    /// Listed databases; empty unless `mode` is `databases`.
+    databases: Vec<String>,
 }
 
 /// Builds the redacted config view from current boot + hot state. Secrets never
@@ -58,6 +69,10 @@ async fn build_config_response(state: &AppState) -> Result<ConfigResponse, RtDbE
             && cfg.oauth.oidc.authorize_url.is_some()
             && cfg.oauth.oidc.token_url.is_some()
             && cfg.oauth.oidc.userinfo_url.is_some(),
+        storage_signed_urls: SignedUrlsView {
+            mode: cfg.storage.require_signed_urls.mode(),
+            databases: cfg.storage.require_signed_urls.databases(),
+        },
         hot: (**hot).clone(),
         version: env!("CARGO_PKG_VERSION"),
         git_commit: env!("BUILD_GIT_COMMIT"),

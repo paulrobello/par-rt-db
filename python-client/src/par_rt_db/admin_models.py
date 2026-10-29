@@ -344,6 +344,16 @@ class HotConfig(_Wire):
     per_db_rpm: int = 0
 
 
+class StorageSignedUrls(_Wire):
+    """Boot-pinned ``RTDB_STORAGE_REQUIRE_SIGNED_URLS`` scope (read-only).
+
+    ``mode`` is ``off``, ``all`` or ``databases``; ``databases`` is empty unless
+    ``mode`` is ``databases``."""
+
+    mode: str
+    databases: list[str]
+
+
 class ConfigResponse(_Wire):
     """``GET /admin/config`` response — redacted boot config + hot config + build
     identity + admin allowlist. Secrets surface as configured-bools, never values."""
@@ -358,6 +368,7 @@ class ConfigResponse(_Wire):
     google_configured: bool
     gitlab_configured: bool
     oidc_configured: bool
+    storage_signed_urls: StorageSignedUrls
     hot: HotConfig
     version: str
     git_commit: str

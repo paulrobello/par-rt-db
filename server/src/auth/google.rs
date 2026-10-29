@@ -289,7 +289,7 @@ mod tests {
                 rate_limit_exempt_dbs: Vec::new(),
             },
             storage: crate::config::StorageConfig {
-                require_signed_urls: false,
+                require_signed_urls: crate::config::SignedUrlsScope::Off,
                 share_grants_enabled: false,
                 image: crate::config::ImageTransformConfig {
                     enabled: true,

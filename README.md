@@ -282,6 +282,8 @@ compression.
 | `GET /api/storage/{db}/{id}/metadata` | Bearer token | `{ id, sha256, size, contentType?, creationTime }`. |
 | `GET /api/storage/{db}/{id}/signed-url` | Bearer token | Mints a signed, time-limited public URL (`?exp=` + HMAC `?sig=`) for the blob. The mint is db-scoped: a caller authorized for db A cannot mint for a blob in db B (SEC-113). `?ttlSeconds=` clamps to `[1, MAX_SIGNED_URL_TTL_SECS]`; default `DEFAULT_SIGNED_URL_TTL_SECS`. The unauthenticated `GET /storage/{id}` route verifies `?exp=&sig=` when present (403 on failure) and behaves unchanged when absent (ENH-017). |
 
+**Signed-only serving (SEC-113).** `RTDB_STORAGE_REQUIRE_SIGNED_URLS` (boot-only) makes `GET /storage/{id}` reject any request without a valid `?exp=&sig=` pair (403). `false`/unset (default) keeps opaque public URLs, `true` requires signatures for every database, and a comma-separated list of database names (case-insensitive, whitespace and empty entries ignored, e.g. `RTDB_STORAGE_REQUIRE_SIGNED_URLS=secure_docs,private`) requires them only for blobs in those databases while every other database stays public. A malformed value (anything that is neither a boolean nor valid database names) aborts startup. The scope is read back via `GET /admin/config` as `storageSignedUrls: { mode: "off" | "all" | "databases", databases: [...] }`. Share-minted signed URLs serve normally under every mode.
+
 Both serve routes honor HTTP `Range` requests: `Range: bytes=...` → `206 Partial Content` with `Content-Range`/`Content-Length` (and `Accept-Ranges: bytes` advertised), `416` for an out-of-bounds range, and a `200` full body when no range is requested. Single-range only; on-the-fly image transforms (`?w=` etc.) skip range handling.
 
 ### Per-row public share grants

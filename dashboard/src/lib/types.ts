@@ -161,6 +161,8 @@ export interface ConfigResponse {
   googleConfigured: boolean;
   gitlabConfigured: boolean;
   oidcConfigured: boolean;
+  /** Boot-pinned RTDB_STORAGE_REQUIRE_SIGNED_URLS scope (read-only). */
+  storageSignedUrls: { mode: "off" | "all" | "databases"; databases: string[] };
   hot: HotConfig;
   version: string;
   gitCommit: string;

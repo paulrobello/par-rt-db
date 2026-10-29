@@ -841,6 +841,7 @@ async fn get_config_returns_response() {
                 "perTokenRpm": 600,
                 "perDbRpm": 6000
             },
+            "storageSignedUrls": {"mode": "databases", "databases": ["app"]},
             "version": "0.1.0",
             "gitCommit": "abc1234",
             "admins": [{"email":"a@x.com","githubId":1}]
@@ -862,6 +863,8 @@ async fn get_config_returns_response() {
     assert_eq!(cfg.hot.idempotency_ttl_ms, 300000);
     assert_eq!(cfg.hot.per_token_rpm, 600);
     assert_eq!(cfg.hot.per_db_rpm, 6000);
+    assert_eq!(cfg.storage_signed_urls.mode, "databases");
+    assert_eq!(cfg.storage_signed_urls.databases, vec!["app".to_string()]);
     assert_eq!(cfg.version, "0.1.0");
     assert_eq!(cfg.git_commit, "abc1234");
     assert_eq!(cfg.admins.len(), 1);
@@ -902,6 +905,7 @@ async fn patch_config_patches_and_returns_config() {
                 "perTokenRpm": 1200,
                 "perDbRpm": 9000
             },
+            "storageSignedUrls": {"mode": "off", "databases": []},
             "version": "",
             "gitCommit": "",
             "admins": []

@@ -6,6 +6,7 @@ import dev.parrtdb.admin.CreateWebhookOptions
 import dev.parrtdb.admin.Directive
 import dev.parrtdb.admin.HotConfigPatch
 import dev.parrtdb.admin.MintTokenOptions
+import dev.parrtdb.admin.StorageSignedUrls
 import dev.parrtdb.admin.TableFilter
 import dev.parrtdb.admin.WebhookEditOptions
 import dev.parrtdb.errors.ErrorCode
@@ -258,11 +259,12 @@ class AdminClientTest {
             val m = a.mergeUsers("anon", "real")
             assertEquals(2, m.dbs["app"]!!.tables["t"])
             assertEquals("real", body(srv.requests.last())["confirm"]!!.jsonPrimitive.content)
-            srv.reply(200, """{"port":1,"hot":{"allowedOrigins":["x"],"sessionTtlDays":7},"version":"v","gitCommit":"c","admins":[]}""")
+            srv.reply(200, """{"port":1,"storageSignedUrls":{"mode":"databases","databases":["app"]},"hot":{"allowedOrigins":["x"],"sessionTtlDays":7},"version":"v","gitCommit":"c","admins":[]}""")
             val cfg = a.patchConfig(HotConfigPatch(perDbRpm = 100))
             assertEquals("PATCH", srv.requests.last().method)
             assertEquals("""{"perDbRpm":100}""", srv.requests.last().body)
             assertEquals(7, cfg.hot.sessionTtlDays)
+            assertEquals(StorageSignedUrls("databases", listOf("app")), cfg.storageSignedUrls)
         }
     }
 

@@ -7,8 +7,8 @@
 //! `/storage/...?...` path+query and re-fetch against the ephemeral test addr.
 
 use crate::common::{
-    admin_post, fresh_db, spawn_app, test_state, test_state_with_require_signed_urls,
-    test_state_with_transforms_disabled,
+    admin_get, admin_post, fresh_db, spawn_app, test_state, test_state_with_require_signed_urls,
+    test_state_with_signed_only_dbs, test_state_with_transforms_disabled,
 };
 use rtdb_server::signed_url;
 use rtdb_server::storage;
@@ -455,6 +455,65 @@ async fn sec113_default_mode_still_allows_opaque_id() -> anyhow::Result<()> {
     let served = reqwest::get(format!("http://{addr}/storage/{id}")).await?;
     assert_eq!(served.status(), 200);
     assert_eq!(served.bytes().await?.as_ref(), &bytes[..]);
+    Ok(())
+}
+
+// Per-database scope: a listed database is signed-only while a sibling
+// database on the same server keeps serving by opaque id. Listed-db signed
+// fetches still work.
+#[tokio::test]
+async fn sec113_per_db_scope_signs_only_listed_db() -> anyhow::Result<()> {
+    // Database names are generated per test, so the scope is set after creation.
+    let probe = test_state().await;
+    let signed_db = fresh_db(&probe).await;
+    let public_db = fresh_db(&probe).await;
+    let state = test_state_with_signed_only_dbs(&[&signed_db]).await;
+    let addr = spawn_app(state.clone()).await;
+    let (signed_id, bytes) = seed(&state, &signed_db).await;
+    let (public_id, _) = seed(&state, &public_db).await;
+
+    let denied = reqwest::get(format!("http://{addr}/storage/{signed_id}")).await?;
+    assert_eq!(denied.status(), 403);
+    let open = reqwest::get(format!("http://{addr}/storage/{public_id}")).await?;
+    assert_eq!(open.status(), 200);
+
+    let token = mint_token(addr, &signed_db).await;
+    let mint = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/storage/{signed_db}/{signed_id}/signed-url"
+        ))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    assert_eq!(mint.status(), 200);
+    let url = mint.json::<serde_json::Value>().await?["url"]
+        .as_str()
+        .expect("url")
+        .to_string();
+    let path = &url[url.find("/storage/").expect("path")..];
+    let served = reqwest::get(format!("http://{addr}{path}")).await?;
+    assert_eq!(served.status(), 200);
+    assert_eq!(served.bytes().await?.as_ref(), &bytes[..]);
+    Ok(())
+}
+
+// The scope is read back (read-only) from GET /admin/config.
+#[tokio::test]
+async fn sec113_scope_is_read_back_via_admin_config() -> anyhow::Result<()> {
+    for (state, mode, dbs) in [
+        (test_state().await, "off", vec![]),
+        (test_state_with_require_signed_urls().await, "all", vec![]),
+        (
+            test_state_with_signed_only_dbs(&["alpha", "beta"]).await,
+            "databases",
+            vec!["alpha", "beta"],
+        ),
+    ] {
+        let addr = spawn_app(state).await;
+        let body: serde_json::Value = admin_get(addr, "/admin/config").await.json().await?;
+        assert_eq!(body["storageSignedUrls"]["mode"], mode);
+        assert_eq!(body["storageSignedUrls"]["databases"], json!(dbs));
+    }
     Ok(())
 }
 

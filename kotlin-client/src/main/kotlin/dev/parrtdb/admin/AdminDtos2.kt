@@ -191,6 +191,13 @@ data class HotConfig(
     }
 }
 
+/** Read-only boot-pinned signed-URL storage scope: [mode] is `off`, `all` or `databases`; [databases] is empty unless `databases`. */
+data class StorageSignedUrls(val mode: String, val databases: List<String>) {
+    companion object {
+        fun fromJson(e: JsonElement) = decode(e, "storageSignedUrls") { StorageSignedUrls(it.s("mode"), it.strs("databases")) }
+    }
+}
+
 /** GET /admin/config: redacted boot config, hot config, build identity and the admin allowlist. */
 data class ConfigResponse(
     val port: Long,
@@ -203,6 +210,7 @@ data class ConfigResponse(
     val googleConfigured: Boolean,
     val gitlabConfigured: Boolean,
     val oidcConfigured: Boolean,
+    val storageSignedUrls: StorageSignedUrls,
     val hot: HotConfig,
     val version: String,
     val gitCommit: String,
@@ -214,6 +222,7 @@ data class ConfigResponse(
                 ConfigResponse(
                     it.l("port"), it.s("publicUrl"), it.s("githubBaseUrl"), it.s("githubApiUrl"),
                     it.b("databaseUrlConfigured"), it.b("adminKeyConfigured"), it.b("githubConfigured"), it.b("googleConfigured"), it.b("gitlabConfigured"), it.b("oidcConfigured"),
+                    it.opt("storageSignedUrls")?.let { s -> StorageSignedUrls.fromJson(s) } ?: StorageSignedUrls("off", emptyList()),
                     it.opt("hot")?.let { h -> HotConfig.fromJson(h) } ?: HotConfig(emptyList(), 0, 0, 0, 0, 0, 0, 0, 0, 0),
                     it.s("version"), it.s("gitCommit"), it.list("admins") { x -> AdminMember.fromJson(x) },
                 )

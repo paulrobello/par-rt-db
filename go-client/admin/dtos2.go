@@ -141,23 +141,32 @@ type HotConfig struct {
 	PerDbRPM             int64    `json:"perDbRpm"`
 }
 
+// StorageSignedUrls is the read-only boot-pinned RTDB_STORAGE_REQUIRE_SIGNED_URLS
+// scope. Mode is "off", "all" or "databases"; Databases is empty unless Mode is
+// "databases".
+type StorageSignedUrls struct {
+	Mode      string   `json:"mode"`
+	Databases []string `json:"databases"`
+}
+
 // ConfigResponse is GET /admin/config — redacted boot config + hot config +
 // build identity + the admin allowlist.
 type ConfigResponse struct {
-	Port                  int64         `json:"port"`
-	PublicURL             string        `json:"publicUrl"`
-	GithubBaseURL         string        `json:"githubBaseUrl"`
-	GithubAPIURL          string        `json:"githubApiUrl"`
-	DatabaseURLConfigured bool          `json:"databaseUrlConfigured"`
-	AdminKeyConfigured    bool          `json:"adminKeyConfigured"`
-	GithubConfigured      bool          `json:"githubConfigured"`
-	GoogleConfigured      bool          `json:"googleConfigured"`
-	GitlabConfigured      bool          `json:"gitlabConfigured"`
-	OidcConfigured        bool          `json:"oidcConfigured"`
-	Hot                   HotConfig     `json:"hot"`
-	Version               string        `json:"version"`
-	GitCommit             string        `json:"gitCommit"`
-	Admins                []AdminMember `json:"admins"`
+	Port                  int64             `json:"port"`
+	PublicURL             string            `json:"publicUrl"`
+	GithubBaseURL         string            `json:"githubBaseUrl"`
+	GithubAPIURL          string            `json:"githubApiUrl"`
+	DatabaseURLConfigured bool              `json:"databaseUrlConfigured"`
+	AdminKeyConfigured    bool              `json:"adminKeyConfigured"`
+	GithubConfigured      bool              `json:"githubConfigured"`
+	GoogleConfigured      bool              `json:"googleConfigured"`
+	GitlabConfigured      bool              `json:"gitlabConfigured"`
+	OidcConfigured        bool              `json:"oidcConfigured"`
+	StorageSignedURLs     StorageSignedUrls `json:"storageSignedUrls"`
+	Hot                   HotConfig         `json:"hot"`
+	Version               string            `json:"version"`
+	GitCommit             string            `json:"gitCommit"`
+	Admins                []AdminMember     `json:"admins"`
 }
 
 // SchemaHistorySummary is one row of SchemaHistory (no schema blob).

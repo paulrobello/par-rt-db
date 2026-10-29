@@ -29,6 +29,7 @@ const baseConfig: ConfigResponse = {
   googleConfigured: false,
   gitlabConfigured: false,
   oidcConfigured: false,
+  storageSignedUrls: { mode: "off", databases: [] },
   hot: {
     allowedOrigins: ["https://app.example.com"],
     sessionTtlDays: 7,

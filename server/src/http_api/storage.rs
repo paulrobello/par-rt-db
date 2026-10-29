@@ -15,6 +15,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 
 use crate::auth::Principal;
+use crate::config::SignedUrlsScope;
 use crate::db::now_ms;
 use crate::error::RtDbError;
 use crate::image_transform::{Resolved, TransformParams};
@@ -214,10 +215,11 @@ pub(crate) async fn signed_url_handler(
 /// client IP (SEC-004 / SEC-112) when `RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM > 0`;
 /// off by default.
 ///
-/// SEC-113: when `RTDB_STORAGE_REQUIRE_SIGNED_URLS=true`, every request must
-/// carry a complete, valid `?exp=&sig=` pair — the opaque id alone is no longer
-/// sufficient. The default (false) preserves today's behavior: opaque bearer
-/// URLs are a deliberate Convex-parity feature. Either way, a request that
+/// SEC-113: when `RTDB_STORAGE_REQUIRE_SIGNED_URLS` is `true` (or lists the
+/// blob's database), every request must carry a complete, valid `?exp=&sig=`
+/// pair — the opaque id alone is no longer sufficient. The default (off)
+/// preserves today's behavior: opaque bearer URLs are a deliberate
+/// Convex-parity feature. Either way, a request that
 /// supplies `exp` or `sig` is signed-URL-shaped and must verify completely.
 pub(crate) async fn serve_public_handler(
     State(state): State<Arc<AppState>>,
@@ -235,7 +237,11 @@ pub(crate) async fn serve_public_handler(
     let has_sig = q.contains_key("sig");
     // SEC-113: require-signature mode flips the default — without a complete,
     // valid signature, the request is rejected before resolving the blob.
-    if state.config.storage.require_signed_urls && !(has_exp && has_sig) {
+    if matches!(
+        state.config.storage.require_signed_urls,
+        SignedUrlsScope::All
+    ) && !(has_exp && has_sig)
+    {
         return Err(RtDbError::forbidden("signed url required"));
     }
     // Additive signed-URL verification: if either `exp` or `sig` is present,
@@ -279,6 +285,11 @@ pub(crate) async fn serve_public_handler(
     let db = storage::resolve_db(&state.pool, &id)
         .await?
         .ok_or_else(|| RtDbError::not_found("unknown file"))?;
+    // Per-database scope: only knowable once the blob's db is resolved. A
+    // signed-shaped request already passed full verification above.
+    if !(has_exp && has_sig) && state.config.storage.requires_signed_urls(&db) {
+        return Err(RtDbError::forbidden("signed url required"));
+    }
     let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     serve_bytes(&state, &db, &id, &q, range).await
 }

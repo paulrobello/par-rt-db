@@ -724,6 +724,18 @@ pub struct HotConfig {
     pub per_db_rpm: i64,
 }
 
+/// Read-only view of the boot-pinned signed-URL storage scope inside
+/// [`ConfigResponse`]. Mirrors `server/src/admin::SignedUrlsView`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct StorageSignedUrls {
+    /// `off`, `all`, or `databases`.
+    pub mode: String,
+    /// Listed databases; empty unless `mode` is `databases`.
+    pub databases: Vec<String>,
+}
+
 /// `GET /admin/config` response — redacted boot config + hot config + build
 /// identity + admin allowlist. Mirrors `server/src/admin::ConfigResponse`.
 #[derive(Debug, Clone, Deserialize)]
@@ -750,6 +762,8 @@ pub struct ConfigResponse {
     pub gitlab_configured: bool,
     /// Whether generic OIDC is configured.
     pub oidc_configured: bool,
+    /// Boot-pinned `RTDB_STORAGE_REQUIRE_SIGNED_URLS` scope (read-only).
+    pub storage_signed_urls: StorageSignedUrls,
     /// The runtime-mutable subset.
     pub hot: HotConfig,
     /// Crate version.

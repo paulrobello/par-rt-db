@@ -170,7 +170,7 @@ pub fn test_config() -> Config {
             rate_limit_exempt_dbs: Vec::new(),
         },
         storage: rtdb_server::config::StorageConfig {
-            require_signed_urls: false,
+            require_signed_urls: rtdb_server::config::SignedUrlsScope::Off,
             share_grants_enabled: false,
             image: rtdb_server::config::ImageTransformConfig {
                 enabled: true,
@@ -295,12 +295,25 @@ pub async fn test_state_with_slow_queries(ms: u64, log_params: bool) -> Arc<AppS
     AppState::new(pool, config, test_hot())
 }
 
+/// Like `test_state_with_require_signed_urls` but scoped to `dbs` only.
+pub async fn test_state_with_signed_only_dbs(dbs: &[&str]) -> Arc<AppState> {
+    let mut config = test_config();
+    config.storage.require_signed_urls = rtdb_server::config::SignedUrlsScope::Databases(
+        dbs.iter().map(|d| d.to_string()).collect(),
+    );
+    let pool = test_pool(&config.database_url)
+        .await
+        .expect("connect to test postgres");
+    db::bootstrap(&pool).await.expect("bootstrap rtdb_auth");
+    AppState::new(pool, config, test_hot())
+}
+
 /// Like `test_state` but with `storage.require_signed_urls = true`. Used by
 /// `tests/storage_signed_url_test.rs` (SEC-113) to exercise require-signature
 /// mode without touching env vars. Mirrors the `test_state_with_*` pattern.
 pub async fn test_state_with_require_signed_urls() -> Arc<AppState> {
     let mut config = test_config();
-    config.storage.require_signed_urls = true;
+    config.storage.require_signed_urls = rtdb_server::config::SignedUrlsScope::All;
     let pool = test_pool(&config.database_url)
         .await
         .expect("connect to test postgres");

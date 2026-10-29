@@ -1128,6 +1128,21 @@ public struct HotConfig: Equatable, Codable, Sendable {
     }
 }
 
+/// Read-only boot-pinned `RTDB_STORAGE_REQUIRE_SIGNED_URLS` scope inside
+/// ``ConfigResponse``. `mode` is `off`, `all`, or `databases`; `databases` is
+/// empty unless `mode` is `databases`.
+public struct StorageSignedUrls: Equatable, Codable, Sendable {
+    /// `off`, `all`, or `databases`.
+    public var mode: String
+    /// Listed databases; empty unless `mode` is `databases`.
+    public var databases: [String]
+
+    public init(mode: String, databases: [String]) {
+        self.mode = mode
+        self.databases = databases
+    }
+}
+
 /// `GET /admin/config` response — redacted boot config + hot config + build
 /// identity + admin allowlist.
 public struct ConfigResponse: Equatable, Codable, Sendable {
@@ -1151,6 +1166,8 @@ public struct ConfigResponse: Equatable, Codable, Sendable {
     public var gitlabConfigured: Bool
     /// Whether generic OIDC is configured.
     public var oidcConfigured: Bool
+    /// Boot-pinned signed-URL storage scope (read-only).
+    public var storageSignedUrls: StorageSignedUrls
     /// The runtime-mutable subset.
     public var hot: HotConfig
     /// Crate version.
@@ -1171,6 +1188,7 @@ public struct ConfigResponse: Equatable, Codable, Sendable {
         googleConfigured: Bool,
         gitlabConfigured: Bool,
         oidcConfigured: Bool,
+        storageSignedUrls: StorageSignedUrls,
         hot: HotConfig,
         version: String,
         gitCommit: String,
@@ -1186,6 +1204,7 @@ public struct ConfigResponse: Equatable, Codable, Sendable {
         self.googleConfigured = googleConfigured
         self.gitlabConfigured = gitlabConfigured
         self.oidcConfigured = oidcConfigured
+        self.storageSignedUrls = storageSignedUrls
         self.hot = hot
         self.version = version
         self.gitCommit = gitCommit
@@ -1195,7 +1214,7 @@ public struct ConfigResponse: Equatable, Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case port, publicUrl, githubBaseUrl, githubApiUrl, databaseUrlConfigured
         case adminKeyConfigured, githubConfigured, googleConfigured, gitlabConfigured
-        case oidcConfigured, hot, version, gitCommit, admins
+        case oidcConfigured, storageSignedUrls, hot, version, gitCommit, admins
     }
 }
 

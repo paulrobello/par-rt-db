@@ -55,7 +55,7 @@ fn test_config() -> Config {
             rate_limit_exempt_dbs: Vec::new(),
         },
         storage: rtdb_server::config::StorageConfig {
-            require_signed_urls: false,
+            require_signed_urls: rtdb_server::config::SignedUrlsScope::Off,
             share_grants_enabled: false,
             image: rtdb_server::config::ImageTransformConfig {
                 enabled: true,

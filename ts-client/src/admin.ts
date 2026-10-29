@@ -369,6 +369,17 @@ export interface HotConfig {
   perDbRpm: number;
 }
 /**
+ * Read-only view of the server's `RTDB_STORAGE_REQUIRE_SIGNED_URLS` scope:
+ * which databases require signed storage URLs (SEC-113).
+ */
+export interface StorageSignedUrls {
+  /** `off` = none, `all` = every database, `databases` = only the listed ones. */
+  mode: "off" | "all" | "databases";
+  /** The listed databases when mode is `databases`; empty otherwise. */
+  databases: string[];
+}
+
+/**
  * The full configuration profile response returned by the server.
  */
 export interface ConfigResponse {
@@ -386,6 +397,8 @@ export interface ConfigResponse {
   version: string;
   gitCommit: string;
   admins: AdminMember[];
+  /** Signed-URL scope (SEC-113), read-only. */
+  storageSignedUrls: StorageSignedUrls;
 }
 /**
  * Patch object for updating server runtime configuration variables.
