@@ -664,8 +664,8 @@ async fn revoke_unknown_state_returns_unknown() -> anyhow::Result<()> {
 
 // The-cube cross-tab ask: a bearer-only login's cleanup must leave a
 // PRE-EXISTING cookie-backed session valid, and the revoke endpoint itself
-// must emit no Set-Cookie headers at all (unlike POST /auth/logout, which
-// still attaches them unconditionally — the deferred follow-up card).
+// must emit no Set-Cookie headers at all (as does a pure-bearer
+// POST /auth/logout).
 #[tokio::test]
 async fn revoke_leaves_preexisting_cookie_session_valid() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
@@ -725,6 +725,73 @@ async fn revoke_leaves_preexisting_cookie_session_valid() -> anyhow::Result<()> 
     assert_eq!(me.status(), reqwest::StatusCode::OK);
     let me_body: Value = me.json().await?;
     assert_eq!(me_body["user"]["email"], json!(email));
+    Ok(())
+}
+
+// POST /auth/logout emits its cookie clears only when the request presented
+// the rtdb_session cookie. A bearer-only logout must not stomp another tab's
+// cookie-backed session; a cookie-backed logout clears both cookies as before.
+#[tokio::test]
+async fn logout_emits_cookie_clears_only_when_cookie_presented() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let email = unique_email("logout");
+    mount_github_mocks(&mock, unique_github_id(), "paul", &email, Duration::ZERO, 2).await;
+    let (_state, addr) = bearer_state(&mock).await;
+
+    // Cookie-backed session in the jar.
+    let client = no_redirect_client();
+    let default_state = begin_login(&client, addr, None).await;
+    let cb = callback(&client, addr, &default_state).await;
+    assert_eq!(cb.status(), reqwest::StatusCode::OK);
+
+    // Bearer session for the same user, delivered by poll.
+    let (bearer_state_token, _secret) = begin_bearer(&client, addr).await;
+    let cb = callback(&client, addr, &bearer_state_token).await;
+    assert_eq!(cb.status(), reqwest::StatusCode::OK);
+    let pv = poll_state(&client, addr, &bearer_state_token).await;
+    let bearer_token = pv["token"].as_str().expect("bearer token").to_string();
+
+    // Bearer-only logout (bare client, no cookie): zero Set-Cookie headers,
+    // and the cookie-backed session in the jar survives.
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/auth/logout"))
+        .header("Authorization", format!("Bearer {bearer_token}"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .count(),
+        0,
+        "bearer-only logout must not emit Set-Cookie headers"
+    );
+    let me = client.get(format!("http://{addr}/auth/me")).send().await?;
+    assert_eq!(me.status(), reqwest::StatusCode::OK);
+
+    // Cookie-backed logout: both clears are still emitted.
+    let resp = client
+        .post(format!("http://{addr}/auth/logout"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let cleared: Vec<String> = resp
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(str::to_string))
+        .collect();
+    assert!(
+        cleared.iter().any(|c| c.starts_with("rtdb_session=;")),
+        "cookie-backed logout clears rtdb_session: {cleared:?}"
+    );
+    assert!(
+        cleared.iter().any(|c| c.starts_with("rtdb-admin-csrf=;")),
+        "cookie-backed logout clears rtdb-admin-csrf: {cleared:?}"
+    );
+    let me = client.get(format!("http://{addr}/auth/me")).send().await?;
+    assert_eq!(me.status(), reqwest::StatusCode::UNAUTHORIZED);
     Ok(())
 }
 

@@ -1060,9 +1060,8 @@ enum StateRevokeResponse {
 /// non-bearer deliveries all answer `unknown`. The digest compare is
 /// constant-time (`ct_eq`, same hygiene as the CSRF gates). This
 /// endpoint sets no cookies, so it never disturbs a browser's pre-existing
-/// `rtdb_session` — unlike `POST /auth/logout`, which always attaches
-/// cookie-clearing headers (suppressing those when the request presented no
-/// cookie is a separate, deferred follow-up card).
+/// `rtdb_session` — and `POST /auth/logout` likewise emits its
+/// cookie-clearing headers only when the request presented that cookie.
 ///
 /// The route is unauthenticated (capability = state + secret), so it carries
 /// the same SEC-003-style per-IP fixed-window guard as `/begin` (30 rpm,
@@ -1266,20 +1265,25 @@ struct OkResponse {
 /// `POST /auth/logout`: idempotent regardless of whether the bearer token is
 /// present, valid, or already expired — a `DELETE` matching zero rows is not
 /// an error, so only a genuine query failure (not a merely-absent session)
-/// produces a 500 here.
+/// produces a 500 here. The cookie clears are attached only when the request
+/// presented `rtdb_session`: a pure-bearer logout from a browser context would
+/// otherwise wipe a different tab's cookie-backed session browser-wide.
 async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let presented_cookie = crate::auth::cookie::session_cookie(&headers).is_some();
     if let Some(token) = bearer_token(&headers)
         && let Err(err) = session::delete_session(&state.pool, token).await
     {
         return err.into_response();
     }
     let mut resp = Json(OkResponse { ok: true }).into_response();
-    // SEC-001 phase 2: clear the HttpOnly session cookie alongside the
-    // server-side session row. SEC-106: clear the CSRF nonce with it.
-    resp.headers_mut()
-        .append(SET_COOKIE, crate::auth::cookie::clear_session_cookie());
-    resp.headers_mut()
-        .append(SET_COOKIE, crate::auth::cookie::clear_admin_csrf_cookie());
+    if presented_cookie {
+        // SEC-001 phase 2: clear the HttpOnly session cookie alongside the
+        // server-side session row. SEC-106: clear the CSRF nonce with it.
+        resp.headers_mut()
+            .append(SET_COOKIE, crate::auth::cookie::clear_session_cookie());
+        resp.headers_mut()
+            .append(SET_COOKIE, crate::auth::cookie::clear_admin_csrf_cookie());
+    }
     resp
 }
 
