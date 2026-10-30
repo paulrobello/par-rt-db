@@ -167,6 +167,20 @@ pub async fn delete_session(pool: &PgPool, token: &str) -> Result<(), RtDbError>
     tombstone_or_delete_by_hash(pool, &hash).await
 }
 
+/// Unconditional row removal for cleanup paths whose durable fence lives
+/// ELSEWHERE (the bearer roll-forward cleanup after a mid-mint state revoke):
+/// the minted session was never delivered, so no client holds the capability
+/// pair and a tombstone anchor would serve no one — hard-delete, unlike the
+/// logout resolver.
+pub async fn purge_session_row(pool: &PgPool, token: &str) -> Result<(), RtDbError> {
+    let hash = sha256_hex(token);
+    sqlx::query("DELETE FROM rtdb_auth.sessions WHERE token_hash = $1")
+        .bind(&hash)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// The shared revocation-by-deletion resolver keyed on `token_hash`: tombstone
 /// live capability rows, delete the rest. Logout (by plaintext token), the
 /// admin revoke-one path, and `delete_sessions_for_user` all resolve through

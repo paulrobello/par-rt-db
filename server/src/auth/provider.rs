@@ -433,7 +433,7 @@ async fn roll_forward_into_revocation(state: &Arc<AppState>, state_token: &str, 
             // Row present and revoked — delete, then clear the recorded
             // plaintext. On delete failure the marker STAYS: the next
             // state/revoke retry deletes the session and confirms.
-            if let Err(err) = session::delete_session(&state.pool, token).await {
+            if let Err(err) = session::purge_session_row(&state.pool, token).await {
                 tracing::warn!(
                     error = %err,
                     "oauth: failed to delete a session minted after revoke; token left recorded for revoke-retry cleanup"
@@ -456,7 +456,7 @@ async fn roll_forward_into_revocation(state: &Arc<AppState>, state_token: &str, 
         Ok(_) => {
             // Row already swept/missing — the poll was dead anyway; clean up
             // best-effort so no live session lingers.
-            if let Err(err) = session::delete_session(&state.pool, token).await {
+            if let Err(err) = session::purge_session_row(&state.pool, token).await {
                 tracing::warn!(error = %err, "oauth: failed to delete a session minted after a swept revoke");
             }
         }
@@ -465,7 +465,7 @@ async fn roll_forward_into_revocation(state: &Arc<AppState>, state_token: &str, 
             // fence's cleanup intent still applies. Settlement stays unset, so
             // retries keep answering `unconfirmed` (honest: untracked debt).
             tracing::warn!(error = %err, "oauth: roll-forward marker write failed");
-            if let Err(derr) = session::delete_session(&state.pool, token).await {
+            if let Err(derr) = session::purge_session_row(&state.pool, token).await {
                 tracing::warn!(error = %derr, "oauth: failed to delete a session after a failed marker");
             }
         }
