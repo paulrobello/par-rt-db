@@ -275,8 +275,15 @@ async fn host_surface_guard(
         "/api/query" | "/api/query-batch" | "/api/mutate" | "/api/mutate-batch"
     ) && let Ok(token) = bearer_token(request.headers())
     {
-        let principal = resolve_bearer(&state.pool, token).await?;
-        crate::auth::host_policy::non_document(&principal.row_ctx())?;
+        // Only a RESOLVABLE restricted bearer narrows its surface — the check
+        // needs the principal. An unresolvable bearer (admin key, garbage,
+        // revoked token) is the handler auth's decision, not this guard's:
+        // hard-failing here 401'd legitimate admin-key callers of /api
+        // storage routes (card 01a18ac4904). Mirrors the soft semantics of
+        // the /storage/ branch above.
+        if let Ok(principal) = resolve_bearer(&state.pool, token).await {
+            crate::auth::host_policy::non_document(&principal.row_ctx())?;
+        }
     }
     Ok(next.run(request).await)
 }

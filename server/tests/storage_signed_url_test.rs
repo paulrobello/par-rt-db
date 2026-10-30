@@ -574,3 +574,33 @@ async fn sec113_mint_unknown_id_returns_404() -> anyhow::Result<()> {
     assert_eq!(resp.status(), 404);
     Ok(())
 }
+
+/// The admin key may mint directly — the RtDbAdminClient.getSignedUrl contract
+/// (card 01a18ac4904): a bearer of the admin key gets `{url, expiresAt}` and
+/// the returned URL serves the blob. The db-scoped token path is unchanged.
+#[tokio::test]
+async fn admin_key_can_mint_signed_url() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let addr = spawn_app(state.clone()).await;
+    let (id, bytes) = seed(&state, &db).await;
+
+    // Mint with the admin key (no db-scoped token at all).
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/api/storage/{db}/{id}/signed-url"))
+        .header("Authorization", "Bearer test-admin-key")
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200, "mint body: {}", resp.text().await?);
+    let body: serde_json::Value = resp.json().await?;
+    let url = body["url"].as_str().expect("url present");
+    let exp = body["expiresAt"].as_i64().expect("expiresAt present");
+    assert!(exp > rtdb_server::db::now_ms());
+
+    // The URL serves the bytes (swap the public_url host for the live addr).
+    let path = &url[url.find("/storage/").expect("path present")..];
+    let served = reqwest::get(format!("http://{addr}{path}")).await?;
+    assert_eq!(served.status(), 200);
+    assert_eq!(served.bytes().await?.as_ref(), &bytes[..]);
+    Ok(())
+}

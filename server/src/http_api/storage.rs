@@ -173,8 +173,16 @@ pub(crate) async fn signed_url_handler(
     Path((db, id)): Path<(String, String)>,
     AxumQuery(q): AxumQuery<HashMap<String, String>>,
 ) -> Result<Json<SignedUrlResponse>, RtDbError> {
-    let principal = authed(&state, &headers, &db).await?;
-    check_http_rate_limits(&state, &principal, &db).await?;
+    // The admin key may mint directly — the `RtDbAdminClient.getSignedUrl`
+    // contract promises it (card 01a18ac4904): the key is instance-wide, and
+    // minting the capability is exactly what the admin storage surfaces do.
+    // Db-scoped principals keep the existing path (authorize + per-principal
+    // rate limit); admin skips both (admin routes are un-throttled today).
+    // The cross-db 404 below binds both callers equally.
+    if crate::admin::require_admin(&state, &headers).await.is_err() {
+        let principal = authed(&state, &headers, &db).await?;
+        check_http_rate_limits(&state, &principal, &db).await?;
+    }
     // SEC-113: resolve the owning db and reject cross-db. A caller authorized
     // for db A must not be able to mint a URL for an id that lives in db B,
     // even if they somehow know the id — the mint is the capability.
