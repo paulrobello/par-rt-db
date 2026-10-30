@@ -500,6 +500,10 @@ enum PollResult {
         /// logins only); `None` when the session predates the feature or the
         /// stamp failed.
         session_id: Option<String>,
+        /// The capability's provable expiry (the session's absolute
+        /// `expires_at`, bearer logins only): the instant the tombstone is
+        /// swept, bounding the retry's evidentiary window.
+        expires_at: Option<i64>,
     },
     Failed,
     Expired,
@@ -542,15 +546,20 @@ async fn poll_login(state: &Arc<AppState>, state_token: &str) -> PollResult {
                     Ok(principal @ Principal::User { .. }) => {
                         // The capability identifier rides the same one-shot
                         // delivery as the token; a session without a stamped
-                        // capability (cookie/default, pre-upgrade) omits it.
-                        let session_id = session::lookup_session_id(&state.pool, &t)
+                        // capability (cookie/default, pre-upgrade) omits both
+                        // halves — `sessionId` and the provable `expiresAt`.
+                        let capability = session::lookup_session_capability(&state.pool, &t)
                             .await
                             .unwrap_or(None);
+                        let (session_id, expires_at) = capability
+                            .map(|(sid, exp)| (Some(sid), Some(exp)))
+                            .unwrap_or((None, None));
                         PollResult::Complete {
                             token: t,
                             user: authed_user(&principal),
                             cookie_mode: delivery == DELIVERY_COOKIE,
                             session_id,
+                            expires_at,
                         }
                     }
                     _ => PollResult::Expired, // token did not resolve — treat as gone
@@ -1014,6 +1023,14 @@ enum StateResponse {
         user: AuthedUser,
         #[serde(rename = "sessionId", skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
+        /// The capability's provable expiry — the session's absolute
+        /// `expires_at` (bearer logins only): the instant the tombstone is
+        /// swept and the evidentiary window closes. A client resolves the
+        /// capability as fulfilled once local time passes it; `unknown`
+        /// before that instant is a genuine anomaly, not an expired
+        /// capability.
+        #[serde(rename = "expiresAt", skip_serializing_if = "Option::is_none")]
+        expires_at: Option<i64>,
     },
     Expired,
     Error,
@@ -1047,17 +1064,24 @@ async fn auth_state(
             user,
             cookie_mode,
             session_id,
+            expires_at,
         } => {
             let token = if cookie_mode { None } else { Some(token) };
-            // The capability identifier is bearer-only: a cookie-mode login
+            // The capability fields are bearer-only: a cookie-mode login
             // carries no stamped capability, so never leak its absence as a
-            // field. (lookup_session_id returns None for those rows anyway —
-            // this also keeps a hypothetical stamp failure from leaking mode.)
-            let session_id = if cookie_mode { None } else { session_id };
+            // field. (lookup_session_capability returns None for those rows
+            // anyway — this also keeps a hypothetical stamp failure from
+            // leaking mode.)
+            let (session_id, expires_at) = if cookie_mode {
+                (None, None)
+            } else {
+                (session_id, expires_at)
+            };
             Json(StateResponse::Complete {
                 token,
                 user,
                 session_id,
+                expires_at,
             })
             .into_response()
         }

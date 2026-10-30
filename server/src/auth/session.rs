@@ -401,17 +401,25 @@ pub async fn stamp_revoke_capability(
     Ok(())
 }
 
-/// The `session_id` for a live session token, for the one-shot poll delivery.
-/// `None` when the token does not resolve or the row carries no capability
-/// (never stamped — cookie/default logins and pre-upgrade rows).
-pub async fn lookup_session_id(pool: &PgPool, token: &str) -> Result<Option<String>, RtDbError> {
+/// The durable capability (`session_id`, `expires_at`) for a session token,
+/// for the one-shot poll delivery. `None` when the token does not resolve or
+/// the row carries no capability (never stamped — cookie/default logins and
+/// pre-upgrade rows). `expires_at` rides along as the capability's PROVABLE
+/// expiry: the tombstone sweeping at that instant bounds the evidentiary
+/// window, so a client holding the pair can resolve the capability as
+/// fulfilled once local time passes it (the session is dead by TTL regardless).
+pub async fn lookup_session_capability(
+    pool: &PgPool,
+    token: &str,
+) -> Result<Option<(String, i64)>, RtDbError> {
     let hash = sha256_hex(token);
-    let session_id: Option<Option<String>> =
-        sqlx::query_scalar("SELECT session_id FROM rtdb_auth.sessions WHERE token_hash = $1")
-            .bind(&hash)
-            .fetch_optional(pool)
-            .await?;
-    Ok(session_id.flatten())
+    let row: Option<(Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT session_id, expires_at FROM rtdb_auth.sessions WHERE token_hash = $1",
+    )
+    .bind(&hash)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(session_id, expires_at)| session_id.zip(expires_at)))
 }
 
 /// Prunes revoked-session tombstones (`revoked_at` set by

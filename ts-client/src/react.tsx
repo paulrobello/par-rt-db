@@ -319,13 +319,22 @@ export const OAUTH_POLL_TIMEOUT_MS = 180_000;
  *  the body. A transient fetch failure or malformed body keeps polling
  *  (returns `{ done: false }`); only a terminal `expired`/`error` status
  *  rejects. `sessionId` (bearer-mode logins only) is the non-secret half of
- *  the durable session-revoke capability; the server omits it otherwise. */
+ *  the durable session-revoke capability and `expiresAt` its provable expiry —
+ *  the session's absolute TTL, the instant the tombstone is swept; the server
+ *  omits both halves otherwise, and a client holding the pair resolves the
+ *  capability as fulfilled once local time passes `expiresAt`. */
 async function pollOAuthState(
   apiBase: string,
   state: string,
   cookieMode: boolean,
 ): Promise<
-  { done: true; token: string | undefined; sessionId: string | undefined } | { done: false }
+  | {
+      done: true;
+      token: string | undefined;
+      sessionId: string | undefined;
+      expiresAt: number | undefined;
+    }
+  | { done: false }
 > {
   let resp: Response;
   try {
@@ -333,8 +342,8 @@ async function pollOAuthState(
     // /begin, same value as `state`) is attached. Without it the server
     // rejects the poll as if the flow had expired — a leaked `state` URL
     // alone cannot poll. A browser flow here is default/cookie delivery, so
-    // `sessionId` is simply absent from the body; types stay truthful either
-    // way.
+    // the capability halves are simply absent from the body; types stay
+    // truthful either way.
     resp = await fetch(`${apiBase}/auth/state?state=${encodeURIComponent(state)}`, {
       credentials: "include",
     });
@@ -342,14 +351,24 @@ async function pollOAuthState(
     return { done: false };
   }
   if (!resp.ok) return { done: false };
-  let data: { status?: string; token?: string; sessionId?: string };
+  let data: {
+    status?: string;
+    token?: string;
+    sessionId?: string;
+    expiresAt?: number;
+  };
   try {
-    data = (await resp.json()) as { status?: string; token?: string; sessionId?: string };
+    data = (await resp.json()) as {
+      status?: string;
+      token?: string;
+      sessionId?: string;
+      expiresAt?: number;
+    };
   } catch {
     return { done: false };
   }
   if (data.status === "complete" && (cookieMode || typeof data.token === "string")) {
-    return { done: true, token: data.token, sessionId: data.sessionId };
+    return { done: true, token: data.token, sessionId: data.sessionId, expiresAt: data.expiresAt };
   }
   if (data.status === "expired" || data.status === "error") {
     throw new Error(data.status === "expired" ? "sign-in expired" : "sign-in failed");
@@ -458,7 +477,12 @@ export function signInWithApple(baseUrl: string): Promise<string> {
  *  `/auth/state/revoke` it is not bounded by the 10-minute state window —
  *  the capability lives for the session's TTL. `"revoked"` is a confirmed
  *  fence (also the idempotent retry answer); `"unknown"` means the pair did
- *  not match anything (treat as unconfirmed and retry). */
+ *  not match anything (treat as unconfirmed and retry). Resolution rule:
+ *  retry until `"revoked"`; once local time passes the poll's `expiresAt`
+ *  the capability is resolved as fulfilled — the session is dead by TTL
+ *  regardless, and `"unknown"` before that instant is a genuine anomaly
+ *  (wrong server, stamp failure, feature-less server), not an expired
+ *  capability. */
 export async function revokeOAuthSession(
   baseUrl: string,
   sessionId: string,

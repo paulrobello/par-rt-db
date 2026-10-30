@@ -1268,8 +1268,8 @@ async fn session_revoke_invalid_capabilities_are_unknown() -> anyhow::Result<()>
     let pv = poll_state(&client, addr, &cookie_state).await;
     assert_eq!(pv["status"], json!("complete"));
     assert!(
-        pv.get("sessionId").is_none(),
-        "cookie-mode poll must not carry sessionId"
+        pv.get("sessionId").is_none() && pv.get("expiresAt").is_none(),
+        "cookie-mode poll must carry neither capability half"
     );
     // No capability exists for the cookie-mode session — there is no
     // sessionId to present — and the bearer session stays live.
@@ -1414,9 +1414,42 @@ async fn default_flow_poll_omits_session_id() -> anyhow::Result<()> {
     let pv = poll_state(&client, addr, &state_token).await;
     assert_eq!(pv["status"], json!("complete"));
     assert!(
-        pv.get("sessionId").is_none(),
-        "default-flow poll must not carry sessionId"
+        pv.get("sessionId").is_none() && pv.get("expiresAt").is_none(),
+        "default-flow poll must carry neither capability half"
     );
+    Ok(())
+}
+
+// Provable capability expiry: the bearer poll delivers `expiresAt` — the
+// session's absolute expires_at, the instant the tombstone is swept — so a
+// client holding (sessionId, revokeSecret) can resolve the capability as
+// fulfilled once local time passes it, instead of retrying `unknown` forever.
+#[tokio::test]
+async fn poll_delivers_provable_capability_expiry() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let email = unique_email("sesrevexp-delivery");
+    mount_github_mocks(&mock, unique_github_id(), "paul", &email, Duration::ZERO, 1).await;
+    let (_state, addr) = bearer_state(&mock).await;
+
+    let client = no_redirect_client();
+    let (state_token, _secret) = begin_bearer(&client, addr).await;
+    let cb = callback(&client, addr, &state_token).await;
+    assert_eq!(cb.status(), reqwest::StatusCode::OK);
+    let pv = poll_state(&client, addr, &state_token).await;
+    assert_eq!(pv["status"], json!("complete"));
+    let session_id = pv["sessionId"]
+        .as_str()
+        .expect("bearer poll carries sessionId");
+    let expires_at = pv["expiresAt"]
+        .as_i64()
+        .expect("bearer poll carries expiresAt");
+    assert!(
+        expires_at > db::now_ms(),
+        "expiresAt must be a future instant (the session TTL)"
+    );
+    // The capability pair still confirms before expiry (rule unchanged).
+    let resp = revoke_session(addr, session_id, Some("wrong")).await;
+    assert_eq!(resp.json::<Value>().await?, json!({"status": "unknown"}));
     Ok(())
 }
 
