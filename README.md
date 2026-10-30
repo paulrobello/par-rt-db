@@ -155,7 +155,12 @@ The same path runs for scheduled/cron jobs and durable workflow steps (a per-db
 scheduler enqueues due work as `CommitterRequest::RunScheduled` /
 `RunWorkflowAdvance`). Reads that don't write go straight to Postgres
 through `execute_query` under READ COMMITTED. Auth re-runs `authorize` on every
-Subscribe/Mutate over an open WebSocket. File storage is HTTP-only and bypasses the
+Subscribe/Mutate over an open WebSocket. Revocation liveness extends to pushes:
+the subscription fan-out re-checks credential liveness per write batch — host
+tokens via `authorize`, user sessions via an `EXISTS` on the session row
+(revoked by any path, or expired ⇒ the subscription is dropped before
+publication, so a revoked session stops receiving query updates without waiting
+for a next op). File storage is HTTP-only and bypasses the
 committer (blobs don't touch document tables). See
 [`server/README.md`](server/README.md) for the server layout and
 [`CLAUDE.md`](CLAUDE.md) for the full invariant list.

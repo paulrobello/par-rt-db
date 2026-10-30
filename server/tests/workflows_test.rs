@@ -663,6 +663,7 @@ async fn spec_bounds_and_allowlist_rejected() -> anyhow::Result<()> {
         host_capability: None,
         enqueuer: None,
         admin: false,
+        session_hash: None,
     };
 
     // The smuggle attempt: a spec whose step txn writes the forbidden table.

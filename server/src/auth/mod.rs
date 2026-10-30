@@ -155,6 +155,7 @@ pub async fn resolve_enqueuer(
                 host_capability: None,
                 enqueuer: Some(enqueuer.clone()),
                 admin: false,
+                session_hash: None,
             });
         }
         return Err(RtDbError::forbidden(
@@ -174,6 +175,7 @@ pub async fn resolve_enqueuer(
             host_capability: None,
             enqueuer: Some(enqueuer.clone()),
             admin: false,
+            session_hash: None,
         })
     } else {
         Err(RtDbError::forbidden(
@@ -427,6 +429,18 @@ pub struct PrincipalCtx {
     /// decoding (an older origin's context arrives as non-admin).
     #[serde(default)]
     pub admin: bool,
+    /// The subscriber's session row digest (`Principal::User.session_hash`),
+    /// captured at subscribe time and carried on every stored subscription so
+    /// `fan_out` can re-check session liveness before pushing (a session
+    /// revoked by ANY path — logout, admin revoke, `/auth/session/revoke` —
+    /// stops receiving query updates). `None` for bypass/machine/system
+    /// contexts and for principals without a session (those subscriptions keep
+    /// the pre-existing unconditional fan-out). `#[serde(default)]` keeps
+    /// mixed-version forwarding decoding (an older origin's context arrives
+    /// without the field, falling back to the pre-existing unconditional
+    /// fan-out — the safe posture for a rolling upgrade).
+    #[serde(default)]
+    pub session_hash: Option<String>,
 }
 
 impl PrincipalCtx {
@@ -450,6 +464,7 @@ impl PrincipalCtx {
             host_capability: None,
             enqueuer: None,
             admin: false,
+            session_hash: None,
         }
     }
 
@@ -470,13 +485,19 @@ impl Principal {
     /// `$email` predicates resolve; `User` principals are never table-scoped.
     pub fn row_ctx(&self) -> PrincipalCtx {
         match self {
-            Principal::User { user_id, email, .. } => PrincipalCtx {
+            Principal::User {
+                user_id,
+                email,
+                session_hash,
+                ..
+            } => PrincipalCtx {
                 user_id: Some(user_id.clone()),
                 email: email.clone(),
                 tables: None,
                 host_capability: None,
                 enqueuer: self.enqueuer(),
                 admin: false,
+                session_hash: session_hash.clone(),
             },
             Principal::Machine {
                 tables,
@@ -489,6 +510,7 @@ impl Principal {
                 host_capability: host_capability.clone(),
                 enqueuer: None,
                 admin: false,
+                session_hash: None,
             },
         }
     }

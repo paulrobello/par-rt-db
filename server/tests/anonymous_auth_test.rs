@@ -367,6 +367,7 @@ async fn anonymous_owns_its_inserted_docs() -> anyhow::Result<()> {
         host_capability: None,
         enqueuer: None,
         admin: false,
+        session_hash: None,
     };
     match execute_query(
         &state.pool,

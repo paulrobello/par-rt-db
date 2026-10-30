@@ -905,6 +905,55 @@ fn host_may_push(entry: &SubEntry, states: &HashMap<String, HostLive>) -> bool {
     host_token(entry).is_some_and(|id| states.get(id) == Some(&HostLive::Live))
 }
 
+/// Fan-out session liveness: one bounded liveness check per UNIQUE session
+/// hash per batch (never per subscription), so N subscriptions on one session
+/// cost one query. `Dead` is terminal (revoked by any path or expired);
+/// `Transient` suppresses nothing — a DB failure must not sever healthy
+/// subscriptions, mirroring `apply_host_liveness`.
+async fn session_liveness<F, Fut>(entries: &DbSubs, mut check: F) -> HashMap<String, HostLive>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<(), RtDbError>>,
+{
+    let hashes: std::collections::HashSet<String> = entries
+        .values()
+        .filter_map(|entry| entry.principal_ctx.session_hash.clone())
+        .collect();
+    futures::stream::iter(hashes)
+        .map(|hash| {
+            let future = check(hash.clone());
+            async move {
+                let live = match future.await {
+                    Ok(()) => HostLive::Live,
+                    Err(error)
+                        if matches!(
+                            error.code,
+                            crate::error::ErrorCode::Unauthorized
+                                | crate::error::ErrorCode::Forbidden
+                        ) =>
+                    {
+                        HostLive::Dead
+                    }
+                    Err(_) => HostLive::Transient,
+                };
+                (hash, live)
+            }
+        })
+        .buffer_unordered(FAN_OUT_CONCURRENCY)
+        .collect()
+        .await
+}
+
+fn apply_session_liveness(entries: &mut DbSubs, states: &HashMap<String, HostLive>) {
+    entries.retain(|_, entry| {
+        entry
+            .principal_ctx
+            .session_hash
+            .as_ref()
+            .is_none_or(|hash| states.get(hash) != Some(&HostLive::Dead))
+    });
+}
+
 /// Registered live-query subscriptions, sharded per database. Each database's
 /// subscriptions live behind its own `Arc<Mutex<DbSubs>>`, so a per-db
 /// committer's `fan_out` (a Postgres re-run per affected subscription) holds
@@ -1393,6 +1442,17 @@ impl SubscriptionManager {
         })
         .await;
         apply_host_liveness(&mut db_subs, &host_states);
+
+        // Session liveness (same bounded shape): a user session revoked by any
+        // path — or expired — has its subscriptions dropped before publication,
+        // closing the push hole the per-op checks can't reach (a stale fan-out
+        // has no "next op"). Subs without a session hash (machine/system) are
+        // unaffected.
+        let session_states = session_liveness(&db_subs, |hash| async move {
+            crate::auth::session::session_fan_out_alive(pool, &hash).await
+        })
+        .await;
+        apply_session_liveness(&mut db_subs, &session_states);
 
         // Apply pass: identical bookkeeping to the former sequential loop,
         // just driven from the collected results instead of an in-place

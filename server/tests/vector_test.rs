@@ -1282,6 +1282,7 @@ async fn vector_search_paginate_pages_reconstruct_the_unpaginated_ranking() {
         host_capability: None,
         enqueuer: None,
         admin: false,
+        session_hash: None,
     };
     let base = serde_json::json!({
         "table": "docs",
@@ -1551,6 +1552,7 @@ async fn hybrid_search_paginate_binds_after_the_owner_predicate() {
         host_capability: None,
         enqueuer: None,
         admin: false,
+        session_hash: None,
     };
     let base = serde_json::json!({
         "table": "docs",

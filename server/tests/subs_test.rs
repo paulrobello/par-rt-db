@@ -862,6 +862,7 @@ async fn inspector_snapshots_subscriptions_and_per_db_counters() -> anyhow::Resu
                 host_capability: None,
                 enqueuer: None,
                 admin: false,
+                session_hash: None,
             },
         )
         .await?;
@@ -1063,5 +1064,197 @@ async fn per_db_rows_expose_skips_total_and_rerun_ratio_on_admin_stats() -> anyh
     assert!(skips > 0, "admin response shows the skip total");
     assert_eq!(ratio, reruns as f64 / (reruns + skips) as f64);
     assert!((0.0..=1.0).contains(&ratio));
+    Ok(())
+}
+
+// --- fan-out session liveness (card 01a18a06fa3a) ---------------------------
+
+use crate::common::mint_user_session;
+
+// A user-session subscription stops receiving query updates once the session
+// is dead — revoked by any path (logout delete, capability tombstone, expiry).
+// The fan-out liveness pass drops the subscription BEFORE publication, closing
+// the push hole the per-op revocation checks can't reach (a stale fan-out has
+// no "next op" to re-check on).
+#[tokio::test]
+async fn fan_out_stops_pushing_to_dead_user_session() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let suffix = uuid::Uuid::now_v7().simple();
+
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 1.0),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+
+    // A real session row backs the subscription's identity; the ctx rides the
+    // session hash so fan_out re-checks liveness once per batch.
+    let user_id = format!("u-subs-{suffix}");
+    let email = format!("subs-{suffix}@example.com");
+    let token = mint_user_session(&state.pool, &user_id, &email).await;
+    let ctx = PrincipalCtx {
+        user_id: Some(user_id),
+        email: Some(email),
+        session_hash: Some(rtdb_server::db::sha256_hex(&token)),
+        ..Default::default()
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    state
+        .realtime
+        .committers
+        .subscribe(
+            &db,
+            next_conn_id(),
+            "q1".to_string(),
+            collect_work_items(),
+            tx,
+            ctx,
+        )
+        .await?;
+    rx.try_recv().expect("initial query update");
+
+    // Control: while the session is alive, a matching write pushes.
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 2.0),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    rx.try_recv().expect("push while session is alive");
+
+    // Path 1 — logout (plain session: hard delete). No push after.
+    rtdb_server::auth::session::delete_session(&state.pool, &token).await?;
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 3.0),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    assert!(
+        matches!(
+            rx.try_recv(),
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected)
+        ),
+        "deleted session must receive no push"
+    );
+
+    // Path 2 — the durable capability tombstone (what POST /auth/session/revoke
+    // writes: revoked_at set, row retained).
+    let token_b = mint_user_session(
+        &state.pool,
+        &format!("u-subs-b-{suffix}"),
+        &format!("subs-b-{suffix}@example.com"),
+    )
+    .await;
+    let hash_b = rtdb_server::db::sha256_hex(&token_b);
+    let ctx_b = PrincipalCtx {
+        user_id: Some(format!("u-subs-b-{suffix}")),
+        email: Some(format!("subs-b-{suffix}@example.com")),
+        session_hash: Some(hash_b.clone()),
+        ..Default::default()
+    };
+    let (tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel();
+    state
+        .realtime
+        .committers
+        .subscribe(
+            &db,
+            next_conn_id(),
+            "q2".to_string(),
+            collect_work_items(),
+            tx_b,
+            ctx_b,
+        )
+        .await?;
+    rx_b.try_recv().expect("initial update for session B");
+    sqlx::query("UPDATE rtdb_auth.sessions SET revoked_at = $1 WHERE token_hash = $2")
+        .bind(rtdb_server::db::now_ms())
+        .bind(&hash_b)
+        .execute(&state.pool)
+        .await
+        .expect("tombstone session B");
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 4.0),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    assert!(
+        matches!(
+            rx_b.try_recv(),
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected)
+        ),
+        "tombstoned session must receive no push"
+    );
+
+    // Path 3 — plain expiry: the same terminal Dead.
+    let token_c = mint_user_session(
+        &state.pool,
+        &format!("u-subs-c-{suffix}"),
+        &format!("subs-c-{suffix}@example.com"),
+    )
+    .await;
+    let hash_c = rtdb_server::db::sha256_hex(&token_c);
+    let ctx_c = PrincipalCtx {
+        user_id: Some(format!("u-subs-c-{suffix}")),
+        email: Some(format!("subs-c-{suffix}@example.com")),
+        session_hash: Some(hash_c.clone()),
+        ..Default::default()
+    };
+    let (tx_c, mut rx_c) = tokio::sync::mpsc::unbounded_channel();
+    state
+        .realtime
+        .committers
+        .subscribe(
+            &db,
+            next_conn_id(),
+            "q3".to_string(),
+            collect_work_items(),
+            tx_c,
+            ctx_c,
+        )
+        .await?;
+    rx_c.try_recv().expect("initial update for session C");
+    sqlx::query("UPDATE rtdb_auth.sessions SET expires_at = 1 WHERE token_hash = $1")
+        .bind(&hash_c)
+        .execute(&state.pool)
+        .await
+        .expect("backdate session C");
+    state
+        .realtime
+        .committers
+        .mutate(
+            &db,
+            None,
+            insert_work_item("backlog", 5.0),
+            PrincipalCtx::bypass(),
+        )
+        .await?;
+    assert!(
+        matches!(
+            rx_c.try_recv(),
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected)
+        ),
+        "expired session must receive no push"
+    );
     Ok(())
 }

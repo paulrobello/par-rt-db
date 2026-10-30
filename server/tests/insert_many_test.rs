@@ -45,6 +45,7 @@ async fn run(f: &Fixture, steps: Vec<Step>) -> Result<TxnOutcome, RtDbError> {
         host_capability: None,
         enqueuer: None,
         admin: false,
+        session_hash: None,
     };
     execute_txn(
         &f.state.pool,

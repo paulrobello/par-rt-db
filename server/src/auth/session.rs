@@ -428,3 +428,26 @@ pub async fn sweep_revoked_tombstones(pool: &PgPool) -> Result<u64, RtDbError> {
     .await?;
     Ok(r.rows_affected())
 }
+
+/// Fan-out liveness for stored user-session subscriptions (called from
+/// `subs::fan_out`, once per unique session hash per batch): the session must
+/// still exist, be un-revoked, AND unexpired — a session revoked by ANY path
+/// (logout, admin revoke, `POST /auth/session/revoke`) or past `expires_at`
+/// stops receiving query updates. Distinct from `session_still_valid` (per-op
+/// revocation only; expiry stays the resolvers' cached `expires_at` compare) —
+/// a stale fan-out has no "next op" to notice expiry on.
+pub async fn session_fan_out_alive(pool: &PgPool, token_hash: &str) -> Result<(), RtDbError> {
+    let (live,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM rtdb_auth.sessions \
+         WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > $2)",
+    )
+    .bind(token_hash)
+    .bind(now_ms())
+    .fetch_one(pool)
+    .await?;
+    if live {
+        Ok(())
+    } else {
+        Err(RtDbError::unauthorized("session revoked or expired"))
+    }
+}

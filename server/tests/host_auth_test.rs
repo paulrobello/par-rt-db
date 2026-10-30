@@ -1824,6 +1824,7 @@ fn principal_ctx_capability_round_trips_and_defaults_to_none() {
         }),
         enqueuer: None,
         admin: false,
+        session_hash: None,
     };
     let json = serde_json::to_value(&ctx).expect("serialize ctx");
     // `PrincipalCtx` has no rename_all: its serde names are the Rust field

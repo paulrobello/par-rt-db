@@ -869,6 +869,7 @@ mod tests {
                     host_capability: None,
                     enqueuer: None,
                     admin: false,
+                    session_hash: None,
                 },
                 admission_epoch: None,
             },
