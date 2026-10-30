@@ -1337,15 +1337,17 @@ struct SessionRevokeBody {
 /// Response of `POST /auth/session/revoke`. `revoked` is a CONFIRMED fence:
 /// the session matching the (sessionId, revokeSecret) capability is verifiably
 /// dead — its `revoked_at` marker was set (or was already a tombstone, or the
-/// row was past expiry and got pruned) inside the same transaction that
-/// proved the capability. `unknown` means no row matched: never-stamped
-/// session (cookie/default deliveries, pre-upgrade rows), wrong or missing
-/// secret, or an identifier that never existed — indistinguishable by design
-/// (no existence leak). There is no `unconfirmed` here: unlike the state flow
-/// there is no ambiguous-insert window — the capability is stamped on a row
-/// that provably exists, so absence after a confirmed fence is durable.
-/// The-cube client rule carries over: any non-`revoked` outcome is treated as
-/// unconfirmed and retried.
+/// row was past expiry and got pruned in the same transaction) — in the
+/// transaction that proved the capability. `unknown` means no row matched:
+/// never-stamped session (cookie/default deliveries, pre-upgrade rows), wrong
+/// or missing secret, an identifier that never existed, or a row already
+/// removed by background cleanup (the 60s tombstone sweep or the lazy expiry
+/// delete — so a retry after a confirmed revoke CAN turn `unknown` once the
+/// tombstone is swept past TTL; safe, since expiry was already enforced by
+/// every resolver, but not evidentiary) — indistinguishable by design (no
+/// existence leak). There is no `unconfirmed` here: unlike the state flow
+/// there is no ambiguous-insert window. The-cube client rule carries over:
+/// any non-`revoked` outcome is treated as unconfirmed and retried.
 #[derive(serde::Serialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
 enum SessionRevokeResponse {
