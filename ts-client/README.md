@@ -220,6 +220,30 @@ operator escape hatch that merges an anonymous user into a real one — mirrorin
 `POST /admin/merge-users` (the typed `confirm == realUserId` guard is applied
 for you).
 
+#### OAuth sessions with a durable revoke capability
+
+The sign-in helpers resolve the session token only. When your app also needs
+to revoke the session later — server-side logout, unbind, or a "sign out
+everywhere" control — begin the flow with `signInWithOAuthSession(baseUrl,
+provider)` (from `@par-rt-db/client/react`): it uses the server's bearer
+delivery (`mode=bearer`, the server sets no cookie) and resolves an
+`OAuthSessionCapability`:
+
+```ts
+const cap = await signInWithOAuthSession("https://rtdb.example.com", "google");
+client.setToken(cap.token);
+// Keep cap.sessionId + cap.revokeSecret somewhere reachable; when you need to
+// fence the session durably:
+await revokeOAuthSession(baseUrl, cap.sessionId, cap.revokeSecret);
+```
+
+`sessionId` + `revokeSecret` are the two halves of the durable revoke
+capability (delivered once each — `revokeSecret` rides the begin response,
+`sessionId` + `expiresAt` ride the completion poll), and `expiresAt` is the
+server-time bound for the revoke-retry rule documented on
+`revokeOAuthSession`. The default `signInWith*` helpers stay token-only and
+unchanged.
+
 #### The `unreachable` auth state
 
 A cookie-mode app served from an origin the server has not allowlisted gets

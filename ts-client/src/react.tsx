@@ -378,32 +378,64 @@ async function pollOAuthState(
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** Credential delivery requested at `/auth/{provider}/begin`. `"default"`
+ *  resolves with the poll's token (the server also sets the session cookie).
+ *  `"cookie"` (SEC-207) is cookie-only — no token in any body. `"bearer"` is
+ *  token-only (the server never sets a cookie) and the only delivery that
+ *  carries the durable session-revoke capability: `revokeSecret` in the begin
+ *  response, `sessionId` + `expiresAt` in the poll's `complete` body. */
+type OAuthDelivery = "default" | "cookie" | "bearer";
+
+/** What a completed flow hands back: the credential plus, for bearer
+ *  deliveries, the once-only halves of the durable session-revoke capability
+ *  (`undefined` for the other deliveries — the server omits the fields). */
+interface OAuthFlowResult {
+  token: string | undefined;
+  sessionId: string | undefined;
+  revokeSecret: string | undefined;
+  expiresAt: number | undefined;
+}
+
 /**
  * Shared begin + poll relay. In cookie mode (SEC-207) `begin` carries
  * `mode=cookie` so the server omits the token from the poll's `complete` —
  * resolving with `undefined` (the HttpOnly cookie is the credential). Token
- * mode always resolves with the token string.
+ * mode always resolves with the token string; bearer delivery additionally
+ * resolves the revoke-capability halves (begin's one-time `revokeSecret`,
+ * the poll's `sessionId` + `expiresAt`).
  */
 async function beginOAuthFlow(
   baseUrl: string,
   provider: OAuthProvider,
-  cookieMode: boolean,
-): Promise<string | undefined> {
+  delivery: OAuthDelivery,
+): Promise<OAuthFlowResult> {
   const api = baseUrl.replace(/\/+$/, "");
   const spaOrigin = window.location.origin;
+  const modeQuery = delivery === "default" ? "" : `&mode=${delivery}`;
   const beginResp = await fetch(
-    `${api}/auth/${provider}/begin?origin=${encodeURIComponent(spaOrigin)}${cookieMode ? "&mode=cookie" : ""}`,
+    `${api}/auth/${provider}/begin?origin=${encodeURIComponent(spaOrigin)}${modeQuery}`,
     { credentials: "include" },
   );
   if (!beginResp.ok) {
     throw new Error(`could not start sign-in (${beginResp.status})`);
   }
-  const began = (await beginResp.json()) as { authorizeUrl: string; state: string };
+  const began = (await beginResp.json()) as {
+    authorizeUrl: string;
+    state: string;
+    revokeSecret?: string;
+  };
   window.open(began.authorizeUrl, "rtdb-auth", "noopener,noreferrer,width=600,height=700");
   const deadline = Date.now() + OAUTH_POLL_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const r = await pollOAuthState(api, began.state, cookieMode);
-    if (r.done) return r.token;
+    const r = await pollOAuthState(api, began.state, delivery === "cookie");
+    if (r.done) {
+      return {
+        token: r.token,
+        sessionId: r.sessionId,
+        revokeSecret: began.revokeSecret,
+        expiresAt: r.expiresAt,
+      };
+    }
     await sleep(OAUTH_POLL_INTERVAL_MS);
   }
   throw new Error("sign-in timed out");
@@ -416,13 +448,13 @@ async function beginOAuthFlow(
  * old postMessage/closed-poll relay is replaced by this poll.
  */
 function signInWithOAuth(baseUrl: string, provider: OAuthProvider): Promise<string> {
-  return beginOAuthFlow(baseUrl, provider, false).then((token) => {
+  return beginOAuthFlow(baseUrl, provider, "default").then((r) => {
     // Token mode's server response always carries the token; this guard only
     // keeps the typed contract honest without a cast.
-    if (token === undefined) {
+    if (r.token === undefined) {
       throw new Error("sign-in completed without a token");
     }
-    return token;
+    return r.token;
   });
 }
 
@@ -432,7 +464,7 @@ function signInWithOAuth(baseUrl: string, provider: OAuthProvider): Promise<stri
  * callback is the only credential. Resolves when the flow completes.
  */
 async function signInWithOAuthCookie(baseUrl: string, provider: OAuthProvider): Promise<void> {
-  await beginOAuthFlow(baseUrl, provider, true);
+  await beginOAuthFlow(baseUrl, provider, "cookie");
 }
 
 /** Begins the GitHub OAuth flow and resolves with the session token polled from `/auth/state`. */
@@ -468,6 +500,55 @@ export function signInWithMicrosoft(baseUrl: string): Promise<string> {
  *  dedicated POST `/auth/apple/callback`. */
 export function signInWithApple(baseUrl: string): Promise<string> {
   return signInWithOAuth(baseUrl, "apple");
+}
+
+/** A token-mode OAuth login resolved together with the durable
+ *  session-revoke capability (bearer delivery — the server sets no cookie):
+ *  `token` feeds `setToken`/`getToken`; `sessionId` + `revokeSecret` are the
+ *  two halves `revokeOAuthSession` consumes, and `expiresAt` bounds the
+ *  capability's validity on SERVER time (a retry bound, not a proof — see
+ *  {@link revokeOAuthSession} for the sound resolution rule). The halves are
+ *  delivered once: `revokeSecret` only in the begin response, `sessionId` +
+ *  `expiresAt` only in the completion poll. The server omits the fields
+ *  outside bearer delivery, so they may be `undefined` even on success —
+ *  treat that as "no capability issued", not an error. */
+export interface OAuthSessionCapability {
+  /** The bearer session token — pass to `RtDbClient`'s `getToken`/`setToken`. */
+  token: string;
+  /** Non-secret half of the revoke capability (undefined outside bearer delivery). */
+  sessionId: string | undefined;
+  /** One-time secret half, delivered only in the begin response (undefined outside bearer delivery). */
+  revokeSecret: string | undefined;
+  /** Server-time instant after which the capability is unresolved-unverifiable (undefined outside bearer delivery). */
+  expiresAt: number | undefined;
+}
+
+/**
+ * Begins a provider OAuth flow in bearer delivery (`mode=bearer`) and
+ * resolves with the session token AND the durable session-revoke capability.
+ * Persist the `token` on your `RtDbClient` as usual; keep `sessionId` +
+ * `revokeSecret` where your app can reach them and wire logout/unbind to
+ * `revokeOAuthSession(authBaseUrl, capability.sessionId, capability.revokeSecret)`
+ * (retry until `"revoked"`, then give up only per `expiresAt`'s rule). This is
+ * the only helper whose login yields the capability — `signInWith*` resolve
+ * the token alone — and it sets no cookie, so the token is the only
+ * credential. Requires the same server surface as the other helpers (no
+ * server-side enablement beyond what bearer delivery already ships).
+ */
+export async function signInWithOAuthSession(
+  baseUrl: string,
+  provider: OAuthProvider,
+): Promise<OAuthSessionCapability> {
+  const r = await beginOAuthFlow(baseUrl, provider, "bearer");
+  if (r.token === undefined) {
+    throw new Error("sign-in completed without a token");
+  }
+  return {
+    token: r.token,
+    sessionId: r.sessionId,
+    revokeSecret: r.revokeSecret,
+    expiresAt: r.expiresAt,
+  };
 }
 
 /** Durably revokes ONE OAuth session by its capability pair — `sessionId`

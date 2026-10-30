@@ -14,6 +14,7 @@ import {
   signInWithGitLab,
   signInWithGoogle,
   signInWithMicrosoft,
+  signInWithOAuthSession,
   signInWithOidc,
   Unauthenticated,
   useConnectionState,
@@ -256,6 +257,89 @@ describe("signInWithGoogle (begin + poll relay)", () => {
       "rtdb-auth",
       "noopener,noreferrer,width=600,height=700",
     );
+  });
+});
+
+describe("signInWithOAuthSession (bearer delivery + revoke capability)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("begins with mode=bearer and resolves the token plus the revoke-capability halves", async () => {
+    vi.useFakeTimers();
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy.mockResolvedValueOnce(
+      oauthResp({ authorizeUrl: "about:blank", state: "s1", revokeSecret: "rvs-1" }),
+    );
+    fetchSpy.mockResolvedValueOnce(oauthResp({ status: "pending" }));
+    fetchSpy.mockResolvedValueOnce(
+      oauthResp({
+        status: "complete",
+        token: "tok-cap",
+        user: { kind: "user" },
+        sessionId: "sid-1",
+        expiresAt: 1_700_000_000_000,
+      }),
+    );
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+
+    const promise = signInWithOAuthSession("http://h:8300", "google");
+    // Drives the begin fetch → first poll (pending) → 800ms sleep → second poll (complete).
+    await vi.advanceTimersByTimeAsync(OAUTH_POLL_INTERVAL_MS);
+
+    await expect(promise).resolves.toEqual({
+      token: "tok-cap",
+      sessionId: "sid-1",
+      revokeSecret: "rvs-1",
+      expiresAt: 1_700_000_000_000,
+    });
+    const beginUrl = fetchSpy.mock.calls[0]?.[0] as string;
+    expect(beginUrl).toContain("/auth/google/begin?origin=");
+    expect(beginUrl).toContain("&mode=bearer");
+    expect(openSpy).toHaveBeenCalledWith(
+      "about:blank",
+      "rtdb-auth",
+      "noopener,noreferrer,width=600,height=700",
+    );
+  });
+
+  it("resolves undefined capability halves when the server omits them", async () => {
+    vi.useFakeTimers();
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy.mockResolvedValueOnce(oauthResp({ authorizeUrl: "about:blank", state: "s1" }));
+    fetchSpy.mockResolvedValueOnce(
+      oauthResp({ status: "complete", token: "tok-plain", user: { kind: "user" } }),
+    );
+    vi.spyOn(window, "open").mockReturnValue(null);
+
+    const promise = signInWithOAuthSession("http://h:8300", "github");
+    await vi.advanceTimersByTimeAsync(OAUTH_POLL_INTERVAL_MS);
+
+    await expect(promise).resolves.toEqual({
+      token: "tok-plain",
+      sessionId: undefined,
+      revokeSecret: undefined,
+      expiresAt: undefined,
+    });
+  });
+
+  it("keeps the default-delivery begin URL free of a mode param", async () => {
+    vi.useFakeTimers();
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy.mockResolvedValueOnce(oauthResp({ authorizeUrl: "about:blank", state: "s1" }));
+    fetchSpy.mockResolvedValueOnce(
+      oauthResp({ status: "complete", token: "tok-1", user: { kind: "user" } }),
+    );
+    vi.spyOn(window, "open").mockReturnValue(null);
+
+    const promise = signInWithGitHub("http://h:8300");
+    await vi.advanceTimersByTimeAsync(OAUTH_POLL_INTERVAL_MS);
+    await expect(promise).resolves.toBe("tok-1");
+
+    const beginUrl = fetchSpy.mock.calls[0]?.[0] as string;
+    expect(beginUrl).toContain("/auth/github/begin?origin=");
+    expect(beginUrl).not.toContain("mode=");
   });
 });
 
