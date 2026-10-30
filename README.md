@@ -157,10 +157,14 @@ scheduler enqueues due work as `CommitterRequest::RunScheduled` /
 through `execute_query` under READ COMMITTED. Auth re-runs `authorize` on every
 Subscribe/Mutate over an open WebSocket. Revocation liveness extends to pushes:
 the subscription fan-out re-checks credential liveness per write batch — host
-tokens via `authorize`, user sessions via an `EXISTS` on the session row
-(revoked by any path, or expired ⇒ the subscription is dropped before
-publication, so a revoked session stops receiving query updates without waiting
-for a next op). File storage is HTTP-only and bypasses the
+tokens via `authorize`, user sessions via an `EXISTS` on the session row — and
+drops revoked/expired-session subscriptions before publication. The guarantee is
+batch-scoped, not continuous: a revocation that commits while a batch is already
+re-running can still deliver that batch's already-computed update (the same
+one-op window the per-op checks accept); every subsequent batch excludes the
+session. A transient liveness-lookup failure suppresses that batch's pushes for
+session-backed subscriptions (fail-closed, like host tokens) without severing
+the subscriptions. File storage is HTTP-only and bypasses the
 committer (blobs don't touch document tables). See
 [`server/README.md`](server/README.md) for the server layout and
 [`CLAUDE.md`](CLAUDE.md) for the full invariant list.

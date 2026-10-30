@@ -954,6 +954,18 @@ fn apply_session_liveness(entries: &mut DbSubs, states: &HashMap<String, HostLiv
     });
 }
 
+/// Publication gate mirroring `host_may_push`: a session-backed subscription
+/// pushes only on a confirmed `Live` check this pass. A `Transient` lookup
+/// failure SUPPRESSES this pass's pushes while retaining the subscription —
+/// the same fail-closed posture as host tokens — which costs nothing extra
+/// during a real Postgres outage (the re-run itself needs the database).
+fn session_may_push(entry: &SubEntry, states: &HashMap<String, HostLive>) -> bool {
+    match entry.principal_ctx.session_hash.as_ref() {
+        None => true,
+        Some(hash) => states.get(hash) == Some(&HostLive::Live),
+    }
+}
+
 /// Registered live-query subscriptions, sharded per database. Each database's
 /// subscriptions live behind its own `Arc<Mutex<DbSubs>>`, so a per-db
 /// committer's `fan_out` (a Postgres re-run per affected subscription) holds
@@ -1529,7 +1541,7 @@ impl SubscriptionManager {
                 }
             };
 
-            if !host_may_push(entry, &host_states) {
+            if !host_may_push(entry, &host_states) || !session_may_push(entry, &session_states) {
                 continue;
             }
             entry.last = canon;
@@ -1595,6 +1607,71 @@ mod tests {
 
     fn q(value: serde_json::Value) -> Query {
         serde_json::from_value(value).expect("parse query")
+    }
+
+    // Session liveness unit tests (review of d710c6d): Dead removes the
+    // subscription, a transient lookup failure retains it but suppresses this
+    // pass's pushes (fail-closed, mirroring host tokens), and N subscriptions
+    // on one session cost one liveness check.
+    #[tokio::test]
+    async fn revoked_session_subs_removed_transient_retained_but_suppressed() {
+        let manager = SubscriptionManager::new();
+        let schema = q(serde_json::json!({"table":"agents"}));
+        let hash = "deadbeef".to_string();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let entry = || SubEntry {
+            query: schema.clone(),
+            tx: tx.clone(),
+            last: "[]".into(),
+            read_set: ReadSet::Table,
+            principal_ctx: PrincipalCtx {
+                session_hash: Some(hash.clone()),
+                ..Default::default()
+            },
+            live_host_principal: None,
+        };
+        let mut entries = HashMap::from([((1, "a".into()), entry()), ((1, "b".into()), entry())]);
+
+        // Transient: both retained (one shared check), but no push allowed.
+        let mut checks = 0;
+        let states = session_liveness(&entries, |_| {
+            checks += 1;
+            std::future::ready(Err(RtDbError::internal("temporary")))
+        })
+        .await;
+        assert_eq!(checks, 1, "unique-hash dedupe: one check for two subs");
+        apply_session_liveness(&mut entries, &states);
+        assert_eq!(entries.len(), 2, "transient failure must retain subs");
+        assert!(entries.values().all(|e| !session_may_push(e, &states)));
+
+        // Dead: both removed.
+        let states = session_liveness(&entries, |_| {
+            std::future::ready(Err(RtDbError::unauthorized("revoked")))
+        })
+        .await;
+        apply_session_liveness(&mut entries, &states);
+        assert!(entries.is_empty());
+        drop(manager);
+    }
+
+    // A session-hash-less subscription (bypass/machine) is unaffected by the
+    // session gate: it pushes without any liveness state.
+    #[test]
+    fn session_may_push_bypass_unaffected() {
+        let manager = SubscriptionManager::new();
+        let schema = q(serde_json::json!({"table":"agents"}));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let entry = SubEntry {
+            query: schema,
+            tx,
+            last: "[]".into(),
+            read_set: ReadSet::Table,
+            principal_ctx: PrincipalCtx::bypass(),
+            live_host_principal: None,
+        };
+        let states: HashMap<String, HostLive> = HashMap::new();
+        assert!(session_may_push(&entry, &states));
+        drop(manager);
     }
 
     /// A table with string/number/boolean indexable fields and a couple of
