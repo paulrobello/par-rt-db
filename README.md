@@ -287,7 +287,7 @@ compression.
 | `POST /api/storage/{db}` | Bearer token | Upload: raw body + `Content-Type` → `{ id, sha256, size, contentType }`. Enforces `RTDB_MAX_FILE_SIZE`. |
 | `GET /storage/{id}` | **none** | **Unauthenticated public serve** — anyone with the opaque uuid-v7 URL fetches it (Convex parity; revoke by delete). The single unauthenticated route. |
 | `GET /api/storage/{db}/{id}` | Bearer token | Authed, caller-db-scoped serve. |
-| `DELETE /api/storage/{db}/{id}` | Bearer token | Deletes a blob (idempotent; revokes the public URL). |
+| `DELETE /api/storage/{db}/{id}` | Bearer token | Deletes a blob (idempotent; revokes the public URL). **Principal-scoped**: a machine token deletes only blobs it uploaded (`machine:{token_id}` owner stamp) and an OAuth user only its own; reads stay db-open for machine-owned blobs (consumer references survive token churn), and `None`-owner legacy rows stay deletable by any db-scoped principal. |
 | `GET /api/storage/{db}/{id}/metadata` | Bearer token | `{ id, sha256, size, contentType?, creationTime }`. |
 | `GET /api/storage/{db}/{id}/signed-url` | Bearer token | Mints a signed, time-limited public URL (`?exp=` + HMAC `?sig=`) for the blob. The mint is db-scoped: a caller authorized for db A cannot mint for a blob in db B (SEC-113). `?ttlSeconds=` clamps to `[1, MAX_SIGNED_URL_TTL_SECS]`; default `DEFAULT_SIGNED_URL_TTL_SECS`. The unauthenticated `GET /storage/{id}` route verifies `?exp=&sig=` when present (403 on failure) and behaves unchanged when absent (ENH-017). |
 

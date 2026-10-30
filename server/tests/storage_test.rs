@@ -1611,3 +1611,50 @@ async fn enh021_chunked_blob_range_semantics_unchanged() -> anyhow::Result<()> {
     assert_eq!(oob.headers().get("accept-ranges").unwrap(), "bytes");
     Ok(())
 }
+
+/// DELETE is principal-scoped (card 01a18ac4943, option b): a machine token
+/// can delete only blobs it uploaded (owner = its token id). A different
+/// token's delete is 403 — but it can still READ (authed serve) the blob, so
+/// consumer references survive token churn. The uploader deletes its own.
+#[tokio::test]
+async fn cross_token_delete_is_forbidden_but_read_stays_open() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let db = fresh_db(&state).await;
+    let addr = spawn_app(state.clone()).await;
+    let token_a = mint_token(addr, &db).await;
+    let token_b = mint_token(addr, &db).await;
+
+    let id = upload(&addr, &db, &token_a, b"owned by A").await;
+
+    // B's delete is refused; A's serve of it still works.
+    let resp = reqwest::Client::new()
+        .delete(format!("http://{addr}/api/storage/{db}/{id}"))
+        .bearer_auth(&token_b)
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "cross-token delete must 403"
+    );
+    let served = reqwest::Client::new()
+        .get(format!("http://{addr}/api/storage/{db}/{id}"))
+        .bearer_auth(&token_b)
+        .send()
+        .await?;
+    assert_eq!(
+        served.status(),
+        StatusCode::OK,
+        "cross-token READ stays open"
+    );
+    assert_eq!(served.bytes().await?.as_ref(), b"owned by A");
+
+    // The uploader deletes its own blob.
+    let resp = reqwest::Client::new()
+        .delete(format!("http://{addr}/api/storage/{db}/{id}"))
+        .bearer_auth(&token_a)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    Ok(())
+}

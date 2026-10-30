@@ -62,13 +62,16 @@ pub(crate) async fn upload_handler(
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    // SEC-118: stamp the uploading user's user_id onto the row so the authed
-    // serve/delete/metadata routes can enforce per-row authorization. Machine
-    // tokens and admin uploads stay NULL (system-initiated) — matching how
-    // `ownerField` treats system writes.
-    let owner_id = match &principal {
-        Principal::User { user_id, .. } => Some(user_id.as_str()),
-        Principal::Machine { .. } => None,
+    // SEC-118: stamp the uploading principal's identity onto the row —
+    // `user_id` for OAuth users, `machine:{token_id}` for machine tokens
+    // (card 01a18ac4943: an unowned machine upload was deletable by every
+    // other db-scoped token). DELETE is principal-scoped; machine-owned
+    // blobs stay db-open for READ for every principal class (a user reading
+    // a machine's blob keeps working — see `enforce_blob_owner`), so blob
+    // references held by consumers survive token churn.
+    let owner_id: Option<String> = match &principal {
+        Principal::User { user_id, .. } => Some(user_id.clone()),
+        Principal::Machine { token_id, .. } => Some(format!("machine:{token_id}")),
     };
     // ENH-021: stream the request body straight into the chunked storage path.
     // 1 MiB at a time is resident — N concurrent uploads is N × 1 MiB, not N ×
@@ -117,7 +120,7 @@ pub(crate) async fn upload_handler(
         &state.pool,
         &db,
         content_type.as_deref(),
-        owner_id,
+        owner_id.as_deref(),
         limit as u64,
         quota_check,
         body_stream,
@@ -302,15 +305,41 @@ pub(crate) async fn serve_public_handler(
     serve_bytes(&state, &db, &id, &q, range).await
 }
 
-/// - `blob_owner == Some(owner)` and the caller is a `User` whose `user_id`
-///   matches → allow.
-/// - Otherwise → `Forbidden`. Admin reaches storage via the `/admin/*` routes
-///   (which bypass per-row rules through `PrincipalCtx::bypass()`), not here.
+/// Per-row READ authorization: `blob_owner == None` allows every caller;
+/// machine-owned rows (the self-describing `machine:` owner prefix, which
+/// OAuth user ids never carry) stay db-open to readers of every principal
+/// class, so a user reading a machine's blob keeps working, while user-owned
+/// rows keep strict per-row protection against other users. Admin reaches
+/// storage via the `/admin/*` routes (which bypass per-row rules through
+/// `PrincipalCtx::bypass()`), not here.
 fn enforce_blob_owner(principal: &Principal, blob_owner: &Option<String>) -> Result<(), RtDbError> {
     match (blob_owner, principal) {
         (None, _) => Ok(()),
         (Some(_), Principal::Machine { .. }) => Ok(()),
         (Some(owner), Principal::User { user_id, .. }) if owner == user_id => Ok(()),
+        (Some(owner), Principal::User { .. }) if owner.starts_with("machine:") => Ok(()),
+        _ => Err(RtDbError::forbidden("not the blob owner")),
+    }
+}
+
+/// DELETE-only owner enforcement (card 01a18ac4943, option b): the destructive
+/// op is principal-scoped — a machine token may delete only blobs it uploaded
+/// (`machine:{token_id}`), an OAuth user only its own. Serve/metadata keep the
+/// db-open semantics of `enforce_blob_owner` (references held by consumers
+/// survive token churn). `None`-owner rows (pre-fix machine uploads, admin
+/// uploads) stay deletable by any db-scoped principal — legacy data, unchanged.
+fn enforce_blob_deletion(
+    principal: &Principal,
+    blob_owner: &Option<String>,
+) -> Result<(), RtDbError> {
+    match (blob_owner, principal) {
+        (None, _) => Ok(()),
+        (Some(owner), Principal::User { user_id, .. }) if owner == user_id => Ok(()),
+        (Some(owner), Principal::Machine { token_id, .. })
+            if *owner == format!("machine:{token_id}") =>
+        {
+            Ok(())
+        }
         _ => Err(RtDbError::forbidden("not the blob owner")),
     }
 }
@@ -749,9 +778,10 @@ pub(crate) async fn delete_handler(
     check_http_rate_limits(&state, &principal, &db).await?;
     // SEC-118: per-row owner check before the destructive op. A missing row
     // short-circuits to the idempotent `{ ok: true }` — the existence of an
-    // id is not disclosed to a non-owner.
+    // id is not disclosed to a non-owner. DELETE is principal-scoped
+    // (machine tokens delete only their own uploads; card 01a18ac4943).
     if let Some(meta) = storage::get_meta(&state.pool, &db, &id).await? {
-        enforce_blob_owner(&principal, &meta.owner_id)?;
+        enforce_blob_deletion(&principal, &meta.owner_id)?;
         storage::delete_with_epoch(&state.pool, &db, &id, Some(admission_epoch.0)).await?;
     }
     Ok(Json(OkResponse { ok: true }))

@@ -128,9 +128,10 @@ pub struct FileMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
     pub creation_time: i64,
-    /// Per-row owner (SEC-118). `None` for machine-token / admin uploads and
-    /// for rows that predate the column. Never serialized to the wire — the
-    /// HTTP metadata route redacts it before responding.
+    /// Per-row owner (SEC-118). The `user_id` for OAuth uploads,
+    /// `machine:{token_id}` for machine uploads; `None` for admin uploads and
+    /// rows predating the column. Never serialized to the wire — the HTTP
+    /// metadata route redacts it before responding.
     #[serde(skip)]
     pub owner_id: Option<String>,
 }
@@ -150,11 +151,13 @@ pub struct FileMeta {
 /// (small bodies, no need for streaming) and for tests that build rows
 /// directly. New HTTP uploads route through `put_stream`.
 ///
-/// SEC-118: `owner_id` carries the uploading principal's user_id for
-/// `Principal::User`, and is `None` for machine tokens / admin (system
-/// uploads). Enforcement is at the authed serve / delete / metadata routes,
-/// not here — a NULL owner is "anyone authorized for the db may touch it",
-/// matching how `ownerField` treats system-initiated document writes.
+/// SEC-118: `owner_id` carries the uploading principal's identity — the
+/// `user_id` for `Principal::User`, `machine:{token_id}` for machine tokens
+/// (HTTP uploads stamp it; admin/test `put` callers may pass `None`). DELETE
+/// is principal-scoped against it; reads stay db-open for machine-owned rows.
+/// Enforcement is at the authed serve / delete / metadata routes, not here —
+/// a NULL owner is "anyone authorized for the db may touch it", matching how
+/// `ownerField` treats system-initiated document writes.
 pub async fn put(
     pool: &PgPool,
     db: &str,
