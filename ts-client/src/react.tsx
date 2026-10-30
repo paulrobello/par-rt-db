@@ -319,10 +319,10 @@ export const OAUTH_POLL_TIMEOUT_MS = 180_000;
  *  the body. A transient fetch failure or malformed body keeps polling
  *  (returns `{ done: false }`); only a terminal `expired`/`error` status
  *  rejects. `sessionId` (bearer-mode logins only) is the non-secret half of
- *  the durable session-revoke capability and `expiresAt` its provable expiry —
- *  the session's absolute TTL, the instant the tombstone is swept; the server
- *  omits both halves otherwise, and a client holding the pair resolves the
- *  capability as fulfilled once local time passes `expiresAt`. */
+ *  the durable session-revoke capability and `expiresAt` its absolute expiry
+ *  bound on SERVER time — the tombstone-sweep instant; the server omits both
+ *  halves otherwise. It is a retry bound, not a proof: a client clock ahead of
+ *  the server reaches it early (see revokeOAuthSession for the sound rule). */
 async function pollOAuthState(
   apiBase: string,
   state: string,
@@ -476,13 +476,14 @@ export function signInWithApple(baseUrl: string): Promise<string> {
  *  this needs neither the bearer token nor any admin credential, and unlike
  *  `/auth/state/revoke` it is not bounded by the 10-minute state window —
  *  the capability lives for the session's TTL. `"revoked"` is a confirmed
- *  fence (also the idempotent retry answer); `"unknown"` means the pair did
- *  not match anything (treat as unconfirmed and retry). Resolution rule:
- *  retry until `"revoked"`; once local time passes the poll's `expiresAt`
- *  the capability is resolved as fulfilled — the session is dead by TTL
- *  regardless, and `"unknown"` before that instant is a genuine anomaly
- *  (wrong server, stamp failure, feature-less server), not an expired
- *  capability. */
+ *  fence (also the idempotent retry answer, and the answer for an
+ *  already-expired row the server still holds); `"unknown"` means the pair
+ *  did not match anything (treat as unconfirmed and retry). Skew-safe
+ *  resolution rule: retry until `"revoked"`; only after the poll's
+ *  `expiresAt` (server time) plus a clock-skew margin AND continued
+ *  `"unknown"` may the client stop — resolved-unverifiable, never proven.
+ *  A client clock ahead of the server can pass `expiresAt` early, so local
+ *  time alone is not proof of expiry. */
 export async function revokeOAuthSession(
   baseUrl: string,
   sessionId: string,

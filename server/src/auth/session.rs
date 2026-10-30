@@ -404,10 +404,13 @@ pub async fn stamp_revoke_capability(
 /// The durable capability (`session_id`, `expires_at`) for a session token,
 /// for the one-shot poll delivery. `None` when the token does not resolve or
 /// the row carries no capability (never stamped — cookie/default logins and
-/// pre-upgrade rows). `expires_at` rides along as the capability's PROVABLE
-/// expiry: the tombstone sweeping at that instant bounds the evidentiary
-/// window, so a client holding the pair can resolve the capability as
-/// fulfilled once local time passes it (the session is dead by TTL regardless).
+/// pre-upgrade rows). `expires_at` rides along as the capability's absolute
+/// expiry bound ON SERVER TIME — the tombstone-sweep instant. It is a retry
+/// bound, not a client-side proof: a client clock ahead of the server
+/// reaches it early, so the sound rule is retry-until-`revoked` (the
+/// server confirms an already-expired row it still holds), then stop only
+/// past this instant plus a clock-skew margin with continued `unknown`
+/// (resolved-unverifiable).
 pub async fn lookup_session_capability(
     pool: &PgPool,
     token: &str,

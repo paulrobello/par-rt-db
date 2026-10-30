@@ -1420,10 +1420,11 @@ async fn default_flow_poll_omits_session_id() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Provable capability expiry: the bearer poll delivers `expiresAt` — the
-// session's absolute expires_at, the instant the tombstone is swept — so a
-// client holding (sessionId, revokeSecret) can resolve the capability as
-// fulfilled once local time passes it, instead of retrying `unknown` forever.
+// Expiry delivery: the bearer poll delivers `expiresAt` — the session's
+// absolute expires_at on server time, the tombstone-sweep instant — the bound
+// a client's retry loop uses. Not a client-side proof (clock skew); the sound
+// rule lives in the endpoint docs: retry until `revoked`, stop past the bound
+// plus a skew margin with continued `unknown`.
 #[tokio::test]
 async fn poll_delivers_provable_capability_expiry() -> anyhow::Result<()> {
     let mock = MockServer::start().await;

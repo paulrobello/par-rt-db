@@ -832,5 +832,11 @@ a binary that cannot answer them anyway):
 DELETE FROM rtdb_auth.sessions WHERE revoked_at IS NOT NULL;
 ```
 
-(Newer binaries are unaffected either way: every resolver excludes
-`revoked_at IS NOT NULL`.)
+**This purge is an owner-authorization step, not a routine command**: it deletes
+credential rows on the live database. Run it only with the operator's explicit
+go-ahead for the specific rollback, during a write-quiet window (no concurrent
+tombstone creation), and never as a standing cleanup — a co-op consumer holding
+sessions on the instance must be consulted first. The pinned probe covers the
+old resolver SQL shape, not a runtime old-binary rollback; mixed-version runtime
+verification remains open. (Newer binaries are unaffected either way: every
+resolver excludes `revoked_at IS NOT NULL`.)

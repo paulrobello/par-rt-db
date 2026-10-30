@@ -1023,12 +1023,14 @@ enum StateResponse {
         user: AuthedUser,
         #[serde(rename = "sessionId", skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
-        /// The capability's provable expiry — the session's absolute
-        /// `expires_at` (bearer logins only): the instant the tombstone is
-        /// swept and the evidentiary window closes. A client resolves the
-        /// capability as fulfilled once local time passes it; `unknown`
-        /// before that instant is a genuine anomaly, not an expired
-        /// capability.
+        /// The capability's absolute expiry bound (bearer logins only): the
+        /// session's `expires_at` on SERVER time, when the tombstone is
+        /// swept. Not a client-side proof — a client clock ahead of the
+        /// server reaches it early. The sound client rule: retry until
+        /// `revoked` (the server answers `revoked` for an already-expired
+        /// row it still holds, proving and pruning it); only after this
+        /// instant plus a clock-skew margin AND continued `unknown` may the
+        /// client stop, as resolved-unverifiable — never as proof.
         #[serde(rename = "expiresAt", skip_serializing_if = "Option::is_none")]
         expires_at: Option<i64>,
     },
