@@ -1419,3 +1419,166 @@ async fn default_flow_poll_omits_session_id() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// --- logout tombstone rule (card: capability anchor survives logout) ---------
+
+// Bearer logout on a capability-stamped session tombstones the row instead of
+// deleting it: the token dies everywhere (revoked_at is excluded by every
+// resolver) while the capability anchor survives, so a lost logout response
+// followed by a /auth/session/revoke retry answers a confirmed `revoked`
+// (previously: `unknown`, indistinguishable from never-matched).
+#[tokio::test]
+async fn logout_tombstones_capability_session_and_retries_confirm() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let email = unique_email("logout-tomb");
+    mount_github_mocks(&mock, unique_github_id(), "paul", &email, Duration::ZERO, 1).await;
+    let (state, addr) = bearer_state(&mock).await;
+
+    let client = no_redirect_client();
+    let (token, session_id, secret) = bearer_login(&client, addr).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/auth/logout"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await?;
+    assert_eq!(body["ok"], json!(true));
+
+    // The token is dead everywhere.
+    let me = reqwest::Client::new()
+        .get(format!("http://{addr}/auth/me"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    assert_eq!(me.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(live_session_count_for_email(&state, &email).await, 0);
+
+    // The tombstone row persists with the capability anchor intact.
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT 1::BIGINT FROM rtdb_auth.sessions WHERE session_id = $1 AND revoked_at IS NOT NULL AND revoke_secret_hash IS NOT NULL")
+            .bind(&session_id)
+            .fetch_optional(&state.pool)
+            .await
+            .expect("tombstone row lookup");
+    assert!(row.is_some(), "capability tombstone must survive logout");
+
+    // Criterion: the retry after a committed logout answers confirmed revoked.
+    let retry = revoke_session(addr, &session_id, Some(&secret)).await;
+    assert_eq!(retry.json::<Value>().await?, json!({"status": "revoked"}));
+    Ok(())
+}
+
+// Idempotent logout: a second logout on an already-tombstoned capability
+// session is a no-op — the tombstone (and its capability anchor) survives, and
+// the capability retry still confirms.
+#[tokio::test]
+async fn logout_idempotent_capability_tombstone_reconfirms() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let email = unique_email("logout-idem");
+    mount_github_mocks(&mock, unique_github_id(), "paul", &email, Duration::ZERO, 1).await;
+    let (state, addr) = bearer_state(&mock).await;
+
+    let client = no_redirect_client();
+    let (token, session_id, secret) = bearer_login(&client, addr).await;
+
+    for _ in 0..2 {
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/auth/logout"))
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    }
+
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT 1::BIGINT FROM rtdb_auth.sessions WHERE session_id = $1 AND revoked_at IS NOT NULL",
+    )
+    .bind(&session_id)
+    .fetch_optional(&state.pool)
+    .await
+    .expect("tombstone row lookup");
+    assert!(row.is_some(), "repeat logout must not delete the tombstone");
+
+    let retry = revoke_session(addr, &session_id, Some(&secret)).await;
+    assert_eq!(retry.json::<Value>().await?, json!({"status": "revoked"}));
+    Ok(())
+}
+
+// Expiry bound: the logout tombstone is pruned by the same TTL sweep as any
+// other — after the sweep, the capability retry answers `unknown` (the
+// evidentiary window is bounded by the session TTL; safe but not evidentiary,
+// per the endpoint docs).
+#[tokio::test]
+async fn logout_prunes_expired_capability_tombstone() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let email = unique_email("logout-prune");
+    mount_github_mocks(&mock, unique_github_id(), "paul", &email, Duration::ZERO, 1).await;
+    let (state, addr) = bearer_state(&mock).await;
+
+    let client = no_redirect_client();
+    let (token, session_id, secret) = bearer_login(&client, addr).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/auth/logout"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // Age the tombstone past its TTL and run the sweep directly.
+    sqlx::query("UPDATE rtdb_auth.sessions SET expires_at = 1 WHERE session_id = $1")
+        .bind(&session_id)
+        .execute(&state.pool)
+        .await
+        .expect("age logout tombstone");
+    let pruned = rtdb_server::auth::session::sweep_revoked_tombstones(&state.pool).await?;
+    assert_eq!(pruned, 1, "the expired logout tombstone is pruned");
+
+    // Evidentiary window closed: the retry can no longer confirm.
+    let retry = revoke_session(addr, &session_id, Some(&secret)).await;
+    assert_eq!(retry.json::<Value>().await?, json!({"status": "unknown"}));
+    Ok(())
+}
+
+// Regression: a session WITHOUT a capability (default/cookie deliveries) is
+// still hard-deleted by logout — no tombstone, row gone entirely.
+#[tokio::test]
+async fn logout_still_deletes_noncapability_sessions() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let email = unique_email("logout-plain");
+    mount_github_mocks(&mock, unique_github_id(), "paul", &email, Duration::ZERO, 1).await;
+    let (state, addr) = bearer_state(&mock).await;
+
+    let client = no_redirect_client();
+    let state_token = begin_login(&client, addr, None).await;
+    let cb = callback(&client, addr, &state_token).await;
+    assert_eq!(cb.status(), reqwest::StatusCode::OK);
+    let pv = poll_state(&client, addr, &state_token).await;
+    assert_eq!(pv["status"], json!("complete"));
+    let token = pv["token"]
+        .as_str()
+        .expect("default poll carries token")
+        .to_string();
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/auth/logout"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(live_session_count_for_email(&state, &email).await, 0);
+
+    let (rows,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM rtdb_auth.sessions s JOIN rtdb_auth.users u ON u.id = s.user_id WHERE u.email = $1")
+            .bind(&email)
+            .fetch_one(&state.pool)
+            .await
+            .expect("count all rows");
+    assert_eq!(
+        rows, 0,
+        "non-capability logout must hard-delete, no tombstone"
+    );
+    Ok(())
+}

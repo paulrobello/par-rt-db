@@ -150,15 +150,100 @@ pub async fn resolve_session(pool: &PgPool, token: &str) -> Result<Option<Princi
     }))
 }
 
-/// Deletes a session by its plaintext token. Not an error if the token
-/// doesn't exist — logout is idempotent (see `auth::provider::logout`).
+/// Deletes a session by its plaintext token — the logout resolver. Not an
+/// error if the token doesn't exist — logout is idempotent (see
+/// `auth::provider::logout`).
+///
+/// Capability-bearing rows (`revoke_secret_hash IS NOT NULL`) are TOMBSTONED
+/// rather than deleted: the row is the only durable anchor
+/// `POST /auth/session/revoke` resolves against, and hard-deleting it turns
+/// every future capability retry into `unknown` — indistinguishable from
+/// never-matched. The tombstone sets the same `revoked_at` marker every
+/// resolver excludes, so the session dies exactly as a delete would; only the
+/// anchor survives (until the TTL sweep prunes it). Rows without a capability
+/// keep the plain delete, and an already-tombstoned row is left untouched.
 pub async fn delete_session(pool: &PgPool, token: &str) -> Result<(), RtDbError> {
     let hash = sha256_hex(token);
-    sqlx::query("DELETE FROM rtdb_auth.sessions WHERE token_hash = $1")
-        .bind(&hash)
+    tombstone_or_delete_by_hash(pool, &hash).await
+}
+
+/// The shared revocation-by-deletion resolver keyed on `token_hash`: tombstone
+/// live capability rows, delete the rest. Logout (by plaintext token), the
+/// admin revoke-one path, and `delete_sessions_for_user` all resolve through
+/// this so every deletion path preserves the capability anchor the same way
+/// `POST /auth/session/revoke` does.
+async fn tombstone_or_delete_by_hash(pool: &PgPool, hash: &str) -> Result<(), RtDbError> {
+    let now = now_ms();
+    sqlx::query(
+        "UPDATE rtdb_auth.sessions \
+         SET revoked_at = $2 \
+         WHERE token_hash = $1 AND revoked_at IS NULL AND revoke_secret_hash IS NOT NULL",
+    )
+    .bind(hash)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "DELETE FROM rtdb_auth.sessions WHERE token_hash = $1 AND revoke_secret_hash IS NULL",
+    )
+    .bind(hash)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Deletes one session by its token_hash (the admin revoke-one path). SEC-120:
+/// tries both `sessions` (OAuth user) and `admin_sessions` (admin-key login) so
+/// either kind is revocable through the same `DELETE /admin/sessions/{hash}`.
+/// Capability-bearing rows are tombstoned rather than deleted (same anchor
+/// rule as `delete_session`); admin-key rows have no capability and keep the
+/// plain delete. Idempotent: returns 1 when the row existed, 0 if already
+/// gone — never an error.
+pub async fn delete_session_by_hash(pool: &PgPool, token_hash: &str) -> Result<u64, RtDbError> {
+    let now = now_ms();
+    let r1 = sqlx::query(
+        "UPDATE rtdb_auth.sessions \
+         SET revoked_at = $2 \
+         WHERE token_hash = $1 AND revoked_at IS NULL AND revoke_secret_hash IS NOT NULL",
+    )
+    .bind(token_hash)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    let r2 = sqlx::query(
+        "DELETE FROM rtdb_auth.sessions WHERE token_hash = $1 AND revoke_secret_hash IS NULL",
+    )
+    .bind(token_hash)
+    .execute(pool)
+    .await?;
+    let r3 = sqlx::query("DELETE FROM rtdb_auth.admin_sessions WHERE token_hash = $1")
+        .bind(token_hash)
         .execute(pool)
         .await?;
-    Ok(())
+    Ok(r1.rows_affected() + r2.rows_affected() + r3.rows_affected())
+}
+
+/// Deletes every session for `user_id` (the admin revoke-all path). Idempotent.
+/// Capability-bearing rows are tombstoned rather than deleted (same anchor
+/// rule as `delete_session`).
+pub async fn delete_sessions_for_user(pool: &PgPool, user_id: &str) -> Result<u64, RtDbError> {
+    let now = now_ms();
+    let r1 = sqlx::query(
+        "UPDATE rtdb_auth.sessions \
+         SET revoked_at = $2 \
+         WHERE user_id = $1 AND revoked_at IS NULL AND revoke_secret_hash IS NOT NULL",
+    )
+    .bind(user_id)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    let r2 = sqlx::query(
+        "DELETE FROM rtdb_auth.sessions WHERE user_id = $1 AND revoke_secret_hash IS NULL",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(r1.rows_affected() + r2.rows_affected())
 }
 
 /// Deletes an admin session by its plaintext token (SEC-004: `POST
@@ -266,31 +351,6 @@ pub async fn list_sessions(
             },
         )
         .collect())
-}
-
-/// Deletes one session by its token_hash (the admin revoke-one path). SEC-120:
-/// tries both `sessions` (OAuth user) and `admin_sessions` (admin-key login) so
-/// either kind is revocable through the same `DELETE /admin/sessions/{hash}`.
-/// Idempotent: returns 0 if the row is already gone — never an error.
-pub async fn delete_session_by_hash(pool: &PgPool, token_hash: &str) -> Result<u64, RtDbError> {
-    let r1 = sqlx::query("DELETE FROM rtdb_auth.sessions WHERE token_hash = $1")
-        .bind(token_hash)
-        .execute(pool)
-        .await?;
-    let r2 = sqlx::query("DELETE FROM rtdb_auth.admin_sessions WHERE token_hash = $1")
-        .bind(token_hash)
-        .execute(pool)
-        .await?;
-    Ok(r1.rows_affected() + r2.rows_affected())
-}
-
-/// Deletes every session for `user_id` (the admin revoke-all path). Idempotent.
-pub async fn delete_sessions_for_user(pool: &PgPool, user_id: &str) -> Result<u64, RtDbError> {
-    let result = sqlx::query("DELETE FROM rtdb_auth.sessions WHERE user_id = $1")
-        .bind(user_id)
-        .execute(pool)
-        .await?;
-    Ok(result.rows_affected())
 }
 
 /// Deletes every EXPIRED session row (the admin remove-all-expired path).

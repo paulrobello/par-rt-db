@@ -2,10 +2,30 @@ use crate::common::{admin_delete, admin_get, mint_user_session, spawn_app, test_
 use rtdb_server::auth::Principal;
 use rtdb_server::auth::session::{
     create_admin_session, create_session, delete_session_by_hash, delete_sessions_for_user,
-    list_sessions, resolve_session,
+    list_sessions, resolve_session, stamp_revoke_capability,
 };
 use rtdb_server::db::sha256_hex;
 use serde_json::Value;
+
+/// Stamps a capability pair onto a freshly minted session, the way the bearer
+/// settlement path does: the stored verifier is sha256 of the client-only
+/// secret, so `POST /auth/session/revoke` can confirm against it.
+async fn stamp_capability(
+    pool: &sqlx::PgPool,
+    token: &str,
+    suffix: impl std::fmt::Display,
+    label: &str,
+) {
+    let secret = format!("secret-{label}-{suffix}");
+    stamp_revoke_capability(
+        pool,
+        token,
+        &format!("sid-{label}-{suffix}"),
+        &sha256_hex(&secret),
+    )
+    .await
+    .expect("stamp capability");
+}
 
 #[tokio::test]
 async fn list_and_delete_sessions_works() -> anyhow::Result<()> {
@@ -229,5 +249,71 @@ async fn admin_can_remove_all_expired_sessions() -> anyhow::Result<()> {
     // test binary may expire rows into the shared DB at any moment).
     let resp = admin_delete(addr, "/admin/sessions?expired=true").await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    Ok(())
+}
+
+/// Admin revocation-by-deletion preserves capability anchors the same way the
+/// capability endpoint does: revoke-one by hash and revoke-all for a user
+/// tombstone capability rows (revoked_at set, row retained) instead of
+/// destroying them, so a client's `POST /auth/session/revoke` retry keeps
+/// answering a confirmed `revoked`. Non-capability rows keep the plain
+/// delete, and revoked tombstones never reappear in `/admin/sessions`.
+#[tokio::test]
+async fn admin_revoke_paths_tombstone_capability_rows() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let suffix = uuid::Uuid::now_v7().simple();
+    let id = format!("u-cap-{suffix}");
+    let email = format!("cap-{suffix}@example.com");
+    mint_user_session(&state.pool, &id, &email).await;
+
+    // Two capability-stamped rows + one plain row for the same user.
+    let tok_a = create_session(&state.pool, &id, 1).await?;
+    let tok_b = create_session(&state.pool, &id, 1).await?;
+    stamp_capability(&state.pool, &tok_a, &suffix, "a").await;
+    stamp_capability(&state.pool, &tok_b, &suffix, "b").await;
+    let _plain = create_session(&state.pool, &id, 1).await?;
+
+    // Revoke-one by hash: tombstones, count semantics unchanged. Four rows
+    // were created (the minted one plus three); one is now a tombstone.
+    let hash_a = sha256_hex(&tok_a);
+    let resp = admin_delete(addr, &format!("/admin/sessions/{hash_a}")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(list_sessions(&state.pool, Some(&id), 1000).await?.len(), 3);
+    let (tombstones,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM rtdb_auth.sessions WHERE token_hash = $1 AND revoked_at IS NOT NULL",
+    )
+    .bind(&hash_a)
+    .fetch_one(&state.pool)
+    .await?;
+    assert_eq!(tombstones, 1, "revoke-one must tombstone, not delete");
+
+    // Revoke-all for the user: tombstones the other capability row, hard-
+    // deletes the plain one. Count semantics unchanged (3 = 1 tombstone + 1
+    // capability tombstone + 1 plain delete).
+    let resp = admin_delete(addr, &format!("/admin/sessions?user={id}")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await?;
+    assert_eq!(body["revoked"], serde_json::json!(3));
+    assert_eq!(list_sessions(&state.pool, Some(&id), 1000).await?.len(), 0);
+
+    // Both capability retries confirm from their tombstones.
+    for label in ["a", "b"] {
+        let secret = format!("secret-{label}-{suffix}");
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/auth/session/revoke"))
+            .json(&serde_json::json!({
+                "sessionId": format!("sid-{label}-{suffix}"),
+                "revokeSecret": secret
+            }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            resp.json::<Value>().await?,
+            serde_json::json!({"status": "revoked"}),
+            "capability retry after admin revoke-all must confirm"
+        );
+    }
     Ok(())
 }
