@@ -317,3 +317,55 @@ async fn admin_revoke_paths_tombstone_capability_rows() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Downgrade hazard probe (card 01a18a17f1a3): an OLD server binary
+/// (pre-b5c27c3) resolved sessions with `WHERE token_hash = $1` and no
+/// `revoked_at` filter — it cannot see revocation. Against the upgraded
+/// schema, a tombstoned (revoked) row therefore still authenticates under the
+/// old resolver shape, and an old logout hard-deletes the tombstone,
+/// destroying the capability anchor. Rolling back across b5c27c3 resurrects
+/// revoked sessions until their TTL; the address is the purge runbook step in
+/// `deploy/README.md` (Rollback — Downgrading across session revocation).
+/// This probe pins the hazard against the CURRENT schema so a schema change
+/// that invalidates the runbook forces this test to be re-derived.
+#[tokio::test]
+async fn old_resolver_sql_resolves_revoked_tombstones_downgrade_hazard() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let suffix = uuid::Uuid::now_v7().simple();
+    let user_id = format!("u-rollback-{suffix}");
+    let email = format!("rollback-{suffix}@example.com");
+    mint_user_session(&state.pool, &user_id, &email).await;
+
+    // A capability-stamped session, tombstoned exactly as
+    // POST /auth/session/revoke leaves it (revoked_at set, row retained).
+    let token = create_session(&state.pool, &user_id, 1).await?;
+    stamp_capability(&state.pool, &token, &suffix, "rb").await;
+    let hash = sha256_hex(&token);
+    sqlx::query("UPDATE rtdb_auth.sessions SET revoked_at = $1 WHERE token_hash = $2")
+        .bind(rtdb_server::db::now_ms())
+        .bind(&hash)
+        .execute(&state.pool)
+        .await?;
+
+    // The CURRENT resolver excludes the tombstone.
+    assert!(
+        resolve_session(&state.pool, &token).await?.is_none(),
+        "current resolver must exclude the tombstone"
+    );
+
+    // The PRE-b5c27c3 resolver shape — verbatim old WHERE clause — resolves
+    // it: the resurrection hazard the runbook's purge step addresses.
+    let old_row: Option<(String, i64)> = sqlx::query_as(
+        "SELECT s.user_id, s.expires_at \
+         FROM rtdb_auth.sessions s \
+         WHERE s.token_hash = $1",
+    )
+    .bind(&hash)
+    .fetch_optional(&state.pool)
+    .await?;
+    assert!(
+        old_row.is_some(),
+        "old resolver shape resurrects the tombstone"
+    );
+    Ok(())
+}

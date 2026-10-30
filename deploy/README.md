@@ -812,3 +812,25 @@ older commit.
 
 `docker compose down` only stops the stack (the named volume `rtdb-pg` persists
 data) — it is not a rollback. To wipe data too: `docker compose down -v`.
+
+### Downgrading across session revocation (b5c27c3)
+
+The session-revocation schema is additive (`session_id`, `revoke_secret_hash`,
+`revoked_at` on `rtdb_auth.sessions`), so an OLD binary happily runs against the
+upgraded database — but it cannot see `revoked_at`. The pre-revocation resolvers
+matched `WHERE token_hash = $1` with no revocation filter, so a REVOKED session
+left as a tombstone still authenticates under an old binary, and an old logout
+hard-deletes the tombstone (destroying the capability anchor). Rolling back to a
+pre-`b5c27c3` commit therefore resurrects revoked sessions until their TTL
+expires. The pinned probe is `sessions_test::old_resolver_sql_resolves_revoked_tombstones_downgrade_hazard`.
+
+Before rolling back across `b5c27c3`, purge the tombstones on the live database
+(revoked sessions become plain deletions — their capability anchors are moot on
+a binary that cannot answer them anyway):
+
+```sql
+DELETE FROM rtdb_auth.sessions WHERE revoked_at IS NOT NULL;
+```
+
+(Newer binaries are unaffected either way: every resolver excludes
+`revoked_at IS NOT NULL`.)
