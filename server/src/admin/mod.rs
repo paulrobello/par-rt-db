@@ -58,15 +58,30 @@ use tokens::*;
 use webhooks::*;
 use workflows::*;
 
-/// Who an admin request was made as: the raw admin key (CLI/automation) or an
-/// OAuth user on the server-wide admin allowlist (browser dashboard). The
+/// Who an admin request was made as: the raw admin key (CLI/automation), a
+/// dashboard cookie admin-session row (SEC-120), or an OAuth user on the
+/// server-wide admin allowlist (browser dashboard). The
 /// `User` variant is unit today — admin activity is currently attributed only
 /// through the op-feed's `owner` field (which is `None` for admin writes); if
 /// per-principal audit logging is added later, thread the resolved `Principal`
 /// back in here.
 #[derive(Clone, Copy)]
 pub(crate) enum AdminPrincipal {
+    /// The raw root admin key (bearer). The only credential admitted to the
+    /// raw-key-only destructive gates — the admin purge route and legacy
+    /// `evalExpr` migrate directives (SEC-107).
     Key,
+    /// A dashboard cookie session row (SEC-120 hashed token in
+    /// `rtdb_auth.admin_sessions`). Full admin surfaces, but NOT the
+    /// raw-key-only gates: a cookie session is a delegated, revocable
+    /// credential and must never reach the purge route or legacy raw-SQL
+    /// `evalExpr`.
+    Session,
+    /// OAuth user on the server-wide admin allowlist (browser dashboard). The
+    /// `User` variant is unit today — admin activity is currently attributed only
+    /// through the op-feed's `owner` field (which is `None` for admin writes); if
+    /// per-principal audit logging is added later, thread the resolved `Principal`
+    /// back in here.
     User,
 }
 
@@ -129,11 +144,12 @@ pub(crate) async fn authenticate_admin(
     }
     // SEC-120: the dashboard cookie now carries a hashed admin session token
     // (never the raw admin key). Resolve it against `rtdb_auth.admin_sessions`
-    // — a valid, non-expired row admits the request as `AdminPrincipal::Key`
-    // (same privilege tier as the raw key). Falls through to the OAuth path on
-    // a miss so a non-admin session is still rejected with the right code.
+    // — a valid, non-expired row admits the request as `AdminPrincipal::Session`
+    // (every dashboard surface, but not the raw-key-only destructive gates).
+    // Falls through to the OAuth path on a miss so a non-admin session is
+    // still rejected with the right code.
     if auth::session::resolve_admin_session(&state.pool, token).await? {
-        return Ok(AdminPrincipal::Key);
+        return Ok(AdminPrincipal::Session);
     }
     let principal = match auth::resolve_bearer(&state.pool, token).await {
         Ok(principal) => principal,

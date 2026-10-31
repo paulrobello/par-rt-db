@@ -79,8 +79,10 @@ pub(super) async fn admin_purge(
     Path(db): Path<String>,
     ApiJson(body): ApiJson<PurgeRequest>,
 ) -> Result<Json<PurgeResponse>, RtDbError> {
-    // Owner direction 2026-10-31: admin-key only — an OAuth allowlist session
-    // (User) may never purge, matching the key-only gate on schema restore.
+    // Owner direction 2026-10-31: admin-key only — delegated credentials
+    // (dashboard cookie sessions, `Session`; OAuth allowlist admins, `User`)
+    // may never purge, matching the raw-key gate on legacy evalExpr migrate
+    // directives (SEC-107).
     if !matches!(principal, AdminPrincipal::Key) {
         return Err(RtDbError::forbidden("purge requires the admin key"));
     }

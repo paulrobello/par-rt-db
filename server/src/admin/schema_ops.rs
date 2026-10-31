@@ -127,8 +127,9 @@ pub(super) async fn admin_migrate(
     // — a denylist over SQL text cannot be made sound, so containment is enforced
     // structurally here: a LEGACY `evalExpr` (either `expr` or `where` carrying
     // a raw-SQL string) is admitted only under the root `admin_key`
-    // (`AdminPrincipal::Key`), never under a delegated/OAuth-allowlist dashboard
-    // admin. The root admin_key holder already has full server/DB access, so it
+    // (`AdminPrincipal::Key`), never under a delegated credential (dashboard
+    // cookie session, `Session`; OAuth allowlist admin, `User`). The root
+    // admin_key holder already has full server/DB access, so it
     // does not expand their reach; a delegated admin must not reach
     // `rtdb_auth.machine_tokens`/`sessions`/`admins` or other tenants' documents
     // through raw SQL. The TYPED path (ENH-020 — a closed `ValueExpr` /

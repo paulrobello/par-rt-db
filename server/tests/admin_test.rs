@@ -2599,3 +2599,89 @@ async fn delete_db_without_creation_id_still_deletes() -> anyhow::Result<()> {
     assert!(!schema_exists(&pool, &name).await?);
     Ok(())
 }
+
+// SEC-120 credential-kind split (card 01a19332f16a7660b6da12dc091b907b):
+// dashboard cookie sessions resolve to `AdminPrincipal::Session`, which keeps
+// every dashboard surface but is rejected at the raw-key-only gates — the
+// admin purge route and legacy raw-SQL `evalExpr` migrate directives.
+
+#[tokio::test]
+async fn sec120_cookie_session_purge_rejected_403() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    let (client, _session, csrf) = admin_login_cookies(addr).await;
+    let resp = client
+        .post(format!("http://{addr}/admin/db/some-db/purge"))
+        .header("x-rtdb-csrf", &csrf)
+        .json(&serde_json::json!({"table": "events"}))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a cookie session must not reach the purge route"
+    );
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], serde_json::json!("FORBIDDEN"));
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("purge requires the admin key")),
+        "the 403 must come from the purge key gate, not the CSRF guard: {}",
+        body["message"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sec120_cookie_session_legacy_eval_expr_rejected_403() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    let (client, _session, csrf) = admin_login_cookies(addr).await;
+    let resp = client
+        .post(format!("http://{addr}/admin/db/some-db/migrate"))
+        .header("x-rtdb-csrf", &csrf)
+        .json(&serde_json::json!({"directives": [{
+            "op": "evalExpr",
+            "table": "events",
+            "set": "y",
+            "expr": "y + 1"
+        }]}))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a cookie session must not reach legacy raw-SQL evalExpr"
+    );
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], serde_json::json!("FORBIDDEN"));
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("legacy raw-SQL evalExpr requires the root admin key")),
+        "the 403 must come from the SEC-107 legacy gate: {}",
+        body["message"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sec120_cookie_session_still_reads_admin_surfaces() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state).await;
+
+    let (client, _session, _csrf) = admin_login_cookies(addr).await;
+    let resp = client
+        .get(format!("http://{addr}/admin/dbs"))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "the Session split must not regress cookie dashboard reads"
+    );
+    Ok(())
+}
