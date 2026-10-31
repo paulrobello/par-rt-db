@@ -434,6 +434,7 @@ loss is `DROP TABLE` for tables absent from the target snapshot, and migrate dat
 | --- | --- | --- |
 | `POST /admin/db/{db}/query` | Bearer admin key | Admin reads documents across any database (`owner=None`, bypassing per-row `ownerField`). Accepts `includeDeleted: true` (admin-route param, not a wire `Query` field) to surface soft-deleted rows. |
 | `POST /admin/db/{db}/mutate` | Bearer admin key | Admin writes documents across any database. Capped by `RTDB_MAX_AFFECTED_DOCS`. |
+| `POST /admin/db/{db}/purge` | Bearer admin key | Two-phase reclamation of `insertOnly` rows by predicate. Body `{table, filter?, limit?, confirm?}` where `filter` is the DSL `where` shape (omit to match the whole table) and `limit` clamps to [1, 10000] (default 10000). Without `confirm` the call is a preview: `{matching, confirmToken, limit}`, nothing deleted. With `confirm: confirmToken` the call deletes up to `limit` rows through the committer (`RunPurge` arm — serialized with every write, forwarded to the lease owner under multi-instance, four-tap published with `source="purge"`, so audit rows land in `rtdb.audit_log`): `{deleted, truncated}`. The token binds db+table+filter+the current matching count, so any churn (including the purge's own deletes) stales it: a truncated reply (`truncated: true`) means rows still match — re-preview, then confirm again, until `truncated: false` and `deleted: 0`. Errors: 404 unknown db/table, 400 table not `insertOnly` (use admin mutate `deleteByQuery` for other tables), 409 while the db is quiesced or frozen `readonly` (a purge is a document mutation), 409 `PRECONDITION_FAILED` on a stale/mismatched token (re-preview). Hard-deletes — even on a `softDelete` table — so the rows actually leave storage; `onDelete` children cascade/setNull with the same per-row budget the reaper uses. |
 | `GET /admin/db/{db}/schedules` | Bearer admin key | Lists scheduled jobs for a database (admin-scoped). |
 | `POST /admin/db/{db}/schedules` | Bearer admin key | Creates a scheduled job for a database (admin-scoped). |
 | `POST /admin/db/{db}/schedules/{id}/{cancel,pause,resume}` | Bearer admin key | Cancels, pauses, or resumes a scheduled job (admin-scoped). |
@@ -1482,6 +1483,10 @@ Schema-driven and operator paths stay sanctioned:
 - **The admin owner-bypass mutate route** (`POST /admin/db/{db}/mutate`, which the
   dashboard uses, and the admin WS bypass) is exempt, so operators can still
   correct or purge rows. Machine tokens, users, and scheduled jobs are gated.
+- **The admin purge route** (`POST /admin/db/{db}/purge`) is the sanctioned
+  early-reclamation path for `insertOnly` tables: delete-by-predicate behind a
+  preview/confirm handshake, audit-logged with `source="purge"`. See
+  [Reclaiming insertOnly rows](#reclaiming-insertonly-rows-ttl-vs-purge-vs-neither).
 
 `insertOnly` and `softDelete` are redundant together (every delete is rejected, so
 nothing can be stamped); `undelete` is rejected like any other modifying step.
@@ -1489,6 +1494,41 @@ Mirrored in all seven implementations (server plus the ts/rust/python/swift/go/
 kotlin clients' schema DSLs and in-memory engines); see the `insert-only-*` /
 `error-insert-only-*` cases in [`wire-corpus/semantics/`](wire-corpus/semantics/)
 and [FEATURE_MATRIX #48](FEATURE_MATRIX.md).
+
+### Reclaiming insertOnly rows (TTL vs purge vs neither)
+
+`insertOnly` tables grow without bound by design; two sanctioned paths remove
+rows, and the choice between them is operational:
+
+- **TTL — the default answer.** Declare `ttl` on the table (a field + a
+  default duration). The server's per-db TTL reaper batch-deletes expired rows
+  every `RTDB_TTL_SWEEP_INTERVAL_SECS` (default 60s, batch
+  `RTDB_TTL_BATCH` = 5000) inside the committer's serialized turn — no
+  operator involvement, four-tap published with `source="ttl"`. Wait the TTL
+  out for anything not urgent. This is the ONLY path a normal client sees.
+- **Purge — the incident answer.** A client bug floods an append-only table
+  (measured: ~500 director wake rows in one morning from a single loop bug):
+  the rows are inert but still occupy storage until expiry, and waiting 90
+  days is not reclamation. `POST /admin/db/{db}/purge` removes the matching
+  rows now, behind a preview/confirm handshake so a wrong predicate cannot
+  fire blind (the confirm token binds db+table+filter+the live matching
+  count, so any churn stales it). Every removed row is audit-logged with
+  `source="purge"`, subscriptions fan out, and the per-call cap keeps one
+  call from monopolizing the single writer. Admin key required; refused while
+  the db is frozen `readonly` (a purge is a document mutation — unfreeze
+  first); respects quiesce.
+- **Neither — when the rows are the record.** An append-only log whose value
+  is audit/compliance history, or a table whose rows feed downstream
+  consumers that resolve them by reference, should have NO ttl and get no
+  purge: both paths are destructive and unaudited reconstruction is
+  impossible. If the data must leave, export first (`GET /admin/export-db`,
+  or a change-feed consumer) before purging, and prefer an `onDelete:
+  restrict` reference design over bulk reclamation when children pin the
+  rows.
+
+Rule of thumb: every `insertOnly` table should carry a `ttl` sized to its
+retention need; the purge route exists for the gap between "flooded now" and
+"expires eventually", not as a second delete API.
 
 ## Field constraints
 

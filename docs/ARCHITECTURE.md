@@ -1101,7 +1101,7 @@ semantics case would not.
 
 Durable document mutations publish through the committer's single enforcement
 point — the `publish_taps` helper (`committer/taps.rs`) — called from
-**eight** `handle_*` arms:
+**nine** `handle_*` arms:
 
 | Arm | `source` | Emits DocOps | Notes |
 | --- | --- | --- | --- |
@@ -1110,6 +1110,7 @@ point — the `publish_taps` helper (`committer/taps.rs`) — called from
 | `handle_workflow_advance` | `"workflow"` | yes | Durable workflow step commits. Audit + webhook taps in-txn |
 | `handle_migrate` | `"migrate"` | yes | Schema migrate DDL + DML — best-effort post-commit taps |
 | `handle_reaper` | `"ttl"` | yes | TTL deletes are durable writes, `owner = None` — best-effort post-commit taps |
+| `handle_purge` | `"purge"` | yes | Admin purge of insertOnly rows (`POST /admin/db/{db}/purge`, confirm-token handshake) — durable writes, `owner = None`, forwardable to the lease owner, best-effort post-commit taps |
 | `handle_merge_users` | `"merge"` | yes | The anon→real merge's committed doc restamps — best-effort post-commit taps |
 | `handle_push_schema` | `"push"` | no | `docop_taps = false`: fan-out + cross-replica invalidation only — DDL/backfills emit no DocOps, so no op-feed/audit/webhook taps |
 | `handle_restore_schema` | `"restore"` | no | Same shape as push, for schema-history restore |
