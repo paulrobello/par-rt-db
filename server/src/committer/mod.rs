@@ -41,7 +41,10 @@ mod taps;
 use arms::merge::handle_merge_users;
 use arms::migrate::handle_migrate;
 use arms::mutate::handle_mutate;
-use arms::purge::{PurgeOutcome, handle_purge};
+/// Crate-visible re-export: the admin purge route matches on the arm's
+/// phase-shaped reply, and `arms` itself is committer-private.
+pub(crate) use arms::purge::PurgeResult;
+use arms::purge::handle_purge;
 use arms::reaper::handle_reaper;
 use arms::scheduled::handle_scheduled;
 use arms::schema::{handle_push_schema, handle_restore_schema};
@@ -168,17 +171,18 @@ pub enum CommitterRequest {
     /// sites with `source = "ttl"`.
     RunReaper { admission_epoch: i64 },
     /// An admin purge of an insertOnly table is due. Reply-carrying and
-    /// forwardable like `RunMergeUsers`: the
-    /// committer batch-deletes the rows the predicate selects inside its
-    /// serialized turn and publishes through the four tap sites with
-    /// `source = "purge"`. The HTTP handler does the preview/count/confirm
-    /// handshake; this arm is the single-writer execution.
+    /// forwardable like `RunMergeUsers`: the committer verifies the confirm
+    /// handshake against the serialized snapshot and batch-deletes the rows
+    /// the predicate selects inside its turn, publishing through the four
+    /// tap sites with `source = "purge"`. `confirm = None` is the preview
+    /// half of the handshake: a read-only turn returning the count + token.
     RunPurge {
         table: String,
         filter: Option<crate::query::FilterExpr>,
         limit: u32,
+        confirm: Option<String>,
         admission_epoch: i64,
-        reply: oneshot::Sender<Result<PurgeOutcome, RtDbError>>,
+        reply: oneshot::Sender<Result<PurgeResult, RtDbError>>,
     },
     /// A claimed workflow run is due for advancement (FM-29). Fire-and-forget
     /// like `RunReaper`: the scheduler claims the row; the committer executes
@@ -649,13 +653,6 @@ impl Committers {
     /// whose backend died and was reconnected without re-acquiring the lock
     /// (`lease_lost`) no longer counts as ownership — the replica is a
     /// de-facto shadow until the entry respawns.
-    /// The current admission epoch, for callers outside the committer module
-    /// that must stamp a `RunPurge`-style request themselves (the forwarded
-    /// write path). One `db.rs` delegation so `pool` stays private.
-    pub(crate) async fn admission_epoch(&self) -> Result<i64, RtDbError> {
-        crate::db::admission_epoch(&self.pool).await
-    }
-
     pub async fn is_owner(&self, db: &str) -> bool {
         let guard = self.channels.lock().await;
         guard.get(db).is_some_and(|entry| {
@@ -825,7 +822,7 @@ impl Committers {
                 decode_or_internal::<crate::merge::MergeDbResult>(value, reply)
             }
             CommitterRequest::RunPurge { reply, .. } => {
-                decode_or_internal::<PurgeOutcome>(value, reply)
+                decode_or_internal::<PurgeResult>(value, reply)
             }
             CommitterRequest::RunRestoreSchema { reply, .. } => {
                 // ARC-004: same as migrate — invalidate for a lazy reload.
@@ -1178,16 +1175,18 @@ impl Committers {
     /// for the commit-then-fan-out cycle to complete. Funneled through the
     /// per-db committer like `mutate`, so a SHADOW replica forwards it to the
     /// lease owner (Stage 4c) and the four downstream taps fire on the owner's
-    /// serialized turn. See `handle_purge` for the execution and the admin
-    /// purge route for the confirm-token handshake.
+    /// serialized turn. `confirm = None` runs the read-only preview half of
+    /// the handshake. See `handle_purge` for the execution and the admin
+    /// purge route for the API shape.
     pub async fn purge(
         &self,
         db: &str,
         table: String,
         filter: Option<crate::query::FilterExpr>,
         limit: u32,
+        confirm: Option<String>,
         admission_epoch: i64,
-    ) -> Result<PurgeOutcome, RtDbError> {
+    ) -> Result<PurgeResult, RtDbError> {
         let (reply, reply_rx) = oneshot::channel();
         self.submit(
             db,
@@ -1195,6 +1194,7 @@ impl Committers {
                 table,
                 filter,
                 limit,
+                confirm,
                 admission_epoch,
                 reply,
             },
@@ -1629,13 +1629,21 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                 table,
                 filter,
                 limit,
+                confirm,
                 admission_epoch,
                 reply,
             } => {
                 let span = tracing::info_span!("committer.purge", db = %ctx.db, table = %table);
-                let outcome = handle_purge(&ctx, &table, filter.as_ref(), limit, admission_epoch)
-                    .instrument(span)
-                    .await;
+                let outcome = handle_purge(
+                    &ctx,
+                    &table,
+                    filter.as_ref(),
+                    limit,
+                    confirm.as_deref(),
+                    admission_epoch,
+                )
+                .instrument(span)
+                .await;
                 let _ = reply.send(outcome);
             }
             CommitterRequest::RunWorkflowAdvance {

@@ -130,7 +130,7 @@ pub(crate) const MAX_CASCADE_ROWS: usize = 10_000;
 /// single-writer for the whole database. `SET LOCAL` scopes the value to this
 /// transaction and reverts on commit/rollback, so it never leaks to other pool
 /// users. SEC-104.
-const STATEMENT_TIMEOUT_MS: u64 = 60_000;
+pub(crate) const STATEMENT_TIMEOUT_MS: u64 = 60_000;
 
 /// The kind of write a step performed on a document. Recorded in `WriteSet.ops`
 /// so downstream consumers (e.g. the activity feed) can stream what happened

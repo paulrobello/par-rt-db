@@ -65,11 +65,15 @@ pub(in crate::committer) fn forward_write_of(
             table,
             filter,
             limit,
+            confirm,
+            admission_epoch,
             ..
         } => Some(crate::forward::ForwardWrite::Purge {
             table: table.clone(),
             filter: filter.clone(),
             limit: *limit,
+            confirm: confirm.clone(),
+            admission_epoch: *admission_epoch,
         }),
         _ => None,
     }

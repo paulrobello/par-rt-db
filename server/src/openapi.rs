@@ -656,6 +656,12 @@ pub fn document() -> Value {
             "Admin",
         ),
         (
+            "post",
+            "/admin/db/{db}/purge",
+            "Two-phase purge of insertOnly rows (preview + confirm token)",
+            "Admin",
+        ),
+        (
             "get",
             "/admin/db/{db}/changes",
             "Change feed under the admin session",

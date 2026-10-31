@@ -235,6 +235,12 @@ pub enum ForwardWrite {
         table: String,
         filter: Option<crate::query::FilterExpr>,
         limit: u32,
+        confirm: Option<String>,
+        /// The origin's admission epoch, carried verbatim: the owner must
+        /// evaluate the purge against the epoch the request was admitted
+        /// under, not one re-read at forward time (a fence bump between the
+        /// two must reject the write, not silently re-admit it).
+        admission_epoch: i64,
     },
 }
 
@@ -571,9 +577,10 @@ async fn execute_as_owner(
             table,
             filter,
             limit,
+            confirm,
+            admission_epoch,
         } => {
             let (reply, reply_rx) = oneshot::channel();
-            let admission_epoch = committers.admission_epoch().await.ok()?;
             committers
                 .submit_owned(
                     db,
@@ -581,6 +588,7 @@ async fn execute_as_owner(
                         table,
                         filter,
                         limit,
+                        confirm,
                         admission_epoch,
                         reply,
                     },
@@ -905,6 +913,18 @@ mod tests {
                 real_id: "real".into(),
             },
             ForwardWrite::RestoreSchema { target_version: 3 },
+            ForwardWrite::Purge {
+                table: "feed".into(),
+                filter: Some(
+                    serde_json::from_value(serde_json::json!({
+                        "op": "eq", "field": "kind", "value": "wake"
+                    }))
+                    .expect("filter"),
+                ),
+                limit: 100,
+                confirm: Some("tok".into()),
+                admission_epoch: 7,
+            },
         ];
         for case in cases {
             let json = serde_json::to_string(&case).unwrap();
