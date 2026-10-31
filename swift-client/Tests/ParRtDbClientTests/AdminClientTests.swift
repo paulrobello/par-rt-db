@@ -1638,15 +1638,9 @@ struct AdminClientTests {
 
     @Test func purgeSurfacesStaleTokenEnvelope() async throws {
         let client = makeAdminClient()
-        StubProtocol.handler = { _ in
-            (
-                409,
-                Data(
-                    #"{"code":"PRECONDITION_FAILED","message":"confirm token does not match the current state (5 row(s) now match 'events'); re-run the preview to get a fresh token"}"#
-                        .utf8
-                )
-            )
-        }
+        let staleBody =
+            #"{"code":"PRECONDITION_FAILED","message":"confirm token stale; re-run the preview"}"#
+        StubProtocol.handler = { _ in (409, Data(staleBody.utf8)) }
         do {
             try await client.purge("app", table: "events", confirm: "stale")
             Issue.record("purge should throw on a stale confirm token")
