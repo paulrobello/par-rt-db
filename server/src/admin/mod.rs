@@ -27,6 +27,7 @@ mod docs;
 mod login;
 mod merge;
 mod observability;
+mod purge;
 mod schedules;
 mod schema_ops;
 mod sessions;
@@ -47,6 +48,7 @@ use docs::*;
 use login::*;
 use merge::*;
 use observability::*;
+use purge::*;
 use schedules::*;
 use schema_ops::*;
 use sessions::*;
@@ -362,6 +364,9 @@ pub fn admin_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/admin/dbs/{db}/stats", get(db_stats))
         .route("/admin/db/{db}/query", post(admin_query))
         .route("/admin/db/{db}/mutate", post(admin_mutate))
+        // Early reclamation of insertOnly rows by predicate (confirm-token
+        // handshake) — the API answer to a flooded append-only table.
+        .route("/admin/db/{db}/purge", post(admin_purge))
         // The retained change feed under the admin gate — the dashboard reads
         // document history through its cookie session, no machine token.
         .route("/admin/db/{db}/changes", get(admin_changes))

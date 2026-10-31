@@ -76,6 +76,7 @@ pub(in crate::committer) async fn handle_reaper(
             // the budget is fresh per initiating row (`MAX_CASCADE_ROWS` is
             // per initiating delete).
             let mut visited: HashSet<(String, String)> = HashSet::new();
+            let mut reclaimed: u64 = 0;
             for (id,) in ids {
                 crate::db::ensure_admission_epoch(&mut conn, &ctx.db, admission_epoch).await?;
                 let mut cascade_rows = 0usize;
@@ -106,7 +107,18 @@ pub(in crate::committer) async fn handle_reaper(
                         db = %ctx.db, table = %table_name, doc_id = %id, error = %e,
                         "ttl reaper cascade failed"
                     );
+                } else {
+                    reclaimed += 1;
                 }
+            }
+            if reclaimed > 0 {
+                // Per-pass observability (card 01a192a72c): one line per
+                // reclaiming table pass, next to the `record_ttl_expired`
+                // metric the same ops add to.
+                tracing::info!(
+                    db = %ctx.db, table = %table_name, reclaimed,
+                    "ttl reaper pass reclaimed rows"
+                );
             }
             continue;
         }
@@ -186,6 +198,12 @@ pub(in crate::committer) async fn handle_reaper(
             );
             continue;
         }
+        // Per-pass observability (card 01a192a72c): one line per reclaiming
+        // table pass, next to the `record_ttl_expired` metric.
+        tracing::info!(
+            db = %ctx.db, table = %table_name, reclaimed = rows.len() as u64,
+            "ttl reaper pass reclaimed rows"
+        );
         write_set.tables.extend(batch_ws.tables);
         write_set.docs.extend(batch_ws.docs);
         write_set.ops.append(&mut batch_ws.ops);

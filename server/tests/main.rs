@@ -56,6 +56,7 @@ mod pool_bound_test;
 mod presence_test;
 mod presence_xreplica_test;
 mod proptest_parity;
+mod purge_test;
 mod query_combinations;
 mod query_introspect_test;
 mod query_test;

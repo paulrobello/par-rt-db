@@ -61,6 +61,16 @@ pub(in crate::committer) fn forward_write_of(
                 target_version: *target_version,
             })
         }
+        CommitterRequest::RunPurge {
+            table,
+            filter,
+            limit,
+            ..
+        } => Some(crate::forward::ForwardWrite::Purge {
+            table: table.clone(),
+            filter: filter.clone(),
+            limit: *limit,
+        }),
         _ => None,
     }
 }
@@ -83,6 +93,9 @@ pub(in crate::committer) fn fail_forwarded_reply(req: CommitterRequest, err: RtD
             let _ = reply.send(Err(err));
         }
         CommitterRequest::RunMergeUsers { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
+        CommitterRequest::RunPurge { reply, .. } => {
             let _ = reply.send(Err(err));
         }
         CommitterRequest::RunRestoreSchema { reply, .. } => {

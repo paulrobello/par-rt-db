@@ -6,6 +6,7 @@
 pub(in crate::committer) mod merge;
 pub(in crate::committer) mod migrate;
 pub(in crate::committer) mod mutate;
+pub(in crate::committer) mod purge;
 pub(in crate::committer) mod reaper;
 pub(in crate::committer) mod scheduled;
 pub(in crate::committer) mod schema;

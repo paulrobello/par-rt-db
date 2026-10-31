@@ -3,9 +3,10 @@
 //! affected subscriptions, diffs against the last pushed value, and pushes only
 //! on change. This serialization is load-bearing: `execute_txn`/`execute_query`
 //! run READ COMMITTED with no row locking, so every durable write must pass
-//! through here. Handles all ten `CommitterRequest` arms — `Mutate`,
+//! through here. Handles all eleven `CommitterRequest` arms — `Mutate`,
 //! `Subscribe`, `RunScheduled`, `RunMigrate`, `RunPushSchema`, `RunReaper`,
-//! `RunWorkflowAdvance`, `RunMergeUsers`, `RunRestoreSchema`, and `Shutdown` —
+//! `RunPurge`, `RunWorkflowAdvance`, `RunMergeUsers`, `RunRestoreSchema`, and
+//! `Shutdown` —
 //! and publishes the write arms at the four tap sites (subscription fan-out,
 //! op-feed, audit log, webhooks). Never add a second writer.
 
@@ -40,6 +41,7 @@ mod taps;
 use arms::merge::handle_merge_users;
 use arms::migrate::handle_migrate;
 use arms::mutate::handle_mutate;
+use arms::purge::{PurgeOutcome, handle_purge};
 use arms::reaper::handle_reaper;
 use arms::scheduled::handle_scheduled;
 use arms::schema::{handle_push_schema, handle_restore_schema};
@@ -165,6 +167,19 @@ pub enum CommitterRequest {
     /// delete inside its serialized turn and publishes through the four tap
     /// sites with `source = "ttl"`.
     RunReaper { admission_epoch: i64 },
+    /// An admin purge of an insertOnly table is due. Reply-carrying and
+    /// forwardable like `RunMergeUsers`: the
+    /// committer batch-deletes the rows the predicate selects inside its
+    /// serialized turn and publishes through the four tap sites with
+    /// `source = "purge"`. The HTTP handler does the preview/count/confirm
+    /// handshake; this arm is the single-writer execution.
+    RunPurge {
+        table: String,
+        filter: Option<crate::query::FilterExpr>,
+        limit: u32,
+        admission_epoch: i64,
+        reply: oneshot::Sender<Result<PurgeOutcome, RtDbError>>,
+    },
     /// A claimed workflow run is due for advancement (FM-29). Fire-and-forget
     /// like `RunReaper`: the scheduler claims the row; the committer executes
     /// the current step's txn and writes the bookkeeping inside its serialized
@@ -634,6 +649,13 @@ impl Committers {
     /// whose backend died and was reconnected without re-acquiring the lock
     /// (`lease_lost`) no longer counts as ownership — the replica is a
     /// de-facto shadow until the entry respawns.
+    /// The current admission epoch, for callers outside the committer module
+    /// that must stamp a `RunPurge`-style request themselves (the forwarded
+    /// write path). One `db.rs` delegation so `pool` stays private.
+    pub(crate) async fn admission_epoch(&self) -> Result<i64, RtDbError> {
+        crate::db::admission_epoch(&self.pool).await
+    }
+
     pub async fn is_owner(&self, db: &str) -> bool {
         let guard = self.channels.lock().await;
         guard.get(db).is_some_and(|entry| {
@@ -802,12 +824,15 @@ impl Committers {
             CommitterRequest::RunMergeUsers { reply, .. } => {
                 decode_or_internal::<crate::merge::MergeDbResult>(value, reply)
             }
+            CommitterRequest::RunPurge { reply, .. } => {
+                decode_or_internal::<PurgeOutcome>(value, reply)
+            }
             CommitterRequest::RunRestoreSchema { reply, .. } => {
                 // ARC-004: same as migrate — invalidate for a lazy reload.
                 self.schemas.invalidate(db).await;
                 decode_or_internal::<i64>(value, reply)
             }
-            // `forward_write_of` returned Some only for the five arms above;
+            // `forward_write_of` returned Some only for the arms above;
             // anything else never reaches this method. Drop it with an
             // internal error — never resubmit: the owner already executed.
             other => {
@@ -1140,6 +1165,37 @@ impl Committers {
                 principal_ctx,
                 admission_epoch,
                 enqueued_at,
+                reply,
+            },
+        )
+        .await?;
+        reply_rx
+            .await
+            .map_err(|_| RtDbError::internal("committer task dropped the reply"))?
+    }
+
+    /// Purges the rows a predicate selects on an insertOnly table and waits
+    /// for the commit-then-fan-out cycle to complete. Funneled through the
+    /// per-db committer like `mutate`, so a SHADOW replica forwards it to the
+    /// lease owner (Stage 4c) and the four downstream taps fire on the owner's
+    /// serialized turn. See `handle_purge` for the execution and the admin
+    /// purge route for the confirm-token handshake.
+    pub async fn purge(
+        &self,
+        db: &str,
+        table: String,
+        filter: Option<crate::query::FilterExpr>,
+        limit: u32,
+        admission_epoch: i64,
+    ) -> Result<PurgeOutcome, RtDbError> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.submit(
+            db,
+            CommitterRequest::RunPurge {
+                table,
+                filter,
+                limit,
+                admission_epoch,
                 reply,
             },
         )
@@ -1568,6 +1624,19 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                 if let Err(err) = outcome {
                     tracing::error!(db = %ctx.db, error = %err, "ttl reaper handling failed");
                 }
+            }
+            CommitterRequest::RunPurge {
+                table,
+                filter,
+                limit,
+                admission_epoch,
+                reply,
+            } => {
+                let span = tracing::info_span!("committer.purge", db = %ctx.db, table = %table);
+                let outcome = handle_purge(&ctx, &table, filter.as_ref(), limit, admission_epoch)
+                    .instrument(span)
+                    .await;
+                let _ = reply.send(outcome);
             }
             CommitterRequest::RunWorkflowAdvance {
                 row,

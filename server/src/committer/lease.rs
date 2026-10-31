@@ -187,6 +187,9 @@ pub(in crate::committer) async fn reply_ownership_conflict(
         CommitterRequest::RunMergeUsers { reply, .. } => {
             let _ = reply.send(Err(err));
         }
+        CommitterRequest::RunPurge { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
         CommitterRequest::RunRestoreSchema { reply, .. } => {
             let _ = reply.send(Err(err));
         }
@@ -215,6 +218,7 @@ pub(in crate::committer) fn request_needs_write(req: &CommitterRequest) -> bool 
             | CommitterRequest::RunScheduled { .. }
             | CommitterRequest::RunMigrate { .. }
             | CommitterRequest::RunReaper { .. }
+            | CommitterRequest::RunPurge { .. }
             | CommitterRequest::RunWorkflowAdvance { .. }
             | CommitterRequest::RunMergeUsers { .. }
             | CommitterRequest::RunPushSchema { .. }

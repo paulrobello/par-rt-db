@@ -231,6 +231,11 @@ pub enum ForwardWrite {
     RestoreSchema {
         target_version: i64,
     },
+    Purge {
+        table: String,
+        filter: Option<crate::query::FilterExpr>,
+        limit: u32,
+    },
 }
 
 /// The owner's outcome for a forwarded write. Exactly one of `ok` / `error`
@@ -555,6 +560,28 @@ async fn execute_as_owner(
                     db,
                     CommitterRequest::RunRestoreSchema {
                         target_version,
+                        reply,
+                    },
+                )
+                .await
+                .ok()?;
+            recv_forwarded(reply_rx).await.and_then(serialize_result)
+        }
+        ForwardWrite::Purge {
+            table,
+            filter,
+            limit,
+        } => {
+            let (reply, reply_rx) = oneshot::channel();
+            let admission_epoch = committers.admission_epoch().await.ok()?;
+            committers
+                .submit_owned(
+                    db,
+                    CommitterRequest::RunPurge {
+                        table,
+                        filter,
+                        limit,
+                        admission_epoch,
                         reply,
                     },
                 )
