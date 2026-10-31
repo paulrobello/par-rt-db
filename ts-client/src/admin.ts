@@ -3,6 +3,7 @@ import { RtDbError } from "./errors.js";
 import { enrollRequest, type FileMetadata, type SignedUrl, type TransformOpts } from "./http.js";
 import type {
   ChangeFeedResponse,
+  FilterExpr,
   MigrateRequestJson,
   MigrateResultJson,
   QueryJson,
@@ -665,6 +666,34 @@ export interface SlowQueriesResponse {
   capacity: number;
 }
 
+/** Options for `purgePreview`/`purge` (POST /admin/db/{db}/purge). `filter` is
+ *  the same `FilterExpr` DSL a query's `where` uses — omit to purge every row
+ *  of the table. `limit` caps rows deleted per call; the server clamps it to
+ *  [1, 10000] and defaults to 10000. */
+export interface PurgeOptions {
+  filter?: FilterExpr;
+  limit?: number;
+}
+
+/** Preview reply from `purgePreview`: how many rows the filter currently
+ *  matches, the `confirmToken` to echo back to `purge` (stale — rows changed
+ *  since the preview — makes the confirm refuse with 409; re-preview), and the
+ *  per-call row cap the confirm will apply. */
+export interface PurgePreview {
+  matching: number;
+  confirmToken: string;
+  limit: number;
+}
+
+/** Confirm reply from `purge`. `truncated: true` means rows still match: the
+ *  token bound the preview-time count, so that count has now changed and the
+ *  next confirm needs a fresh token — re-run `purgePreview` first, then
+ *  confirm again, until a pass reports `truncated: false`. */
+export interface PurgeResult {
+  deleted: number;
+  truncated: boolean;
+}
+
 function toSchemaJson(schema: AnySchema | SchemaJson): SchemaJson {
   return "toJSON" in schema && typeof schema.toJSON === "function"
     ? schema.toJSON()
@@ -1251,6 +1280,39 @@ export class RtDbAdminClient {
       idempotencyKey: opts?.idempotencyKey,
     });
     return (body as { results: unknown[] }).results;
+  }
+
+  /** Preview a purge of an insertOnly table (POST /admin/db/{db}/purge without
+   *  `confirm`). Counts the rows `opts.filter` currently matches (all rows when
+   *  omitted — admin-bypass, per-row rules do not apply) and returns the
+   *  `confirmToken` to echo back to {@link purge}. Nothing is deleted.
+   *  Errors: 404 unknown db/table; 400 table not insertOnly; 409 readonly/
+   *  quiesced. */
+  async purgePreview(db: string, table: string, opts: PurgeOptions = {}): Promise<PurgePreview> {
+    return (await this.request("POST", `/admin/db/${encodeURIComponent(db)}/purge`, {
+      table,
+      ...pickDefined(opts),
+    })) as PurgePreview;
+  }
+
+  /** Execute a confirmed purge of an insertOnly table (POST
+   *  /admin/db/{db}/purge with `confirm` — the `confirmToken` from
+   *  {@link purgePreview}). Deletes up to `opts.limit` matching rows (server
+   *  cap 10000). A reply with `truncated: true` means rows still match: the
+   *  token bound the preview-time count, so re-preview and confirm again until
+   *  a pass reports `truncated: false`. A stale token refuses with 409
+   *  (PRECONDITION_FAILED) — re-run the preview. */
+  async purge(
+    db: string,
+    table: string,
+    opts: PurgeOptions,
+    confirm: string,
+  ): Promise<PurgeResult> {
+    return (await this.request("POST", `/admin/db/${encodeURIComponent(db)}/purge`, {
+      table,
+      ...pickDefined(opts),
+      confirm,
+    })) as PurgeResult;
   }
 
   /** List scheduled jobs for `db` (GET /admin/db/{db}/schedules). */

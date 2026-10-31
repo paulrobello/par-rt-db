@@ -19,7 +19,7 @@ from typing import Any
 
 import httpx
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from par_rt_db import AfterMs, Cron, Mutation, TableQuery, t
 from par_rt_db.admin import (
@@ -34,6 +34,8 @@ from par_rt_db.admin import (
     MetricsSnapshot,
     MintedToken,
     OpEvent,
+    PurgePreviewResult,
+    PurgeResult,
     RtDbAdminClient,
     SchemaHistoryEntry,
     SchemaHistorySummary,
@@ -55,7 +57,13 @@ from par_rt_db.admin_models import (
 from par_rt_db.errors import ErrorCode, RtDbError
 from par_rt_db.http_client import FileMetadata, SubscriptionInfo
 from par_rt_db.schema import Schema
-from par_rt_db.wire import PROTOCOL_VERSION, ScheduleInfo, WorkflowInfo, WorkflowInfoFull
+from par_rt_db.wire import (
+    PROTOCOL_VERSION,
+    FilterExpr,
+    ScheduleInfo,
+    WorkflowInfo,
+    WorkflowInfoFull,
+)
 
 ADMIN_BEARER = "Bearer admin-key"
 URL = "https://rtdb.example"
@@ -597,6 +605,136 @@ def test_merge_users_posts_typed_confirm_and_parses_report() -> None:
     assert report.storage_repointed == 2
     assert report.sessions_repointed == 1
     assert report.anon_deleted is True
+
+
+# --- sync/async: two-phase insertOnly purge (POST /admin/db/{db}/purge) ----
+
+
+_PURGE_FILTER_WIRE = {"op": "eq", "field": "kind", "value": "wake"}
+
+
+def test_purge_preview_posts_table_only_and_parses_preview() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["url"] = request.url
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"matching": 5, "confirmToken": "tok-1", "limit": 10000})
+
+    with _sync_client(handler) as c:
+        preview = c.purge_preview("kanban", "events")
+    assert captured["method"] == "POST"
+    assert captured["url"].path == "/admin/db/kanban/purge"
+    # filter/limit/confirm all omitted → only the table key is sent.
+    assert captured["body"] == {"table": "events"}
+    assert isinstance(preview, PurgePreviewResult)
+    assert preview.matching == 5
+    assert preview.confirm_token == "tok-1"
+    assert preview.limit == 10000
+
+
+def test_purge_preview_sends_filter_and_limit_when_given() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"matching": 2, "confirmToken": "tok-2", "limit": 500})
+
+    f = TypeAdapter(FilterExpr).validate_python(_PURGE_FILTER_WIRE)
+    with _sync_client(handler) as c:
+        preview = c.purge_preview("kanban", "events", filter=f, limit=500)
+    assert captured["body"] == {"table": "events", "filter": _PURGE_FILTER_WIRE, "limit": 500}
+    assert preview.matching == 2
+    assert preview.limit == 500
+
+
+def test_purge_confirm_posts_token_and_parses_result() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"deleted": 5, "truncated": False})
+
+    f = TypeAdapter(FilterExpr).validate_python(_PURGE_FILTER_WIRE)
+    with _sync_client(handler) as c:
+        result = c.purge("kanban", "events", confirm="tok-1", filter=f, limit=500)
+    assert captured["body"] == {
+        "table": "events",
+        "filter": _PURGE_FILTER_WIRE,
+        "limit": 500,
+        "confirm": "tok-1",
+    }
+    assert isinstance(result, PurgeResult)
+    assert result.deleted == 5
+    assert result.truncated is False
+
+
+def test_purge_models_reject_cross_phase_and_unknown_fields() -> None:
+    # The server phase-skips fields, so extra="forbid" makes each model exact:
+    # a preview body must not carry confirm-phase keys and vice versa.
+    with pytest.raises(ValidationError):
+        PurgePreviewResult.model_validate(
+            {"matching": 1, "confirmToken": "t", "limit": 1, "deleted": 0}
+        )
+    with pytest.raises(ValidationError):
+        PurgePreviewResult.model_validate(
+            {"matching": 1, "confirmToken": "t", "limit": 1, "extra": True}
+        )
+    with pytest.raises(ValidationError):
+        PurgeResult.model_validate({"deleted": 0, "truncated": True, "matching": 1})
+    with pytest.raises(ValidationError):
+        PurgeResult.model_validate({"deleted": 0, "truncated": True, "unknown": 1})
+
+
+def test_purge_stale_confirm_token_409_raises_precondition() -> None:
+    # Stale token (rows changed since the preview) → 409 PRECONDITION_FAILED;
+    # the caller re-previews for a fresh token.
+    client = _sync_client(
+        _handler_map(
+            {
+                ("POST", "/admin/db/kanban/purge", '"confirm"'): httpx.Response(
+                    409,
+                    json={
+                        "code": "PRECONDITION_FAILED",
+                        "message": "confirm token does not match the current state",
+                    },
+                )
+            }
+        )
+    )
+    with client as c, pytest.raises(RtDbError) as ei:
+        c.purge("kanban", "events", confirm="stale-token")
+    assert ei.value.code is ErrorCode.PRECONDITION_FAILED
+
+
+async def test_async_purge_preview_and_confirm_mirrors_sync() -> None:
+    seen: list[tuple[str, str, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append((request.method, request.url.path, body))
+        if "confirm" in body:
+            return httpx.Response(200, json={"deleted": 2, "truncated": True})
+        return httpx.Response(200, json={"matching": 2, "confirmToken": "tok-9", "limit": 10000})
+
+    f = TypeAdapter(FilterExpr).validate_python(_PURGE_FILTER_WIRE)
+    async with _async_client(handler) as c:
+        preview = await c.purge_preview("kanban", "events", filter=f)
+        result = await c.purge("kanban", "events", confirm=preview.confirm_token, filter=f)
+    assert seen[0] == (
+        "POST",
+        "/admin/db/kanban/purge",
+        {"table": "events", "filter": _PURGE_FILTER_WIRE},
+    )
+    assert seen[1] == (
+        "POST",
+        "/admin/db/kanban/purge",
+        {"table": "events", "filter": _PURGE_FILTER_WIRE, "confirm": "tok-9"},
+    )
+    assert isinstance(preview, PurgePreviewResult)
+    assert isinstance(result, PurgeResult)
+    assert result.truncated is True
 
 
 # --- sync: error envelope -------------------------------------------------

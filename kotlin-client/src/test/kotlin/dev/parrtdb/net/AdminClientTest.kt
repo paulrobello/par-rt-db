@@ -76,6 +76,77 @@ class AdminClientTest {
     }
 
     @Test
+    fun `purge preview and confirm preserve the filter and omit unset fields`() = run10 {
+        TestHttpServer().use { srv ->
+            val a = AdminClient(srv.baseUrl, "adminkey")
+            srv.reply(200, """{"matching":5000000000,"confirmToken":"token","limit":10000}""")
+            val preview = a.purgePreview("app", "events")
+            assertEquals(5_000_000_000L, preview.matching)
+            assertEquals("token", preview.confirmToken)
+            assertEquals(10000, preview.limit)
+            assertEquals("POST", srv.requests.last().method)
+            assertEquals("/admin/db/app/purge", srv.requests.last().path)
+            assertEquals("Bearer adminkey", srv.requests.last().header("Authorization"))
+            assertEquals("""{"table":"events"}""", srv.requests.last().body)
+
+            val filter = dev.parrtdb.wire.FilterExpr.Eq("kind", jsonStr("wake"))
+            a.purgePreview("app", "events", filter, 25)
+            assertEquals("""{"table":"events","filter":{"op":"eq","field":"kind","value":"wake"},"limit":25}""", srv.requests.last().body)
+            srv.reply(200, """{"deleted":25,"truncated":true}""")
+            val result = a.purge("app", "events", preview.confirmToken, filter, 25)
+            assertEquals(25L, result.deleted)
+            assertTrue(result.truncated)
+            assertEquals("""{"table":"events","filter":{"op":"eq","field":"kind","value":"wake"},"limit":25,"confirm":"token"}""", srv.requests.last().body)
+            srv.reply(200, """{"deleted":0,"truncated":false}""")
+            val empty = a.purge("app", "events", "fresh-token")
+            assertEquals(0L, empty.deleted)
+            assertEquals(false, empty.truncated)
+            assertEquals("""{"table":"events","confirm":"fresh-token"}""", srv.requests.last().body)
+        }
+    }
+
+    @Test
+    fun `purge maps admin errors without retrying`() = run10 {
+        TestHttpServer().use { srv ->
+            val a = AdminClient(srv.baseUrl, "k")
+            for ((status, code) in listOf(
+                401 to ErrorCode.UNAUTHORIZED,
+                404 to ErrorCode.NOT_FOUND,
+                400 to ErrorCode.BAD_REQUEST,
+                409 to ErrorCode.READ_ONLY,
+                409 to ErrorCode.PRECONDITION_FAILED,
+            )) {
+                srv.reply(status, """{"code":"${code.wire}","message":"purge rejected"}""")
+                assertEquals(code, assertFailsWith<RtDbException> { a.purgePreview("app", "events") }.code)
+                assertEquals(code, assertFailsWith<RtDbException> { a.purge("app", "events", "stale") }.code)
+            }
+            assertEquals(10, srv.requests.size)
+        }
+    }
+
+    @Test
+    fun `purge phase dtos reject unknown fields and invalid types`() = run10 {
+        TestHttpServer().use { srv ->
+            val a = AdminClient(srv.baseUrl, "k")
+            for (response in listOf(
+                """{"matching":1,"confirmToken":"t","limit":1,"deleted":0}""",
+                """{"matching":"one","confirmToken":"t","limit":1}""",
+                """{"matching":1,"confirmToken":"t","limit":2147483648}""",
+            )) {
+                srv.reply(200, response)
+                assertFailsWith<dev.parrtdb.wire.WireException> { a.purgePreview("app", "events") }
+            }
+            for (response in listOf(
+                """{"deleted":1,"truncated":false,"matching":1}""",
+                """{"deleted":1,"truncated":"false"}""",
+            )) {
+                srv.reply(200, response)
+                assertFailsWith<dev.parrtdb.wire.WireException> { a.purge("app", "events", "t") }
+            }
+        }
+    }
+
+    @Test
     fun `mint token options and list tokens with host capability`() = run10 {
         TestHttpServer().use { srv ->
             val a = AdminClient(srv.baseUrl, "k")

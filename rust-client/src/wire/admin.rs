@@ -1540,3 +1540,56 @@ pub struct SlowQueriesResponse {
     /// Ring-buffer cap.
     pub capacity: usize,
 }
+
+/// Borrowed HTTP body for `POST /admin/db/{db}/purge`. Mirrors server
+/// `admin::purge::PurgeRequest` (camelCase). Optional fields are omitted when
+/// `None` — the phase selector is `confirm`'s presence: absent → preview,
+/// present → confirmed delete.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PurgeRequest<'a> {
+    pub(crate) table: &'a str,
+    /// The DSL filter (same wire shape as a Query's `where`) selecting the
+    /// rows to remove; `None` purges every row of the table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) filter: Option<&'a crate::wire::FilterExpr>,
+    /// Per-call row cap, clamped server-side to [1, 10_000]; `None` = server
+    /// default (10_000).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) limit: Option<u32>,
+    /// The `confirmToken` a preview returned; `None` = preview only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) confirm: Option<&'a str>,
+}
+
+/// Preview-phase reply of `POST /admin/db/{db}/purge` (no `confirm` sent):
+/// the row count the filter matches, the token the confirm call must echo,
+/// and the effective per-call row cap. Mirrors server
+/// `admin::purge::PurgeResponse`'s preview fields.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PurgePreview {
+    /// Rows currently matching `filter` (or the table's full row count when
+    /// no filter).
+    pub matching: i64,
+    /// Echo this back as `confirm` to delete. Changes when the matching row
+    /// count does, so a stale token fails with `PRECONDITION_FAILED` (409).
+    pub confirm_token: String,
+    /// The effective per-call row cap (request `limit` clamped to [1, 10_000]).
+    pub limit: u32,
+}
+
+/// Confirm-phase reply of `POST /admin/db/{db}/purge` (`confirm` sent).
+/// `truncated == true` means rows still match. A successful deletion changes
+/// the matching count, so obtain a fresh preview token before the next batch.
+/// Mirrors server `admin::purge::PurgeResponse`'s confirm fields.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PurgeResult {
+    /// Rows deleted by this call (at most the effective `limit`).
+    pub deleted: u64,
+    /// `true` when rows still match and the confirm should be re-run.
+    pub truncated: bool,
+}

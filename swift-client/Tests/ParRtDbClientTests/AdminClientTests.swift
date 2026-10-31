@@ -1573,4 +1573,86 @@ struct AdminClientTests {
         }
         try await client.setAnonymousAccess("app", enabled: false)
     }
+
+    // MARK: purge (insertOnly reclamation)
+
+    @Test func purgePreviewPostsFilterAndLimit() async throws {
+        let client = makeAdminClient()
+        StubProtocol.handler = { request in
+            try adminAuth(request)
+            try demand(request.httpMethod == "POST", "expected POST")
+            try demand(request.url?.path == "/admin/db/app/purge", "path mismatch")
+            let body = try jsonObjectBody(request)
+            try demand(body["table"] as? String == "events", "table mismatch: \(body)")
+            let filter = body["filter"] as? [String: Any]
+            try demand(filter?["op"] as? String == "eq", "filter.op mismatch: \(body)")
+            try demand(filter?["field"] as? String == "kind", "filter.field mismatch: \(body)")
+            try demand(filter?["value"] as? String == "wake", "filter.value mismatch: \(body)")
+            try demand((body["limit"] as? Int) == 500, "limit mismatch: \(body)")
+            try demand(body["confirm"] == nil, "preview must not send confirm: \(body)")
+            return (200, Data(#"{"matching":1234,"confirmToken":"tok-1","limit":500}"#.utf8))
+        }
+        let preview = try await client.purgePreview(
+            "app", table: "events",
+            filter: .eq(field: "kind", value: .string("wake")), limit: 500
+        )
+        #expect(preview.matching == 1234)
+        #expect(preview.confirmToken == "tok-1")
+        #expect(preview.limit == 500)
+    }
+
+    @Test func purgePreviewOmitsAbsentOptionals() async throws {
+        let client = makeAdminClient()
+        StubProtocol.handler = { request in
+            let body = try jsonObjectBody(request)
+            try demand(Set(body.keys) == ["table"], "unexpected keys: \(body)")
+            try demand(body["table"] as? String == "events", "table mismatch: \(body)")
+            return (200, Data(#"{"matching":7,"confirmToken":"tok-2","limit":10000}"#.utf8))
+        }
+        let preview = try await client.purgePreview("app", table: "events")
+        #expect(preview.matching == 7)
+        #expect(preview.limit == 10000)
+    }
+
+    @Test func purgeSendsConfirmTokenAndDecodesOutcome() async throws {
+        let client = makeAdminClient()
+        StubProtocol.handler = { request in
+            try adminAuth(request)
+            try demand(request.httpMethod == "POST", "expected POST")
+            try demand(request.url?.path == "/admin/db/app/purge", "path mismatch")
+            let body = try jsonObjectBody(request)
+            try demand(body["table"] as? String == "events", "table mismatch: \(body)")
+            try demand(body["confirm"] as? String == "tok-1", "confirm token mismatch: \(body)")
+            let filter = body["filter"] as? [String: Any]
+            try demand(filter?["op"] as? String == "eq", "filter.op mismatch: \(body)")
+            try demand(body["limit"] == nil, "nil limit must be omitted: \(body)")
+            return (200, Data(#"{"deleted":500,"truncated":true}"#.utf8))
+        }
+        let outcome = try await client.purge(
+            "app", table: "events",
+            filter: .eq(field: "kind", value: .string("wake")), confirm: "tok-1"
+        )
+        #expect(outcome.deleted == 500)
+        #expect(outcome.truncated)
+    }
+
+    @Test func purgeSurfacesStaleTokenEnvelope() async throws {
+        let client = makeAdminClient()
+        StubProtocol.handler = { _ in
+            (
+                409,
+                Data(
+                    #"{"code":"PRECONDITION_FAILED","message":"confirm token does not match the current state (5 row(s) now match 'events'); re-run the preview to get a fresh token"}"#
+                        .utf8
+                )
+            )
+        }
+        do {
+            try await client.purge("app", table: "events", confirm: "stale")
+            Issue.record("purge should throw on a stale confirm token")
+        } catch let error as RtDbError {
+            #expect(error.code == .preconditionFailed)
+            #expect(error.message.contains("re-run the preview"))
+        }
+    }
 }

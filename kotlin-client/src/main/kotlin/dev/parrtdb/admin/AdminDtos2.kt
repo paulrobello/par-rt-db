@@ -279,3 +279,17 @@ data class SchemaPreviewDiff(val added: List<SchemaPreviewTableAdd>, val rejecte
             }
     }
 }
+
+/** Preview phase of [AdminClient.purgePreview]: the matching count plus the token to confirm with. */
+data class PurgePreview(val matching: Long, val confirmToken: String, val limit: Int) {
+    companion object {
+        fun fromJson(e: JsonElement) = decode(e, "purgePreview") { PurgePreview(it.l("matching"), it.s("confirmToken"), it.int("limit")) }
+    }
+}
+
+/** Confirm phase of [AdminClient.purge]; re-run the call while [truncated] is true. */
+data class PurgeResult(val deleted: Long, val truncated: Boolean) {
+    companion object {
+        fun fromJson(e: JsonElement) = decode(e, "purgeResult") { PurgeResult(it.l("deleted"), it.b("truncated")) }
+    }
+}

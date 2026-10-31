@@ -40,30 +40,32 @@ export type {
   ConfigResponse,
   CreateEnrollmentGrantOptions,
   CreateWebhookOptions,
-  DbStats,
   DbQuotaCounters,
+  DbStats,
   DbSubCounters,
   DbWorkflowStatusCounts,
   EditWebhookOptions,
-  EnrollResult,
   EnrollmentGrant,
+  EnrollResult,
   ExplainResult,
   GetAuditOptions,
   HostCapability,
-  ListDeliveriesOptions,
   HotConfig,
   HotConfigPatch,
   LatencyStats,
+  ListDeliveriesOptions,
   MergeConflict,
   MergeDbResult,
   MergeReport,
-  StorageSignedUrls,
   MetricsSnapshot,
   MintTokenOptions,
   OpEvent,
   OpEventKind,
   PresenceRoomInspect,
   PresenceRoomsResponse,
+  PurgeOptions,
+  PurgePreview,
+  PurgeResult,
   RestoreResult,
   RtDbAdminClientOptions,
   SchemaPreviewColumnAdd,
@@ -74,6 +76,7 @@ export type {
   SessionInfo,
   SlowQueriesResponse,
   SlowQueryEntry,
+  StorageSignedUrls,
   SubscriptionInfo,
   SubscriptionsPrincipal,
   SubscriptionsResponse,
@@ -83,6 +86,8 @@ export type {
   WebhookDelivery,
 } from "./admin.js";
 export { RtDbAdminClient } from "./admin.js";
+export type { StreamChangesOptions } from "./change-feed.js";
+export { ChangeFeedStream } from "./change-feed.js";
 export type {
   AuthState,
   ChangeBatchMeta,
@@ -93,8 +98,6 @@ export type {
   WebSocketLike,
 } from "./client.js";
 export { RtDbClient } from "./client.js";
-export { ChangeFeedStream } from "./change-feed.js";
-export type { StreamChangesOptions } from "./change-feed.js";
 export type { RtDbErrorCode, RtDbErrorEnvelope } from "./errors.js";
 export { RtDbError } from "./errors.js";
 export type {
@@ -143,6 +146,7 @@ export type {
   ChangeFeedResponse,
   ChangeOp,
   ChangeOpKind,
+  ClaimedSchedule,
   ClientMessage,
   DirectiveJson,
   DirectiveReportJson,
@@ -163,15 +167,14 @@ export type {
   PresenceMember,
   QueryJson,
   SampleChangeJson,
-  ClaimedSchedule,
   ScheduleInfo,
   ScheduleWhen,
   SchemaHistoryEntry,
   SchemaHistoryEntrySummary,
   SchemaJson,
   SearchMode,
-  SearchRankMode,
   SearchQuery,
+  SearchRankMode,
   ServerMessage,
   StepJson,
   StepOutcome,

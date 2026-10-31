@@ -1556,6 +1556,62 @@ impl RtDbAdminClient {
         self.expect_ok(resp).await
     }
 
+    /// Preview reclamation of rows from an insertOnly table via
+    /// `POST /admin/db/{db}/purge`. `None` filter matches every row. The server
+    /// clamps `limit` to [1, 10_000], defaulting to 10_000 when omitted.
+    /// Requires the instance admin key. Unknown db/table returns `NOT_FOUND`,
+    /// a non-insertOnly table returns `BAD_REQUEST`, and a frozen database
+    /// returns `READ_ONLY`.
+    pub async fn purge_preview(
+        &self,
+        db: &str,
+        table: &str,
+        filter: Option<&crate::wire::FilterExpr>,
+        limit: Option<u32>,
+    ) -> Result<crate::wire::admin::PurgePreview, RtDbError> {
+        let resp = self
+            .post_json(
+                &format!("/admin/db/{db}/purge"),
+                &crate::wire::admin::PurgeRequest {
+                    table,
+                    filter,
+                    limit,
+                    confirm: None,
+                },
+            )
+            .await?;
+        crate::http_common::deserialize(resp).await
+    }
+
+    /// Confirm insertOnly-row reclamation via `POST /admin/db/{db}/purge`.
+    /// Pass the token returned by [`purge_preview`](Self::purge_preview) with
+    /// the same table and filter. The token binds the current matching count,
+    /// so after a truncated batch (`truncated: true`) preview again before the
+    /// next confirm — echoing a stale token fails with `PRECONDITION_FAILED`
+    /// (409). Read-only or quiesced databases reject the call with
+    /// `READ_ONLY` (409).
+    pub async fn purge(
+        &self,
+        db: &str,
+        table: &str,
+        filter: Option<&crate::wire::FilterExpr>,
+        limit: Option<u32>,
+        confirm: &str,
+    ) -> Result<crate::wire::admin::PurgeResult, RtDbError> {
+        let resp = self
+            .post_json(
+                &format!("/admin/db/{db}/purge"),
+                &crate::wire::admin::PurgeRequest {
+                    table,
+                    filter,
+                    limit,
+                    confirm: Some(confirm),
+                },
+            )
+            .await?;
+        crate::http_common::deserialize(resp).await
+    }
+
     async fn post_json<Req: Serialize>(
         &self,
         path: &str,

@@ -1068,6 +1068,59 @@ public actor RtDbAdminClient {
             contentType: "application/json"
         )
     }
+
+    // MARK: Purge (insertOnly reclamation)
+
+    /// `POST /admin/db/{db}/purge` without `confirm` — phase one of the
+    /// two-phase reclamation of insertOnly rows (the sanctioned answer to "a
+    /// client bug flooded an append-only table"). Counts the rows matching
+    /// `filter` (the same wire shape a Query's `where` uses; nil for every
+    /// row of the table) and returns a `confirmToken`; nothing is deleted.
+    /// `limit` is the per-call row cap the confirm phase will apply (server
+    /// default 10,000, clamped to [1, 10,000]).
+    ///
+    /// A `truncated: true` reply from the confirm phase means rows still
+    /// match: re-preview (the token is bound to the current matching count,
+    /// so a stale one refuses with 409) and confirm again until
+    /// `truncated: false`. The table must be declared insertOnly — a 400
+    /// (BAD_REQUEST) otherwise; a quiesced or read-only database refuses
+    /// with READ_ONLY.
+    @discardableResult
+    public func purgePreview(
+        _ db: String, table: String, filter: FilterExpr? = nil, limit: UInt32? = nil
+    ) async throws -> PurgePreview {
+        let response: PurgeResponse = try await postJson(
+            "purge preview", "/admin/db/\(encodePath(db))/purge",
+            PurgeRequest(table: table, filter: filter, limit: limit, confirm: nil)
+        )
+        guard let matching = response.matching, let confirmToken = response.confirmToken,
+              let limit = response.limit
+        else {
+            throw RtDbError(code: .internal, message: "purge preview missing preview fields")
+        }
+        return PurgePreview(matching: matching, confirmToken: confirmToken, limit: limit)
+    }
+
+    /// `POST /admin/db/{db}/purge` with `confirm` — phase two: pass the
+    /// `confirmToken` a `purgePreview` returned to delete up to `limit`
+    /// rows (server default and cap 10,000). `filter`/`limit` must be the
+    /// same values the preview used or the token refuses with 409
+    /// (PRECONDITION_FAILED). A `truncated: true` reply means rows still
+    /// match — re-preview and confirm again (see `purgePreview`).
+    @discardableResult
+    public func purge(
+        _ db: String, table: String, filter: FilterExpr? = nil, limit: UInt32? = nil,
+        confirm token: String
+    ) async throws -> PurgeOutcome {
+        let response: PurgeResponse = try await postJson(
+            "purge", "/admin/db/\(encodePath(db))/purge",
+            PurgeRequest(table: table, filter: filter, limit: limit, confirm: token)
+        )
+        guard let deleted = response.deleted, let truncated = response.truncated else {
+            throw RtDbError(code: .internal, message: "purge confirm missing outcome fields")
+        }
+        return PurgeOutcome(deleted: deleted, truncated: truncated)
+    }
 }
 
 // MARK: - Transport
@@ -1474,6 +1527,25 @@ private struct SetReadOnlyRequest: Encodable {
     let readOnly: Bool
 }
 
+private struct PurgeRequest: Encodable {
+    let table: String
+    let filter: FilterExpr?
+    let limit: UInt32?
+    let confirm: String?
+
+    enum CodingKeys: String, CodingKey {
+        case table, filter, limit, confirm
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(table, forKey: .table)
+        try container.encodeIfPresent(filter, forKey: .filter)
+        try container.encodeIfPresent(limit, forKey: .limit)
+        try container.encodeIfPresent(confirm, forKey: .confirm)
+    }
+}
+
 /// Encodes as `{}` — `backupNow`'s empty JSON body.
 private struct EmptyRequest: Encodable {}
 
@@ -1570,6 +1642,44 @@ private struct AnonymousAccessResponse: Decodable {
 
 private struct ReadOnlyResponse: Decodable {
     let readOnly: Bool
+}
+
+/// Phase-shaped purge reply (the server skips absent fields), decoded once
+/// and projected into `PurgePreview`/`PurgeOutcome` by the phase methods.
+private struct PurgeResponse: Decodable {
+    let matching: Int64?
+    let confirmToken: String?
+    let limit: UInt32?
+    let deleted: UInt64?
+    let truncated: Bool?
+}
+
+/// The preview half of a two-phase `POST /admin/db/{db}/purge`: the count of
+/// rows matching the purge filter, the one-shot `confirmToken` to hand back
+/// to `purge`, and the per-call row cap the confirm will apply.
+public struct PurgePreview: Equatable, Sendable {
+    public let matching: Int64
+    public let confirmToken: String
+    public let limit: UInt32
+
+    public init(matching: Int64, confirmToken: String, limit: UInt32) {
+        self.matching = matching
+        self.confirmToken = confirmToken
+        self.limit = limit
+    }
+}
+
+/// The confirm half of a two-phase `POST /admin/db/{db}/purge`: rows deleted
+/// by this call, and whether rows still match (`truncated: true` — re-preview
+/// and confirm again until it reports false).
+public struct PurgeOutcome: Equatable, Sendable {
+    public let deleted: UInt64
+    public let truncated: Bool
+
+    public init(deleted: UInt64, truncated: Bool) {
+        self.deleted = deleted
+        self.truncated = truncated
+    }
 }
 
 /// Blocking writes into the bound stream backing a streaming upload. The

@@ -3207,3 +3207,87 @@ async fn export_stream_pipes_into_import_stream() {
     let out = client.export_db_stream("src").await.unwrap();
     client.import_db_stream("dst", out).await.unwrap();
 }
+
+// InsertOnly purge — two-phase: preview (no `confirm` in the body) returns
+// `{matching, confirmToken, limit}`; confirm echoes the token and returns
+// `{deleted, truncated}`.
+
+#[tokio::test]
+async fn purge_preview_posts_table_and_filter_omits_confirm() {
+    let (server, client) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/admin/db/events/purge"))
+        .and(header("authorization", BEARER))
+        .and(body_partial_json(json!({
+            "table": "events",
+            "filter": {"op": "eq", "field": "kind", "value": "wake"}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "matching": 42, "confirmToken": "tok", "limit": 10_000
+        })))
+        .mount(&server)
+        .await;
+    let preview = client
+        .purge_preview(
+            "events",
+            "events",
+            Some(&crate::wire::FilterExpr::Eq {
+                field: "kind".to_string(),
+                value: json!("wake"),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview.matching, 42);
+    assert_eq!(preview.confirm_token, "tok");
+    assert_eq!(preview.limit, 10_000);
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(body.get("confirm").is_none());
+    assert!(body.get("limit").is_none());
+}
+
+#[tokio::test]
+async fn purge_posts_confirm_token_and_reports_truncation() {
+    let (server, client) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/admin/db/events/purge"))
+        .and(header("authorization", BEARER))
+        .and(body_partial_json(
+            json!({"table": "events", "confirm": "tok", "limit": 500}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "deleted": 500, "truncated": true
+        })))
+        .mount(&server)
+        .await;
+    let result = client
+        .purge("events", "events", None, Some(500), "tok")
+        .await
+        .unwrap();
+    assert_eq!(result.deleted, 500);
+    assert!(result.truncated);
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(body.get("filter").is_none());
+}
+
+#[tokio::test]
+async fn purge_surfaces_stale_token_envelope() {
+    let (server, client) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/admin/db/events/purge"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+            "code": "PRECONDITION_FAILED",
+            "message": "confirm token does not match the current state"
+        })))
+        .mount(&server)
+        .await;
+    let err = client
+        .purge("events", "events", None, None, "stale")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::PreconditionFailed);
+    assert!(err.message.contains("confirm token does not match"));
+}

@@ -12,6 +12,7 @@ import dev.parrtdb.http.pathEscape
 import dev.parrtdb.http.stepResults
 import dev.parrtdb.http.withQuery
 import dev.parrtdb.wire.ChangeFeedResponse
+import dev.parrtdb.wire.FilterExpr
 import dev.parrtdb.wire.Query
 import dev.parrtdb.wire.ScheduleInfo
 import dev.parrtdb.wire.ScheduleWhen
@@ -33,6 +34,7 @@ import java.net.http.HttpClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 
 /**
  * The admin control-plane client (all /admin routes). Every call carries the instance admin key as the bearer.
@@ -320,6 +322,30 @@ class AdminClient(baseUrl: String, adminKey: String, transport: HttpTransport = 
     /** Owner-bypass write. */
     suspend fun adminMutate(db: String, txn: Transaction, idempotencyKey: String? = null): List<StepResult> =
         stepResults(core.json("POST", "/admin/db/$db/mutate", jsonObj("txn" to txn.toJson(), "idempotencyKey" to idempotencyKey?.takeIf { it.isNotEmpty() }?.let { jsonStr(it) })), "adminMutate")
+
+    /**
+     * Phase one of the two-phase purge of an insertOnly table: counts the rows matching [filter]
+     * (the same wire shape a [Query]'s `where` uses; omit to match the whole table) and returns
+     * [PurgePreview.confirmToken]. Nothing is deleted.
+     */
+    suspend fun purgePreview(db: String, table: String, filter: FilterExpr? = null, limit: Int? = null): PurgePreview =
+        PurgePreview.fromJson(core.json("POST", "/admin/db/$db/purge", purgeBody(table, filter, limit, null)))
+
+    /**
+     * Phase two: with the [confirmToken] a [purgePreview] returned, deletes up to `limit` rows
+     * (server-capped at 10,000) per call. Re-run while [PurgeResult.truncated] is true. A stale
+     * token fails with PRECONDITION_FAILED (409) — re-preview to get a fresh one.
+     */
+    suspend fun purge(db: String, table: String, confirmToken: String, filter: FilterExpr? = null, limit: Int? = null): PurgeResult =
+        PurgeResult.fromJson(core.json("POST", "/admin/db/$db/purge", purgeBody(table, filter, limit, confirmToken)))
+
+    private fun purgeBody(table: String, filter: FilterExpr?, limit: Int?, confirm: String?): JsonObject =
+        jsonObj(
+            "table" to jsonStr(table),
+            "filter" to filter?.toJson(),
+            "limit" to limit?.let { jsonNum(it) },
+            "confirm" to confirm?.let { jsonStr(it) },
+        )
 
     // ---- enrollment ------------------------------------------------------------------------
 

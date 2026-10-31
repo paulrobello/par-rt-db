@@ -39,6 +39,8 @@ Surface covered:
   subscription table + fan-out counters, optionally filtered by db
 * scheduled jobs — ``GET|POST /admin/db/{db}/schedules`` plus
   ``.../{id}/cancel|pause|resume`` (the admin view spans all principals)
+* two-phase insertOnly purge — ``POST /admin/db/{db}/purge`` (preview →
+  confirm, repeat while ``truncated``)
 * file storage — ``GET|POST /admin/db/{db}/storage`` (raw-byte upload) plus
   ``DELETE .../{id}`` (idempotent)
 * per-db anonymous-access toggle (SEC-103) —
@@ -119,6 +121,8 @@ from .admin_models import (
     MintedToken,
     OpEvent,
     PresenceRoomsResponse,
+    PurgePreviewResult,
+    PurgeResult,
     SchemaHistoryEntry,
     SchemaHistorySummary,
     SchemaPreviewDiff,
@@ -138,6 +142,7 @@ from .schema import SchemaDef
 from .wire import (
     PROTOCOL_VERSION,
     ChangeFeedResponse,
+    FilterExpr,
     ScheduleInfo,
     ScheduleWhen,
     WorkflowInfo,
@@ -1076,6 +1081,62 @@ def _op_slow_queries(*, db: str | None = None, limit: int | None = None) -> _Adm
         params["limit"] = limit
     return _AdminRequest(
         "GET", "/admin/slow-queries", {"params": params}, _parse_model(SlowQueriesResponse)
+    )
+
+
+# --- two-phase insertOnly purge (POST /admin/db/{db}/purge) ------------------
+#
+# Preview (no ``confirm``) → {matching, confirmToken, limit}; confirm (with the
+# token) → {deleted, truncated}; repeat while ``truncated`` is True. ``filter``
+# is the same wire ``FilterExpr`` a Query's ``filter`` uses; omitted keys are
+# not sent so the server defaults apply (whole-table match, limit 10000).
+
+
+def _purge_body(
+    table: str,
+    *,
+    filter: FilterExpr | None = None,
+    limit: int | None = None,
+    confirm: str | None = None,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {"table": table}
+    if filter is not None:
+        body["filter"] = filter.model_dump(by_alias=True, mode="json")
+    if limit is not None:
+        body["limit"] = limit
+    if confirm is not None:
+        body["confirm"] = confirm
+    return body
+
+
+def _op_purge_preview(
+    db: str,
+    table: str,
+    *,
+    filter: FilterExpr | None = None,
+    limit: int | None = None,
+) -> _AdminRequest:
+    return _AdminRequest(
+        "POST",
+        f"/admin/db/{db}/purge",
+        {"json": _purge_body(table, filter=filter, limit=limit)},
+        _parse_model(PurgePreviewResult),
+    )
+
+
+def _op_purge_confirm(
+    db: str,
+    table: str,
+    *,
+    confirm: str,
+    filter: FilterExpr | None = None,
+    limit: int | None = None,
+) -> _AdminRequest:
+    return _AdminRequest(
+        "POST",
+        f"/admin/db/{db}/purge",
+        {"json": _purge_body(table, filter=filter, limit=limit, confirm=confirm)},
+        _parse_model(PurgeResult),
     )
 
 
@@ -2282,6 +2343,52 @@ class RtDbAdminClient:
         """
         return self._executor.run(_op_slow_queries(db=db, limit=limit))
 
+    # --- two-phase insertOnly purge (POST /admin/db/{db}/purge) ---
+
+    def purge_preview(
+        self,
+        db: str,
+        table: str,
+        *,
+        filter: FilterExpr | None = None,
+        limit: int | None = None,
+    ) -> PurgePreviewResult:
+        """``POST /admin/db/{db}/purge`` without ``confirm`` → ``PurgePreviewResult``.
+
+        Phase one of the two-phase reclamation handshake: counts the insertOnly
+        rows matching ``filter`` (the same wire ``FilterExpr`` a Query's
+        ``filter`` uses; omit it to match the whole table) and returns the
+        ``confirm_token`` to hand to :meth:`purge`, plus the effective per-call
+        ``limit`` (server default and cap 10000). Nothing is deleted.
+
+        Errors: ``NOT_FOUND`` for an unknown db or table, ``BAD_REQUEST`` when
+        the table is not insertOnly, ``READ_ONLY`` when the db is readonly or
+        quiesced.
+        """
+        return self._executor.run(_op_purge_preview(db, table, filter=filter, limit=limit))
+
+    def purge(
+        self,
+        db: str,
+        table: str,
+        *,
+        confirm: str,
+        filter: FilterExpr | None = None,
+        limit: int | None = None,
+    ) -> PurgeResult:
+        """``POST /admin/db/{db}/purge`` with the preview's ``confirmToken`` →
+        ``PurgeResult``.
+
+        Phase two: deletes up to ``limit`` matching rows. ``truncated`` is
+        ``True`` when rows still match — call again (same token while the
+        matching count is unchanged) until it reports ``truncated=False``. A
+        stale token (rows changed since the preview) fails with ``CONFLICT``
+        (409): re-run :meth:`purge_preview` for a fresh one.
+        """
+        return self._executor.run(
+            _op_purge_confirm(db, table, confirm=confirm, filter=filter, limit=limit)
+        )
+
 
 class AsyncRtDbAdminClient:
     """Async twin of :class:`RtDbAdminClient` (the ``[aio]`` extra).
@@ -3049,3 +3156,40 @@ class AsyncRtDbAdminClient:
         semantics.
         """
         return await self._executor.run(_op_slow_queries(db=db, limit=limit))
+
+    # --- two-phase insertOnly purge (POST /admin/db/{db}/purge) ---
+
+    async def purge_preview(
+        self,
+        db: str,
+        table: str,
+        *,
+        filter: FilterExpr | None = None,
+        limit: int | None = None,
+    ) -> PurgePreviewResult:
+        """``POST /admin/db/{db}/purge`` without ``confirm`` → ``PurgePreviewResult``
+        (async).
+
+        See :meth:`RtDbAdminClient.purge_preview` for phase and error
+        semantics; nothing is deleted.
+        """
+        return await self._executor.run(_op_purge_preview(db, table, filter=filter, limit=limit))
+
+    async def purge(
+        self,
+        db: str,
+        table: str,
+        *,
+        confirm: str,
+        filter: FilterExpr | None = None,
+        limit: int | None = None,
+    ) -> PurgeResult:
+        """``POST /admin/db/{db}/purge`` with the preview's ``confirmToken`` →
+        ``PurgeResult`` (async).
+
+        See :meth:`RtDbAdminClient.purge` for the two-phase handshake, the
+        ``truncated`` loop, and the 409 stale-token behavior.
+        """
+        return await self._executor.run(
+            _op_purge_confirm(db, table, confirm=confirm, filter=filter, limit=limit)
+        )

@@ -5,6 +5,8 @@ import type {
   HotConfig,
   HotConfigPatch,
   MergeReport,
+  PurgePreview,
+  PurgeResult,
   SessionInfo,
   SlowQueriesResponse,
   SlowQueryEntry,
@@ -1957,5 +1959,84 @@ describe("RtDbAdminClient — streaming snapshot I/O", () => {
     expect(init.body).toBeInstanceOf(ReadableStream);
     const sent = await new Response(init.body).text();
     expect(sent).toBe("line1\nline2\n");
+  });
+});
+
+describe("RtDbAdminClient purge (insertOnly reclamation)", () => {
+  it("purgePreview POSTs {table} without confirm and returns {matching, confirmToken, limit}", async () => {
+    const preview: PurgePreview = { matching: 42, confirmToken: "tok-1", limit: 10000 };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(preview));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+
+    await expect(admin.purgePreview("kanban", "wakes")).resolves.toEqual(preview);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/db/kanban/purge");
+    expect(init.method).toBe("POST");
+    expect(init.headers.Authorization).toBe("Bearer k");
+    // Preview body: `confirm` absent entirely so the server counts instead of deletes.
+    expect(JSON.parse(init.body)).toEqual({ table: "wakes" });
+  });
+
+  it("purgePreview passes filter/limit and omits absent option keys (no undefined leaks)", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse({ matching: 3, confirmToken: "tok-2", limit: 500 } satisfies PurgePreview),
+      );
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+
+    await admin.purgePreview("kanban", "wakes", {
+      filter: { op: "eq", field: "kind", value: "wake" },
+      limit: 500,
+    });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body).toEqual({
+      table: "wakes",
+      filter: { op: "eq", field: "kind", value: "wake" },
+      limit: 500,
+    });
+    expect("confirm" in body).toBe(false);
+  });
+
+  it("purge sends the confirm token and returns {deleted, truncated}", async () => {
+    const result: PurgeResult = { deleted: 42, truncated: false };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(result));
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+
+    await expect(
+      admin.purge(
+        "kanban",
+        "wakes",
+        { filter: { op: "eq", field: "kind", value: "wake" } },
+        "tok-1",
+      ),
+    ).resolves.toEqual(result);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://h:8300/admin/db/kanban/purge");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body)).toEqual({
+      table: "wakes",
+      filter: { op: "eq", field: "kind", value: "wake" },
+      confirm: "tok-1",
+    });
+  });
+
+  it("a wrong/stale confirm surfaces the 409 PRECONDITION_FAILED envelope as RtDbError", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse(
+        {
+          code: "PRECONDITION_FAILED",
+          message: "confirm token does not match the current state (3 row(s) now match 'wakes')",
+        },
+        409,
+      ),
+    );
+    const admin = new RtDbAdminClient({ url: "http://h:8300", adminKey: "k", fetch: fetchMock });
+
+    await expect(admin.purge("kanban", "wakes", {}, "stale-token")).rejects.toMatchObject({
+      name: "RtDbError",
+      code: "PRECONDITION_FAILED",
+      status: 409,
+    });
   });
 });

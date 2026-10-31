@@ -713,6 +713,28 @@ class SignedUrl(_Wire):
     expires_at: int
 
 
+class PurgePreviewResult(_Wire):
+    """``POST /admin/db/{db}/purge`` preview response (no ``confirm`` sent):
+    the matching-row count, the ``confirmToken`` to hand back for the delete,
+    and the effective per-call ``limit``. Mirrors the phase-shaped
+    ``server::admin::purge::PurgeResponse`` preview fields (the server skips
+    serializing the confirm-phase fields, so ``extra="forbid"`` is exact)."""
+
+    matching: int
+    confirm_token: str = Field(alias="confirmToken")
+    limit: int
+
+
+class PurgeResult(_Wire):
+    """``POST /admin/db/{db}/purge`` confirm response: rows deleted in this
+    call and whether rows still match (re-run the confirm until ``truncated``
+    is ``False``). Mirrors the confirm-phase fields of
+    ``server::admin::purge::PurgeResponse``."""
+
+    deleted: int
+    truncated: bool
+
+
 # ``StepResult`` is a ``Union`` alias (no ``model_validate``); route through a
 # single ``TypeAdapter`` for the untagged per-step result, mirroring mutation.py
 # and the data-plane HTTP clients.
