@@ -47,6 +47,15 @@ make build            # builds the linked SDK, then vite build → dist/
 → immutable cache; `index.html` → no-cache). See the root `CLAUDE.md` "Dashboard
 SPA" note for how the router serves it as the last fallback route.
 
+### Icons and PWA manifest
+
+The favicon / PWA icon suite in `public/` is generated, not hand-edited:
+`python3 scripts/gen-icons.py` (needs `rsvg-convert` + Pillow) regenerates every
+file from the SVG master in `scripts/gen-icons.py`. The suite covers
+`favicon.svg` / `favicon.ico` / PNG favicons, `apple-touch-icon.png`,
+`icons/icon-{192,512}.png`, and the maskable 512; `public/manifest.webmanifest`
+makes the console installable. Head tags live in `index.html`.
+
 ## Verify
 
 ```bash
