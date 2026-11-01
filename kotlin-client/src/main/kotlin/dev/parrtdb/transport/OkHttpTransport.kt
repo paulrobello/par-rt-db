@@ -22,7 +22,7 @@ import okio.source
 
 /**
  * OkHttp-backed transport, the one to use on Android (where `java.net.http` does not exist). OkHttp
- * 4.x is a `compileOnly` dependency of this library: add `com.squareup.okhttp3:okhttp` to your app.
+ * is a `compileOnly` dependency of this library: add `com.squareup.okhttp3:okhttp` to your app.
  * Configure timeouts, TLS and proxies on the [client] you pass in.
  */
 class OkHttpTransport(private val client: OkHttpClient = OkHttpClient()) : StreamingHttpTransport, WsTransport {
@@ -43,7 +43,7 @@ class OkHttpTransport(private val client: OkHttpClient = OkHttpClient()) : Strea
 
                     override fun onResponse(call: Call, response: Response) {
                         try {
-                            response.use { cont.resume(TransportResponse(it.code, it.body?.bytes() ?: ByteArray(0))) }
+                            response.use { cont.resume(TransportResponse(it.code, it.body.bytes())) }
                         } catch (e: IOException) {
                             cont.resumeWithException(e)
                         }
@@ -76,7 +76,7 @@ class OkHttpTransport(private val client: OkHttpClient = OkHttpClient()) : Strea
 
                     // The Response is deliberately left open: closing the returned stream closes it.
                     override fun onResponse(call: Call, response: Response) {
-                        cont.resume(StreamingResponse(response.code, response.body?.byteStream() ?: java.io.ByteArrayInputStream(ByteArray(0))))
+                        cont.resume(StreamingResponse(response.code, response.body.byteStream()))
                     }
                 },
             )

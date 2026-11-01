@@ -26,6 +26,24 @@ function Probe() {
   );
 }
 
+function ProbeErr({ onError }: { onError: (e: unknown) => void }) {
+  const s = useSession();
+  return (
+    <button
+      type="button"
+      onClick={async () => {
+        try {
+          await s.signInWithAdminKey("bad");
+        } catch (e) {
+          onError(e);
+        }
+      }}
+    >
+      try-bad
+    </button>
+  );
+}
+
 function buildFetch(opts: { loginStatus?: number; meBody?: unknown } = {}) {
   const loginStatus = opts.loginStatus ?? 204;
   const meBody = opts.meBody ?? { email: "ops@example.com" };
@@ -175,27 +193,13 @@ describe("SessionProvider", () => {
     globalThis.fetch = buildFetch({ loginStatus: 401 });
 
     let captured: unknown = null;
-    function ProbeErr() {
-      const s = useSession();
-      return (
-        <button
-          type="button"
-          onClick={async () => {
-            try {
-              await s.signInWithAdminKey("bad");
-            } catch (e) {
-              captured = e;
-            }
-          }}
-        >
-          try-bad
-        </button>
-      );
-    }
-
     render(
       <SessionProvider>
-        <ProbeErr />
+        <ProbeErr
+          onError={(e) => {
+            captured = e;
+          }}
+        />
       </SessionProvider>,
     );
 

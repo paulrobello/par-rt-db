@@ -17,6 +17,7 @@ import {
   signInWithOAuthSession,
   signInWithOidc,
   Unauthenticated,
+  type OAuthProvider,
   useConnectionState,
   usePaginatedQuery,
   useQuery,
@@ -66,19 +67,91 @@ function setup() {
   return { client, sockets };
 }
 
+function QueryItemsView({ query }: { query: RtQuery<Array<{ _id: string }>> }) {
+  const items = useQuery(query);
+  return <div>{items === undefined ? "loading" : `count:${items.length}`}</div>;
+}
+
+function SkipQueryView() {
+  const items = useQuery<unknown[]>("skip");
+  return <div>{items === undefined ? "skipped" : "has"}</div>;
+}
+
+function SignInButton({
+  label,
+  provider,
+  onSignIn,
+}: {
+  label: string;
+  provider?: OAuthProvider;
+  onSignIn: (pending: Promise<void>) => void;
+}) {
+  const { signIn } = useRtDbAuth();
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        onSignIn(signIn(provider));
+      }}
+    >
+      {label}
+    </button>
+  );
+}
+
+function PaginatedItemsView() {
+  const r = usePaginatedQuery<{ _id: string }>(() => ({ table: "items" }), {
+    pageSize: 2,
+  });
+  return (
+    <div>
+      <span>count:{r.data.length}</span>
+      <span>loading:{String(r.loading)}</span>
+      <span>hasNext:{String(r.hasNextPage)}</span>
+      <button type="button" onClick={() => void r.loadMore()}>
+        more
+      </button>
+    </div>
+  );
+}
+
+function PaginatedDisabledView() {
+  const r = usePaginatedQuery<{ _id: string }>(() => ({ table: "items" }), {
+    enabled: false,
+  });
+  return <div>count:{r.data.length}</div>;
+}
+
+function PaginatedRefetchView() {
+  const r = usePaginatedQuery<{ _id: string }>(() => ({ table: "items" }), {
+    pageSize: 2,
+  });
+  return (
+    <div>
+      <span>count:{r.data.length}</span>
+      <button type="button" onClick={() => void r.loadMore()}>
+        more
+      </button>
+      <button type="button" onClick={() => void r.refetch()}>
+        refetch
+      </button>
+    </div>
+  );
+}
+
+function ConnectionStateView() {
+  const conn = useConnectionState();
+  return <div>conn:{conn}</div>;
+}
+
 describe("react bindings", () => {
   it("useQuery returns undefined then the pushed result", async () => {
     const { client, sockets } = setup();
     const q: RtQuery<Array<{ _id: string }>> = { json: { table: "items" } };
 
-    function View() {
-      const items = useQuery(q);
-      return <div>{items === undefined ? "loading" : `count:${items.length}`}</div>;
-    }
-
     render(
       <RtDbProvider client={client} authBaseUrl="http://h:8300">
-        <View />
+        <QueryItemsView query={q} />
       </RtDbProvider>,
     );
     await act(async () => {
@@ -118,13 +191,9 @@ describe("react bindings", () => {
 
   it('"skip" suppresses the subscription', async () => {
     const { client, sockets } = setup();
-    function View() {
-      const items = useQuery<unknown[]>("skip");
-      return <div>{items === undefined ? "skipped" : "has"}</div>;
-    }
     render(
       <RtDbProvider client={client} authBaseUrl="http://h:8300">
-        <View />
+        <SkipQueryView />
       </RtDbProvider>,
     );
     await act(async () => {
@@ -404,23 +473,15 @@ describe("useRtDbAuth signIn routing", () => {
     const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
     let pending: Promise<void> | undefined;
 
-    function View() {
-      const { signIn } = useRtDbAuth();
-      return (
-        <button
-          type="button"
-          onClick={() => {
-            pending = signIn("google");
-          }}
-        >
-          google
-        </button>
-      );
-    }
-
     render(
       <RtDbProvider client={client} authBaseUrl="http://h:8300">
-        <View />
+        <SignInButton
+          label="google"
+          provider="google"
+          onSignIn={(p) => {
+            pending = p;
+          }}
+        />
       </RtDbProvider>,
     );
 
@@ -455,23 +516,14 @@ describe("useRtDbAuth signIn routing", () => {
     vi.spyOn(window, "open").mockReturnValue(null);
     let pending: Promise<void> | undefined;
 
-    function View() {
-      const { signIn } = useRtDbAuth();
-      return (
-        <button
-          type="button"
-          onClick={() => {
-            pending = signIn();
-          }}
-        >
-          default
-        </button>
-      );
-    }
-
     render(
       <RtDbProvider client={client} authBaseUrl="http://h:8300">
-        <View />
+        <SignInButton
+          label="default"
+          onSignIn={(p) => {
+            pending = p;
+          }}
+        />
       </RtDbProvider>,
     );
 
@@ -531,22 +583,14 @@ describe("useRtDbAuth cookie mode (SEC-002)", () => {
     vi.spyOn(window, "open").mockReturnValue(null);
 
     let pending: Promise<void> | undefined;
-    function View() {
-      const { signIn } = useRtDbAuth();
-      return (
-        <button
-          type="button"
-          onClick={() => {
-            pending = signIn();
-          }}
-        >
-          in
-        </button>
-      );
-    }
     render(
       <RtDbProvider client={client} authBaseUrl="http://h:8300">
-        <View />
+        <SignInButton
+          label="in"
+          onSignIn={(p) => {
+            pending = p;
+          }}
+        />
       </RtDbProvider>,
     );
 
@@ -576,22 +620,14 @@ describe("useRtDbAuth cookie mode (SEC-002)", () => {
     vi.spyOn(window, "open").mockReturnValue(null);
 
     let pending: Promise<void> | undefined;
-    function View() {
-      const { signIn } = useRtDbAuth();
-      return (
-        <button
-          type="button"
-          onClick={() => {
-            pending = signIn();
-          }}
-        >
-          in
-        </button>
-      );
-    }
     render(
       <RtDbProvider client={client} authBaseUrl="http://h:8300">
-        <View />
+        <SignInButton
+          label="in"
+          onSignIn={(p) => {
+            pending = p;
+          }}
+        />
       </RtDbProvider>,
     );
 
@@ -636,25 +672,9 @@ describe("usePaginatedQuery", () => {
     const { client, sockets } = setup();
     const delivered = new Set<string>();
 
-    function View() {
-      const r = usePaginatedQuery<{ _id: string }>(() => ({ table: "items" }), {
-        pageSize: 2,
-      });
-      return (
-        <div>
-          <span>count:{r.data.length}</span>
-          <span>loading:{String(r.loading)}</span>
-          <span>hasNext:{String(r.hasNextPage)}</span>
-          <button type="button" onClick={() => void r.loadMore()}>
-            more
-          </button>
-        </div>
-      );
-    }
-
     render(
       <RtDbProvider client={client} authBaseUrl="http://h:8300">
-        <View />
+        <PaginatedItemsView />
       </RtDbProvider>,
     );
     // First page is pending before the socket authenticates.
@@ -711,15 +731,9 @@ describe("usePaginatedQuery", () => {
 
   it("does not subscribe when enabled is false", async () => {
     const { client, sockets } = setup();
-    function View() {
-      const r = usePaginatedQuery<{ _id: string }>(() => ({ table: "items" }), {
-        enabled: false,
-      });
-      return <div>count:{r.data.length}</div>;
-    }
     render(
       <RtDbProvider client={client} authBaseUrl="http://h:8300">
-        <View />
+        <PaginatedDisabledView />
       </RtDbProvider>,
     );
     await act(async () => {
@@ -733,25 +747,9 @@ describe("usePaginatedQuery", () => {
   it("refetch drops deeper pages and re-subscribes the first page", async () => {
     const { client, sockets } = setup();
     const delivered = new Set<string>();
-    function View() {
-      const r = usePaginatedQuery<{ _id: string }>(() => ({ table: "items" }), {
-        pageSize: 2,
-      });
-      return (
-        <div>
-          <span>count:{r.data.length}</span>
-          <button type="button" onClick={() => void r.loadMore()}>
-            more
-          </button>
-          <button type="button" onClick={() => void r.refetch()}>
-            refetch
-          </button>
-        </div>
-      );
-    }
     render(
       <RtDbProvider client={client} authBaseUrl="http://h:8300">
-        <View />
+        <PaginatedRefetchView />
       </RtDbProvider>,
     );
     await act(async () => {
@@ -800,13 +798,9 @@ describe("usePaginatedQuery", () => {
 describe("useConnectionState", () => {
   it("tracks the idle → connecting → connected transitions", async () => {
     const { client, sockets } = setup();
-    function View() {
-      const conn = useConnectionState();
-      return <div>conn:{conn}</div>;
-    }
     render(
       <RtDbProvider client={client} authBaseUrl="http://h:8300">
-        <View />
+        <ConnectionStateView />
       </RtDbProvider>,
     );
     // Before the socket opens the client is not yet connected.

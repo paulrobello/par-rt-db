@@ -11,13 +11,13 @@ JVM-first: Kotlin Multiplatform is deferred. The core layers (wire, DSL,
 in-memory engine, admin DTOs) are pure Kotlin + kotlinx-serialization. The
 network layer (`RtDbHttpClient`, `AdminClient`, `RtDbWsClient`) runs over a
 pluggable transport (`dev.parrtdb.transport`): `JdkTransport` (the default,
-`java.net.http`, JVM only) or `OkHttpTransport` (OkHttp 4.x).
+`java.net.http`, JVM only) or `OkHttpTransport` (OkHttp 5.x).
 
 **Android: supported at minSdk 26.** `java.net.http` does not exist on Android
 at any API level, so pass an `OkHttpTransport` to every network client. The
 floor is 26 because the cursor codec uses `java.util.Base64`. OkHttp is a
-`compileOnly` dependency of this library: add `com.squareup.okhttp3:okhttp:4.12.0`
-(or newer 4.x) to your app.
+`compileOnly` dependency of this library: add `com.squareup.okhttp3:okhttp:5.5.1`
+(or newer 5.x) to your app.
 
 ```kotlin
 val transport = OkHttpTransport(okHttpClient) // your configured OkHttpClient

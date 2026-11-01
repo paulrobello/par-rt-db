@@ -52,26 +52,69 @@ function setup() {
   return { client, sockets };
 }
 
+function PresenceRoomView() {
+  const r = usePresence("doc:1");
+  return (
+    <div>
+      <span>count:{r.members.length}</span>
+      <button type="button" onClick={() => r.updatePresence({ cursor: { x: 1 } })}>
+        move
+      </button>
+      <button type="button" onClick={() => r.leavePresence()}>
+        leave
+      </button>
+    </div>
+  );
+}
+
+function PresenceMountView() {
+  usePresence("doc:1");
+  return <div>x</div>;
+}
+
+function PresenceRoomSwitchView() {
+  const [room, setRoom] = useState("doc:1");
+  usePresence(room);
+  return (
+    <button type="button" onClick={() => setRoom("doc:2")}>
+      switch
+    </button>
+  );
+}
+
+function PresenceMemberA() {
+  usePresence("doc:1");
+  return <div>a</div>;
+}
+
+function PresenceMemberB() {
+  usePresence("doc:1");
+  return <div>b</div>;
+}
+
+function PresenceTree({
+  client,
+  showA,
+  showB,
+}: {
+  client: RtDbClient;
+  showA: boolean;
+  showB: boolean;
+}) {
+  return (
+    <RtDbProvider client={client} authBaseUrl="http://h:8300">
+      {showA && <PresenceMemberA />}
+      {showB && <PresenceMemberB />}
+    </RtDbProvider>
+  );
+}
+
 describe("usePresence", () => {
   it("joins on auth, reflects inbound snapshots, and sends updates", async () => {
     const { client, sockets } = setup();
-    function View() {
-      const r = usePresence("doc:1");
-      return (
-        <div>
-          <span>count:{r.members.length}</span>
-          <button type="button" onClick={() => r.updatePresence({ cursor: { x: 1 } })}>
-            move
-          </button>
-          <button type="button" onClick={() => r.leavePresence()}>
-            leave
-          </button>
-        </div>
-      );
-    }
     render(
       <RtDbProvider client={client} authBaseUrl="http://h:8300">
-        <View />
+        <PresenceRoomView />
       </RtDbProvider>,
     );
 
@@ -103,13 +146,9 @@ describe("usePresence", () => {
 
   it("sends leavePresence on unmount", async () => {
     const { client, sockets } = setup();
-    function View() {
-      usePresence("doc:1");
-      return <div>x</div>;
-    }
     const { unmount } = render(
       <RtDbProvider client={client} authBaseUrl="http://h:8300">
-        <View />
+        <PresenceMountView />
       </RtDbProvider>,
     );
     await act(async () => {
@@ -128,18 +167,9 @@ describe("usePresence", () => {
 
   it("re-subscribes when room changes (leaves old, joins new)", async () => {
     const { client, sockets } = setup();
-    function View() {
-      const [room, setRoom] = useState("doc:1");
-      usePresence(room);
-      return (
-        <button type="button" onClick={() => setRoom("doc:2")}>
-          switch
-        </button>
-      );
-    }
     render(
       <RtDbProvider client={client} authBaseUrl="http://h:8300">
-        <View />
+        <PresenceRoomSwitchView />
       </RtDbProvider>,
     );
     await act(async () => {
@@ -171,21 +201,7 @@ describe("usePresence", () => {
     // leavePresence (would kill the room for the still-mounted second); only
     // the LAST unmount sends the wire leave.
     const { client, sockets } = setup();
-    function A() {
-      usePresence("doc:1");
-      return <div>a</div>;
-    }
-    function B() {
-      usePresence("doc:1");
-      return <div>b</div>;
-    }
-    const Tree = ({ showA, showB }: { showA: boolean; showB: boolean }) => (
-      <RtDbProvider client={client} authBaseUrl="http://h:8300">
-        {showA && <A />}
-        {showB && <B />}
-      </RtDbProvider>
-    );
-    const { rerender } = render(<Tree showA showB />);
+    const { rerender } = render(<PresenceTree client={client} showA showB />);
 
     await act(async () => {
       sockets[0].open();
@@ -199,13 +215,13 @@ describe("usePresence", () => {
 
     // Unmount A only: B still holds the room — no wire leave.
     await act(async () => {
-      rerender(<Tree showA={false} showB />);
+      rerender(<PresenceTree client={client} showA={false} showB />);
     });
     expect(sockets[0].parsed().filter((m) => m.type === "leavePresence").length).toBe(0);
 
     // Unmount B too: last listener → wire leave fires exactly once.
     await act(async () => {
-      rerender(<Tree showA={false} showB={false} />);
+      rerender(<PresenceTree client={client} showA={false} showB={false} />);
     });
     const leaves = sockets[0].parsed().filter((m) => m.type === "leavePresence");
     expect(leaves).toEqual([{ type: "leavePresence", room: "doc:1" }]);

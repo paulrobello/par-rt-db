@@ -12,8 +12,8 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
     // Optional: only OkHttpTransport needs it; Android apps add okhttp themselves.
-    compileOnly("com.squareup.okhttp3:okhttp:4.12.0")
-    testImplementation("com.squareup.okhttp3:okhttp:4.12.0")
+    compileOnly("com.squareup.okhttp3:okhttp:5.5.1")
+    testImplementation("com.squareup.okhttp3:okhttp:5.5.1")
     testImplementation(kotlin("test"))
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
 }
