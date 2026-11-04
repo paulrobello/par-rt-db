@@ -49,12 +49,15 @@ pub(crate) fn check_protocol_version(headers: &HeaderMap) -> Result<(), RtDbErro
     Ok(())
 }
 
-fn bearer_token(headers: &HeaderMap) -> Result<&str, RtDbError> {
-    if let Some(v) = headers
+fn explicit_bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-    {
+}
+
+fn bearer_token(headers: &HeaderMap) -> Result<&str, RtDbError> {
+    if let Some(v) = explicit_bearer(headers) {
         return Ok(v);
     }
     // SEC-001: dashboard cookie path (HttpOnly `rtdb_session`). Same-origin
@@ -77,6 +80,21 @@ async fn authed(
     db: &str,
 ) -> Result<Principal, RtDbError> {
     check_protocol_version(headers)?;
+    // SEC-007: CORS gates browser *reads*, not execution — a cross-site POST
+    // still runs server-side, and the JSON body's implicit preflight does not
+    // cover the preflight-free storage upload. When the ambient session
+    // cookie (SEC-001) is the credential, mirror the WS upgrade check
+    // (SEC-105): a present Origin must match `allowed_origins` or
+    // `public_url`. Absent Origin (CLI/SDK/machine token) and explicit-bearer
+    // requests are admitted — the resolve/authorize gates below still
+    // validate the credential either way.
+    let cookie_credential = explicit_bearer(headers).is_none()
+        && crate::auth::cookie::session_cookie(headers).is_some();
+    if cookie_credential
+        && !crate::origin_allowed(headers, &state.runtime.hot, &state.config.public_url)
+    {
+        return Err(RtDbError::forbidden("origin not allowed"));
+    }
     let token = bearer_token(headers)?;
     let principal = resolve_bearer(&state.pool, token).await?;
     authorize(&state.pool, &principal, db).await?;

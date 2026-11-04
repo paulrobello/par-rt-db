@@ -561,6 +561,13 @@ flow). Both resolve through the same
 WS handler and admin re-auth paths re-run on every op (revocation and expiry take effect on
 open connections — see [Known MVP limitations](#known-mvp-limitations)).
 
+On the HTTP data routes (`/api/*`) the session cookie may stand in for the bearer header.
+Because CORS gates browser *reads* — not execution — a cookie-authenticated request there
+carries a server-side Origin check (SEC-007): when the `rtdb_session` cookie is the
+credential (no `Authorization` header) and the request bears an `Origin`, that origin must
+match `RTDB_ALLOWED_ORIGINS` or `RTDB_PUBLIC_URL`, else `403`. Requests with an explicit
+bearer header, and non-browser requests with no `Origin` at all, are unaffected.
+
 #### Host machine authorization
 
 An optional, versioned **host capability** on a machine token —
@@ -648,7 +655,7 @@ operators tune on first boot:
 | `RTDB_ADMIN_KEY` | yes | — | Server-wide admin bearer (constant-time compared). Generate with `openssl rand -hex 32`. |
 | `RTDB_PORT` | no | `8300` | HTTP/WS listen port. |
 | `RTDB_PUBLIC_URL` | no | `http://localhost:8300` | Public origin (OAuth callback base, external links). |
-| `RTDB_ALLOWED_ORIGINS` | no | empty | Comma-separated browser origins; also the exact-match CORS allowlist for `/api/*` and `/auth/*`. **Hot-reloadable.** |
+| `RTDB_ALLOWED_ORIGINS` | no | empty | Comma-separated browser origins; also the exact-match CORS allowlist for `/api/*` and `/auth/*`, and the Origin gate for cookie-authenticated `/api/*` requests (SEC-007). **Hot-reloadable.** |
 | `RTDB_STATIC_DIR` | no | unset | Directory of static SPA build artifacts. Set/unset existing dir ⇒ dashboard served same-origin at the catch-all route fallback; unset/empty/missing ⇒ API-only. |
 | `RTDB_GITHUB_CLIENT_ID` + `RTDB_GITHUB_CLIENT_SECRET` | no | none | GitHub OAuth app credentials — both required to enable GitHub login. The other five providers (Google, GitLab, Microsoft, Apple, OIDC) follow the same `RTDB_<PROVIDER>_CLIENT_ID` + `_CLIENT_SECRET` pair pattern; see `.env.example` and [`docs/OAUTH_SETUP.md`](docs/OAUTH_SETUP.md). |
 | `RTDB_OTEL_ENABLED` | no | `false` | OpenTelemetry/OTLP tracing master switch (ENH-018). Requires the `otel` cargo feature — the shipped Docker image builds with it, source builds must pass `--features otel`. `false` (default) produces zero OTLP calls. Paired with `RTDB_OTEL_ENDPOINT` (default `http://127.0.0.1:4317`), `RTDB_OTEL_SERVICE_NAME` (default `par-rt-db`), and `RTDB_OTEL_SAMPLE_RATIO` (default `0.05`). A bearer-gated collector also needs the standard `OTEL_EXPORTER_OTLP_HEADERS` var (crate-native; the deploy-compose forwards it). See [Tracing](deploy/README.md#tracing-opentelemetry--otlp-enh-018). |

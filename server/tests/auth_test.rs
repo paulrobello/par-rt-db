@@ -1,4 +1,4 @@
-use crate::common::{fresh_db, spawn_app, test_state};
+use crate::common::{admin_get, admin_post, fresh_db, mint_user_session, spawn_app, test_state};
 use rtdb_server::auth::{self, Principal};
 use rtdb_server::error::ErrorCode;
 use serde_json::json;
@@ -254,6 +254,268 @@ async fn full_access_token_unrestricted_regression() -> anyhow::Result<()> {
         )
         .await;
         assert_eq!(resp.status(), 200, "{label}: full-access reads workItems");
+    }
+
+    Ok(())
+}
+
+/// SEC-007 regression set: the shared `authed` prologue must reject an HTTP
+/// data-route request whose `Origin` is neither `public_url` nor on the hot
+/// `allowed_origins` list when the ambient session cookie is the credential
+/// (CORS does not stop the request from *executing*, and the storage upload
+/// is preflight-free), while an allowlisted Origin, `public_url` itself, an
+/// absent Origin (CLI/SDK/machine token), and an explicit bearer header all
+/// stay admitted. Cookie cases ride a real OAuth session — fresh
+/// `rtdb_auth.users`/`sessions` rows whose email is allowlisted for the db
+/// via the admin API (the `per_row_auth_test` fixture shape) — because a
+/// machine token only authenticates via `Authorization` and can never
+/// exercise the cookie path.
+async fn cookie_session_for(
+    state: &std::sync::Arc<rtdb_server::AppState>,
+    addr: SocketAddr,
+    db: &str,
+) -> String {
+    let suffix = uuid::Uuid::now_v7().simple();
+    let email = format!("sec007-{suffix}@example.com");
+    let session = mint_user_session(&state.pool, &format!("sec007-{suffix}"), &email).await;
+    let r = admin_post(
+        addr,
+        "/admin/allowlist",
+        json!({"db": db, "action": "add", "email": email}),
+    )
+    .await;
+    assert_eq!(r.status(), reqwest::StatusCode::OK, "allowlist add failed");
+    session
+}
+
+fn mutate_body(db: &str) -> serde_json::Value {
+    json!({"db": db, "txn": {"steps": [{"op": "insert", "table": "projects", "doc": {
+        "name": "sec007", "status": "active", "tags": [], "updatedAt": 0
+    }}]}})
+}
+
+#[tokio::test]
+async fn http_data_route_rejects_disallowed_origin() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let session = cookie_session_for(&state, addr, &name).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/mutate"))
+        .header("Origin", "https://evil.example")
+        .header("Cookie", format!("rtdb_session={session}"))
+        .json(&mutate_body(&name))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a cookie-authenticated mutate from a disallowed Origin must be rejected"
+    );
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["code"], json!("FORBIDDEN"));
+
+    // Same credential, no Origin header: admitted, so the 403 above was the
+    // Origin gate alone — and the rejected write left no document behind.
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/query"))
+        .header("Cookie", format!("rtdb_session={session}"))
+        .json(&json!({"db": name, "query": {"table": "projects"}}))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        200,
+        "the session cookie without an Origin must stay admitted"
+    );
+    let body: serde_json::Value = resp.json().await?;
+    assert!(
+        body["result"]
+            .as_array()
+            .is_some_and(|docs| docs.is_empty()),
+        "the rejected mutate must leave no document"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_upload_rejects_disallowed_origin() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let session = cookie_session_for(&state, addr, &name).await;
+
+    // The upload takes a raw text/plain body — the preflight-free CSRF shape
+    // the JSON routes don't have.
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/storage/{name}"))
+        .header("Origin", "https://evil.example")
+        .header("Cookie", format!("rtdb_session={session}"))
+        .header("Content-Type", "text/plain")
+        .body("csrf-bytes")
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a cookie-authenticated upload from a disallowed Origin must be rejected"
+    );
+
+    // The rejected upload left no blob.
+    let body: serde_json::Value = admin_get(addr, &format!("/admin/db/{name}/storage"))
+        .await
+        .json()
+        .await?;
+    assert!(
+        body["files"]
+            .as_array()
+            .is_some_and(|files| files.is_empty()),
+        "the rejected upload must leave no blob"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_data_route_allows_allowlisted_origin() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let session = cookie_session_for(&state, addr, &name).await;
+
+    // The test hot allowlist seeds `http://localhost:5173` (common::test_hot).
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/mutate"))
+        .header("Origin", "http://localhost:5173")
+        .header("Cookie", format!("rtdb_session={session}"))
+        .json(&mutate_body(&name))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        200,
+        "an allowlisted Origin with a valid session cookie must mutate"
+    );
+
+    // And the write landed: one projects doc.
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/query"))
+        .header("Cookie", format!("rtdb_session={session}"))
+        .json(&json!({"db": name, "query": {"table": "projects"}}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await?;
+    let docs = body["result"].as_array().expect("docs array");
+    assert_eq!(docs.len(), 1, "the admitted mutate must have written");
+    assert_eq!(docs[0]["name"], json!("sec007"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_data_route_allows_public_url_origin() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let session = cookie_session_for(&state, addr, &name).await;
+
+    // `common::test_config` seeds `public_url = "http://localhost:0"`, the
+    // deploy's own origin — always allowed.
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/mutate"))
+        .header("Origin", "http://localhost:0")
+        .header("Cookie", format!("rtdb_session={session}"))
+        .json(&mutate_body(&name))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        200,
+        "the public_url Origin with a valid session cookie must mutate"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_data_route_allows_absent_origin() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let (_, token) = auth::tokens::mint_token(&state.pool, &name, "sec7", None, false, None)
+        .await
+        .expect("mint token");
+
+    // No Origin header at all: the CLI/SDK/machine-token shape. Admitted —
+    // the resolve/authorize gates still validate the credential.
+    let resp = api_post(addr, "/api/mutate", &token, mutate_body(&name)).await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "an absent Origin (non-browser client) must keep mutating"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_data_route_allows_explicit_bearer_with_disallowed_origin() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let (_, token) = auth::tokens::mint_token(&state.pool, &name, "sec7", None, false, None)
+        .await
+        .expect("mint token");
+
+    // A non-ambient credential cannot be CSRF-forged (a foreign page cannot
+    // set the Authorization header), so the Origin check does not apply.
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/mutate"))
+        .header("Origin", "https://evil.example")
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&mutate_body(&name))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status(),
+        200,
+        "an explicit bearer header is non-ambient and must stay admitted"
+    );
+
+    Ok(())
+}
+
+/// Empty-Authorization semantics, pinned against the current parser
+/// (`http_api::bearer_token` / `explicit_bearer`, inspected): an explicitly
+/// empty `Bearer` is NOT a credential — the prefix match filters empty tokens
+/// and falls through to the ambient cookie. With no cookie present the
+/// request is 401 either way. This asserts only that floor (the vault rule
+/// from the go-client F7 fix: an explicitly-presented-but-empty credential
+/// must never authenticate on its own); the empty-bearer-WITH-cookie
+/// fallback is deliberately not pinned while the main session may revise it.
+/// Both wire spellings are covered — OWS trimming can deliver `Bearer`
+/// without the trailing space, and both fail the parser identically.
+#[tokio::test]
+async fn empty_bearer_without_cookie_is_unauthorized() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+
+    for header in ["Bearer ", "Bearer"] {
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/api/mutate"))
+            .header("Authorization", header)
+            .json(&mutate_body(&name))
+            .send()
+            .await?;
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{header:?}: an explicitly empty bearer must not authenticate"
+        );
     }
 
     Ok(())

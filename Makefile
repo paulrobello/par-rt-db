@@ -374,15 +374,20 @@ rtdb-cli:
 
 # ENH-025: regenerate the cli/README.md command reference (the
 # cli-reference:begin/end marker region) from the CLI's own clap definitions.
+# env -u: clap renders each `[env: VAR=…]` default from the live environment,
+# so a dev shell with RTDB_URL exported would bake a private value into the
+# committed docs — regenerate and verify against a clean RTDB_* environment.
+CLI_DOCS_ENV = env -u RTDB_URL -u RTDB_DB -u RTDB_TOKEN -u RTDB_ADMIN_KEY
+
 cli-docs:
-	cd cli && cargo run --quiet --bin gen-cli-docs -- README.md
+	cd cli && $(CLI_DOCS_ENV) cargo run --quiet --bin gen-cli-docs -- README.md
 
 # Gate half: regenerate a copy of the README and diff it against the committed
 # one — any difference means the documented reference is stale.
 cli-docs-check:
 	@tmpdir=$$(mktemp -d); \
 	cp cli/README.md "$$tmpdir/README.md"; \
-	if (cd cli && cargo run --quiet --bin gen-cli-docs -- "$$tmpdir/README.md") \
+	if (cd cli && $(CLI_DOCS_ENV) cargo run --quiet --bin gen-cli-docs -- "$$tmpdir/README.md") \
 		&& diff -u cli/README.md "$$tmpdir/README.md"; then \
 		rm -rf "$$tmpdir"; \
 	else \
