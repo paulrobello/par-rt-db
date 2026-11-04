@@ -616,7 +616,9 @@ schema lacks the expected fields:
   valid priority (`next-turn` or `interrupt`). Routing, content, sender, message identity,
   trace, and `_creationTime` become immutable to restricted tokens after insertion. Only the
   recipient host may patch a message, with exactly one of two receipt shapes: queued →
-  delivered (`state = "delivered"` plus a finite positive `delivered_ms`) or queued/delivered
+  delivered (`state = "delivered"` plus a finite positive `delivered_ms`, optionally also a
+  string `claim_id` stamping the delivery claim for transport-failure recovery — the only
+  field the delivered transition may set besides its receipt) or queued/delivered
   → acked (`state = "acked"` plus a finite positive `acked_ms` and string `ack_note`).
   Rewriting a completed receipt, extra fields, arbitrary state transitions, and sender-side
   forged receipts are rejected. Every other message mutation variant is denied.

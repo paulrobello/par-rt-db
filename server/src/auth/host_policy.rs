@@ -201,7 +201,14 @@ pub fn patch(
                     .iter()
                     .all(|(key, value)| candidate.get(key) == Some(value))
                 && previous.as_object().is_some_and(|old| {
-                    candidate.len() == old.len()
+                    // An unset optional field is an absent key, so a delivered
+                    // claim stamping `claim_id` onto a doc stored without it
+                    // grows the candidate by exactly that one key.
+                    candidate.len()
+                        == old.len()
+                            + usize::from(
+                                candidate.contains_key("claim_id") && !old.contains_key("claim_id"),
+                            )
                         && old.iter().all(|(key, value)| {
                             fields.contains_key(key) || candidate.get(key) == Some(value)
                         })
@@ -210,8 +217,12 @@ pub fn patch(
                 && match fields.get("state").and_then(Value::as_str) {
                     Some("delivered") => {
                         text(previous, "state") == Some("queued")
-                            && fields.len() == 2
                             && positive(fields.get("delivered_ms"))
+                            && match fields.len() {
+                                2 => true,
+                                3 => fields.get("claim_id").is_some_and(Value::is_string),
+                                _ => false,
+                            }
                     }
                     Some("acked") => {
                         matches!(text(previous, "state"), Some("queued" | "delivered"))
@@ -291,6 +302,126 @@ mod tests {
                 &previous,
                 &candidate,
                 fields.as_object().unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    fn message_ctx() -> PrincipalCtx {
+        let mut ctx = PrincipalCtx::bypass();
+        ctx.host_capability = Some(HostCapability::ParMeshV1 {
+            host: "receiver".into(),
+        });
+        ctx
+    }
+
+    fn try_message_patch(previous: &Value, fields: Value) -> Result<(), RtDbError> {
+        let mut candidate = previous.as_object().unwrap().clone();
+        candidate.extend(fields.as_object().unwrap().clone());
+        patch(
+            &message_ctx(),
+            "messages",
+            previous,
+            &candidate,
+            fields.as_object().unwrap(),
+        )
+    }
+
+    fn queued_message(extra: &str) -> Value {
+        let mut doc = json!({"from_addr":"sender@sender:mesh","target":"worker@receiver:mesh","to_addr":"*@receiver:mesh","host":"receiver","state":"queued","delivered_ms":0,"acked_ms":0,"ack_note":""});
+        if !extra.is_empty() {
+            doc.as_object_mut()
+                .unwrap()
+                .insert("claim_id".into(), json!(extra));
+        }
+        doc
+    }
+
+    #[test]
+    fn delivered_transition_accepts_optional_string_claim_id() {
+        // Legacy two-field shape still admitted, with and without a stored
+        // claim_id key.
+        assert!(
+            try_message_patch(
+                &queued_message(""),
+                json!({"state":"delivered","delivered_ms":2})
+            )
+            .is_ok()
+        );
+        assert!(
+            try_message_patch(
+                &queued_message(""),
+                json!({"state":"delivered","delivered_ms":2,"claim_id":"claim-1"})
+            )
+            .is_ok()
+        );
+        // A doc stored with claim_id already present overwrites in place.
+        assert!(
+            try_message_patch(
+                &queued_message("seed"),
+                json!({"state":"delivered","delivered_ms":2,"claim_id":"claim-1"})
+            )
+            .is_ok()
+        );
+        assert!(
+            try_message_patch(
+                &queued_message(""),
+                json!({"state":"delivered","delivered_ms":2,"claim_id":7})
+            )
+            .is_err()
+        );
+        assert!(
+            try_message_patch(
+                &queued_message(""),
+                json!({"state":"delivered","delivered_ms":2,"claim_id":null})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn delivered_transition_rejects_any_other_third_field() {
+        assert!(
+            try_message_patch(
+                &queued_message(""),
+                json!({"state":"delivered","delivered_ms":2,"ack_note":"x"})
+            )
+            .is_err()
+        );
+        assert!(
+            try_message_patch(
+                &queued_message(""),
+                json!({"state":"delivered","delivered_ms":2,"claim_id":"c","ack_note":"x"})
+            )
+            .is_err()
+        );
+        assert!(try_message_patch(&queued_message(""), json!({"state":"delivered"})).is_err());
+    }
+
+    #[test]
+    fn acked_transition_shape_is_unchanged() {
+        let mut delivered = queued_message("");
+        delivered["state"] = json!("delivered");
+        delivered["delivered_ms"] = json!(2);
+        let fields = json!({"state":"acked","acked_ms":3,"ack_note":"done"});
+        assert!(try_message_patch(&delivered, fields).is_ok());
+        // claim_id does not widen the acked shape (a stored claim survives
+        // the ack untouched — patches only rewrite named fields).
+        delivered
+            .as_object_mut()
+            .unwrap()
+            .insert("claim_id".into(), json!("claim-1"));
+        assert!(
+            try_message_patch(
+                &delivered,
+                json!({"state":"acked","acked_ms":3,"ack_note":"done"})
+            )
+            .is_ok()
+        );
+        assert!(
+            try_message_patch(
+                &delivered,
+                json!({"state":"acked","acked_ms":3,"ack_note":"done","claim_id":"c"})
             )
             .is_err()
         );

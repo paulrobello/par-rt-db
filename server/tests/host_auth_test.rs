@@ -57,6 +57,10 @@ async fn mesh_fixture() -> (
     for field in ["ts_ms", "delivered_ms", "acked_ms"] {
         messages.insert(field.into(), json!({"type":"number"}));
     }
+    messages.insert(
+        "claim_id".into(),
+        json!({"type":"optional","inner":{"type":"string"}}),
+    );
     let schema = serde_json::from_value(json!({"tables":{
         "agents":{"fields":agents,"indexes":[{"name":"by_addr","fields":["addr"]}]},
         "messages":{"fields":messages,"indexes":[{"name":"by_msgid","fields":["msgid"]},{"name":"by_ts","fields":["ts_ms"]},{"name":"search_body","fields":["body"],"search":true}]}
@@ -163,6 +167,89 @@ async fn mesh_positive_directory_cross_host_send_and_receipts() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn mesh_delivered_claim_may_stamp_claim_id() {
+    let (_state, addr, db, local, remote) = mesh_fixture().await;
+    // claim_id is a schema-optional column: the queued message stores WITHOUT
+    // the key, and the delivered claim patch transitions state and stamps the
+    // claim token in one step — the shape par-mesh's pollFor recovery needs.
+    let response = mesh_post(addr, &local, "/api/mutate", json!({"db":db,"txn":{"steps":[{"op":"insert","table":"messages","doc":message_doc("testhost","otherhost")}]}})).await;
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    let body: serde_json::Value = response.json().await.unwrap();
+    let id = body["results"][0]["id"]
+        .as_str()
+        .expect("insert id")
+        .to_owned();
+    let response = mesh_post(addr, &remote, "/api/mutate", json!({"db":db,"txn":{"steps":[{"op":"patch","table":"messages","id":id,"fields":{"state":"delivered","delivered_ms":2,"claim_id":"claim-token-1"}}]}})).await;
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    let response = mesh_post(
+        addr,
+        &remote,
+        "/api/query",
+        json!({"db":db,"query":{"table":"messages","get":id}}),
+    )
+    .await;
+    let doc = response.json::<serde_json::Value>().await.unwrap()["result"].clone();
+    assert_eq!(doc["state"], json!("delivered"));
+    assert_eq!(doc["claim_id"], json!("claim-token-1"));
+    // The acked transition keeps its exact three-field shape; a claim stamped
+    // at delivery survives the ack untouched.
+    let response = mesh_post(addr, &remote, "/api/mutate", json!({"db":db,"txn":{"steps":[{"op":"patch","table":"messages","id":id,"fields":{"state":"acked","acked_ms":3,"ack_note":"done"}}]}})).await;
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    let response = mesh_post(
+        addr,
+        &remote,
+        "/api/query",
+        json!({"db":db,"query":{"table":"messages","get":id}}),
+    )
+    .await;
+    let doc = response.json::<serde_json::Value>().await.unwrap()["result"].clone();
+    assert_eq!(doc["state"], json!("acked"));
+    assert_eq!(doc["claim_id"], json!("claim-token-1"));
+}
+
+#[tokio::test]
+async fn mesh_delivered_claim_rejects_other_third_fields() {
+    let (_state, addr, db, local, _remote) = mesh_fixture().await;
+    let response = mesh_post(addr, &local, "/api/mutate", json!({"db":db,"txn":{"steps":[{"op":"insert","table":"messages","doc":message_doc("testhost","otherhost")}]}})).await;
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    let body: serde_json::Value = response.json().await.unwrap();
+    let id = body["results"][0]["id"]
+        .as_str()
+        .expect("insert id")
+        .to_owned();
+    // Schema-valid patch (ack_note is a string field), but the capability
+    // denies a delivered transition naming anything but state, delivered_ms,
+    // and an optional string claim_id — the production FORBIDDEN symptom.
+    let response = mesh_post(addr, &local, "/api/mutate", json!({"db":db,"txn":{"steps":[{"op":"patch","table":"messages","id":id,"fields":{"state":"delivered","delivered_ms":5,"ack_note":"forged"}}]}})).await;
+    assert_eq!(response.status(), 403);
+    let response = mesh_post(
+        addr,
+        &local,
+        "/api/query",
+        json!({"db":db,"query":{"table":"messages","get":id}}),
+    )
+    .await;
+    let doc = response.json::<serde_json::Value>().await.unwrap()["result"].clone();
+    assert_eq!(doc["state"], json!("queued"));
 }
 
 #[tokio::test]
