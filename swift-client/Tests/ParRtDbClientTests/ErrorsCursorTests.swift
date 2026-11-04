@@ -11,17 +11,45 @@ struct ErrorsCursorTests {
         }
     }
 
+    /// The canonical error-code table shared with every client
+    /// (ARC-001): `wire-corpus/error-codes.json`, one row per
+    /// server/src/error.rs::ErrorCode variant. The expected set is
+    /// derived from the fixture — no hand-typed code list to fall out of
+    /// sync; WireCorpusTests.errorCodesKnownToSwiftClient pins the same
+    /// agreement.
+    private func loadErrorCodesCorpus() throws -> Set<String> {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // ParRtDbClientTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // swift-client
+            .deletingLastPathComponent() // repo root
+            .appendingPathComponent("wire-corpus/error-codes.json")
+        guard
+            let top = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any],
+            let codes = top["codes"] as? [[String: Any]]
+        else {
+            throw ErrorsCursorCorpusFailure("error-codes.json: missing top-level 'codes' array")
+        }
+        let wireCodes = codes.compactMap { $0["code"] as? String }
+        guard wireCodes.count == codes.count else {
+            throw ErrorsCursorCorpusFailure("error-codes.json: an entry has no string 'code'")
+        }
+        return Set(wireCodes)
+    }
+
     @Test func errorCodeIsTheFullServerSet() throws {
-        // Every wire string from server/src/error.rs::ErrorCode — the full set.
-        let expected: Set = [
-            "UNAUTHORIZED", "FORBIDDEN", "NOT_FOUND", "SCHEMA_VIOLATION",
-            "PRECONDITION_FAILED", "BAD_REQUEST", "INTERNAL", "RATE_LIMITED",
-            "CONFLICT", "QUOTA_EXCEEDED", "UNSUPPORTED_PROTOCOL", "CURSOR_EXPIRED",
-            "READ_ONLY"
-        ]
-        #expect(ErrorCode.allCases.count == expected.count)
+        let expected = try loadErrorCodesCorpus()
+        let actual = Set(ErrorCode.allCases.map(\.rawValue))
+        // Issue.record rather than #expect: the expectation macro's
+        // autoclosure over a generic Set == comparison trips this
+        // toolchain's frontend crash (see WireCorpusTests' NOTE).
+        if actual != expected {
+            let detail = "corpus: \(expected.sorted()), client: \(actual.sorted())"
+            Issue.record(
+                "swift ErrorCode drifted from wire-corpus/error-codes.json — \(detail)"
+            )
+        }
         for code in ErrorCode.allCases {
-            #expect(expected.contains(code.rawValue))
             // The rawValue IS the wire string: encode → decode round-trips.
             let encoded = try JSONEncoder().encode([code])
             #expect(String(data: encoded, encoding: .utf8) == "[\"\(code.rawValue)\"]")
@@ -145,5 +173,17 @@ private actor AttemptCounter {
     func record() -> Int {
         count += 1
         return count
+    }
+}
+
+private struct ErrorsCursorCorpusFailure: Error, CustomStringConvertible {
+    let message: String
+
+    init(_ message: String) {
+        self.message = message
+    }
+
+    var description: String {
+        message
     }
 }

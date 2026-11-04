@@ -320,8 +320,9 @@ or change its HTTP status) ships with an update to `error-codes.json` in the
 same commit, and a matching update to every client's error-code type
 (`ts-client/src/errors.ts`, `rust-client/src/error.rs`,
 `python-client/src/par_rt_db/errors.py`,
-`swift-client/Sources/ParRtDbClient/Errors.swift`, and the Go client's
-`go-client/errors/errors.go`, and `kotlin-client/src/main/kotlin/dev/parrtdb/errors/Errors.kt`). This mirrors the semantics
+`swift-client/Sources/ParRtDbClient/Errors.swift`, the Go client's
+`go-client/errors/` (see below), and
+`kotlin-client/src/main/kotlin/dev/parrtdb/errors/Errors.kt`). This mirrors the semantics
 corpus's authoring rule above.
 
 **Enforcement:**
@@ -345,6 +346,18 @@ corpus's authoring rule above.
   (`RtDbError.status_code`); the Go client asserts it too (`errors.HTTPStatus`);
 TS and Rust don't model an HTTP status per code,
   so they check the code set only.
+- **Go's table is generated** (ARC-001): the Go client's enumerated table —
+  the `ErrorCode` constants, the `httpStatus` map, and `AllCodes()` — lives in
+  the committed `go-client/errors/error_codes_gen.go`, generated from this
+  fixture by `make gen-error-codes` (a `go:generate` directive in
+  `go-client/errors/errors.go`; the generator is
+  `go-client/internal/gen/errorcodes`). Run it in the same change as any
+  fixture update; `TestErrorCodesCorpus` additionally pins `AllCodes()` to
+  fixture order, so a stale or hand-edited table fails the Go suite.
+- **Swift's expected list is derived** (ARC-001): the one hand-typed
+  expected-code set the swift client carried
+  (`ErrorsCursorTests.errorCodeIsTheFullServerSet`) now loads this fixture at
+  test time instead — no Swift-side code list to fall out of sync.
 
 ## Query combination rules
 

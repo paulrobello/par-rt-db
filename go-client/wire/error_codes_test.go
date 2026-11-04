@@ -33,6 +33,13 @@ func TestErrorCodesCorpus(t *testing.T) {
 		corpusByCode[e.Code] = e.HTTPStatus
 	}
 	clientCodes := errors.AllCodes()
+	for i, e := range fixture.Codes {
+		// AllCodes is generated in fixture (enum declaration) order.
+		if clientCodes[i] != errors.ErrorCode(e.Code) {
+			t.Fatalf("AllCodes order drifted from the fixture at %d: client %s, corpus %s (regenerate with 'make gen-error-codes')",
+				i, clientCodes[i], e.Code)
+		}
+	}
 	for _, c := range clientCodes {
 		status, ok := corpusByCode[string(c)]
 		if !ok {

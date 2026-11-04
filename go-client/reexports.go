@@ -157,21 +157,11 @@ type (
 	RtDbError = errors.RtDbError
 )
 
-// Error codes.
-const (
-	CodeUnauthorized        = errors.CodeUnauthorized
-	CodeForbidden           = errors.CodeForbidden
-	CodeNotFound            = errors.CodeNotFound
-	CodeSchemaViolation     = errors.CodeSchemaViolation
-	CodePreconditionFailed  = errors.CodePreconditionFailed
-	CodeBadRequest          = errors.CodeBadRequest
-	CodeInternal            = errors.CodeInternal
-	CodeRateLimited         = errors.CodeRateLimited
-	CodeConflict            = errors.CodeConflict
-	CodeQuotaExceeded       = errors.CodeQuotaExceeded
-	CodeUnsupportedProtocol = errors.CodeUnsupportedProtocol
-	CodeCursorExpired       = errors.CodeCursorExpired
-)
+// Error codes: the per-code aliases are GENERATED from
+// wire-corpus/error-codes.json into reexports_error_codes_gen.go
+// (ARC-001) — never hand-edit them; run `make gen-error-codes`.
+
+//go:generate go run ./internal/gen/errorcodes -corpus ../wire-corpus/error-codes.json -errors ./errors/error_codes_gen.go -reexports ./reexports_error_codes_gen.go
 
 // HTTPStatus maps a code to its canonical status.
 func HTTPStatus(code ErrorCode) int { return errors.HTTPStatus(code) }

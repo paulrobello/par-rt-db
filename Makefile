@@ -37,7 +37,7 @@ SWIFT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(1),$(SW
 	rust-client-doc ts-client-doc python-client-doc swift-client-doc docs-api \
 	host-reserve host-release host-reservation-check \
 	go-client-install go-client-fmt go-client-fmt-check go-client-lint go-client-test \
-	go-client-typecheck go-client-checkall \
+	go-client-typecheck go-client-checkall gen-error-codes \
 	kotlin-client-install kotlin-client-build kotlin-client-lint kotlin-client-typecheck \
 	kotlin-client-test kotlin-client-checkall \
 	swift-client-build swift-client-test swift-client-lint swift-client-fmt \
@@ -287,6 +287,16 @@ go-client-test:
 	cd go-client && go test -race ./...
 
 go-client-checkall: go-client-fmt-check go-client-lint go-client-typecheck go-client-test
+
+# ARC-001: regenerate the Go client's error-code tables (errors-package
+# const block, httpStatus map, AllCodes; root-package Code* aliases) from
+# wire-corpus/error-codes.json — the canonical table the server regenerates
+# from server/src/error.rs::ErrorCode. Run after any ErrorCode
+# add/remove/status change, in the same change.
+# go-client/wire/error_codes_test.go fails the gate when the committed
+# table disagrees with the fixture.
+gen-error-codes:
+	cd go-client && go generate .
 
 # Kotlin/JVM client. The Gradle wrapper pins Gradle itself; the only host
 # requirement is a JDK 17+ (CI installs Temurin 21). Compiler warnings are
