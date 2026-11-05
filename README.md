@@ -174,11 +174,11 @@ committer (blobs don't touch document tables). See
 * [Docker](https://www.docker.com/) — for the dev Postgres and for the production `docker compose` deploy path (see [`deploy/README.md`](deploy/README.md))
 * A Rust `stable` toolchain to build the server binary from source ([`rust-toolchain.toml`](rust-toolchain.toml) is the single source of truth)
 * `jq` for the Quickstart walkthrough
-* Per client SDK: bun/node for TypeScript, cargo for Rust, Python 3.12+ (uv) for Python, Xcode with the Swift 6 toolchain for Swift (Darwin only), Go 1.23+ for Go
+* Per client SDK: bun/node for TypeScript, cargo for Rust, Python 3.12+ (uv) for Python, Xcode with the Swift 6 toolchain for Swift (Darwin only), Go 1.23+ for Go, a JDK 17+ for Kotlin
 
 ## Prerequisites for dev
 * See [CONTRIBUTING's development setup](CONTRIBUTING.md#development-setup) for the full tool list and first-time setup
-* A GNU-compatible `make` — every target spans all nine packages (swift-client's lines are Darwin-guarded and skip loudly on Linux); first-time installs are `make ts-client-install`, `make dashboard-install`, `make python-client-install`, and `make go-client-install` (see [Make targets](#make-targets))
+* A GNU-compatible `make` — every target spans all ten packages (swift-client's lines are Darwin-guarded and skip loudly on Linux); first-time installs are `make ts-client-install`, `make dashboard-install`, `make python-client-install`, `make go-client-install`, and `make kotlin-client-install` (see [Make targets](#make-targets))
 
 ## Quickstart
 
@@ -237,7 +237,7 @@ curl -s -X POST http://localhost:8300/api/query \
 To run the full test suite instead (dev Postgres must be up):
 
 ```bash
-make test   # dev-db-up + test suites across all nine packages (fmt/clippy/typecheck live in make checkall)
+make test   # dev-db-up + test suites across all ten packages (fmt/clippy/typecheck live in make checkall)
 ```
 
 ## Endpoints
@@ -461,7 +461,7 @@ loss is `DROP TABLE` for tables absent from the target snapshot, and migrate dat
 | `GET /admin/subscriptions` | Bearer admin key | Lists active subscriptions across all dbs (live query inspector). |
 | `GET /admin/presence` | Bearer admin key | Live per-room presence inspector: one row per room with member count, serialized-state bytes, and the oldest member's join age. In multi-instance mode, `memberCount`/`stateBytes` merge in gossiped peer membership (best-effort, never authoritative — `mergedWithPeers` discloses it); `localMemberCount` is always this replica's own count. Also surfaced as `presenceDetail` on `GET /admin/metrics`. |
 | `POST /admin/db/{db}/explain` | Bearer admin key | Query introspection (ENH-019): re-compiles a `Query` through the real path and returns `{sql, params, terminal, warnings}` — a plan, no rows. |
-| `GET /admin/db/{db}/changes` | Bearer admin key or dashboard cookie | The retained change feed under the admin gate — identical cursor/`logId`/`410 CURSOR_EXPIRED` semantics as the data-plane feed, no machine token and no table allowlist (the admin gate grants the whole database). Backs the dashboard's document-history viewer. Mirrored in all five admin clients (`adminChanges` TS/Swift, `admin_changes` Rust/Python, `AdminChanges` Go). |
+| `GET /admin/db/{db}/changes` | Bearer admin key or dashboard cookie | The retained change feed under the admin gate — identical cursor/`logId`/`410 CURSOR_EXPIRED` semantics as the data-plane feed, no machine token and no table allowlist (the admin gate grants the whole database). Backs the dashboard's document-history viewer. Mirrored in all six admin clients (`adminChanges` TS/Swift/Kotlin, `admin_changes` Rust/Python, `AdminChanges` Go). |
 | `GET /admin/slow-queries` | Bearer admin key | Bounded in-memory ring of queries slower than `RTDB_SLOW_QUERY_MS` (default 0 = disabled; `RTDB_SLOW_QUERY_CAPACITY` default 200; `RTDB_SLOW_QUERY_LOG_PARAMS=false` keeps doc content out). |
 | `GET /admin/sessions?user=&limit=` | Bearer admin key | Lists active interactive sessions (OAuth/anonymous/admin-key). `?user=` filters by `user_id` or email (omitted ⇒ all, server-wide); `?limit=` clamped to `[1, 1000]`, default 200. `token_hash` is a non-reversible sha256 digest, safe to surface. |
 | `DELETE /admin/sessions/{token_hash}` | Bearer admin key | Revokes a single session by its `token_hash` (takes effect on the next op over an already-open connection — `session_still_valid` re-queries on every interactive Subscribe/Mutate/Presence). |
@@ -828,8 +828,9 @@ joined doc's identity. Legal with every doc-returning terminal (`get`,
 Subscriptions see joined keys as part of the change-detection canonical: a
 child-table write that changes joined output re-runs the subscription and
 pushes; a re-run where nothing visible changed pushes nothing. Mirrored in
-all five clients (ts `QueryJson.lookups` + `.lookup()` builder, rust via the
-shared core type); pinned by the `lookup-*` semantics-corpus cases.
+all six clients (ts `QueryJson.lookups` + `.lookup()` builder, rust via the
+shared core type, kotlin via `wire/Query.kt`'s `LookupSpec`); pinned by the
+`lookup-*` semantics-corpus cases.
 
 ### Transaction shape
 
@@ -863,7 +864,7 @@ The bulk import steps carry many documents in one step, so an import is no longe
 - `{"op":"upsertMany","table":t,"index":i,"docs":[...]}` resolves each doc through the named index's **full equality**, reading the eq values from the doc's own indexed fields (a doc missing one fails `BAD_REQUEST`), then inserts the doc or merges it into the single match like `upsert` with `insert == patch == doc`. The step result is `{"ids":[...],"inserted":[bool,...]}` in doc order.
 - **Row cap.** At most `MAX_BY_QUERY_ROWS` (1000) docs per step; more fails `BAD_REQUEST` before any doc is written. Each doc counts toward the admin `RTDB_MAX_AFFECTED_DOCS` budget and the 10,000-row per-transaction ceiling.
 - **Atomicity.** Any invalid document (schema violation, unique conflict, constraint failure, authorization) aborts the whole transaction with that document's typed error, rolling back the earlier docs of the step and every other step.
-- v1 scope: a step carries documents only, with no interleaved preconditions. Mirrored in all five clients (`insertMany`/`upsertMany` builders and in-memory engines) and pinned by the `txn-insert-many-*` and `txn-upsert-many-*` corpus cases.
+- v1 scope: a step carries documents only, with no interleaved preconditions. Mirrored in all six clients (`insertMany`/`upsertMany` builders and in-memory engines) and pinned by the `txn-insert-many-*` and `txn-upsert-many-*` corpus cases.
 
 The `expectNoMatch` step (`{"op":"expectNoMatch","table":...,"filter":{...}}`) is a predicate-driven precondition: if any live row in `table` that the caller can see matches `filter` (the same `FilterExpr` the by-query steps accept, including `olderThan`), the whole transaction aborts with `PRECONDITION_FAILED` and the fixed message "filter matched an existing document". Otherwise it writes nothing and its step result is `null`. Steps run in order, so an `insert` earlier in the same transaction counts. Client builders expose the idiom as `insertIf(table, doc, { expectNoMatch: filter })`, which emits `expectNoMatch` followed by `insert`. Because the committer serializes writes per database, concurrent overlapping inserts (for example room bookings) admit exactly one. Notes:
 
@@ -911,7 +912,7 @@ optional `protocolVersion` (ARC-013) so a client can declare the wire version it
 speaks. Omitting it is backward-compatible (treated as version `1`); a client
 requesting a version *newer* than the server's is
 rejected with `UNSUPPORTED_PROTOCOL` (400) instead of a generic `deny_unknown_fields`
-400, so a version skew is diagnosable. All five SDKs send the header on every
+400, so a version skew is diagnosable. All six SDKs send the header on every
 HTTP call — data plane and admin alike. When the `auth` frame carries
 `protocolVersion`, `authOk` echoes the server's `PROTOCOL_VERSION` back (also
 omitted otherwise, so an older client's `authOk` bytes never change). Version
@@ -1319,9 +1320,9 @@ on the side table row (like cancel) — `awaitSignal` steps write no documents.
 Start runs via the HTTP `POST /api/workflows` routes, the WS
 `startWorkflow` / `cancelWorkflow` / `listWorkflows` frames, the admin CRUD
 routes, or the `startWorkflow` / `cancelWorkflow` txn steps (insertion atomic
-with the enclosing writes). All five clients mirror the surface:
+with the enclosing writes). All six clients mirror the surface:
 `startWorkflow` / `cancelWorkflow` / `listWorkflows` / `signalWorkflow`
-(ts, rust, python, swift, go — reactive + HTTP) plus admin variants, the
+(ts, rust, python, swift, go, kotlin — reactive + HTTP) plus admin variants, the
 `rtdb workflows` CLI (incl. `rtdb workflows signal`), and the dashboard
 Workflows page (which shows waiting runs and can send the signal). Spec:
 [`docs/superpowers/specs/2026-08-15-workflows-design.md`](docs/superpowers/specs/2026-08-15-workflows-design.md)
@@ -1408,9 +1409,9 @@ The consumer contract:
   allowlist (the admin gate grants the whole database). It backs the
   dashboard's document-history viewer.
 
-All five client SDKs expose the feed (`listChanges` in TS, `changes()` in
-Rust/Python/Swift/Go) and the admin twin (`adminChanges` in TS/Swift,
-`admin_changes` in Rust/Python, `AdminChanges` in Go).
+All six client SDKs expose the feed (`listChanges` in TS, `changes()` in
+Rust/Python/Swift/Go/Kotlin) and the admin twin (`adminChanges` in
+TS/Swift/Kotlin, `admin_changes` in Rust/Python, `AdminChanges` in Go).
 
 ### Pushed change feed over WebSocket
 
@@ -1573,7 +1574,7 @@ coerced row value is re-checked at apply time.
 
 Constraints are **write-path only**: they change no stored shape, are not
 compared by destructive-change detection (adding or removing one is an
-additive push), and mirror across all six implementations (enforced in every
+additive push), and mirror across all seven implementations (enforced in every
 client's in-memory engine). See the `constraint-*` / `error-constraint-*`
 cases in [`wire-corpus/semantics/`](wire-corpus/semantics/) for the pinned
 cross-engine semantics and [FEATURE_MATRIX #43](FEATURE_MATRIX.md).
@@ -1737,6 +1738,7 @@ here rather than restating it.
 | `make dashboard-install` | dashboard | `bun install` at repo root + `dashboard/`. |
 | `make python-client-install` | python-client | `uv sync --all-extras` in `python-client/`, so pyright can resolve the optional `http`/`ws` deps. |
 | `make go-client-install` | go-client | `go mod download` in `go-client/`. |
+| `make kotlin-client-install` | kotlin-client | `./gradlew --version` in `kotlin-client/` — validates the JDK and bootstraps the pinned Gradle wrapper. |
 
 The Cargo workspace members (`core/`, `server/`, `rust-client/`, `cli/`) and
 `swift-client/` have no install target — `cargo` and SwiftPM fetch on first
