@@ -183,10 +183,11 @@ pub fn insert(ctx: &PrincipalCtx, table: &str, doc: &Map<String, Value>) -> Resu
     if allowed { Ok(()) } else { Err(denied()) }
 }
 
-/// Length cap for the delivered-transition `claim_id` stamp (SEC-004): the
-/// policy layer bounds the one caller-supplied string it admits instead of
-/// leaning on downstream document-size quotas. Ids are opaque to the server,
-/// so the cap only needs to comfortably exceed any real id format.
+/// Length cap for the caller-supplied string stamps the policy admits — the
+/// delivered-transition `claim_id` (SEC-004) and the acked-transition
+/// `ack_note` (same unbounded-string class, capped here rather than leaning
+/// on downstream document-size quotas). Values are opaque to the server, so
+/// the cap only needs to comfortably exceed any real id or note format.
 const MAX_CLAIM_ID_LEN: usize = 128;
 
 pub fn patch(
@@ -236,7 +237,10 @@ pub fn patch(
                         matches!(text(previous, "state"), Some("queued" | "delivered"))
                             && fields.len() == 3
                             && positive(fields.get("acked_ms"))
-                            && fields.get("ack_note").is_some_and(Value::is_string)
+                            && fields.get("ack_note").is_some_and(|v| {
+                                v.as_str()
+                                    .is_some_and(|note| note.len() <= MAX_CLAIM_ID_LEN)
+                            })
                     }
                     _ => false,
                 }
@@ -400,6 +404,31 @@ mod tests {
             try_message_patch(
                 &queued_message(""),
                 json!({"state":"delivered","delivered_ms":2,"claim_id":over_cap})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn acked_transition_caps_ack_note_length() {
+        // Same unbounded-string class as claim_id (SEC-004): at the cap
+        // passes, one past it fails closed like a non-string value.
+        let mut delivered = queued_message("");
+        delivered["state"] = json!("delivered");
+        delivered["delivered_ms"] = json!(2);
+        let at_cap = "y".repeat(MAX_CLAIM_ID_LEN);
+        assert!(
+            try_message_patch(
+                &delivered,
+                json!({"state":"acked","acked_ms":3,"ack_note":at_cap})
+            )
+            .is_ok()
+        );
+        let over_cap = "y".repeat(MAX_CLAIM_ID_LEN + 1);
+        assert!(
+            try_message_patch(
+                &delivered,
+                json!({"state":"acked","acked_ms":3,"ack_note":over_cap})
             )
             .is_err()
         );
