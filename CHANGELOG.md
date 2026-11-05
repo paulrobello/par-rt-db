@@ -21,6 +21,11 @@ alter observable behavior on upgrade.
 
 ### Breaking
 
+- **Go DSL: `InsertIf` now returns `(Mutation, error)` (QA-008, `6a81591`).**
+  A doc the JSON encoder cannot represent used to panic mid-builder; the
+  error now returns instead, and the panic is confined to the new
+  `MustInsertIf`. Update chained `.InsertIf(...)` call sites to handle the
+  error or switch to `MustInsertIf`.
 - **The trigram GIN for `search`'s `mode: "trgm"` is now opt-in per index
   (`trgm: true`, `fcc8ae7` — FEATURE_MATRIX #30).** Every search index used to
   pay for a second GIN (roughly doubling index storage) even when trgm mode
@@ -122,6 +127,13 @@ alter observable behavior on upgrade.
 
 ### Added
 
+- **Tag-driven release pipeline adopted in-tree (enh-031, squash `e6c74db` +
+  corpus sync `44f27d7`).** `release.yml` publishes npm/crates.io/PyPI on
+  green `main` pushes (serial runs, already-published versions skipped),
+  creates the matching `vX.Y.Z` tag + GitHub release, and `make
+  publish-check`/`version-lockstep-check.sh` gate every registry artifact
+  (now eight manifests incl. kotlin-client). Activation still requires the
+  registry credentials and the owner's v1 declaration.
 - **The shipped Docker image now builds the server `--features otel`, and the
   compose file forwards the standard `OTEL_EXPORTER_OTLP_HEADERS` var
   (feature-built image, bearer-header export, collector network path).** The
@@ -437,6 +449,29 @@ alter observable behavior on upgrade.
 
 ### Changed
 
+- **2026-11-04 audit remediation — quality and architecture rework (QA/ARC
+  series).** The write-path god function was decomposed: admission guards now
+  live in `txn/admission.rs` as a `TxnAdmission` enum plus the combined
+  `set_config` preamble (`e507fc2`), cascade threading is grouped in
+  `CascadeCtx` (`5cabec7`), and the mirrored interpreters were decomposed
+  server-first and mirrored (value-expr EvalCtx dispatch in server + rust
+  client, search plan/scorer split in ts + go, `b1b47b7`, `c58e83f`), with a
+  down-only Swift swiftlint-suppression ratchet (baseline 48, `44aff1a`). God
+  files split along existing seams: server `subs/`, `migrate/`, `presence/`,
+  `metrics/`, client-side rust `ws/`+`http/`, ts store/admin/client,
+  python admin, swift InMemoryEngine, dashboard DataBrowserPage (`05af941`,
+  `166ae2e`, `7e0d38d`, `ddedaa5`, `7cfddb5`, `1d0c9ff`, `cfd8f14`,
+  `443521b`, `4ff95f9`, `fa95f24`). Kotlin's in-memory engine replaces
+  post-kind-check `!!` with a `requireInner` helper (`8eee6db`); the ts
+  in-memory store's public signatures lost their `any` leak (`6a05ad0`); the
+  Go error-code tables are generated from `wire-corpus/error-codes.json`
+  (`2c972a3`). OpenAPI drift is checked against the live router (`249574a`);
+  index-value typing alignment and the 63-byte name cap are enforced by
+  test/const-assert (`59db15b`); the shared-Postgres test harness has a 60 s
+  pool ceiling, one retry on PoolTimedOut, and a connect semaphore
+  (`179aedd`); the gate fails fast on a stale `ts-client/dist` with the exact
+  fix command (`e2722be`); AppState's construction contract is tested at its
+  runtime seams (`78d96bd`).
 - **Audit-log and webhook-delivery rows commit with the write they describe
   (ENH-047).** On the mutate, scheduled, and workflow paths the
   `rtdb.audit_log` and `rtdb.webhook_deliveries` INSERTs now run inside the
@@ -550,6 +585,15 @@ alter observable behavior on upgrade.
 
 ### Security
 
+- **2026-11-04 audit hardening (SEC-002/003/004).** Every external GitHub
+  Action is now SHA-pinned with a version comment in both workflows
+  (`57fcc8c`); the OAuth close interstitials send a `script-src 'sha256-…'`
+  CSP instead of `unsafe-inline` (`e3e2b4b`); the ParMeshV1 delivered
+  `claim_id` and acked `ack_note` stamps are length-capped fail-closed at the
+  policy layer with boundary tests (`43808e9`, `25c1f46`). Python runtime deps
+  carry upper bounds (`03dcbfc`). `crypto-bigint 0.5.5` (RUSTSEC-2026-0387)
+  remains tracked upstream — it reaches the tree via jsonwebtoken → p256 →
+  elliptic-curve, which no stable release fixes yet.
 - **Webhook SSRF denylist covers IPv4-mapped and IPv4-compatible IPv6
   addresses.** `is_blocked_ip` evaluated them only against the IPv6 table, so
   `[::ffff:169.254.169.254]` and friends bypassed the entire IPv4 denylist and
@@ -572,6 +616,20 @@ alter observable behavior on upgrade.
   cannot hand a bearer token to a caller that should only ever hold the cookie.
 
 ### Documentation
+
+- **2026-11-04 audit documentation sweep (DOC-001..011 + ARC-004).**
+  kotlin-client added to every hub doc with counts recounted from the tree
+  (10 packages, 6 SDKs, 7 wire implementations, 7 runners); the gate
+  description matches the 14-leg `checkall`; the two broken cross-references
+  are fixed; the Kotlin CHANGELOG entry landed; kotlin-client's README grew
+  66→215 lines with signature-verified examples; the README Query-shape
+  paragraph became a terminals table plus subsections; the Packages table has
+  the `core/` row; the deploy runbook gained the measured per-database
+  capacity-planning section; `version-lockstep-check.sh` covers all eight
+  manifests. Two audit claims were corrected rather than obeyed: the
+  "unused" `WorkflowStatus::as_wire_str` has a grep-invisible caller
+  (`server/src/workflows.rs:897`), and the SEC-001 dependency path runs via
+  jsonwebtoken → p256 → elliptic-curve, not rsa.
 
 This cycle included a full documentation audit and remediation. The 2026-07-21
 design spec is demoted to a historical record — `README.md`,
