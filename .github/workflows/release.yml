@@ -108,7 +108,11 @@ jobs:
     needs: verify
     # Publish only from the default branch, so a workflow_dispatch from a
     # feature branch can never release that branch's version.
-    if: github.ref == 'refs/heads/main'
+    # ENH-031 deferral: publishing stays OFF until the owner declares v1 and
+    # configures credentials — set the repository variable ENABLE_AUTO_PUBLISH
+    # to 'true' to arm the publish chain. Until then these jobs skip silently
+    # so green-main pushes stay green instead of failing on missing secrets.
+    if: github.ref == 'refs/heads/main' && vars.ENABLE_AUTO_PUBLISH == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -145,7 +149,8 @@ jobs:
   publish-npm:
     name: Publish npm package
     needs: verify
-    if: github.ref == 'refs/heads/main'
+    # See the ENABLE_AUTO_PUBLISH note under publish-crates.
+    if: github.ref == 'refs/heads/main' && vars.ENABLE_AUTO_PUBLISH == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -182,7 +187,8 @@ jobs:
   publish-pypi:
     name: Publish PyPI package
     needs: verify
-    if: github.ref == 'refs/heads/main'
+    # See the ENABLE_AUTO_PUBLISH note under publish-crates.
+    if: github.ref == 'refs/heads/main' && vars.ENABLE_AUTO_PUBLISH == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -228,7 +234,9 @@ jobs:
   swift-version-check:
     name: Resolve Swift version
     needs: verify
-    if: github.ref == 'refs/heads/main'
+    # See the ENABLE_AUTO_PUBLISH note under publish-crates. This job exists
+    # to prove SwiftPM tag resolution for a release; no release, no check.
+    if: github.ref == 'refs/heads/main' && vars.ENABLE_AUTO_PUBLISH == 'true'
     runs-on: macos-latest
     timeout-minutes: 20
     permissions:
@@ -314,7 +322,8 @@ jobs:
   github-release:
     name: Create GitHub release
     needs: [verify, publish-crates, publish-npm, publish-pypi, swift-version-check, cli-binaries]
-    if: github.ref == 'refs/heads/main'
+    # See the ENABLE_AUTO_PUBLISH note under publish-crates.
+    if: github.ref == 'refs/heads/main' && vars.ENABLE_AUTO_PUBLISH == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

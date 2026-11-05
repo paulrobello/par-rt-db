@@ -6,6 +6,13 @@ the tree declares and creates the matching `vX.Y.Z` tag and GitHub release.
 This mirrors the owner's deploy-on-push services (green CI on `main` is the
 ship event).
 
+**The publish chain is armed by the repository variable `ENABLE_AUTO_PUBLISH`.**
+Until it is set to `true` (Settings → Secrets and variables → Actions →
+Variables), the publish, Swift tag-check, and GitHub-release jobs skip on
+every push — verification still runs, main stays green, and nothing ships.
+Arming is the owner's v1-declaration action; it also presumes the one-time
+registry credentials below are in place.
+
 ## What is published
 
 | Artifact | Destination | Release behavior |
