@@ -38,7 +38,8 @@ SWIFT_CLIENT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(
 	rust-client-doc ts-client-doc python-client-doc swift-client-doc docs-api \
 	host-reserve host-release host-reservation-check \
 	go-client-install go-client-fmt go-client-fmt-check go-client-lint go-client-test \
-	go-client-typecheck go-client-checkall gen-error-codes \
+	go-client-typecheck go-client-checkall gen-error-codes gen-error-codes-ts \
+	gen-error-codes-ts-check gen-error-codes-rust gen-error-codes-rust-check \
 	kotlin-client-install kotlin-client-build kotlin-client-lint kotlin-client-typecheck \
 	kotlin-client-test kotlin-client-checkall \
 	swift-client-build swift-client-test swift-client-lint swift-client-fmt \
@@ -299,6 +300,41 @@ go-client-checkall: go-client-fmt-check go-client-lint go-client-typecheck go-cl
 gen-error-codes:
 	cd go-client && go generate .
 
+# ARC-001 follow-up: the same generate/check pattern for the two remaining
+# hand-maintained error-code lists — ts-client's `ALL_ERROR_CODES` (generated
+# into src/errors_gen.ts) and rust-client's corpus table (generated into
+# src/error_codes_gen.rs). Run after any ErrorCode add/remove/status change,
+# in the same change. The -check legs in checkall fail when the committed
+# generated file disagrees with the fixture (ts-client's wire-corpus test and
+# rust-client's exhaustive-match test stay as belt-and-suspenders).
+gen-error-codes-ts:
+	cd ts-client && bun internal/gen-errorcodes.ts
+
+gen-error-codes-ts-check:
+	@tmpdir=$$(mktemp -d); \
+	if (cd ts-client && bun internal/gen-errorcodes.ts --out "$$tmpdir/errors_gen.ts") \
+		&& diff -u ts-client/src/errors_gen.ts "$$tmpdir/errors_gen.ts"; then \
+		rm -rf "$$tmpdir"; \
+	else \
+		status=$$?; rm -rf "$$tmpdir"; \
+		echo "ts-client/src/errors_gen.ts is stale — run 'make gen-error-codes-ts' and commit the result" >&2; \
+		exit $$status; \
+	fi
+
+gen-error-codes-rust:
+	cd rust-client && cargo run --quiet --bin gen-error-codes
+
+gen-error-codes-rust-check:
+	@tmpdir=$$(mktemp -d); \
+	if (cd rust-client && cargo run --quiet --bin gen-error-codes -- --out "$$tmpdir/error_codes_gen.rs") \
+		&& diff -u rust-client/src/error_codes_gen.rs "$$tmpdir/error_codes_gen.rs"; then \
+		rm -rf "$$tmpdir"; \
+	else \
+		status=$$?; rm -rf "$$tmpdir"; \
+		echo "rust-client/src/error_codes_gen.rs is stale — run 'make gen-error-codes-rust' and commit the result" >&2; \
+		exit $$status; \
+	fi
+
 # Kotlin/JVM client. The Gradle wrapper pins Gradle itself; the only host
 # requirement is a JDK 17+ (CI installs Temurin 21). Compiler warnings are
 # errors (build.gradle.kts), so compile doubles as lint and typecheck, and the
@@ -456,7 +492,7 @@ hostname-leak-check:
 ts-dist-preflight:
 	./scripts/ts-dist-preflight.sh
 
-checkall: ts-dist-preflight env-drift-check dockerfile-stub-check backup-persistence-check hostname-leak-check cli-docs-check docs-api fmt-check lint typecheck test rust-client-check-features publish-check dev-db-clean-check
+checkall: ts-dist-preflight env-drift-check dockerfile-stub-check backup-persistence-check hostname-leak-check cli-docs-check gen-error-codes-ts-check gen-error-codes-rust-check docs-api fmt-check lint typecheck test rust-client-check-features publish-check dev-db-clean-check
 	@mkdir -p target && echo "$(GATE_KEY)" > $(GATE_STAMP)
 
 # Content-addressed gate reuse for deploys: `checkall` stamps the gate key

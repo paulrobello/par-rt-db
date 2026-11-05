@@ -5,8 +5,8 @@
  * source of truth for which clauses of the read `Query` DSL may not be set
  * together (server `query::combinations`, and the equivalent evaluator in every
  * other client). `tests/wire-corpus.test.ts` asserts this table matches the JSON
- * file exactly, the same convention `errors.ts`'s `ALL_ERROR_CODES` uses for
- * `wire-corpus/error-codes.json` (ARC-017) — a straight relative import of the
+ * file exactly (ARC-017) — unlike `error-codes.json`, whose client table is now
+ * generated (`errors_gen.ts`, ARC-001 follow-up), a straight relative import of the
  * JSON from outside `ts-client/`'s own source tree would violate the package
  * build's `rootDir` (see `tsconfig.build.json`), so the table is embedded as a
  * TS literal instead of imported. Update BOTH files together (ENH-028).

@@ -46,6 +46,33 @@ pub enum ErrorCode {
     ReadOnly,
 }
 
+#[path = "error_codes_gen.rs"]
+mod error_codes_gen;
+pub use error_codes_gen::CORPUS_ERROR_CODES;
+
+impl ErrorCode {
+    /// Every variant, in declaration order. Pinned set-for-set (wire code and
+    /// HTTP status) against `CORPUS_ERROR_CODES` by
+    /// `error_codes_corpus_matches_enum` below, and the exhaustive match in
+    /// that test's `corpus_status` makes a variant added without a corpus row
+    /// a compile error rather than a silent omission.
+    pub const ALL: [ErrorCode; 13] = [
+        ErrorCode::Unauthorized,
+        ErrorCode::Forbidden,
+        ErrorCode::NotFound,
+        ErrorCode::SchemaViolation,
+        ErrorCode::PreconditionFailed,
+        ErrorCode::BadRequest,
+        ErrorCode::Internal,
+        ErrorCode::Conflict,
+        ErrorCode::RateLimited,
+        ErrorCode::QuotaExceeded,
+        ErrorCode::UnsupportedProtocol,
+        ErrorCode::CursorExpired,
+        ErrorCode::ReadOnly,
+    ];
+}
+
 /// Raw `{code, message, retryAfter?}` as it appears on the wire (HTTP body /
 /// WS error frame). `retry_after` is present only on `RATE_LIMITED`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,23 +182,57 @@ mod tests {
 
     #[test]
     fn error_code_round_trips_all_variants() {
-        let all = [
-            ErrorCode::Unauthorized,
-            ErrorCode::Forbidden,
-            ErrorCode::NotFound,
-            ErrorCode::SchemaViolation,
-            ErrorCode::PreconditionFailed,
-            ErrorCode::BadRequest,
-            ErrorCode::Internal,
-            ErrorCode::Conflict,
-            ErrorCode::RateLimited,
-            ErrorCode::QuotaExceeded,
-        ];
-        for c in all {
+        for c in ErrorCode::ALL {
             let v = serde_json::to_value(c).unwrap();
             let back: ErrorCode = serde_json::from_value(v).unwrap();
             assert_eq!(c, back);
         }
+    }
+
+    #[test]
+    fn error_codes_corpus_matches_enum() {
+        // Exhaustive match: a variant added to `ErrorCode` without an arm here
+        // is a compile error, so the corpus table cannot silently go stale —
+        // the hand-mirrored counterpart of the generated `CORPUS_ERROR_CODES`.
+        fn corpus_status(code: ErrorCode) -> u16 {
+            match code {
+                ErrorCode::Unauthorized => 401,
+                ErrorCode::Forbidden => 403,
+                ErrorCode::NotFound => 404,
+                ErrorCode::SchemaViolation => 422,
+                ErrorCode::PreconditionFailed => 409,
+                ErrorCode::BadRequest => 400,
+                ErrorCode::Internal => 500,
+                ErrorCode::RateLimited => 429,
+                ErrorCode::Conflict => 409,
+                ErrorCode::QuotaExceeded => 507,
+                ErrorCode::UnsupportedProtocol => 400,
+                ErrorCode::CursorExpired => 410,
+                ErrorCode::ReadOnly => 409,
+            }
+        }
+        let mut from_enum: Vec<(String, u16)> = ErrorCode::ALL
+            .iter()
+            .map(|c| {
+                let wire = serde_json::to_value(c)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                (wire, corpus_status(*c))
+            })
+            .collect();
+        from_enum.sort();
+        let mut from_corpus: Vec<(String, u16)> = CORPUS_ERROR_CODES
+            .iter()
+            .map(|(code, status)| ((*code).to_string(), *status))
+            .collect();
+        from_corpus.sort();
+        assert_eq!(
+            from_enum, from_corpus,
+            "ErrorCode drifted from wire-corpus/error-codes.json — regenerate the \
+             table with 'make gen-error-codes-rust' after mirroring the enum"
+        );
     }
 
     #[test]

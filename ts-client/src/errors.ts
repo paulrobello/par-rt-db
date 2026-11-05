@@ -1,7 +1,8 @@
 /**
  * Error envelope for `@par-rt-db/client`. Every failure — over WebSocket,
  * HTTP, or the in-memory test harness — surfaces as an {@link RtDbError}
- * carrying a stable {@link RtDbErrorCode} from the closed set below, plus a
+ * carrying a stable {@link RtDbErrorCode} (generated into `errors_gen.ts`
+ * from wire-corpus/error-codes.json), plus a
  * human-readable message. The server's wire envelope is
  * `{ code, message, retryAfter? }`; {@link RtDbError.fromEnvelope} materializes
  * it into the thrown class. Codes map 1:1 to the server's `error.rs` table:
@@ -32,43 +33,11 @@
  *   it is unfrozen.
  */
 
-export type RtDbErrorCode =
-  | "UNAUTHORIZED"
-  | "FORBIDDEN"
-  | "NOT_FOUND"
-  | "SCHEMA_VIOLATION"
-  | "PRECONDITION_FAILED"
-  | "CONFLICT"
-  | "BAD_REQUEST"
-  | "INTERNAL"
-  | "RATE_LIMITED"
-  | "QUOTA_EXCEEDED"
-  | "UNSUPPORTED_PROTOCOL"
-  | "CURSOR_EXPIRED"
-  | "READ_ONLY";
+import { ALL_ERROR_CODES } from "./errors_gen.js";
+import type { RtDbErrorCode } from "./errors_gen.js";
 
-/** Every {@link RtDbErrorCode}, in the order declared above. The single
- *  source of truth for "is this a known code" — {@link CODES} and the
- *  ARC-017 wire-corpus test both derive from this array, so a code added
- *  here without a matching `wire-corpus/error-codes.json` row (or vice
- *  versa) fails that test. TypeScript has no enum reflection, so unlike the
- *  server's compile-enforced exhaustive match, forgetting to extend this
- *  array is a test-time, not compile-time, catch. */
-export const ALL_ERROR_CODES: readonly RtDbErrorCode[] = [
-  "UNAUTHORIZED",
-  "FORBIDDEN",
-  "NOT_FOUND",
-  "SCHEMA_VIOLATION",
-  "PRECONDITION_FAILED",
-  "CONFLICT",
-  "BAD_REQUEST",
-  "INTERNAL",
-  "RATE_LIMITED",
-  "QUOTA_EXCEEDED",
-  "UNSUPPORTED_PROTOCOL",
-  "CURSOR_EXPIRED",
-  "READ_ONLY",
-];
+export { ALL_ERROR_CODES };
+export type { RtDbErrorCode };
 
 const CODES: ReadonlySet<string> = new Set<RtDbErrorCode>(ALL_ERROR_CODES);
 

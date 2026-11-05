@@ -558,29 +558,16 @@ fn protocol_constants_max_steps_matches_corpus() {
 /// every code the corpus lists is known to `par_rt_db_client::ErrorCode` (round
 /// trips through serde) and that the client's closed set carries no code the
 /// corpus doesn't — a code added to the server without a matching client
-/// variant would otherwise fail silently. `ALL` is not itself compiler-checked
-/// complete; adding a variant to `ErrorCode` without adding it here fails this
-/// test (not a compile error) — see the server test for the actual
-/// compile-time exhaustiveness guard.
+/// variant would otherwise fail silently. The closed set comes from
+/// `ErrorCode::ALL`, which is compile-checked complete against the corpus via
+/// the exhaustive match in `error::tests::error_codes_corpus_matches_enum`
+/// (ARC-001 follow-up), so adding a variant without a corpus row is now a
+/// compile error, not a silent omission.
 #[test]
 fn error_codes_known_to_rust_client() {
     use par_rt_db_client::ErrorCode;
 
-    const ALL: [ErrorCode; 13] = [
-        ErrorCode::Unauthorized,
-        ErrorCode::Forbidden,
-        ErrorCode::NotFound,
-        ErrorCode::SchemaViolation,
-        ErrorCode::PreconditionFailed,
-        ErrorCode::BadRequest,
-        ErrorCode::Internal,
-        ErrorCode::Conflict,
-        ErrorCode::RateLimited,
-        ErrorCode::QuotaExceeded,
-        ErrorCode::UnsupportedProtocol,
-        ErrorCode::CursorExpired,
-        ErrorCode::ReadOnly,
-    ];
+    let all = ErrorCode::ALL;
 
     let corpus: Value = serde_json::from_str(include_str!("../../wire-corpus/error-codes.json"))
         .unwrap_or_else(|e| panic!("parse error-codes.json: {e}"));
@@ -592,7 +579,7 @@ fn error_codes_known_to_rust_client() {
         .collect();
     corpus_codes.sort();
 
-    let mut known_codes: Vec<String> = ALL
+    let mut known_codes: Vec<String> = all
         .iter()
         .map(|c| {
             serde_json::to_value(c)
