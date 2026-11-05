@@ -52,6 +52,13 @@ export function formatTime(ms: number): string {
   return new Date(ms).toLocaleTimeString(undefined, { hour12: false });
 }
 
+/** Cell value as table text: null spelled out, objects JSON-ified, rest as-is. */
+export function cellText(v: unknown): string {
+  if (v === null) return "null";
+  if (typeof v === "object") return JSON.stringify(v);
+  return String(v);
+}
+
 /** Absolute date+time, hour12:false (e.g. "8/4/2026, 14:03:09"). Use for log
  *  rows where the calendar day matters; sibling pages inline this same
  *  toLocaleString call for their timestamps. */
