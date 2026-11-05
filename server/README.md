@@ -8,13 +8,14 @@ query updates on change. One instance hosts many named databases. There is no
 embedded JS runtime and no per-app server code — this one generic binary serves
 every app.
 
-This directory holds the `rtdb-server` binary. Five client SDKs live
+This directory holds the `rtdb-server` binary. Six client SDKs live
 alongside it: [`../ts-client/`](../ts-client) (browser/Node),
 [`../rust-client/`](../rust-client) (Rust),
 [`../python-client/`](../python-client) (Python — wire + DSL + sync HTTP/admin/storage
 + reactive WS, all shipped), [`../swift-client/`](../swift-client)
-(`ParRtDbClient`/`ParRtDbUI`, Darwin-only), and
-[`../go-client/`](../go-client) (Go). An operator dashboard SPA
+(`ParRtDbClient`/`ParRtDbUI`, Darwin-only),
+[`../go-client/`](../go-client) (Go), and
+[`../kotlin-client/`](../kotlin-client) (Kotlin/JVM + Android). An operator dashboard SPA
 ([`../dashboard/`](../dashboard)) is served same-origin by the server when
 `RTDB_STATIC_DIR` is set, and the [`../cli/`](../cli) package wraps
 `par-rt-db-client` as the `rtdb` operator/CI binary. A [`../core/`](../core)
@@ -117,7 +118,7 @@ Paths below are relative to `server/src/` (this directory's `src/`).
 | Webhook outbox (when `RTDB_WEBHOOKS_ENABLED=true`) | `src/webhook.rs` (per-`DocOp` outbox row drained by a boot worker; at-least-once) |
 | Backup lifecycle (when `RTDB_BACKUP_ENABLED=true`) | `src/backup.rs` (manual `pg_dump` trigger + dump list/download/delete; `pg_restore --no-owner --no-privileges` into a fresh `rtdb_restored_<stamp>` DB) |
 | Rate limiter (per-token + per-db fixed window) | `src/rate_limit.rs` (`RTDB_RATE_LIMIT_PER_TOKEN_RPM` / `RTDB_RATE_LIMIT_PER_DB_RPM`, 0 = off; hot-configurable via `PATCH /admin/config` — `perTokenRpm`/`perDbRpm` — the per-IP guards stay boot-pinned) |
-| OpenTelemetry / OTLP tracing (ENH-018, opt-in) | `src/tracing_setup.rs` (subscriber init + `OtelGuard` flush); span instrumentation in `src/committer/`/`src/subs.rs`/`src/query/`/`src/txn.rs`. The `otel` cargo feature (default off) gates the deps + subscriber; `RTDB_OTEL_ENABLED` (default false) gates it at runtime. `committer.mutate` carries `queue_wait_ms`. |
+| OpenTelemetry / OTLP tracing (ENH-018, opt-in) | `src/tracing_setup.rs` (subscriber init + `OtelGuard` flush); span instrumentation in `src/committer/`/`src/subs.rs`/`src/query/`/`src/txn/`. The `otel` cargo feature (default off) gates the deps + subscriber; `RTDB_OTEL_ENABLED` (default false) gates it at runtime. `committer.mutate` carries `queue_wait_ms`. |
 | Query introspection (ENH-019) | `POST /admin/db/{db}/explain` (re-compiles a Query JSON via `compile_query`, returns `{sql, params, terminal, warnings}` — no rows) and `GET /admin/slow-queries` (bounded ring of queries that exceeded `RTDB_SLOW_QUERY_MS`). Ring + `SlowQueryRecord` in `src/metrics.rs`; explain + slow-query recording in `src/http_api.rs`; list endpoint in `src/admin/observability.rs`. `RTDB_SLOW_QUERY_MS=0` (default) disables; `RTDB_SLOW_QUERY_LOG_PARAMS=false` (default) keeps document content out of the log. |
 | Mutation-log dedup (idempotency) | `src/mutation_log.rs` |
 | Op feed (in-memory ring + `/admin/stream`) | `src/op_feed.rs` |
@@ -126,7 +127,7 @@ Paths below are relative to `server/src/` (this directory's `src/`).
 | Hot config + dynamic CORS | `src/config/` (hot row in `src/config/hot.rs`; `Arc<ArcSwap<HotConfig>>` on `AppState`) |
 | Health | `src/health.rs` |
 | Schema model + validation | `src/schema/` |
-| Computed-field expression grammar + evaluation (ENH-028) | `src/value_expr.rs` (shared by push validation, the write-path stamp in `src/txn.rs`, push/restore backfill, and migrate re-stamps in `src/migrate.rs`) |
+| Computed-field expression grammar + evaluation (ENH-028) | `src/value_expr.rs` (shared by push validation, the write-path stamp in `src/txn/`, push/restore backfill, and migrate re-stamps in `src/migrate.rs`) |
 | Schema → Postgres DDL | `src/ddl.rs` |
 | Write / read paths | `src/txn/` (`mod.rs`, `row_ops.rs`, `stamp.rs`, `auth.rs`, `steps.rs`, `cascade.rs`), `src/query/` (`mod.rs` compile + dispatch, `filter.rs`, `terminals.rs`, `search.rs`, `row_auth.rs`) |
 | Pagination (cursor keyset) | `src/pagination.rs` |
@@ -321,7 +322,7 @@ startup (mirrors `mutations`/`scheduled_txns`).
 
 ## Develop
 
-The `make` targets below run **from the repo root** (they coordinate all nine
+The `make` targets below run **from the repo root** (they coordinate all ten
 packages — see the root `Makefile` for the full target list):
 
 ```sh

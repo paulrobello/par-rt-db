@@ -6,11 +6,11 @@ contribution.
 
 ## Project guides
 
-- [`DOCUMENTATION_STYLE_GUIDE.md`](DOCUMENTATION_STYLE_GUIDE.md) — formatting, tone, and structure conventions for every doc in this repo and across the nine workspace packages.
+- [`DOCUMENTATION_STYLE_GUIDE.md`](DOCUMENTATION_STYLE_GUIDE.md) — formatting, tone, and structure conventions for every doc in this repo and across the ten workspace packages.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — server internals: the single-writer committer, per-database background tasks, data pipeline, transports, auth, storage, quotas, and the admin surface — with the reasoning behind each invariant.
 - [`OAUTH_SETUP.md`](OAUTH_SETUP.md) — register OAuth apps and wire them into par-rt-db (GitHub, Google, GitLab, Microsoft, Apple, generic OIDC). Each provider is independently optional.
 - [`RELEASING.md`](RELEASING.md) — the tag-driven release procedure: one-time registry setup, lockstep version bump, CHANGELOG heading, gate, push (owner-confirmed), and automated registry publication.
-- [`clients.md`](clients.md) — the five client SDKs (TypeScript/Rust/Python/Swift/Go) at a glance: surface comparison, the six-implementation wire parity contract, and links to each package's detailed README.
+- [`clients.md`](clients.md) — the six client SDKs (TypeScript/Rust/Python/Swift/Go/Kotlin) at a glance: surface comparison, the seven-implementation wire parity contract, and links to each package's detailed README.
 - [`atomic-counter.md`](atomic-counter.md) — the `adjustCounter` transaction step: atomic bounded counter updates inside the same transaction as related document writes.
 
 ## Generated API references
@@ -30,7 +30,7 @@ Tagged releases publish the same sites together on GitHub Pages.
 - [`../README.md`](../README.md) — project overview, quickstart, configuration, and wire protocol.
 - [`../CLAUDE.md`](../CLAUDE.md) — authoritative agent guidance: what the project is, the workspace layout, the invariants the codebase depends on, and how to verify work.
 - [`../CONTRIBUTING.md`](../CONTRIBUTING.md) — development environment, test/lint/format commands, commit and PR conventions, and the pre-commit hook setup.
-- [`../FEATURE_MATRIX.md`](../FEATURE_MATRIX.md) — Convex-parity contract; the source of truth for which features are implemented and mirrored across the five clients.
+- [`../FEATURE_MATRIX.md`](../FEATURE_MATRIX.md) — Convex-parity contract; the source of truth for which features are implemented and mirrored across the six clients.
 - [`../CHANGELOG.md`](../CHANGELOG.md) — released changes, following [Keep a Changelog](https://keepachangelog.com/). The historical enhancement candidate list (`ENHANCEMENTS.md`, ENH-001–022) was retired once all enhancements shipped; the backlog now lives on the project kanban board (tagged `enhancement`), and the `ENH-*` ids are preserved there and in `docs/superpowers/plans/*-enh-NNN-*.md` filenames.
 - [`../DESIGN.md`](../DESIGN.md) — dashboard visual design system (mode, palette, typography, components, motion).
 - [`../PRODUCT.md`](../PRODUCT.md) — product framing for the operator console.
@@ -48,8 +48,9 @@ When the code and a spec disagree, the code wins; fix the spec.
 
 ## Per-package READMEs
 
-The workspace holds nine packages (`core`, `server`, `ts-client`, `rust-client`,
-`python-client`, `swift-client`, `go-client`, `dashboard`, `cli`); eight have their own README
+The workspace holds ten packages (`core`, `server`, `ts-client`, `rust-client`,
+`python-client`, `swift-client`, `go-client`, `kotlin-client`, `dashboard`,
+`cli`); nine have their own README
 covering install, usage, and development (`core` is an internal wire-types crate
 with no consumer-facing surface of its own):
 
@@ -59,5 +60,6 @@ with no consumer-facing surface of its own):
 - [`../python-client/README.md`](../python-client/README.md) — `par-rt-db` (Python): wire contract + schema/mutation/query DSL + sync HTTP/admin/storage + async HTTP twin + reactive WS + in-memory harness.
 - [`../swift-client/README.md`](../swift-client/README.md) — `ParRtDbClient` / `ParRtDbUI` (Swift): wire contract + schema/mutation/query DSL + HTTP/admin/storage clients + reactive WS + in-memory harness + SwiftUI `LiveQuery` bindings.
 - [`../go-client/README.md`](../go-client/README.md) — `github.com/paulrobello/par-rt-db/go-client` (Go): wire contract + schema/mutation/query DSL + HTTP/admin clients + reactive WS transport (`wsclient`, the only package with an external dependency) + in-memory harness.
+- [`../kotlin-client/README.md`](../kotlin-client/README.md) — `dev.parrtdb:par-rt-db-kotlin-client` (Kotlin, JVM 17+ / Android minSdk 26): wire contract + schema/mutation/query DSL + HTTP/admin clients + reactive WS (`Flow`) + pluggable transport (`JdkTransport`/`OkHttpTransport`) + in-memory harness.
 - [`../dashboard/README.md`](../dashboard/README.md) — Vite + React operator console SPA (databases, schema, live data browser, metrics, op feed, hot config, admin allowlist).
 - [`../cli/README.md`](../cli/README.md) — `rtdb` CLI for CI/operator workflows (list/create dbs, push schema, query/mutate, mint/revoke tokens).

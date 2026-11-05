@@ -2,7 +2,7 @@
 //! failure surfaces to clients as `{code, message}`; `ErrorCode` maps to an HTTP
 //! status via `IntoResponse`. Client-facing 500s carry a generic message — never
 //! stringify a sqlx/serde error into the body (log it via `tracing`). The codes
-//! and statuses here are the contract the three client SDKs mirror.
+//! and statuses here are the contract the six client SDKs mirror.
 
 use axum::Json;
 use axum::http::{HeaderValue, StatusCode, header};

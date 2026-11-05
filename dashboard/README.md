@@ -73,7 +73,8 @@ sections above.
 
 ### Logging in
 
-Two login methods, both funneled through `authenticate_admin` on the server:
+Two login methods exist — **admin key** and **OAuth** — both funneled through
+`authenticate_admin` on the server; each is detailed below.
 
 Both paths set an HttpOnly `rtdb_session` cookie — `POST /admin/login` for the
 admin key, the OAuth callback for a session token — so no dashboard credential

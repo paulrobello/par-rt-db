@@ -56,7 +56,7 @@ working with zero providers configured.
   completion carries no token at all and the HttpOnly cookie is the only
   carrier (the ts-client's cookie-mode sign-in and the operator dashboard
   begin this way). With `&mode=bearer` (opt-in, [bearer
-  delivery](#bearer-delivery-opt-in)), it is the inverse: the callback sets no
+  delivery](#hardening)), it is the inverse: the callback sets no
   session cookie and no admin-CSRF nonce, and the one-shot poll is the only
   carrier. The poll
   is keyed on the `state` token plus a `SameSite=None` `rtdb-oauth-state` cookie

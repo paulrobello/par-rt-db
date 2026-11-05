@@ -189,6 +189,24 @@ alter observable behavior on upgrade.
   presence, reconnect/backoff/dedupe), `admin` (the `/admin/*` control plane),
   `optimistic`, and an in-memory engine. Executed by the shared semantics
   corpus with zero skips.
+- **Kotlin client — the seventh protocol mirror.** `kotlin-client/` ships the
+  Kotlin/JVM implementation of the par-rt-db wire contract (Kotlin 2.4, JVM 17+
+  bytecode, Android minSdk 26): `wire` (strict-decode vocabulary, unknown
+  fields rejected like the server's `deny_unknown_fields`), `dsl` (table
+  queries, filter/value-expr constructors, `MutationBuilder`, schema DSL,
+  cursor codec), `errors` (codes mirroring `server/src/error.rs`), `http`
+  (one-shot queries/mutate/schedules/storage/workflows), `transport`
+  (pluggable — `JdkTransport` default, `OkHttpTransport` for Android), `ws`
+  (reactive `/sync` over Kotlin `Flow`: live queries, presence, mutate-over-WS,
+  the pushed change feed), `admin` (the `/admin/*` control plane, incl. the
+  streaming export/import pair), and an in-memory engine. Android support
+  rides the OkHttp transport because `java.net.http` does not exist on Android
+  at any API level (OkHttp is `compileOnly`; the cursor codec's `java.util.Base64`
+  sets the minSdk-26 floor). Executed by the shared wire corpus — semantics,
+  golden vector, and wire sections, zero skips — as the seventh runner; the
+  Gradle `test` task fails the build on any skipped case. See
+  [`kotlin-client/README.md`](kotlin-client/README.md) and
+  [`wire-corpus/README.md`](wire-corpus/README.md) for current coverage.
 - **`POST /api/mutate-batch` (`457ea3f`)** — fans out N independent
   transactions in one round trip through the same committer path as
   `/api/mutate` (subscriptions, op-feed taps, per-entry idempotency replay all

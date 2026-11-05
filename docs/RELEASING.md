@@ -17,7 +17,10 @@ ship event).
 | `ParRtDbClient`, `ParRtDbUI` | Git tags via SwiftPM | Not a registry package. The repository root `Package.swift` is the package manifest. |
 
 `server` and `rtdb-cli` are not registry packages (`publish = false`). The CLI
-is distributed only as the GitHub Release binaries above.
+is distributed only as the GitHub Release binaries above. `kotlin-client` is
+also unpublished: its `build.gradle.kts` version exists only so the lockstep
+check below can prove it agrees — consume it from a checkout (see
+[`kotlin-client/README.md`](../kotlin-client/README.md)).
 
 Swift consumers use the repository's root package and an exact semantic version
 without the `v` prefix:
@@ -51,19 +54,21 @@ Perform these steps once, before the first real release:
 
 ## Normal release flow
 
-All seven versioned manifests must agree before releasing:
+All eight versioned manifests must agree before releasing:
 
 - `server/Cargo.toml`, `rust-client/Cargo.toml`, `cli/Cargo.toml`, and
   `core/Cargo.toml`
 - `ts-client/package.json` and `dashboard/package.json`
 - `python-client/pyproject.toml`
+- `kotlin-client/build.gradle.kts` (lockstep-only — see above)
 
 1. Bump those manifests to the next version in one commit. Swift has no
    manifest version; its version is represented by the tag. Regenerate the
    lockfiles after bumping (`cargo build` for `Cargo.lock`; `bun install` from
    the repo root for the bun workspace lockfile, which records the workspace
    package versions; `uv lock` in `python-client/` for `uv.lock`, which records
-   the package's own version) and include them in the same commit.
+   the package's own version) and include them in the same commit. Gradle has
+   no committed lockfile, so the Kotlin manifest needs no regeneration step.
 2. Move the matching entries from `CHANGELOG.md`'s `[Unreleased]` section to a
    `## [X.Y.Z] - YYYY-MM-DD` section and update comparison links.
 3. Run `make checkall` (which includes `make publish-check`) and fix every

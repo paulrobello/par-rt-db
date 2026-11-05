@@ -99,13 +99,14 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 - **Round-trip JSON float parsing**: the shared Rust JSON parser preserves finite `f64` values when decoding their serialized representation. Exact-bit tests guard fractional values that otherwise move by one floating-point unit, including values nested in document payloads.
 - **Single serialized committer per database**: all writes flow through one committer task per database and reads run under READ COMMITTED (except `adjustCounter`, which row-locks its counter) — realtime correctness without distributed coordination
 - **Rust on axum/tokio with Postgres 17 storage**: graceful shutdown drains in-flight requests before exiting, bounded by `RTDB_SHUTDOWN_DRAIN_MS`
-- **One wire contract, six implementations**: the server and the ts/rust/python/swift/go clients all run the shared semantics corpus, staying byte-identical ([`wire-corpus/`](wire-corpus/README.md) — every top-level section is consumed by all six runners)
+- **One wire contract, seven implementations**: the server and the ts/rust/python/swift/go/kotlin clients all run the shared semantics corpus, staying byte-identical ([`wire-corpus/`](wire-corpus/README.md) — every top-level section is consumed by all seven runners)
 - **Security defaults**: constant-time key comparison, generic client-facing 500 messages (detail only in logs), typed `confirm` guards on destructive operations, path-traversal-guarded downloads
 
 ## Packages
 
 | Package | Path | Stack | What it is |
 | --- | --- | --- | --- |
+| **Core** | [`core/`](core) | Rust (`par-rt-db-core`) | Internal crate — the wire vocabulary shared by the server and the Rust client, so a drift between them is a compile error rather than a corpus failure; no consumer-facing surface of its own |
 | **Server** | [`server/`](server) | Rust (axum/tokio + Postgres 17) | The realtime database binary |
 | **TypeScript client** | [`ts-client/`](ts-client) | TS (`@par-rt-db/client`, bun) | Browser/Node/React Native SDK + React bindings + in-memory test harness |
 | **Rust client** | [`rust-client/`](rust-client) | Rust (`par-rt-db-client`) | Rust SDK: http + reactive ws + admin + `.filter()`/`.search()`/`.vector_search()` builders |
@@ -116,7 +117,7 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 | **Dashboard** | [`dashboard/`](dashboard) | Vite + React 19 + TS (bun) | Operator console SPA served same-origin at `RTDB_STATIC_DIR` |
 | **`rtdb` CLI** | [`cli/`](cli) | Rust (`rtdb` binary, cargo) | Operator/CI wrapper around `par-rt-db-client`: list/create dbs, push schema, query/mutate, mint/revoke tokens |
 
-The server is the source of truth; the five SDKs (ts/rust/python/swift/go) each mirror
+The server is the source of truth; the six SDKs (ts/rust/python/swift/go/kotlin) each mirror
 its wire contract directly, the CLI wraps `rust-client`, and the dashboard SPA
 consumes `ts-client`. See [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) for the
 Convex-parity contract and [`CLAUDE.md`](CLAUDE.md) for contributor guidance.
@@ -174,11 +175,11 @@ committer (blobs don't touch document tables). See
 * [Docker](https://www.docker.com/) — for the dev Postgres and for the production `docker compose` deploy path (see [`deploy/README.md`](deploy/README.md))
 * A Rust `stable` toolchain to build the server binary from source ([`rust-toolchain.toml`](rust-toolchain.toml) is the single source of truth)
 * `jq` for the Quickstart walkthrough
-* Per client SDK: bun/node for TypeScript, cargo for Rust, Python 3.12+ (uv) for Python, Xcode with the Swift 6 toolchain for Swift (Darwin only), Go 1.23+ for Go
+* Per client SDK: bun/node for TypeScript, cargo for Rust, Python 3.12+ (uv) for Python, Xcode with the Swift 6 toolchain for Swift (Darwin only), Go 1.23+ for Go, a JDK 17+ for Kotlin
 
 ## Prerequisites for dev
 * See [CONTRIBUTING's development setup](CONTRIBUTING.md#development-setup) for the full tool list and first-time setup
-* A GNU-compatible `make` — every target spans all nine packages (swift-client's lines are Darwin-guarded and skip loudly on Linux); first-time installs are `make ts-client-install`, `make dashboard-install`, `make python-client-install`, and `make go-client-install` (see [Make targets](#make-targets))
+* A GNU-compatible `make` — every target spans all ten packages (swift-client's lines are Darwin-guarded and skip loudly on Linux); first-time installs are `make ts-client-install`, `make dashboard-install`, `make python-client-install`, `make go-client-install`, and `make kotlin-client-install` (see [Make targets](#make-targets))
 
 ## Quickstart
 
@@ -237,7 +238,7 @@ curl -s -X POST http://localhost:8300/api/query \
 To run the full test suite instead (dev Postgres must be up):
 
 ```bash
-make test   # dev-db-up + test suites across all nine packages (fmt/clippy/typecheck live in make checkall)
+make test   # dev-db-up + test suites across all ten packages (fmt/clippy/typecheck live in make checkall)
 ```
 
 ## Endpoints
@@ -461,7 +462,7 @@ loss is `DROP TABLE` for tables absent from the target snapshot, and migrate dat
 | `GET /admin/subscriptions` | Bearer admin key | Lists active subscriptions across all dbs (live query inspector). |
 | `GET /admin/presence` | Bearer admin key | Live per-room presence inspector: one row per room with member count, serialized-state bytes, and the oldest member's join age. In multi-instance mode, `memberCount`/`stateBytes` merge in gossiped peer membership (best-effort, never authoritative — `mergedWithPeers` discloses it); `localMemberCount` is always this replica's own count. Also surfaced as `presenceDetail` on `GET /admin/metrics`. |
 | `POST /admin/db/{db}/explain` | Bearer admin key | Query introspection (ENH-019): re-compiles a `Query` through the real path and returns `{sql, params, terminal, warnings}` — a plan, no rows. |
-| `GET /admin/db/{db}/changes` | Bearer admin key or dashboard cookie | The retained change feed under the admin gate — identical cursor/`logId`/`410 CURSOR_EXPIRED` semantics as the data-plane feed, no machine token and no table allowlist (the admin gate grants the whole database). Backs the dashboard's document-history viewer. Mirrored in all five admin clients (`adminChanges` TS/Swift, `admin_changes` Rust/Python, `AdminChanges` Go). |
+| `GET /admin/db/{db}/changes` | Bearer admin key or dashboard cookie | The retained change feed under the admin gate — identical cursor/`logId`/`410 CURSOR_EXPIRED` semantics as the data-plane feed, no machine token and no table allowlist (the admin gate grants the whole database). Backs the dashboard's document-history viewer. Mirrored in all six admin clients (`adminChanges` TS/Swift/Kotlin, `admin_changes` Rust/Python, `AdminChanges` Go). |
 | `GET /admin/slow-queries` | Bearer admin key | Bounded in-memory ring of queries slower than `RTDB_SLOW_QUERY_MS` (default 0 = disabled; `RTDB_SLOW_QUERY_CAPACITY` default 200; `RTDB_SLOW_QUERY_LOG_PARAMS=false` keeps doc content out). |
 | `GET /admin/sessions?user=&limit=` | Bearer admin key | Lists active interactive sessions (OAuth/anonymous/admin-key). `?user=` filters by `user_id` or email (omitted ⇒ all, server-wide); `?limit=` clamped to `[1, 1000]`, default 200. `token_hash` is a non-reversible sha256 digest, safe to surface. |
 | `DELETE /admin/sessions/{token_hash}` | Bearer admin key | Revokes a single session by its `token_hash` (takes effect on the next op over an already-open connection — `session_still_valid` re-queries on every interactive Subscribe/Mutate/Presence). |
@@ -747,64 +748,71 @@ mirrored as the HTTP `Retry-After` header); every other code omits it:
 that `paginate` pages a ranked terminal rather than replacing it, so it may
 accompany `search`/`vectorSearch`/`hybridSearch` (see
 [Pagination](#pagination)). See
-`server/src/query/` for full semantics: index prefix binds, range predicates
-(`gt`/`gte`/`lt`/`lte`) follow the `eq` prefix, `order: "asc"|"desc"`, `take`
-capped at 4096, `unique` de-duplicates on the indexed fields, `count` is an
-uncapped `SELECT COUNT(*)`, `first` is sugar over `take(1)`, `filter` carries
-an `eq`/`neq`/`gt`/`gte`/`lt`/`lte`/`in`/`not`/`contains`/`exists` + `and`/`or`
-predicate compiled to SQL, `search` ranks by `ts_rank` over a generated
-tsvector (and accepts an optional `filter` to narrow the `WHERE` in the same
-SQL pass — the same `FilterExpr` `.filter()` accepts; query text is parsed as
-websearch syntax — quoted phrases require adjacency, a bare `or` unions,
-`-term` excludes; an optional `snippet: true` attaches a `_searchSnippet`
-`ts_headline` fragment per hit with matched terms wrapped in `<mark>`
-(server-fixed word bounds, tsquery mode only); an optional
-`mode: "trgm"` switches to substring/autocomplete matching — case-insensitive
-`ILIKE` ranked by `pg_trgm` `similarity()`, backed by a GIN trigram index; the
-index **must** declare `trgm: true` at push time — a search index without the
-flag is rejected with `BAD_REQUEST` ("does not declare trgm: true");
-two optional ranking knobs, both omitted from the wire when unset so existing
-requests stay byte-identical: `rankMode: "ts_rank" | "ts_rank_cd"` (tsquery
-mode only; `ts_rank_cd` is cover-density ranking and rewards tighter term
-proximity, `ts_rank` is the default) and `minSimilarity` (trgm mode only, a
-number in `0..=1`; hits whose `similarity()` is below it are dropped). A knob
-used in the wrong mode, or `minSimilarity` outside `0..=1`, is `BAD_REQUEST`),
-`vectorSearch` ranks by
-the index's declared metric distance over a write-maintained pgvector column
-(also accepting an optional full `filter`), `hybridSearch` fuses the full-text
-(`ts_rank`) and `vectorSearch` rankings for the same table into one list via
-Reciprocal Rank Fusion, `paginate` is opaque-cursor keyset pagination,
-`distinct` returns the unique values of the index field after the `eq` prefix
-(ascending; NULLs included, sorted last), and `aggregate` runs a scalar
-`sum`/`min`/`max`/`avg`/`count`, optionally grouped (`groupBy`) by the next
-index field (rows missing the group value form one `key: null` group,
-sorted last) — or, wire-v2, several named ops in one pass via an
-`aggregates: {alias: op, …}` map, and `groupBy` widened to an explicit list of
-declared index fields for composite grouping (`count per (status, priority)`);
-the map form returns `{alias: value, …}` ungrouped or `[{keys, values}]` rows
-grouped, and composes with the legacy single-`op` + field-list combination the
-same way. Aggregate result forms: `sum`/`min`/`max` over an `int64` index
-field return the exact decimal string — the int64 wire convention, exact past
-2^53 where a JSON number is an IEEE-754 double (a `sum` of satoshis or byte
-counts is not silently rounded); `avg` over any numeric field stays a JSON
-number (documented f64 form — a fractional mean has no int64 representation);
-`count` is an integer; a `number` field's aggregates are JSON numbers. A grouped
-aggregate may carry `having: {name: {eq?, ne?, gt?, gte?, lt?, lte?}}`, a
-post-group filter over aggregate values (`count >= 2`, `sum > 100`): `name` is an
-`aggregates` alias or, for a single-`op` spec, the lowercase op name; bounds on
-one name and across names AND together; it compiles to SQL `HAVING` on the
-server and post-filters identically in every in-memory engine. `having` needs a
-grouped spec, a numeric aggregate (`count`, or `sum`/`avg`/`min`/`max` over a
-numeric field), at least one bound per name, and a known name — otherwise
-`BAD_REQUEST`. Failing groups are dropped before the `MAX_TAKE` group cap, and
-a NULL aggregate never satisfies a bound. An optional `fields` array projects each result doc to the
-listed user fields — the system fields (`_id`/`_creationTime`/`_version`) and
-synthetic fields (`_searchSnippet`) are always kept, `fields: []` is an
-ids-only view, names are validated against the schema (`BAD_REQUEST` on an
-unknown field), it composes with every doc-bearing terminal (`count`/
-`distinct`/`aggregate` return no docs, so it is a no-op there), and a
-projected subscription does not push when a write changes only non-projected
-fields (the pushed payloads still carry `_version`).
+`server/src/query/` for full semantics.
+
+#### Terminals
+
+| Terminal | Behavior |
+| --- | --- |
+| `count` | An uncapped `SELECT COUNT(*)`. |
+| `first` | Sugar over `take(1)`. |
+| `search` | Ranks by `ts_rank` over a generated tsvector — see [Search modes](#search-modes). |
+| `vectorSearch` | Ranks by the index's declared metric distance over a write-maintained pgvector column (also accepting an optional full `filter`). |
+| `hybridSearch` | Fuses the full-text (`ts_rank`) and `vectorSearch` rankings for the same table into one list via Reciprocal Rank Fusion. |
+| `paginate` | Opaque-cursor keyset pagination. |
+| `distinct` | Returns the unique values of the index field after the `eq` prefix (ascending; NULLs included, sorted last). |
+| `aggregate` | Runs a scalar `sum`/`min`/`max`/`avg`/`count`, optionally grouped — see [Aggregates](#aggregates). |
+
+#### Index clauses
+
+- `index` prefix binds; range predicates (`gt`/`gte`/`lt`/`lte`) follow the `eq` prefix.
+- `order: "asc"|"desc"`; `take` is capped at 4096; `unique` de-duplicates on the indexed fields.
+- `filter` carries an `eq`/`neq`/`gt`/`gte`/`lt`/`lte`/`in`/`not`/`contains`/`exists` + `and`/`or` predicate compiled to SQL.
+
+#### Search modes
+
+- **tsquery (the default)** ranks by `ts_rank` over a generated tsvector and accepts an optional `filter` to narrow the `WHERE` in the same SQL pass — the same `FilterExpr` `.filter()` accepts. Query text is parsed as websearch syntax: quoted phrases require adjacency, a bare `or` unions, and `-term` excludes. An optional `snippet: true` attaches a `_searchSnippet` `ts_headline` fragment per hit with matched terms wrapped in `<mark>` (server-fixed word bounds, tsquery mode only). An optional `rankMode: "ts_rank" | "ts_rank_cd"` selects cover-density ranking (`ts_rank_cd` rewards tighter term proximity; `ts_rank` is the default; tsquery mode only).
+- **trgm** — an optional `mode: "trgm"` switches to substring/autocomplete matching: case-insensitive `ILIKE` ranked by `pg_trgm` `similarity()`, backed by a GIN trigram index. The index **must** declare `trgm: true` at push time — a search index without the flag is rejected with `BAD_REQUEST` ("does not declare trgm: true"). An optional `minSimilarity` (a number in `0..=1`) drops hits whose `similarity()` is below it (trgm mode only).
+
+Both ranking knobs (`rankMode`, `minSimilarity`) are omitted from the wire when unset, so existing requests stay byte-identical. A knob used in the wrong mode, or `minSimilarity` outside `0..=1`, is `BAD_REQUEST`.
+
+#### Aggregates
+
+`aggregate` runs a scalar `sum`/`min`/`max`/`avg`/`count`, optionally grouped
+(`groupBy`) by the next index field (rows missing the group value form one
+`key: null` group, sorted last) — or, wire-v2, several named ops in one pass
+via an `aggregates: {alias: op, …}` map, and `groupBy` widened to an explicit
+list of declared index fields for composite grouping (`count per
+(status, priority)`); the map form returns `{alias: value, …}` ungrouped or
+`[{keys, values}]` rows grouped, and composes with the legacy single-`op` +
+field-list combination the same way.
+
+Result forms:
+
+- `sum`/`min`/`max` over an `int64` index field return the exact decimal string — the int64 wire convention, exact past 2^53 where a JSON number is an IEEE-754 double (a `sum` of satoshis or byte counts is not silently rounded).
+- `avg` over any numeric field stays a JSON number (documented f64 form — a fractional mean has no int64 representation).
+- `count` is an integer; a `number` field's aggregates are JSON numbers.
+
+A grouped aggregate may carry `having: {name: {eq?, ne?, gt?, gte?, lt?, lte?}}`,
+a post-group filter over aggregate values (`count >= 2`, `sum > 100`): `name`
+is an `aggregates` alias or, for a single-`op` spec, the lowercase op name;
+bounds on one name and across names AND together; it compiles to SQL `HAVING`
+on the server and post-filters identically in every in-memory engine.
+`having` needs a grouped spec, a numeric aggregate (`count`, or
+`sum`/`avg`/`min`/`max` over a numeric field), at least one bound per name, and
+a known name — otherwise `BAD_REQUEST`. Failing groups are dropped before the
+`MAX_TAKE` group cap, and a NULL aggregate never satisfies a bound.
+
+#### Field projection
+
+An optional `fields` array projects each result doc to the listed user fields
+— the system fields (`_id`/`_creationTime`/`_version`) and synthetic fields
+(`_searchSnippet`) are always kept, `fields: []` is an ids-only view, names are
+validated against the schema (`BAD_REQUEST` on an unknown field), it composes
+with every doc-bearing terminal (`count`/`distinct`/`aggregate` return no
+docs, so it is a no-op there), and a projected subscription does not push when
+a write changes only non-projected fields (the pushed payloads still carry
+`_version`).
 
 An optional `lookups` array performs server-side lookup expansion — an
 N+1-free id join on the read DSL. Each `{"field", "table", "as", "cap"?}`
@@ -828,8 +836,9 @@ joined doc's identity. Legal with every doc-returning terminal (`get`,
 Subscriptions see joined keys as part of the change-detection canonical: a
 child-table write that changes joined output re-runs the subscription and
 pushes; a re-run where nothing visible changed pushes nothing. Mirrored in
-all five clients (ts `QueryJson.lookups` + `.lookup()` builder, rust via the
-shared core type); pinned by the `lookup-*` semantics-corpus cases.
+all six clients (ts `QueryJson.lookups` + `.lookup()` builder, rust via the
+shared core type, kotlin via `wire/Query.kt`'s `LookupSpec`); pinned by the
+`lookup-*` semantics-corpus cases.
 
 ### Transaction shape
 
@@ -851,7 +860,7 @@ workflow control-flow steps `startWorkflow` (inserts the per-db `workflows`
 run row on the open sqlx transaction — atomic with the enclosing writes; step
 result `{"workflowId": "<id>"}`; the spec's tables are allowlist-checked at
 submit time) and `cancelWorkflow` (`{"cancelled": <bool>}`, `false` on a
-missing/terminal run — a no-op, not an error) — see `server/src/txn.rs`.
+missing/terminal run — a no-op, not an error) — see `server/src/txn/`.
 
 `expectFields(table, id, expected)` checks exact values at selected object-key paths without writing the live row or advancing its version. Unasserted fields may change. Missing and null remain distinct, selected objects compare in full, and existing visibility/table scopes apply. See [row-field guards](docs/transaction-field-guards.md) for bounds, ordering, retries and SDK methods.
 
@@ -863,7 +872,7 @@ The bulk import steps carry many documents in one step, so an import is no longe
 - `{"op":"upsertMany","table":t,"index":i,"docs":[...]}` resolves each doc through the named index's **full equality**, reading the eq values from the doc's own indexed fields (a doc missing one fails `BAD_REQUEST`), then inserts the doc or merges it into the single match like `upsert` with `insert == patch == doc`. The step result is `{"ids":[...],"inserted":[bool,...]}` in doc order.
 - **Row cap.** At most `MAX_BY_QUERY_ROWS` (1000) docs per step; more fails `BAD_REQUEST` before any doc is written. Each doc counts toward the admin `RTDB_MAX_AFFECTED_DOCS` budget and the 10,000-row per-transaction ceiling.
 - **Atomicity.** Any invalid document (schema violation, unique conflict, constraint failure, authorization) aborts the whole transaction with that document's typed error, rolling back the earlier docs of the step and every other step.
-- v1 scope: a step carries documents only, with no interleaved preconditions. Mirrored in all five clients (`insertMany`/`upsertMany` builders and in-memory engines) and pinned by the `txn-insert-many-*` and `txn-upsert-many-*` corpus cases.
+- v1 scope: a step carries documents only, with no interleaved preconditions. Mirrored in all six clients (`insertMany`/`upsertMany` builders and in-memory engines) and pinned by the `txn-insert-many-*` and `txn-upsert-many-*` corpus cases.
 
 The `expectNoMatch` step (`{"op":"expectNoMatch","table":...,"filter":{...}}`) is a predicate-driven precondition: if any live row in `table` that the caller can see matches `filter` (the same `FilterExpr` the by-query steps accept, including `olderThan`), the whole transaction aborts with `PRECONDITION_FAILED` and the fixed message "filter matched an existing document". Otherwise it writes nothing and its step result is `null`. Steps run in order, so an `insert` earlier in the same transaction counts. Client builders expose the idiom as `insertIf(table, doc, { expectNoMatch: filter })`, which emits `expectNoMatch` followed by `insert`. Because the committer serializes writes per database, concurrent overlapping inserts (for example room bookings) admit exactly one. Notes:
 
@@ -911,7 +920,7 @@ optional `protocolVersion` (ARC-013) so a client can declare the wire version it
 speaks. Omitting it is backward-compatible (treated as version `1`); a client
 requesting a version *newer* than the server's is
 rejected with `UNSUPPORTED_PROTOCOL` (400) instead of a generic `deny_unknown_fields`
-400, so a version skew is diagnosable. All five SDKs send the header on every
+400, so a version skew is diagnosable. All six SDKs send the header on every
 HTTP call — data plane and admin alike. When the `auth` frame carries
 `protocolVersion`, `authOk` echoes the server's `PROTOCOL_VERSION` back (also
 omitted otherwise, so an older client's `authOk` bytes never change). Version
@@ -1319,9 +1328,9 @@ on the side table row (like cancel) — `awaitSignal` steps write no documents.
 Start runs via the HTTP `POST /api/workflows` routes, the WS
 `startWorkflow` / `cancelWorkflow` / `listWorkflows` frames, the admin CRUD
 routes, or the `startWorkflow` / `cancelWorkflow` txn steps (insertion atomic
-with the enclosing writes). All five clients mirror the surface:
+with the enclosing writes). All six clients mirror the surface:
 `startWorkflow` / `cancelWorkflow` / `listWorkflows` / `signalWorkflow`
-(ts, rust, python, swift, go — reactive + HTTP) plus admin variants, the
+(ts, rust, python, swift, go, kotlin — reactive + HTTP) plus admin variants, the
 `rtdb workflows` CLI (incl. `rtdb workflows signal`), and the dashboard
 Workflows page (which shows waiting runs and can send the signal). Spec:
 [`docs/superpowers/specs/2026-08-15-workflows-design.md`](docs/superpowers/specs/2026-08-15-workflows-design.md)
@@ -1408,9 +1417,9 @@ The consumer contract:
   allowlist (the admin gate grants the whole database). It backs the
   dashboard's document-history viewer.
 
-All five client SDKs expose the feed (`listChanges` in TS, `changes()` in
-Rust/Python/Swift/Go) and the admin twin (`adminChanges` in TS/Swift,
-`admin_changes` in Rust/Python, `AdminChanges` in Go).
+All six client SDKs expose the feed (`listChanges` in TS, `changes()` in
+Rust/Python/Swift/Go/Kotlin) and the admin twin (`adminChanges` in
+TS/Swift/Kotlin, `admin_changes` in Rust/Python, `AdminChanges` in Go).
 
 ### Pushed change feed over WebSocket
 
@@ -1573,7 +1582,7 @@ coerced row value is re-checked at apply time.
 
 Constraints are **write-path only**: they change no stored shape, are not
 compared by destructive-change detection (adding or removing one is an
-additive push), and mirror across all six implementations (enforced in every
+additive push), and mirror across all seven implementations (enforced in every
 client's in-memory engine). See the `constraint-*` / `error-constraint-*`
 cases in [`wire-corpus/semantics/`](wire-corpus/semantics/) for the pinned
 cross-engine semantics and [FEATURE_MATRIX #43](FEATURE_MATRIX.md).
@@ -1737,6 +1746,7 @@ here rather than restating it.
 | `make dashboard-install` | dashboard | `bun install` at repo root + `dashboard/`. |
 | `make python-client-install` | python-client | `uv sync --all-extras` in `python-client/`, so pyright can resolve the optional `http`/`ws` deps. |
 | `make go-client-install` | go-client | `go mod download` in `go-client/`. |
+| `make kotlin-client-install` | kotlin-client | `./gradlew --version` in `kotlin-client/` — validates the JDK and bootstraps the pinned Gradle wrapper. |
 
 The Cargo workspace members (`core/`, `server/`, `rust-client/`, `cli/`) and
 `swift-client/` have no install target — `cargo` and SwiftPM fetch on first
@@ -1761,17 +1771,20 @@ run.
 
 | Stage | What it checks | Standalone target |
 | --- | --- | --- |
-| 1. `env-drift-check` | Every `RTDB_*` var read by the server or documented in `.env.example` is forwarded to the container by `docker-compose.yml`'s `environment:` block. The block is an explicit allowlist, so a `.env`-only key silently does nothing. | `make env-drift-check` |
-| 2. `dockerfile-stub-check` | Every `[[test]]` declared by a non-server workspace member has a matching placeholder in the Dockerfile's dependency-caching layer. Without it `make deploy` fails at cargo's manifest parse — a break the rest of `checkall` cannot see. | `make dockerfile-stub-check` |
-| 3. `backup-persistence-check` | The rendered `docker-compose.yml` mounts a persistent volume at `/backups` for the server, so scheduled dumps survive a container restart. | `make backup-persistence-check` |
-| 4. `hostname-leak-check` | Runs when a local, gitignored `.hostname-leak-patterns` file exists (skips silently in CI, where it doesn't): no tracked file may match the compiled hostname patterns, so a scrubbed hostname cannot quietly reappear in a doc or commit. | `make hostname-leak-check` |
-| 5. `cli-docs-check` | `cli/README.md` matches what `gen-cli-docs` regenerates, so the CLI reference cannot drift from the CLI. | `make cli-docs-check` |
-| 6. `docs-api` | API docs regenerate cleanly for every SDK (`rust-client-doc`, `ts-client-doc`, `python-client-doc`, `swift-client-doc`), with warnings denied, so doc comments cannot rot. | `make docs-api` |
-| 7. `fmt-check` | Formatting across all nine packages. | `make fmt-check` |
-| 8. `lint` | Clippy under `-D warnings`, biome, ruff, `go vet`, swiftlint `--strict`. | `make lint` |
-| 9. `typecheck` | `tsc`, pyright, `go vet`, `swift build`. | `make typecheck` |
-| 10. `test` | The full suite across all nine packages, against the dev Postgres. | `make test` |
-| 11. `rust-client-check-features` | The rust-client library **and** its test targets compile under every meaningful feature combination, not just `--all-features`. | `make rust-client-check-features` |
+| 1. `ts-dist-preflight` | `ts-client/dist` (gitignored) exists and is not stale, so the gate fails up front naming the fix (`make ts-client-build`) instead of failing later at dashboard typecheck with a missing-module error that reads like a code defect. | `make ts-dist-preflight` |
+| 2. `env-drift-check` | Every `RTDB_*` var read by the server or documented in `.env.example` is forwarded to the container by `docker-compose.yml`'s `environment:` block. The block is an explicit allowlist, so a `.env`-only key silently does nothing. | `make env-drift-check` |
+| 3. `dockerfile-stub-check` | Every `[[test]]` declared by a non-server workspace member has a matching placeholder in the Dockerfile's dependency-caching layer. Without it `make deploy` fails at cargo's manifest parse — a break the rest of `checkall` cannot see. | `make dockerfile-stub-check` |
+| 4. `backup-persistence-check` | The rendered `docker-compose.yml` mounts a persistent volume at `/backups` for the server, so scheduled dumps survive a container restart. | `make backup-persistence-check` |
+| 5. `hostname-leak-check` | Runs when a local, gitignored `.hostname-leak-patterns` file exists (skips silently in CI, where it doesn't): no tracked file may match the compiled hostname patterns, so a scrubbed hostname cannot quietly reappear in a doc or commit. | `make hostname-leak-check` |
+| 6. `cli-docs-check` | `cli/README.md` matches what `gen-cli-docs` regenerates, so the CLI reference cannot drift from the CLI. | `make cli-docs-check` |
+| 7. `docs-api` | API docs regenerate cleanly for every SDK (`rust-client-doc`, `ts-client-doc`, `python-client-doc`, `swift-client-doc`), with warnings denied, so doc comments cannot rot. | `make docs-api` |
+| 8. `fmt-check` | Formatting across all ten packages. | `make fmt-check` |
+| 9. `lint` | Clippy under `-D warnings`, biome, ruff, `go vet`, swiftlint `--strict`. | `make lint` |
+| 10. `typecheck` | `tsc`, pyright, `go vet`, `swift build`. | `make typecheck` |
+| 11. `test` | The full suite across all ten packages, against the dev Postgres. | `make test` |
+| 12. `rust-client-check-features` | The rust-client library **and** its test targets compile under every meaningful feature combination, not just `--all-features`. | `make rust-client-check-features` |
+| 13. `publish-check` | Release artifacts validate in dry-run — crates.io packaging, the npm tarball, the Python distributions — and the versioned manifests agree (the lockstep check). The release workflow's verify job reruns it with `--require-tag` on a tag checkout. | `make publish-check` |
+| 14. `dev-db-clean-check` | Proves `dev-db-clean.sql`'s merge-fixture section on the live dev Postgres: seeds throwaway pattern-matching rows plus a non-matching sentinel, runs the real clean, asserts zero fixtures remain and the sentinel survives. Runs after `test`, so the dev db is guaranteed up. | `make dev-db-clean-check` |
 
 Never `--no-verify` past the gate. If you do, fix the gate before anything
 else.
@@ -1922,7 +1935,7 @@ Design and as-built notes:
 
 ## Clients
 
-par-rt-db ships five client SDKs that each mirror the server's wire contract,
+par-rt-db ships six client SDKs that each mirror the server's wire contract,
 plus an operator SPA and a CLI built on top of them:
 
 - [`ts-client/`](ts-client/README.md) — `@par-rt-db/client` (browser/Node/React Native): schema builder, reactive WebSocket client, React bindings, HTTP/admin clients, in-memory test harness.
@@ -1930,6 +1943,7 @@ plus an operator SPA and a CLI built on top of them:
 - [`python-client/`](python-client/README.md) — `par-rt-db` (Python): wire contract + schema/mutation/query DSL + sync HTTP/admin/storage + reactive WS.
 - [`swift-client/`](swift-client/README.md) — `ParRtDbClient`/`ParRtDbUI` (Swift 6, iOS 17+/macOS 14): wire + query/mutation/schema DSL + HTTP + reactive WS + SwiftUI `LiveQuery`, plus the admin client, presence, optimistic updates, and the in-memory engine (see its README's coverage table).
 - [`go-client/`](go-client/README.md) — `github.com/paulrobello/par-rt-db/go-client` (Go 1.23+): wire + schema DSL + typed HTTP queries + reactive WS + admin client + the in-memory engine, stdlib-only outside `coder/websocket`.
+- [`kotlin-client/`](kotlin-client/README.md) — `dev.parrtdb:par-rt-db-kotlin-client` (Kotlin 2.4, JVM 17+ / Android minSdk 26): wire + query/mutation/schema DSL + HTTP + reactive WS (`Flow`) + admin client + the in-memory engine, over a pluggable transport (`JdkTransport` or OkHttp for Android).
 - [`dashboard/`](dashboard/README.md) — the operator console SPA (admin/operator UI served same-origin at `RTDB_STATIC_DIR`; consumes `ts-client`).
 - [`cli/`](cli/README.md) — `rtdb` operator/CI binary (wraps `par-rt-db-client`). `rtdb changes --db <db> [--since <seq>] [--limit <n>] [--follow]` prints one page of durable change ops as compact NDJSON, with the `nextSeq` cursor on stderr. Omit `--since` to start at the current head, or pass `--since 0` for the oldest retained ops. `--follow` polls every two seconds until Ctrl-C; `CURSOR_EXPIRED` exits non-zero without silently resyncing. Supply `RTDB_URL` and `RTDB_TOKEN` (machine token).
 
@@ -1943,7 +1957,7 @@ plus an operator SPA and a CLI built on top of them:
 * Q: Can I use it over plain HTTP?
   * A: Yes — one-shot `POST /api/query` / `POST /api/mutate` cover reads and writes. The WebSocket (`/sync`) is only needed for live subscriptions and presence.
 * Q: Which languages have client SDKs?
-  * A: TypeScript (`@par-rt-db/client`, with React bindings), Rust (`par-rt-db-client`), Python (`par-rt-db`), Swift (`ParRtDbClient`, iOS 17+/macOS 14), and Go (`go-client`), plus the `rtdb` CLI and the operator dashboard.
+  * A: TypeScript (`@par-rt-db/client`, with React bindings), Rust (`par-rt-db-client`), Python (`par-rt-db`), Swift (`ParRtDbClient`, iOS 17+/macOS 14), Go (`go-client`), and Kotlin (`kotlin-client`, JVM + Android), plus the `rtdb` CLI and the operator dashboard.
 * Q: Is auth required?
   * A: Machine tokens are the baseline. Each of the six OAuth providers is independently optional (blank env ⇒ its routes return 503), and anonymous access is opt-in (off by default).
 * Q: Can I run multiple replicas behind a load balancer?

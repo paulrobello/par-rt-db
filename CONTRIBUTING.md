@@ -23,7 +23,7 @@ notes), see [`CLAUDE.md`](CLAUDE.md).
 
 ## Repository layout
 
-par-rt-db is a monorepo with **nine packages** built from one root `Makefile`:
+par-rt-db is a monorepo with **ten packages** built from one root `Makefile`:
 
 | Package | Path | Stack |
 | --- | --- | --- |
@@ -34,12 +34,13 @@ par-rt-db is a monorepo with **nine packages** built from one root `Makefile`:
 | Python client | `python-client/` | Python (`par-rt-db`, uv) |
 | Swift client | `swift-client/` | Swift (`ParRtDbClient`/`ParRtDbUI`, swift) |
 | Go client | `go-client/` | Go (`github.com/paulrobello/par-rt-db/go-client`) |
+| Kotlin client | `kotlin-client/` | Kotlin (`dev.parrtdb:par-rt-db-kotlin-client`, gradle) |
 | Dashboard | `dashboard/` | Vite + React 19 + TS (bun) |
 | `rtdb` CLI | `cli/` | Rust (`rtdb` binary, cargo; wraps `par-rt-db-client`) |
 
-The server is the source of truth for the wire protocol and the DSL; the five
-client SDKs (`ts-client`, `rust-client`, `python-client`, `swift-client`, `go-client`)
-mirror it — six implementations of one wire contract.
+The server is the source of truth for the wire protocol and the DSL; the six
+client SDKs (`ts-client`, `rust-client`, `python-client`, `swift-client`, `go-client`,
+`kotlin-client`) mirror it — seven implementations of one wire contract.
 [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) tracks parity
 against Convex with per-row notes on which clients mirror each feature.
 
@@ -81,19 +82,19 @@ gitignored and rebuilt on demand.
 ## The build gate
 
 `make checkall` is the **definition of done**. It must pass before every
-commit, and it spans all nine packages (`core`, `server`, `ts-client`,
-`rust-client`, `python-client`, `swift-client`, `go-client`, `dashboard`,
-`cli`).
+commit, and it spans all ten packages (`core`, `server`, `ts-client`,
+`rust-client`, `python-client`, `swift-client`, `go-client`, `kotlin-client`,
+`dashboard`, `cli`).
 
-Its eight stages, what each one catches, and every other make target are
+Its stages, what each one catches, and every other make target are
 documented once in the root README under
 [Verification gates](README.md#verification-gates). That table is the canonical
 description — read it there rather than trusting a summary here.
 
-Two stages exist because the rest of the gate cannot see what they check:
-`env-drift-check` catches a `RTDB_*` var the compose file never forwards, and
-`dockerfile-stub-check` catches a `[[test]]` with no Dockerfile stub, which
-would otherwise break only `make deploy`.
+Several stages exist because the rest of the gate cannot see what they check —
+for example `env-drift-check` catches a `RTDB_*` var the compose file never
+forwards, and `dockerfile-stub-check` catches a `[[test]]` with no Dockerfile
+stub, which would otherwise break only `make deploy`.
 
 Never `--no-verify` past the gate. If you do, fix the gate immediately and push
 the fix before anything else.
@@ -298,15 +299,16 @@ etc.).
 
 ## Versioning
 
-All packages — `server`, `cli`, `dashboard`, and the five client SDKs
-(`ts-client`, `rust-client`, `python-client`, `swift-client`, `go-client`) —
+All packages — `server`, `cli`, `dashboard`, and the six client SDKs
+(`ts-client`, `rust-client`, `python-client`, `swift-client`, `go-client`,
+`kotlin-client`) —
 version in
 **lockstep**: one version for the whole protocol surface, bumped together in
 the same release commit. `swift-client` carries no manifest version — SPM has
 no version field, so the repo's release tag is its version — but it is part of
-the lockstep unit all the same. The six implementations of the wire contract
-(`server/src/protocol.rs` plus the five client mirrors) are one unit;
-independent client versions would claim compatibility the six-way mirror does
+the lockstep unit all the same. The seven implementations of the wire contract
+(`server/src/protocol.rs` plus the six client mirrors) are one unit;
+independent client versions would claim compatibility the seven-way mirror does
 not have. The release procedure,
 including the lockstep bump and tag-driven registry
 publication, is [`docs/RELEASING.md`](docs/RELEASING.md).
@@ -380,13 +382,14 @@ failing test.
   every value via `$n`. Never interpolate an unvalidated value. Physical names
   are lowercased and length-capped to fit Postgres's 63-byte limit — don't
   raise the caps.
-- **Six implementations, one wire contract** — `server/src/protocol.rs`,
+- **Seven implementations, one wire contract** — `server/src/protocol.rs`,
   `ts-client/src/protocol.ts`, `rust-client/src/wire.rs`,
   `python-client/src/par_rt_db/wire.py`,
-  `swift-client/Sources/ParRtDbClient/Wire.swift`, and `go-client/wire/` are
-  six implementations of
+  `swift-client/Sources/ParRtDbClient/Wire.swift`, `go-client/wire/`, and
+  `kotlin-client/src/main/kotlin/dev/parrtdb/wire/` are
+  seven implementations of
   the same protocol. The casing is deliberately non-uniform and load-bearing.
-  Any server change must be mirrored in **all six** — wire types, DSL
+  Any server change must be mirrored in **all seven** — wire types, DSL
   builders, and their tests. If a client doesn't yet cover a changed surface,
   file the gap explicitly in `FEATURE_MATRIX.md` rather than letting it drift.
 - **Errors** — every failure is the `RtDbError` envelope `{code, message}`
@@ -410,8 +413,8 @@ failing test.
   layer `touch`es a placeholder for every `[[test]]` declared by a non-server
   workspace member. Add a test target to `rust-client/Cargo.toml` (or another
   member) without adding its stub and `make deploy` fails at cargo's manifest
-  parse, while `make checkall` stays green — which is why `checkall` now runs
-  `dockerfile-stub-check` as its second stage. Run `make dockerfile-stub-check`
+  parse, while `make checkall` stays green — which is why `checkall` runs
+  `dockerfile-stub-check`. Run `make dockerfile-stub-check`
   after touching any member's test targets; its output names the exact stub
   line to add.
 - **Storage bypasses the committer** — `storage::put` writes directly to the
@@ -444,14 +447,14 @@ Before requesting review:
 - [ ] `make checkall` passes locally on a clean checkout, including `make docs-api`.
 - [ ] `make docs-api` produces warning-free Rust, TypeScript, Python, and Swift references.
 - [ ] Tests are added or updated for any new behavior (every package the change touches).
-- [ ] If the change alters the wire protocol or DSL, all five client SDKs (`ts-client`, `rust-client`, `python-client`, `swift-client`, `go-client`) are updated and tested in the same PR, and `FEATURE_MATRIX.md` reflects the new state.
+- [ ] If the change alters the wire protocol or DSL, all six client SDKs (`ts-client`, `rust-client`, `python-client`, `swift-client`, `go-client`, `kotlin-client`) are updated and tested in the same PR, and `FEATURE_MATRIX.md` reflects the new state.
 - [ ] No `unwrap()`/`expect()` outside `#[cfg(test)]`; no new clippy warnings.
 - [ ] No real secrets in the diff. `pre-commit` (gitleaks) is installed and passes.
 - [ ] Commit messages follow Conventional Commits.
 - [ ] Relevant docs (`README`, `FEATURE_MATRIX`, `CHANGELOG`, package READMEs) are updated.
-- [ ] If the change adds or renames an env var, `.env.example`, `docker-compose.yml`'s `environment:` block (the allowlist that actually feeds the container), and the root README Configuration table are updated — `make env-drift-check` (first stage of `checkall`) guards this.
+- [ ] If the change adds or renames an env var, `.env.example`, `docker-compose.yml`'s `environment:` block (the allowlist that actually feeds the container), and the root README Configuration table are updated — `make env-drift-check` (part of `make checkall`) guards this.
 - [ ] If the change adds a route, the root README Endpoints table and `server/README.md` are updated.
-- [ ] If the change adds or modifies a query terminal, `FilterExpr` variant, or mutation-step result shape, a case covering it is added to `wire-corpus/golden-vector.json` (the cross-client parity fixture consumed by all five golden-vector suites). The corpus is the source of truth for cross-client agreement; an uncovered terminal is a regression risk for the other four engines.
+- [ ] If the change adds or modifies a query terminal, `FilterExpr` variant, or mutation-step result shape, a case covering it is added to `wire-corpus/golden-vector.json` (the cross-client parity fixture consumed by all seven golden-vector runners). The corpus is the source of truth for cross-client agreement; an uncovered terminal is a regression risk for the other six engines.
 - [ ] If the change alters any server behavior a client engine mirrors — step results, error codes, defaults, visibility (soft delete/TTL), cursor semantics — a case pinning the new behavior is added (or updated) in `wire-corpus/semantics/` per the authoring rule in [`wire-corpus/README.md`](wire-corpus/README.md).
 - [ ] If a property test (`server/tests/proptest_parity.rs`) found a server-vs-engine divergence, the fix also ships the minimized counterexample as a `wire-corpus/semantics/` case (so all six client engines inherit it, not just the rust one — unmirrored engines get a loud `skip` until they do) and commits the proptest seed under `server/proptest-regressions/`.
 

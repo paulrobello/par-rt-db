@@ -46,6 +46,19 @@ json_version() {
   bun -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).version)' "$1"
 }
 
+# Gradle Kotlin DSL: the top-level `version = "X.Y.Z"` assignment (the only
+# unindented `version =` line — buildscript/dependency blocks quote versions
+# inside function-call arguments, never as a bare assignment).
+gradle_version() {
+  awk '
+    /^[[:space:]]*version[[:space:]]*=/ {
+      v=$0; sub(/^[^"]*"/, "", v); sub(/".*$/, "", v)
+      if (v != "") { print v; found=1; exit }
+    }
+    END { if (!found) exit 1 }
+  ' "$1"
+}
+
 manifests=(
   server/Cargo.toml
   rust-client/Cargo.toml
@@ -54,6 +67,7 @@ manifests=(
   ts-client/package.json
   dashboard/package.json
   python-client/pyproject.toml
+  kotlin-client/build.gradle.kts
 )
 versions=()
 for manifest in "${manifests[@]}"; do
@@ -61,6 +75,7 @@ for manifest in "${manifests[@]}"; do
   case "$manifest" in
     */package.json) version=$(json_version "$manifest") ;;
     python-client/pyproject.toml) version=$(python_version "$manifest") ;;
+    *.gradle.kts) version=$(gradle_version "$manifest") ;;
     *) version=$(cargo_version "$manifest") ;;
   esac
   [ -n "$version" ] || { echo "version-lockstep: no version found in $manifest" >&2; exit 1; }
