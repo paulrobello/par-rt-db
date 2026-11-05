@@ -1,7 +1,36 @@
+import type {
+  ChangeBatchMeta,
+  ChangeFeedSub,
+  SubscribeChangesOptions,
+} from "./client-change-feed.js";
+import { iterateChanges, onFeedFrame, sendFeedSubscribe } from "./client-change-feed.js";
+import {
+  CLOSE_APP_DROP,
+  DEFAULT_AUTH_UNREACHABLE_AFTER,
+  DEFAULT_BACKOFF,
+  DEFAULT_HEARTBEAT_MS,
+  httpToWs,
+  isThenable,
+} from "./client-transport.js";
 import { RtDbError } from "./errors.js";
 import type { TransformOpts, UploadInput } from "./http.js";
 import { RtDbHttpClient } from "./http.js";
 import { parseStepResults, type StepResult } from "./mutation.js";
+import type {
+  OfflineQueueStatus,
+  QueuedMutate,
+  QueuedSchedule,
+  QueuedWorkflow,
+  ScheduleMsg,
+  WorkflowMsg,
+} from "./offline_queue.js";
+import {
+  DEFAULT_OFFLINE_QUEUE_TTL_MS,
+  flushOfflineQueue,
+  mintOfflineKey,
+  offlineQueueStatus,
+  pruneOfflineQueue,
+} from "./offline_queue.js";
 import { projectOptimisticUpdate } from "./optimistic.js";
 import type {
   AuthedUser,
@@ -19,6 +48,9 @@ import type {
 } from "./protocol.js";
 import { PROTOCOL_VERSION } from "./protocol.js";
 import type { RtQuery } from "./query.js";
+
+export type { ChangeBatchMeta, SubscribeChangesOptions } from "./client-change-feed.js";
+export type { OfflineQueueStatus } from "./offline_queue.js";
 
 /**
  * Minimal surface of a WebSocket the client depends on (browser/Node/bun compatible).
@@ -150,16 +182,6 @@ export interface RtDbClientOptions {
   offlineQueueTtlMs?: number;
 }
 
-/** Snapshot of the opt-in offline mutation queue, from
- * {@link RtDbClient.getOfflineQueueStatus}. */
-export interface OfflineQueueStatus {
-  /** Number of mutations currently queued for replay. */
-  depth: number;
-  /** Age in ms of the oldest queued entry (from the client's injectable
-   * clock), or `null` when the queue is empty. */
-  oldestAgeMs: number | null;
-}
-
 interface Subscription {
   queryId: string;
   query: QueryJson;
@@ -171,111 +193,6 @@ interface Subscription {
   serverLast?: unknown;
   /** True while `last` includes an unconfirmed optimistic overlay. */
   optimistic: boolean;
-}
-
-interface PendingMutate {
-  resolve: (results: StepResult[]) => void;
-  reject: (error: RtDbError) => void;
-}
-
-interface QueuedMutate extends PendingMutate {
-  mutId: string;
-  idempotencyKey?: string;
-  txn: TransactionJson;
-  /** Client-clock timestamp of the mutation call. The offline queue's TTL and
-   * age observability are measured from this, across reconnects. */
-  queuedAt: number;
-}
-
-/** The ClientMessage a schedule call will send once authenticated, carried while
- * queued so `flushOnAuth` can dispatch it verbatim. */
-type ScheduleMsg =
-  | { kind: "schedule"; when: ScheduleWhen; txn: TransactionJson; external?: true }
-  | { kind: "cancel"; id: string }
-  | { kind: "pause"; id: string }
-  | { kind: "resume"; id: string }
-  | { kind: "list" };
-
-/** A schedule call awaiting its server reply (resolve/reject plus the message
- * to send). Queued while unauthenticated; once dispatched, only the handlers
- * remain tracked in `pendingSchedules` keyed by `scheduleId`. */
-interface QueuedSchedule {
-  scheduleId: string;
-  msg: ScheduleMsg;
-  resolve: (value: unknown) => void;
-  reject: (error: RtDbError) => void;
-}
-
-/** The ClientMessage a workflow call will send once authenticated (FM-29). */
-type WorkflowMsg =
-  | { kind: "start"; spec: WorkflowSpec }
-  | { kind: "cancel"; id: string }
-  | { kind: "signal"; id: string; name: string; payload?: unknown }
-  | { kind: "list"; status?: WorkflowStatus };
-
-/** A workflow call awaiting its server reply — the FM-29 analogue of
- * {@link QueuedSchedule}, correlated by a `wf-${n}` id. */
-interface QueuedWorkflow {
-  workflowId: string;
-  msg: WorkflowMsg;
-  resolve: (value: unknown) => void;
-  reject: (error: RtDbError) => void;
-}
-
-const DEFAULT_BACKOFF = { baseMs: 500, maxMs: 15_000 };
-const DEFAULT_HEARTBEAT_MS = 20_000;
-const DEFAULT_AUTH_UNREACHABLE_AFTER = 5;
-/**
- * Default TTL for the opt-in offline mutation queue — deliberately the server's
- * default idempotency-key dedup TTL (`mutation_log::DEFAULT_DEDUP_TTL_MS`): a
- * replay older than the dedup table's memory could double-apply.
- */
-const DEFAULT_OFFLINE_QUEUE_TTL_MS = 300_000;
-/**
- * App-range close code we use for the drops WE initiate (heartbeat timeout,
- * socket error). The WebSocket spec forbids passing the reserved 1006 to
- * `close()` (it throws `InvalidAccessError`), so we must use 1000 or a
- * 4000–4999 code. `handleClose` treats any non-4401 code as a reconnectable drop.
- */
-const CLOSE_APP_DROP = 4000;
-
-function isThenable(value: unknown): value is Promise<unknown> {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as { then?: unknown }).then === "function"
-  );
-}
-
-function httpToWs(url: string): string {
-  return url.replace(/^http/, "ws").replace(/\/+$/, "");
-}
-
-/** Options for {@link RtDbClient.subscribeChanges}. */
-export interface SubscribeChangesOptions {
-  /** Restrict the feed to these tables (omitted/empty = all tables). */
-  tables?: string[];
-  /** Resume cursor: deliver ops with `seq > since`. Omitted = start at the current head. */
-  since?: number;
-  /** Epoch (`logId`) the `since` cursor was taken from; a mismatch yields `CURSOR_EXPIRED`. */
-  feedEpoch?: string;
-}
-
-/** Per-batch metadata passed to a {@link RtDbClient.subscribeChanges} callback. */
-export interface ChangeBatchMeta {
-  /** Epoch of the log the ops belong to (same value as the HTTP feed's `logId`). */
-  feedEpoch: string;
-  /** The log head at send time. */
-  head: number;
-}
-
-interface ChangeFeedSub {
-  feedId: string;
-  tables: string[];
-  since: number | undefined;
-  feedEpoch: string | undefined;
-  onBatch: (ops: ChangeOp[], meta: ChangeBatchMeta) => void;
-  onError: ((err: RtDbError) => void) | undefined;
 }
 
 /** Reactive WebSocket client: one connection, serialized subscriptions, correlated mutations. */
@@ -510,16 +427,7 @@ export class RtDbClient {
    */
   getOfflineQueueStatus(): OfflineQueueStatus {
     this.pruneOfflineQueue();
-    if (this.offlineQueue.length === 0) {
-      return { depth: 0, oldestAgeMs: null };
-    }
-    let oldest = Number.POSITIVE_INFINITY;
-    for (const entry of this.offlineQueue) {
-      if (entry.queuedAt < oldest) {
-        oldest = entry.queuedAt;
-      }
-    }
-    return { depth: this.offlineQueue.length, oldestAgeMs: this.now() - oldest };
+    return offlineQueueStatus(this.offlineQueue, () => this.now());
   }
 
   /**
@@ -907,103 +815,18 @@ export class RtDbClient {
     ops: ChangeOp[];
     meta: ChangeBatchMeta;
   }> {
-    type Item = { ops: ChangeOp[]; meta: ChangeBatchMeta };
-    const queue: Item[] = [];
-    let failure: RtDbError | null = null;
-    let done = false;
-    let wake: (() => void) | null = null;
-    const notify = () => {
-      const w = wake;
-      wake = null;
-      w?.();
-    };
-    const unsubscribe = this.subscribeChanges(
+    return iterateChanges(
+      (options, onBatch, onError) => this.subscribeChanges(options, onBatch, onError),
       opts,
-      (ops, meta) => {
-        queue.push({ ops, meta });
-        notify();
-      },
-      (err) => {
-        failure = err;
-        notify();
-      },
     );
-    const it: AsyncIterableIterator<Item> = {
-      [Symbol.asyncIterator]: () => it,
-      next: async () => {
-        for (;;) {
-          const item = queue.shift();
-          if (item) {
-            return { value: item, done: false };
-          }
-          if (failure) {
-            const err = failure;
-            failure = null;
-            done = true;
-            throw err;
-          }
-          if (done) {
-            return { value: undefined, done: true };
-          }
-          await new Promise<void>((resolve) => {
-            wake = resolve;
-          });
-        }
-      },
-      return: async () => {
-        done = true;
-        unsubscribe();
-        notify();
-        return { value: undefined, done: true };
-      },
-    };
-    return it;
   }
 
   private sendFeedSubscribe(sub: ChangeFeedSub): void {
-    const frame: ClientMessage = { type: "feedSubscribe", feedId: sub.feedId };
-    if (sub.since !== undefined) {
-      frame.since = sub.since;
-    }
-    if (sub.feedEpoch !== undefined) {
-      frame.feedEpoch = sub.feedEpoch;
-    }
-    if (sub.tables.length > 0) {
-      frame.tables = sub.tables;
-    }
-    this.send(frame);
+    sendFeedSubscribe(sub, (frame) => this.send(frame));
   }
 
   private onFeedFrame(msg: Extract<ServerMessage, { type: "feedEvents" | "feedErr" }>): void {
-    const sub = this.changeFeeds.get(msg.feedId);
-    if (!sub) {
-      return;
-    }
-    if (msg.type === "feedErr") {
-      this.changeFeeds.delete(msg.feedId);
-      sub.onError?.(RtDbError.fromEnvelope(msg.error));
-      return;
-    }
-    // An epoch change means the log was recreated: seqs restart, so the old
-    // cursor no longer applies to this stream.
-    const sameEpoch = sub.feedEpoch === undefined || sub.feedEpoch === msg.feedEpoch;
-    const lastSeq = sameEpoch ? (sub.since ?? Number.NEGATIVE_INFINITY) : Number.NEGATIVE_INFINITY;
-    const fresh = msg.ops.filter((op) => op.seq > lastSeq);
-    sub.feedEpoch = msg.feedEpoch;
-    if (sub.since === undefined && msg.ops.length === 0) {
-      // Started at the head: pin the cursor so a reconnect resumes from here
-      // instead of skipping whatever committed while disconnected.
-      sub.since = msg.head;
-    }
-    if (fresh.length > 0) {
-      sub.onBatch(fresh, { feedEpoch: msg.feedEpoch, head: msg.head });
-      sub.since = Math.max(...fresh.map((o) => o.seq));
-    }
-    if (msg.ops.length > 0 && this.changeFeeds.get(msg.feedId) === sub) {
-      // Ack even a fully-deduped batch so the server's flow-control window advances.
-      const ackSeq = Math.max(...msg.ops.map((o) => o.seq));
-      this.send({ type: "feedAck", feedId: msg.feedId, seq: ackSeq });
-    }
+    onFeedFrame(msg, this.changeFeeds, (frame) => this.send(frame));
   }
 
   /** Mints a `sch-${n}` correlation id and either dispatches (when authenticated)
@@ -1535,13 +1358,11 @@ export class RtDbClient {
       this.send({ type: "presence", room, state });
     }
     this.pruneOfflineQueue();
-    // Leave the tail queued if a send synchronously closes the socket.
-    while (this.socket && this.offlineQueue.length > 0) {
-      const entry = this.offlineQueue.shift();
-      if (entry) {
-        this.dispatchMutate(entry);
-      }
-    }
+    flushOfflineQueue(
+      this.offlineQueue,
+      () => this.socket !== null,
+      (entry) => this.dispatchMutate(entry),
+    );
     const queued = this.unsentMutates.splice(0);
     for (const entry of queued) {
       this.dispatchMutate(entry);
@@ -1627,19 +1448,16 @@ export class RtDbClient {
   }
 
   private pruneOfflineQueue(): void {
-    const cutoff = this.now() - this.offlineTtlMs;
-    for (let i = this.offlineQueue.length - 1; i >= 0; i--) {
-      const entry = this.offlineQueue[i];
-      if (entry && entry.queuedAt <= cutoff) {
-        this.offlineQueue.splice(i, 1);
-        this.revertOptimistic(entry.mutId);
-        entry.reject(new RtDbError("INTERNAL", "offline mutation queue TTL expired"));
-      }
-    }
+    pruneOfflineQueue(
+      this.offlineQueue,
+      () => this.now(),
+      this.offlineTtlMs,
+      (mutId) => this.revertOptimistic(mutId),
+    );
   }
 
   private mintOfflineKey(mutId: string): string {
-    return `off-${mutId}-${this.random().toString(36).slice(2, 10)}`;
+    return mintOfflineKey(mutId, () => this.random());
   }
 
   /** Rejects only in-flight (sent, unacked) schedule requests; never-sent ones stay queued. */
