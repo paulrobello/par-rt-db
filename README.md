@@ -106,6 +106,7 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 
 | Package | Path | Stack | What it is |
 | --- | --- | --- | --- |
+| **Core** | [`core/`](core) | Rust (`par-rt-db-core`) | Internal crate — the wire vocabulary shared by the server and the Rust client, so a drift between them is a compile error rather than a corpus failure; no consumer-facing surface of its own |
 | **Server** | [`server/`](server) | Rust (axum/tokio + Postgres 17) | The realtime database binary |
 | **TypeScript client** | [`ts-client/`](ts-client) | TS (`@par-rt-db/client`, bun) | Browser/Node/React Native SDK + React bindings + in-memory test harness |
 | **Rust client** | [`rust-client/`](rust-client) | Rust (`par-rt-db-client`) | Rust SDK: http + reactive ws + admin + `.filter()`/`.search()`/`.vector_search()` builders |
