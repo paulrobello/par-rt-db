@@ -69,6 +69,7 @@ mod schedule_principal_test;
 mod schedule_step_test;
 mod scheduled_test;
 mod scheduler_lifecycle_test;
+mod schema_collision_test;
 mod schema_evolution_test;
 mod schema_history_test;
 mod schema_validators_test;

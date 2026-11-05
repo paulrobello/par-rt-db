@@ -158,19 +158,19 @@ async fn main() {
     // retaining the newest `backup_retention` dumps. The task sleeps in bounded
     // chunks and never aborts the server on a pg_dump/prune failure (logged +
     // continued). The connection string is passed as PG* env vars, never argv.
+    // Spawned AFTER `AppState::new` below because each dump opens the schema
+    // gate's backup window (`AppState::runtime.schema_gate`) to serialize
+    // against tenant schema migrations (2026-11-05 incident) — the task only
+    // sleeps until its first cron fire, so the later spawn changes nothing
+    // observable.
+    let mut spawn_backup_task: Option<(String, String, String, u32)> = None;
     if config.backup.enabled {
-        let db_url = config.database_url.clone();
-        let dir = config.backup.dir.clone();
-        let cron = config.backup.cron.clone();
-        let retention = config.backup.retention;
-        let fut = rtdb_server::backup::run_backup_task(db_url, dir, cron, retention);
-        let token = main_shutdown_token.clone();
-        main_bg_handles.push(tokio::spawn(async move {
-            tokio::select! {
-                () = token.cancelled() => {}
-                () = fut => {}
-            }
-        }));
+        spawn_backup_task = Some((
+            config.database_url.clone(),
+            config.backup.dir.clone(),
+            config.backup.cron.clone(),
+            config.backup.retention,
+        ));
     } else {
         tracing::info!(
             "managed backups are disabled (RTDB_BACKUP_ENABLED is false); \
@@ -211,6 +211,21 @@ async fn main() {
     // Read before `config` moves into `AppState`.
     let drain_bound = std::time::Duration::from_millis(config.shutdown_drain_ms);
     let state = AppState::new(pool, config, hot);
+
+    // The managed backup task (see the block above for why it waits for
+    // `AppState`): each dump opens the shared schema gate's backup window so
+    // schema DDL defers and in-flight DDL drains before the dump reads.
+    if let Some((db_url, dir, cron, retention)) = spawn_backup_task {
+        let schema_gate = state.runtime.schema_gate.clone();
+        let fut = rtdb_server::backup::run_backup_task(db_url, dir, cron, retention, schema_gate);
+        let token = main_shutdown_token.clone();
+        main_bg_handles.push(tokio::spawn(async move {
+            tokio::select! {
+                () = token.cancelled() => {}
+                () = fut => {}
+            }
+        }));
+    }
     // Cloned so `state` survives past `build_router` (which consumes its
     // argument into the router's extension state) for the ARC-009 shutdown
     // drain below — cheap, `AppState` is only ever held behind an `Arc`.

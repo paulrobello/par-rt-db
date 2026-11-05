@@ -45,6 +45,7 @@ pub mod reaper;
 pub mod scheduler;
 pub mod schema;
 pub mod schema_diff;
+pub mod schema_gate;
 pub mod schema_history;
 pub mod shutdown;
 pub mod signed_url;
@@ -236,6 +237,12 @@ pub struct Runtime {
     /// cross-instance op-feed fan-out; auto-generated when `RTDB_INSTANCE_ID`
     /// is unset. Surfaced for diagnostics + tests.
     pub instance_id: String,
+    /// Schema-DDL admission gate (2026-11-05 incident): caps concurrent
+    /// schema-DDL passes so lock waits cannot exhaust the query pool, and
+    /// serializes them against `pg_dump` backups in both directions. Shared
+    /// with the per-db committers (via `CommitterConfig`), the managed backup
+    /// task, and the manual `/admin/backup` trigger. See `schema_gate`.
+    pub schema_gate: Arc<schema_gate::SchemaGate>,
 }
 
 /// Per-instance auth bookkeeping that is neither a config value nor a realtime
@@ -373,6 +380,12 @@ impl AppState {
         } else {
             None
         };
+        // 2026-11-05 incident: the schema-DDL admission gate is shared by the
+        // committers' DDL arms, the managed backup task, and the manual
+        // `/admin/backup` trigger, so it must be built once here — before both
+        // consumers — and cloned into `Runtime` (for the backup paths) and
+        // `CommitterConfig` (for the DDL arms).
+        let schema_gate = Arc::new(schema_gate::SchemaGate::new());
         let committers = Committers::new(
             pool.clone(),
             subs.clone(),
@@ -385,6 +398,7 @@ impl AppState {
                 quotas.clone(),
                 instance_id.clone(),
                 forwarder.clone(),
+                schema_gate.clone(),
             ),
         );
         // ARC-009: cancellation + join handles for every background task
@@ -561,6 +575,7 @@ impl AppState {
                 started_at: SystemTime::now(),
                 backup_running: Arc::new(AtomicBool::new(false)),
                 instance_id,
+                schema_gate,
             },
             auth: Auth { http },
             limits: Limits {

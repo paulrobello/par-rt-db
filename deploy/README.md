@@ -725,6 +725,62 @@ in the `rtdb-pg` named volume.
 
 All name-bearing routes pass a path-traversal guard (`backup::validate_dump_name`).
 
+### Schema changes vs. the backup window (serialization)
+
+Background: on 2026-11-05 (03:00Z) the daily `pg_dump` started while tenant
+schema pushes from an earlier deploy were still retrying. Each push's
+`ALTER TABLE ADD COLUMN IF NOT EXISTS` queued behind the dump's ACCESS SHARE
+table locks (~15s each, one 125s), every queued ALTER pinned a sqlx pool
+connection, and the shared query pool exhausted — every API query 500'd for
+~9 minutes while Postgres itself stayed healthy (69/100 connections, zero
+lock waits). Four mechanisms now bound this, all in-process
+(`server/src/schema_gate.rs`, `ddl::push_schema_gated`):
+
+1. **Unchanged-push short-circuit** — a push whose tables map already matches
+   the committed schema issues NO DDL at all (no transaction, no advisory
+   lock, no `meta` upsert, no schema-history row). The hours-long storm of
+   clients re-pushing an unchanged schema is now free. Exception: a schema
+   containing `trgm` search indexes still runs its (fast, `IF NOT EXISTS`)
+   pass so a physically dropped trigram GIN keeps self-healing on re-push.
+2. **Single-flight per database** — concurrent pushes to one database are
+   serialized by that database's committer; every queued push re-validates
+   against the winner's committed schema, so N simultaneous identical pushes
+   issue at most one DDL pass (the rest short-circuit).
+3. **DDL admission cap + lock timeout** — at most 2 schema-DDL passes (push,
+   migrate, restore) execute server-wide; a lock wait can therefore pin at
+   most 2 of the pool's connections no matter how many databases are
+   mid-migration. Passes also run under a transaction-scoped
+   `lock_timeout = 30s`, so a stuck ALTER errors (retryable) instead of
+   holding its connection for minutes. A push/migrate that cannot get a DDL
+   slot within 30s fails with `409 CONFLICT` ("schema operations are busy…
+   retry") — clients should retry with backoff; the SDK push paths are
+   idempotent, so a retry after a 409/lock-timeout is always safe.
+4. **Backup gate (both directions)** — a starting backup (cron `pg_dump` or
+   the manual trigger) first flags `backup_in_flight`, then drains the 2 DDL
+   slots before reading. New CHANGED pushes during the dump defer with
+   `409 CONFLICT` ("schema change deferred: a backup is in flight; retry
+   after it completes"); in-flight DDL finishes before the dump starts.
+   UNCHANGED re-pushes still succeed during a dump (they never need DDL
+   admission). If DDL is still stuck after a 15-minute drain the backup
+   proceeds anyway (an error is logged) — the admission cap, not the gate,
+   is what bounds pool damage, so a wedged migration cannot postpone the
+   nightly backup indefinitely.
+
+Runbook guidance:
+
+- Deploy-time schema pushes that add columns/indexes are safe at any hour,
+  but finishing tenant schema pushes **before 02:55Z** avoids even the
+   short deferral window around the default `0 3 * * *` cron.
+- A `409` on `POST /admin/push-schema` or `POST /admin/db/{db}/migrate`
+  with either message above means "retry", not "failed" — schedule the
+  retry (the deploy tooling should treat 409-with-backoff like a
+  connection error, not a hard failure).
+- Multi-instance note: only the lease owner executes DDL, so the owner's
+  gate is the one that counts. Keep `RTDB_BACKUP_ENABLED` on the owner
+  replica (or single instance) — a backup enabled on a non-owner replica
+  is not serialized against the owner's migrations by this gate (the
+  admission cap still bounds the blast radius).
+
 ### Restore
 
 `POST /admin/restore` (typed body: `confirm == "<dump-name>"`) restores a dump

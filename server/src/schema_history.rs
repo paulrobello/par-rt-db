@@ -1,6 +1,9 @@
-//! Schema change history — captures a full `SchemaDef` snapshot on every push,
-//! migrate, and restore, in a per-db `schema_history` table co-located with
-//! `meta`. Always on (no config flag): low-volume, and its value is being
+//! Schema change history — captures a full `SchemaDef` snapshot on every
+//! schema-CHANGING push, migrate, and restore, in a per-db `schema_history`
+//! table co-located with `meta`. A push whose tables map already matches the
+//! committed schema skips the capture (no DDL ran — see
+//! `ddl::push_schema_gated`), so a re-push storm cannot spam the table.
+//! Always on (no config flag): low-volume, and its value is being
 //! present when a revert is needed. Best-effort like the audit tap — a capture
 //! failure is warned, never propagated (the schema change already committed).
 

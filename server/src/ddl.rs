@@ -212,19 +212,42 @@ async fn validate_search_languages(pool: &PgPool, schema: &SchemaDef) -> Result<
     }
 }
 
-/// Validates `schema`, diffs it against whatever is currently pushed for `db`
-/// (rejecting destructive changes), and applies the additive DDL — new tables,
-/// new indexed-field columns with backfill, and new indexes — plus the `meta`
-/// upsert, all inside a single transaction. Returns the applied schema plus
-/// the set of tables whose EXISTING documents the apply rewrites (the
-/// backfills below) — callers use it to re-run subscriptions, which a
-/// backfill otherwise leaves serving stale values until the table's next
-/// write.
-pub async fn push_schema(
+/// Outcome of a schema push through the committer's gated path. `ddl_executed`
+/// is false exactly when the pushed tables map already matched the committed
+/// schema and the push short-circuited without opening a transaction — the
+/// caller uses it to skip the per-push side effects (schema-history capture,
+/// cross-replica cache invalidation) that would otherwise fire on every
+/// no-op re-push.
+pub(crate) struct PushOutcome {
+    pub schema: SchemaDef,
+    pub backfilled: std::collections::BTreeSet<String>,
+    pub ddl_executed: bool,
+}
+
+/// Shared pre-flight for both push entry points: validation, previous-schema
+/// load, trgm grandfathering, destructive-change rejection — and the
+/// unchanged-schema short-circuit. 2026-11-05 incident: clients re-pushing an
+/// UNCHANGED schema re-issued the identical `ADD COLUMN IF NOT EXISTS` DDL
+/// (each queuing on table locks), so a push whose tables map already matches
+/// the committed schema now issues no DDL at all — no transaction, no
+/// advisory-extension lock, no `meta` upsert. Behavior-preserving: with
+/// `previous == schema`, `apply_schema_additive` diffed out to zero
+/// statements anyway; only idempotent no-ops are skipped.
+enum PreparedPush {
+    /// Matches the committed schema — nothing to apply.
+    NoOp(SchemaDef),
+    Apply {
+        schema: SchemaDef,
+        previous: Option<SchemaDef>,
+        backfilled: std::collections::BTreeSet<String>,
+    },
+}
+
+async fn prepare_push(
     pool: &PgPool,
     db: &str,
     mut schema: SchemaDef,
-) -> Result<(SchemaDef, std::collections::BTreeSet<String>), RtDbError> {
+) -> Result<PreparedPush, RtDbError> {
     schema.validate()?;
     validate_db_name(db)?;
     validate_search_languages(pool, &schema).await?;
@@ -244,10 +267,46 @@ pub async fn push_schema(
     if let Some(old_schema) = &previous {
         detect_destructive_changes(old_schema, &schema)?;
     }
+    if previous.as_ref() == Some(&schema) && !has_trgm_search_index(&schema) {
+        tracing::info!(
+            db,
+            "schema push short-circuited: tables map matches the committed schema; no DDL issued"
+        );
+        return Ok(PreparedPush::NoOp(schema));
+    }
     let backfilled = backfill_affected_tables(previous.as_ref(), &schema);
+    Ok(PreparedPush::Apply {
+        schema,
+        previous,
+        backfilled,
+    })
+}
 
+/// The DDL transaction shared by both push entry points — advisory extension
+/// lock, additive apply, `meta` upsert — in one committed transaction.
+/// `lock_timeout` pins a transaction-scoped cap on lock waits on the gated
+/// path (see `schema_gate::DDL_LOCK_TIMEOUT`); `None` preserves the ungated
+/// behavior unchanged.
+async fn execute_push(
+    pool: &PgPool,
+    db: &str,
+    schema: SchemaDef,
+    previous: Option<SchemaDef>,
+    backfilled: std::collections::BTreeSet<String>,
+    lock_timeout: Option<std::time::Duration>,
+) -> Result<(SchemaDef, std::collections::BTreeSet<String>), RtDbError> {
     let pg_schema_name = pg_schema(db);
     let mut tx = pool.begin().await?;
+    if let Some(timeout) = lock_timeout {
+        // Const-derived literal, never client input. The `s` suffix is
+        // required: a bare number is milliseconds in Postgres time GUCs.
+        sqlx::query(AssertSqlSafe(format!(
+            "SET LOCAL lock_timeout = '{}s'",
+            timeout.as_secs()
+        )))
+        .execute(&mut *tx)
+        .await?;
+    }
 
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(crate::db::EXTENSION_LOCK_KEY)
@@ -284,6 +343,89 @@ pub async fn push_schema(
 
     tx.commit().await?;
     Ok((schema, backfilled))
+}
+
+/// Validates `schema`, diffs it against whatever is currently pushed for `db`
+/// (rejecting destructive changes), and applies the additive DDL — new tables,
+/// new indexed-field columns with backfill, and new indexes — plus the `meta`
+/// upsert, all inside a single transaction. A push whose tables map already
+/// matches the committed schema applies nothing and returns immediately (see
+/// `PreparedPush`). Returns the applied schema plus
+/// the set of tables whose EXISTING documents the apply rewrites (the
+/// backfills below) — callers use it to re-run subscriptions, which a
+/// backfill otherwise leaves serving stale values until the table's next
+/// write.
+pub async fn push_schema(
+    pool: &PgPool,
+    db: &str,
+    schema: SchemaDef,
+) -> Result<(SchemaDef, std::collections::BTreeSet<String>), RtDbError> {
+    match prepare_push(pool, db, schema).await? {
+        PreparedPush::NoOp(schema) => Ok((schema, std::collections::BTreeSet::new())),
+        PreparedPush::Apply {
+            schema,
+            previous,
+            backfilled,
+        } => execute_push(pool, db, schema, previous, backfilled, None).await,
+    }
+}
+
+/// The committer's gated push: identical semantics to [`push_schema`], plus
+/// the 2026-11-05 incident bounds — the DDL pass (when one is needed at all)
+/// is admitted through the schema gate's concurrency cap, defers while a
+/// backup is in flight (a no-op push skips the gate entirely and succeeds
+/// during a backup), and runs under a transaction-scoped `lock_timeout` so a
+/// stuck table lock surfaces as an error instead of holding a pool
+/// connection. Returns whether DDL actually executed.
+pub(crate) async fn push_schema_gated(
+    pool: &PgPool,
+    db: &str,
+    schema: SchemaDef,
+    gate: &crate::schema_gate::SchemaGate,
+) -> Result<PushOutcome, RtDbError> {
+    match prepare_push(pool, db, schema).await? {
+        PreparedPush::NoOp(schema) => Ok(PushOutcome {
+            schema,
+            backfilled: std::collections::BTreeSet::new(),
+            ddl_executed: false,
+        }),
+        PreparedPush::Apply {
+            schema,
+            previous,
+            backfilled,
+        } => {
+            let _ddl_permit = gate.begin_ddl().await?;
+            let (schema, backfilled) = execute_push(
+                pool,
+                db,
+                schema,
+                previous,
+                backfilled,
+                Some(crate::schema_gate::DDL_LOCK_TIMEOUT),
+            )
+            .await?;
+            Ok(PushOutcome {
+                schema,
+                backfilled,
+                ddl_executed: true,
+            })
+        }
+    }
+}
+
+/// Whether any index is a search index with the FM-30 `trgm` flag. A re-push
+/// of an otherwise-unchanged schema with such indexes still runs the DDL
+/// pass: `create_indexes` re-issues `CREATE INDEX IF NOT EXISTS` for every
+/// trgm search index, which is the documented self-heal for a physically
+/// dropped trigram GIN (search_test::
+/// `trgm_gin_index_created_backfilled_and_idempotent`). Schemas without one
+/// — the overwhelming case — short-circuit a no-op re-push with no DDL.
+fn has_trgm_search_index(schema: &SchemaDef) -> bool {
+    schema
+        .tables
+        .values()
+        .flat_map(|table| table.indexes.iter())
+        .any(|index| index.search && index.trgm)
 }
 
 /// Tables whose existing documents a push rewrites, derived from the same

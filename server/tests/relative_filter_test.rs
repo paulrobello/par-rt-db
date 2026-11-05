@@ -433,6 +433,7 @@ async fn scheduled_sweep_fires_with_the_server_clock() -> anyhow::Result<()> {
             instance_id: String::new(),
             multi_instance: false,
             forwarder: None,
+            schema_gate: std::sync::Arc::new(rtdb_server::schema_gate::SchemaGate::new()),
         },
     );
 

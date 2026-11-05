@@ -68,8 +68,14 @@ pub(super) async fn create_backup(
     let url = state.config.database_url.clone();
     let dir = state.config.backup.dir.clone();
     let flag = state.runtime.backup_running.clone();
+    let gate = state.runtime.schema_gate.clone();
     tokio::spawn(async move {
         let _guard = BackupRunningGuard(flag);
+        // 2026-11-05 incident: manual dumps open the same schema-gate backup
+        // window as the cron task — DDL defers, in-flight DDL drains first —
+        // so a manual trigger during tenant migrations cannot recreate the
+        // lock-queue pool exhaustion.
+        let _backup_hold = gate.begin_backup().await;
         match crate::backup::perform_backup(&url, &dir).await {
             Ok(p) => tracing::info!(path = %p.display(), "manual backup completed"),
             Err(e) => tracing::error!(error = %e, "manual backup failed"),

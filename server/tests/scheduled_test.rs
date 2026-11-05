@@ -477,6 +477,7 @@ async fn one_shot_fires_and_writes() {
             instance_id: String::new(),
             multi_instance: false,
             forwarder: None,
+            schema_gate: std::sync::Arc::new(rtdb_server::schema_gate::SchemaGate::new()),
         },
     );
 
@@ -537,6 +538,7 @@ async fn cron_fires_and_stays_pending() {
             instance_id: String::new(),
             multi_instance: false,
             forwarder: None,
+            schema_gate: std::sync::Arc::new(rtdb_server::schema_gate::SchemaGate::new()),
         },
     );
 
@@ -611,6 +613,7 @@ async fn cron_with_tz_recomputes_local_next_fire_on_rearm() {
             instance_id: String::new(),
             multi_instance: false,
             forwarder: None,
+            schema_gate: std::sync::Arc::new(rtdb_server::schema_gate::SchemaGate::new()),
         },
     );
 
@@ -701,6 +704,7 @@ async fn failing_cron_reschedules_anyway() {
             instance_id: String::new(),
             multi_instance: false,
             forwarder: None,
+            schema_gate: std::sync::Arc::new(rtdb_server::schema_gate::SchemaGate::new()),
         },
     );
 
@@ -794,6 +798,7 @@ async fn one_shot_catches_up_after_being_past_due() {
             instance_id: String::new(),
             multi_instance: false,
             forwarder: None,
+            schema_gate: std::sync::Arc::new(rtdb_server::schema_gate::SchemaGate::new()),
         },
     );
 
@@ -859,6 +864,7 @@ async fn cron_skips_missed_windows() {
             instance_id: String::new(),
             multi_instance: false,
             forwarder: None,
+            schema_gate: std::sync::Arc::new(rtdb_server::schema_gate::SchemaGate::new()),
         },
     );
 
@@ -960,6 +966,7 @@ async fn interval_records_missed_windows_after_downtime() {
             instance_id: String::new(),
             multi_instance: false,
             forwarder: None,
+            schema_gate: std::sync::Arc::new(rtdb_server::schema_gate::SchemaGate::new()),
         },
     );
 
@@ -1039,6 +1046,7 @@ async fn interval_on_time_reports_zero_missed_windows() {
             instance_id: String::new(),
             multi_instance: false,
             forwarder: None,
+            schema_gate: std::sync::Arc::new(rtdb_server::schema_gate::SchemaGate::new()),
         },
     );
 
@@ -1110,6 +1118,7 @@ async fn failing_txn_marks_error_one_shot() {
             instance_id: String::new(),
             multi_instance: false,
             forwarder: None,
+            schema_gate: std::sync::Arc::new(rtdb_server::schema_gate::SchemaGate::new()),
         },
     );
 
@@ -1246,6 +1255,7 @@ async fn interval_fires_repeatedly_and_skips_paused_windows() {
             instance_id: String::new(),
             multi_instance: false,
             forwarder: None,
+            schema_gate: std::sync::Arc::new(rtdb_server::schema_gate::SchemaGate::new()),
         },
     );
 
