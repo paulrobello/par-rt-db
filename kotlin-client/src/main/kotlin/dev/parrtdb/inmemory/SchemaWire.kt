@@ -86,9 +86,9 @@ fun fieldTypeToWire(ty: FieldType): JsonElement {
             ty.onDelete?.let { out["onDelete"] = jsonStr(it.wire) }
         }
         "literal" -> ty.value?.let { out["value"] = it }
-        "optional" -> out["inner"] = fieldTypeToWire(ty.inner!!)
-        "array" -> out["element"] = fieldTypeToWire(ty.inner!!)
-        "record" -> out["value"] = fieldTypeToWire(ty.inner!!)
+        "optional" -> out["inner"] = fieldTypeToWire(requireInner(ty))
+        "array" -> out["element"] = fieldTypeToWire(requireInner(ty))
+        "record" -> out["value"] = fieldTypeToWire(requireInner(ty))
         "union" -> out["variants"] = jsonArr(ty.variants.map { fieldTypeToWire(it) })
         "object" -> out["fields"] = sortedObj(ty.fields.mapValues { fieldTypeToWire(it.value) })
         "vector" -> out["dimensions"] = jsonNum(formatI64(ty.dimensions.toLong()))

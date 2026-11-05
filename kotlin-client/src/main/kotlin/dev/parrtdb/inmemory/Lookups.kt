@@ -29,8 +29,8 @@ internal fun validateLookups(s: Store, q: Query, table: TableDef): List<String> 
         requireTable(s, lk.table)
         val ty = table.fields[lk.field] ?: throw bad("lookup field '${lk.field}' is not declared on table '${q.table}'")
         var inner = ty
-        if (inner.kind == "optional") inner = inner.inner!!
-        if (inner.kind == "array") inner = inner.inner!!
+        if (inner.kind == "optional") inner = requireInner(inner)
+        if (inner.kind == "array") inner = requireInner(inner)
         if (inner.kind != "id") throw bad("lookup field '${lk.field}' must be declared Id, Optional<Id>, or Array<Id>")
         if (inner.table != lk.table) {
             throw bad("lookup field '${lk.field}' declares Id table '${inner.table}' but the lookup names '${lk.table}'")
@@ -46,7 +46,7 @@ internal fun validateLookups(s: Store, q: Query, table: TableDef): List<String> 
 
 private fun isArrayLookup(ty: FieldType): Boolean {
     var inner = ty
-    if (inner.kind == "optional") inner = inner.inner!!
+    if (inner.kind == "optional") inner = requireInner(inner)
     return inner.kind == "array"
 }
 
