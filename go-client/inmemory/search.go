@@ -254,12 +254,20 @@ func attachSearchSnippets(rows wire.Array, indexFields []string, parsed websearc
 	}
 }
 
-// executeSearchTerminal runs the search terminal: shared prologue (non-empty
-// query, SEC-007 byte cap, index resolution, snippet/mode combination), then
-// the mode branch. tsquery (default) matches the websearch approximation and
-// narrows by the carried filter; trgm substring-matches and ranks by the
-// pinned similarity stand-in.
-func executeSearchTerminal(s *Store, q *wire.Query, search *wire.SearchQuery, table *TableDef) (wire.JSONValue, error) {
+// searchPlan is the validated search terminal plan: the resolved search
+// index's fields and the snippet opt-in — every BAD_REQUEST gate applied once
+// up front so the mode runners work on a well-formed spec. Mirrors ts-client's
+// SearchPlan/planSearch.
+type searchPlan struct {
+	indexFields []string
+	snippet     bool
+}
+
+// planSearch validates the search spec against the table and resolves its
+// index (non-empty query, SEC-007 byte cap, index resolution, the
+// trgm/snippet/rankMode/minSimilarity mode combinations, and the composed
+// filter's field validation). Mirrors ts-client's planSearch.
+func planSearch(search *wire.SearchQuery, table *TableDef) (*searchPlan, error) {
 	if strings.TrimSpace(search.Query) == "" {
 		return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "search query text must not be empty")
 	}
@@ -297,7 +305,6 @@ func executeSearchTerminal(s *Store, q *wire.Query, search *wire.SearchQuery, ta
 			return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "minSimilarity must be between 0 and 1")
 		}
 	}
-	indexFields := indexDef.Fields
 	snippet := search.Snippet != nil && *search.Snippet
 	if snippet && search.Mode == wire.SearchModeTrgm {
 		return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "snippet is only supported in tsquery mode")
@@ -307,90 +314,117 @@ func executeSearchTerminal(s *Store, q *wire.Query, search *wire.SearchQuery, ta
 			return nil, err
 		}
 	}
-	rows := collectAllLocked(s, q.Table)
-	trgm := search.Mode == wire.SearchModeTrgm
-	if trgm {
-		if search.Filter != nil {
-			rows = filterDocs(rows, search.Filter, table.Fields)
-		}
-		needle := strings.ToLower(search.Query)
-		queryLen := len(search.Query)
-		type scoredRow struct {
-			score     float64
-			createdAt int64
-			id        string
-			doc       wire.Object
-		}
-		var scored []scoredRow
-		for _, rv := range rows {
-			doc := rv.(wire.Object)
-			var best *float64
-			for _, field := range indexFields {
-				text, ok := doc[field].(wire.String)
-				if !ok {
-					continue
-				}
-				ts := string(text)
-				if strings.Contains(strings.ToLower(ts), needle) {
-					score := 0.0
-					if len(ts) > 0 {
-						score = float64(queryLen) / float64(len(ts))
-					}
-					if best == nil || score > *best {
-						best = &score
-					}
-				}
-			}
-			if best != nil && (search.MinSimilarity == nil || *best >= *search.MinSimilarity) {
-				sr := scoredRow{score: *best, doc: doc}
-				if n, ok := doc["_creationTime"].(wire.Number); ok {
-					if v, ok := parseI64(string(n)); ok {
-						sr.createdAt = v
-					}
-				} else {
-					sr.createdAt = -9223372036854775808
-				}
-				if id, ok := doc["_id"].(wire.String); ok {
-					sr.id = string(id)
-				}
-				scored = append(scored, sr)
-			}
-		}
-		sort.SliceStable(scored, func(a, b int) bool {
-			if scored[a].score != scored[b].score {
-				return scored[a].score > scored[b].score
-			}
-			if scored[a].createdAt != scored[b].createdAt {
-				return scored[a].createdAt > scored[b].createdAt
-			}
-			return scored[a].id > scored[b].id
-		})
-		if q.Paginate != nil {
-			var ranked []*rankedRow
-			for _, sr := range scored {
-				ranked = append(ranked, newRankedRow(jsonNumberFromF64(sr.score), sr.doc))
-			}
-			return paginateRanked(q.Paginate, ranked, true)
-		}
-		limit := maxTake
-		if q.Take != nil {
-			limit = *q.Take
-		}
-		out := make(wire.Array, 0, len(scored))
-		for i, sr := range scored {
-			if i >= limit {
-				break
-			}
-			out = append(out, sr.doc)
-		}
-		return out, nil
+	return &searchPlan{indexFields: indexDef.Fields, snippet: snippet}, nil
+}
+
+// executeSearchTerminal runs the search terminal: planSearch applies the
+// shared gates once, then the mode branch. tsquery (default) matches the
+// websearch approximation and narrows by the carried filter; trgm
+// substring-matches and ranks by the pinned similarity stand-in. Mirrors
+// ts-client's executeSearchTerminal (plan + scoreTrgmSearch/scoreTsquerySearch)
+// with each mode finishing its own sort/paginate tail.
+func executeSearchTerminal(s *Store, q *wire.Query, search *wire.SearchQuery, table *TableDef) (wire.JSONValue, error) {
+	plan, err := planSearch(search, table)
+	if err != nil {
+		return nil, err
 	}
-	// tsquery (default) mode.
+	rows := collectAllLocked(s, q.Table)
+	if search.Mode == wire.SearchModeTrgm {
+		return runTrgmSearch(q, search, plan, table, rows)
+	}
+	return runTsquerySearch(q, search, plan, table, rows)
+}
+
+// runTrgmSearch is the trgm mode runner (ts-client's scoreTrgmSearch plus this
+// engine's sort/paginate tail): substring matching over the indexed fields
+// ranked by the pinned similarity stand-in.
+func runTrgmSearch(q *wire.Query, search *wire.SearchQuery, plan *searchPlan, table *TableDef, rows wire.Array) (wire.JSONValue, error) {
+	if search.Filter != nil {
+		rows = filterDocs(rows, search.Filter, table.Fields)
+	}
+	needle := strings.ToLower(search.Query)
+	queryLen := len(search.Query)
+	type scoredRow struct {
+		score     float64
+		createdAt int64
+		id        string
+		doc       wire.Object
+	}
+	var scored []scoredRow
+	for _, rv := range rows {
+		doc := rv.(wire.Object)
+		var best *float64
+		for _, field := range plan.indexFields {
+			text, ok := doc[field].(wire.String)
+			if !ok {
+				continue
+			}
+			ts := string(text)
+			if strings.Contains(strings.ToLower(ts), needle) {
+				score := 0.0
+				if len(ts) > 0 {
+					score = float64(queryLen) / float64(len(ts))
+				}
+				if best == nil || score > *best {
+					best = &score
+				}
+			}
+		}
+		if best != nil && (search.MinSimilarity == nil || *best >= *search.MinSimilarity) {
+			sr := scoredRow{score: *best, doc: doc}
+			if n, ok := doc["_creationTime"].(wire.Number); ok {
+				if v, ok := parseI64(string(n)); ok {
+					sr.createdAt = v
+				}
+			} else {
+				sr.createdAt = -9223372036854775808
+			}
+			if id, ok := doc["_id"].(wire.String); ok {
+				sr.id = string(id)
+			}
+			scored = append(scored, sr)
+		}
+	}
+	sort.SliceStable(scored, func(a, b int) bool {
+		if scored[a].score != scored[b].score {
+			return scored[a].score > scored[b].score
+		}
+		if scored[a].createdAt != scored[b].createdAt {
+			return scored[a].createdAt > scored[b].createdAt
+		}
+		return scored[a].id > scored[b].id
+	})
+	if q.Paginate != nil {
+		var ranked []*rankedRow
+		for _, sr := range scored {
+			ranked = append(ranked, newRankedRow(jsonNumberFromF64(sr.score), sr.doc))
+		}
+		return paginateRanked(q.Paginate, ranked, true)
+	}
+	limit := maxTake
+	if q.Take != nil {
+		limit = *q.Take
+	}
+	out := make(wire.Array, 0, len(scored))
+	for i, sr := range scored {
+		if i >= limit {
+			break
+		}
+		out = append(out, sr.doc)
+	}
+	return out, nil
+}
+
+// runTsquerySearch is the tsquery (default) mode runner (ts-client's
+// scoreTsquerySearch plus this engine's tails): the websearch approximation
+// narrows by the carried filter, with snippets, ranked paging, and the raw
+// kept order.
+func runTsquerySearch(q *wire.Query, search *wire.SearchQuery, plan *searchPlan, table *TableDef, rows wire.Array) (wire.JSONValue, error) {
 	parsed := parseWebsearchQuery(search.Query)
 	var kept wire.Array
 	for _, rv := range rows {
 		doc := rv.(wire.Object)
-		texts := searchFieldTexts(doc, indexFields)
+		texts := searchFieldTexts(doc, plan.indexFields)
 		excludedHit := false
 		for _, op := range parsed.excluded {
 			if searchOperandMatches(op, texts) {
@@ -422,8 +456,8 @@ func executeSearchTerminal(s *Store, q *wire.Query, search *wire.SearchQuery, ta
 	if search.Filter != nil {
 		kept = filterDocs(kept, search.Filter, table.Fields)
 	}
-	if snippet {
-		attachSearchSnippets(kept, indexFields, parsed)
+	if plan.snippet {
+		attachSearchSnippets(kept, plan.indexFields, parsed)
 	}
 	if q.Paginate != nil {
 		positives := map[string]bool{}
@@ -433,7 +467,7 @@ func executeSearchTerminal(s *Store, q *wire.Query, search *wire.SearchQuery, ta
 		var ranked []*rankedRow
 		for _, rv := range kept {
 			doc := rv.(wire.Object)
-			score := tsqueryScore(doc, indexFields, positives)
+			score := tsqueryScore(doc, plan.indexFields, positives)
 			ranked = append(ranked, newRankedRow(wire.Number(formatI64(score)), doc))
 		}
 		sortRankedRows(ranked)

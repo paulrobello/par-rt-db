@@ -27,6 +27,7 @@ import type {
   Paginate,
   PaginatedResultJson,
   QueryJson,
+  SearchQuery,
   TableJson,
 } from "../protocol.js";
 import { QUERY_COMBO_RULES, type QueryComboClause } from "./query-combinations.js";
@@ -976,7 +977,11 @@ function executeHybridSearchTerminal(q: QueryJson, eq: unknown[], hasRange: bool
 /** `search` terminal: full-text matching under websearch syntax (default
  *  `tsquery` mode — quoted phrases, `or`, `-term`; FM-31) or
  *  case-insensitive substring matching (`trgm` mode), each with a
- *  deterministic relevance stand-in. */
+ *  deterministic relevance stand-in. QA-002 decomposition: `planSearch`
+ *  applies every BAD_REQUEST gate once, each mode scores in its own helper,
+ *  and this function keeps the mode branch plus the shared rank/paginate
+ *  tail — the same shape go-client mirrors (`planSearch` + per-mode runners).
+ *  `take` (already capped to MAX_TAKE above) limits the unpaginated result. */
 function executeSearchTerminal(
   q: QueryJson,
   tableDef: TableJson,
@@ -1003,16 +1008,49 @@ function executeSearchTerminal(
       "search cannot be combined with index, eq, range bounds, order, unique, first, count, distinct, aggregate, filter, or vector search",
     );
   }
-  // Full-text matching (not ts_rank ordering): mirror
-  // `websearch_to_tsquery` semantics closely enough that a unit test can
-  // assert match/no-match — quoted phrases require adjacency, bare `or`
-  // unions alternatives, `-term` excludes, plain terms stay AND (a pure
-  // superset of the former plainto token-AND for plain input). A doc matches
-  // when ANY alternative matches against the concatenated text of the search
-  // index's declared fields. Ranking is a deterministic stand-in
-  // (query-lexeme frequency desc, then `created_at` desc, then `id` desc) —
-  // exact `ts_rank` order is intentionally not replicated. `take` (already
-  // capped to MAX_TAKE above) limits the result.
+  const plan = planSearch(q, tableDef);
+  const rows = rowsFor(q.table);
+  const scored =
+    plan.search.mode === "trgm"
+      ? scoreTrgmSearch(plan, tableDef, rows)
+      : scoreTsquerySearch(plan, tableDef, rows);
+  scored.sort((a, b) =>
+    a.score !== b.score ? b.score - a.score : compareTiebreakDesc(a.row, b.row),
+  );
+  if (q.paginate !== undefined) {
+    // ENH-030: page the SAME ranked order the unpaginated arm returns — score
+    // desc, then `created_at` desc, then `id` desc — so the concatenation of
+    // the pages is exactly the full ranked result. `take` is forbidden
+    // alongside `paginate`, so the whole scored set is the pool, mirroring the
+    // server's paginated form (whose `LIMIT` is `numItems + 1` with no pool
+    // cap). `_searchSnippet` still rides along on each page when opted in.
+    return paginateResult(q.paginate, scored, {
+      sortKeys: SEARCH_SORT_KEYS,
+      sortPgs: SEARCH_SORT_PGS,
+      dir: "desc",
+      sortValueOf: searchHitSortValue,
+      toDoc: searchHitDoc,
+      validateCursor: validateSearchCursorValues,
+    });
+  }
+  return scored.slice(0, q.take ?? MAX_TAKE).map(searchHitDoc);
+}
+
+/** The validated `search` plan: the spec, its resolved search index, and the
+ *  mode-shaped options — every BAD_REQUEST gate (empty query, the SEC-007
+ *  byte cap, index resolution, the trgm/snippet/rankMode/minSimilarity mode
+ *  combinations, and the composed filter's field validation) applied once up
+ *  front so the scoring arms work on a well-formed spec. Mirrors go-client's
+ *  `searchPlan`/`planSearch`. */
+interface SearchPlan {
+  search: SearchQuery;
+  searchDef: IndexJson;
+  snippet: boolean;
+  minSimilarity: number | undefined;
+}
+
+/** Validates the `search` spec against the table and resolves its index. */
+function planSearch(q: QueryJson, tableDef: TableJson): SearchPlan {
   // biome-ignore lint/style/noNonNullAssertion: dispatcher only calls this under q.search !== undefined
   const search = q.search!;
   if (search.query.trim().length === 0) {
@@ -1060,79 +1098,83 @@ function executeSearchTerminal(
       throw new RtDbError("BAD_REQUEST", "minSimilarity must be between 0 and 1");
     }
   }
-  const limit = q.take ?? MAX_TAKE;
+  return { search, searchDef, snippet, minSimilarity };
+}
+
+/** `trgm` scoring (ILIKE '%q%' + similarity() on the server): a doc matches
+ *  when ANY indexed field's lowercased text contains the lowercased query as
+ *  a substring — infix/prefix hits token-AND cannot make. Similarity ranking
+ *  stand-in, pinned for cross-client harness parity: per doc, over the
+ *  indexed fields that contain the query, score = query.length / field.length
+ *  (a shorter containing field is more similar), max across fields. Same
+ *  `created_at`/`id` tie-breaks as the tsquery path. */
+function scoreTrgmSearch(
+  plan: SearchPlan,
+  tableDef: TableJson,
+  rows: Map<string, StoredRow>,
+): SearchHit[] {
+  const { search, searchDef, minSimilarity } = plan;
+  const needle = search.query.toLowerCase();
   const scored: SearchHit[] = [];
-  if (search.mode === "trgm") {
-    // `trgm` mode (ILIKE '%q%' + similarity() on the server): a doc matches
-    // when ANY indexed field's lowercased text contains the lowercased query
-    // as a substring — infix/prefix hits token-AND cannot make. Similarity
-    // ranking stand-in, pinned for cross-client harness parity: per doc,
-    // over the indexed fields that contain the query, score =
-    // query.length / field.length (a shorter containing field is more
-    // similar), max across fields. Same `created_at`/`id` tie-breaks as the
-    // tsquery path.
-    const needle = search.query.toLowerCase();
-    for (const row of rowsFor(q.table).values()) {
-      if (row.deletedAt !== undefined) continue; // FM-33: stamped rows are invisible
-      if (search.filter && !evalFilterExpr(search.filter, row.doc, tableDef.fields)) {
-        continue;
-      }
-      let best = 0;
-      for (const field of searchDef.fields) {
-        const text = ftsStringify(row.doc[field]).toLowerCase();
-        if (text.includes(needle)) {
-          const similarity = needle.length / text.length;
-          if (similarity > best) best = similarity;
-        }
-      }
-      if (best > 0 && (minSimilarity === undefined || best >= minSimilarity)) {
-        scored.push({ row, score: best });
+  for (const row of rows.values()) {
+    if (row.deletedAt !== undefined) continue; // FM-33: stamped rows are invisible
+    if (search.filter && !evalFilterExpr(search.filter, row.doc, tableDef.fields)) {
+      continue;
+    }
+    let best = 0;
+    for (const field of searchDef.fields) {
+      const text = ftsStringify(row.doc[field]).toLowerCase();
+      if (text.includes(needle)) {
+        const similarity = needle.length / text.length;
+        if (similarity > best) best = similarity;
       }
     }
-  } else {
-    const alts = parseWebsearchQuery(search.query);
-    // Every positive lexeme across the alternatives (the query tree ts_headline
-    // would mark on the server) — reused for scoring and snippet highlights.
-    const positives = new Set(alts.flatMap((a) => [...a.terms, ...a.phrases.flat()]));
-    for (const row of rowsFor(q.table).values()) {
-      if (row.deletedAt !== undefined) continue; // FM-33: stamped rows are invisible
-      if (search.filter && !evalFilterExpr(search.filter, row.doc, tableDef.fields)) {
-        continue;
-      }
-      const source = searchDef.fields.map((f) => ftsStringify(row.doc[f])).join(" ");
-      const docTokens = ftsTokens(source);
-      if (!alts.some((a) => altMatches(a, docTokens))) {
-        continue;
-      }
-      let score = 0;
-      for (const dt of docTokens) {
-        if (positives.has(dt)) score++;
-      }
-      const hit: SearchHit = { row, score };
-      if (snippet) hit.snippet = buildSearchSnippet(source, positives);
-      scored.push(hit);
+    if (best > 0 && (minSimilarity === undefined || best >= minSimilarity)) {
+      scored.push({ row, score: best });
     }
   }
-  scored.sort((a, b) =>
-    a.score !== b.score ? b.score - a.score : compareTiebreakDesc(a.row, b.row),
-  );
-  if (q.paginate !== undefined) {
-    // ENH-030: page the SAME ranked order the unpaginated arm returns — score
-    // desc, then `created_at` desc, then `id` desc — so the concatenation of
-    // the pages is exactly the full ranked result. `take` is forbidden
-    // alongside `paginate`, so the whole scored set is the pool, mirroring the
-    // server's paginated form (whose `LIMIT` is `numItems + 1` with no pool
-    // cap). `_searchSnippet` still rides along on each page when opted in.
-    return paginateResult(q.paginate, scored, {
-      sortKeys: SEARCH_SORT_KEYS,
-      sortPgs: SEARCH_SORT_PGS,
-      dir: "desc",
-      sortValueOf: searchHitSortValue,
-      toDoc: searchHitDoc,
-      validateCursor: validateSearchCursorValues,
-    });
+  return scored;
+}
+
+/** `tsquery` (default) scoring: the websearch approximation — mirror
+ *  `websearch_to_tsquery` semantics closely enough that a unit test can
+ *  assert match/no-match: quoted phrases require adjacency, bare `or` unions
+ *  alternatives, `-term` excludes, plain terms stay AND (a pure superset of
+ *  the former plainto token-AND for plain input). A doc matches when ANY
+ *  alternative matches against the concatenated text of the search index's
+ *  declared fields. Ranking is a deterministic stand-in (query-lexeme
+ *  frequency desc, then `created_at` desc, then `id` desc) — exact `ts_rank`
+ *  order is intentionally not replicated. */
+function scoreTsquerySearch(
+  plan: SearchPlan,
+  tableDef: TableJson,
+  rows: Map<string, StoredRow>,
+): SearchHit[] {
+  const { search, searchDef, snippet } = plan;
+  const alts = parseWebsearchQuery(search.query);
+  // Every positive lexeme across the alternatives (the query tree ts_headline
+  // would mark on the server) — reused for scoring and snippet highlights.
+  const positives = new Set(alts.flatMap((a) => [...a.terms, ...a.phrases.flat()]));
+  const scored: SearchHit[] = [];
+  for (const row of rows.values()) {
+    if (row.deletedAt !== undefined) continue; // FM-33: stamped rows are invisible
+    if (search.filter && !evalFilterExpr(search.filter, row.doc, tableDef.fields)) {
+      continue;
+    }
+    const source = searchDef.fields.map((f) => ftsStringify(row.doc[f])).join(" ");
+    const docTokens = ftsTokens(source);
+    if (!alts.some((a) => altMatches(a, docTokens))) {
+      continue;
+    }
+    let score = 0;
+    for (const dt of docTokens) {
+      if (positives.has(dt)) score++;
+    }
+    const hit: SearchHit = { row, score };
+    if (snippet) hit.snippet = buildSearchSnippet(source, positives);
+    scored.push(hit);
   }
-  return scored.slice(0, limit).map(searchHitDoc);
+  return scored;
 }
 
 /** `count` terminal: COUNT(*) over the matching set. */
