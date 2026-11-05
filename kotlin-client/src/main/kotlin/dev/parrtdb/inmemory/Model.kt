@@ -1,5 +1,6 @@
 package dev.parrtdb.inmemory
 
+import dev.parrtdb.errors.schemaViolation
 import dev.parrtdb.wire.FilterExpr
 import dev.parrtdb.wire.Query
 import dev.parrtdb.wire.StepResult
@@ -33,6 +34,12 @@ data class FieldType(
 )
 
 data class VectorIndexSpec(val dimensions: Int, val filterFields: List<String> = emptyList(), val metric: String = "cosine")
+
+/** `inner` for the container kinds (`optional`/`array`/`record`), where Rust's
+ * enum and TS's decode make a missing inner unrepresentable — Kotlin's nullable
+ * field surfaces the malformed schema as SCHEMA_VIOLATION instead of an NPE. */
+internal fun requireInner(ty: FieldType): FieldType =
+    ty.inner ?: throw schemaViolation("field type '${ty.kind}' is missing its inner type")
 
 data class IndexDef(
     val name: String,

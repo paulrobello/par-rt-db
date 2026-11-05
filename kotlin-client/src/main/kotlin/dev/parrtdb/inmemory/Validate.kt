@@ -46,9 +46,9 @@ fun validateValue(ty: FieldType, value: JsonElement): Boolean =
         "null" -> value is JsonNull
         "id" -> isHexId(value)
         "literal" -> jsonEq(value, ty.value)
-        "optional" -> value is JsonNull || validateValue(ty.inner!!, value)
+        "optional" -> value is JsonNull || validateValue(requireInner(ty), value)
         "union" -> ty.variants.any { validateValue(it, value) }
-        "array" -> value is JsonArray && value.all { validateValue(ty.inner!!, it) }
+        "array" -> value is JsonArray && value.all { validateValue(requireInner(ty), it) }
         "object" -> {
             if (value !is JsonObject) {
                 false
@@ -64,7 +64,7 @@ fun validateValue(ty: FieldType, value: JsonElement): Boolean =
         "int64" -> isInt64String(value)
         "bytes" -> isBase64String(value)
         "any" -> true
-        "record" -> value is JsonObject && value.values.all { validateValue(ty.inner!!, it) }
+        "record" -> value is JsonObject && value.values.all { validateValue(requireInner(ty), it) }
         "vector" ->
             value is JsonArray && value.size == ty.dimensions &&
                 value.all { numOf(it)?.let { n -> jsonNumberF64(n).let { f -> !f.isNaN() && !f.isInfinite() } } ?: false }
@@ -152,7 +152,7 @@ fun stripUnsetOptionals(table: TableDef, doc: JsonObject): JsonObject {
     for ((key, value) in doc) {
         if (isNullValue(value)) {
             val fty = table.fields[key]
-            if (fty != null && fty.kind == "optional" && !validateValue(fty.inner!!, value)) continue
+            if (fty != null && fty.kind == "optional" && !validateValue(requireInner(fty), value)) continue
         }
         out[key] = value
     }
@@ -233,7 +233,7 @@ fun applyPatch(table: TableDef, doc: JsonObject, fields: JsonObject, now: Long):
     for ((field, value) in fields) {
         if (field in table.computed) continue
         val fty = table.fields[field] ?: throw schemaViolation("unknown field '$field'")
-        if (fty.kind == "optional" && isNullValue(value) && !validateValue(fty.inner!!, value)) {
+        if (fty.kind == "optional" && isNullValue(value) && !validateValue(requireInner(fty), value)) {
             merged.remove(field)
             continue
         }

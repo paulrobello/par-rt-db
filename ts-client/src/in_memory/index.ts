@@ -3,8 +3,11 @@
  * `src/in_memory.ts` monolith exported, from the modules it was decomposed
  * into (ARC-201; mirrors the rust-client's `in_memory/` layout):
  *
- * - `./store.ts` — the client core (rows, transactions, schedules, workflows,
- *   storage, presence, admin surface).
+ * - `./store.ts` — the client core (rows, transactions, step dispatch,
+ *   storage) re-exporting its decomposed subsystems: `./presence.ts` (rooms +
+ *   membership), `./workflow.ts` (scheduler/workflow engine), `./doc_stamp.ts`
+ *   (schema validation + default/computed stamping), `./admin_view.ts` (the
+ *   in-memory admin surface).
  * - `./query.ts` — the query engine (`executeQuery` dispatcher + one executor
  *   per terminal).
  * - `./migrate.ts` — the migration engine (one function per directive kind).

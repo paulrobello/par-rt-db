@@ -24,7 +24,7 @@ private fun isWideningOf(old: FieldType, next: FieldType): Boolean {
 }
 
 private fun isObjectShapeWidening(old: FieldType, next: FieldType): Boolean {
-    if (old.kind == "array" && next.kind == "array") return isObjectShapeWidening(old.inner!!, next.inner!!)
+    if (old.kind == "array" && next.kind == "array") return isObjectShapeWidening(requireInner(old), requireInner(next))
     if (old.kind == "object" && next.kind == "object") {
         for ((name, oldTy) in old.fields) {
             val newTy = next.fields[name] ?: return false
@@ -40,7 +40,7 @@ private fun isObjectShapeWidening(old: FieldType, next: FieldType): Boolean {
 private fun stripOnDelete(ty: FieldType): FieldType =
     when (ty.kind) {
         "id" -> if (ty.onDelete == null) ty else FieldType("id", table = ty.table)
-        "optional", "array", "record" -> FieldType(ty.kind, inner = stripOnDelete(ty.inner!!))
+        "optional", "array", "record" -> FieldType(ty.kind, inner = stripOnDelete(requireInner(ty)))
         "union" -> FieldType("union", variants = ty.variants.map { stripOnDelete(it) })
         "object" -> FieldType("object", fields = ty.fields.mapValues { stripOnDelete(it.value) })
         else -> ty

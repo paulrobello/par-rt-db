@@ -563,7 +563,7 @@ func countItemsNamed(s *Store, name string) int {
 func TestExpectNoMatchPassesWhenNothingMatches(t *testing.T) {
 	s := newTestStore(t)
 	res, err := ApplyTxn(s, dsl.NewMutation().
-		InsertIf("items", dsl.Eq("name", wire.String("a")),
+		MustInsertIf("items", dsl.Eq("name", wire.String("a")),
 			map[string]any{"name": "a", "status": "todo", "order": 1}).Build(), "")
 	if err != nil {
 		t.Fatalf("insertIf on empty table: %v", err)
@@ -581,7 +581,7 @@ func TestExpectNoMatchAbortsAndRollsBack(t *testing.T) {
 	seedRow(t, s, "items", 100, docObj("name", "a", "status", "todo", "order", int64(1)))
 	_, err := ApplyTxn(s, dsl.NewMutation().
 		Insert("items", docObj("name", "b", "status", "todo", "order", 2)).
-		InsertIf("items", dsl.Eq("name", wire.String("a")),
+		MustInsertIf("items", dsl.Eq("name", wire.String("a")),
 			map[string]any{"name": "a", "status": "todo", "order": 3}).Build(), "")
 	expectNoMatchAbort(t, err)
 	if countItemsNamed(s, "a") != 1 || countItemsNamed(s, "b") != 0 {

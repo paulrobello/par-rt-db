@@ -64,7 +64,7 @@ private fun validateFilterExprAt(expr: FilterExpr, table: TableDef, allowRelativ
             expr.values.forEach { checkLeafKind(expr.field, it, table) }
         }
         is FilterExpr.Eq, is FilterExpr.Neq, is FilterExpr.Gt, is FilterExpr.Gte, is FilterExpr.Lt, is FilterExpr.Lte -> {
-            val (field, value) = leafOf(expr)!!
+            val (field, value) = requireNotNull(leafOf(expr)) { "leafOf returned null for " + expr::class.simpleName }
             checkLeaf(field, value, table)
         }
         is FilterExpr.Contains -> checkLeaf(expr.field, expr.value, table)
@@ -72,7 +72,7 @@ private fun validateFilterExprAt(expr: FilterExpr, table: TableDef, allowRelativ
             if (!allowRelativeTime) throw badRequest("olderThan filter is only allowed in patchByQuery/deleteByQuery filters")
             if (expr.ms < 0) throw badRequest("olderThan ms must be >= 0")
             var fty = leafFieldType(expr.field, table)
-            if (fty.kind == "optional") fty = fty.inner!!
+            if (fty.kind == "optional") fty = requireInner(fty)
             if (fty.kind != "number" && fty.kind != "int64") {
                 throw badRequest("field '${expr.field}' must be a number or int64 field for olderThan")
             }
@@ -112,7 +112,7 @@ private fun checkLeafKind(field: String, value: JsonElement, table: TableDef) {
 }
 
 private fun validateJsonbComparisonValue(field: String, ty: FieldType, value: JsonElement) {
-    val inner = if (ty.kind == "optional") ty.inner!! else ty
+    val inner = if (ty.kind == "optional") requireInner(ty) else ty
     val ok =
         when (inner.kind) {
             "string", "id", "bytes" -> strOf(value) != null
@@ -143,7 +143,7 @@ fun indexColumnType(ty: FieldType): IndexedType {
             val all = ty.variants.isNotEmpty() && ty.variants.all { it.kind == "literal" && strOf(it.value) != null }
             if (all) return IndexedType(PgType.Text, false)
         }
-        "optional" -> return indexColumnType(ty.inner!!).copy(nullable = true)
+        "optional" -> return indexColumnType(requireInner(ty)).copy(nullable = true)
     }
     throw RtDbException(ErrorCode.SCHEMA_VIOLATION, "field type '${ty.kind}' is not indexable")
 }

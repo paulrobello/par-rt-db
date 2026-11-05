@@ -89,10 +89,6 @@ func cloneTableDef(in *TableDef) *TableDef {
 		out.Fields[k] = cloneFieldType(v)
 	}
 	out.Indexes = append(out.Indexes, in.Indexes...)
-	for _, idx := range out.Indexes {
-		i := idx
-		_ = i
-	}
 	for i := range out.Indexes {
 		if in.Indexes[i].Vector != nil {
 			v := *in.Indexes[i].Vector

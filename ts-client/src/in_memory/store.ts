@@ -1,11 +1,14 @@
 /**
  * In-memory implementation of the par-rt-db client for unit tests — the client
  * core (mirrors `rust-client/src/in_memory/mod.rs`): stored rows, the
- * transaction executor, schedules/workflows/storage/presence, and the admin
- * surface. The query engine lives in `./query.ts`, the migration engine in
- * `./migrate.ts`, and value/filter validation in `./validate.ts`; the public
- * surface of the former `in_memory.ts` monolith is re-exported from
- * `./index.ts`.
+ * transaction executor, storage, and the public client/admin classes. The
+ * query engine lives in `./query.ts`, the migration engine in
+ * `./migrate.ts`, filter/value predicates in `./validate.ts`, doc
+ * validation/stamping in `./doc_stamp.ts`, the schedule/workflow machinery in
+ * `./workflow.ts`, presence in `./presence.ts`, and the admin surface in
+ * `./admin_view.ts`; the public surface of the former `in_memory.ts` monolith
+ * is re-exported from `./index.ts` (this module re-exports the names that
+ * moved so existing `./store.js` imports keep resolving).
  *
  * The server (`server/src/{txn,query,schema,protocol}.rs`) is the source of
  * truth for the declarative DSL, step-result shapes, system fields, and query
@@ -22,15 +25,6 @@
  * corpus test rather than surfacing later as a silent divergence.
  */
 
-import type {
-  AuditEntry,
-  DbSubCounters,
-  GetAuditOptions,
-  MergeReport,
-  SessionInfo,
-  SubscriptionInfo,
-  SubscriptionsResponse,
-} from "../admin.js";
 import { canonical } from "../canonical.js";
 import { RtDbError } from "../errors.js";
 import type { FileMetadata, UploadInput, UploadResult } from "../http.js";
@@ -38,7 +32,6 @@ import { parseStepResults, type StepResult } from "../mutation.js";
 import type {
   AuthedUser,
   DirectiveReportJson,
-  FieldTypeJson,
   FilterExpr,
   MigrateRequestJson,
   MigrateResultJson,
@@ -47,18 +40,27 @@ import type {
   ScheduleInfo,
   ScheduleWhen,
   SchemaJson,
-  StepOutcome,
-  StepRetry,
   TableJson,
   TransactionJson,
-  ValueExprJson,
   WorkflowInfo,
   WorkflowInfoFull,
   WorkflowSpec,
   WorkflowStatus,
 } from "../protocol.js";
 import type { RtQuery } from "../query.js";
-import type { SchemaDefinition } from "../schema.js";
+import type { AnySchema } from "../schema.js";
+import { InMemoryAdminClient } from "./admin_view.js";
+import {
+  applyDefaults,
+  applyPatch,
+  stampComputed,
+  stampTtlDefault,
+  stampUpdatedAt,
+  stripUnsetOptionals,
+  validateComputed,
+  validateConstraints,
+  validateDoc,
+} from "./doc_stamp.js";
 import { checkFieldExpectations, validateFieldGuardShapes } from "./field-guard.js";
 import {
   applyMigrationDirective,
@@ -68,20 +70,35 @@ import {
   validateOnDelete,
   validateSchema,
 } from "./migrate.js";
+import { PresenceMembership, PresenceRooms } from "./presence.js";
 import { executeQuery, requireIndex, stripVersionForDiff } from "./query.js";
 import {
   clone,
   coerceIndexValue,
   evalFilterExpr,
-  evalValueExpr,
-  isBase64String,
-  isHexId,
-  isInt64String,
   isPlainObject,
   validateFilter,
-  walkFilterExprFields,
-  walkValueExprFields,
 } from "./validate.js";
+import {
+  claimDueWorkflows,
+  countSteps,
+  CRON_STEP_MS,
+  dueAtFor,
+  MAX_EVERY_MS,
+  MAX_SIGNAL_PAYLOAD_BYTES,
+  MAX_STEPS,
+  type ScheduledJob,
+  toScheduleInfo,
+  toWorkflowInfo,
+  validateWorkflowSpec,
+  type WorkflowRun,
+} from "./workflow.js";
+
+// Re-exported so imports from "./store.js" (the ./index.ts façade above all)
+// keep resolving after the QA-003b split moved these to their own modules.
+export { InMemoryAdminClient } from "./admin_view.js";
+export { PresenceRooms } from "./presence.js";
+export { MAX_EVERY_MS, MAX_STEPS } from "./workflow.js";
 
 /** Normalizes any {@link UploadInput} to `Uint8Array` for hashing/storage.
  *  The in-memory harness is not a real transport, so streaming inputs are
@@ -129,7 +146,6 @@ async function toUint8Array(body: UploadInput): Promise<Uint8Array> {
   );
 }
 
-export const MAX_STEPS = 1024;
 /** Hard cap on rows a single `patchByQuery`/`deleteByQuery` step may touch.
  * Mirrors server `txn::MAX_BY_QUERY_ROWS`; a larger match set is truncated. */
 /** Step ops an `insertOnly` table rejects with SCHEMA_VIOLATION (everything that
@@ -200,21 +216,6 @@ export function worstCaseAffected(txn: TransactionJson): number {
   return total;
 }
 
-/** FM-28/FM-29: recursive step count — a `schedule` step counts as itself plus
- * every step in its nested txn; a `startWorkflow` step counts as itself plus
- * every step of every txn in its spec. Mirrors the server's recursive gate
- * against `MAX_STEPS` (a nested tree can't smuggle past the flat cap). */
-function countSteps(txn: TransactionJson): number {
-  let total = txn.steps.length;
-  for (const step of txn.steps) {
-    if (step.op === "schedule") total += countSteps(step.txn);
-    if (step.op === "startWorkflow") {
-      for (const s of step.spec.steps) total += s.txn ? countSteps(s.txn) : 0;
-    }
-  }
-  return total;
-}
-
 /** A stored row: the user doc plus its identity/history, kept separate so the
  * system fields (`_id`/`_creationTime`/`_version`) are merged in only at read
  * time — exactly as the server stores `doc` jsonb alongside `id`/`created_at`/
@@ -229,323 +230,12 @@ export interface StoredRow {
   deletedAt?: number;
 }
 
-interface Subscription {
+export interface Subscription {
   query: QueryJson;
   table: string;
   listeners: Set<(value: unknown) => void>;
   last: unknown;
   hasValue: boolean;
-}
-
-/** Mirrors server schedule status values. */
-type ScheduleStatus = "pending" | "running" | "paused" | "error";
-
-/** A stored scheduled job in the in-memory harness. `tick` fires due non-paused
- * jobs by applying `txn` through the same atomic path as `mutate`; `external`
- * jobs are never fired by `tick` (the server's internal scheduler likewise
- * excludes them — application workers claim them through the external claim
- * surface instead). */
-interface ScheduledJob {
-  id: string;
-  kind: "oneshot" | "cron" | "interval";
-  txn: TransactionJson;
-  dueAt: number;
-  cron?: string;
-  tz?: string;
-  everyMs?: number;
-  status: ScheduleStatus;
-  createdAt: number;
-  firedCount: number;
-  /** Never executed by the harness's `tick` — served to application workers
-   * via the external claim surface (server `scheduled_txns.external`). */
-  external: boolean;
-  lastError?: string;
-  /** Cumulative count of recurring-job windows that elapsed before a fire.
-   * Computed exactly for interval jobs; always 0 for cron jobs, since this
-   * harness re-arms cron on a fixed `CRON_STEP_MS` approximation rather than
-   * real cron occurrence math and cannot count missed cron windows accurately. */
-  missedCount: number;
-  lastMissedAt?: number;
-}
-
-/** Approximate cron re-fire interval for the in-memory stub. Real 5-field cron
- * parsing is deferred to the server; the harness only needs crons to re-arm. */
-const CRON_STEP_MS = 60_000;
-
-/** Upper bound on an interval job's `everyMs`: one year in ms. Mirrors server
- * `scheduler::MAX_EVERY_MS`; bounds `now + everyMs` and the horizon a recurring
- * job can occupy a row for. */
-export const MAX_EVERY_MS = 365 * 24 * 60 * 60 * 1000;
-
-/** FM-29: hard cap on steps per workflow spec. Mirrors server
- * `workflows::MAX_WORKFLOW_STEPS`. */
-const MAX_WORKFLOW_STEPS = 64;
-
-/** FM-29: retry policy applied when a step spec omits `retry`. Mirrors server
- * `protocol::StepRetry::default`. */
-const DEFAULT_STEP_RETRY: Required<StepRetry> = {
-  maxAttempts: 3,
-  initialRetryMs: 1_000,
-  maxRetryMs: 60_000,
-};
-
-/** FM-29: exponential backoff after the `attempts`-th failure of a step —
- * `initialRetryMs * 2^(attempts-1)` (shift capped at 32), clamped to
- * `maxRetryMs`. Mirrors server `workflows::backoff_ms`. */
-function backoffMs(retry: Required<StepRetry>, attempts: number): number {
-  const shift = Math.min(attempts - 1, 32);
-  return Math.min(retry.initialRetryMs * 2 ** shift, retry.maxRetryMs);
-}
-
-/** FM-29: the effective retry policy for a step — the spec's partial policy
- * with server `StepRetry::default` filling the gaps. */
-function resolveStepRetry(retry?: StepRetry): Required<StepRetry> {
-  return retry
-    ? {
-        maxAttempts: retry.maxAttempts,
-        initialRetryMs: retry.initialRetryMs ?? DEFAULT_STEP_RETRY.initialRetryMs,
-        maxRetryMs: retry.maxRetryMs ?? DEFAULT_STEP_RETRY.maxRetryMs,
-      }
-    : DEFAULT_STEP_RETRY;
-}
-
-/** FM-29: submit-time spec validation. Mirrors server `workflows::validate_spec`
- * (same checks, same BAD_REQUEST messages, including the recursive
- * `MAX_STEPS` gate over the spec's step txns). */
-function validateWorkflowSpec(spec: WorkflowSpec): void {
-  if (spec.steps.length === 0) {
-    throw new RtDbError("BAD_REQUEST", "workflow must have at least one step");
-  }
-  if (spec.steps.length > MAX_WORKFLOW_STEPS) {
-    throw new RtDbError("BAD_REQUEST", `workflow exceeds ${MAX_WORKFLOW_STEPS} steps`);
-  }
-  for (const [i, step] of spec.steps.entries()) {
-    // awaitSignal parity: exactly one of txn/awaitSignal per step, and the
-    // wait declaration is bounded (name 1..=256 chars, timeoutMs > 0).
-    const hasTxn = step.txn !== undefined;
-    const hasSig = step.awaitSignal !== undefined;
-    if (hasTxn === hasSig) {
-      throw new RtDbError(
-        "BAD_REQUEST",
-        `steps[${i}] must carry exactly one of txn or awaitSignal`,
-      );
-    }
-    if (step.awaitSignal !== undefined) {
-      const sig = step.awaitSignal;
-      if (sig.name.length === 0 || sig.name.length > 256) {
-        throw new RtDbError("BAD_REQUEST", `steps[${i}].awaitSignal.name must be 1..=256 chars`);
-      }
-      if (sig.timeoutMs === 0) {
-        throw new RtDbError("BAD_REQUEST", `steps[${i}].awaitSignal.timeoutMs must be > 0`);
-      }
-    }
-    if (step.retry) {
-      if (step.retry.maxAttempts === 0) {
-        throw new RtDbError("BAD_REQUEST", `steps[${i}].retry.maxAttempts must be >= 1`);
-      }
-      const initial = step.retry.initialRetryMs ?? DEFAULT_STEP_RETRY.initialRetryMs;
-      const max = step.retry.maxRetryMs ?? DEFAULT_STEP_RETRY.maxRetryMs;
-      if (initial === 0 || max < initial) {
-        throw new RtDbError(
-          "BAD_REQUEST",
-          `steps[${i}].retry requires initialRetryMs > 0 and maxRetryMs >= initialRetryMs`,
-        );
-      }
-    }
-  }
-  const total = spec.steps.reduce((sum, s) => sum + (s.txn ? countSteps(s.txn) : 0), 0);
-  if (total > MAX_STEPS) {
-    throw new RtDbError(
-      "BAD_REQUEST",
-      `workflow recursive step count ${total} exceeds MAX_STEPS ${MAX_STEPS}`,
-    );
-  }
-}
-
-/** awaitSignal: gate stored on a run parked with no `timeoutMs` — never due,
- * so only a delivery or a cancel can wake the run (the server's `i64::MAX`).
- * Below any real clock reading `sleepUntil` can be compared against. */
-const NEVER_DUE = Number.MAX_SAFE_INTEGER;
-
-/** awaitSignal: serialized-size cap on one signal payload — mirrors server
- * `workflows::MAX_SIGNAL_PAYLOAD_BYTES` (64 KiB). */
-const MAX_SIGNAL_PAYLOAD_BYTES = 64 * 1024;
-
-/** FM-29: a stored workflow run in the in-memory harness. Field names mirror
- * the server's `workflows` table columns; `sleepUntil` is always set (the
- * column is NOT NULL server-side — insert computes the initial gate, later
- * transitions overwrite it, terminal states leave it). The `wait*`/
- * `signalPayload` fields mirror the server's awaitSignal side-table columns
- * (`wait_name`/`waited_since`/`signal_payload`): present only from park until
- * the wait resolves — every leave-`waiting` transition clears them. */
-interface WorkflowRun {
-  id: string;
-  spec: WorkflowSpec;
-  status: WorkflowStatus;
-  currentStep: number;
-  attempts: number;
-  sleepUntil: number;
-  lastError?: string;
-  waitName?: string;
-  waitedSince?: number;
-  signalPayload?: unknown;
-  createdAt: number;
-  updatedAt: number;
-  startedAt?: number;
-  finishedAt?: number;
-  stepOutcomes: StepOutcome[];
-}
-
-/**
- * Shared in-memory presence backing: a `room -> connectionId -> member` map with
- * a per-room subscriber set. Two `InMemoryRtDbClient`s that share a
- * `PresenceRooms` instance see each other's joins/updates/leaves fan out,
- * approximating the server's per-db presence registry for tests (one client,
- * one connection — exactly like the live server's per-ConnId keying). A client
- * with no `presenceRooms` option gets a private instance and only ever sees
- * itself in its rooms.
- *
- * Mirrors the existing harness pattern of `notifySubs(writeSet)` fanning a
- * recomputed snapshot to every local subscriber after a write.
- */
-export class PresenceRooms {
-  private readonly members = new Map<string, Map<string, PresenceMember>>();
-  private readonly subs = new Map<string, Set<(members: PresenceMember[]) => void>>();
-  private readonly expiry = new Map<string, Map<string, number>>();
-
-  /** Returns a stable-order snapshot of `room`'s current members. */
-  snapshot(room: string): PresenceMember[] {
-    const map = this.members.get(room);
-    return map ? [...map.values()] : [];
-  }
-
-  /** Adds or replaces `member` in `room` and fans out a fresh snapshot. */
-  join(room: string, member: PresenceMember): void {
-    let map = this.members.get(room);
-    if (!map) {
-      map = new Map();
-      this.members.set(room, map);
-    }
-    map.set(member.connectionId, member);
-    this.fanOut(room);
-  }
-
-  /** Updates `connectionId`'s state in `room` and fans out. No-op if the
-   * connection is not in the room (matches the live server, which would not
-   * relay an update for a non-member). When `ttlMs` > 0, schedules an expiry
-   * sweep that nulls this member's `state` at `now + ttlMs` (the member stays
-   * listed); a refresh with `ttlMs` absent/0/falsy clears any pending expiry (a
-   * permissive offline approximation — the LIVE SERVER rejects ttlMs <= 0 with
-   * BAD_REQUEST), mirroring the live server's "ttlMs after the last refresh"
-   * semantics for the > 0 case. */
-  update(
-    room: string,
-    connectionId: string,
-    state: unknown,
-    ttlMs?: number,
-    now: number = Date.now(),
-  ): void {
-    const map = this.members.get(room);
-    const member = map?.get(connectionId);
-    if (!member) {
-      return;
-    }
-    member.state = state ?? null;
-    let exp = this.expiry.get(room);
-    if (!exp) {
-      exp = new Map();
-      this.expiry.set(room, exp);
-    }
-    if (ttlMs && ttlMs > 0) {
-      exp.set(connectionId, now + ttlMs);
-    } else {
-      exp.delete(connectionId);
-    }
-    this.fanOut(room);
-  }
-
-  /** Removes `connectionId` from `room` and fans out. No-op if absent. Also
-   * clears any pending expiry so a re-join doesn't inherit a stale ttl. */
-  leave(room: string, connectionId: string): void {
-    const map = this.members.get(room);
-    if (!map) {
-      return;
-    }
-    map.delete(connectionId);
-    this.expiry.get(room)?.delete(connectionId);
-    if (map.size === 0) {
-      this.members.delete(room);
-    }
-    this.fanOut(room);
-  }
-
-  /** Clears expired members' `state` to `null` (the member stays listed) and
-   * fans out each touched room once. Returns true if anything expired. Mirrors
-   * the live server's per-connection ttl clearing. */
-  expire(now: number = Date.now()): boolean {
-    let any = false;
-    const touched: string[] = [];
-    for (const [room, exp] of this.expiry) {
-      const roomMap = this.members.get(room);
-      if (!roomMap) {
-        this.expiry.delete(room);
-        continue;
-      }
-      let roomTouched = false;
-      for (const [connId, at] of exp) {
-        if (at <= now) {
-          const m = roomMap.get(connId);
-          if (m) {
-            m.state = null;
-            any = true;
-            roomTouched = true;
-          }
-          exp.delete(connId);
-        }
-      }
-      if (roomTouched) {
-        touched.push(room);
-      }
-    }
-    for (const room of touched) {
-      this.fanOut(room);
-    }
-    return any;
-  }
-
-  /** Registers `fn` for `room` snapshots and immediately fires it with the
-   * current snapshot (mirroring the server's first `presenceSnapshot` on join).
-   * Returns an unsubscribe. */
-  subscribe(room: string, fn: (members: PresenceMember[]) => void): () => void {
-    let set = this.subs.get(room);
-    if (!set) {
-      set = new Set();
-      this.subs.set(room, set);
-    }
-    set.add(fn);
-    fn(this.snapshot(room));
-    return () => {
-      const current = this.subs.get(room);
-      if (!current) {
-        return;
-      }
-      current.delete(fn);
-      if (current.size === 0) {
-        this.subs.delete(room);
-      }
-    };
-  }
-
-  private fanOut(room: string): void {
-    const set = this.subs.get(room);
-    if (!set) {
-      return;
-    }
-    const snap = this.snapshot(room);
-    for (const fn of set) {
-      fn(snap);
-    }
-  }
 }
 
 /**
@@ -569,7 +259,7 @@ export interface InMemoryRtDbClientOptions {
   presenceRooms?: PresenceRooms;
 }
 
-function toSchemaJson(schema: SchemaDefinition<any> | SchemaJson): SchemaJson {
+function toSchemaJson(schema: AnySchema | SchemaJson): SchemaJson {
   return "toJSON" in schema && typeof schema.toJSON === "function"
     ? schema.toJSON()
     : (schema as SchemaJson);
@@ -600,553 +290,6 @@ function diffCanonical(value: unknown, q: QueryJson): string {
   return canonical(q.fields === undefined ? value : stripVersionForDiff(value, q));
 }
 
-/** Recursive value validator — a port of server `schema::validate_value`. */
-function validateValue(ty: FieldTypeJson, value: unknown): boolean {
-  switch (ty.type) {
-    case "string":
-      return typeof value === "string";
-    case "number":
-      return typeof value === "number";
-    case "boolean":
-      return typeof value === "boolean";
-    case "null":
-      return value === null;
-    case "id":
-      return isHexId(value);
-    case "literal":
-      return value === ty.value;
-    case "optional":
-      return value === null || validateValue(ty.inner, value);
-    case "union":
-      return ty.variants.some((variant) => validateValue(variant, value));
-    case "array":
-      return Array.isArray(value) && value.every((item) => validateValue(ty.element, item));
-    case "object":
-      if (!isPlainObject(value)) {
-        return false;
-      }
-      if (Object.keys(value).some((key) => !(key in ty.fields))) {
-        return false;
-      }
-      return Object.entries(ty.fields).every(([field, fieldTy]) => {
-        if (field in value) {
-          return validateValue(fieldTy, value[field]);
-        }
-        return fieldTy.type === "optional";
-      });
-    case "int64":
-      return isInt64String(value);
-    case "bytes":
-      return isBase64String(value);
-    case "any":
-      return true;
-    case "record":
-      return isPlainObject(value) && Object.values(value).every((v) => validateValue(ty.value, v));
-    case "vector":
-      return (
-        Array.isArray(value) &&
-        value.length === ty.dimensions &&
-        value.every((item) => typeof item === "number" && Number.isFinite(item))
-      );
-  }
-}
-
-/** Write-path constraint check for one present field value — a port of server
- *  `schema::value::check_constraints_for_field`. Null never violates; bounds
- *  compare inclusively (exact i64 compare on int64 decimal strings);
- *  `pattern` is an unanchored `RegExp` search. Violations are
- *  SCHEMA_VIOLATION naming the field and constraint. */
-function checkConstraintsForField(table: TableJson, field: string, value: unknown): void {
-  const fc = table.constraints?.[field];
-  if (fc === undefined || value === null) {
-    return;
-  }
-  const violate = (label: string): RtDbError =>
-    new RtDbError("SCHEMA_VIOLATION", `field '${field}' violates its '${label}' constraint`);
-  const base = (() => {
-    let ty = table.fields[field];
-    while (ty?.type === "optional") {
-      ty = ty.inner;
-    }
-    return ty?.type;
-  })();
-  if (base === "number") {
-    const v = typeof value === "number" ? value : NaN;
-    if (fc.min !== undefined && v < fc.min) {
-      throw violate("min");
-    }
-    if (fc.max !== undefined && v > fc.max) {
-      throw violate("max");
-    }
-  } else if (base === "int64") {
-    // Exact i64 compare on the decimal string (BigInt) — IEEE doubles are
-    // exact only to 2^53, so a float parse mis-compares bounds past it
-    // (pinned by the corpus's constraint-int64-bounds-past-2p53 cases). A
-    // non-parsable value or non-integer bound never violates, matching the
-    // server's `parse::<i64>` (bounds are push-validated integers anyway).
-    const v = typeof value === "string" && isInt64String(value) ? BigInt(value) : null;
-    if (v !== null) {
-      const bound = (b: number | undefined): bigint | null =>
-        b !== undefined && Number.isInteger(b) ? BigInt(b) : null;
-      const min = bound(fc.min);
-      if (min !== null && v < min) {
-        throw violate("min");
-      }
-      const max = bound(fc.max);
-      if (max !== null && v > max) {
-        throw violate("max");
-      }
-    }
-  } else if (base === "string" && typeof value === "string") {
-    if (fc.minLength !== undefined && value.length < fc.minLength) {
-      throw violate("minLength");
-    }
-    if (fc.maxLength !== undefined && value.length > fc.maxLength) {
-      throw violate("maxLength");
-    }
-    if (fc.pattern !== undefined && !new RegExp(fc.pattern).test(value)) {
-      throw violate("pattern");
-    }
-  }
-}
-
-/** Full-document validation — a port of server `schema::validate_doc`. */
-function validateDoc(table: TableJson, doc: Record<string, unknown>): void {
-  for (const key of Object.keys(doc)) {
-    if (key.startsWith("_")) {
-      throw new RtDbError("SCHEMA_VIOLATION", `field '${key}' is reserved`);
-    }
-    if (!(key in table.fields)) {
-      throw new RtDbError("SCHEMA_VIOLATION", `unknown field '${key}'`);
-    }
-  }
-  for (const [field, fieldTy] of Object.entries(table.fields)) {
-    if (field in doc) {
-      if (!validateValue(fieldTy, doc[field])) {
-        throw new RtDbError("SCHEMA_VIOLATION", `field '${field}' has an invalid value`);
-      }
-      checkConstraintsForField(table, field, doc[field]);
-    } else if (fieldTy.type !== "optional") {
-      throw new RtDbError("SCHEMA_VIOLATION", `field '${field}' is required`);
-    }
-  }
-}
-
-/** Removes keys whose value is `null` for an `Optional` field whose inner type
- * does not itself accept `null` — a port of server `strip_unset_optionals`, so
- * an inserted/patched-then-nulled optional lands as "key absent", matching the
- * server's single representation of an unset optional. */
-function stripUnsetOptionals(
-  table: TableJson,
-  doc: Record<string, unknown>,
-): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(doc)) {
-    if (value === null) {
-      const fieldTy = table.fields[key];
-      if (fieldTy?.type === "optional" && !validateValue(fieldTy.inner, null)) {
-        continue;
-      }
-    }
-    out[key] = value;
-  }
-  return out;
-}
-
-/** Stamps the TTL field at insert when the table declares a
- * `defaultDurationMs` and the document omits the field. After this, the TTL
- * field is ordinary (patch/replace manipulate it normally). Mirrors server
- * `txn::stamp_ttl_default`; runs BEFORE validation so the stamped value
- * satisfies a required numeric field. Returns the same `doc` reference when no
- * stamp is needed, otherwise a shallow copy with the field set. */
-function stampTtlDefault(
-  table: TableJson,
-  doc: Record<string, unknown>,
-  now: number,
-): Record<string, unknown> {
-  const ttl = table.ttl;
-  if (ttl?.defaultDurationMs != null && !(ttl.field in doc)) {
-    const out: Record<string, unknown> = { ...doc };
-    out[ttl.field] = now + ttl.defaultDurationMs;
-    return out;
-  }
-  return doc;
-}
-
-/** Stamps the table's `updatedAtField` (FM-36) with the current epoch-ms,
- * overwriting any client-supplied value — the same authority model as
- * `stampTtlDefault`. Runs on every version-bumping write path: insert, patch,
- * replace, upsert (both branches), patchByQuery, and cascade setNull. On the
- * patch-shaped paths the stamp rides INSIDE the patch payload (applied before
- * `applyPatch`), so a client-supplied value is replaced before validation
- * ever sees it. The value matches the field's wire convention: a JSON number
- * on `number`, a decimal string on `int64`. Mirrors server
- * `txn::stamp_updated_at`; returns the same `target` reference when the table
- * declares no `updatedAtField`, otherwise a shallow copy with the field set. */
-function stampUpdatedAt(
-  table: TableJson,
-  target: Record<string, unknown>,
-  now: number,
-): Record<string, unknown> {
-  const field = table.updatedAtField;
-  if (field === undefined) {
-    return target;
-  }
-  const out: Record<string, unknown> = { ...target };
-  out[field] = table.fields[field]?.type === "int64" ? String(now) : now;
-  return out;
-}
-
-/** Applies the table's push-time-validated `defaults` (FM-32) to a NEW
- * document: every key the doc omits is stamped from the schema. Runs after
- * `stampTtlDefault` (a ttl default on the same field wins — it stamped the key
- * first) and before any principal stamps (server-stamped owner/authorize
- * values win). Callers are exactly the new-document paths — insert, replace,
- * upsert-insert; `patch` (and upsert-update / patchByQuery) never re-apply, so
- * clearing an optional field stays cleared. Mirrors server `txn::apply_defaults`;
- * returns the same `doc` reference when no stamp is needed, otherwise a
- * shallow copy with the fields set. */
-function applyDefaults(table: TableJson, doc: Record<string, unknown>): Record<string, unknown> {
-  const defaults = table.defaults;
-  if (!defaults) return doc;
-  const missing = Object.keys(defaults).filter((field) => !(field in doc));
-  if (missing.length === 0) return doc;
-  const out: Record<string, unknown> = { ...doc };
-  for (const field of missing) {
-    // Clone so array/object defaults are never aliased into a doc (the server
-    // clones the serde value too).
-    out[field] = clone(defaults[field]);
-  }
-  return out;
-}
-
-/** Stamps the table's computed fields (ENH-028): every `computed` entry is
- * re-evaluated against the final doc and stored — a null result REMOVES the
- * key (an unset optional field is an absent key, `stripUnsetOptionals`' shape
- * convention) and a non-null result overwrites whatever is there (the
- * ownerField authority model: client-supplied values never survive). An
- * evaluation error fails the whole write as BAD_REQUEST, naming the field.
- * Runs last in the stamp chain — after ttl default, updatedAt, defaults, and
- * autoIncrement, so expressions see final inputs — and before `validateDoc` at
- * every site: `applyPatch` (patch, upsert's update branch, patchByQuery, and
- * cascade setNull), `doInsert` (insert + upsert's insert branch), and
- * `doReplace`. Mirrors server `txn::stamp_computed`; returns the same `doc`
- * reference when the table declares no computed fields. */
-function stampComputed(
-  table: TableJson,
-  doc: Record<string, unknown>,
-  now: number,
-): Record<string, unknown> {
-  const computed = table.computed;
-  if (!computed) return doc;
-  const out: Record<string, unknown> = { ...doc };
-  for (const [name, expr] of Object.entries(computed)) {
-    let value: unknown;
-    try {
-      value = evalValueExpr(expr, out, now, table.fields);
-    } catch (err) {
-      const message = err instanceof RtDbError ? err.message : String(err);
-      throw new RtDbError("BAD_REQUEST", `computed field '${name}': ${message}`);
-    }
-    if (value === null || value === undefined) {
-      delete out[name];
-    } else {
-      out[name] = value;
-    }
-  }
-  return out;
-}
-
-/** The statically-known result kind of a `ValueExprJson`, for the computed-field
- * push check — a port of server `schema::infer_static_kind`. `undefined` means
- * the result kind varies by input: `field` (text extraction of any JSON
- * value), `coalesce`/`case` (whichever branch wins), and the null / object /
- * array literals whose runtime `validateDoc` check is the only guard. */
-type StaticKind = "string" | "number" | "boolean";
-
-function inferStaticKind(expr: ValueExprJson): StaticKind | undefined {
-  switch (expr.op) {
-    case "field":
-    case "coalesce":
-    case "case":
-      return undefined;
-    case "literal": {
-      const v = expr.value;
-      if (typeof v === "string") return "string";
-      if (typeof v === "number") return "number";
-      if (typeof v === "boolean") return "boolean";
-      return undefined;
-    }
-    case "concat":
-    case "lower":
-    case "upper":
-    case "trim":
-      return "string";
-    case "cast":
-      switch (expr.to) {
-        case "toString":
-          return "string";
-        case "toNumber":
-        case "toInt64":
-          return "number";
-        case "toBoolean":
-          return "boolean";
-      }
-      return undefined;
-    case "add":
-    case "sub":
-    case "mul":
-    case "div":
-    case "now":
-      return "number";
-  }
-}
-
-/** Computed-field push validation (ENH-028) — a port of server
- * `schema::TableDef::validate_computed`, called from `pushSchema` and re-run
- * on a migration's derived schema (the `changeType` re-validation path). Rules:
- * 1. every `computed` key names a declared field;
- * 2. the key is not one of the server-stamped declaration fields
- *    (`ownerField`/`collaboratorsField`/`autoIncrementField`);
- * 3. every field the expression references (including `case.whens` filter
- *    fields) is declared and not itself computed (no chained evaluation);
- * 4. `case.when` filters reject principal markers — computed exprs run on
- *    every write with no interactive principal (the engine's `validateFilter`
- *    rejects a marker's object value as a non-scalar filter value);
- * 5. when the expression's result kind is statically known, the field's type
- *    must accept a value of that kind (an int64 field admits a String kind —
- *    decimal-string possibility — but never a Number kind, since arithmetic
- *    yields JSON numbers);
- * 6. the table's `authorize` predicate references no computed field.
- * Every failure is BAD_REQUEST, like the server. */
-/** Push-time constraint validation — a port of server `schema::validate`'s
- *  `validate_constraints`: each key names a declared field, `min`/`max` sit
- *  only on number/int64 (integer bounds on int64), `minLength`/`maxLength`/
- *  `pattern` only on string, bounds don't cross, and `pattern` compiles under
- *  `RegExp` (unanchored search). Violations are SCHEMA_VIOLATION naming the
- *  field, matching the server's typed push error. */
-function validateConstraints(schema: SchemaJson): void {
-  for (const [tableName, table] of Object.entries(schema.tables)) {
-    for (const [field, fc] of Object.entries(table.constraints ?? {})) {
-      const violate = (detail: string): RtDbError =>
-        new RtDbError("SCHEMA_VIOLATION", `constraints on field '${field}': ${detail}`);
-      let fieldTy = table.fields[field];
-      if (fieldTy === undefined) {
-        throw new RtDbError(
-          "SCHEMA_VIOLATION",
-          `constraints key '${field}' is not a declared field of table '${tableName}'`,
-        );
-      }
-      while (fieldTy.type === "optional") {
-        fieldTy = fieldTy.inner;
-      }
-      if (fc.min !== undefined || fc.max !== undefined) {
-        if (fieldTy.type !== "number" && fieldTy.type !== "int64") {
-          throw violate(`'min'/'max' is legal only on number/int64 fields`);
-        }
-        if (
-          fieldTy.type === "int64" &&
-          [fc.min, fc.max].some((b) => b !== undefined && !Number.isInteger(b))
-        ) {
-          throw violate(`'min'/'max' bound must be an integer on an int64 field`);
-        }
-      }
-      if (
-        (fc.minLength !== undefined || fc.maxLength !== undefined || fc.pattern !== undefined) &&
-        fieldTy.type !== "string"
-      ) {
-        throw violate(`'minLength'/'maxLength'/'pattern' is legal only on string fields`);
-      }
-      if (fc.min !== undefined && fc.max !== undefined && fc.min > fc.max) {
-        throw violate(`'min' exceeds 'max'`);
-      }
-      if (fc.minLength !== undefined && fc.maxLength !== undefined && fc.minLength > fc.maxLength) {
-        throw violate(`'minLength' exceeds 'maxLength'`);
-      }
-      if (fc.pattern !== undefined) {
-        try {
-          // Validate compile only (same check the server runs at push time).
-          new RegExp(fc.pattern);
-        } catch {
-          throw violate(`invalid pattern: '${fc.pattern}'`);
-        }
-      }
-    }
-  }
-}
-
-function validateComputed(schema: SchemaJson): void {
-  for (const [tableName, table] of Object.entries(schema.tables)) {
-    const computed = table.computed;
-    if (computed) {
-      for (const [field, expr] of Object.entries(computed)) {
-        if (!Object.hasOwn(table.fields, field)) {
-          throw new RtDbError(
-            "BAD_REQUEST",
-            `computed field '${tableName}.${field}' is not a declared field`,
-          );
-        }
-        if (table.ownerField === field) {
-          throw new RtDbError(
-            "BAD_REQUEST",
-            `computed field '${tableName}.${field}' must not be the table's ownerField`,
-          );
-        }
-        if (table.collaboratorsField === field) {
-          throw new RtDbError(
-            "BAD_REQUEST",
-            `computed field '${tableName}.${field}' must not be the table's collaboratorsField`,
-          );
-        }
-        if (table.autoIncrementField === field) {
-          throw new RtDbError(
-            "BAD_REQUEST",
-            `computed field '${tableName}.${field}' must not be the table's autoIncrementField`,
-          );
-        }
-        walkValueExprFields(expr, (referenced) => {
-          if (!Object.hasOwn(table.fields, referenced)) {
-            throw new RtDbError(
-              "BAD_REQUEST",
-              `computed field '${tableName}.${field}' references undeclared field '${referenced}'`,
-            );
-          }
-          if (Object.hasOwn(computed, referenced)) {
-            throw new RtDbError(
-              "BAD_REQUEST",
-              `computed field '${tableName}.${field}' references computed field '${referenced}' (computed fields may not reference each other)`,
-            );
-          }
-        });
-        validateComputedCaseWhens(expr, table);
-        const kind = inferStaticKind(expr);
-        if (kind !== undefined) {
-          const sample = kind === "string" ? "s" : kind === "number" ? 1 : true;
-          // `validateValue` is the wire contract, but int64's wire form is a
-          // decimal STRING: a Number-kind result can never validate
-          // (arithmetic yields JSON numbers), while a String-kind one can
-          // ("42") — decimal-ness stays a runtime `validateDoc` check.
-          // Optional unwrapping admits the nullable spelling.
-          let inner = table.fields[field];
-          while (inner.type === "optional") {
-            inner = inner.inner;
-          }
-          const accepts =
-            validateValue(table.fields[field], sample) ||
-            (inner.type === "int64" && kind === "string");
-          if (!accepts) {
-            throw new RtDbError(
-              "BAD_REQUEST",
-              `computed field '${tableName}.${field}' produces ${kind === "string" ? "a string" : kind === "number" ? "a number" : "a boolean"}, which the field type does not accept`,
-            );
-          }
-        }
-      }
-    }
-    // Rule 6: authorize runs pre-stamp on the insert paths, so a predicate
-    // over a computed field would read client input.
-    if (table.authorize !== undefined && computed !== undefined) {
-      walkFilterExprFields(table.authorize, (referenced) => {
-        if (Object.hasOwn(computed, referenced)) {
-          throw new RtDbError(
-            "BAD_REQUEST",
-            `computed field '${tableName}.${referenced}' must not be referenced by the table's authorize predicate (authorize predicates may not reference computed fields)`,
-          );
-        }
-      });
-    }
-  }
-}
-
-/** Walks a computed expression's `case` nodes validating each `when` filter
- * with the engine's filter validator — the marker-rejecting mode the server's
- * `validate_computed_case_whens` applies (a `{"$user":true}` marker value
- * fails the scalar-value check). `then`/`otherwise` recurse so a `case`
- * nested inside a branch is covered. */
-function validateComputedCaseWhens(expr: ValueExprJson, table: TableJson): void {
-  switch (expr.op) {
-    case "case":
-      for (const cw of expr.whens) {
-        validateFilter(cw.when, table);
-        validateComputedCaseWhens(cw.then, table);
-      }
-      validateComputedCaseWhens(expr.otherwise, table);
-      return;
-    case "concat":
-    case "coalesce":
-      for (const part of expr.parts) {
-        validateComputedCaseWhens(part, table);
-      }
-      return;
-    case "add":
-    case "sub":
-    case "mul":
-    case "div":
-      validateComputedCaseWhens(expr.left, table);
-      validateComputedCaseWhens(expr.right, table);
-      return;
-    case "lower":
-    case "upper":
-    case "trim":
-    case "cast":
-      validateComputedCaseWhens(expr.value, table);
-      return;
-    case "field":
-    case "literal":
-    case "now":
-      return;
-  }
-}
-
-/** Applies a patch's fields onto `doc` — a port of server `txn::apply_patch`.
- * Every patch-shaped path funnels through here (`patch`, upsert's update
- * branch, `patchByQuery`, and cascade setNull), so the computed-field stamp
- * sits here too: client-supplied computed keys are dropped pre-merge (the
- * stamp after the loop overwrites them, but a wrong-typed value must not fail
- * validation first), and each computed field is re-evaluated against the
- * merged doc before `validateDoc`. */
-function applyPatch(
-  table: TableJson,
-  doc: Record<string, unknown>,
-  fields: Record<string, unknown>,
-  now: number,
-): Record<string, unknown> {
-  // The auto-increment field is server-assigned and immutable after insert.
-  // A patch may carry it back unchanged (round-trip friendly), but any
-  // different value — including a type-shifted form of the same number — is
-  // rejected. Covers `patch`, upsert's update branch, and `patchByQuery`
-  // (every patch-shaped path funnels through here). Mirrors the check at the
-  // top of server `txn::apply_patch`.
-  const auto = table.autoIncrementField;
-  if (auto !== undefined && auto in fields && doc[auto] !== fields[auto]) {
-    throw new RtDbError("BAD_REQUEST", `autoIncrementField '${auto}' cannot be changed`);
-  }
-  const merged: Record<string, unknown> = { ...doc };
-  for (const [field, value] of Object.entries(fields)) {
-    // ENH-028: a computed key in the patch payload is dropped — the stamp
-    // below re-derives it from the merged doc (server `apply_patch`'s
-    // skip+drop of `table_def.computed` keys).
-    if (table.computed !== undefined && Object.hasOwn(table.computed, field)) {
-      continue;
-    }
-    const fieldTy = table.fields[field];
-    if (!fieldTy) {
-      throw new RtDbError("SCHEMA_VIOLATION", `unknown field '${field}'`);
-    }
-    if (value === null && fieldTy.type === "optional" && !validateValue(fieldTy.inner, null)) {
-      delete merged[field];
-      continue;
-    }
-    if (!validateValue(fieldTy, value)) {
-      throw new RtDbError("SCHEMA_VIOLATION", `field '${field}' has an invalid value`);
-    }
-    merged[field] = value;
-  }
-  const stamped = stampComputed(table, merged, now);
-  validateDoc(table, stamped);
-  return stamped;
-}
-
 /**
  * In-memory par-rt-db client for unit tests. No network, no Postgres; mirrors
  * server DSL/step-result/system-field semantics. See the file-level doc for the
@@ -1170,14 +313,9 @@ export class InMemoryRtDbClient {
     string,
     { bytes: Uint8Array; contentType?: string; createdAt: number }
   >();
-  private readonly presenceRooms: PresenceRooms;
-  private readonly presenceUser: AuthedUser;
-  private readonly joinedRooms = new Set<string>();
-  /** Unsubscribe handles for the per-room callbacks this client registered on
-   * `PresenceRooms`. Tracked so `leavePresence(room)` can drop every local
-   * subscriber for that room, mirroring the reactive client and the live
-   * server (which stops delivering snapshots once a connection has left). */
-  private readonly presenceUnsubs = new Map<string, Array<() => void>>();
+  /** Join/update/leave mechanics for this client's presence rooms, driving
+   * the shared (or private) `PresenceRooms` backing. */
+  private readonly presenceMembership: PresenceMembership;
   /** This client's stable identity in presence rooms. Generated as a
    * counter-prefixed token distinct from document ids so tests can tell them
    * apart at a glance. */
@@ -1193,9 +331,13 @@ export class InMemoryRtDbClient {
   constructor(options: InMemoryRtDbClientOptions = {}) {
     this.now = options.now ?? (() => Date.now());
     this.random = options.random ?? Math.random;
-    this.presenceRooms = options.presenceRooms ?? new PresenceRooms();
-    this.presenceUser = options.presenceUser ?? { kind: "user" };
     this.connectionId = options.connectionId ?? `c${(++this.idCounter).toString(36)}`;
+    this.presenceMembership = new PresenceMembership(
+      options.presenceRooms ?? new PresenceRooms(),
+      this.connectionId,
+      options.presenceUser ?? { kind: "user" },
+      this.now,
+    );
   }
 
   /** In-memory admin surface mirroring `RtDbAdminClient`: a seedable audit log
@@ -1224,7 +366,7 @@ export class InMemoryRtDbClient {
    * empty doc stores only for brand-new tables. Every push validates TTL and
    * index-field rules (`validateSchema`) and `onDelete` declarations (FM-33),
    * both SCHEMA_VIOLATION, like the server does. */
-  pushSchema(schema: SchemaDefinition<any> | SchemaJson): void {
+  pushSchema(schema: AnySchema | SchemaJson): void {
     // Cloned because `grandfatherTrgm` mutates in place and `toJSON()` hands
     // back the builder's own index objects — a shared `defineSchema(...)`
     // fixture must not pick up one client's grandfathered flag.
@@ -1472,33 +614,7 @@ export class InMemoryRtDbClient {
     state?: unknown,
     onUpdate?: (members: PresenceMember[]) => void,
   ): () => void {
-    this.joinedRooms.add(room);
-    this.presenceRooms.join(room, {
-      connectionId: this.connectionId,
-      user: this.presenceUser,
-      state: state ?? null,
-    });
-    let off: (() => void) | undefined;
-    if (onUpdate) {
-      off = this.presenceRooms.subscribe(room, onUpdate);
-      let arr = this.presenceUnsubs.get(room);
-      if (!arr) {
-        arr = [];
-        this.presenceUnsubs.set(room, arr);
-      }
-      arr.push(off);
-    }
-    return () => {
-      off?.();
-      if (off) {
-        const arr = this.presenceUnsubs.get(room);
-        if (arr) {
-          const i = arr.indexOf(off);
-          if (i >= 0) arr.splice(i, 1);
-          if (arr.length === 0) this.presenceUnsubs.delete(room);
-        }
-      }
-    };
+    return this.presenceMembership.join(room, state, onUpdate);
   }
 
   /** Broadcasts updated `state` for this connection in `room`. No-op if this
@@ -1507,25 +623,14 @@ export class InMemoryRtDbClient {
    * schedules an expiry that nulls this member's `state` at `now + ttlMs`
    * (the member stays listed) — mirroring the live server. */
   updatePresence(room: string, state: unknown, ttlMs?: number): void {
-    if (!this.joinedRooms.has(room)) {
-      return;
-    }
-    this.presenceRooms.update(room, this.connectionId, state, ttlMs, this.now());
+    this.presenceMembership.update(room, state, ttlMs);
   }
 
   /** Leaves `room`: removes this connection from the member list, drops every
    * local subscriber this client registered for that room, and fans out a
    * fresh snapshot to remaining subscribers. */
   leavePresence(room: string): void {
-    if (!this.joinedRooms.delete(room)) {
-      return;
-    }
-    const arr = this.presenceUnsubs.get(room);
-    if (arr) {
-      for (const off of arr) off();
-      this.presenceUnsubs.delete(room);
-    }
-    this.presenceRooms.leave(room, this.connectionId);
+    this.presenceMembership.leave(room);
   }
 
   // ---- schedules ------------------------------------------------------------
@@ -1565,7 +670,7 @@ export class InMemoryRtDbClient {
       id,
       kind: when.type === "cron" ? "cron" : when.type === "interval" ? "interval" : "oneshot",
       txn,
-      dueAt: this.dueAtFor(when, now),
+      dueAt: dueAtFor(when, now),
       status: "pending",
       createdAt: now,
       firedCount: 0,
@@ -1622,7 +727,7 @@ export class InMemoryRtDbClient {
    * Lists all workflows/tasks scheduled in this in-memory instance.
    */
   async listSchedules(): Promise<ScheduleInfo[]> {
-    return [...this.schedules.values()].map((job) => this.toScheduleInfo(job));
+    return [...this.schedules.values()].map((job) => toScheduleInfo(job));
   }
 
   // ---- workflows (FM-29) ------------------------------------------------------
@@ -1632,7 +737,7 @@ export class InMemoryRtDbClient {
    * gated at `now + steps[0].sleepBeforeMs`); `tick` advances it. */
   async startWorkflow(spec: WorkflowSpec): Promise<WorkflowInfo> {
     validateWorkflowSpec(spec);
-    return this.toWorkflowInfo(this.startWorkflowJob(spec));
+    return toWorkflowInfo(this.startWorkflowJob(spec));
   }
 
   /** Cancels a pending/running/waiting run: flips it to `cancelled` +
@@ -1700,7 +805,7 @@ export class InMemoryRtDbClient {
     return [...this.workflows.values()]
       .filter((run) => status === undefined || run.status === status)
       .sort((a, b) => b.createdAt - a.createdAt)
-      .map((run) => this.toWorkflowInfo(run));
+      .map((run) => toWorkflowInfo(run));
   }
 
   /** Fetches one full run row — info plus the per-step outcome trail
@@ -1710,7 +815,7 @@ export class InMemoryRtDbClient {
     if (!run) {
       throw new RtDbError("NOT_FOUND", `workflow '${id}' not found`);
     }
-    return { ...this.toWorkflowInfo(run), stepOutcomes: [...run.stepOutcomes] };
+    return { ...toWorkflowInfo(run), stepOutcomes: [...run.stepOutcomes] };
   }
 
   /** Sync core of {@link startWorkflow} — the `Step::StartWorkflow` transaction
@@ -1731,32 +836,6 @@ export class InMemoryRtDbClient {
     };
     this.workflows.set(run.id, run);
     return run;
-  }
-
-  private toWorkflowInfo(run: WorkflowRun): WorkflowInfo {
-    return {
-      id: run.id,
-      name: run.spec.name,
-      status: run.status,
-      currentStep: run.currentStep,
-      stepCount: run.spec.steps.length,
-      attempts: run.attempts,
-      sleepUntil: run.sleepUntil,
-      createdAt: run.createdAt,
-      updatedAt: run.updatedAt,
-      ...(run.lastError === undefined ? {} : { lastError: run.lastError }),
-      // Projected only while `waiting` (server `info_from_row`): a delivered
-      // signal flips the run to `pending` with the slot still set during the
-      // latest-wins window — the info row must not leak the stale wait.
-      ...(run.status !== "waiting" || run.waitName === undefined
-        ? {}
-        : { waitingFor: run.waitName }),
-      ...(run.status !== "waiting" || run.waitedSince === undefined
-        ? {}
-        : { waitedSince: run.waitedSince }),
-      ...(run.startedAt === undefined ? {} : { startedAt: run.startedAt }),
-      ...(run.finishedAt === undefined ? {} : { finishedAt: run.finishedAt }),
-    };
   }
 
   // ---- file storage ----------------------------------------------------------
@@ -1833,7 +912,7 @@ export class InMemoryRtDbClient {
   tick(nowMs?: number): number {
     const now = nowMs ?? this.now();
     this.fireDueJobs(now);
-    this.claimDueWorkflows(now);
+    claimDueWorkflows(this.workflows, now, (txn) => this.executeTransaction(txn));
     return this.reapTtl(now);
   }
 
@@ -1892,186 +971,6 @@ export class InMemoryRtDbClient {
     }
   }
 
-  /** Claim and advance every due workflow run (the second `tick` phase):
-   * pending runs and waiting runs whose timeout gate expired (server
-   * `claim_due` covers both) flip to running — `startedAt` stamped on the
-   * first claim only — then advance through `advanceWorkflow`. */
-  private claimDueWorkflows(now: number): void {
-    const due = [...this.workflows.values()].filter(
-      (run) => (run.status === "pending" || run.status === "waiting") && run.sleepUntil <= now,
-    );
-    for (const run of due) {
-      run.status = "running";
-      if (run.startedAt === undefined) {
-        run.startedAt = now;
-      }
-      run.updatedAt = now;
-      this.advanceWorkflow(run, now);
-    }
-  }
-
-  /** FM-29: drives one claimed run across step boundaries, mirroring the
-   * server committer's advance loop. Success on the last step finalizes;
-   * success earlier moves to the next step and applies its `sleepBeforeMs`
-   * gate (a future gate re-pends the run and ends this pass — a `now` gate
-   * continues in the same tick); failure re-pends with exponential backoff
-   * (no outcome recorded for retried attempts) or, once attempts are
-   * exhausted, marks the run failed with a terminal outcome. */
-  private advanceWorkflow(run: WorkflowRun, now: number): void {
-    for (;;) {
-      // Per-boundary liveness check: a cancel (or terminal transition) between
-      // steps ends the pass — the server re-checks the row each boundary.
-      const live = this.workflows.get(run.id);
-      if (live !== run || run.status !== "running") {
-        return;
-      }
-      const step = run.spec.steps[run.currentStep];
-      if (!step) {
-        return;
-      }
-      // awaitSignal: side-state only — no document writes. The server's
-      // three-way wake discriminator, read off the claimed run: a present
-      // payload = delivered, else unset waitedSince = first arrival, else
-      // the timeout gate expired.
-      if (step.awaitSignal !== undefined) {
-        const sig = step.awaitSignal;
-        if (run.signalPayload !== undefined) {
-          const outcome: StepOutcome = {
-            stepIndex: run.currentStep,
-            status: "success",
-            attempts: run.attempts + 1,
-            at: now,
-            signal: run.signalPayload,
-          };
-          run.stepOutcomes.push(outcome);
-          run.updatedAt = now;
-          delete run.signalPayload;
-          delete run.waitName;
-          delete run.waitedSince;
-          const isLast = run.currentStep + 1 >= run.spec.steps.length;
-          if (isLast) {
-            run.status = "success";
-            run.attempts = 0;
-            delete run.lastError;
-            run.finishedAt = now;
-            return;
-          }
-          run.currentStep += 1;
-          run.attempts = 0;
-          // Same next-gate logic as the txn path:
-          const gate = now + (run.spec.steps[run.currentStep].sleepBeforeMs ?? 0);
-          if (gate > now) {
-            run.status = "pending";
-            run.sleepUntil = gate;
-            run.updatedAt = now;
-            return;
-          }
-          continue;
-        }
-        // An omitted timeoutMs is never due — cancel or a delivery is the
-        // only escape (the server's i64::MAX gate).
-        const timeoutGate = sig.timeoutMs !== undefined ? now + sig.timeoutMs : NEVER_DUE;
-        if (run.waitedSince === undefined) {
-          // First arrival: park.
-          run.status = "waiting";
-          run.waitName = sig.name;
-          run.waitedSince = now;
-          run.sleepUntil = timeoutGate;
-          delete run.signalPayload;
-          run.updatedAt = now;
-          return;
-        }
-        // The row parked and its gate expired: a timed-out attempt. A retry
-        // waits the FULL timeoutMs again — never backoff.
-        const retry = resolveStepRetry(step.retry);
-        run.attempts += 1;
-        if (run.attempts < retry.maxAttempts) {
-          run.status = "waiting";
-          run.waitedSince = now;
-          run.sleepUntil = timeoutGate;
-          run.updatedAt = now;
-          return;
-        }
-        const error = `awaitSignal '${sig.name}' timed out`;
-        run.stepOutcomes.push({
-          stepIndex: run.currentStep,
-          status: "failed",
-          attempts: run.attempts,
-          at: now,
-          error,
-        });
-        run.status = "failed";
-        run.lastError = error;
-        run.finishedAt = now;
-        run.updatedAt = now;
-        delete run.signalPayload;
-        delete run.waitName;
-        delete run.waitedSince;
-        return;
-      }
-      if (step.txn === undefined) {
-        // Exactly-one-of is submit-validated; a step with neither is a
-        // corrupt snapshot — stop the pass rather than throw the tick.
-        return;
-      }
-      let execError: string | null = null;
-      try {
-        this.executeTransaction(step.txn);
-      } catch (e) {
-        execError = e instanceof Error ? e.message : String(e);
-      }
-      if (execError === null) {
-        const outcome: StepOutcome = {
-          stepIndex: run.currentStep,
-          status: "success",
-          attempts: run.attempts + 1,
-          at: now,
-        };
-        const isLast = run.currentStep + 1 >= run.spec.steps.length;
-        run.stepOutcomes.push(outcome);
-        run.updatedAt = now;
-        if (isLast) {
-          run.status = "success";
-          run.attempts = 0;
-          delete run.lastError;
-          run.finishedAt = now;
-          return;
-        }
-        run.currentStep += 1;
-        run.attempts = 0;
-        const next = run.spec.steps[run.currentStep];
-        const gate = now + (next.sleepBeforeMs ?? 0);
-        if (gate > now) {
-          run.status = "pending";
-          run.sleepUntil = gate;
-          run.updatedAt = now;
-          return;
-        }
-        continue;
-      }
-      const retry = resolveStepRetry(step.retry);
-      run.attempts += 1;
-      if (run.attempts < retry.maxAttempts) {
-        run.status = "pending";
-        run.sleepUntil = now + backoffMs(retry, run.attempts);
-        run.updatedAt = now;
-        return;
-      }
-      run.stepOutcomes.push({
-        stepIndex: run.currentStep,
-        status: "failed",
-        attempts: run.attempts,
-        at: now,
-        error: execError,
-      });
-      run.status = "failed";
-      run.lastError = execError;
-      run.finishedAt = now;
-      run.updatedAt = now;
-      return;
-    }
-  }
-
   /** Removes documents whose TTL field value is a number strictly less than
    * `now`, for every table that declares a `ttl`. Fires subscription fan-out
    * for touched tables (mirroring `executeTransaction`). Returns the count
@@ -2106,52 +1005,6 @@ export class InMemoryRtDbClient {
       this.notifySubs(ctx.touched);
     }
     return removed;
-  }
-
-  private dueAtFor(when: ScheduleWhen, now: number): number {
-    switch (when.type) {
-      case "afterMs":
-        return now + when.ms;
-      case "runAt":
-        return when.ms;
-      case "cron":
-        return now + CRON_STEP_MS;
-      case "interval":
-        return now + when.everyMs;
-    }
-  }
-
-  private toScheduleInfo(job: ScheduledJob): ScheduleInfo {
-    const info: ScheduleInfo = {
-      id: job.id,
-      kind: job.kind,
-      dueAt: job.dueAt,
-      status: job.status,
-      createdAt: job.createdAt,
-      firedCount: job.firedCount,
-    };
-    if (job.external) {
-      info.external = job.external;
-    }
-    if (job.cron !== undefined) {
-      info.cron = job.cron;
-    }
-    if (job.tz !== undefined) {
-      info.tz = job.tz;
-    }
-    if (job.everyMs !== undefined) {
-      info.everyMs = job.everyMs;
-    }
-    if (job.lastError !== undefined) {
-      info.lastError = job.lastError;
-    }
-    if (job.missedCount > 0) {
-      info.missedCount = job.missedCount;
-    }
-    if (job.lastMissedAt !== undefined) {
-      info.lastMissedAt = job.lastMissedAt;
-    }
-    return info;
   }
 
   // ---- transaction execution -------------------------------------------------
@@ -2915,187 +1768,5 @@ export class InMemoryRtDbClient {
     for (const [tableName, rows] of snapshot) {
       this.tables.set(tableName, rows);
     }
-  }
-}
-
-/** The single database name the in-memory harness models (it is single-db).
- *  Surfaced on audit rows and the subscription inspector for shape parity with
- *  `RtDbAdminClient`, which reads per-db data on a real multi-db server. */
-const IN_MEMORY_DB = "db";
-
-/** Terminal step kind a query resolves to (the `terminal` field the server
- *  reports on `GET /admin/subscriptions`). Best-effort derivation from the
- *  query JSON — sufficient for shape parity in the harness. */
-function queryTerminal(q: QueryJson): string {
-  if (q.get !== undefined) return "get";
-  if (q.count) return "count";
-  if (q.first) return "first";
-  if (q.unique) return "unique";
-  if (q.distinct) return "distinct";
-  if (q.aggregate !== undefined) return "aggregate";
-  // ENH-030: the ranked terminals outrank `paginate`, which composes with them
-  // as a peer clause rather than replacing them — the server's `cq.terminal`
-  // likewise stays `search`/`vectorSearch`/`hybridSearch` for a paginated
-  // ranked query, so these three must be tested first.
-  if (q.search !== undefined) return "search";
-  if (q.vectorSearch !== undefined) return "vectorSearch";
-  if (q.hybridSearch !== undefined) return "hybridSearch";
-  if (q.paginate !== undefined) return "paginate";
-  return "collect";
-}
-
-/** Invalidation class the committer would assign (the `readSetClass` field the
- *  server reports): point reads, indexed (eq/range) reads, ordered (take/first)
- *  reads, else table-level. Best-effort — the harness does not track the real
- *  skip logic, only the shape. */
-function queryReadSetClass(q: QueryJson): string {
-  if (q.get !== undefined) return "point";
-  const hasIndex =
-    q.index !== undefined ||
-    (q.eq?.length ?? 0) > 0 ||
-    q.gt !== undefined ||
-    q.gte !== undefined ||
-    q.lt !== undefined ||
-    q.lte !== undefined;
-  if (q.order !== undefined || q.first || q.take !== undefined) return "ordered";
-  if (hasIndex) return "indexed";
-  return "table";
-}
-
-/** In-memory admin surface mirroring `RtDbAdminClient`: a seedable durable
- *  audit log (`getAudit`) and the live subscription inspector
- *  (`listSubscriptions`). Bound to an `InMemoryRtDbClient`'s clock and
- *  subscription registry so admin-keyed consumers (audit backstops, quota
- *  inspection) are unit-testable with no network. The harness does not track
- *  invalidation counters, so those totals read zero; the audit log is seedable
- *  rather than auto-recorded (tests assert the read shape, not DocOp
- *  provenance). */
-export class InMemoryAdminClient {
-  private readonly auditLog: AuditEntry[] = [];
-  private auditSeq = 0;
-
-  constructor(private readonly backplane: { now: () => number; subs: readonly Subscription[] }) {}
-
-  /** Seed audit rows directly (test affordance). `id` auto-increments when
-   *  omitted; `tsMs` defaults to the host clock; `op`/`principal` default to
-   *  null and the rest to empty strings, matching the `AuditEntry` shape. */
-  seedAudit(rows: Array<Partial<AuditEntry>>): void {
-    for (const row of rows) {
-      const id = row.id ?? ++this.auditSeq;
-      if (row.id !== undefined && row.id > this.auditSeq) this.auditSeq = row.id;
-      this.auditLog.push({
-        id,
-        tsMs: row.tsMs ?? this.backplane.now(),
-        db: row.db ?? IN_MEMORY_DB,
-        table: row.table ?? "",
-        op: row.op ?? null,
-        docId: row.docId ?? "",
-        principal: row.principal ?? null,
-        source: row.source ?? "client",
-      });
-    }
-  }
-
-  /** Durable audit-log entries, newest-first, mirroring `GET /admin/audit`.
-   *  Each of `db`/`table`/`op`/`principal`/`source` is an optional equality
-   *  filter (combined AND); `limit`/`offset` page (defaults 100/0). */
-  getAudit(opts?: GetAuditOptions): Promise<AuditEntry[]> {
-    let rows = this.auditLog;
-    if (opts?.db) rows = rows.filter((r) => r.db === opts.db);
-    if (opts?.table) rows = rows.filter((r) => r.table === opts.table);
-    if (opts?.op) rows = rows.filter((r) => r.op === opts.op);
-    if (opts?.principal) rows = rows.filter((r) => r.principal === opts.principal);
-    if (opts?.source) rows = rows.filter((r) => r.source === opts.source);
-    const sorted = [...rows].sort((a, b) => (a.tsMs !== b.tsMs ? b.tsMs - a.tsMs : b.id - a.id));
-    const offset = opts?.offset ?? 0;
-    const limit = opts?.limit ?? 100;
-    return Promise.resolve(sorted.slice(offset, offset + limit));
-  }
-
-  /** Live subscription inspector, mirroring `GET /admin/subscriptions`. Returns
-   *  the currently-registered queries as `SubscriptionInfo` rows plus per-db
-   *  rollup. Invalidation totals read zero (the harness does not track them). */
-  listSubscriptions(opts?: { db?: string }): Promise<SubscriptionsResponse> {
-    if (opts?.db && opts.db !== IN_MEMORY_DB) {
-      return Promise.resolve(this.emptySubscriptions());
-    }
-    const subscriptions: SubscriptionInfo[] = this.backplane.subs.map((s) => ({
-      db: IN_MEMORY_DB,
-      table: s.table,
-      terminal: queryTerminal(s.query),
-      readSetClass: queryReadSetClass(s.query),
-      principal: null,
-    }));
-    const perDb: DbSubCounters[] = subscriptions.length
-      ? [
-          {
-            db: IN_MEMORY_DB,
-            reruns: 0,
-            skipsPoint: 0,
-            skipsIndexed: 0,
-            skipsOrdered: 0,
-            missed: 0,
-            skips: 0,
-            rerunRatio: 0,
-          },
-        ]
-      : [];
-    return Promise.resolve({
-      subscriptions,
-      subsRerunsTotal: 0,
-      subsSkipsPointTotal: 0,
-      subsSkipsIndexedTotal: 0,
-      subsSkipsOrderedTotal: 0,
-      subsMissedPushesTotal: 0,
-      perDb,
-    });
-  }
-
-  /** Active interactive sessions. The harness mints no sessions, so this always
-   *  reads empty — mirroring `RtDbAdminClient.listSessions` for admin consumers
-   *  unit-tested with no network. */
-  listSessions(_filter?: { user?: string; limit?: number }): Promise<SessionInfo[]> {
-    return Promise.resolve([]);
-  }
-
-  /** Revoke one session by token hash. No-op in-memory; resolves void. */
-  revokeSession(_tokenHash: string): Promise<void> {
-    return Promise.resolve();
-  }
-
-  /** Revoke every session for a user. No-op in-memory; reports zero revoked. */
-  revokeUserSessions(_userId: string): Promise<{ ok: boolean; revoked: number }> {
-    return Promise.resolve({ ok: true, revoked: 0 });
-  }
-
-  /** Revoke every expired session. No-op in-memory (the harness mints no
-   *  sessions); reports zero revoked. */
-  revokeExpiredSessions(): Promise<{ ok: boolean; revoked: number }> {
-    return Promise.resolve({ ok: true, revoked: 0 });
-  }
-
-  /** Anon→real account merge. No-op in-memory; resolves an empty report
-   *  (nothing re-stamped, nothing repointed, no anon row deleted) — mirroring
-   *  `RtDbAdminClient.mergeUsers` for admin consumers unit-tested with no
-   *  network. */
-  mergeUsers(_anonUserId: string, _realUserId: string): Promise<MergeReport> {
-    return Promise.resolve({
-      dbs: {},
-      storageRepointed: 0,
-      sessionsRepointed: 0,
-      anonDeleted: false,
-    });
-  }
-
-  private emptySubscriptions(): SubscriptionsResponse {
-    return {
-      subscriptions: [],
-      subsRerunsTotal: 0,
-      subsSkipsPointTotal: 0,
-      subsSkipsIndexedTotal: 0,
-      subsSkipsOrderedTotal: 0,
-      subsMissedPushesTotal: 0,
-      perDb: [],
-    };
   }
 }

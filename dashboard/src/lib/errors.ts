@@ -1,3 +1,5 @@
+import { RtDbError } from "@par-rt-db/client";
+
 /**
  * Coerce a caught value (the `e` in `catch (e)`) into a human-readable string.
  *
@@ -8,4 +10,9 @@
  */
 export function toErrorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/** Surfaces the server's wire `{code, message}` envelope verbatim. */
+export function formatWriteError(e: unknown): string {
+  return e instanceof RtDbError ? `${e.code}: ${e.message}` : toErrorMessage(e);
 }

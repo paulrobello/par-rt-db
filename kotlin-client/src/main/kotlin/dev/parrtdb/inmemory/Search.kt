@@ -106,12 +106,12 @@ private fun parseWebsearchQuery(text: String): WebsearchQuery {
 }
 
 private fun operandMatches(op: SearchOperand, fieldTexts: List<String>): Boolean {
-    val needle = if (op.isPhrase) op.phrase!!.joinToString(" ") else op.term
+    val needle = op.phrase?.joinToString(" ") ?: op.term
     return fieldTexts.any { it.contains(needle) }
 }
 
 private fun positiveLexemes(parsed: WebsearchQuery): List<String> =
-    parsed.groups.flatMap { g -> g.flatMap { if (it.isPhrase) it.phrase!! else listOf(it.term) } }
+    parsed.groups.flatMap { g -> g.flatMap { it.phrase ?: listOf(it.term) } }
 
 private fun ftsStringify(v: JsonElement?): String = valueText(v) ?: ""
 
