@@ -183,6 +183,12 @@ pub fn insert(ctx: &PrincipalCtx, table: &str, doc: &Map<String, Value>) -> Resu
     if allowed { Ok(()) } else { Err(denied()) }
 }
 
+/// Length cap for the delivered-transition `claim_id` stamp (SEC-004): the
+/// policy layer bounds the one caller-supplied string it admits instead of
+/// leaning on downstream document-size quotas. Ids are opaque to the server,
+/// so the cap only needs to comfortably exceed any real id format.
+const MAX_CLAIM_ID_LEN: usize = 128;
+
 pub fn patch(
     ctx: &PrincipalCtx,
     table: &str,
@@ -220,7 +226,9 @@ pub fn patch(
                             && positive(fields.get("delivered_ms"))
                             && match fields.len() {
                                 2 => true,
-                                3 => fields.get("claim_id").is_some_and(Value::is_string),
+                                3 => fields.get("claim_id").is_some_and(|v| {
+                                    v.as_str().is_some_and(|id| id.len() <= MAX_CLAIM_ID_LEN)
+                                }),
                                 _ => false,
                             }
                     }
@@ -374,6 +382,24 @@ mod tests {
             try_message_patch(
                 &queued_message(""),
                 json!({"state":"delivered","delivered_ms":2,"claim_id":null})
+            )
+            .is_err()
+        );
+        // SEC-004: the stamp is length-capped at the policy layer — at the
+        // cap passes, one past it fails closed like a non-string value.
+        let at_cap = "x".repeat(MAX_CLAIM_ID_LEN);
+        assert!(
+            try_message_patch(
+                &queued_message(""),
+                json!({"state":"delivered","delivered_ms":2,"claim_id":at_cap})
+            )
+            .is_ok()
+        );
+        let over_cap = "x".repeat(MAX_CLAIM_ID_LEN + 1);
+        assert!(
+            try_message_patch(
+                &queued_message(""),
+                json!({"state":"delivered","delivered_ms":2,"claim_id":over_cap})
             )
             .is_err()
         );
