@@ -26,14 +26,15 @@ GATE_STAMP = target/.gate-tree
 # stays green without silently dropping the package.
 SWIFT_OS := $(shell uname -s)
 SWIFT_SKIP := @echo "Skipping swift-client (non-Darwin host)"
-SWIFT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(1),$(SWIFT_SKIP))
+SWIFT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),$(1),$(SWIFT_SKIP))
+SWIFT_CLIENT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(1),$(SWIFT_SKIP))
 
 .PHONY: clean build test lint fmt fmt-check typecheck checkall checkall-cached dev-db-up dev-db-down dev-db-clean dev-db-clean-check \
 	pre-commit pre-commit-update ts-client-build ts-client-install dashboard-install \
 	dashboard-test \
 	python-client-install python-client-test python-client-lint python-client-fmt \
 	python-client-typecheck python-client-checkall rust-client-check-features rtdb-cli deploy \
-	env-drift-check dockerfile-stub-check backup-persistence-check cli-docs cli-docs-check \
+	env-drift-check dockerfile-stub-check backup-persistence-check publish-check cli-docs cli-docs-check \
 	rust-client-doc ts-client-doc python-client-doc swift-client-doc docs-api \
 	host-reserve host-release host-reservation-check \
 	go-client-install go-client-fmt go-client-fmt-check go-client-lint go-client-test \
@@ -58,7 +59,7 @@ ts-client-build:
 # Remove generated build output while preserving installed dependencies.
 clean:
 	cargo clean
-	rm -rf ts-client/dist dashboard/dist dashboard/node_modules/.cache swift-client/.build
+	rm -rf ts-client/dist dashboard/dist dashboard/node_modules/.cache swift-client/.build .build
 build: ts-client-build go-client-install
 	cd core && cargo build
 	cd server && cargo build
@@ -74,7 +75,7 @@ fmt:
 	cd dashboard && bun run fmt
 	cd python-client && uv run ruff format .
 	cd go-client && gofmt -w .
-	$(call SWIFT_IF_DARWIN,swiftformat .)
+	$(call SWIFT_CLIENT_IF_DARWIN,swiftformat .)
 
 fmt-check:
 	cargo fmt --all -- --check
@@ -82,7 +83,7 @@ fmt-check:
 	cd dashboard && bun run fmt-check
 	cd python-client && uv run ruff format --check .
 	cd go-client && test -z "$$(gofmt -l .)" || { echo 'gofmt needed:'; gofmt -l .; exit 1; }
-	$(call SWIFT_IF_DARWIN,swiftformat --lint .)
+	$(call SWIFT_CLIENT_IF_DARWIN,swiftformat --lint .)
 
 # ARC-014: one workspace-level clippy invocation instead of four per-crate
 # `cd X && cargo clippy` invocations. --all-features was already applied to
@@ -96,7 +97,7 @@ lint:
 	cd go-client && go vet ./...
 	cd go-client && go vet -tags live ./...
 	cd kotlin-client && ./gradlew --console=plain compileKotlin compileTestKotlin
-	$(call SWIFT_IF_DARWIN,swiftlint --strict)
+	$(call SWIFT_CLIENT_IF_DARWIN,swiftlint --strict)
 
 # ARC-014: workspace-level typecheck. The former `cargo check --workspace
 # --all-targets --all-features` here was pure duplication: `make lint` runs
@@ -328,17 +329,17 @@ swift-client-test:
 	$(call SWIFT_IF_DARWIN,swift test)
 
 swift-client-lint:
-	$(call SWIFT_IF_DARWIN,swiftlint --strict)
+	$(call SWIFT_CLIENT_IF_DARWIN,swiftlint --strict)
 
 swift-client-fmt:
-	$(call SWIFT_IF_DARWIN,swiftformat .)
+	$(call SWIFT_CLIENT_IF_DARWIN,swiftformat .)
 
 # Check-only twin of swift-client-fmt: the gate fails on unformatted Swift
 # instead of silently applying the format. Must run before the applying fmt in
 # swift-client-checkall — a check after the apply could never fail — matching
 # the root checkall, which carries fmt-check with no apply step at all.
 swift-client-fmt-check:
-	$(call SWIFT_IF_DARWIN,swiftformat --lint .)
+	$(call SWIFT_CLIENT_IF_DARWIN,swiftformat --lint .)
 
 swift-client-typecheck:
 	$(call SWIFT_IF_DARWIN,swift build)
@@ -375,7 +376,7 @@ python-client-doc:
 	cd python-client && uv run --all-extras pdoc par_rt_db -o docs-api --docformat google
 
 swift-client-doc:
-	$(call SWIFT_IF_DARWIN,mkdir -p docs-api && swift package --allow-writing-to-directory docs-api generate-documentation --target ParRtDbClient --output-path docs-api/ParRtDbClient.doccarchive --transform-for-static-hosting --hosting-base-path par-rt-db/swift --warnings-as-errors)
+	$(call SWIFT_IF_DARWIN,mkdir -p swift-client/docs-api && swift package --allow-writing-to-directory swift-client/docs-api generate-documentation --target ParRtDbClient --output-path swift-client/docs-api/ParRtDbClient.doccarchive --transform-for-static-hosting --hosting-base-path par-rt-db/swift --warnings-as-errors)
 
 docs-api: rust-client-doc ts-client-doc python-client-doc swift-client-doc
 
@@ -445,7 +446,7 @@ hostname-leak-check:
 		fi; \
 	fi
 
-checkall: env-drift-check dockerfile-stub-check backup-persistence-check hostname-leak-check cli-docs-check docs-api fmt-check lint typecheck test rust-client-check-features dev-db-clean-check
+checkall: env-drift-check dockerfile-stub-check backup-persistence-check hostname-leak-check cli-docs-check docs-api fmt-check lint typecheck test rust-client-check-features publish-check dev-db-clean-check
 	@mkdir -p target && echo "$(GATE_KEY)" > $(GATE_STAMP)
 
 # Content-addressed gate reuse for deploys: `checkall` stamps the gate key
@@ -460,6 +461,16 @@ checkall-cached:
 	else \
 		$(MAKE) checkall; \
 	fi
+# ENH-031: validate every registry artifact before a release tag — lockstep
+# manifests, crates dry-runs, npm pack contents, uv build + twine check
+# (scripts/publish-check.sh). PUBLISH_CHECK_ARGS passes flags through to the
+# script; the release workflow's verify job runs
+# `make publish-check PUBLISH_CHECK_ARGS=--require-tag` on a tag checkout,
+# where a tag/manifest version mismatch must hard-fail instead of NOTICE.
+publish-check:
+	./scripts/publish-check.sh $(PUBLISH_CHECK_ARGS)
+
+checkall: env-drift-check dockerfile-stub-check cli-docs-check docs-api fmt-check lint typecheck test rust-client-check-features publish-check
 
 # ENH-033: criterion micro-benchmarks over the pure hot paths (server) and the
 # in-memory engine (rust-client). No Postgres, no server process. Deliberately

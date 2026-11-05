@@ -36,7 +36,7 @@ expect_used = "warn"
 # ARC-004: the wire vocabulary the server and the Rust client both speak.
 # Defined once so a drift between them is a compile error rather than a
 # wire-corpus failure. No I/O, no runtime — serde and serde_json only.
-par-rt-db-core = { path = "core" }
+par-rt-db-core = { path = "core", version = "0.1.0" }
 # Shared by server + rust-client (+ cli for serde_json/anyhow).
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }

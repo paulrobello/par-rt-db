@@ -1,0 +1,363 @@
+# Green-gated release: a push to main that passes the gate publishes the
+# version the tree declares — the same deploy-on-push shape this owner's
+# lenny2 services use. Repeated pushes are no-ops: every registry publish
+# skips an already-published version, and the GitHub release job re-uploads
+# with --clobber. The job that creates the GitHub release also creates the
+# matching vX.Y.Z git tag at the released commit, which is what SwiftPM's
+# `.exact("X.Y.Z")` resolves against. workflow_dispatch re-runs the pipeline
+# for recovery after a partial publish. Releasing is lockstep: bump all seven
+# versioned manifests in one commit (see docs/RELEASING.md), then push to main.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  # Serial and never cancelled mid-flight: a killed run could strand a version
+  # published to one registry but not the others.
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify release
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RTDB_TEST_DATABASE_URL: postgres://rtdb:rtdb@127.0.0.1:55434/rtdb
+    outputs:
+      # The single version every published artifact carries. publish-check's
+      # version-lockstep gate has proved all seven manifests agree; read it
+      # from server/Cargo.toml as the authority.
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      # Reclaim runner disk before the build. The full debug build of the
+      # server + rust-client test graph (hundreds of `target/debug/deps`
+      # artifacts) plus the `pgvector/pgvector:pg17` Docker pull exhausts the
+      # ubuntu-latest root FS — observed as `rustc-LLVM ERROR: IO failure on
+      # output stream: No space left on device` mid-compile (three consecutive
+      # failures, 2026-08-11). ubuntu-latest ships ~5–7 GB of SDK/toolchain
+      # cruft this workflow never uses (Android, .NET, CodeQL, Haskell, the
+      # apt cache, stale Docker images); removing it head-of-queue prevents
+      # the disk-fill. Manual `rm` (not a third-party action) to keep the
+      # workflow's pinned-action discipline. `df -h` proves the reclamation.
+      - name: Free runner disk space
+        run: |
+          set -x
+          df -h /
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /usr/local/share/powershell \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/local/share/edge_driver \
+            /usr/local/share/gecko_driver \
+            /usr/local/share/chrome_driver
+          sudo apt-get clean
+          sudo docker system prune -af --volumes || true
+          df -h /
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          enable-cache: true
+      - name: Install ts-client deps
+        run: make ts-client-install
+      - name: Install dashboard deps
+        run: make dashboard-install
+      - name: Install python-client deps
+        run: make python-client-install
+      - name: Run make checkall
+        run: make checkall
+      - name: Run release publish check
+        run: make publish-check
+      - name: Resolve release version from the tree
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(awk '
+            /^\[package\][[:space:]]*$/ { in_package=1; next }
+            /^\[/ { in_package=0 }
+            in_package && /^version[[:space:]]*=/ {
+              v=$3; gsub(/["[:space:]]/, "", v); print v; exit
+            }' server/Cargo.toml)"
+          [ -n "$version" ] || { echo "could not resolve version from server/Cargo.toml" >&2; exit 1; }
+          echo "release version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  publish-crates:
+    name: Publish crates.io packages
+    needs: verify
+    # Publish only from the default branch, so a workflow_dispatch from a
+    # feature branch can never release that branch's version.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: stable
+      - name: Publish core then rust-client
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$VERSION"
+          for spec in "par-rt-db-core:core" "par-rt-db-client:rust-client"; do
+            crate="${spec%%:*}"
+            directory="${spec##*:}"
+            if curl --fail --silent --show-error \
+              -A 'par-rt-db-release/1.0 (+https://github.com/paulrobello/par-rt-db)' \
+              "https://crates.io/api/v1/crates/${crate}" |
+              grep -Eq "\"vers\"[[:space:]]*:[[:space:]]*\"${version}\""; then
+              echo "${crate} ${version} already exists; skipping"
+              continue
+            fi
+            echo "Publishing ${crate} ${version}"
+            cargo publish --manifest-path "${directory}/Cargo.toml" --allow-dirty
+          done
+
+  publish-npm:
+    name: Publish npm package
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+      - name: Build and publish
+        working-directory: ts-client
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$VERSION"
+          case "$version" in
+            *-*) npm_tag=rc ;;
+            *) npm_tag=latest ;;
+          esac
+          bun install --frozen-lockfile
+          bun run build
+          if npm view @par-rt-db/client@"${version}" version >/dev/null 2>&1; then
+            echo "@par-rt-db/client ${version} already exists; skipping"
+            exit 0
+          fi
+          printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > .npmrc
+          trap 'rm -f .npmrc' EXIT
+          npm publish --provenance --access public --tag "$npm_tag"
+
+  publish-pypi:
+    name: Publish PyPI package
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+      - name: Check existing version and build
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$VERSION"
+          status="$(curl --silent --show-error --output /dev/null \
+            --write-out '%{http_code}' \
+            "https://pypi.org/pypi/par-rt-db/${version}/json")"
+          case "$status" in
+            200)
+              echo "par-rt-db ${version} already exists; skipping"
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            404)
+              ;;
+            *)
+              echo "Unexpected PyPI response status: ${status}" >&2
+              exit 1
+              ;;
+          esac
+          echo "exists=false" >> "$GITHUB_OUTPUT"
+          uv build --directory python-client
+      - name: Publish to PyPI with trusted publishing
+        if: steps.package.outputs.exists != 'true'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
+        with:
+          packages-dir: python-client/dist
+
+  swift-version-check:
+    name: Resolve Swift version
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+      - name: Resolve exact semantic version from scratch
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$VERSION"
+          scratch="$(mktemp -d)"
+          trap 'rm -rf "$scratch"' EXIT
+          cat > "$scratch/Package.swift" <<EOF
+          // swift-tools-version:6.0
+          import PackageDescription
+          let package = Package(
+              name: "TagResolutionCheck",
+              dependencies: [
+                  .package(url: "https://github.com/paulrobello/par-rt-db", exact: "${version}")
+              ],
+              targets: [
+                  .executableTarget(name: "TagResolutionCheck", dependencies: [
+                      .product(name: "ParRtDbClient", package: "par-rt-db")
+                  ])
+              ]
+          )
+          EOF
+          mkdir "$scratch/Sources"
+          mkdir "$scratch/Sources/TagResolutionCheck"
+          printf 'import ParRtDbClient\n' > "$scratch/Sources/TagResolutionCheck/main.swift"
+          cd "$scratch"
+          swift package resolve
+
+  cli-binaries:
+    name: Build CLI (${{ matrix.label }})
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - label: darwin-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - name: Install Linux linker
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - name: Build CLI binary
+        run: cargo build --release --manifest-path cli/Cargo.toml --target ${{ matrix.target }}
+      - name: Package CLI binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          cp "target/${{ matrix.target }}/release/rtdb" artifact/rtdb
+          tar -czf "rtdb-${{ matrix.label }}.tar.gz" -C artifact rtdb
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: rtdb-${{ matrix.label }}
+          path: rtdb-${{ matrix.label }}.tar.gz
+          if-no-files-found: error
+
+  github-release:
+    name: Create GitHub release
+    needs: [verify, publish-crates, publish-npm, publish-pypi, swift-version-check, cli-binaries]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download Linux CLI artifact
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: rtdb-linux-x86_64
+          path: release-assets
+      - name: Download macOS CLI artifact
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: rtdb-darwin-arm64
+          path: release-assets
+      - name: Create or update GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes_file="$(mktemp)"
+          trap 'rm -f "$notes_file"' EXIT
+          version="${VERSION#v}"
+          awk -v version="$version" '
+            $0 ~ "^## \\[(" version ")\\]" { capture=1; print; next }
+            capture && /^## \[/ { exit }
+            capture { print }
+          ' CHANGELOG.md > "$notes_file"
+          if [ ! -s "$notes_file" ]; then
+            printf 'Release %s\n' "$VERSION" > "$notes_file"
+          fi
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            gh release upload "v$VERSION" release-assets/* --clobber
+          else
+            release_args=(--title "v$VERSION" --notes-file "$notes_file")
+            case "$version" in
+              *-*) release_args+=(--prerelease) ;;
+            esac
+            gh release create "v$VERSION" release-assets/* --target "${{ github.sha }}" "${release_args[@]}"
+          fi

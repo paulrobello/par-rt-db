@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "type": "module",
   "license": "MIT",
+  "description": "TypeScript client for par-rt-db over HTTP and reactive WebSocket",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/paulrobello/par-rt-db.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "exports": {
     ".": {
       "development": "./src/index.ts",

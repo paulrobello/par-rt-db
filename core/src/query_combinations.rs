@@ -58,7 +58,7 @@ use serde::Deserialize;
 /// `wire-corpus/query-combinations.json`, embedded at compile time so neither
 /// crate needs a runtime file read (and so a missing/relocated file is a
 /// build error, not a startup surprise).
-static RULES_JSON: &str = include_str!("../../wire-corpus/query-combinations.json");
+static RULES_JSON: &str = include_str!("../wire-corpus/query-combinations.json");
 
 #[derive(Debug, Deserialize)]
 struct RuleTable {
@@ -185,5 +185,18 @@ mod tests {
     fn two_terminals_at_once_is_rejected() {
         let present: HashSet<&str> = ["count", "distinct"].into_iter().collect();
         assert!(check_query_combinations(&present).is_err());
+    }
+    /// The package-local copy must match the repository's canonical corpus.
+    #[test]
+    fn packaged_rules_match_root_wire_corpus() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../wire-corpus/query-combinations.json");
+        let Ok(root_json) = std::fs::read_to_string(root) else {
+            return;
+        };
+        assert_eq!(
+            RULES_JSON, root_json,
+            "packaged query-combination rules drifted from the canonical corpus"
+        );
     }
 }

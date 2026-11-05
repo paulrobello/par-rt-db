@@ -41,29 +41,42 @@ Design and scope:
 
 ## Installation (Swift Package Manager)
 
-The package currently lives in this repo — depend on it by local path:
+The package is published from this repository by git tag. Depend on an exact
+release version from Swift Package Manager (the corresponding git tag is
+`vX.Y.Z`):
 
 ```swift
 // in your Package.swift
 dependencies: [
-    .package(path: "../par-rt-db/swift-client"),
+    .package(url: "https://github.com/paulrobello/par-rt-db", exact: "X.Y.Z"),
 ],
 targets: [
     .target(name: "MyApp", dependencies: [
-        .product(name: "ParRtDbClient", package: "swift-client"),
-        .product(name: "ParRtDbUI", package: "swift-client"),   // if you use LiveQuery
+        .product(name: "ParRtDbClient", package: "par-rt-db"),
+        .product(name: "ParRtDbUI", package: "par-rt-db"),   // if you use LiveQuery
     ]),
 ],
 ```
 
-In an Xcode app project: File → Add Package Dependencies… → Add Local… → select
-`swift-client/`.
+Replace `X.Y.Z` with the release version you want, for example `0.1.0`;
+SwiftPM resolves it against the corresponding `v0.1.0` tag. In an Xcode app
+project, choose File → Add Package Dependencies…, paste
+`https://github.com/paulrobello/par-rt-db`, and select the exact release tag.
 
-Nothing is published today: there is no root `Package.swift` in this repository
-and no release tag, so a URL-based SwiftPM dependency
-(`.package(url: "https://github.com/paulrobello/par-rt-db.git", ...)`) does not
-resolve. The local-path form above is the only supported installation method
-until a release process exists.
+For local development, point SwiftPM at a checkout instead of a tag. The path
+must be the repository root (where the package manifest now lives):
+
+```swift
+dependencies: [
+    .package(path: "../par-rt-db"),
+],
+targets: [
+    .target(name: "MyApp", dependencies: [
+        .product(name: "ParRtDbClient", package: "par-rt-db"),
+        .product(name: "ParRtDbUI", package: "par-rt-db"),   // if you use LiveQuery
+    ]),
+],
+```
 
 ## Quick start
 

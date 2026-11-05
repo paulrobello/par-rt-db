@@ -18,11 +18,13 @@ where its detailed documentation lives.
 | Go | `github.com/paulrobello/par-rt-db/go-client` | [`go-client/`](../go-client) | [`go-client/README.md`](../go-client/README.md) |
 
 No package has been published to a registry yet; consume
-each SDK from this repo — see its README for workspace setup. This repo's
-root has no `Package.swift` (the Swift manifest lives at
-`swift-client/Package.swift`), so a Swift consumer adds the package by local
-path (see its README), not as a remote git dependency, even though the repo
-carries a `v0.1.0` release tag.
+each SDK from this repo — see its README for workspace setup. Registry
+publication is tag-driven by [`release.yml`](../.github/workflows/release.yml)
+and runs only after the full verification gate. Swift is the exception to local
+consumption: the repo's root `Package.swift` lets a Swift consumer add the
+package as a remote git dependency with `exact:` semantics — the declared
+semantic version (no `v` prefix) resolves against the corresponding `v`-tagged
+release.
 
 ## Surface comparison
 

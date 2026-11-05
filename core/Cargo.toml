@@ -6,6 +6,7 @@ license = "MIT"
 authors = ["Paul Robello <probello@gmail.com>"]
 description = "Shared wire types for par-rt-db's server and Rust client"
 repository = "https://github.com/paulrobello/par-rt-db"
+keywords = ["database", "realtime", "wire-format"]
 
 [lints]
 workspace = true

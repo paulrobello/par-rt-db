@@ -7,6 +7,23 @@ requires-python = ">=3.12"
 license = {text = "MIT"}
 authors = [{name = "Paul Robello", email = "probello@gmail.com"}]
 dependencies = ["pydantic>=2.14.2,<3"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Homepage = "https://github.com/paulrobello/par-rt-db"
+Repository = "https://github.com/paulrobello/par-rt-db"
+Changelog = "https://github.com/paulrobello/par-rt-db/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 ws = ["websockets>=17.4"]  # added in Plan 2
@@ -33,20 +50,16 @@ build-backend = "hatchling.build"
 packages = ["src/par_rt_db"]
 
 [tool.hatch.build.targets.wheel.force-include]
-# ENH-028 phase 2: the shared query-combination rule table lives in the repo's
-# wire-corpus (single source of truth for all five runners); force-included
-# here so `importlib.resources` can load it from an installed wheel without a
-# duplicated copy drifting from the canonical file.
-"../wire-corpus/query-combinations.json" = "par_rt_db/_data/query-combinations.json"
+# ENH-028/ENH-031: keep a package-local copy of the canonical table so both
+# direct wheel builds and wheels rebuilt from an sdist have the resource.
+"src/par_rt_db/_data/query-combinations.json" = "par_rt_db/_data/query-combinations.json"
 
 [tool.hatch.build.targets.sdist.force-include]
 # Mirrors the wheel force-include above, but into the src tree itself so the
 # file travels inside the sdist tarball (no `../wire-corpus` to reach once
-# unpacked). Note: this repo has no PyPI publish pipeline and `make checkall`
-# never builds a wheel or sdist for python-client (verified 2026-08-25) — a
-# hypothetical wheel-built-from-this-sdist step would still need its own
-# `../wire-corpus` reach and isn't covered; `uv build --wheel` from a checkout
-# (the case that matters) works, verified directly.
+# ENH-031: the release pipeline builds this sdist with `uv build` and publishes
+# it to PyPI. The force-include keeps the shared rule table inside the archive,
+# where the checkout-relative `../wire-corpus` path is no longer available.
 "../wire-corpus/query-combinations.json" = "src/par_rt_db/_data/query-combinations.json"
 
 [tool.ruff]
