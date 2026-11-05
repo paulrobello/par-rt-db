@@ -1,6 +1,6 @@
 # Green-gated release: a push to main that passes the gate publishes the
 # version the tree declares — the same deploy-on-push shape this owner's
-# lenny2 services use. Repeated pushes are no-ops: every registry publish
+# services use. Repeated pushes are no-ops: every registry publish
 # skips an already-published version, and the GitHub release job re-uploads
 # with --clobber. The job that creates the GitHub release also creates the
 # matching vX.Y.Z git tag at the released commit, which is what SwiftPM's
