@@ -333,6 +333,14 @@ impl AppState {
             .clone()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(notify::generate_instance_id);
+        // ARC-002: the resolved id tags NOTIFY payloads (self-dedupe) and the
+        // multi-instance identity threading below — an empty id would make a
+        // replica filter its own notifications wrong. This is the one
+        // construction invariant that is data-dependent rather than
+        // move-ordering (the "built before its dependent" orderings are
+        // borrow-checker-enforced: every threaded handle is moved into its
+        // consumer, so a reorder does not compile).
+        debug_assert!(!instance_id.trim().is_empty());
         // Read before `config` is destructured into the AppState literal below
         // (and before `pool` moves into it).
         let multi_instance = config.multi_instance.enabled;

@@ -16,6 +16,7 @@ mod common;
 mod admin_test;
 mod aggregate_having_test;
 mod anonymous_auth_test;
+mod app_state_test;
 mod audit_test;
 mod auth_test;
 mod auto_increment_test;
