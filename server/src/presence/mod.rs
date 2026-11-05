@@ -125,6 +125,8 @@ impl PresenceManager {
     /// `protocol_version` is the connection's negotiated `protocolVersion`
     /// (`None` = omitted on the `Auth` frame, v1 semantics) — see
     /// `Session::protocol_version` for how `flush_once` uses it.
+    // QA-005: room/state/user/protocol_version is the join-frame payload and
+    // db/conn/tx the connection identity — not context threading.
     #[allow(clippy::too_many_arguments)]
     pub async fn join(
         &self,

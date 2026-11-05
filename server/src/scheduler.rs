@@ -313,6 +313,9 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
 /// so a `Step::Schedule` inside `execute_txn` enqueues its row atomically with
 /// the txn's document writes (FM-28): the row becomes visible exactly at the
 /// caller's `tx.commit()` and rolls back with it. Identical SQL to `insert`.
+// QA-005: kind/due_at/txn/cron/every_ms/tz/external/enqueuer is the
+// scheduled_txns row payload (one bind per INSERT column), not context
+// threading.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_on(
     conn: &mut PgConnection,
@@ -360,6 +363,8 @@ pub(crate) async fn insert_on(
     Ok(id)
 }
 
+// QA-005: pool-vs-conn aside, the same scheduled_txns row payload as
+// `insert_on` (each field one bind); forwarding keeps the two lists aligned.
 #[allow(clippy::too_many_arguments)]
 pub async fn insert(
     pool: &PgPool,

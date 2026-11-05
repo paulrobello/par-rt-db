@@ -212,6 +212,9 @@ fn counter_value(
     })
 }
 
+// QA-005: table/id/field/delta/min/max/expected is the AdjustCounter step's
+// own wire payload (each consumed once), not context threading — the
+// transaction quintet already lives in StepCtx.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn step_adjust_counter(
     sctx: &mut StepCtx<'_>,

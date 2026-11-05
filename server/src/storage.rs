@@ -170,6 +170,9 @@ pub async fn put(
     put_with_epoch(pool, db, sha256, size, content_type, owner_id, bytes, None).await
 }
 
+// QA-005: sha256/size/content_type/owner_id/bytes is the storage row payload
+// (one bind per INSERT column) plus the admission-epoch override — not
+// context threading.
 #[allow(clippy::too_many_arguments)]
 pub async fn put_with_epoch(
     pool: &PgPool,
@@ -289,6 +292,9 @@ where
     .await
 }
 
+// QA-005: the upload payload (content_type/owner_id/limit/quota_check/
+// chunk_stream — the last two generic) plus the epoch override — a payload
+// with its own identity, not context threading.
 #[allow(clippy::too_many_arguments)]
 pub async fn put_stream_with_epoch<F, Fut, S, E>(
     pool: &PgPool,
