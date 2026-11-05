@@ -687,3 +687,67 @@ pub(crate) async fn eq_lookup(
     let rows = query.fetch_all(&mut *conn).await?;
     Ok(rows)
 }
+
+/// ARC-007: "the read and write paths share index-value typing" is a prose
+/// invariant in docs/ARCHITECTURE.md — this pins it as a test. `eq_bind_for`
+/// (the read/filter side, in `dsl.rs`) and `scalar_bind` (the write side,
+/// above) each switch on the pg-type string `indexed_column_type` returns, so
+/// a mapping change that reaches only one path now fails here instead of
+/// drifting silently into mis-bound comparisons or internal errors.
+#[cfg(test)]
+mod index_typing_tests {
+    use super::*;
+    use crate::dsl::eq_bind_for;
+    use serde_json::json;
+
+    #[test]
+    fn read_and_write_index_binds_match_ddl_types() {
+        let cases = [
+            (FieldType::String, json!("hello"), "text"),
+            (FieldType::Number, json!(1.25), "double precision"),
+            (FieldType::Boolean, json!(true), "boolean"),
+            (FieldType::Int64, json!(i64::MAX.to_string()), "bigint"),
+            (FieldType::id("items"), json!("a".repeat(32)), "text"),
+            (
+                FieldType::Literal {
+                    value: json!("open"),
+                },
+                json!("open"),
+                "text",
+            ),
+            (
+                FieldType::Union {
+                    variants: vec![FieldType::Literal {
+                        value: json!("open"),
+                    }],
+                },
+                json!("open"),
+                "text",
+            ),
+        ];
+        for (ty, value, pg_type) in cases {
+            for ty in [ty.clone(), FieldType::optional(ty)] {
+                assert_eq!(indexed_column_type(&ty).unwrap().0, pg_type);
+                let read = eq_bind_for(&ty, &value).unwrap();
+                let write = scalar_bind(&ty, &value).unwrap();
+                let same = match (read, write) {
+                    (EqBind::Text(a), ColBind::Text(Some(b))) => a == b,
+                    (EqBind::Num(a), ColBind::Num(Some(b))) => a == b,
+                    (EqBind::Bool(a), ColBind::Bool(Some(b))) => a == b,
+                    (EqBind::I64(a), ColBind::I64(Some(b))) => a == b,
+                    _ => false,
+                };
+                assert!(same, "read/write bind drift for {ty:?}");
+                let null = scalar_bind(&ty, &serde_json::Value::Null).unwrap();
+                assert!(matches!(
+                    (pg_type, null),
+                    ("text", ColBind::Text(None))
+                        | ("double precision", ColBind::Num(None))
+                        | ("boolean", ColBind::Bool(None))
+                        | ("bigint", ColBind::I64(None))
+                ));
+                assert!(eq_bind_for(&ty, &serde_json::Value::Null).is_err());
+            }
+        }
+    }
+}
