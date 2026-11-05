@@ -453,7 +453,8 @@ pub enum WorkflowStatus {
 }
 
 impl WorkflowStatus {
-    /// The wire string (`"pending"` etc.).
+    /// The wire string (`"pending"` etc.), also used by the server to bind its
+    /// optional workflow-status filter to SQL without allocating a `String`.
     pub fn as_wire_str(&self) -> &'static str {
         match self {
             WorkflowStatus::Pending => "pending",
