@@ -180,6 +180,12 @@ func parseSchema(v wire.JSONValue) (*SchemaDef, error) {
 	return out, nil
 }
 
+// parseTableDef converts one table's wire JSON into the typed TableDef.
+// QA-002 decomposition: dispatch is one call per table key into the per-key
+// parse helpers below, applied in a fixed order so the first malformed key is
+// the first error — error strings and precedence are unchanged from the
+// pre-decomposition single body. The same shape as parseFieldType's per-kind
+// dispatch and the server's EvalCtx per-operator table.
 func parseTableDef(v wire.JSONValue) (*TableDef, error) {
 	obj, ok := v.(wire.Object)
 	if !ok {
@@ -192,29 +198,11 @@ func parseTableDef(v wire.JSONValue) (*TableDef, error) {
 		return nil, err
 	}
 	td := &TableDef{Fields: map[string]FieldType{}, Defaults: map[string]wire.JSONValue{}, Computed: map[string]wire.ValueExpr{}}
-	fieldsObj, ok := obj["fields"].(wire.Object)
-	if !ok {
-		return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "table.fields must be an object")
+	if err := parseTableFields(obj, td); err != nil {
+		return nil, err
 	}
-	for fname, fv := range fieldsObj {
-		ft, err := parseFieldType(fv)
-		if err != nil {
-			return nil, err
-		}
-		td.Fields[fname] = *ft
-	}
-	if idxV, ok := obj["indexes"]; ok && idxV != nil {
-		arr, ok := idxV.(wire.Array)
-		if !ok {
-			return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "table.indexes must be an array")
-		}
-		for _, iv := range arr {
-			idx, err := parseIndexDef(iv)
-			if err != nil {
-				return nil, err
-			}
-			td.Indexes = append(td.Indexes, *idx)
-		}
+	if err := parseTableIndexes(obj, td); err != nil {
+		return nil, err
 	}
 	var err error
 	if td.OwnerField, err = optString(obj, "ownerField"); err != nil {
@@ -232,152 +220,283 @@ func parseTableDef(v wire.JSONValue) (*TableDef, error) {
 	if td.Description, err = optString(obj, "description"); err != nil {
 		return nil, err
 	}
-	if v, ok := obj["fieldDescriptions"]; ok && v != nil {
-		fdObj, ok := v.(wire.Object)
-		if !ok {
-			return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
-				"table.fieldDescriptions must be an object")
-		}
-		td.FieldDescriptions = map[string]string{}
-		for fname, fv := range fdObj {
-			s, ok := fv.(wire.String)
-			if !ok {
-				return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
-					"table.fieldDescriptions entries must be strings")
-			}
-			td.FieldDescriptions[fname] = string(s)
-		}
+	if err := parseFieldDescriptions(obj, td); err != nil {
+		return nil, err
 	}
+	if err := parseTableFlags(obj, td); err != nil {
+		return nil, err
+	}
+	if err := parseTableTTL(obj, td); err != nil {
+		return nil, err
+	}
+	if err := parseTableDefaults(obj, td); err != nil {
+		return nil, err
+	}
+	if err := parseTableConstraints(obj, td); err != nil {
+		return nil, err
+	}
+	if err := parseTableComputed(obj, td); err != nil {
+		return nil, err
+	}
+	if err := parseTableAuthorize(obj, td); err != nil {
+		return nil, err
+	}
+	return td, nil
+}
+
+// parseTableFields parses the required `fields` map into td.Fields.
+func parseTableFields(obj wire.Object, td *TableDef) error {
+	fieldsObj, ok := obj["fields"].(wire.Object)
+	if !ok {
+		return rtdberrors.New(rtdberrors.CodeBadRequest, "table.fields must be an object")
+	}
+	for fname, fv := range fieldsObj {
+		ft, err := parseFieldType(fv)
+		if err != nil {
+			return err
+		}
+		td.Fields[fname] = *ft
+	}
+	return nil
+}
+
+// parseTableIndexes parses the optional `indexes` array into td.Indexes.
+func parseTableIndexes(obj wire.Object, td *TableDef) error {
+	idxV, ok := obj["indexes"]
+	if !ok || idxV == nil {
+		return nil
+	}
+	arr, ok := idxV.(wire.Array)
+	if !ok {
+		return rtdberrors.New(rtdberrors.CodeBadRequest, "table.indexes must be an array")
+	}
+	for _, iv := range arr {
+		idx, err := parseIndexDef(iv)
+		if err != nil {
+			return err
+		}
+		td.Indexes = append(td.Indexes, *idx)
+	}
+	return nil
+}
+
+// parseFieldDescriptions parses the optional `fieldDescriptions` map into
+// td.FieldDescriptions (left nil when the key is absent).
+func parseFieldDescriptions(obj wire.Object, td *TableDef) error {
+	v, ok := obj["fieldDescriptions"]
+	if !ok || v == nil {
+		return nil
+	}
+	fdObj, ok := v.(wire.Object)
+	if !ok {
+		return rtdberrors.New(rtdberrors.CodeBadRequest,
+			"table.fieldDescriptions must be an object")
+	}
+	td.FieldDescriptions = map[string]string{}
+	for fname, fv := range fdObj {
+		s, ok := fv.(wire.String)
+		if !ok {
+			return rtdberrors.New(rtdberrors.CodeBadRequest,
+				"table.fieldDescriptions entries must be strings")
+		}
+		td.FieldDescriptions[fname] = string(s)
+	}
+	return nil
+}
+
+// parseTableFlags parses the optional `softDelete` / `insertOnly` booleans.
+func parseTableFlags(obj wire.Object, td *TableDef) error {
 	if v, ok := obj["softDelete"]; ok {
 		b, ok := v.(wire.Bool)
 		if !ok {
-			return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "table.softDelete must be a boolean")
+			return rtdberrors.New(rtdberrors.CodeBadRequest, "table.softDelete must be a boolean")
 		}
 		td.SoftDelete = bool(b)
 	}
 	if v, ok := obj["insertOnly"]; ok {
 		b, ok := v.(wire.Bool)
 		if !ok {
-			return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "table.insertOnly must be a boolean")
+			return rtdberrors.New(rtdberrors.CodeBadRequest, "table.insertOnly must be a boolean")
 		}
 		td.InsertOnly = bool(b)
 	}
-	if v, ok := obj["ttl"]; ok && v != nil {
-		ttl, err := parseTTL(v)
+	return nil
+}
+
+// parseTableTTL parses the optional `ttl` object into td.TTL.
+func parseTableTTL(obj wire.Object, td *TableDef) error {
+	v, ok := obj["ttl"]
+	if !ok || v == nil {
+		return nil
+	}
+	ttl, err := parseTTL(v)
+	if err != nil {
+		return err
+	}
+	td.TTL = ttl
+	return nil
+}
+
+// parseTableDefaults parses the optional `defaults` map into td.Defaults.
+func parseTableDefaults(obj wire.Object, td *TableDef) error {
+	v, ok := obj["defaults"]
+	if !ok || v == nil {
+		return nil
+	}
+	dobj, ok := v.(wire.Object)
+	if !ok {
+		return rtdberrors.New(rtdberrors.CodeBadRequest, "table.defaults must be an object")
+	}
+	for k, dv := range dobj {
+		td.Defaults[k] = dv
+	}
+	return nil
+}
+
+// parseTableConstraints parses the optional `constraints` map into
+// td.Constraints (left nil when the key is absent).
+func parseTableConstraints(obj wire.Object, td *TableDef) error {
+	v, ok := obj["constraints"]
+	if !ok || v == nil {
+		return nil
+	}
+	cobj, ok := v.(wire.Object)
+	if !ok {
+		return rtdberrors.New(rtdberrors.CodeBadRequest, "table.constraints must be an object")
+	}
+	td.Constraints = map[string]FieldConstraints{}
+	for fname, cv := range cobj {
+		fc, err := parseFieldConstraints(fname, cv)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		td.TTL = ttl
+		td.Constraints[fname] = *fc
 	}
-	if v, ok := obj["defaults"]; ok && v != nil {
-		dobj, ok := v.(wire.Object)
-		if !ok {
-			return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "table.defaults must be an object")
-		}
-		for k, dv := range dobj {
-			td.Defaults[k] = dv
-		}
+	return nil
+}
+
+// parseFieldConstraints parses one field's constraint object. Every entry key
+// is optional and nil when absent; the typed getters below keep the exact
+// per-key error strings.
+func parseFieldConstraints(fname string, cv wire.JSONValue) (*FieldConstraints, error) {
+	fco, ok := cv.(wire.Object)
+	if !ok {
+		return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+			"table.constraints entries must be objects")
 	}
-	if v, ok := obj["constraints"]; ok && v != nil {
-		cobj, ok := v.(wire.Object)
-		if !ok {
-			return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "table.constraints must be an object")
-		}
-		td.Constraints = map[string]FieldConstraints{}
-		for fname, cv := range cobj {
-			fco, ok := cv.(wire.Object)
-			if !ok {
-				return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
-					"table.constraints entries must be objects")
-			}
-			if err := rejectUnknownKeys(fco, "constraints", "min", "max", "minLength",
-				"maxLength", "pattern"); err != nil {
-				return nil, err
-			}
-			var fc FieldConstraints
-			if bv, ok := fco["min"]; ok && bv != nil {
-				num, ok := bv.(wire.Number)
-				if !ok {
-					return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
-						"constraints.min must be a number")
-				}
-				fc.Min = &num
-			}
-			if bv, ok := fco["max"]; ok && bv != nil {
-				num, ok := bv.(wire.Number)
-				if !ok {
-					return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
-						"constraints.max must be a number")
-				}
-				fc.Max = &num
-			}
-			if bv, ok := fco["minLength"]; ok && bv != nil {
-				num, ok := bv.(wire.Number)
-				if !ok {
-					return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
-						"constraints.minLength must be a number")
-				}
-				n, err := jsonNumberI64(num)
-				if err != nil {
-					return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
-						"constraints.minLength must be an integer")
-				}
-				fc.MinLength = &n
-			}
-			if bv, ok := fco["maxLength"]; ok && bv != nil {
-				num, ok := bv.(wire.Number)
-				if !ok {
-					return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
-						"constraints.maxLength must be a number")
-				}
-				n, err := jsonNumberI64(num)
-				if err != nil {
-					return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
-						"constraints.maxLength must be an integer")
-				}
-				fc.MaxLength = &n
-			}
-			if bv, ok := fco["pattern"]; ok && bv != nil {
-				sv, ok := bv.(wire.String)
-				if !ok {
-					return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
-						"constraints.pattern must be a string")
-				}
-				s := string(sv)
-				fc.Pattern = &s
-			}
-			td.Constraints[fname] = fc
-		}
+	if err := rejectUnknownKeys(fco, "constraints", "min", "max", "minLength",
+		"maxLength", "pattern"); err != nil {
+		return nil, err
 	}
-	if v, ok := obj["computed"]; ok && v != nil {
-		cobj, ok := v.(wire.Object)
-		if !ok {
-			return nil, rtdberrors.New(rtdberrors.CodeBadRequest, "table.computed must be an object")
-		}
-		for k, cv := range cobj {
-			raw, err := json.Marshal(cv)
-			if err != nil {
-				return nil, err
-			}
-			expr, err := wire.UnmarshalValueExpr(raw)
-			if err != nil {
-				return nil, err
-			}
-			td.Computed[k] = expr
-		}
+	var fc FieldConstraints
+	var err error
+	if fc.Min, err = constraintNumber(fco, "min"); err != nil {
+		return nil, err
 	}
-	if v, ok := obj["authorize"]; ok && v != nil {
-		raw, err := json.Marshal(v)
+	if fc.Max, err = constraintNumber(fco, "max"); err != nil {
+		return nil, err
+	}
+	if fc.MinLength, err = constraintI64(fco, "minLength"); err != nil {
+		return nil, err
+	}
+	if fc.MaxLength, err = constraintI64(fco, "maxLength"); err != nil {
+		return nil, err
+	}
+	if fc.Pattern, err = constraintString(fco, "pattern"); err != nil {
+		return nil, err
+	}
+	return &fc, nil
+}
+
+// constraintNumber reads an optional wire.Number constraint entry, nil when
+// the key is absent or JSON-null.
+func constraintNumber(fco wire.Object, key string) (*wire.Number, error) {
+	bv, ok := fco[key]
+	if !ok || bv == nil {
+		return nil, nil
+	}
+	num, ok := bv.(wire.Number)
+	if !ok {
+		return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+			"constraints."+key+" must be a number")
+	}
+	return &num, nil
+}
+
+// constraintI64 reads an optional integer constraint entry, nil when absent —
+// a non-integer spelling ("3.0") fails, mirroring serde_json's as_i64.
+func constraintI64(fco wire.Object, key string) (*int64, error) {
+	nv, err := constraintNumber(fco, key)
+	if err != nil {
+		return nil, err
+	}
+	if nv == nil {
+		return nil, nil
+	}
+	n, err := jsonNumberI64(*nv)
+	if err != nil {
+		return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+			"constraints."+key+" must be an integer")
+	}
+	return &n, nil
+}
+
+// constraintString reads an optional string constraint entry, nil when absent.
+func constraintString(fco wire.Object, key string) (*string, error) {
+	bv, ok := fco[key]
+	if !ok || bv == nil {
+		return nil, nil
+	}
+	sv, ok := bv.(wire.String)
+	if !ok {
+		return nil, rtdberrors.New(rtdberrors.CodeBadRequest,
+			"constraints."+key+" must be a string")
+	}
+	s := string(sv)
+	return &s, nil
+}
+
+// parseTableComputed parses the optional `computed` map into td.Computed.
+func parseTableComputed(obj wire.Object, td *TableDef) error {
+	v, ok := obj["computed"]
+	if !ok || v == nil {
+		return nil
+	}
+	cobj, ok := v.(wire.Object)
+	if !ok {
+		return rtdberrors.New(rtdberrors.CodeBadRequest, "table.computed must be an object")
+	}
+	for k, cv := range cobj {
+		raw, err := json.Marshal(cv)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		fe, err := wire.UnmarshalFilterExpr(raw)
+		expr, err := wire.UnmarshalValueExpr(raw)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		td.Authorize = fe
+		td.Computed[k] = expr
 	}
-	return td, nil
+	return nil
+}
+
+// parseTableAuthorize parses the optional `authorize` predicate into
+// td.Authorize.
+func parseTableAuthorize(obj wire.Object, td *TableDef) error {
+	v, ok := obj["authorize"]
+	if !ok || v == nil {
+		return nil
+	}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	fe, err := wire.UnmarshalFilterExpr(raw)
+	if err != nil {
+		return err
+	}
+	td.Authorize = fe
+	return nil
 }
 
 func parseIndexDef(v wire.JSONValue) (*IndexDef, error) {

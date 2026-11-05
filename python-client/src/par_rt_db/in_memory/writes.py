@@ -178,256 +178,317 @@ class _WritesEngine(_Core):
         """Run one step, returning its result and the set of tables it wrote
         (empty for read-only/control-flow steps). FM-33: a delete step's set
         includes every child table its ``onDelete`` cascade touched, so
-        subscribers on those tables re-run."""
+        subscribers on those tables re-run.
+
+        QA-002 decomposition: dispatch is one arm per step op into the
+        ``_exec_<op>`` handlers below — the same shape as the server's
+        ``eval_node``/``EvalCtx`` dispatch table and the ts/go ``planSearch``
+        plan/executor split. Behavior, error strings, and error precedence are
+        unchanged from the pre-decomposition single body."""
         self._enforce_insert_only(step)
         match step:
             case _ExpectBefore():
                 return None, set()
-            case _Insert(table=table, doc=doc):
-                table_def = self._require_table(table)
-                new_id = self._do_insert(table, table_def, doc)
-                return _insert_result(new_id), {table}
-            case _InsertMany(table=table, docs=docs):
-                _check_bulk_len("insertMany", len(docs))
-                table_def = self._require_table(table)
-                ids = [self._do_insert(table, table_def, doc) for doc in docs]
-                return _insert_many_result(ids), {table}
-            case _UpsertMany(table=table, index=index, docs=docs):
-                _check_bulk_len("upsertMany", len(docs))
-                table_def = self._require_table(table)
-                index_fields = _require_index(table_def, index).fields
-                many_ids: list[str] = []
-                many_inserted: list[bool] = []
-                for n, doc in enumerate(docs):
-                    missing = [f for f in index_fields if f not in doc]
-                    if missing:
-                        raise RtDbError(
-                            ErrorCode.BAD_REQUEST,
-                            f"upsertMany docs[{n}] is missing indexed field "
-                            f"'{missing[0]}' of index '{index}'",
-                        )
-                    rows = self._eq_lookup(table_def, table, index, [doc[f] for f in index_fields])
-                    if len(rows) > 1:
-                        raise RtDbError(
-                            ErrorCode.PRECONDITION_FAILED, "upsert matched multiple documents"
-                        )
-                    if rows:
-                        merged = apply_patch(
-                            table_def,
-                            rows[0].doc,
-                            _stamp_updated_at(table_def, doc, self._now()),
-                            now=self._now(),
-                        )
-                        self._do_update(table_def, table, rows[0].id, merged)
-                        many_ids.append(rows[0].id)
-                        many_inserted.append(False)
-                    else:
-                        many_ids.append(self._do_insert(table, table_def, doc))
-                        many_inserted.append(True)
-                return _upsert_many_result(many_ids, many_inserted), {table}
-            case _Patch(table=table, id=sid, fields=fields):
-                table_def = self._require_table(table)
-                self._do_patch(table_def, table, sid, fields)
-                return None, {table}
-            case _AdjustCounter(
-                table=table,
-                id=sid,
-                field=field,
-                delta=delta,
-                min=minimum,
-                max=maximum,
-                expected=expected,
-            ):
-                table_def = self._require_table(table)
-                self._do_adjust_counter(
-                    table_def, table, sid, field, delta, minimum, maximum, expected
-                )
-                return None, {table}
-            case _Replace(table=table, id=sid, doc=doc):
-                table_def = self._require_table(table)
-                self._do_replace(table_def, table, sid, doc)
-                return None, {table}
-            case _Delete(table=table, id=sid):
-                table_def = self._require_table(table)
-                touched: set[str] = set()
-                self._do_delete(table_def, table, sid, touched)
-                return None, touched
-            case _Undelete(table=table, id=sid):
-                # FM-33: restore a soft-deleted row. BAD_REQUEST on a table
-                # without `softDelete`; NOT_FOUND when absent; idempotent None
-                # result when already live.
-                table_def = self._require_table(table)
-                if not table_def.soft_delete:
-                    raise RtDbError(
-                        ErrorCode.BAD_REQUEST,
-                        f"table '{table}' does not declare softDelete",
-                    )
-                row = self._docs.get((table, sid))
-                if row is None:
-                    raise RtDbError(ErrorCode.NOT_FOUND, f"document '{sid}' not found")
-                if _is_live(row):
-                    # Idempotent: restoring a live row changes nothing.
-                    return None, set()
-                # Restoring re-enters the live-row unique predicate — the
-                # server's physical partial unique index makes the UPDATE
-                # collide; the harness enforces the same CONFLICT up front.
-                self._check_unique_indexes(table_def, table, row.doc, sid)
-                self._docs[(table, sid)] = replace(row, deleted_at=None, version=row.version + 1)
-                return None, {table}
-            case _ExpectVersion(table=table, id=sid, version=version):
-                table_def = self._require_table(table)
-                self._do_expect_version(table_def, table, sid, version)
-                return None, set()
-            case _ExpectFields(table=table, id=sid, expected=expected):
-                table_def = self._require_table(table)
-                row = self._docs.get((table, sid))
-                if row is None or not _is_live(row):
-                    raise RtDbError(ErrorCode.NOT_FOUND, f"document '{sid}' not found")
-                check_field_expectations(table_def, row.doc, expected)
-                return None, set()
-            case _ExpectAbsent(table=table, index=index, eq=eq_vals):
-                table_def = self._require_table(table)
-                rows = self._eq_lookup(table_def, table, index, eq_vals)
-                if rows:
-                    raise RtDbError(
-                        ErrorCode.PRECONDITION_FAILED,
-                        f"index '{index}' already has a matching document",
-                    )
-                return None, set()
-            case _ExpectNoMatch(table=table, filter=flt):
-                table_def = self._require_table(table)
-                _validate_filter(flt, table_def, allow_relative_time=True)
-                step_now = self._now()
-                if any(
-                    t == table
-                    and _is_live(row)
-                    and _eval_filter_expr(flt, row.doc, table_def.fields, step_now)
-                    for (t, _id), row in self._docs.items()
-                ):
-                    raise RtDbError(
-                        ErrorCode.PRECONDITION_FAILED, "filter matched an existing document"
-                    )
-                return None, set()
-            case _Upsert(
-                table=table,
-                index=index,
-                eq=eq_vals,
-                insert=insert_doc,
-                patch=patch_fields,
-            ):
-                table_def = self._require_table(table)
-                rows = self._eq_lookup(table_def, table, index, eq_vals)
-                if len(rows) > 1:
-                    raise RtDbError(
-                        ErrorCode.PRECONDITION_FAILED, "upsert matched multiple documents"
-                    )
-                if rows:
-                    row = rows[0]
-                    # FM-36: the update branch stamps the patch fields before
-                    # the merge (server `step_upsert`), so an upsert that never
-                    # mentions the field still restamps, and a client-supplied
-                    # value is overwritten.
-                    merged = apply_patch(
-                        table_def,
-                        row.doc,
-                        _stamp_updated_at(table_def, patch_fields, self._now()),
-                        now=self._now(),
-                    )
-                    self._do_update(table_def, table, row.id, merged)
-                    return _upsert_result(row.id, False), {table}
-                new_id = self._do_insert(table, table_def, insert_doc)
-                return _upsert_result(new_id, True), {table}
-            case _PatchByQuery(table=table, filter=flt, patch=patch_fields, limit=limit_opt):
-                table_def = self._require_table(table)
-                # `allow_relative_time=True` makes the by-query scan the one
-                # surface that accepts `olderThan` (server compile_scan_where).
-                _validate_filter(flt, table_def, allow_relative_time=True)
-                # The cutoff clock is read once per step execution (compile ==
-                # execution inside the committer turn on the server).
-                step_now = self._now()
-                # FM-33: soft-deleted rows are absent to the scan (the server
-                # selects through `compile_scan_where`'s `deleted_at IS NULL`).
-                matched = [
-                    row
-                    for (t, _id), row in self._docs.items()
-                    if t == table
-                    and _is_live(row)
-                    and _eval_filter_expr(flt, row.doc, table_def.fields, step_now)
-                ]
-                matched.sort(key=lambda r: (r.created_at, r.id))
-                limit = (
-                    MAX_BY_QUERY_ROWS if limit_opt is None else min(limit_opt, MAX_BY_QUERY_ROWS)
-                )
-                truncated = len(matched) > limit
-                take = matched[:limit]
-                for row in take:
-                    # FM-36: stamp per row with a fresh `now` (server
-                    # `step_patch_by_query`), exactly like a per-id patch.
-                    merged = apply_patch(
-                        table_def,
-                        row.doc,
-                        _stamp_updated_at(table_def, patch_fields, self._now()),
-                        now=self._now(),
-                    )
-                    self._do_update(table_def, table, row.id, merged)
-                return _patch_by_query_result(len(take), truncated), {table}
-            case _DeleteByQuery(table=table, filter=flt, limit=limit_opt):
-                table_def = self._require_table(table)
-                _validate_filter(flt, table_def, allow_relative_time=True)
-                step_now = self._now()
-                matched = [
-                    row
-                    for (t, _id), row in self._docs.items()
-                    if t == table
-                    and _is_live(row)
-                    and _eval_filter_expr(flt, row.doc, table_def.fields, step_now)
-                ]
-                matched.sort(key=lambda r: (r.created_at, r.id))
-                limit = (
-                    MAX_BY_QUERY_ROWS if limit_opt is None else min(limit_opt, MAX_BY_QUERY_ROWS)
-                )
-                truncated = len(matched) > limit
-                take = matched[:limit]
-                # FM-33: every selected row deletes through the same
-                # onDelete-aware path as a per-id delete (stamp on a
-                # softDelete table, else cascade). `visited` and the row
-                # budget are shared across the whole step: a row already
-                # handled by an earlier row's cascade is skipped, and one
-                # budget bounds every cascade the step starts.
-                visited: set[tuple[str, str]] = set()
-                cascade_rows = [0]
-                touched = {table}
-                for row in take:
-                    self._delete_row_cascade(table, row.id, visited, cascade_rows, False, touched)
-                return _delete_by_query_result(len(take), truncated), touched
-            case _Schedule(when=when, txn=nested_txn, external=step_external):
-                # FM-28: enqueue, don't execute — tick() fires the nested txn
-                # later through _execute_transaction (which re-validates it).
-                # Routes through schedule() so the when is validated (everyMs
-                # bounds) identically on the step and standalone paths. An
-                # external step enqueues an external job — tick() skips it the
-                # same way the server's claim_due/next_due exclude external rows.
-                return (
-                    _schedule_result(self.schedule(nested_txn, when, external=bool(step_external))),
-                    set(),
-                )
-            case _CancelSchedule(id=job_id):
-                # Unlike the standalone cancel op (NOT_FOUND on a miss), the
-                # step reports {"cancelled": bool} — a miss is not an error.
-                before = len(self._schedules)
-                self._schedules = [j for j in self._schedules if j.id != job_id]
-                return _cancel_schedule_result(len(self._schedules) < before), set()
-            case _StartWorkflow(spec=wf_spec):
-                # FM-29: insert the run on the open txn — the rollback snapshot
-                # above restores it if a later step fails, so a rolled-back txn
-                # leaves no orphan run.
-                return _start_workflow_result(self._insert_workflow(wf_spec)), set()
-            case _CancelWorkflow(id=wf_id):
-                # Same shape as cancelSchedule: {"cancelled": bool}, a miss or
-                # terminal run is a no-op False, not an error.
-                return _cancel_workflow_result(self.cancel_workflow(wf_id)), set()
+            case _Insert():
+                return self._exec_insert(step)
+            case _InsertMany():
+                return self._exec_insert_many(step)
+            case _UpsertMany():
+                return self._exec_upsert_many(step)
+            case _Patch():
+                return self._exec_patch(step)
+            case _AdjustCounter():
+                return self._exec_adjust_counter(step)
+            case _Replace():
+                return self._exec_replace(step)
+            case _Delete():
+                return self._exec_delete(step)
+            case _Undelete():
+                return self._exec_undelete(step)
+            case _ExpectVersion():
+                return self._exec_expect_version(step)
+            case _ExpectFields():
+                return self._exec_expect_fields(step)
+            case _ExpectAbsent():
+                return self._exec_expect_absent(step)
+            case _ExpectNoMatch():
+                return self._exec_expect_no_match(step)
+            case _Upsert():
+                return self._exec_upsert(step)
+            case _PatchByQuery():
+                return self._exec_patch_by_query(step)
+            case _DeleteByQuery():
+                return self._exec_delete_by_query(step)
+            case _Schedule():
+                return self._exec_schedule(step)
+            case _CancelSchedule():
+                return self._exec_cancel_schedule(step)
+            case _StartWorkflow():
+                return self._exec_start_workflow(step)
+            case _CancelWorkflow():
+                return self._exec_cancel_workflow(step)
             case _:
                 raise RtDbError(ErrorCode.INTERNAL, "unknown step op")
+
+    # ---- per-op step handlers (QA-002) --------------------------------------
+    # Each handler runs exactly the body its ``match`` arm ran before the
+    # decomposition, in the same order — the dispatch above is behavior-neutral.
+
+    def _exec_insert(self, step: _Insert) -> tuple[StepResult, set[str]]:
+        table = step.table
+        table_def = self._require_table(table)
+        new_id = self._do_insert(table, table_def, step.doc)
+        return _insert_result(new_id), {table}
+
+    def _exec_insert_many(self, step: _InsertMany) -> tuple[StepResult, set[str]]:
+        docs = step.docs
+        _check_bulk_len("insertMany", len(docs))
+        table = step.table
+        table_def = self._require_table(table)
+        ids = [self._do_insert(table, table_def, doc) for doc in docs]
+        return _insert_many_result(ids), {table}
+
+    def _exec_upsert_many(self, step: _UpsertMany) -> tuple[StepResult, set[str]]:
+        docs = step.docs
+        _check_bulk_len("upsertMany", len(docs))
+        table = step.table
+        index = step.index
+        table_def = self._require_table(table)
+        index_fields = _require_index(table_def, index).fields
+        many_ids: list[str] = []
+        many_inserted: list[bool] = []
+        for n, doc in enumerate(docs):
+            missing = [f for f in index_fields if f not in doc]
+            if missing:
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    f"upsertMany docs[{n}] is missing indexed field "
+                    f"'{missing[0]}' of index '{index}'",
+                )
+            rows = self._eq_lookup(table_def, table, index, [doc[f] for f in index_fields])
+            if len(rows) > 1:
+                raise RtDbError(ErrorCode.PRECONDITION_FAILED, "upsert matched multiple documents")
+            if rows:
+                merged = apply_patch(
+                    table_def,
+                    rows[0].doc,
+                    _stamp_updated_at(table_def, doc, self._now()),
+                    now=self._now(),
+                )
+                self._do_update(table_def, table, rows[0].id, merged)
+                many_ids.append(rows[0].id)
+                many_inserted.append(False)
+            else:
+                many_ids.append(self._do_insert(table, table_def, doc))
+                many_inserted.append(True)
+        return _upsert_many_result(many_ids, many_inserted), {table}
+
+    def _exec_patch(self, step: _Patch) -> tuple[StepResult, set[str]]:
+        table = step.table
+        table_def = self._require_table(table)
+        self._do_patch(table_def, table, step.id, step.fields)
+        return None, {table}
+
+    def _exec_adjust_counter(self, step: _AdjustCounter) -> tuple[StepResult, set[str]]:
+        table = step.table
+        table_def = self._require_table(table)
+        self._do_adjust_counter(
+            table_def, table, step.id, step.field, step.delta, step.min, step.max, step.expected
+        )
+        return None, {table}
+
+    def _exec_replace(self, step: _Replace) -> tuple[StepResult, set[str]]:
+        table = step.table
+        table_def = self._require_table(table)
+        self._do_replace(table_def, table, step.id, step.doc)
+        return None, {table}
+
+    def _exec_delete(self, step: _Delete) -> tuple[StepResult, set[str]]:
+        table = step.table
+        table_def = self._require_table(table)
+        touched: set[str] = set()
+        self._do_delete(table_def, table, step.id, touched)
+        return None, touched
+
+    def _exec_undelete(self, step: _Undelete) -> tuple[StepResult, set[str]]:
+        # FM-33: restore a soft-deleted row. BAD_REQUEST on a table
+        # without `softDelete`; NOT_FOUND when absent; idempotent None
+        # result when already live.
+        table = step.table
+        sid = step.id
+        table_def = self._require_table(table)
+        if not table_def.soft_delete:
+            raise RtDbError(ErrorCode.BAD_REQUEST, f"table '{table}' does not declare softDelete")
+        row = self._docs.get((table, sid))
+        if row is None:
+            raise RtDbError(ErrorCode.NOT_FOUND, f"document '{sid}' not found")
+        if _is_live(row):
+            # Idempotent: restoring a live row changes nothing.
+            return None, set()
+        # Restoring re-enters the live-row unique predicate — the
+        # server's physical partial unique index makes the UPDATE
+        # collide; the harness enforces the same CONFLICT up front.
+        self._check_unique_indexes(table_def, table, row.doc, sid)
+        self._docs[(table, sid)] = replace(row, deleted_at=None, version=row.version + 1)
+        return None, {table}
+
+    def _exec_expect_version(self, step: _ExpectVersion) -> tuple[StepResult, set[str]]:
+        table = step.table
+        table_def = self._require_table(table)
+        self._do_expect_version(table_def, table, step.id, step.version)
+        return None, set()
+
+    def _exec_expect_fields(self, step: _ExpectFields) -> tuple[StepResult, set[str]]:
+        table = step.table
+        sid = step.id
+        table_def = self._require_table(table)
+        row = self._docs.get((table, sid))
+        if row is None or not _is_live(row):
+            raise RtDbError(ErrorCode.NOT_FOUND, f"document '{sid}' not found")
+        check_field_expectations(table_def, row.doc, step.expected)
+        return None, set()
+
+    def _exec_expect_absent(self, step: _ExpectAbsent) -> tuple[StepResult, set[str]]:
+        table = step.table
+        table_def = self._require_table(table)
+        rows = self._eq_lookup(table_def, table, step.index, step.eq)
+        if rows:
+            raise RtDbError(
+                ErrorCode.PRECONDITION_FAILED,
+                f"index '{step.index}' already has a matching document",
+            )
+        return None, set()
+
+    def _exec_expect_no_match(self, step: _ExpectNoMatch) -> tuple[StepResult, set[str]]:
+        table = step.table
+        table_def = self._require_table(table)
+        flt = step.filter
+        _validate_filter(flt, table_def, allow_relative_time=True)
+        step_now = self._now()
+        if any(
+            t == table
+            and _is_live(row)
+            and _eval_filter_expr(flt, row.doc, table_def.fields, step_now)
+            for (t, _id), row in self._docs.items()
+        ):
+            raise RtDbError(ErrorCode.PRECONDITION_FAILED, "filter matched an existing document")
+        return None, set()
+
+    def _exec_upsert(self, step: _Upsert) -> tuple[StepResult, set[str]]:
+        table = step.table
+        index = step.index
+        table_def = self._require_table(table)
+        rows = self._eq_lookup(table_def, table, index, step.eq)
+        if len(rows) > 1:
+            raise RtDbError(ErrorCode.PRECONDITION_FAILED, "upsert matched multiple documents")
+        if rows:
+            row = rows[0]
+            # FM-36: the update branch stamps the patch fields before
+            # the merge (server `step_upsert`), so an upsert that never
+            # mentions the field still restamps, and a client-supplied
+            # value is overwritten.
+            merged = apply_patch(
+                table_def,
+                row.doc,
+                _stamp_updated_at(table_def, step.patch, self._now()),
+                now=self._now(),
+            )
+            self._do_update(table_def, table, row.id, merged)
+            return _upsert_result(row.id, False), {table}
+        new_id = self._do_insert(table, table_def, step.insert)
+        return _upsert_result(new_id, True), {table}
+
+    def _exec_patch_by_query(self, step: _PatchByQuery) -> tuple[StepResult, set[str]]:
+        table = step.table
+        table_def = self._require_table(table)
+        take, truncated = self._by_query_window(table_def, table, step.filter, step.limit)
+        for row in take:
+            # FM-36: stamp per row with a fresh `now` (server
+            # `step_patch_by_query`), exactly like a per-id patch.
+            merged = apply_patch(
+                table_def,
+                row.doc,
+                _stamp_updated_at(table_def, step.patch, self._now()),
+                now=self._now(),
+            )
+            self._do_update(table_def, table, row.id, merged)
+        return _patch_by_query_result(len(take), truncated), {table}
+
+    def _exec_delete_by_query(self, step: _DeleteByQuery) -> tuple[StepResult, set[str]]:
+        table = step.table
+        table_def = self._require_table(table)
+        take, truncated = self._by_query_window(table_def, table, step.filter, step.limit)
+        # FM-33: every selected row deletes through the same
+        # onDelete-aware path as a per-id delete (stamp on a
+        # softDelete table, else cascade). `visited` and the row
+        # budget are shared across the whole step: a row already
+        # handled by an earlier row's cascade is skipped, and one
+        # budget bounds every cascade the step starts.
+        visited: set[tuple[str, str]] = set()
+        cascade_rows = [0]
+        touched = {table}
+        for row in take:
+            self._delete_row_cascade(table, row.id, visited, cascade_rows, False, touched)
+        return _delete_by_query_result(len(take), truncated), touched
+
+    def _by_query_window(
+        self,
+        table_def: TableDef,
+        table_name: str,
+        flt: Any,
+        limit_opt: int | None,
+    ) -> tuple[list[StoredRow], bool]:
+        """Shared prefix of the two by-query steps: validate the filter, scan
+        the table's live rows under the filter (``allow_relative_time=True``
+        makes the by-query scan the one surface that accepts ``olderThan``,
+        server compile_scan_where; FM-33: soft-deleted rows are absent to the
+        scan), sort by ``(created_at, id)``, and cut the
+        :data:`MAX_BY_QUERY_ROWS`-capped window. The cutoff clock is read once
+        per step execution (compile == execution inside the committer turn on
+        the server). Returns ``(take, truncated)``."""
+        _validate_filter(flt, table_def, allow_relative_time=True)
+        step_now = self._now()
+        matched = [
+            row
+            for (t, _id), row in self._docs.items()
+            if t == table_name
+            and _is_live(row)
+            and _eval_filter_expr(flt, row.doc, table_def.fields, step_now)
+        ]
+        matched.sort(key=lambda r: (r.created_at, r.id))
+        limit = MAX_BY_QUERY_ROWS if limit_opt is None else min(limit_opt, MAX_BY_QUERY_ROWS)
+        truncated = len(matched) > limit
+        return matched[:limit], truncated
+
+    def _exec_schedule(self, step: _Schedule) -> tuple[StepResult, set[str]]:
+        # FM-28: enqueue, don't execute — tick() fires the nested txn
+        # later through _execute_transaction (which re-validates it).
+        # Routes through schedule() so the when is validated (everyMs
+        # bounds) identically on the step and standalone paths. An
+        # external step enqueues an external job — tick() skips it the
+        # same way the server's claim_due/next_due exclude external rows.
+        return (
+            _schedule_result(self.schedule(step.txn, step.when, external=bool(step.external))),
+            set(),
+        )
+
+    def _exec_cancel_schedule(self, step: _CancelSchedule) -> tuple[StepResult, set[str]]:
+        # Unlike the standalone cancel op (NOT_FOUND on a miss), the
+        # step reports {"cancelled": bool} — a miss is not an error.
+        before = len(self._schedules)
+        self._schedules = [j for j in self._schedules if j.id != step.id]
+        return _cancel_schedule_result(len(self._schedules) < before), set()
+
+    def _exec_start_workflow(self, step: _StartWorkflow) -> tuple[StepResult, set[str]]:
+        # FM-29: insert the run on the open txn — the rollback snapshot
+        # above restores it if a later step fails, so a rolled-back txn
+        # leaves no orphan run.
+        return _start_workflow_result(self._insert_workflow(step.spec)), set()
+
+    def _exec_cancel_workflow(self, step: _CancelWorkflow) -> tuple[StepResult, set[str]]:
+        # Same shape as cancelSchedule: {"cancelled": bool}, a miss or
+        # terminal run is a no-op False, not an error.
+        return _cancel_workflow_result(self.cancel_workflow(step.id)), set()
 
     def _do_insert(self, table_name: str, table_def: TableDef, doc: dict[str, Any]) -> str:
         # TTL default: stamp the declared field at insert only when the caller
