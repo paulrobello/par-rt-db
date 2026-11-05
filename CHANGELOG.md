@@ -533,6 +533,19 @@ alter observable behavior on upgrade.
 
 ### Fixed
 
+- **Schema pushes and the backup window can no longer starve the query pool
+  (2026-11-04 prod incident).** A push whose tables map already matches the
+  committed schema is now a true no-op (no DDL, no transaction, no history
+  row), concurrent pushes to one database coalesce into a single DDL pass
+  behind the committer, a server-wide DDL admission gate caps concurrent
+  schema-DDL passes at 2 with a 30 s bounded wait (`409 CONFLICT`, retryable)
+  and a 30 s `lock_timeout` inside gated DDL transactions, and the backup
+  drains the DDL slots before dumping (changed pushes defer with a retryable
+  409 while a backup runs; unchanged re-pushes still succeed). During a
+  simulated backup+ALTER collision ordinary mutations keep being served
+  (`schema_collision_test`). The 2026-11-04 03:00Z incident (2,153
+  pool-timeouts, ~9 minutes of fleet-wide 500s across kanban/mesh) traced to
+  exactly this collision.
 - **Storage quota and admin stats now report one accounting basis (server —
   FEATURE_MATRIX #26).** Enforcement measured user data + blobs while also
   charging engine bookkeeping: the change log (`changes`/`change_head`) and
