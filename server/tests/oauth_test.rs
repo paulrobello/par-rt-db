@@ -185,7 +185,7 @@ async fn login_flow(addr: SocketAddr, origin: &str) -> String {
             .expect("csp header")
             .to_str()
             .expect("utf8"),
-        "default-src 'none'; script-src 'unsafe-inline'"
+        "default-src 'none'; script-src 'sha256-Wn5wULmWNAS84lRO4JMQ9jE/kYWz1ADWjWy4z2jjosA='"
     );
 
     // SEC-001 phase 2: the token is in the Set-Cookie header, not the body.

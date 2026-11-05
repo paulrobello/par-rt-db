@@ -945,6 +945,9 @@ struct AppleCallbackForm {
 /// The popup-closing HTML shared by every delivery mode. Nothing is
 /// interpolated (no `origin`, no token) — SEC-005 stays retired: the token
 /// never appears in the body regardless of how the response carries it.
+/// SEC-003: the close responses' CSP allows ONLY this exact script, via a
+/// sha256 hash source — changing the script means recomputing the hash in
+/// both close-response builders below.
 fn callback_close_html() -> &'static str {
     "<!doctype html><html><head><meta charset=\"utf-8\"><title>Signed in</title>\
      </head><body><script>window.close();</script>\
@@ -959,7 +962,9 @@ fn callback_close_response(token: &str, secure: bool) -> Response {
     let mut response = Html(callback_close_html()).into_response();
     response.headers_mut().insert(
         HeaderName::from_static("content-security-policy"),
-        HeaderValue::from_static("default-src 'none'; script-src 'unsafe-inline'"),
+        HeaderValue::from_static(
+            "default-src 'none'; script-src 'sha256-Wn5wULmWNAS84lRO4JMQ9jE/kYWz1ADWjWy4z2jjosA='",
+        ),
     );
     match crate::auth::cookie::set_session_cookie(token, secure) {
         Ok(cookie) => {
@@ -991,7 +996,9 @@ fn bearer_callback_close_response() -> Response {
     let mut response = Html(callback_close_html()).into_response();
     response.headers_mut().insert(
         HeaderName::from_static("content-security-policy"),
-        HeaderValue::from_static("default-src 'none'; script-src 'unsafe-inline'"),
+        HeaderValue::from_static(
+            "default-src 'none'; script-src 'sha256-Wn5wULmWNAS84lRO4JMQ9jE/kYWz1ADWjWy4z2jjosA='",
+        ),
     );
     response
         .headers_mut()
