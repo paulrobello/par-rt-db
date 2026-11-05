@@ -26,8 +26,12 @@ Repository = "https://github.com/paulrobello/par-rt-db"
 Changelog = "https://github.com/paulrobello/par-rt-db/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-ws = ["websockets>=17.4"]  # added in Plan 2
-http = ["httpx>=0.28.1"]     # sync + async HTTP/admin/storage client (http_client + admin + aio_http_client)
+# SEC-005: runtime deps carry upper bounds so a future breaking release
+# cannot be resolved into a fresh install ahead of a client fix (pydantic's
+# `<3` pattern). httpx is 0.x, where semver permits breaking minor bumps, so
+# its cap sits at the tested minor; websockets caps at the next major.
+ws = ["websockets>=17.4,<18"]  # added in Plan 2
+http = ["httpx>=0.28.1,<0.29"]  # sync + async HTTP/admin/storage client (http_client + admin + aio_http_client)
 aio = ["par-rt-db[http]"]    # alias for [http] (ARC-124): async surface no longer needs a separate dep
 
 [dependency-groups]

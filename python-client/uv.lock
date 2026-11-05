@@ -391,10 +391,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "httpx", marker = "extra == 'http'", specifier = ">=0.28.1" },
+    { name = "httpx", marker = "extra == 'http'", specifier = ">=0.28.1,<0.29" },
     { name = "par-rt-db", extras = ["http"], marker = "extra == 'aio'" },
     { name = "pydantic", specifier = ">=2.14.2,<3" },
-    { name = "websockets", marker = "extra == 'ws'", specifier = ">=17.4" },
+    { name = "websockets", marker = "extra == 'ws'", specifier = ">=17.4,<18" },
 ]
 provides-extras = ["ws", "http", "aio"]
 
