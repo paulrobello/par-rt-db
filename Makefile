@@ -30,7 +30,7 @@ SWIFT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),$(1),$(SWIFT_SKIP))
 SWIFT_CLIENT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(1),$(SWIFT_SKIP))
 
 .PHONY: clean build test lint fmt fmt-check typecheck checkall checkall-cached dev-db-up dev-db-down dev-db-clean dev-db-clean-check \
-	pre-commit pre-commit-update ts-client-build ts-client-install dashboard-install \
+	pre-commit pre-commit-update ts-dist-preflight ts-client-build ts-client-install dashboard-install \
 	dashboard-test \
 	python-client-install python-client-test python-client-lint python-client-fmt \
 	python-client-typecheck python-client-checkall rust-client-check-features rtdb-cli deploy \
@@ -104,7 +104,7 @@ lint:
 # clippy over the identical scope, and clippy is check + lints, so it already
 # fails on everything check would fail on. What remains is the non-Rust
 # typecheckers plus the Swift build, which clippy does not cover.
-typecheck: ts-client-build
+typecheck: ts-dist-preflight ts-client-build
 	cd ts-client && bun run typecheck
 	cd dashboard && bun run typecheck
 	cd python-client && uv run pyright
@@ -446,7 +446,17 @@ hostname-leak-check:
 		fi; \
 	fi
 
-checkall: env-drift-check dockerfile-stub-check backup-persistence-check hostname-leak-check cli-docs-check docs-api fmt-check lint typecheck test rust-client-check-features publish-check dev-db-clean-check
+# ARC-003: preflight for the dashboard's gitignored SDK dependency. The
+# dashboard resolves @par-rt-db/client from ts-client/dist; when it is missing
+# (fresh checkout/worktree) or stale, the gate used to fail deep inside
+# dashboard typecheck with a missing-module error that reads like a code
+# defect. This fails first, naming the actual cause and fix. Cheap (stat only)
+# and placed before every other leg; `typecheck`'s ts-client-build prerequisite
+# then rebuilds it so the same gate run proceeds on a current SDK.
+ts-dist-preflight:
+	./scripts/ts-dist-preflight.sh
+
+checkall: ts-dist-preflight env-drift-check dockerfile-stub-check backup-persistence-check hostname-leak-check cli-docs-check docs-api fmt-check lint typecheck test rust-client-check-features publish-check dev-db-clean-check
 	@mkdir -p target && echo "$(GATE_KEY)" > $(GATE_STAMP)
 
 # Content-addressed gate reuse for deploys: `checkall` stamps the gate key
