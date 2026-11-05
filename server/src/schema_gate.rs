@@ -103,8 +103,10 @@ impl SchemaGate {
     /// backup holds the gate; otherwise waits up to [`DDL_PERMIT_WAIT`] for a
     /// slot. The flag check before the acquire is race-safe: a backup that
     /// sets the flag after this check is still draining permits, so this
-    /// pass's acquire blocks until the backup completes — the pass runs after
-    /// the dump, never during it.
+    /// pass's acquire blocks until the backup completes — it runs after the
+    /// dump, never during it. (Sole exception: a backup whose drain timed out
+    /// is running without holding the permits; the cap still bounds that
+    /// pass to one of 2 connections — see [`BACKUP_DRAIN_WAIT`].)
     pub async fn begin_ddl(&self) -> Result<tokio::sync::SemaphorePermit<'_>, RtDbError> {
         if self.backup_in_flight.load(Ordering::Acquire) {
             tracing::warn!(
