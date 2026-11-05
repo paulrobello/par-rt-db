@@ -86,15 +86,15 @@ commit, and it spans all ten packages (`core`, `server`, `ts-client`,
 `rust-client`, `python-client`, `swift-client`, `go-client`, `kotlin-client`,
 `dashboard`, `cli`).
 
-Its eight stages, what each one catches, and every other make target are
+Its stages, what each one catches, and every other make target are
 documented once in the root README under
 [Verification gates](README.md#verification-gates). That table is the canonical
 description — read it there rather than trusting a summary here.
 
-Two stages exist because the rest of the gate cannot see what they check:
-`env-drift-check` catches a `RTDB_*` var the compose file never forwards, and
-`dockerfile-stub-check` catches a `[[test]]` with no Dockerfile stub, which
-would otherwise break only `make deploy`.
+Several stages exist because the rest of the gate cannot see what they check —
+for example `env-drift-check` catches a `RTDB_*` var the compose file never
+forwards, and `dockerfile-stub-check` catches a `[[test]]` with no Dockerfile
+stub, which would otherwise break only `make deploy`.
 
 Never `--no-verify` past the gate. If you do, fix the gate immediately and push
 the fix before anything else.
@@ -413,8 +413,8 @@ failing test.
   layer `touch`es a placeholder for every `[[test]]` declared by a non-server
   workspace member. Add a test target to `rust-client/Cargo.toml` (or another
   member) without adding its stub and `make deploy` fails at cargo's manifest
-  parse, while `make checkall` stays green — which is why `checkall` now runs
-  `dockerfile-stub-check` as its second stage. Run `make dockerfile-stub-check`
+  parse, while `make checkall` stays green — which is why `checkall` runs
+  `dockerfile-stub-check`. Run `make dockerfile-stub-check`
   after touching any member's test targets; its output names the exact stub
   line to add.
 - **Storage bypasses the committer** — `storage::put` writes directly to the
@@ -452,9 +452,9 @@ Before requesting review:
 - [ ] No real secrets in the diff. `pre-commit` (gitleaks) is installed and passes.
 - [ ] Commit messages follow Conventional Commits.
 - [ ] Relevant docs (`README`, `FEATURE_MATRIX`, `CHANGELOG`, package READMEs) are updated.
-- [ ] If the change adds or renames an env var, `.env.example`, `docker-compose.yml`'s `environment:` block (the allowlist that actually feeds the container), and the root README Configuration table are updated — `make env-drift-check` (first stage of `checkall`) guards this.
+- [ ] If the change adds or renames an env var, `.env.example`, `docker-compose.yml`'s `environment:` block (the allowlist that actually feeds the container), and the root README Configuration table are updated — `make env-drift-check` (part of `make checkall`) guards this.
 - [ ] If the change adds a route, the root README Endpoints table and `server/README.md` are updated.
-- [ ] If the change adds or modifies a query terminal, `FilterExpr` variant, or mutation-step result shape, a case covering it is added to `wire-corpus/golden-vector.json` (the cross-client parity fixture consumed by all five golden-vector suites). The corpus is the source of truth for cross-client agreement; an uncovered terminal is a regression risk for the other four engines.
+- [ ] If the change adds or modifies a query terminal, `FilterExpr` variant, or mutation-step result shape, a case covering it is added to `wire-corpus/golden-vector.json` (the cross-client parity fixture consumed by all seven golden-vector runners). The corpus is the source of truth for cross-client agreement; an uncovered terminal is a regression risk for the other six engines.
 - [ ] If the change alters any server behavior a client engine mirrors — step results, error codes, defaults, visibility (soft delete/TTL), cursor semantics — a case pinning the new behavior is added (or updated) in `wire-corpus/semantics/` per the authoring rule in [`wire-corpus/README.md`](wire-corpus/README.md).
 - [ ] If a property test (`server/tests/proptest_parity.rs`) found a server-vs-engine divergence, the fix also ships the minimized counterexample as a `wire-corpus/semantics/` case (so all six client engines inherit it, not just the rust one — unmirrored engines get a loud `skip` until they do) and commits the proptest seed under `server/proptest-regressions/`.
 

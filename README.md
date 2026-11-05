@@ -1761,17 +1761,20 @@ run.
 
 | Stage | What it checks | Standalone target |
 | --- | --- | --- |
-| 1. `env-drift-check` | Every `RTDB_*` var read by the server or documented in `.env.example` is forwarded to the container by `docker-compose.yml`'s `environment:` block. The block is an explicit allowlist, so a `.env`-only key silently does nothing. | `make env-drift-check` |
-| 2. `dockerfile-stub-check` | Every `[[test]]` declared by a non-server workspace member has a matching placeholder in the Dockerfile's dependency-caching layer. Without it `make deploy` fails at cargo's manifest parse — a break the rest of `checkall` cannot see. | `make dockerfile-stub-check` |
-| 3. `backup-persistence-check` | The rendered `docker-compose.yml` mounts a persistent volume at `/backups` for the server, so scheduled dumps survive a container restart. | `make backup-persistence-check` |
-| 4. `hostname-leak-check` | Runs when a local, gitignored `.hostname-leak-patterns` file exists (skips silently in CI, where it doesn't): no tracked file may match the compiled hostname patterns, so a scrubbed hostname cannot quietly reappear in a doc or commit. | `make hostname-leak-check` |
-| 5. `cli-docs-check` | `cli/README.md` matches what `gen-cli-docs` regenerates, so the CLI reference cannot drift from the CLI. | `make cli-docs-check` |
-| 6. `docs-api` | API docs regenerate cleanly for every SDK (`rust-client-doc`, `ts-client-doc`, `python-client-doc`, `swift-client-doc`), with warnings denied, so doc comments cannot rot. | `make docs-api` |
-| 7. `fmt-check` | Formatting across all nine packages. | `make fmt-check` |
-| 8. `lint` | Clippy under `-D warnings`, biome, ruff, `go vet`, swiftlint `--strict`. | `make lint` |
-| 9. `typecheck` | `tsc`, pyright, `go vet`, `swift build`. | `make typecheck` |
-| 10. `test` | The full suite across all nine packages, against the dev Postgres. | `make test` |
-| 11. `rust-client-check-features` | The rust-client library **and** its test targets compile under every meaningful feature combination, not just `--all-features`. | `make rust-client-check-features` |
+| 1. `ts-dist-preflight` | `ts-client/dist` (gitignored) exists and is not stale, so the gate fails up front naming the fix (`make ts-client-build`) instead of failing later at dashboard typecheck with a missing-module error that reads like a code defect. | `make ts-dist-preflight` |
+| 2. `env-drift-check` | Every `RTDB_*` var read by the server or documented in `.env.example` is forwarded to the container by `docker-compose.yml`'s `environment:` block. The block is an explicit allowlist, so a `.env`-only key silently does nothing. | `make env-drift-check` |
+| 3. `dockerfile-stub-check` | Every `[[test]]` declared by a non-server workspace member has a matching placeholder in the Dockerfile's dependency-caching layer. Without it `make deploy` fails at cargo's manifest parse — a break the rest of `checkall` cannot see. | `make dockerfile-stub-check` |
+| 4. `backup-persistence-check` | The rendered `docker-compose.yml` mounts a persistent volume at `/backups` for the server, so scheduled dumps survive a container restart. | `make backup-persistence-check` |
+| 5. `hostname-leak-check` | Runs when a local, gitignored `.hostname-leak-patterns` file exists (skips silently in CI, where it doesn't): no tracked file may match the compiled hostname patterns, so a scrubbed hostname cannot quietly reappear in a doc or commit. | `make hostname-leak-check` |
+| 6. `cli-docs-check` | `cli/README.md` matches what `gen-cli-docs` regenerates, so the CLI reference cannot drift from the CLI. | `make cli-docs-check` |
+| 7. `docs-api` | API docs regenerate cleanly for every SDK (`rust-client-doc`, `ts-client-doc`, `python-client-doc`, `swift-client-doc`), with warnings denied, so doc comments cannot rot. | `make docs-api` |
+| 8. `fmt-check` | Formatting across all ten packages. | `make fmt-check` |
+| 9. `lint` | Clippy under `-D warnings`, biome, ruff, `go vet`, swiftlint `--strict`. | `make lint` |
+| 10. `typecheck` | `tsc`, pyright, `go vet`, `swift build`. | `make typecheck` |
+| 11. `test` | The full suite across all ten packages, against the dev Postgres. | `make test` |
+| 12. `rust-client-check-features` | The rust-client library **and** its test targets compile under every meaningful feature combination, not just `--all-features`. | `make rust-client-check-features` |
+| 13. `publish-check` | Release artifacts validate in dry-run — crates.io packaging, the npm tarball, the Python distributions — and the versioned manifests agree (the lockstep check). The release workflow's verify job reruns it with `--require-tag` on a tag checkout. | `make publish-check` |
+| 14. `dev-db-clean-check` | Proves `dev-db-clean.sql`'s merge-fixture section on the live dev Postgres: seeds throwaway pattern-matching rows plus a non-matching sentinel, runs the real clean, asserts zero fixtures remain and the sentinel survives. Runs after `test`, so the dev db is guaranteed up. | `make dev-db-clean-check` |
 
 Never `--no-verify` past the gate. If you do, fix the gate before anything
 else.
