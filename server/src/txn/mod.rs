@@ -22,7 +22,7 @@ use sqlx::PgPool;
 use tracing::Instrument;
 
 use crate::auth::{PrincipalCtx, authorize_table};
-use crate::db::{now_ms, quiesce_key, validate_db_name};
+use crate::db::now_ms;
 use crate::ddl::pg_schema;
 use crate::dsl::StepTableExt;
 use crate::error::{ErrorCode, RtDbError};
@@ -386,6 +386,8 @@ impl Default for MutatePreamble<'_> {
 /// idempotency cache — the checks `handle_mutate` used to pay as separate
 /// pre-transaction round trips. A cached result rolls back and replays before
 /// the freeze check; `read_only = true` rolls back and returns `READ_ONLY`.
+/// All pre-execution guards (static caps, quiesce admission, the combined
+/// preamble statement) live in the `admission` submodule (QA-001).
 // ENH-048: eight params — the preamble rides alongside `idem`; each is
 // independently needed (same `#[allow]` shape as `publish_taps_skip_side_writes`).
 #[allow(clippy::too_many_arguments)]
@@ -406,139 +408,47 @@ pub async fn execute_txn_with_side(
     // guard is `!Send` and would poison this `Send` future across the `.await`s.
     let span = tracing::info_span!("txn.execute", db, steps = count_steps(txn));
     async {
-        validate_db_name(db)?;
+        admission::validate_static_admission(txn, db)?;
         // Task 5: `ctx` carries `user_id` + `email`; the row-auth helpers below use
         // only the uid, so derive the legacy `owner: Option<&str>` view once and
         // thread it unchanged — byte-identical ownerField/collaboratorsField behavior.
         let owner = ctx.user_id.as_deref();
-        let deadline = par_rt_db_core::engine::transaction_deadline(txn)
-            .map_err(RtDbError::bad_request)?;
-
-        if count_steps(txn) > MAX_STEPS {
-            return Err(RtDbError::bad_request(format!(
-                "transaction exceeds maximum of {MAX_STEPS} steps  \
-            (counted recursively, including scheduled txns)"
-            )));
-        }
-
-        // SEC-104: compose the per-step caps into an aggregate affected-document
-        // budget and a by-query step-count cap, both checked BEFORE any step
-        // executes so an over-cap txn commits nothing. Commit 82650c2 introduced
-        // by-query steps AND raised MAX_STEPS in the same change; without these
-        // composite caps the worst-case committer turn was ~1,000,000 rows — a
-        // single `/api/mutate` could stall the single-writer for a database and
-        // starve every other writer/subscription on it. The by-query step cap is
-        // the sharp bound; the affected-row budget is the blast-radius bound.
-        let by_query_steps = txn
-            .steps
-            .iter()
-            .filter(|s| {
-                matches!(
-                    s,
-                    Step::PatchByQuery { .. }
-                        | Step::DeleteByQuery { .. }
-                        | Step::ExpectNoMatch { .. }
-                )
-            })
-            .count();
-        if by_query_steps > MAX_BY_QUERY_STEPS_PER_TXN {
-            return Err(RtDbError::bad_request(format!(
-                "transaction has {by_query_steps} by-query steps,  \
-            exceeding the limit of {MAX_BY_QUERY_STEPS_PER_TXN}"
-            )));
-        }
-        let worst = worst_case_affected(txn);
-        if worst > MAX_AFFECTED_ROWS_PER_TXN {
-            return Err(RtDbError::bad_request(format!(
-                "transaction could affect up to {worst} documents,  \
-            exceeding the limit of {MAX_AFFECTED_ROWS_PER_TXN}"
-            )));
-        }
+        let deadline =
+            par_rt_db_core::engine::transaction_deadline(txn).map_err(RtDbError::bad_request)?;
 
         let pg_schema_name = pg_schema(db);
         let mut results = Vec::with_capacity(txn.steps.len());
         let mut write_set = WriteSet::default();
 
-        let admission_epoch = preamble.admission_epoch;
-        let admission_generation = if preamble.check_quiesce {
-            let (quiesced, generation) = crate::db::quiesce_admission(pool, db).await?;
-            if quiesced {
-                return Err(RtDbError::read_only());
-            }
-            Some(generation)
-        } else {
-            None
-        };
+        let admission_generation =
+            admission::check_quiesce_admission(pool, db, preamble.check_quiesce).await?;
 
         let mut tx = pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(quiesce_key(db))
-            .execute(&mut *tx)
-            .await?;
-        if let Some(epoch) = admission_epoch {
-            crate::db::ensure_admission_epoch(&mut tx, db, epoch).await?;
-        }
-        // SEC-104: bound every statement in this committer turn. A pathological
-        // scan (e.g. a filter over an unindexed field that escapes the row budget)
-        // aborts this transaction rather than stalling the single-writer for the
-        // whole database. `set_config(..., true)` has the same transaction scope as
-        // `SET LOCAL` — it reverts on commit/rollback, never leaking to other pool
-        // users. The value is a const, never user input.
-        //
-        // ENH-048: the freeze flag and the idempotency lookup ride this first
-        // statement instead of costing separate pre-transaction round trips.
-        // Ordering is the documented ruling: a cached result is an idempotent
-        // replay (rollback, return the cached results) BEFORE the freeze check;
-        // only a non-replayed write sees `READ_ONLY`. Both paths roll back —
-        // nothing commits. System arms (`check_freeze = false`, no key) fall
-        // back to the plain set_config so the combined query is not wasted on
-        // subselects they would ignore.
-        if preamble.idem_key.is_none() && !preamble.check_freeze && admission_generation.is_none() {
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "SET LOCAL statement_timeout = {STATEMENT_TIMEOUT_MS}"
-            )))
-            .execute(&mut *tx)
-            .await?;
-        } else {
-            let combined = format!(
-                "SELECT set_config('statement_timeout', $1, true), \
-                 COALESCE((SELECT read_only FROM rtdb_auth.databases WHERE name = $2), FALSE), \
-                 COALESCE((SELECT quiesced FROM rtdb_auth.databases WHERE name = $2), FALSE), \
-                 COALESCE((SELECT quiesce_generation FROM rtdb_auth.databases WHERE name = $2), 0), \
-                 (SELECT result FROM \"{pg_schema_name}\".mutation_cache_v2 \
-                  WHERE mut_id = $3 AND expires_at > $4)"
-            );
-            let row: (String, bool, bool, i64, Option<serde_json::Value>) = sqlx::query_as(sqlx::AssertSqlSafe(combined))
-                .bind(STATEMENT_TIMEOUT_MS.to_string())
-                .bind(db)
-                .bind(preamble.idem_key)
-                .bind(now_ms())
-                .fetch_one(&mut *tx)
-                .await?;
-            if let Some(value) = row.4 {
-                let results: Vec<serde_json::Value> = serde_json::from_value(value).map_err(|err| {
-                    tracing::error!(error = %err, db, "failed to deserialize cached mutation result");
-                    RtDbError::internal("failed to read cached mutation result")
-                })?;
+        match admission::run_mutate_preamble(
+            &mut tx,
+            db,
+            pg_schema_name.as_str(),
+            preamble,
+            admission_generation,
+        )
+        .await?
+        {
+            // Idempotent replay: a previous execution already committed under
+            // this key — roll back and return the stored results verbatim.
+            TxnAdmission::Replay(results) => {
                 tx.rollback().await?;
                 return Ok(TxnOutcome {
                     results,
                     write_set: WriteSet::default(),
                 });
             }
-            // The freeze exemption is client-plane only (ENH-048): system
-            // arms (`check_freeze = false`) ignore `read_only` exactly as
-            // they did when this branch was reserved for client arms. The
-            // quiesce fence is the cutover barrier and stops system writes
-            // too, as does any generation change behind the admission's back.
-            let frozen_client_write = row.1 && preamble.check_freeze;
-            if frozen_client_write
-                || row.2
-                || admission_generation.is_some_and(|generation| row.3 != generation)
-            {
+            // Fenced off (read-only freeze / quiesce / generation change):
+            // rolled back, nothing commits.
+            TxnAdmission::ReadOnly => {
                 tx.rollback().await?;
                 return Err(RtDbError::read_only());
             }
+            TxnAdmission::Admitted => {}
         }
 
         let mut sctx = StepCtx {
@@ -557,7 +467,11 @@ pub async fn execute_txn_with_side(
         for step in &txn.steps {
             crate::auth::host_policy::operation(sctx.ctx, step)?;
             if let Some(table) = step.table() {
-                crate::auth::host_policy::schema_contract(sctx.ctx, table, sctx.schema.table(table)?)?;
+                crate::auth::host_policy::schema_contract(
+                    sctx.ctx,
+                    table,
+                    sctx.schema.table(table)?,
+                )?;
             }
             // ENH-005 Task 4: gate each step against the machine-token table
             // allowlist BEFORE any work. A scoped token cannot write a forbidden
@@ -609,9 +523,11 @@ pub async fn execute_txn_with_side(
                 Step::ExpectVersion { table, id, version } => {
                     step_expect_version(&mut sctx, table, id, *version).await?
                 }
-                Step::ExpectFields { table, id, expected } => {
-                    step_expect_fields(&mut sctx, table, id, expected).await?
-                }
+                Step::ExpectFields {
+                    table,
+                    id,
+                    expected,
+                } => step_expect_fields(&mut sctx, table, id, expected).await?,
                 Step::ExpectBefore { .. } => sctx.results.push(serde_json::Value::Null),
                 Step::ExpectAbsent { table, index, eq } => {
                     step_expect_absent(&mut sctx, table, index, eq).await?
@@ -727,11 +643,14 @@ pub async fn execute_txn(
     .await
 }
 
+mod admission;
 mod auth;
 mod cascade;
 mod row_ops;
 mod stamp;
 mod steps;
+
+use admission::TxnAdmission;
 
 pub(crate) use auth::{
     authorize_spec_tables, authorize_txn_tables, check_owner, check_owner_doc, doc_visible_to,
