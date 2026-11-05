@@ -58,7 +58,7 @@ import type {
   WorkflowStatus,
 } from "../protocol.js";
 import type { RtQuery } from "../query.js";
-import type { SchemaDefinition } from "../schema.js";
+import type { AnySchema } from "../schema.js";
 import { checkFieldExpectations, validateFieldGuardShapes } from "./field-guard.js";
 import {
   applyMigrationDirective,
@@ -569,7 +569,7 @@ export interface InMemoryRtDbClientOptions {
   presenceRooms?: PresenceRooms;
 }
 
-function toSchemaJson(schema: SchemaDefinition<any> | SchemaJson): SchemaJson {
+function toSchemaJson(schema: AnySchema | SchemaJson): SchemaJson {
   return "toJSON" in schema && typeof schema.toJSON === "function"
     ? schema.toJSON()
     : (schema as SchemaJson);
@@ -1224,7 +1224,7 @@ export class InMemoryRtDbClient {
    * empty doc stores only for brand-new tables. Every push validates TTL and
    * index-field rules (`validateSchema`) and `onDelete` declarations (FM-33),
    * both SCHEMA_VIOLATION, like the server does. */
-  pushSchema(schema: SchemaDefinition<any> | SchemaJson): void {
+  pushSchema(schema: AnySchema | SchemaJson): void {
     // Cloned because `grandfatherTrgm` mutates in place and `toJSON()` hands
     // back the builder's own index objects — a shared `defineSchema(...)`
     // fixture must not pick up one client's grandfathered flag.
