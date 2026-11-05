@@ -55,6 +55,10 @@ pub struct PresenceManager {
     pool: Option<sqlx::PgPool>,
 }
 
+/// Construction, per-shard state access, validation, and the membership
+/// mutation ops driven by the `/sync` connection lifecycle: `join`,
+/// `update_state`, `leave`, `remove_conn` (disconnect), `drop_db`
+/// (delete-db), and the dirty-room mark shared by every mutation op.
 impl PresenceManager {
     /// Construct a presence manager. The last three args wire ENH-022 Stage 3
     /// cross-instance gossip: `multi_instance` gates the whole layer (false ⇒
@@ -314,7 +318,15 @@ impl PresenceManager {
             .await
             .insert((db.to_string(), room.to_string()));
     }
+}
 
+/// ENH-022 Stage 3 — cross-instance gossip. Everything in this block is gated
+/// on `multi_instance` (single-instance deploys never enter these paths) and
+/// performs NO document write and NO committer interaction: gossip adds only
+/// `pg_notify('rtdb_presence', …)` publishes, in-memory shadow-map writes on
+/// the receive side, and the local++peer union the multi-instance broadcast
+/// consumes.
+impl PresenceManager {
     /// ENH-022 Stage 3: snapshot the LOCAL members of `(db, room)` for a
     /// gossip publish. This is the same projection `flush_once` uses for the
     /// local half of the union — factored out so the publish and the broadcast
@@ -464,6 +476,92 @@ impl PresenceManager {
         }
     }
 
+    /// ENH-022 Stage 3: build the union of local members ++ peer members for
+    /// the multi-instance broadcast. Local members always win the cap (a local
+    /// member is never dropped in favor of a remote one — that would make a
+    /// client's own presence invisible to itself). Peer members are
+    /// namespaced (`"{instance_id}:{conn_id}"`) and deduped by that
+    /// namespaced id. The union is capped at `max_room_size` total; peer
+    /// members beyond the cap are dropped (over-approximate freely,
+    /// never under-approximate — a dropped remote member reappears on
+    /// the next beat, which is the resync contract).
+    ///
+    /// Determinism: locals first (in their iteration order), then peers
+    /// sorted by (instance_id, connection_id) so two flushes of the
+    /// same state produce identical wire bytes.
+    fn build_union(
+        &self,
+        local_members: Vec<PresenceMember>,
+        peers_for_room: Vec<(String, Vec<PresenceMember>)>,
+    ) -> Vec<PresenceMember> {
+        let cap = self.config.max_room_size;
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(local_members.len());
+        let mut union: Vec<PresenceMember> = Vec::with_capacity(local_members.len());
+        for m in local_members.into_iter() {
+            if seen.insert(m.connection_id.clone()) {
+                union.push(m);
+            }
+            if union.len() >= cap {
+                return union;
+            }
+        }
+        // Collect + namespace peer members, then sort by namespaced id so the
+        // order is stable across flushes for the same peer state.
+        let mut peer_members: Vec<PresenceMember> = Vec::new();
+        for (instance_id, members) in peers_for_room {
+            for mut m in members {
+                m.connection_id = format!("{instance_id}:{}", m.connection_id);
+                peer_members.push(m);
+            }
+        }
+        peer_members.sort_by(|a, b| a.connection_id.cmp(&b.connection_id));
+        for m in peer_members {
+            if seen.insert(m.connection_id.clone()) {
+                union.push(m);
+            }
+            if union.len() >= cap {
+                break;
+            }
+        }
+        union
+    }
+
+    /// ENH-022 Stage 3: republish every populated room's local snapshot to
+    /// peers. Called by the beat ticker in `run_flush_task`. Gated on
+    /// `multi_instance` at the call site (the beat ticker only exists then),
+    /// but re-checked here for safety. Best-effort: a publish failure is
+    /// logged in `gossip_publish` and the next beat retries.
+    async fn beat_all_rooms(&self) {
+        if !self.multi_instance {
+            return;
+        }
+        // Collect (db, room) for every populated local room under the brief
+        // outer lock, then publish each outside the lock. A room that becomes
+        // empty between collect and publish publishes an empty snapshot,
+        // which is correct (peers see the room emptied).
+        let rooms: Vec<(String, String)> = {
+            let dbs = self.dbs.lock().await;
+            let mut out = Vec::new();
+            for (db, shard) in dbs.iter() {
+                let p = shard.lock().await;
+                for room in p.rooms.keys() {
+                    out.push((db.clone(), room.clone()));
+                }
+            }
+            out
+        };
+        for (db, room) in rooms {
+            self.gossip_publish(&db, &room).await;
+        }
+    }
+}
+
+/// Read-only inspection: the test-facing member snapshot, the
+/// `rtdb_presence_rooms` / `rtdb_presence_sessions` gauge counts, and the
+/// per-room admin inspector rows (`GET /admin/presence`). No mutation, no
+/// broadcast side effects.
+impl PresenceManager {
     /// Read-only member list for a room (test helper + Task 4 broadcast input).
     pub async fn snapshot(&self, db: &str, room: &str) -> Vec<PresenceMember> {
         let shard = self.shard(db).await;
@@ -617,7 +715,13 @@ impl PresenceManager {
         }
         rooms
     }
+}
 
+/// Sweep & broadcast — the per-tick work the flush task drives: expire armed
+/// TTLs (`expire_once`), broadcast one coalesced snapshot/delta per dirty
+/// room (`flush_once`), and `run_flush_task`, the periodic driver tying
+/// sweep, flush, and the gossip beat together.
+impl PresenceManager {
     /// Clear every session whose armed TTL has elapsed: set its `state` to
     /// `null`, clear its expiry, mark each affected room dirty, and count one
     /// expiry per session. Called at the top of every flush-tick (before
@@ -809,57 +913,6 @@ impl PresenceManager {
         did_work
     }
 
-    /// ENH-022 Stage 3: build the union of local members ++ peer members for
-    /// the multi-instance broadcast. Local members always win the cap (a local
-    /// member is never dropped in favor of a remote one — that would make a
-    /// client's own presence invisible to itself). Peer members are
-    /// namespaced (`"{instance_id}:{conn_id}"`) and deduped by that
-    /// namespaced id. The union is capped at `max_room_size` total; peer
-    /// members beyond the cap are dropped (over-approximate freely,
-    /// never under-approximate — a dropped remote member reappears on
-    /// the next beat, which is the resync contract).
-    ///
-    /// Determinism: locals first (in their iteration order), then peers
-    /// sorted by (instance_id, connection_id) so two flushes of the
-    /// same state produce identical wire bytes.
-    fn build_union(
-        &self,
-        local_members: Vec<PresenceMember>,
-        peers_for_room: Vec<(String, Vec<PresenceMember>)>,
-    ) -> Vec<PresenceMember> {
-        let cap = self.config.max_room_size;
-        let mut seen: std::collections::HashSet<String> =
-            std::collections::HashSet::with_capacity(local_members.len());
-        let mut union: Vec<PresenceMember> = Vec::with_capacity(local_members.len());
-        for m in local_members.into_iter() {
-            if seen.insert(m.connection_id.clone()) {
-                union.push(m);
-            }
-            if union.len() >= cap {
-                return union;
-            }
-        }
-        // Collect + namespace peer members, then sort by namespaced id so the
-        // order is stable across flushes for the same peer state.
-        let mut peer_members: Vec<PresenceMember> = Vec::new();
-        for (instance_id, members) in peers_for_room {
-            for mut m in members {
-                m.connection_id = format!("{instance_id}:{}", m.connection_id);
-                peer_members.push(m);
-            }
-        }
-        peer_members.sort_by(|a, b| a.connection_id.cmp(&b.connection_id));
-        for m in peer_members {
-            if seen.insert(m.connection_id.clone()) {
-                union.push(m);
-            }
-            if union.len() >= cap {
-                break;
-            }
-        }
-        union
-    }
-
     /// Periodic driver. `interval_ms == 0` means flush as fast as possible
     /// (no coalescing sleep) — used by indicator-only deployments. Runs for
     /// the process lifetime. When `interval_ms == 0`, the loop cooperatively
@@ -927,34 +980,5 @@ impl PresenceManager {
                 }
             }
         })
-    }
-
-    /// ENH-022 Stage 3: republish every populated room's local snapshot to
-    /// peers. Called by the beat ticker in `run_flush_task`. Gated on
-    /// `multi_instance` at the call site (the beat ticker only exists then),
-    /// but re-checked here for safety. Best-effort: a publish failure is
-    /// logged in `gossip_publish` and the next beat retries.
-    async fn beat_all_rooms(&self) {
-        if !self.multi_instance {
-            return;
-        }
-        // Collect (db, room) for every populated local room under the brief
-        // outer lock, then publish each outside the lock. A room that becomes
-        // empty between collect and publish publishes an empty snapshot,
-        // which is correct (peers see the room emptied).
-        let rooms: Vec<(String, String)> = {
-            let dbs = self.dbs.lock().await;
-            let mut out = Vec::new();
-            for (db, shard) in dbs.iter() {
-                let p = shard.lock().await;
-                for room in p.rooms.keys() {
-                    out.push((db.clone(), room.clone()));
-                }
-            }
-            out
-        };
-        for (db, room) in rooms {
-            self.gossip_publish(&db, &room).await;
-        }
     }
 }
