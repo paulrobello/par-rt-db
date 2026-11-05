@@ -82,6 +82,23 @@ pub async fn connect_and_bootstrap(
     db::bootstrap(&pool).await?;
     Ok(pool)
 }
+
+/// Like [`connect_and_bootstrap`] but with an explicit connection ceiling, for
+/// tests whose scenario needs more than the single-connection default (e.g.
+/// `schema_collision_test`: the pool must survive 2 DDL-held connections while
+/// ordinary traffic flows). Honors the same setup semaphore.
+pub async fn connect_and_bootstrap_pooled(
+    database_url: &str,
+    max_connections: u32,
+) -> Result<sqlx::PgPool, rtdb_server::error::RtDbError> {
+    let _permit = SETUP_SEMAPHORE
+        .acquire()
+        .await
+        .expect("setup semaphore open");
+    let pool = connect_pool(database_url, max_connections).await?;
+    db::bootstrap(&pool).await?;
+    Ok(pool)
+}
 #[allow(dead_code)]
 pub mod cluster;
 #[allow(unused_imports)]

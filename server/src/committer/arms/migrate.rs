@@ -54,7 +54,19 @@ pub(in crate::committer) async fn handle_migrate(
             })?;
     }
 
+    // 2026-11-05 incident: the migration's DDL+DML pass is admitted through
+    // the schema gate (concurrency cap; defers while a backup is in flight)
+    // and pinned to a transaction-scoped lock_timeout, so a migration that
+    // collides with a backup's table locks surfaces a retryable error
+    // instead of holding a pool connection for the lock wait. `dry_run` is
+    // gated identically — it takes the same DDL locks before its rollback.
+    let _ddl_permit = ctx.schema_gate.begin_ddl().await?;
     let mut tx = ctx.pool.begin().await?;
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::schema_gate::set_local_lock_timeout_sql(),
+    ))
+    .execute(&mut *tx)
+    .await?;
     let fx = crate::migrate::apply_migration(
         &mut tx,
         &ctx.db,

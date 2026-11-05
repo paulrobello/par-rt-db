@@ -273,6 +273,10 @@ pub struct Committers {
     /// broadcast through it to the lease owner; a failed/timeout forward
     /// falls back to the local takeover attempt.
     forwarder: Option<Arc<crate::forward::Forwarder>>,
+    /// Schema-DDL admission gate shared with the backup paths (2026-11-05
+    /// incident); reaches the DDL arms through `CommitterCtx`. See
+    /// `crate::schema_gate`.
+    schema_gate: Arc<crate::schema_gate::SchemaGate>,
     channels: Arc<Mutex<HashMap<String, ChannelEntry>>>,
     quiesce_leases: Arc<Mutex<HashMap<String, sqlx::PgConnection>>>,
 }
@@ -347,6 +351,11 @@ pub struct CommitterConfig {
     /// Built in `AppState::new` and shared with the forward listener task
     /// (`forward::run_forward_listener`), which resolves its replies.
     pub forwarder: Option<Arc<crate::forward::Forwarder>>,
+    /// Schema-DDL admission gate (2026-11-05 incident): bounds concurrent DDL
+    /// passes and serializes them against backups. A runtime handle shared
+    /// with the backup paths via `AppState::runtime.schema_gate`. See
+    /// `crate::schema_gate`.
+    pub schema_gate: Arc<crate::schema_gate::SchemaGate>,
 }
 
 impl CommitterConfig {
@@ -358,6 +367,7 @@ impl CommitterConfig {
         quotas: Arc<crate::quota::UsageCache>,
         instance_id: String,
         forwarder: Option<Arc<crate::forward::Forwarder>>,
+        schema_gate: Arc<crate::schema_gate::SchemaGate>,
     ) -> Self {
         Self {
             audit_log_enabled: config.audit_log_enabled,
@@ -370,6 +380,7 @@ impl CommitterConfig {
             instance_id,
             multi_instance: config.multi_instance.enabled,
             forwarder,
+            schema_gate,
         }
     }
 }
@@ -401,6 +412,7 @@ impl Committers {
             instance_id: cfg.instance_id,
             multi_instance: cfg.multi_instance,
             forwarder: cfg.forwarder,
+            schema_gate: cfg.schema_gate,
             channels: Arc::new(Mutex::new(HashMap::new())),
             quiesce_leases: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -481,6 +493,7 @@ impl Committers {
             multi_instance: self.multi_instance,
             owns_writes,
             lease_lost,
+            schema_gate: self.schema_gate.clone(),
         }
     }
 
@@ -1424,6 +1437,12 @@ struct CommitterCtx {
     /// Stage 2). False on a single-instance deploy — the publish tap is
     /// zero-cost when off.
     multi_instance: bool,
+    /// Schema-DDL admission gate (2026-11-05 incident). The three DDL arms
+    /// (`handle_push_schema`/`handle_migrate`/`handle_restore_schema`) admit
+    /// their DDL pass through `begin_ddl` so lock waits cannot exhaust the
+    /// shared query pool and backups serialize against migrations. See
+    /// `crate::schema_gate`.
+    schema_gate: Arc<crate::schema_gate::SchemaGate>,
 }
 
 /// The per-db committer task loop: processes exactly one `CommitterRequest`

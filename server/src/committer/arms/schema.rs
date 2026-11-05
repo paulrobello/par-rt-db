@@ -38,20 +38,29 @@ pub(in crate::committer) async fn handle_push_schema(
     ctx: &CommitterCtx,
     schema: crate::schema::SchemaDef,
 ) -> Result<crate::schema::SchemaDef, RtDbError> {
-    let (applied, backfilled) = crate::ddl::push_schema(&ctx.pool, &ctx.db, schema).await?;
+    let outcome =
+        crate::ddl::push_schema_gated(&ctx.pool, &ctx.db, schema, &ctx.schema_gate).await?;
+    let applied = outcome.schema;
     ctx.schemas.put(&ctx.db, applied.clone()).await;
-    // ARC-004: tell peer replicas to drop their cached schema for this db so
-    // their next read reloads the new definition from Postgres.
-    if ctx.multi_instance {
-        crate::notify::publish_schema_changed(&ctx.read_pool, &ctx.instance_id, &ctx.db).await;
-    }
-    if let Err(err) =
-        crate::schema_history::capture(&ctx.pool, &ctx.db, "push", None, &applied).await
-    {
-        tracing::warn!(db = %ctx.db, error = %err, "schema history capture failed");
+    // 2026-11-05 incident: a no-op push (tables map already matched the
+    // committed schema — no DDL executed) skips the per-push side effects.
+    // Nothing changed, so peers' caches are already correct, and capturing a
+    // history row per re-push both spams `schema_history` and masked whether
+    // DDL actually ran during the re-push storm.
+    if outcome.ddl_executed {
+        // ARC-004: tell peer replicas to drop their cached schema for this db so
+        // their next read reloads the new definition from Postgres.
+        if ctx.multi_instance {
+            crate::notify::publish_schema_changed(&ctx.read_pool, &ctx.instance_id, &ctx.db).await;
+        }
+        if let Err(err) =
+            crate::schema_history::capture(&ctx.pool, &ctx.db, "push", None, &applied).await
+        {
+            tracing::warn!(db = %ctx.db, error = %err, "schema history capture failed");
+        }
     }
     let write_set = WriteSet {
-        tables: backfilled,
+        tables: outcome.backfilled,
         ..Default::default()
     };
     publish_taps(ctx, &applied, &write_set, None, "push", false, false).await;
@@ -81,7 +90,16 @@ pub(in crate::committer) async fn handle_restore_schema(
         tracing::warn!(db = %ctx.db, error = %err, "schema history capture (outgoing) failed");
     }
 
+    // 2026-11-05 incident: the restore's DDL pass is admitted through the
+    // schema gate (concurrency cap + backup deferral) and pinned to a
+    // transaction-scoped lock_timeout, same as push/migrate.
+    let _ddl_permit = ctx.schema_gate.begin_ddl().await?;
     let mut tx = ctx.pool.begin().await?;
+    sqlx::query(sqlx::AssertSqlSafe(
+        crate::schema_gate::set_local_lock_timeout_sql(),
+    ))
+    .execute(&mut *tx)
+    .await?;
     let touched =
         crate::ddl::reconcile_schema_destructive(&mut tx, &ctx.db, &current, &target).await?;
     // Persist the target blob (same shape as push/migrate tails).

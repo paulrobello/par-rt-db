@@ -259,6 +259,7 @@ async fn make_committers(state: &Arc<AppState>) -> Arc<Committers> {
             instance_id: String::new(),
             multi_instance: false,
             forwarder: None,
+            schema_gate: std::sync::Arc::new(rtdb_server::schema_gate::SchemaGate::new()),
         },
     ))
 }

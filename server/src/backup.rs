@@ -27,7 +27,19 @@ const MAX_BACKUP_SLEEP: Duration = Duration::from_secs(60);
 /// failures and prune failures are logged and the loop continues — the backup
 /// task must never crash the server. Spawned from `main` only when
 /// `config.backup_enabled`.
-pub async fn run_backup_task(database_url: String, dir: String, cron: String, retention: u32) {
+/// The managed backup loop. Each dump opens the schema gate's backup window
+/// (`SchemaGate::begin_backup`) for its duration: new schema DDL defers with a
+/// retryable 409 while the dump reads, and the dump itself waits for in-flight
+/// DDL to drain before starting — the two directions of the 2026-11-05
+/// incident's migration/backup collision. No-op schema pushes are unaffected
+/// (they never take DDL admission).
+pub async fn run_backup_task(
+    database_url: String,
+    dir: String,
+    cron: String,
+    retention: u32,
+    schema_gate: std::sync::Arc<crate::schema_gate::SchemaGate>,
+) {
     tracing::info!(
         cron = %cron,
         dir = %dir,
@@ -57,9 +69,11 @@ pub async fn run_backup_task(database_url: String, dir: String, cron: String, re
             let _ = timeout(MAX_BACKUP_SLEEP, tokio::time::sleep(chunk)).await;
         }
 
+        let _backup_hold = schema_gate.begin_backup().await;
         if let Err(err) = perform_backup(&database_url, &dir).await {
             tracing::error!(error = %err, "backup failed");
         }
+        drop(_backup_hold);
         if let Err(err) = prune_old(&dir, retention).await {
             tracing::warn!(error = %err, "backup prune failed");
         }
