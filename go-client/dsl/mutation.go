@@ -7,6 +7,7 @@ package dsl
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/paulrobello/par-rt-db/go-client/wire"
 )
@@ -106,10 +107,24 @@ func (m Mutation) ExpectNoMatch(table string, filter wire.FilterExpr) Mutation {
 }
 
 // InsertIf queues a conditional insert: ExpectNoMatch(table, filter) followed
-// by an insert of doc. A doc that is not JSON-encodable is a programming
-// error and panics.
-func (m Mutation) InsertIf(table string, filter wire.FilterExpr, doc map[string]any) Mutation {
-	return m.ExpectNoMatch(table, filter).Insert(table, anyObject(doc))
+// by an insert of doc. Returns an error when doc is not JSON-encodable —
+// use MustInsertIf for the pre-existing panic-on-bad-doc behavior.
+func (m Mutation) InsertIf(table string, filter wire.FilterExpr, doc map[string]any) (Mutation, error) {
+	obj, err := anyObject(doc)
+	if err != nil {
+		return m, err
+	}
+	return m.ExpectNoMatch(table, filter).Insert(table, obj), nil
+}
+
+// MustInsertIf is InsertIf that panics on a non-encodable doc instead of
+// returning the error, for callers that know their doc is encodable.
+func (m Mutation) MustInsertIf(table string, filter wire.FilterExpr, doc map[string]any) Mutation {
+	mm, err := m.InsertIf(table, filter, doc)
+	if err != nil {
+		panic(err)
+	}
+	return mm
 }
 
 // Upsert queues the insert-or-patch step keyed by an index eq-prefix.
@@ -170,14 +185,14 @@ func (m Mutation) Build() wire.Transaction {
 }
 
 // anyObject converts a plain Go map to a wire object via its JSON encoding.
-func anyObject(doc map[string]any) wire.JSONValue {
+func anyObject(doc map[string]any) (wire.JSONValue, error) {
 	b, err := json.Marshal(doc)
 	if err != nil {
-		panic("dsl: InsertIf doc is not JSON-encodable: " + err.Error())
+		return nil, fmt.Errorf("dsl: InsertIf doc is not JSON-encodable: %w", err)
 	}
 	v, err := wire.UnmarshalJSON(b)
 	if err != nil {
-		panic("dsl: InsertIf doc: " + err.Error())
+		return nil, fmt.Errorf("dsl: InsertIf doc: %w", err)
 	}
-	return v
+	return v, nil
 }

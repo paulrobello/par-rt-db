@@ -76,7 +76,7 @@ func TestExpectAbsentCarriesTable(t *testing.T) {
 }
 
 func TestInsertIfEmitsExpectNoMatchThenInsert(t *testing.T) {
-	txn := NewMutation().InsertIf("items", Eq("name", wire.String("a")), map[string]any{"name": "a"}).Build()
+	txn := NewMutation().MustInsertIf("items", Eq("name", wire.String("a")), map[string]any{"name": "a"}).Build()
 	blob, err := json.Marshal(txn)
 	if err != nil {
 		t.Fatal(err)
@@ -103,5 +103,18 @@ func TestExpectNoMatchBuilderAlone(t *testing.T) {
 	}
 	if st, ok := txn.Steps[0].(wire.StepExpectNoMatch); !ok || st.Table != "items" {
 		t.Fatalf("step: %#v", txn.Steps[0])
+	}
+}
+
+// InsertIf returns the encode error instead of panicking; only the Must*
+// variant panics (QA-008).
+func TestInsertIfReturnsEncodeErrorInsteadOfPanicking(t *testing.T) {
+	_, err := NewMutation().InsertIf("items", Eq("name", wire.String("a")),
+		map[string]any{"bad": make(chan int)})
+	if err == nil {
+		t.Fatal("want error for non-encodable doc, got nil")
+	}
+	if !bytesHas([]byte(err.Error()), "not JSON-encodable") {
+		t.Fatalf("error text: %v", err)
 	}
 }
