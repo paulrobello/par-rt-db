@@ -120,7 +120,7 @@ before a strict decode, never weaken the decode to admit it.
 **Enforcement:** the server runner carries the coverage meta-test
 (`server/tests/wire_corpus.rs::every_corpus_section_has_a_consumer`): a new
 `wire-corpus.json` section with no runner consumer fails the server suite
-until a consumer is added there and extended to the other five runners. The
+until a consumer is added there and extended to the other six runners. The
 meta-test also fails when its `CONSUMED_SECTIONS` list names a section the
 corpus no longer has, so renames surface immediately.
 

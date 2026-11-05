@@ -8,13 +8,14 @@ query updates on change. One instance hosts many named databases. There is no
 embedded JS runtime and no per-app server code — this one generic binary serves
 every app.
 
-This directory holds the `rtdb-server` binary. Five client SDKs live
+This directory holds the `rtdb-server` binary. Six client SDKs live
 alongside it: [`../ts-client/`](../ts-client) (browser/Node),
 [`../rust-client/`](../rust-client) (Rust),
 [`../python-client/`](../python-client) (Python — wire + DSL + sync HTTP/admin/storage
 + reactive WS, all shipped), [`../swift-client/`](../swift-client)
-(`ParRtDbClient`/`ParRtDbUI`, Darwin-only), and
-[`../go-client/`](../go-client) (Go). An operator dashboard SPA
+(`ParRtDbClient`/`ParRtDbUI`, Darwin-only),
+[`../go-client/`](../go-client) (Go), and
+[`../kotlin-client/`](../kotlin-client) (Kotlin/JVM + Android). An operator dashboard SPA
 ([`../dashboard/`](../dashboard)) is served same-origin by the server when
 `RTDB_STATIC_DIR` is set, and the [`../cli/`](../cli) package wraps
 `par-rt-db-client` as the `rtdb` operator/CI binary. A [`../core/`](../core)
@@ -321,7 +322,7 @@ startup (mirrors `mutations`/`scheduled_txns`).
 
 ## Develop
 
-The `make` targets below run **from the repo root** (they coordinate all nine
+The `make` targets below run **from the repo root** (they coordinate all ten
 packages — see the root `Makefile` for the full target list):
 
 ```sh

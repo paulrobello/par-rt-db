@@ -99,7 +99,7 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 - **Round-trip JSON float parsing**: the shared Rust JSON parser preserves finite `f64` values when decoding their serialized representation. Exact-bit tests guard fractional values that otherwise move by one floating-point unit, including values nested in document payloads.
 - **Single serialized committer per database**: all writes flow through one committer task per database and reads run under READ COMMITTED (except `adjustCounter`, which row-locks its counter) — realtime correctness without distributed coordination
 - **Rust on axum/tokio with Postgres 17 storage**: graceful shutdown drains in-flight requests before exiting, bounded by `RTDB_SHUTDOWN_DRAIN_MS`
-- **One wire contract, six implementations**: the server and the ts/rust/python/swift/go clients all run the shared semantics corpus, staying byte-identical ([`wire-corpus/`](wire-corpus/README.md) — every top-level section is consumed by all six runners)
+- **One wire contract, seven implementations**: the server and the ts/rust/python/swift/go/kotlin clients all run the shared semantics corpus, staying byte-identical ([`wire-corpus/`](wire-corpus/README.md) — every top-level section is consumed by all seven runners)
 - **Security defaults**: constant-time key comparison, generic client-facing 500 messages (detail only in logs), typed `confirm` guards on destructive operations, path-traversal-guarded downloads
 
 ## Packages
@@ -116,7 +116,7 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 | **Dashboard** | [`dashboard/`](dashboard) | Vite + React 19 + TS (bun) | Operator console SPA served same-origin at `RTDB_STATIC_DIR` |
 | **`rtdb` CLI** | [`cli/`](cli) | Rust (`rtdb` binary, cargo) | Operator/CI wrapper around `par-rt-db-client`: list/create dbs, push schema, query/mutate, mint/revoke tokens |
 
-The server is the source of truth; the five SDKs (ts/rust/python/swift/go) each mirror
+The server is the source of truth; the six SDKs (ts/rust/python/swift/go/kotlin) each mirror
 its wire contract directly, the CLI wraps `rust-client`, and the dashboard SPA
 consumes `ts-client`. See [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) for the
 Convex-parity contract and [`CLAUDE.md`](CLAUDE.md) for contributor guidance.
@@ -1922,7 +1922,7 @@ Design and as-built notes:
 
 ## Clients
 
-par-rt-db ships five client SDKs that each mirror the server's wire contract,
+par-rt-db ships six client SDKs that each mirror the server's wire contract,
 plus an operator SPA and a CLI built on top of them:
 
 - [`ts-client/`](ts-client/README.md) — `@par-rt-db/client` (browser/Node/React Native): schema builder, reactive WebSocket client, React bindings, HTTP/admin clients, in-memory test harness.
@@ -1930,6 +1930,7 @@ plus an operator SPA and a CLI built on top of them:
 - [`python-client/`](python-client/README.md) — `par-rt-db` (Python): wire contract + schema/mutation/query DSL + sync HTTP/admin/storage + reactive WS.
 - [`swift-client/`](swift-client/README.md) — `ParRtDbClient`/`ParRtDbUI` (Swift 6, iOS 17+/macOS 14): wire + query/mutation/schema DSL + HTTP + reactive WS + SwiftUI `LiveQuery`, plus the admin client, presence, optimistic updates, and the in-memory engine (see its README's coverage table).
 - [`go-client/`](go-client/README.md) — `github.com/paulrobello/par-rt-db/go-client` (Go 1.23+): wire + schema DSL + typed HTTP queries + reactive WS + admin client + the in-memory engine, stdlib-only outside `coder/websocket`.
+- [`kotlin-client/`](kotlin-client/README.md) — `dev.parrtdb:par-rt-db-kotlin-client` (Kotlin 2.4, JVM 17+ / Android minSdk 26): wire + query/mutation/schema DSL + HTTP + reactive WS (`Flow`) + admin client + the in-memory engine, over a pluggable transport (`JdkTransport` or OkHttp for Android).
 - [`dashboard/`](dashboard/README.md) — the operator console SPA (admin/operator UI served same-origin at `RTDB_STATIC_DIR`; consumes `ts-client`).
 - [`cli/`](cli/README.md) — `rtdb` operator/CI binary (wraps `par-rt-db-client`). `rtdb changes --db <db> [--since <seq>] [--limit <n>] [--follow]` prints one page of durable change ops as compact NDJSON, with the `nextSeq` cursor on stderr. Omit `--since` to start at the current head, or pass `--since 0` for the oldest retained ops. `--follow` polls every two seconds until Ctrl-C; `CURSOR_EXPIRED` exits non-zero without silently resyncing. Supply `RTDB_URL` and `RTDB_TOKEN` (machine token).
 
@@ -1943,7 +1944,7 @@ plus an operator SPA and a CLI built on top of them:
 * Q: Can I use it over plain HTTP?
   * A: Yes — one-shot `POST /api/query` / `POST /api/mutate` cover reads and writes. The WebSocket (`/sync`) is only needed for live subscriptions and presence.
 * Q: Which languages have client SDKs?
-  * A: TypeScript (`@par-rt-db/client`, with React bindings), Rust (`par-rt-db-client`), Python (`par-rt-db`), Swift (`ParRtDbClient`, iOS 17+/macOS 14), and Go (`go-client`), plus the `rtdb` CLI and the operator dashboard.
+  * A: TypeScript (`@par-rt-db/client`, with React bindings), Rust (`par-rt-db-client`), Python (`par-rt-db`), Swift (`ParRtDbClient`, iOS 17+/macOS 14), Go (`go-client`), and Kotlin (`kotlin-client`, JVM + Android), plus the `rtdb` CLI and the operator dashboard.
 * Q: Is auth required?
   * A: Machine tokens are the baseline. Each of the six OAuth providers is independently optional (blank env ⇒ its routes return 503), and anonymous access is opt-in (off by default).
 * Q: Can I run multiple replicas behind a load balancer?

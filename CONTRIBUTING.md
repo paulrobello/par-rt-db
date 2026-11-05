@@ -23,7 +23,7 @@ notes), see [`CLAUDE.md`](CLAUDE.md).
 
 ## Repository layout
 
-par-rt-db is a monorepo with **nine packages** built from one root `Makefile`:
+par-rt-db is a monorepo with **ten packages** built from one root `Makefile`:
 
 | Package | Path | Stack |
 | --- | --- | --- |
@@ -34,12 +34,13 @@ par-rt-db is a monorepo with **nine packages** built from one root `Makefile`:
 | Python client | `python-client/` | Python (`par-rt-db`, uv) |
 | Swift client | `swift-client/` | Swift (`ParRtDbClient`/`ParRtDbUI`, swift) |
 | Go client | `go-client/` | Go (`github.com/paulrobello/par-rt-db/go-client`) |
+| Kotlin client | `kotlin-client/` | Kotlin (`dev.parrtdb:par-rt-db-kotlin-client`, gradle) |
 | Dashboard | `dashboard/` | Vite + React 19 + TS (bun) |
 | `rtdb` CLI | `cli/` | Rust (`rtdb` binary, cargo; wraps `par-rt-db-client`) |
 
-The server is the source of truth for the wire protocol and the DSL; the five
-client SDKs (`ts-client`, `rust-client`, `python-client`, `swift-client`, `go-client`)
-mirror it — six implementations of one wire contract.
+The server is the source of truth for the wire protocol and the DSL; the six
+client SDKs (`ts-client`, `rust-client`, `python-client`, `swift-client`, `go-client`,
+`kotlin-client`) mirror it — seven implementations of one wire contract.
 [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) tracks parity
 against Convex with per-row notes on which clients mirror each feature.
 
@@ -81,9 +82,9 @@ gitignored and rebuilt on demand.
 ## The build gate
 
 `make checkall` is the **definition of done**. It must pass before every
-commit, and it spans all nine packages (`core`, `server`, `ts-client`,
-`rust-client`, `python-client`, `swift-client`, `go-client`, `dashboard`,
-`cli`).
+commit, and it spans all ten packages (`core`, `server`, `ts-client`,
+`rust-client`, `python-client`, `swift-client`, `go-client`, `kotlin-client`,
+`dashboard`, `cli`).
 
 Its eight stages, what each one catches, and every other make target are
 documented once in the root README under
@@ -298,15 +299,16 @@ etc.).
 
 ## Versioning
 
-All packages — `server`, `cli`, `dashboard`, and the five client SDKs
-(`ts-client`, `rust-client`, `python-client`, `swift-client`, `go-client`) —
+All packages — `server`, `cli`, `dashboard`, and the six client SDKs
+(`ts-client`, `rust-client`, `python-client`, `swift-client`, `go-client`,
+`kotlin-client`) —
 version in
 **lockstep**: one version for the whole protocol surface, bumped together in
 the same release commit. `swift-client` carries no manifest version — SPM has
 no version field, so the repo's release tag is its version — but it is part of
-the lockstep unit all the same. The six implementations of the wire contract
-(`server/src/protocol.rs` plus the five client mirrors) are one unit;
-independent client versions would claim compatibility the six-way mirror does
+the lockstep unit all the same. The seven implementations of the wire contract
+(`server/src/protocol.rs` plus the six client mirrors) are one unit;
+independent client versions would claim compatibility the seven-way mirror does
 not have. The release procedure,
 including the lockstep bump and tag-driven registry
 publication, is [`docs/RELEASING.md`](docs/RELEASING.md).
@@ -380,13 +382,14 @@ failing test.
   every value via `$n`. Never interpolate an unvalidated value. Physical names
   are lowercased and length-capped to fit Postgres's 63-byte limit — don't
   raise the caps.
-- **Six implementations, one wire contract** — `server/src/protocol.rs`,
+- **Seven implementations, one wire contract** — `server/src/protocol.rs`,
   `ts-client/src/protocol.ts`, `rust-client/src/wire.rs`,
   `python-client/src/par_rt_db/wire.py`,
-  `swift-client/Sources/ParRtDbClient/Wire.swift`, and `go-client/wire/` are
-  six implementations of
+  `swift-client/Sources/ParRtDbClient/Wire.swift`, `go-client/wire/`, and
+  `kotlin-client/src/main/kotlin/dev/parrtdb/wire/` are
+  seven implementations of
   the same protocol. The casing is deliberately non-uniform and load-bearing.
-  Any server change must be mirrored in **all six** — wire types, DSL
+  Any server change must be mirrored in **all seven** — wire types, DSL
   builders, and their tests. If a client doesn't yet cover a changed surface,
   file the gap explicitly in `FEATURE_MATRIX.md` rather than letting it drift.
 - **Errors** — every failure is the `RtDbError` envelope `{code, message}`
@@ -444,7 +447,7 @@ Before requesting review:
 - [ ] `make checkall` passes locally on a clean checkout, including `make docs-api`.
 - [ ] `make docs-api` produces warning-free Rust, TypeScript, Python, and Swift references.
 - [ ] Tests are added or updated for any new behavior (every package the change touches).
-- [ ] If the change alters the wire protocol or DSL, all five client SDKs (`ts-client`, `rust-client`, `python-client`, `swift-client`, `go-client`) are updated and tested in the same PR, and `FEATURE_MATRIX.md` reflects the new state.
+- [ ] If the change alters the wire protocol or DSL, all six client SDKs (`ts-client`, `rust-client`, `python-client`, `swift-client`, `go-client`, `kotlin-client`) are updated and tested in the same PR, and `FEATURE_MATRIX.md` reflects the new state.
 - [ ] No `unwrap()`/`expect()` outside `#[cfg(test)]`; no new clippy warnings.
 - [ ] No real secrets in the diff. `pre-commit` (gitleaks) is installed and passes.
 - [ ] Commit messages follow Conventional Commits.
