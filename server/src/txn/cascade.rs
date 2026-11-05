@@ -80,6 +80,25 @@ async fn visible_child_ids(
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
+/// Shared, borrow-only threading for one cascade batch (QA-005): the open
+/// sqlx transaction, the physical schema name, the pushed schema (the FK
+/// walk), the accumulating write set, the cycle/batch guard, and the reaper
+/// override travel together from every initiating caller (the `Delete` /
+/// `DeleteByQuery` steps, the purge arm, the TTL reaper) through the
+/// recursion — the list `delete_row_cascade` used to re-declare at every
+/// hop. Borrow-bundle precedent: `StepCtx` (`steps.rs`), `CommitterCtx`.
+/// The per-initiating-row budget and the row identity stay parameters: the
+/// purge and reaper loops reset `cascade_rows` per initiating row while
+/// sharing one context, and `table_name`/`id` name the row being deleted.
+pub(crate) struct CascadeCtx<'a> {
+    pub(crate) conn: &'a mut PgConnection,
+    pub(crate) pg_schema_name: &'a str,
+    pub(crate) schema: &'a SchemaDef,
+    pub(crate) write_set: &'a mut WriteSet,
+    pub(crate) visited: &'a mut HashSet<(String, String)>,
+    pub(crate) force_hard: bool,
+}
+
 /// Deletes row `id` of `table_name` expanding the app-level `onDelete` rules
 /// (FM-33), entirely on the caller's open sqlx transaction (single-writer
 /// invariant: never a second connection). NOT SQL-FK — the graph is declared
@@ -105,29 +124,20 @@ async fn visible_child_ids(
 ///   atomically.
 /// - `force_hard` (reaper) physically removes rows even on `softDelete`
 ///   tables and propagates through the recursion.
-// Params are independently needed (tx target, physical schema, whole-schema
-// FK walk, row identity, tap recording, the two per-step guards, the reaper
-// override); pushes past clippy's default 7-argument threshold like
-// `insert_snapshot_row`.
 // Boxed-return future: the recursion (a cascade child is itself deleted via
 // `delete_row_cascade`) is illegal in a bare `async fn` (E0733) — the future's
 // size is unbounded. `Box::pin` per level is the standard fix; depth is capped
 // by MAX_CASCADE_ROWS, so the allocation chain is bounded by the same budget.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn delete_row_cascade<'a>(
-    conn: &'a mut PgConnection,
-    pg_schema_name: &'a str,
-    schema: &'a SchemaDef,
+    ctx: &'a mut CascadeCtx<'_>,
     table_name: &'a str,
     id: &'a str,
-    write_set: &'a mut WriteSet,
-    visited: &'a mut HashSet<(String, String)>,
     cascade_rows: &'a mut usize,
-    force_hard: bool,
 ) -> Pin<Box<dyn Future<Output = Result<(), RtDbError>> + Send + 'a>> {
     Box::pin(async move {
-        let table_def = schema.table(table_name)?;
-        if !visited.insert((table_name.to_string(), id.to_string())) {
+        let pg_schema_name = ctx.pg_schema_name;
+        let table_def = ctx.schema.table(table_name)?;
+        if !ctx.visited.insert((table_name.to_string(), id.to_string())) {
             return Ok(());
         }
         if *cascade_rows >= MAX_CASCADE_ROWS {
@@ -137,16 +147,17 @@ pub(crate) fn delete_row_cascade<'a>(
         }
         *cascade_rows += 1;
 
-        if table_def.soft_delete && !force_hard {
-            do_soft_delete(conn, pg_schema_name, table_name, id).await?;
-            write_set.touch(table_name, id, OpKind::Delete);
+        if table_def.soft_delete && !ctx.force_hard {
+            do_soft_delete(ctx.conn, ctx.pg_schema_name, table_name, id).await?;
+            ctx.write_set.touch(table_name, id, OpKind::Delete);
             // Stamped = deleted as far as every consumer is concerned: `after =
             // None` ⇒ `fan_out` always re-runs.
-            write_set.capture_doc(table_name, id, None, Some(None), None);
+            ctx.write_set
+                .capture_doc(table_name, id, None, Some(None), None);
             return Ok(());
         }
 
-        for (child_table_name, child_table_def) in &schema.tables {
+        for (child_table_name, child_table_def) in &ctx.schema.tables {
             for (field_name, field_type) in &child_table_def.fields {
                 let Some(action) = on_delete_ref(field_type, table_name) else {
                     continue;
@@ -154,8 +165,8 @@ pub(crate) fn delete_row_cascade<'a>(
                 match action {
                     OnDeleteAction::Restrict => {
                         let hits = visible_child_ids(
-                            conn,
-                            pg_schema_name,
+                            ctx.conn,
+                            ctx.pg_schema_name,
                             child_table_def,
                             child_table_name,
                             field_name,
@@ -172,8 +183,8 @@ pub(crate) fn delete_row_cascade<'a>(
                     }
                     OnDeleteAction::Cascade => {
                         let child_ids = visible_child_ids(
-                            conn,
-                            pg_schema_name,
+                            ctx.conn,
+                            ctx.pg_schema_name,
                             child_table_def,
                             child_table_name,
                             field_name,
@@ -183,23 +194,18 @@ pub(crate) fn delete_row_cascade<'a>(
                         .await?;
                         for child_id in child_ids {
                             delete_row_cascade(
-                                conn,
-                                pg_schema_name,
-                                schema,
+                                &mut *ctx,
                                 child_table_name,
                                 &child_id,
-                                write_set,
-                                visited,
                                 cascade_rows,
-                                force_hard,
                             )
                             .await?;
                         }
                     }
                     OnDeleteAction::SetNull => {
                         let child_ids = visible_child_ids(
-                            conn,
-                            pg_schema_name,
+                            ctx.conn,
+                            ctx.pg_schema_name,
                             child_table_def,
                             child_table_name,
                             field_name,
@@ -221,16 +227,17 @@ pub(crate) fn delete_row_cascade<'a>(
                             fields.insert(field_name.clone(), serde_json::Value::Null);
                             let fields = stamp_updated_at(child_table_def, fields, now_ms());
                             let (pre_doc, merged, created_at) = do_patch(
-                                conn,
-                                pg_schema_name,
+                                ctx.conn,
+                                ctx.pg_schema_name,
                                 child_table_def,
                                 child_table_name,
                                 &child_id,
                                 &fields,
                             )
                             .await?;
-                            write_set.touch(child_table_name, &child_id, OpKind::Patch);
-                            write_set.capture_doc(
+                            ctx.write_set
+                                .touch(child_table_name, &child_id, OpKind::Patch);
+                            ctx.write_set.capture_doc(
                                 child_table_name,
                                 &child_id,
                                 Some(Some(&pre_doc)),
@@ -248,13 +255,14 @@ pub(crate) fn delete_row_cascade<'a>(
             "DELETE FROM \"{pg_schema_name}\".\"{table_ident}\" WHERE \"id\" = $1"
         )))
         .bind(id)
-        .execute(&mut *conn)
+        .execute(&mut *ctx.conn)
         .await?;
         if result.rows_affected() == 0 {
             return Err(RtDbError::not_found(format!("document '{id}' not found")));
         }
-        write_set.touch(table_name, id, OpKind::Delete);
-        write_set.capture_doc(table_name, id, None, Some(None), None);
+        ctx.write_set.touch(table_name, id, OpKind::Delete);
+        ctx.write_set
+            .capture_doc(table_name, id, None, Some(None), None);
         Ok(())
     })
 }

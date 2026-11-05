@@ -14,9 +14,9 @@ use crate::ddl::pg_table;
 use crate::error::{ErrorCode, RtDbError};
 use crate::schema::{FieldType, SchemaDef, SchemaDefExt, TableDefExt};
 use crate::txn::{
-    EqBind, MAX_BY_QUERY_ROWS, OpKind, WriteSet, apply_defaults, apply_patch, check_owner,
-    check_owner_doc, delete_row_cascade, doc_visible_to, stamp_authorize, stamp_auto_increment,
-    stamp_owner, stamp_ttl_default, stamp_updated_at, verify_authorize_doc,
+    CascadeCtx, EqBind, MAX_BY_QUERY_ROWS, OpKind, WriteSet, apply_defaults, apply_patch,
+    check_owner, check_owner_doc, delete_row_cascade, doc_visible_to, stamp_authorize,
+    stamp_auto_increment, stamp_owner, stamp_ttl_default, stamp_updated_at, verify_authorize_doc,
 };
 use crate::txn::{
     apply_update, do_expect_version, do_insert, do_patch, do_replace, do_soft_delete, eq_lookup,
@@ -212,6 +212,9 @@ fn counter_value(
     })
 }
 
+// QA-005: table/id/field/delta/min/max/expected is the AdjustCounter step's
+// own wire payload (each consumed once), not context threading — the
+// transaction quintet already lives in StepCtx.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn step_adjust_counter(
     sctx: &mut StepCtx<'_>,
@@ -380,18 +383,15 @@ pub(crate) async fn step_delete(
         // (cascade/restrict/setNull) inside this same sqlx tx.
         let mut visited = HashSet::new();
         let mut cascade_rows = 0usize;
-        delete_row_cascade(
-            sctx.tx,
-            sctx.pg_schema_name,
-            sctx.schema,
-            table,
-            id,
-            sctx.write_set,
-            &mut visited,
-            &mut cascade_rows,
-            false,
-        )
-        .await?;
+        let mut cctx = CascadeCtx {
+            conn: &mut *sctx.tx,
+            pg_schema_name: sctx.pg_schema_name,
+            schema: sctx.schema,
+            write_set: &mut *sctx.write_set,
+            visited: &mut visited,
+            force_hard: false,
+        };
+        delete_row_cascade(&mut cctx, table, id, &mut cascade_rows).await?;
     }
     sctx.results.push(serde_json::Value::Null);
     Ok(())
@@ -707,19 +707,16 @@ pub(crate) async fn step_delete_by_query(
     if !ids.is_empty() {
         let mut visited = HashSet::new();
         let mut cascade_rows = 0usize;
+        let mut cctx = CascadeCtx {
+            conn: &mut *sctx.tx,
+            pg_schema_name,
+            schema: sctx.schema,
+            write_set: &mut *sctx.write_set,
+            visited: &mut visited,
+            force_hard: false,
+        };
         for id in &ids {
-            delete_row_cascade(
-                sctx.tx,
-                pg_schema_name,
-                sctx.schema,
-                table,
-                id,
-                sctx.write_set,
-                &mut visited,
-                &mut cascade_rows,
-                false,
-            )
-            .await?;
+            delete_row_cascade(&mut cctx, table, id, &mut cascade_rows).await?;
         }
     }
     sctx.results

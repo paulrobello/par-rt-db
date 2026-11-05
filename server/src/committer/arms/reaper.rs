@@ -80,18 +80,17 @@ pub(in crate::committer) async fn handle_reaper(
             for (id,) in ids {
                 crate::db::ensure_admission_epoch(&mut conn, &ctx.db, admission_epoch).await?;
                 let mut cascade_rows = 0usize;
-                if let Err(e) = crate::txn::delete_row_cascade(
-                    &mut conn,
-                    &pg_schema_name,
-                    &schema,
-                    table_name,
-                    &id,
-                    &mut write_set,
-                    &mut visited,
-                    &mut cascade_rows,
-                    true,
-                )
-                .await
+                let mut cctx = crate::txn::CascadeCtx {
+                    conn: &mut conn,
+                    pg_schema_name: &pg_schema_name,
+                    schema: &schema,
+                    write_set: &mut write_set,
+                    visited: &mut visited,
+                    force_hard: true,
+                };
+                if let Err(e) =
+                    crate::txn::delete_row_cascade(&mut cctx, table_name, &id, &mut cascade_rows)
+                        .await
                 {
                     if matches!(
                         crate::db::database_exists(&ctx.read_pool, &ctx.db).await,

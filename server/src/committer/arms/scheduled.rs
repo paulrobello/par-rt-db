@@ -8,6 +8,9 @@ use crate::committer::*;
 /// logged, not propagated. `at-least-once` recovery (the scheduler's
 /// `reset_running` on startup) handles the rare crash window between commit
 /// and finalize.
+// QA-005: everything after `ctx` is the claimed scheduled_txns row payload
+// (id/kind/txn/cron/every_ms/tz/due_at/enqueuer) plus the fire-time epoch —
+// the context threading already lives in `CommitterCtx`.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::committer) async fn handle_scheduled(
     ctx: &CommitterCtx,
