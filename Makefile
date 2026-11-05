@@ -480,7 +480,6 @@ checkall-cached:
 publish-check:
 	./scripts/publish-check.sh $(PUBLISH_CHECK_ARGS)
 
-checkall: env-drift-check dockerfile-stub-check cli-docs-check docs-api fmt-check lint typecheck test rust-client-check-features publish-check
 
 # ENH-033: criterion micro-benchmarks over the pure hot paths (server) and the
 # in-memory engine (rust-client). No Postgres, no server process. Deliberately
