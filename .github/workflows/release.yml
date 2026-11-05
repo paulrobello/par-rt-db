@@ -5,7 +5,7 @@
 # with --clobber. The job that creates the GitHub release also creates the
 # matching vX.Y.Z git tag at the released commit, which is what SwiftPM's
 # `.exact("X.Y.Z")` resolves against. workflow_dispatch re-runs the pipeline
-# for recovery after a partial publish. Releasing is lockstep: bump all seven
+# for recovery after a partial publish. Releasing is lockstep: bump all eight
 # versioned manifests in one commit (see docs/RELEASING.md), then push to main.
 name: Release
 
@@ -32,7 +32,7 @@ jobs:
       RTDB_TEST_DATABASE_URL: postgres://rtdb:rtdb@127.0.0.1:55434/rtdb
     outputs:
       # The single version every published artifact carries. publish-check's
-      # version-lockstep gate has proved all seven manifests agree; read it
+      # version-lockstep gate has proved all eight manifests agree; read it
       # from server/Cargo.toml as the authority.
       version: ${{ steps.version.outputs.version }}
     steps:
