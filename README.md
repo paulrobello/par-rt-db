@@ -852,7 +852,7 @@ workflow control-flow steps `startWorkflow` (inserts the per-db `workflows`
 run row on the open sqlx transaction — atomic with the enclosing writes; step
 result `{"workflowId": "<id>"}`; the spec's tables are allowlist-checked at
 submit time) and `cancelWorkflow` (`{"cancelled": <bool>}`, `false` on a
-missing/terminal run — a no-op, not an error) — see `server/src/txn.rs`.
+missing/terminal run — a no-op, not an error) — see `server/src/txn/`.
 
 `expectFields(table, id, expected)` checks exact values at selected object-key paths without writing the live row or advancing its version. Unasserted fields may change. Missing and null remain distinct, selected objects compare in full, and existing visibility/table scopes apply. See [row-field guards](docs/transaction-field-guards.md) for bounds, ordering, retries and SDK methods.
 
