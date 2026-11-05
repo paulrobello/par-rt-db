@@ -159,112 +159,176 @@ pub(crate) fn compile_value_expr(
 /// predicates reuse `dsl::filter_matches`; `ctx` exists for that arm only, and
 /// push validation rejects principal markers inside computed exprs, so a
 /// bypass ctx is semantically equivalent.
+///
+/// QA-002: dispatch is one arm per grammar node into small per-operator
+/// handlers below, so the interpreter reads as a table of the grammar instead
+/// of one deeply nested function. The client engines mirror this shape
+/// (rust-client `in_memory::value_expr` first) — keep the handler names and
+/// order aligned across copies.
 pub fn eval_value_expr(
     ve: &ValueExpr,
     doc: &serde_json::Map<String, serde_json::Value>,
     now_ms: i64,
     ctx: &PrincipalCtx,
 ) -> Result<serde_json::Value, RtDbError> {
+    let cx = EvalCtx {
+        doc,
+        now_ms,
+        principal: ctx,
+    };
+    eval_node(ve, &cx)
+}
+
+/// The operand environment threaded through the per-operator handlers — the
+/// inputs of `eval_value_expr` bundled so each handler receives one context
+/// instead of re-passing the world.
+struct EvalCtx<'a> {
+    doc: &'a serde_json::Map<String, serde_json::Value>,
+    now_ms: i64,
+    principal: &'a PrincipalCtx,
+}
+
+/// One grammar node → one handler. Every arm is a single call, keeping the
+/// interpreter a dispatch table over `ValueExpr`.
+fn eval_node(ve: &ValueExpr, cx: &EvalCtx) -> Result<serde_json::Value, RtDbError> {
     match ve {
-        ValueExpr::Field { field } => Ok(match doc.get(field).and_then(to_text) {
+        ValueExpr::Field { field } => Ok(eval_field(field, cx.doc)),
+        ValueExpr::Literal { value } => Ok(value.clone()),
+        ValueExpr::Concat { parts } => eval_concat(parts, cx),
+        ValueExpr::Add { left, right } => eval_arithmetic(ArithOp::Add, left, right, cx),
+        ValueExpr::Sub { left, right } => eval_arithmetic(ArithOp::Sub, left, right, cx),
+        ValueExpr::Mul { left, right } => eval_arithmetic(ArithOp::Mul, left, right, cx),
+        ValueExpr::Div { left, right } => eval_arithmetic(ArithOp::Div, left, right, cx),
+        ValueExpr::Coalesce { parts } => eval_coalesce(parts, cx),
+        ValueExpr::Lower { value } => eval_text_transform(value, cx, |text| text.to_lowercase()),
+        ValueExpr::Upper { value } => eval_text_transform(value, cx, |text| text.to_uppercase()),
+        ValueExpr::Trim { value } => {
+            // Spaces only — Postgres btrim's default, not Unicode whitespace:
+            // a leading tab survives.
+            eval_text_transform(value, cx, |text| text.trim_matches(' ').to_string())
+        }
+        ValueExpr::Cast { value, to } => eval_cast(value, to, cx),
+        ValueExpr::Now => Ok(serde_json::Value::from(cx.now_ms)),
+        ValueExpr::Case { whens, otherwise } => eval_case(whens, otherwise, cx),
+    }
+}
+
+/// `Field` — text extraction from the doc (`doc->>'field'` semantics): an
+/// absent or JSON-null field is SQL NULL, everything else its text form.
+fn eval_field(field: &str, doc: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    match doc.get(field).and_then(to_text) {
+        Some(text) => serde_json::Value::String(text),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// `Concat` — Postgres `concat()` semantics: null parts are skipped rather
+/// than nulling the result (`to_text` is `None` exactly for nulls).
+fn eval_concat(parts: &[ValueExpr], cx: &EvalCtx) -> Result<serde_json::Value, RtDbError> {
+    let mut out = String::new();
+    for p in parts {
+        if let Some(text) = to_text(&eval_node(p, cx)?) {
+            out.push_str(&text);
+        }
+    }
+    Ok(serde_json::Value::String(out))
+}
+
+/// The four arithmetic operators, carried as data so the handler does not
+/// re-match the grammar node.
+#[derive(Clone, Copy, PartialEq)]
+enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+/// `Add`/`Sub`/`Mul`/`Div` — IEEE doubles with SQL-NULL propagation; a
+/// non-finite result is an error (`finite_number`).
+fn eval_arithmetic(
+    op: ArithOp,
+    left: &ValueExpr,
+    right: &ValueExpr,
+    cx: &EvalCtx,
+) -> Result<serde_json::Value, RtDbError> {
+    let l = to_numeric(&eval_node(left, cx)?)?;
+    let r = to_numeric(&eval_node(right, cx)?)?;
+    let (Some(l), Some(r)) = (l, r) else {
+        // Either operand SQL-NULL → NULL; propagation precedes the
+        // zero-divisor and finiteness checks (null / 0 is null).
+        return Ok(serde_json::Value::Null);
+    };
+    // `r == 0.0` is true for -0.0 too (IEEE equality), so both zero
+    // spellings are the same divisor error.
+    if op == ArithOp::Div && r == 0.0 {
+        return Err(RtDbError::bad_request("division by zero"));
+    }
+    let x = match op {
+        ArithOp::Add => l + r,
+        ArithOp::Sub => l - r,
+        ArithOp::Mul => l * r,
+        ArithOp::Div => l / r,
+    };
+    finite_number(x)
+}
+
+/// `Coalesce` — the first non-null part, else SQL NULL.
+fn eval_coalesce(parts: &[ValueExpr], cx: &EvalCtx) -> Result<serde_json::Value, RtDbError> {
+    for p in parts {
+        let v = eval_node(p, cx)?;
+        if !v.is_null() {
+            return Ok(v);
+        }
+    }
+    Ok(serde_json::Value::Null)
+}
+
+/// `Lower`/`Upper`/`Trim` share one shape: evaluate the operand, take its
+/// text form, apply the transform. A null operand stays SQL NULL.
+fn eval_text_transform(
+    operand: &ValueExpr,
+    cx: &EvalCtx,
+    transform: impl Fn(&str) -> String,
+) -> Result<serde_json::Value, RtDbError> {
+    Ok(match to_text(&eval_node(operand, cx)?) {
+        Some(text) => serde_json::Value::String(transform(&text)),
+        None => serde_json::Value::Null,
+    })
+}
+
+/// `Cast` — per-target dispatch to the coercion helpers below.
+fn eval_cast(value: &ValueExpr, to: &Cast, cx: &EvalCtx) -> Result<serde_json::Value, RtDbError> {
+    let v = eval_node(value, cx)?;
+    match to {
+        Cast::ToString => Ok(match to_text(&v) {
             Some(text) => serde_json::Value::String(text),
             None => serde_json::Value::Null,
         }),
-        ValueExpr::Literal { value } => Ok(value.clone()),
-        ValueExpr::Concat { parts } => {
-            let mut out = String::new();
-            for p in parts {
-                // to_text is None exactly for null parts — Postgres concat()
-                // skips them rather than nulling the result.
-                if let Some(text) = to_text(&eval_value_expr(p, doc, now_ms, ctx)?) {
-                    out.push_str(&text);
-                }
-            }
-            Ok(serde_json::Value::String(out))
-        }
-        ValueExpr::Add { left, right }
-        | ValueExpr::Sub { left, right }
-        | ValueExpr::Mul { left, right }
-        | ValueExpr::Div { left, right } => {
-            let l = to_numeric(&eval_value_expr(left, doc, now_ms, ctx)?)?;
-            let r = to_numeric(&eval_value_expr(right, doc, now_ms, ctx)?)?;
-            match (l, r) {
-                (Some(l), Some(r)) => {
-                    // `r == 0.0` is true for -0.0 too (IEEE equality), so both
-                    // zero spellings are the same divisor error.
-                    if matches!(ve, ValueExpr::Div { .. }) && r == 0.0 {
-                        return Err(RtDbError::bad_request("division by zero"));
-                    }
-                    let x = match ve {
-                        ValueExpr::Add { .. } => l + r,
-                        ValueExpr::Sub { .. } => l - r,
-                        ValueExpr::Mul { .. } => l * r,
-                        _ => l / r,
-                    };
-                    finite_number(x)
-                }
-                // Either operand SQL-NULL → NULL; propagation precedes the
-                // zero-divisor and finiteness checks (null / 0 is null).
-                _ => Ok(serde_json::Value::Null),
-            }
-        }
-        ValueExpr::Coalesce { parts } => {
-            for p in parts {
-                let v = eval_value_expr(p, doc, now_ms, ctx)?;
-                if !v.is_null() {
-                    return Ok(v);
-                }
-            }
-            Ok(serde_json::Value::Null)
-        }
-        ValueExpr::Lower { value } => {
-            Ok(match to_text(&eval_value_expr(value, doc, now_ms, ctx)?) {
-                Some(text) => serde_json::Value::String(text.to_lowercase()),
-                None => serde_json::Value::Null,
-            })
-        }
-        ValueExpr::Upper { value } => {
-            Ok(match to_text(&eval_value_expr(value, doc, now_ms, ctx)?) {
-                Some(text) => serde_json::Value::String(text.to_uppercase()),
-                None => serde_json::Value::Null,
-            })
-        }
-        ValueExpr::Trim { value } => {
-            Ok(match to_text(&eval_value_expr(value, doc, now_ms, ctx)?) {
-                // Spaces only — Postgres btrim's default, not Unicode whitespace:
-                // a leading tab survives.
-                Some(text) => serde_json::Value::String(text.trim_matches(' ').to_string()),
-                None => serde_json::Value::Null,
-            })
-        }
-        ValueExpr::Cast { value, to } => {
-            let v = eval_value_expr(value, doc, now_ms, ctx)?;
-            match to {
-                Cast::ToString => Ok(match to_text(&v) {
-                    Some(text) => serde_json::Value::String(text),
-                    None => serde_json::Value::Null,
-                }),
-                Cast::ToNumber => match to_numeric(&v)? {
-                    Some(x) => finite_number(x),
-                    None => Ok(serde_json::Value::Null),
-                },
-                Cast::ToInt64 => cast_to_int64(&v),
-                Cast::ToBoolean => cast_to_boolean(&v),
-            }
-        }
-        ValueExpr::Now => Ok(serde_json::Value::from(now_ms)),
-        ValueExpr::Case { whens, otherwise } => {
-            // filter_matches takes a whole-document Value; the clone is paid
-            // only on the Case arm — the no-Case hot path never builds one.
-            let doc_value = serde_json::Value::Object(doc.clone());
-            for cw in whens {
-                if crate::dsl::filter_matches(&doc_value, &cw.when, ctx) {
-                    return eval_value_expr(&cw.then, doc, now_ms, ctx);
-                }
-            }
-            eval_value_expr(otherwise, doc, now_ms, ctx)
+        Cast::ToNumber => match to_numeric(&v)? {
+            Some(x) => finite_number(x),
+            None => Ok(serde_json::Value::Null),
+        },
+        Cast::ToInt64 => cast_to_int64(&v),
+        Cast::ToBoolean => cast_to_boolean(&v),
+    }
+}
+
+/// `Case` — the first matching `when` branch's `then`, else `otherwise`.
+fn eval_case(
+    whens: &[CaseWhen],
+    otherwise: &ValueExpr,
+    cx: &EvalCtx,
+) -> Result<serde_json::Value, RtDbError> {
+    // filter_matches takes a whole-document Value; the clone is paid
+    // only on the Case arm — the no-Case hot path never builds one.
+    let doc_value = serde_json::Value::Object(cx.doc.clone());
+    for cw in whens {
+        if crate::dsl::filter_matches(&doc_value, &cw.when, cx.principal) {
+            return eval_node(&cw.then, cx);
         }
     }
+    eval_node(otherwise, cx)
 }
 
 /// JSON value → text, mirroring the SQL `doc->>'field'` extraction the compile
