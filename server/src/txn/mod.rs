@@ -656,7 +656,7 @@ pub(crate) use auth::{
     authorize_spec_tables, authorize_txn_tables, check_owner, check_owner_doc, doc_visible_to,
     step_cancel_schedule, step_cancel_workflow, step_schedule, step_start_workflow,
 };
-pub(crate) use cascade::{delete_row_cascade, has_on_delete_children};
+pub(crate) use cascade::{CascadeCtx, delete_row_cascade, has_on_delete_children};
 pub(crate) use row_ops::{
     apply_patch, apply_update, do_expect_version, do_insert, do_patch, do_replace, do_soft_delete,
     eq_lookup, insert_snapshot_row,

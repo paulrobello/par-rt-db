@@ -212,18 +212,15 @@ pub(in crate::committer) async fn handle_purge(
     let mut deleted: u64 = 0;
     for (id,) in &ids[..take] {
         let mut cascade_rows = 0usize;
-        crate::txn::delete_row_cascade(
-            &mut tx,
-            &pg_schema_name,
-            &schema,
-            table_name,
-            id,
-            &mut write_set,
-            &mut visited,
-            &mut cascade_rows,
-            true,
-        )
-        .await?;
+        let mut cctx = crate::txn::CascadeCtx {
+            conn: &mut tx,
+            pg_schema_name: &pg_schema_name,
+            schema: &schema,
+            write_set: &mut write_set,
+            visited: &mut visited,
+            force_hard: true,
+        };
+        crate::txn::delete_row_cascade(&mut cctx, table_name, id, &mut cascade_rows).await?;
         aggregate_rows = aggregate_rows.saturating_add(cascade_rows);
         if aggregate_rows > aggregate_budget {
             // Every statement so far is on the open transaction; returning
