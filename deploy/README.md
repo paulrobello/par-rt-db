@@ -15,6 +15,7 @@ VPS and no reverse proxy is needed — TLS is terminated at Cloudflare's edge.
 - [Deploy / update](#deploy--update)
 - [Host reservation (quiet window)](#host-reservation-quiet-window)
 - [Topology: single instance by default; multi-instance is opt-in](#topology-single-instance-by-default-multi-instance-is-opt-in)
+- [Capacity planning: the per-database write budget](#capacity-planning-the-per-database-write-budget)
 - [Host machine authorization rollout](#host-machine-authorization-rollout)
 - [Postgres image](#postgres-image)
 - [Collation](#collation)
@@ -296,6 +297,40 @@ When `RTDB_MULTI_INSTANCE=true`, also set `RTDB_INSTANCE_ID` to a stable,
 distinct value per replica (e.g. `rtdb-a`, `rtdb-b`): NOTIFY self-dedupe works
 with an auto-generated id, but a stable id makes logs and diagnostics easier to
 correlate across replicas.
+
+## Capacity planning: the per-database write budget
+
+The hard scalability boundary is **per database, not per server**: every write
+to one database serializes through that database's single committer turn (the
+single-writer invariant above). Writes scale across databases — one committer
+per db, and under multi-instance one lease-holding writer per db per fleet —
+but a single hot database cannot scale writes horizontally no matter how many
+replicas front it.
+
+Measured budget (from `bench/baseline.json`, median of 3 runs against the
+deployed instance, 2026-08-25; details and methodology in
+[ARCHITECTURE.md's performance section](../docs/ARCHITECTURE.md#performance-characteristics)):
+
+| Load shape | Metric | Budget |
+| --- | --- | --- |
+| Sustained writes, 8 concurrent writers | commits/s | ~149 |
+| Sustained writes | commit latency p50 / p99 | ~43 ms / ~169 ms |
+| Bulk `deleteByQuery`, 5k rows, 100 subscribers | committer-turn hold | ~3.4 s |
+
+The turn-hold number is the one to plan around: while a bulk operation holds
+the turn, **every other write to that same database queues behind it** for the
+whole window. ENH-034 restructured fan-out concurrency and cut turn-hold p50
+by ~27% (~2050 ms → ~1500 ms) with no commit-throughput regression, but a
+multi-second bulk delete still stalls its database's writes for that span —
+schedule bulk maintenance (mass deletes, big migrations, restores) off-peak or
+in batches on databases with live writers.
+
+CI deliberately runs no benchmarks (shared GitHub runners are not comparable
+run to run), so throughput regressions are caught **before deploy**, not by
+CI: compare a fresh `make bench-baseline` against the committed baseline with
+`scripts/bench/compare.ts` (a >15% regression on any metric is the
+investigation trigger). Run this from the dev machine or the deploy host
+(there, against `127.0.0.1:8300` to skip the tunnel).
 
 ## Host machine authorization rollout
 

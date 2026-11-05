@@ -1328,6 +1328,14 @@ a live-mounted volume.
 
 ## Performance characteristics
 
+**Capacity boundary: one serialized write budget per database.** The measured
+~149 commits/s below is a per-db sustained number, not a fleet-wide ceiling.
+Different databases have independent committers and scale across databases
+(and across lease owners under multi-instance), but adding replicas does not
+increase one hot database's write budget. See the deploy runbook's
+[capacity-planning section](../deploy/README.md#capacity-planning-the-per-database-write-budget)
+for the operational budget and bulk-maintenance guidance.
+
 ENH-033 added a two-layer benchmark harness: criterion micro-benchmarks over
 the pure hot paths (`server/benches/`, `rust-client/benches/`, run via
 `make bench-micro`) and a black-box load script (`scripts/bench/load.ts`, run
