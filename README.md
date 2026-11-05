@@ -748,64 +748,71 @@ mirrored as the HTTP `Retry-After` header); every other code omits it:
 that `paginate` pages a ranked terminal rather than replacing it, so it may
 accompany `search`/`vectorSearch`/`hybridSearch` (see
 [Pagination](#pagination)). See
-`server/src/query/` for full semantics: index prefix binds, range predicates
-(`gt`/`gte`/`lt`/`lte`) follow the `eq` prefix, `order: "asc"|"desc"`, `take`
-capped at 4096, `unique` de-duplicates on the indexed fields, `count` is an
-uncapped `SELECT COUNT(*)`, `first` is sugar over `take(1)`, `filter` carries
-an `eq`/`neq`/`gt`/`gte`/`lt`/`lte`/`in`/`not`/`contains`/`exists` + `and`/`or`
-predicate compiled to SQL, `search` ranks by `ts_rank` over a generated
-tsvector (and accepts an optional `filter` to narrow the `WHERE` in the same
-SQL pass — the same `FilterExpr` `.filter()` accepts; query text is parsed as
-websearch syntax — quoted phrases require adjacency, a bare `or` unions,
-`-term` excludes; an optional `snippet: true` attaches a `_searchSnippet`
-`ts_headline` fragment per hit with matched terms wrapped in `<mark>`
-(server-fixed word bounds, tsquery mode only); an optional
-`mode: "trgm"` switches to substring/autocomplete matching — case-insensitive
-`ILIKE` ranked by `pg_trgm` `similarity()`, backed by a GIN trigram index; the
-index **must** declare `trgm: true` at push time — a search index without the
-flag is rejected with `BAD_REQUEST` ("does not declare trgm: true");
-two optional ranking knobs, both omitted from the wire when unset so existing
-requests stay byte-identical: `rankMode: "ts_rank" | "ts_rank_cd"` (tsquery
-mode only; `ts_rank_cd` is cover-density ranking and rewards tighter term
-proximity, `ts_rank` is the default) and `minSimilarity` (trgm mode only, a
-number in `0..=1`; hits whose `similarity()` is below it are dropped). A knob
-used in the wrong mode, or `minSimilarity` outside `0..=1`, is `BAD_REQUEST`),
-`vectorSearch` ranks by
-the index's declared metric distance over a write-maintained pgvector column
-(also accepting an optional full `filter`), `hybridSearch` fuses the full-text
-(`ts_rank`) and `vectorSearch` rankings for the same table into one list via
-Reciprocal Rank Fusion, `paginate` is opaque-cursor keyset pagination,
-`distinct` returns the unique values of the index field after the `eq` prefix
-(ascending; NULLs included, sorted last), and `aggregate` runs a scalar
-`sum`/`min`/`max`/`avg`/`count`, optionally grouped (`groupBy`) by the next
-index field (rows missing the group value form one `key: null` group,
-sorted last) — or, wire-v2, several named ops in one pass via an
-`aggregates: {alias: op, …}` map, and `groupBy` widened to an explicit list of
-declared index fields for composite grouping (`count per (status, priority)`);
-the map form returns `{alias: value, …}` ungrouped or `[{keys, values}]` rows
-grouped, and composes with the legacy single-`op` + field-list combination the
-same way. Aggregate result forms: `sum`/`min`/`max` over an `int64` index
-field return the exact decimal string — the int64 wire convention, exact past
-2^53 where a JSON number is an IEEE-754 double (a `sum` of satoshis or byte
-counts is not silently rounded); `avg` over any numeric field stays a JSON
-number (documented f64 form — a fractional mean has no int64 representation);
-`count` is an integer; a `number` field's aggregates are JSON numbers. A grouped
-aggregate may carry `having: {name: {eq?, ne?, gt?, gte?, lt?, lte?}}`, a
-post-group filter over aggregate values (`count >= 2`, `sum > 100`): `name` is an
-`aggregates` alias or, for a single-`op` spec, the lowercase op name; bounds on
-one name and across names AND together; it compiles to SQL `HAVING` on the
-server and post-filters identically in every in-memory engine. `having` needs a
-grouped spec, a numeric aggregate (`count`, or `sum`/`avg`/`min`/`max` over a
-numeric field), at least one bound per name, and a known name — otherwise
-`BAD_REQUEST`. Failing groups are dropped before the `MAX_TAKE` group cap, and
-a NULL aggregate never satisfies a bound. An optional `fields` array projects each result doc to the
-listed user fields — the system fields (`_id`/`_creationTime`/`_version`) and
-synthetic fields (`_searchSnippet`) are always kept, `fields: []` is an
-ids-only view, names are validated against the schema (`BAD_REQUEST` on an
-unknown field), it composes with every doc-bearing terminal (`count`/
-`distinct`/`aggregate` return no docs, so it is a no-op there), and a
-projected subscription does not push when a write changes only non-projected
-fields (the pushed payloads still carry `_version`).
+`server/src/query/` for full semantics.
+
+#### Terminals
+
+| Terminal | Behavior |
+| --- | --- |
+| `count` | An uncapped `SELECT COUNT(*)`. |
+| `first` | Sugar over `take(1)`. |
+| `search` | Ranks by `ts_rank` over a generated tsvector — see [Search modes](#search-modes). |
+| `vectorSearch` | Ranks by the index's declared metric distance over a write-maintained pgvector column (also accepting an optional full `filter`). |
+| `hybridSearch` | Fuses the full-text (`ts_rank`) and `vectorSearch` rankings for the same table into one list via Reciprocal Rank Fusion. |
+| `paginate` | Opaque-cursor keyset pagination. |
+| `distinct` | Returns the unique values of the index field after the `eq` prefix (ascending; NULLs included, sorted last). |
+| `aggregate` | Runs a scalar `sum`/`min`/`max`/`avg`/`count`, optionally grouped — see [Aggregates](#aggregates). |
+
+#### Index clauses
+
+- `index` prefix binds; range predicates (`gt`/`gte`/`lt`/`lte`) follow the `eq` prefix.
+- `order: "asc"|"desc"`; `take` is capped at 4096; `unique` de-duplicates on the indexed fields.
+- `filter` carries an `eq`/`neq`/`gt`/`gte`/`lt`/`lte`/`in`/`not`/`contains`/`exists` + `and`/`or` predicate compiled to SQL.
+
+#### Search modes
+
+- **tsquery (the default)** ranks by `ts_rank` over a generated tsvector and accepts an optional `filter` to narrow the `WHERE` in the same SQL pass — the same `FilterExpr` `.filter()` accepts. Query text is parsed as websearch syntax: quoted phrases require adjacency, a bare `or` unions, and `-term` excludes. An optional `snippet: true` attaches a `_searchSnippet` `ts_headline` fragment per hit with matched terms wrapped in `<mark>` (server-fixed word bounds, tsquery mode only). An optional `rankMode: "ts_rank" | "ts_rank_cd"` selects cover-density ranking (`ts_rank_cd` rewards tighter term proximity; `ts_rank` is the default; tsquery mode only).
+- **trgm** — an optional `mode: "trgm"` switches to substring/autocomplete matching: case-insensitive `ILIKE` ranked by `pg_trgm` `similarity()`, backed by a GIN trigram index. The index **must** declare `trgm: true` at push time — a search index without the flag is rejected with `BAD_REQUEST` ("does not declare trgm: true"). An optional `minSimilarity` (a number in `0..=1`) drops hits whose `similarity()` is below it (trgm mode only).
+
+Both ranking knobs (`rankMode`, `minSimilarity`) are omitted from the wire when unset, so existing requests stay byte-identical. A knob used in the wrong mode, or `minSimilarity` outside `0..=1`, is `BAD_REQUEST`.
+
+#### Aggregates
+
+`aggregate` runs a scalar `sum`/`min`/`max`/`avg`/`count`, optionally grouped
+(`groupBy`) by the next index field (rows missing the group value form one
+`key: null` group, sorted last) — or, wire-v2, several named ops in one pass
+via an `aggregates: {alias: op, …}` map, and `groupBy` widened to an explicit
+list of declared index fields for composite grouping (`count per
+(status, priority)`); the map form returns `{alias: value, …}` ungrouped or
+`[{keys, values}]` rows grouped, and composes with the legacy single-`op` +
+field-list combination the same way.
+
+Result forms:
+
+- `sum`/`min`/`max` over an `int64` index field return the exact decimal string — the int64 wire convention, exact past 2^53 where a JSON number is an IEEE-754 double (a `sum` of satoshis or byte counts is not silently rounded).
+- `avg` over any numeric field stays a JSON number (documented f64 form — a fractional mean has no int64 representation).
+- `count` is an integer; a `number` field's aggregates are JSON numbers.
+
+A grouped aggregate may carry `having: {name: {eq?, ne?, gt?, gte?, lt?, lte?}}`,
+a post-group filter over aggregate values (`count >= 2`, `sum > 100`): `name`
+is an `aggregates` alias or, for a single-`op` spec, the lowercase op name;
+bounds on one name and across names AND together; it compiles to SQL `HAVING`
+on the server and post-filters identically in every in-memory engine.
+`having` needs a grouped spec, a numeric aggregate (`count`, or
+`sum`/`avg`/`min`/`max` over a numeric field), at least one bound per name, and
+a known name — otherwise `BAD_REQUEST`. Failing groups are dropped before the
+`MAX_TAKE` group cap, and a NULL aggregate never satisfies a bound.
+
+#### Field projection
+
+An optional `fields` array projects each result doc to the listed user fields
+— the system fields (`_id`/`_creationTime`/`_version`) and synthetic fields
+(`_searchSnippet`) are always kept, `fields: []` is an ids-only view, names are
+validated against the schema (`BAD_REQUEST` on an unknown field), it composes
+with every doc-bearing terminal (`count`/`distinct`/`aggregate` return no
+docs, so it is a no-op there), and a projected subscription does not push when
+a write changes only non-projected fields (the pushed payloads still carry
+`_version`).
 
 An optional `lookups` array performs server-side lookup expansion — an
 N+1-free id join on the read DSL. Each `{"field", "table", "as", "cap"?}`
