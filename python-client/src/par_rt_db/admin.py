@@ -87,21 +87,174 @@ from collections.abc import (
     AsyncGenerator,
     AsyncIterable,
     AsyncIterator,
-    Callable,
     Generator,
     Iterable,
     Iterator,
     Mapping,
 )
+from collections.abc import Callable as Callable
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass as dataclass
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote, urlencode
+from urllib.parse import quote as quote
+from urllib.parse import urlencode
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel as BaseModel
+from pydantic import ValidationError
 
+from ._admin_ops_auth import (
+    _op_create_enrollment_grant,
+    _op_list_sessions,
+    _op_list_tokens,
+    _op_merge_users,
+    _op_mint_token,
+    _op_revoke_enrollment_grant,
+    _op_revoke_expired_sessions,
+    _op_revoke_session,
+    _op_revoke_token,
+    _op_revoke_user_sessions,
+)
+from ._admin_ops_backup import (
+    _op_backup_now,
+    _op_delete_backup,
+    _op_download_backup,
+    _op_list_backups,
+    _op_restore_backup,
+)
+from ._admin_ops_db import (
+    _op_admin_changes,
+    _op_admin_mutate,
+    _op_admin_query,
+    _op_admins_add,
+    _op_admins_list,
+    _op_admins_remove,
+    _op_allowlist_add,
+    _op_allowlist_list,
+    _op_allowlist_remove,
+    _op_clone_db,
+    _op_create_db,
+    _op_db_stats,
+    _op_delete_db,
+    _op_export_db,
+    _op_get_anonymous_access,
+    _op_get_config,
+    _op_get_read_only,
+    _op_import_db,
+    _op_import_db_stream,
+    _op_list_dbs,
+    _op_metrics,
+    _op_ops_recent,
+    _op_patch_config,
+    _op_presence_rooms,
+    _op_purge_confirm,
+    _op_purge_preview,
+    _op_set_anonymous_access,
+    _op_set_read_only,
+)
+from ._admin_ops_db import (
+    _parse_create_db as _parse_create_db,
+)
+from ._admin_ops_db import (
+    _purge_body as _purge_body,
+)
+from ._admin_ops_inspect import (
+    _op_explain,
+    _op_get_audit,
+    _op_get_subscriptions,
+    _op_slow_queries,
+)
+from ._admin_ops_schema import (
+    _op_get_json_schema,
+    _op_get_schema,
+    _op_get_schema_version,
+    _op_list_schema_history,
+    _op_migrate_schema,
+    _op_preview_schema,
+    _op_push_schema,
+    _op_restore_schema,
+)
+from ._admin_ops_storage import (
+    _op_admin_delete_file,
+    _op_admin_list_files,
+    _op_admin_upload_file,
+    _op_get_signed_url,
+)
+from ._admin_ops_webhooks import (
+    _op_create_webhook,
+    _op_delete_webhook,
+    _op_edit_webhook,
+    _op_list_deliveries,
+    _op_list_webhooks,
+    _op_redeliver_delivery,
+    _op_redeliver_failed,
+)
+from ._admin_ops_work import (
+    _op_admin_cancel_workflow,
+    _op_admin_create_schedule,
+    _op_admin_delete_workflow,
+    _op_admin_get_workflow,
+    _op_admin_list_schedules,
+    _op_admin_list_workflows,
+    _op_admin_manage_schedule,
+    _op_admin_signal_workflow,
+    _op_admin_start_workflow,
+)
+from ._admin_request import (
+    _AdminRequest as _AdminRequest,
+)
+from ._admin_request import (
+    _AsyncAdminExecutor,
+    _SyncAdminExecutor,
+)
+from ._admin_request import (
+    _parse_bytes as _parse_bytes,
+)
+from ._admin_request import (
+    _parse_databases as _parse_databases,
+)
+from ._admin_request import (
+    _parse_emails as _parse_emails,
+)
+from ._admin_request import (
+    _parse_expect_ok as _parse_expect_ok,
+)
+from ._admin_request import (
+    _parse_json_object as _parse_json_object,
+)
+from ._admin_request import (
+    _parse_model as _parse_model,
+)
+from ._admin_request import (
+    _parse_model_list as _parse_model_list,
+)
+from ._admin_request import (
+    _parse_none as _parse_none,
+)
+from ._admin_request import (
+    _parse_ok_bool as _parse_ok_bool,
+)
+from ._admin_request import (
+    _parse_restored_version as _parse_restored_version,
+)
+from ._admin_request import (
+    _parse_revoked_count as _parse_revoked_count,
+)
+from ._admin_request import (
+    _parse_step_results as _parse_step_results,
+)
+from ._admin_request import (
+    _parse_text as _parse_text,
+)
+from ._admin_request import (
+    _parse_webhook_id as _parse_webhook_id,
+)
+from ._admin_request import (
+    _require_json_object as _require_json_object,
+)
 from .admin_models import (
-    _STEP_RESULT_ADAPTER,
+    _STEP_RESULT_ADAPTER as _STEP_RESULT_ADAPTER,
+)
+from .admin_models import (
     _UNSET,
     AdminGaugesFrame,
     AdminMember,
@@ -137,7 +290,9 @@ from .admin_models import (
 from .errors import ErrorCode, RtDbError
 from .migration import Directive, MigrateRequest
 from .mutation import StepResult, Transaction
-from .query import Query, TableQuery, _terminal_of, parse_result
+from .query import Query, TableQuery
+from .query import _terminal_of as _terminal_of
+from .query import parse_result as parse_result
 from .schema import SchemaDef
 from .wire import (
     PROTOCOL_VERSION,
@@ -157,1064 +312,6 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-#
-# An ``_AdminRequest`` is a transport-agnostic description of one admin HTTP
-# call: the method, path, per-request kwargs (``json``/``params``/``content``/
-# ``headers``), and a ``parse`` closure that turns the successful response into
-# the method's return value. The sync/async executors below perform the actual
-# HTTP; the builders + parse closures are shared, collapsing the former
-# four-way duplication of the admin surface.
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class _AdminRequest:
-    """One admin HTTP call, described independent of sync/async transport."""
-
-    method: str
-    path: str
-    request_kwargs: dict[str, Any]
-    parse: Callable[[httpx.Response], Any]
-    # Raw-body ops (binary dump download, JSONL export) legitimately answer
-    # with a non-JSON 2xx body; the executors skip the JSON-object guard for
-    # them. Void routes need no flag — their body-less 202/204 statuses are
-    # exempted directly.
-    raw_body: bool = False
-
-
-# --- response parse helpers (shared by every builder of the same shape) ---
-
-
-def _parse_none(resp: httpx.Response) -> None:
-    """No body interpretation — fire-and-forget (e.g. ``DELETE /admin/backups/{n}``)."""
-    return None
-
-
-def _parse_expect_ok(resp: httpx.Response) -> None:
-    """Assert the body is ``{ok: true}``; raise :class:`RtDbError` otherwise."""
-    if not resp.json().get("ok"):
-        raise RtDbError(ErrorCode.INTERNAL, "admin request returned ok=false")
-
-
-def _parse_text(resp: httpx.Response) -> str:
-    return resp.text
-
-
-def _parse_bytes(resp: httpx.Response) -> bytes:
-    return resp.content
-
-
-def _parse_json_object(resp: httpx.Response) -> dict[str, Any]:
-    return dict(resp.json())
-
-
-def _parse_databases(resp: httpx.Response) -> list[str]:
-    return list(resp.json()["databases"])
-
-
-def _parse_emails(resp: httpx.Response) -> list[str]:
-    return list(resp.json()["emails"])
-
-
-def _parse_revoked_count(resp: httpx.Response) -> int:
-    return int(resp.json()["revoked"])
-
-
-def _parse_restored_version(resp: httpx.Response) -> int:
-    return int(resp.json()["restoredTo"])
-
-
-def _parse_webhook_id(resp: httpx.Response) -> int:
-    return int(resp.json()["id"])
-
-
-def _parse_ok_bool(resp: httpx.Response) -> bool:
-    """Read a ``{ok: bool}`` body as a return value — for routes where
-    ``ok:false`` is a legitimate outcome (e.g. cancelling/deleting a missing or
-    already-terminal workflow run), not an error."""
-    return bool(resp.json()["ok"])
-
-
-def _parse_step_results(resp: httpx.Response) -> list[StepResult]:
-    return [_STEP_RESULT_ADAPTER.validate_python(r) for r in resp.json()["results"]]
-
-
-def _parse_model[T: BaseModel](model_cls: type[T]) -> Callable[[httpx.Response], T]:
-    """``model_cls.model_validate(resp.json())`` as a parse closure."""
-
-    def parse(resp: httpx.Response) -> T:
-        return model_cls.model_validate(resp.json())
-
-    return parse
-
-
-def _parse_model_list[T: BaseModel](
-    model_cls: type[T], key: str
-) -> Callable[[httpx.Response], list[T]]:
-    """``[model_cls.model_validate(x) for x in resp.json()[key]]`` as a parse closure."""
-
-    def parse(resp: httpx.Response) -> list[T]:
-        return [model_cls.model_validate(x) for x in resp.json()[key]]
-
-    return parse
-
-
-def _require_json_object(resp: httpx.Response, path: str) -> None:
-    """Raise :class:`RtDbError` unless a 2xx ``resp`` carries a JSON object body.
-
-    ts/rust/swift parity: an unparseable 2xx body (empty body, HTML gateway
-    page, invalid JSON) must surface as ``RtDbError`` INTERNAL naming the
-    route — otherwise the caller's ``resp.json()[...]`` raises a raw
-    ``JSONDecodeError`` far from the request that caused it. Shared by the
-    admin executors and both data-plane ``_send`` helpers.
-    """
-    try:
-        body = resp.json()
-    except ValueError as e:
-        raise RtDbError(ErrorCode.INTERNAL, f"{path} returned 2xx with no JSON object body") from e
-    if not isinstance(body, dict):
-        raise RtDbError(ErrorCode.INTERNAL, f"{path} returned 2xx with no JSON object body")
-
-
-# --- request builders (one per admin operation) ---
-#
-# Each builder captures the operation's request construction (path interpolation,
-# conditional body fields, tri-state sentinels, query-param assembly) AND its
-# response parse, so the former four copies collapse to one. The sync/async
-# façade classes below delegate to these via the executors.
-
-
-def _parse_create_db(resp: httpx.Response) -> str:
-    _parse_expect_ok(resp)
-    return str(resp.json()["creationId"])
-
-
-def _op_create_db(name: str) -> _AdminRequest:
-    return _AdminRequest("POST", "/admin/create-db", {"json": {"name": name}}, _parse_create_db)
-
-
-def _op_delete_db(
-    name: str, confirm: str, expected_creation_id: str | None = None
-) -> _AdminRequest:
-    body: dict[str, Any] = {"name": name, "confirm": confirm}
-    if expected_creation_id is not None:
-        body["expectedCreationId"] = expected_creation_id
-    return _AdminRequest("POST", "/admin/delete-db", {"json": body}, _parse_expect_ok)
-
-
-def _op_list_dbs() -> _AdminRequest:
-    return _AdminRequest("GET", "/admin/dbs", {}, _parse_databases)
-
-
-def _op_push_schema(db: str, schema: SchemaDef) -> _AdminRequest:
-    return _AdminRequest(
-        "POST",
-        "/admin/push-schema",
-        {"json": {"db": db, "schema": schema.model_dump(by_alias=True, mode="json")}},
-        _parse_expect_ok,
-    )
-
-
-def _op_preview_schema(db: str, schema: SchemaDef) -> _AdminRequest:
-    return _AdminRequest(
-        "POST",
-        f"/admin/db/{db}/schema/preview",
-        {"json": {"schema": schema.model_dump(by_alias=True, mode="json")}},
-        _parse_model(SchemaPreviewDiff),
-    )
-
-
-def _op_get_schema(db: str) -> _AdminRequest:
-    return _AdminRequest("GET", f"/admin/dbs/{db}/schema", {}, _parse_model(SchemaDef))
-
-
-def _op_get_json_schema(db: str) -> _AdminRequest:
-    return _AdminRequest("GET", f"/admin/db/{db}/schema/json-schema", {}, _parse_json_object)
-
-
-def _op_migrate_schema(
-    db: str,
-    directives: list[Directive] | MigrateRequest,
-    *,
-    dry_run: bool,
-) -> _AdminRequest:
-    wire_directives = (
-        directives.directives if isinstance(directives, MigrateRequest) else directives
-    )
-    body = {
-        "directives": [d.model_dump(by_alias=True, mode="json") for d in wire_directives],
-        "dryRun": dry_run,
-    }
-    return _AdminRequest(
-        "POST", f"/admin/db/{db}/migrate", {"json": body}, _parse_model(MigrateResult)
-    )
-
-
-def _op_list_schema_history(
-    db: str,
-    *,
-    limit: int | None = None,
-    offset: int | None = None,
-) -> _AdminRequest:
-    params: dict[str, int] = {}
-    if limit is not None:
-        params["limit"] = limit
-    if offset is not None:
-        params["offset"] = offset
-    return _AdminRequest(
-        "GET",
-        f"/admin/db/{db}/schema/history",
-        {"params": params or None},
-        _parse_model_list(SchemaHistorySummary, "entries"),
-    )
-
-
-def _op_get_schema_version(db: str, version: int) -> _AdminRequest:
-    return _AdminRequest(
-        "GET",
-        f"/admin/db/{db}/schema/history/{version}",
-        {},
-        _parse_model(SchemaHistoryEntry),
-    )
-
-
-def _op_restore_schema(db: str, version: int, *, confirm: str) -> _AdminRequest:
-    return _AdminRequest(
-        "POST",
-        f"/admin/db/{db}/schema/restore",
-        {"json": {"version": version, "confirm": confirm}},
-        _parse_restored_version,
-    )
-
-
-def _op_export_db(db: str) -> _AdminRequest:
-    return _AdminRequest(
-        "GET", "/admin/export-db", {"params": {"db": db}}, _parse_text, raw_body=True
-    )
-
-
-def _op_import_db(db: str, jsonl: str) -> _AdminRequest:
-    return _AdminRequest(
-        "POST",
-        "/admin/import-db",
-        {
-            "params": {"db": db},
-            "content": jsonl,
-            "headers": {"Content-Type": "application/x-ndjson"},
-        },
-        _parse_expect_ok,
-    )
-
-
-def _op_import_db_stream(db: str, body: Iterable[bytes] | AsyncIterable[bytes]) -> _AdminRequest:
-    """Streaming twin of :func:`_op_import_db`: same endpoint, headers and
-    response; ``content`` is an iterable of byte chunks sent chunked instead of
-    one materialized string."""
-    return _AdminRequest(
-        "POST",
-        "/admin/import-db",
-        {
-            "params": {"db": db},
-            "content": body,
-            "headers": {"Content-Type": "application/x-ndjson"},
-        },
-        _parse_expect_ok,
-    )
-
-
-def _op_clone_db(from_: str, to: str) -> _AdminRequest:
-    return _AdminRequest(
-        "POST",
-        "/admin/clone-db",
-        {"params": {"from": from_, "to": to}},
-        _parse_expect_ok,
-    )
-
-
-def _op_allowlist_add(db: str, email: str) -> _AdminRequest:
-    return _AdminRequest(
-        "POST",
-        "/admin/allowlist",
-        {"json": {"db": db, "action": "add", "email": email}},
-        _parse_expect_ok,
-    )
-
-
-def _op_allowlist_remove(db: str, email: str) -> _AdminRequest:
-    return _AdminRequest(
-        "POST",
-        "/admin/allowlist",
-        {"json": {"db": db, "action": "remove", "email": email}},
-        _parse_expect_ok,
-    )
-
-
-def _op_allowlist_list(db: str) -> _AdminRequest:
-    return _AdminRequest("GET", "/admin/allowlist", {"params": {"db": db}}, _parse_emails)
-
-
-def _op_admins_list() -> _AdminRequest:
-    return _AdminRequest("GET", "/admin/admins", {}, _parse_model_list(AdminMember, "admins"))
-
-
-def _op_admins_add(email: str, github_id: int | None = None) -> _AdminRequest:
-    body: dict[str, Any] = {"email": email}
-    if github_id is not None:
-        body["githubId"] = github_id
-    return _AdminRequest("POST", "/admin/admins", {"json": body}, _parse_expect_ok)
-
-
-def _op_admins_remove(email: str) -> _AdminRequest:
-    return _AdminRequest("DELETE", "/admin/admins", {"json": {"email": email}}, _parse_expect_ok)
-
-
-def _op_db_stats(db: str) -> _AdminRequest:
-    return _AdminRequest("GET", f"/admin/dbs/{db}/stats", {}, _parse_model(DbStats))
-
-
-def _op_metrics() -> _AdminRequest:
-    return _AdminRequest("GET", "/admin/metrics", {}, _parse_model(MetricsSnapshot))
-
-
-def _op_presence_rooms() -> _AdminRequest:
-    return _AdminRequest("GET", "/admin/presence", {}, _parse_model(PresenceRoomsResponse))
-
-
-def _op_ops_recent(
-    *,
-    db: str | None = None,
-    table: str | None = None,
-    n: int | None = None,
-) -> _AdminRequest:
-    params: dict[str, Any] = {}
-    if db is not None:
-        params["db"] = db
-    if table is not None:
-        params["table"] = table
-    if n is not None:
-        params["n"] = n
-    return _AdminRequest(
-        "GET", "/admin/ops/recent", {"params": params}, _parse_model_list(OpEvent, "ops")
-    )
-
-
-def _op_get_config() -> _AdminRequest:
-    return _AdminRequest("GET", "/admin/config", {}, _parse_model(ConfigResponse))
-
-
-def _op_patch_config(patch: HotConfigPatch | Mapping[str, Any]) -> _AdminRequest:
-    if isinstance(patch, Mapping):
-        body: dict[str, Any] = dict(patch)
-    else:
-        body = patch.model_dump(by_alias=True, mode="json", exclude_none=True)
-    return _AdminRequest("PATCH", "/admin/config", {"json": body}, _parse_model(ConfigResponse))
-
-
-def _op_admin_query(
-    db: str,
-    query: Query | TableQuery,
-    *,
-    model: type,
-    include_deleted: bool | None = None,
-) -> _AdminRequest:
-    built = query.build() if isinstance(query, TableQuery) else query
-    body: dict[str, Any] = {"query": built.model_dump(by_alias=True, mode="json")}
-    # ``includeDeleted`` is an internal admin-route param (NOT a wire ``Query``
-    # field): only a truthy value puts the key on the wire — never ``null``,
-    # absent by default so the server's live-rows-only default applies.
-    if include_deleted:
-        body["includeDeleted"] = True
-    terminal = _terminal_of(built)
-
-    def parse(resp: httpx.Response) -> Any:
-        return parse_result(model, terminal, resp.json()["result"])
-
-    return _AdminRequest("POST", f"/admin/db/{db}/query", {"json": body}, parse)
-
-
-def _op_admin_mutate(
-    db: str,
-    txn: Transaction,
-    *,
-    idempotency_key: str | None = None,
-) -> _AdminRequest:
-    body: dict[str, Any] = {"txn": txn.model_dump(by_alias=True, mode="json")}
-    if idempotency_key is not None:
-        body["idempotencyKey"] = idempotency_key
-    return _AdminRequest("POST", f"/admin/db/{db}/mutate", {"json": body}, _parse_step_results)
-
-
-def _op_admin_changes(
-    db: str,
-    since: int = 0,
-    *,
-    table: str | None = None,
-    limit: int | None = None,
-) -> _AdminRequest:
-    # ``since``/``limit`` default server-side (0 and 500); omitted keys are not
-    # sent so the defaults apply. httpx percent-encodes the query params; the
-    # path segment is encoded explicitly.
-    params: dict[str, Any] = {"since": since}
-    if table is not None:
-        params["table"] = table
-    if limit is not None:
-        params["limit"] = limit
-    return _AdminRequest(
-        "GET",
-        f"/admin/db/{quote(db, safe='')}/changes",
-        {"params": params},
-        _parse_model(ChangeFeedResponse),
-    )
-
-
-def _op_backup_now() -> _AdminRequest:
-    return _AdminRequest("POST", "/admin/backup", {"json": {}}, _parse_expect_ok)
-
-
-def _op_list_backups() -> _AdminRequest:
-    return _AdminRequest("GET", "/admin/backups", {}, _parse_json_object)
-
-
-def _op_download_backup(name: str) -> _AdminRequest:
-    return _AdminRequest("GET", f"/admin/backups/{name}", {}, _parse_bytes, raw_body=True)
-
-
-def _op_delete_backup(name: str) -> _AdminRequest:
-    return _AdminRequest("DELETE", f"/admin/backups/{name}", {}, _parse_none)
-
-
-def _op_restore_backup(name: str) -> _AdminRequest:
-    return _AdminRequest(
-        "POST",
-        "/admin/restore",
-        {"json": {"name": name, "confirm": name}},
-        _parse_json_object,
-    )
-
-
-# --- workflow surface (FM-29) ---
-
-
-def _op_admin_list_workflows(
-    db: str,
-    *,
-    status: WorkflowStatus | None = None,
-    limit: int | None = None,
-) -> _AdminRequest:
-    params: dict[str, Any] = {}
-    if status is not None:
-        params["status"] = status
-    if limit is not None:
-        params["limit"] = limit
-    return _AdminRequest(
-        "GET",
-        f"/admin/db/{db}/workflows",
-        {"params": params},
-        _parse_model_list(WorkflowInfo, "workflows"),
-    )
-
-
-def _op_admin_start_workflow(db: str, spec: WorkflowSpec) -> _AdminRequest:
-    return _AdminRequest(
-        "POST",
-        f"/admin/db/{db}/workflows",
-        {"json": spec.model_dump(by_alias=True, mode="json")},
-        lambda resp: str(resp.json()["id"]),
-    )
-
-
-def _op_admin_get_workflow(db: str, id: str) -> _AdminRequest:
-    return _AdminRequest(
-        "GET", f"/admin/db/{db}/workflows/{id}", {}, _parse_model(WorkflowInfoFull)
-    )
-
-
-def _op_admin_cancel_workflow(db: str, id: str) -> _AdminRequest:
-    return _AdminRequest(
-        "POST", f"/admin/db/{db}/workflows/{id}/cancel", {"json": {}}, _parse_ok_bool
-    )
-
-
-def _op_admin_signal_workflow(
-    db: str, id: str, name: str, payload: Any | None = None
-) -> _AdminRequest:
-    body: dict[str, Any] = {"name": name}
-    if payload is not None:
-        body["payload"] = payload
-    return _AdminRequest(
-        "POST", f"/admin/db/{db}/workflows/{id}/signal", {"json": body}, _parse_ok_bool
-    )
-
-
-def _op_admin_delete_workflow(db: str, id: str) -> _AdminRequest:
-    return _AdminRequest("DELETE", f"/admin/db/{db}/workflows/{id}", {}, _parse_ok_bool)
-
-
-# --- admin schedule management ---
-#
-# GET|POST /admin/db/{db}/schedules + POST .../{id}/cancel|pause|resume.
-# Mirrors the ts/rust admin clients one-to-one — paths, bodies, and response
-# shapes identical; reuses the wire ``ScheduleInfo``/``ScheduleWhen`` and the
-# DSL ``Transaction`` types the client already carries. The manage ops take the
-# id + op from the path and no body; ``ok:false`` means an unknown or terminal
-# id (a no-op, not an error), so they parse through ``_parse_ok_bool``.
-
-
-def _op_admin_list_schedules(db: str) -> _AdminRequest:
-    return _AdminRequest(
-        "GET", f"/admin/db/{db}/schedules", {}, _parse_model_list(ScheduleInfo, "schedules")
-    )
-
-
-def _op_admin_create_schedule(db: str, when: ScheduleWhen, txn: Transaction) -> _AdminRequest:
-    return _AdminRequest(
-        "POST",
-        f"/admin/db/{db}/schedules",
-        {
-            "json": {
-                "when": when.model_dump(by_alias=True, mode="json"),
-                "txn": txn.model_dump(by_alias=True, mode="json"),
-            }
-        },
-        lambda resp: str(resp.json()["id"]),
-    )
-
-
-def _op_admin_manage_schedule(db: str, id: str, op: str) -> _AdminRequest:
-    """Bodyless POST for cancel/pause/resume — ``op`` is only ever one of those
-    three literals, each a path segment the server routes on."""
-    return _AdminRequest("POST", f"/admin/db/{db}/schedules/{id}/{op}", {}, _parse_ok_bool)
-
-
-# --- admin file storage ---
-#
-# GET|POST /admin/db/{db}/storage + DELETE .../{id}. The upload body is the
-# file itself (raw bytes, not JSON); ``content_type`` sets the ``Content-Type``
-# header and is left unset when ``None`` (the server then stores the blob
-# untyped) — the same convention as the data-plane ``RtDbHttpClient.upload``.
-
-
-def _op_admin_list_files(db: str) -> _AdminRequest:
-    return _AdminRequest(
-        "GET", f"/admin/db/{db}/storage", {}, _parse_model_list(FileMetadata, "files")
-    )
-
-
-def _op_admin_upload_file(
-    db: str,
-    data: bytes,
-    *,
-    content_type: str | None = None,
-) -> _AdminRequest:
-    headers = {"Content-Type": content_type} if content_type is not None else None
-    return _AdminRequest(
-        "POST",
-        f"/admin/db/{db}/storage",
-        {"content": data, "headers": headers},
-        lambda resp: str(resp.json()["id"]),
-    )
-
-
-def _op_admin_delete_file(db: str, id: str) -> _AdminRequest:
-    return _AdminRequest("DELETE", f"/admin/db/{db}/storage/{id}", {}, _parse_expect_ok)
-
-
-def _op_get_signed_url(
-    db: str,
-    id: str,
-    *,
-    w: int | None = None,
-    h: int | None = None,
-    fit: str | None = None,
-    q: int | None = None,
-    format: str | None = None,
-) -> _AdminRequest:
-    """Mint a signed, time-limited URL for a storage blob. The transform
-    params ride the mint so the server binds them into the signature
-    (SEC-003); ``format="auto"`` is the server default and is omitted."""
-    params: dict[str, Any] = {}
-    if w is not None:
-        params["w"] = w
-    if h is not None:
-        params["h"] = h
-    if fit is not None:
-        params["fit"] = fit
-    if q is not None:
-        params["q"] = q
-    if format is not None and format != "auto":
-        params["format"] = format
-    return _AdminRequest(
-        "GET",
-        f"/api/storage/{db}/{id}/signed-url",
-        {"params": params or None},
-        _parse_model(SignedUrl),
-    )
-
-
-# --- per-db anonymous-access toggle (SEC-103) ---
-
-
-def _op_get_anonymous_access(db: str) -> _AdminRequest:
-    return _AdminRequest(
-        "GET",
-        f"/admin/db/{db}/anonymous-access",
-        {},
-        lambda resp: bool(resp.json()["enabled"]),
-    )
-
-
-def _op_set_anonymous_access(db: str, enabled: bool) -> _AdminRequest:
-    return _AdminRequest(
-        "PATCH",
-        f"/admin/db/{db}/anonymous-access",
-        {"json": {"enabled": enabled}},
-        _parse_expect_ok,
-    )
-
-
-# --- per-db read-only freeze ---
-
-
-def _op_get_read_only(db: str) -> _AdminRequest:
-    return _AdminRequest(
-        "GET",
-        f"/admin/db/{db}/readonly",
-        {},
-        lambda resp: bool(resp.json()["readOnly"]),
-    )
-
-
-def _op_set_read_only(db: str, read_only: bool) -> _AdminRequest:
-    return _AdminRequest(
-        "PATCH",
-        f"/admin/db/{db}/readonly",
-        {"json": {"readOnly": read_only}},
-        _parse_expect_ok,
-    )
-
-
-def _op_mint_token(
-    db: str,
-    name: str,
-    *,
-    expires_at: int | None = None,
-    read_only: bool = False,
-    tables: list[str] | None = None,
-    host_capability: HostCapability | None = None,
-) -> _AdminRequest:
-    body: dict[str, Any] = {"db": db, "name": name, "readOnly": read_only}
-    if expires_at is not None:
-        body["expiresAt"] = expires_at
-    if tables is not None:
-        body["tables"] = list(tables)
-    if host_capability is not None:
-        body["hostCapability"] = host_capability.model_dump(by_alias=True, mode="json")
-    return _AdminRequest("POST", "/admin/mint-token", {"json": body}, _parse_model(MintedToken))
-
-
-def _op_revoke_token(token_id: str) -> _AdminRequest:
-    return _AdminRequest(
-        "POST",
-        "/admin/revoke-token",
-        {"json": {"tokenId": token_id}},
-        _parse_expect_ok,
-    )
-
-
-# --- enrollment grants (host-machine-auth) ----------------------------------
-#
-# POST /admin/enrollment-grants (create, admin bearer) +
-# POST /admin/revoke-enrollment-grant (revoke, admin bearer). The public
-# redemption route, POST /auth/enroll, is NOT an admin route — it lives on the
-# data-plane HTTP clients next to /auth/me (see par_rt_db.http_client).
-
-
-def _op_create_enrollment_grant(
-    db: str,
-    name: str,
-    capability: HostCapability,
-    expires_at: int,
-    *,
-    token_expires_at: int | None = None,
-) -> _AdminRequest:
-    body: dict[str, Any] = {
-        "db": db,
-        "name": name,
-        "capability": capability.model_dump(by_alias=True, mode="json"),
-        "expiresAt": expires_at,
-    }
-    if token_expires_at is not None:
-        body["tokenExpiresAt"] = token_expires_at
-    return _AdminRequest(
-        "POST",
-        "/admin/enrollment-grants",
-        {"json": body},
-        _parse_model(EnrollmentGrant),
-    )
-
-
-def _op_revoke_enrollment_grant(grant_id: str) -> _AdminRequest:
-    return _AdminRequest(
-        "POST",
-        "/admin/revoke-enrollment-grant",
-        {"json": {"grantId": grant_id}},
-        _parse_expect_ok,
-    )
-
-
-def _op_list_tokens(db: str) -> _AdminRequest:
-    return _AdminRequest(
-        "GET", "/admin/tokens", {"params": {"db": db}}, _parse_model_list(TokenInfo, "tokens")
-    )
-
-
-def _op_list_sessions(
-    *,
-    user: str | None = None,
-    limit: int | None = None,
-) -> _AdminRequest:
-    params: dict[str, Any] = {}
-    if user is not None:
-        params["user"] = user
-    if limit is not None:
-        params["limit"] = limit
-    return _AdminRequest(
-        "GET", "/admin/sessions", {"params": params}, _parse_model_list(SessionInfo, "sessions")
-    )
-
-
-def _op_revoke_session(token_hash: str) -> _AdminRequest:
-    return _AdminRequest("DELETE", f"/admin/sessions/{token_hash}", {}, _parse_expect_ok)
-
-
-def _op_revoke_user_sessions(user_id: str) -> _AdminRequest:
-    return _AdminRequest(
-        "DELETE",
-        "/admin/sessions",
-        {"params": {"user": user_id}},
-        _parse_revoked_count,
-    )
-
-
-def _op_revoke_expired_sessions() -> _AdminRequest:
-    return _AdminRequest(
-        "DELETE",
-        "/admin/sessions",
-        {"params": {"expired": "true"}},
-        _parse_revoked_count,
-    )
-
-
-def _op_merge_users(anon_user_id: str, real_user_id: str) -> _AdminRequest:
-    return _AdminRequest(
-        "POST",
-        "/admin/merge-users",
-        {
-            "json": {
-                "anonUserId": anon_user_id,
-                "realUserId": real_user_id,
-                "confirm": real_user_id,
-            }
-        },
-        _parse_model(MergeReport),
-    )
-
-
-def _op_list_webhooks(db: str) -> _AdminRequest:
-    return _AdminRequest(
-        "GET",
-        f"/admin/db/{db}/webhooks",
-        {},
-        _parse_model_list(Webhook, "webhooks"),
-    )
-
-
-def _op_create_webhook(
-    db: str,
-    *,
-    url: str,
-    table: str | None = None,
-    events: list[str] | None = None,
-    enabled: bool | None = None,
-) -> _AdminRequest:
-    body: dict[str, Any] = {"url": url}
-    if table is not None:
-        body["table"] = table
-    if events is not None:
-        body["events"] = list(events)
-    if enabled is not None:
-        body["enabled"] = enabled
-    return _AdminRequest("POST", f"/admin/db/{db}/webhooks", {"json": body}, _parse_webhook_id)
-
-
-def _op_edit_webhook(
-    db: str,
-    id: int,
-    *,
-    url: str | None = None,
-    table: str | None | object = _UNSET,
-    events: list[str] | None = None,
-    enabled: bool | None = None,
-    rotate_secret: bool | None = None,
-) -> _AdminRequest:
-    body: dict[str, Any] = {}
-    if url is not None:
-        body["url"] = url
-    if table is not _UNSET:
-        # ``table`` may be ``None`` (clear to all-tables) or a string (set);
-        # both are valid body values, so assign verbatim.
-        body["table"] = table
-    if events is not None:
-        body["events"] = list(events)
-    if enabled is not None:
-        body["enabled"] = enabled
-    if rotate_secret is not None:
-        body["rotateSecret"] = rotate_secret
-    return _AdminRequest(
-        "PUT", f"/admin/db/{db}/webhooks/{id}", {"json": body}, _parse_model(Webhook)
-    )
-
-
-def _op_delete_webhook(db: str, id: int) -> _AdminRequest:
-    return _AdminRequest(
-        "DELETE",
-        f"/admin/db/{db}/webhooks/{id}",
-        {},
-        _parse_expect_ok,
-    )
-
-
-def _op_redeliver_delivery(db: str, id: int, delivery_id: int) -> _AdminRequest:
-    return _AdminRequest(
-        "POST",
-        f"/admin/db/{db}/webhooks/{id}/deliveries/{delivery_id}/redeliver",
-        {"json": {}},
-        _parse_model(WebhookDelivery),
-    )
-
-
-def _op_redeliver_failed(db: str, id: int) -> _AdminRequest:
-    return _AdminRequest(
-        "POST",
-        f"/admin/db/{db}/webhooks/{id}/deliveries/redeliver-failed",
-        {"json": {}},
-        _parse_model_list(WebhookDelivery, "deliveries"),
-    )
-
-
-def _op_list_deliveries(
-    db: str,
-    id: int,
-    *,
-    status: str | None = None,
-    limit: int | None = None,
-    offset: int | None = None,
-) -> _AdminRequest:
-    params: dict[str, Any] = {}
-    if status is not None:
-        params["status"] = status
-    if limit is not None:
-        params["limit"] = limit
-    if offset is not None:
-        params["offset"] = offset
-    return _AdminRequest(
-        "GET",
-        f"/admin/db/{db}/webhooks/{id}/deliveries",
-        {"params": params},
-        _parse_model_list(WebhookDelivery, "deliveries"),
-    )
-
-
-def _op_get_audit(
-    db: str,
-    *,
-    table: str | None = None,
-    op: str | None = None,
-    principal: str | None = None,
-    source: str | None = None,
-    limit: int | None = None,
-    offset: int | None = None,
-) -> _AdminRequest:
-    params: dict[str, Any] = {"db": db}
-    if table is not None:
-        params["table"] = table
-    if op is not None:
-        params["op"] = op
-    if principal is not None:
-        params["principal"] = principal
-    if source is not None:
-        params["source"] = source
-    if limit is not None:
-        params["limit"] = limit
-    if offset is not None:
-        params["offset"] = offset
-    return _AdminRequest(
-        "GET", "/admin/audit", {"params": params}, _parse_model_list(AuditEntry, "entries")
-    )
-
-
-def _op_get_subscriptions(db: str | None = None) -> _AdminRequest:
-    params: dict[str, Any] = {}
-    if db is not None:
-        params["db"] = db
-    return _AdminRequest(
-        "GET",
-        "/admin/subscriptions",
-        {"params": params},
-        _parse_model(SubscriptionsResponse),
-    )
-
-
-def _op_explain(db: str, query: Query | TableQuery) -> _AdminRequest:
-    built = query.build() if isinstance(query, TableQuery) else query
-    body = {"query": built.model_dump(by_alias=True, mode="json")}
-    return _AdminRequest(
-        "POST", f"/admin/db/{db}/explain", {"json": body}, _parse_model(ExplainResult)
-    )
-
-
-def _op_slow_queries(*, db: str | None = None, limit: int | None = None) -> _AdminRequest:
-    params: dict[str, Any] = {}
-    if db is not None:
-        params["db"] = db
-    if limit is not None:
-        params["limit"] = limit
-    return _AdminRequest(
-        "GET", "/admin/slow-queries", {"params": params}, _parse_model(SlowQueriesResponse)
-    )
-
-
-# --- two-phase insertOnly purge (POST /admin/db/{db}/purge) ------------------
-#
-# Preview (no ``confirm``) → {matching, confirmToken, limit}; confirm (with the
-# token) → {deleted, truncated}; repeat while ``truncated`` is True. ``filter``
-# is the same wire ``FilterExpr`` a Query's ``filter`` uses; omitted keys are
-# not sent so the server defaults apply (whole-table match, limit 10000).
-
-
-def _purge_body(
-    table: str,
-    *,
-    filter: FilterExpr | None = None,
-    limit: int | None = None,
-    confirm: str | None = None,
-) -> dict[str, Any]:
-    body: dict[str, Any] = {"table": table}
-    if filter is not None:
-        body["filter"] = filter.model_dump(by_alias=True, mode="json")
-    if limit is not None:
-        body["limit"] = limit
-    if confirm is not None:
-        body["confirm"] = confirm
-    return body
-
-
-def _op_purge_preview(
-    db: str,
-    table: str,
-    *,
-    filter: FilterExpr | None = None,
-    limit: int | None = None,
-) -> _AdminRequest:
-    return _AdminRequest(
-        "POST",
-        f"/admin/db/{db}/purge",
-        {"json": _purge_body(table, filter=filter, limit=limit)},
-        _parse_model(PurgePreviewResult),
-    )
-
-
-def _op_purge_confirm(
-    db: str,
-    table: str,
-    *,
-    confirm: str,
-    filter: FilterExpr | None = None,
-    limit: int | None = None,
-) -> _AdminRequest:
-    return _AdminRequest(
-        "POST",
-        f"/admin/db/{db}/purge",
-        {"json": _purge_body(table, filter=filter, limit=limit, confirm=confirm)},
-        _parse_model(PurgeResult),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Executors — one sync, one async. Each performs the HTTP call described by an
-# ``_AdminRequest`` and hands the successful response to its ``parse`` closure.
-# Non-2xx raises ``RtDbError`` exactly as the former per-class ``_send``/``_req``
-# helpers did. These are the only place sync vs async differ.
-# ---------------------------------------------------------------------------
-
-
-class _SyncAdminExecutor:
-    """Sync admin request executor over a long-lived :class:`httpx.Client`.
-
-    The bearer header is set on the underlying client at construction time (by
-    the owning façade), so the executor passes only the request description
-    through.
-    """
-
-    def __init__(self, client: httpx.Client) -> None:
-        self._client = client
-
-    def run(self, req: _AdminRequest) -> Any:
-        resp = self._client.request(req.method, req.path, **req.request_kwargs)
-        if not resp.is_success:
-            raise RtDbError.from_http(resp.status_code, resp.content)
-        # 202 (backupNow) and 204 (backup delete) carry no body; raw_body ops
-        # (dump download, export) carry non-JSON bodies. Every other 2xx must
-        # be a JSON object — ts admin parity.
-        if not req.raw_body and resp.status_code not in (202, 204):
-            _require_json_object(resp, f"admin request to {req.path}")
-        return req.parse(resp)
-
-    @contextmanager
-    def stream(self, req: _AdminRequest) -> Generator[Iterator[bytes]]:
-        """Open ``req`` as a streamed response and yield its body chunks.
-
-        A non-2xx status is read in full and raised as :class:`RtDbError`
-        before anything is yielded; the connection closes on context exit.
-        """
-        with self._client.stream(req.method, req.path, **req.request_kwargs) as resp:
-            if not resp.is_success:
-                resp.read()
-                raise RtDbError.from_http(resp.status_code, resp.content)
-            yield resp.iter_bytes()
-
-
-class _AsyncAdminExecutor:
-    """Async admin request executor over a long-lived :class:`httpx.AsyncClient`.
-
-    Async twin of :class:`_SyncAdminExecutor`; behavior is identical apart from
-    the ``await``.
-    """
-
-    def __init__(self, client: httpx.AsyncClient) -> None:
-        self._client = client
-
-    async def run(self, req: _AdminRequest) -> Any:
-        resp = await self._client.request(req.method, req.path, **req.request_kwargs)
-        if not resp.is_success:
-            raise RtDbError.from_http(resp.status_code, resp.content)
-        # Same guard as the sync executor: body-less 202/204 and raw-body ops
-        # are exempt; every other 2xx must be a JSON object.
-        if not req.raw_body and resp.status_code not in (202, 204):
-            _require_json_object(resp, f"admin request to {req.path}")
-        return req.parse(resp)
-
-    @asynccontextmanager
-    async def stream(self, req: _AdminRequest) -> AsyncGenerator[AsyncIterator[bytes]]:
-        """Async twin of :meth:`_SyncAdminExecutor.stream`."""
-        async with self._client.stream(req.method, req.path, **req.request_kwargs) as resp:
-            if not resp.is_success:
-                await resp.aread()
-                raise RtDbError.from_http(resp.status_code, resp.content)
-            yield resp.aiter_bytes()
-
-
-# ---------------------------------------------------------------------------
 # Public façade classes. Each method is a one-line delegation: build the
 # request description, hand it to the executor. The admin surface therefore
 # exists once (in the builders above) rather than four times.
@@ -1231,11 +328,17 @@ class _AsyncAdminExecutor:
 # ``[ws]`` extra) is imported lazily so this module imports without it.
 
 _ADMIN_STREAM_AUTH_FAILED = 4401
+
+
 # Server close code when the admin credential stops validating mid-stream
 # (SEC-006). Terminal, not transient — never reconnected, like the rust client.
 
 _ADMIN_STREAM_BACKOFF_BASE = 0.5
+
+
 _ADMIN_STREAM_BACKOFF_MAX = 15.0
+
+
 # The realtime client's jittered exponential backoff schedule (ws_client).
 
 _ADMIN_FRAME_MODELS: dict[str, Any] = {"op": AdminOpFrame, "gauges": AdminGaugesFrame}
