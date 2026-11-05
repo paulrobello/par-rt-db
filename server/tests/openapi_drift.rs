@@ -97,3 +97,79 @@ fn openapi_document_covers_every_registered_route() {
          router (stale doc, likely a typo): {extra:?}"
     );
 }
+
+/// ARC-006: the source-scan above proves the spec covers every `.route(...)`
+/// literal, but not that those routes are reachable on the router
+/// `build_router` actually produces — a route registered on a sub-router that
+/// is never merged, a wrong nest prefix, or a path silently replaced by a
+/// later merge would pass the scan while 404ing in production. This test
+/// walks the live router instead: every documented path (with `{param}`
+/// segments filled with a probe value) is sent a method no route registers,
+/// so a registered path must answer 405 Method Not Allowed (path matched,
+/// method did not) and only an unregistered path can 404. The test config
+/// sets no `RTDB_STATIC_DIR`, so the SPA fallback is absent and unmatched
+/// paths hit axum's plain default fallback.
+#[tokio::test]
+async fn openapi_documented_paths_resolve_on_the_live_router() {
+    use axum::http::StatusCode;
+    use tower::ServiceExt;
+
+    let state = crate::common::test_state().await;
+    let router = rtdb_server::build_router(state);
+
+    let doc = rtdb_server::openapi::document();
+    let doc_paths: Vec<String> = doc["paths"]
+        .as_object()
+        .unwrap_or_else(|| panic!("openapi document has no paths object"))
+        .keys()
+        .cloned()
+        .collect();
+    assert!(
+        !doc_paths.is_empty(),
+        "openapi document has no paths — nothing to probe"
+    );
+
+    let fill_params = |path: &str| {
+        path.split('/')
+            .map(|seg| if seg.starts_with('{') { "probe" } else { seg })
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+
+    async fn probe(router: axum::Router, path: String) -> StatusCode {
+        let request = axum::http::Request::builder()
+            .method("PROBE")
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .expect("build probe request");
+        router
+            .oneshot(request)
+            .await
+            .expect("probe request through the live router")
+            .status()
+    }
+
+    let mut unresolved = Vec::new();
+    for path in &doc_paths {
+        let status = probe(router.clone(), fill_params(path)).await;
+        if status == StatusCode::NOT_FOUND {
+            unresolved.push(format!("{path} documented but 404s on the live router"));
+        }
+    }
+    assert!(
+        unresolved.is_empty(),
+        "openapi paths that do not resolve on the router build_router produces \
+         (stale spec entry, or the route is registered somewhere never merged): \
+         {unresolved:?}"
+    );
+
+    // Control for the 404 signal itself: a path that is definitely not a
+    // route must 404 here, proving unmatched paths really reach the default
+    // fallback and the loop above cannot pass vacuously.
+    let status = probe(router, "/__openapi_probe_not_a_route__".to_string()).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "control path unexpectedly resolved — the 404 signal is broken"
+    );
+}
