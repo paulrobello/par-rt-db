@@ -49,6 +49,17 @@ pub fn pg_sequence(table: &str) -> String {
     format!("seq_{}", table.to_lowercase())
 }
 
+/// ARC-007: compound index identifiers are built inline as
+/// `i_{table}_{index}` / `tg_{table}_{index}` (push_schema and the destructive
+/// reconcile), so their length budget is 2 + `MAX_TABLE_NAME_LEN` + 1 +
+/// `MAX_INDEX_NAME_LEN` — exactly 63 at today's caps. Enforced at compile
+/// time: raising either cap (a documented no-go) fails the build instead of
+/// letting Postgres truncate two distinct index names into a collision.
+const _: () = assert!(
+    2 + crate::schema::MAX_TABLE_NAME_LEN + 1 + crate::schema::MAX_INDEX_NAME_LEN <= 63,
+    "i_/tg_ compound index identifiers would exceed Postgres's 63-byte cap"
+);
+
 /// Creates the table's sequence when `autoIncrementField` is newly declared
 /// (fresh table, declaration added, or declaration changed), then
 /// repositions it past any stored values — an existing populated table that
@@ -1039,5 +1050,44 @@ mod tests {
             "{}",
             err.message
         );
+    }
+
+    /// ARC-007: physical names must stay within Postgres's 63-byte NAMEDATALEN
+    /// even for the LONGEST identifier the schema validators admit, and must
+    /// be lowercased. The cap holds compositionally today (2-byte prefix +
+    /// `MAX_*_NAME_LEN`); this pins it against the constants themselves, so
+    /// raising any `MAX_*` limit (a documented no-go) or lengthening a prefix
+    /// breaks this test instead of silently letting Postgres truncate two
+    /// distinct identifiers into a collision.
+    #[test]
+    fn physical_names_of_max_length_inputs_stay_within_pg_63_byte_cap() {
+        use crate::schema::{MAX_FIELD_NAME_LEN, MAX_INDEX_NAME_LEN, MAX_TABLE_NAME_LEN};
+
+        let max_table = "a".repeat(MAX_TABLE_NAME_LEN);
+        let max_field = "b".repeat(MAX_FIELD_NAME_LEN);
+        let max_index = "c".repeat(MAX_INDEX_NAME_LEN);
+
+        for name in [
+            pg_table(&max_table),
+            pg_col(&max_field),
+            pg_search_col(&max_index),
+            pg_vector_col(&max_index),
+            pg_sequence(&max_table),
+        ] {
+            assert!(
+                name.len() <= 63,
+                "physical name {name:?} is {} bytes — over Postgres's 63-byte identifier cap",
+                name.len()
+            );
+            assert_eq!(
+                name,
+                name.to_lowercase(),
+                "physical names must be lowercased"
+            );
+        }
+
+        // Compound index identifiers (`i_{table}_{index}`) are enforced at
+        // compile time by the `const _` assert next to the constructors
+        // above; this test covers the constructed names themselves.
     }
 }
