@@ -383,7 +383,10 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  *  `"cookie"` (SEC-207) is cookie-only — no token in any body. `"bearer"` is
  *  token-only (the server never sets a cookie) and the only delivery that
  *  carries the durable session-revoke capability: `revokeSecret` in the begin
- *  response, `sessionId` + `expiresAt` in the poll's `complete` body. */
+ *  response, `sessionId` + `expiresAt` in the poll's `complete` body. A
+ *  bearer begin also returns `loginUrl` — the server-served bootstrap page a
+ *  NON-browser initiator's human opens instead of `authorizeUrl` (see
+ *  `docs/OAUTH_SETUP.md`, "CLI login flow"). */
 type OAuthDelivery = "default" | "cookie" | "bearer";
 
 /** What a completed flow hands back: the credential plus, for bearer
@@ -423,6 +426,7 @@ async function beginOAuthFlow(
     authorizeUrl: string;
     state: string;
     revokeSecret?: string;
+    loginUrl?: string;
   };
   window.open(began.authorizeUrl, "rtdb-auth", "noopener,noreferrer,width=600,height=700");
   const deadline = Date.now() + OAUTH_POLL_TIMEOUT_MS;

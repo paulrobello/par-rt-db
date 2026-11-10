@@ -14,6 +14,16 @@
 //! the 10-minute state window). A lost begin
 //! response means the flow was never navigated and the pending row simply
 //! ages out via the TTL sweep — correct, nothing to clean.
+//!
+//! CLI bootstrap flow: when `/begin` is called by a non-browser client (a CLI
+//! holding `state` + `revokeSecret`), the browser that eventually authorizes
+//! carries none of the begin-minted cookies and the login-CSRF callback gate
+//! rejects the flow structurally. `GET /auth/login?state=` (the begin
+//! response's `loginUrl`, bearer delivery only) re-establishes the binding:
+//! serving it mints the CSRF + poll cookies in the browser that opens it and
+//! redirects to the provider authorize URL. The initiating CLI then polls
+//! `/auth/state` presenting the revoke secret as a header — the same
+//! `{state, revokeSecret}` capability `/auth/state/revoke` requires.
 
 use std::sync::Arc;
 
@@ -22,7 +32,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::{ConnectInfo, Form, Query as QueryParams, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::SET_COOKIE};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -620,6 +630,17 @@ struct BeginParams {
 #[serde(rename_all = "camelCase")]
 struct BeginResponse {
     authorize_url: String,
+    /// CLI bootstrap entry (`GET /auth/login?state=…`), minted ONLY for
+    /// bearer-delivery logins: the URL a human opens in their browser when the
+    /// login was initiated by a non-browser client (a CLI). Serving it mints
+    /// the login-CSRF + poll cookies in THAT browser and redirects to the
+    /// provider authorize URL — re-establishing the begin-browser binding the
+    /// login-CSRF callback gate requires, without the initiating client ever
+    /// needing a cookie jar. Absent for default/cookie deliveries (the
+    /// browser that called begin is the authorizing browser there), keeping
+    /// those responses byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    login_url: Option<String>,
     state: String,
     /// Client-only revoke capability for bearer-mode logins: minted at begin,
     /// delivered ONLY in this response body — never in a URL, cookie,
@@ -774,8 +795,11 @@ async fn provider_begin<P: OAuthProvider>(
 
     let redirect_uri = format!("{}{}", state.config.public_url, provider.callback_path());
     let authorize_url = provider.authorize_url(&redirect_uri, &state_token);
+    let login_url = (delivery == DELIVERY_BEARER)
+        .then(|| format!("{}/auth/login?state={state_token}", state.config.public_url));
     let mut response = Json(BeginResponse {
         authorize_url,
+        login_url,
         state: state_token.clone(),
         revoke_secret: revoke_secret.clone(),
     })
@@ -797,6 +821,115 @@ async fn provider_begin<P: OAuthProvider>(
     // the token — still carries it. Same value, so an attacker needs the cookie,
     // not just the URL.
     if let Ok(state_cookie) = crate::auth::cookie::set_oauth_state_cookie(&state_token, secure) {
+        response.headers_mut().append(SET_COOKIE, state_cookie);
+    }
+    response
+}
+
+#[derive(Deserialize)]
+struct LoginBootstrapParams {
+    state: String,
+}
+
+/// `GET /auth/login?state=`: the CLI login bootstrap page. A non-browser
+/// client (a CLI) initiates the login at `/auth/{provider}/begin?mode=bearer`
+/// and receives `{authorizeUrl, loginUrl, state, revokeSecret}` — but the
+/// begin-minted cookies land on the CALLER's response, so the browser that
+/// eventually authorizes carries none of them and the login-CSRF callback
+/// gate rejects the flow structurally (every time, with
+/// `oauth_login_csrf=true`). This route closes that gap: the human opens
+/// `loginUrl` — never `authorizeUrl` — in their browser; serving it mints the
+/// two cookies in THAT browser and 303-redirects the navigation to the
+/// provider authorize URL, so the begin-browser == callback-browser binding
+/// the login-CSRF gate enforces holds again. The initiating CLI polls
+/// `/auth/state` presenting the revoke secret as the
+/// `x-rtdb-oauth-revoke-secret` header (see `auth_state`).
+///
+/// Binding semantics (documented, accepted risk): whoever learns `state` can
+/// serve this page and thus bind the next authorizing browser to that login —
+/// the same capability class as the `authorizeUrl` itself, and the same
+/// phishing shape RFC 8628 device codes have; bounded by `state` being a
+/// 256-bit secret with a 10-minute TTL that transits exactly the URLs
+/// `authorize_url` already transits. The reverse attack — inducing a victim's
+/// browser to complete the ATTACKER's login, the thing login-CSRF exists to
+/// stop — still fails: the victim browser's csrf cookie matches only the
+/// victim's own pending state, never an attacker-induced callback state.
+///
+/// Serves only `pending`, unexpired rows; anything else (unknown, claimed,
+/// completed, failed, expired) answers a plain 400 envelope, the same shape
+/// the callback's errors use. The redirect target is re-derived from the row's
+/// `provider` column, so a flow begun on one replica bootstraps on any
+/// replica.
+async fn login_bootstrap(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    QueryParams(params): QueryParams<LoginBootstrapParams>,
+) -> Response {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT provider FROM rtdb_auth.oauth_states \
+         WHERE state = $1 AND status = $2 AND expires_at > $3",
+    )
+    .bind(&params.state)
+    .bind(STATUS_PENDING)
+    .bind(now_ms())
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten();
+    let Some((provider_name,)) = row else {
+        return RtDbError::bad_request("invalid or expired login state").into_response();
+    };
+
+    let authorize_url = match provider_name.as_str() {
+        "github" => GithubProvider::from_config(&state.config).map(|p| {
+            p.authorize_url(
+                &format!("{}{}", state.config.public_url, p.callback_path()),
+                &params.state,
+            )
+        }),
+        "google" => GoogleProvider::from_config(&state.config).map(|p| {
+            p.authorize_url(
+                &format!("{}{}", state.config.public_url, p.callback_path()),
+                &params.state,
+            )
+        }),
+        "gitlab" => GitlabProvider::from_config(&state.config).map(|p| {
+            p.authorize_url(
+                &format!("{}{}", state.config.public_url, p.callback_path()),
+                &params.state,
+            )
+        }),
+        "microsoft" => MicrosoftProvider::from_config(&state.config).map(|p| {
+            p.authorize_url(
+                &format!("{}{}", state.config.public_url, p.callback_path()),
+                &params.state,
+            )
+        }),
+        "apple" => AppleProvider::from_config(&state.config).map(|p| {
+            p.authorize_url(
+                &format!("{}{}", state.config.public_url, p.callback_path()),
+                &params.state,
+            )
+        }),
+        "oidc" => OidcProvider::from_config(&state.config).map(|p| {
+            p.authorize_url(
+                &format!("{}{}", state.config.public_url, p.callback_path()),
+                &params.state,
+            )
+        }),
+        _ => None,
+    };
+    let Some(authorize_url) = authorize_url else {
+        return RtDbError::bad_request("provider not configured").into_response();
+    };
+
+    let secure = state.config.cookie_secure
+        || crate::auth::cookie::request_is_secure(&headers, state.config.trusted_proxy);
+    let mut response = Redirect::to(&authorize_url).into_response();
+    if let Ok(csrf) = crate::auth::cookie::set_oauth_csrf_cookie(&params.state, secure) {
+        response.headers_mut().append(SET_COOKIE, csrf);
+    }
+    if let Ok(state_cookie) = crate::auth::cookie::set_oauth_state_cookie(&params.state, secure) {
         response.headers_mut().append(SET_COOKIE, state_cookie);
     }
     response
@@ -1049,13 +1182,19 @@ enum StateResponse {
 /// single-use `state` token minted at `/auth/{provider}/begin`. Returns
 /// `pending | complete | expired | error`.
 ///
-/// SEC-121: the `state` value appears in URLs, edge logs, and the server's
-/// TraceLayer, so a leaked URL alone is not enough to poll — the request must
-/// ALSO carry the `rtdb-oauth-state` cookie set at `/begin` with the same
-/// value. Constant-time compare for hygiene; a missing/mismatched cookie
-/// returns `Expired` (the caller already handles that indistinguishably from a
-/// timed-out flow, and the legit parent — which loaded `/begin` — always has
-/// the cookie).
+/// Authorization, in order: (1) SEC-121 cookie — the `state` value appears in
+/// URLs, edge logs, and the server's TraceLayer, so a leaked URL alone is not
+/// enough to poll; the request must ALSO carry the `rtdb-oauth-state` cookie
+/// set at `/begin` (or `/auth/login`) with the same value, constant-time
+/// compared. (2) CLI bootstrap path — failing the cookie check, a request
+/// carrying the `x-rtdb-oauth-revoke-secret` header whose sha256 matches the
+/// begin-time verifier stored on the row is authorized the same way
+/// `POST /auth/state/revoke` is: `{state, revokeSecret}` together, the secret
+/// delivered once in the begin response body (never a URL). Default/cookie
+/// rows have no verifier and unknown states match nothing, both answering the
+/// same `expired` as a cookie miss (no mode or existence leak). A
+/// missing/mismatched attempt at both returns `Expired` (the caller already
+/// handles that indistinguishably from a timed-out flow).
 async fn auth_state(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1063,7 +1202,7 @@ async fn auth_state(
 ) -> Response {
     let cookie_ok = crate::auth::cookie::oauth_state_cookie(&headers)
         .is_some_and(|c| bool::from(c.as_bytes().ct_eq(params.state.as_bytes())));
-    if !cookie_ok {
+    if !cookie_ok && !authorize_secret_poll(state.as_ref(), &headers, &params.state).await {
         return Json(StateResponse::Expired).into_response();
     }
     match poll_login(&state, &params.state).await {
@@ -1097,6 +1236,47 @@ async fn auth_state(
         PollResult::Failed => Json(StateResponse::Error).into_response(),
         PollResult::Expired => Json(StateResponse::Expired).into_response(),
     }
+}
+
+/// Header-path authorization for the `/auth/state` poll (the CLI bootstrap
+/// flow): the presented `x-rtdb-oauth-revoke-secret` header must hash to the
+/// begin-time verifier stored on the row — the same `{state, revokeSecret}`
+/// capability `POST /auth/state/revoke` requires, so it is exactly as strong
+/// as that fence: the secret was delivered once in the begin response body
+/// (never in a URL), and only its sha256 verifier is stored. Runs only when
+/// the cookie check already failed; browser pollers never reach it.
+///
+/// Cost note: one indexed SELECT per cookie-less poll that carries the header
+/// — the same cost class `/auth/state/revoke` pays per request (there behind
+/// a 30 rpm IP guard). Polls without the header — the common garbage-flood
+/// shape — still fail the cookie check for free, so no limiter is added here.
+/// One-shot semantics are untouched: a second secret-authorized poll of an
+/// already-consumed row re-authorizes but finds nothing terminal-unconsumed,
+/// answering `expired` like any other second poll.
+async fn authorize_secret_poll(state: &AppState, headers: &HeaderMap, state_token: &str) -> bool {
+    let Some(presented) = headers
+        .get("x-rtdb-oauth-revoke-secret")
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let verifier: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT revoke_secret_verifier FROM rtdb_auth.oauth_states \
+         WHERE state = $1 AND expires_at > $2",
+    )
+    .bind(state_token)
+    .bind(now_ms())
+    .fetch_optional(&state.pool)
+    .await
+    .ok();
+    let Some(Some(verifier)) = verifier else {
+        return false;
+    };
+    bool::from(
+        crate::db::sha256_hex(presented)
+            .as_bytes()
+            .ct_eq(verifier.as_bytes()),
+    )
 }
 
 /// Body of `POST /auth/state/revoke`. `revokeSecret` is required: `state`
@@ -1771,6 +1951,7 @@ pub fn auth_routes() -> Router<Arc<AppState>> {
         .route("/auth/apple/callback", post(apple_callback))
         .route("/auth/anonymous", post(anonymous))
         .route("/auth/enroll", post(crate::auth::enrollment::enroll))
+        .route("/auth/login", get(login_bootstrap))
         .route("/auth/state", get(auth_state))
         .route("/auth/state/revoke", post(state_revoke))
         .route("/auth/session/revoke", post(session_revoke))

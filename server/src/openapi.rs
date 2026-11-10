@@ -448,8 +448,25 @@ pub fn document() -> Value {
     );
     add(
         &mut paths,
+        "/auth/login",
+        &[(
+            "get",
+            op(
+                "Serve the CLI login bootstrap page (?state=…; 303 to provider)",
+                "Auth",
+            ),
+        )],
+    );
+    add(
+        &mut paths,
         "/auth/state",
-        &[("get", op("Poll popup sign-in state (?state=…)", "Auth"))],
+        &[(
+            "get",
+            op(
+                "Poll popup sign-in state (?state=…; cookie or x-rtdb-oauth-revoke-secret header)",
+                "Auth",
+            ),
+        )],
     );
     add(
         &mut paths,

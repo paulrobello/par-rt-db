@@ -885,12 +885,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
 /// SEC-121: true for paths whose query string carries OAuth secrets (`state`,
 /// `code`). Covers the generic callback (`/auth/callback`), every provider-
-/// scoped callback (`/auth/{provider}/callback`), and the state poll
-/// (`/auth/state`). For these, the TraceLayer records the PATH ONLY — never the
-/// query string. All other paths record the full URI (the default behavior).
+/// scoped callback (`/auth/{provider}/callback`), the state poll
+/// (`/auth/state`), and the CLI login bootstrap (`/auth/login`). For these,
+/// the TraceLayer records the PATH ONLY — never the query string. All other
+/// paths record the full URI (the default behavior).
 fn trace_should_redact_query(path: &str) -> bool {
     path == "/auth/state"
         || path == "/auth/callback"
+        || path == "/auth/login"
         || (path.ends_with("/callback") && path.starts_with("/auth/"))
 }
 
@@ -928,6 +930,10 @@ mod lib_tests {
             .parse()
             .unwrap();
         assert_eq!(redacted_request_uri(&uri), "/auth/github/callback");
+
+        // /auth/login?state=SECRET (the CLI bootstrap) — path only.
+        let uri: Uri = "/auth/login?state=SECRET".parse().unwrap();
+        assert_eq!(redacted_request_uri(&uri), "/auth/login");
     }
 
     #[test]

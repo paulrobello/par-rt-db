@@ -13,6 +13,7 @@ working with zero providers configured.
 ## Table of contents
 
 - [How it works](#how-it-works)
+- [CLI login flow](#cli-login-flow)
 - [Prerequisites (all providers)](#prerequisites-all-providers)
 - [Quick reference](#quick-reference)
 - [GitHub](#github)
@@ -88,6 +89,56 @@ working with zero providers configured.
   GitHub/Google/GitLab, `RTDB_MICROSOFT_CLIENT_ID`/`_SECRET` for Microsoft
   (`_TENANT` defaults to `common`), all four `RTDB_APPLE_*` fields for Apple,
   and all five `RTDB_OIDC_*` fields for the generic OIDC provider.
+
+## CLI login flow
+
+A browser SPA calls `/begin` itself, so the browser that opens the provider
+authorize screen is the same browser that received the CSRF and poll cookies
+at `/begin`. A CLI (or any non-browser client) calling `/begin` receives those
+cookies on a response it discards — and with `RTDB_OAUTH_LOGIN_CSRF=true` (the
+default) the callback is then rejected structurally (`login CSRF check
+failed`), every time. Bearer begins therefore also return a `loginUrl`: a
+server-served bootstrap page that re-establishes the binding. The full flow:
+
+1. CLI: `GET /auth/{provider}/begin?origin=<allowed>&mode=bearer` →
+   `{ authorizeUrl, loginUrl, state, revokeSecret }`.
+2. CLI: print `loginUrl` and have the human open it in a browser. Serving
+   `GET /auth/login?state=<state>` mints the `rtdb-oauth-csrf` +
+   `rtdb-oauth-state` cookies in THAT browser and 303-redirects it to the
+   provider authorize screen. The CLI never opens `authorizeUrl` directly —
+   without the cookies the callback fails the login-CSRF gate.
+3. The human authorizes; the provider redirects to the callback, which passes
+   the login-CSRF gate and settles the flow. The browser sees a
+   "Sign-in complete" page and nothing else: bearer delivery sets no session
+   cookie in it, so no credential ever lands in the browser.
+4. CLI: poll `GET /auth/state?state=<state>` with the
+   `x-rtdb-oauth-revoke-secret: <revokeSecret>` header until the one-shot
+   `{ status: "complete", token, user, sessionId?, expiresAt? }` arrives.
+   `pending` loops; `expired` after the completion page means the token was
+   already delivered (one-shot semantics).
+
+Security properties (all hold with `RTDB_OAUTH_LOGIN_CSRF=true`):
+
+- **Login-CSRF is preserved.** The bootstrap page re-establishes
+  begin-browser == callback-browser, so an attacker-induced callback URL still
+  fails the gate in a victim's browser — its nonce matches only the victim's
+  own pending state, never an attacker-induced callback state.
+- **The poll capability is `{state, revokeSecret}`** — exactly the pair
+  `POST /auth/state/revoke` already requires. `state` alone transits URLs and
+  proxy logs, so it is not enough to poll; the secret was delivered once in
+  the begin response body over TLS and only its sha256 verifier is stored
+  server-side.
+- **Known, bounded exposure.** Whoever learns `state` can open the bootstrap
+  page themselves and bind the next authorizing browser to that login — the
+  same capability the `authorizeUrl` itself carries, and the same phishing
+  shape RFC 8628 device codes have. `state` is a 256-bit token with a
+  10-minute TTL; treat any URL carrying it like a credential.
+- **No credential in the browser.** The callback sets no cookie (bearer) and
+  the close page is static; the session token exists only in the begin
+  response (secret) and the one-shot poll delivery.
+
+See [Hardening](#hardening) for the bearer-delivery capabilities
+(`POST /auth/state/revoke`, `POST /auth/session/revoke`).
 
 ## Prerequisites (all providers)
 

@@ -177,7 +177,12 @@ async fn begin_full(
         .map(String::as_str)
         .collect();
     match mode {
-        Some("bearer") => assert_eq!(keys, vec!["authorizeUrl", "revokeSecret", "state"]),
+        Some("bearer") => {
+            assert_eq!(
+                keys,
+                vec!["authorizeUrl", "loginUrl", "revokeSecret", "state"]
+            )
+        }
         _ => assert_eq!(keys, vec!["authorizeUrl", "state"]),
     }
     (
@@ -221,6 +226,61 @@ async fn poll_state(client: &reqwest::Client, addr: SocketAddr, state_token: &st
     assert!(body.get("revokeSecret").is_none());
     assert!(body.get("revoke_secret").is_none());
     body
+}
+
+/// CLI-shape begin: plain client (no cookie jar — the response's Set-Cookie
+/// headers are discarded), returns `(state, revokeSecret, loginUrl)`.
+async fn begin_bearer_cli(addr: SocketAddr) -> (String, String, String) {
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/auth/github/begin?origin=http://localhost:5173&mode=bearer"
+        ))
+        .send()
+        .await
+        .expect("send cli begin");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.expect("begin json");
+    (
+        body["state"]
+            .as_str()
+            .expect("bearer begin carries state")
+            .to_string(),
+        body["revokeSecret"]
+            .as_str()
+            .expect("bearer begin carries revokeSecret")
+            .to_string(),
+        body["loginUrl"]
+            .as_str()
+            .expect("bearer begin carries loginUrl")
+            .to_string(),
+    )
+}
+
+/// CLI-shape poll: no cookie jar, the revoke secret as a header. `None` omits
+/// the header (simulating a cookie-less, header-less poll).
+async fn poll_state_cli(addr: SocketAddr, state_token: &str, secret: Option<&str>) -> Value {
+    let mut req =
+        reqwest::Client::new().get(format!("http://{addr}/auth/state?state={state_token}"));
+    if let Some(secret) = secret {
+        req = req.header("x-rtdb-oauth-revoke-secret", secret);
+    }
+    let resp = req.send().await.expect("send cli poll");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    resp.json().await.expect("poll json")
+}
+
+/// The "browser" step of the CLI flow: open `GET /auth/login?state=` with the
+/// cookie-jar client (which then carries the minted cookies to the callback).
+async fn open_login_bootstrap(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    state_token: &str,
+) -> reqwest::Response {
+    client
+        .get(format!("http://{addr}/auth/login?state={state_token}"))
+        .send()
+        .await
+        .expect("send login bootstrap")
 }
 
 /// Bare (cookie-jar-less) revoke with the capability pair. `None` secret
@@ -318,6 +378,77 @@ async fn begin_unknown_mode_still_rejects() -> anyhow::Result<()> {
     Ok(())
 }
 
+// --- CLI login bootstrap (GET /auth/login) -----------------------------------
+
+#[tokio::test]
+async fn login_bootstrap_redirects_and_mints_cookies() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let (_state, addr) = bearer_state(&mock).await;
+
+    let (state_token, _secret, _login_url) = begin_bearer_cli(addr).await;
+    let browser = no_redirect_client();
+    let resp = open_login_bootstrap(&browser, addr, &state_token).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .expect("bootstrap redirects")
+        .to_str()?
+        .to_string();
+    assert!(
+        location.ends_with(&format!("&state={state_token}")),
+        "redirect carries the flow's state: {location}"
+    );
+    assert!(location.contains("/login/oauth/authorize"), "{location}");
+
+    // Both begin-shaped cookies are minted in the opening browser, bound to
+    // the state value the login-CSRF gate (and the cookie poll) compares.
+    let set_cookies: Vec<String> = resp
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(str::to_string))
+        .collect();
+    for name in ["rtdb-oauth-csrf", "rtdb-oauth-state"] {
+        let cookie = set_cookies
+            .iter()
+            .find(|c| c.starts_with(&format!("{name}={state_token}")))
+            .expect("bootstrap mints {name}");
+        assert!(cookie.contains("HttpOnly"), "{cookie}");
+        assert!(cookie.contains("SameSite=None"), "{cookie}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn login_bootstrap_rejects_unknown_and_spent_states() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let email = unique_email("bootstrap-spent");
+    let (state, addr) = bearer_state(&mock).await;
+
+    // Never-minted state → 400.
+    let resp = no_redirect_client()
+        .get(format!(
+            "http://{addr}/auth/login?state={}",
+            db::random_token()
+        ))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // A spent (completed) state → 400, same shape as never-minted.
+    mount_github_mocks(&mock, unique_github_id(), "paul", &email, Duration::ZERO, 1).await;
+    let (state_token, _secret, _login_url) = begin_bearer_cli(addr).await;
+    let browser = no_redirect_client();
+    open_login_bootstrap(&browser, addr, &state_token).await;
+    let resp = callback(&browser, addr, &state_token).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    wait_for_status(&state, &state_token, "completed").await;
+    let resp = open_login_bootstrap(&browser, addr, &state_token).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
 // --- bearer callback: no cookies, poll-only credential ----------------------
 
 #[tokio::test]
@@ -400,7 +531,79 @@ async fn bearer_callback_sets_no_cookies_and_poll_delivers_one_shot() -> anyhow:
     Ok(())
 }
 
-// --- default + cookie-mode regressions --------------------------------------
+// --- CLI flow end-to-end: bootstrap + secret-header poll --------------------
+
+#[tokio::test]
+async fn cli_bootstrap_flow_delivers_token_via_secret_header_poll() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    let email = unique_email("cli-e2e");
+    mount_github_mocks(&mock, unique_github_id(), "paul", &email, Duration::ZERO, 1).await;
+    let (_state, addr) = bearer_state(&mock).await;
+
+    // CLI initiates with a plain client: state + secrets ride the body, the
+    // begin response's cookies are discarded with it.
+    let (state_token, secret, login_url) = begin_bearer_cli(addr).await;
+    assert!(
+        login_url.ends_with(&format!("/auth/login?state={state_token}")),
+        "loginUrl is the server-authoritative bootstrap entry: {login_url}"
+    );
+
+    // While pending, a header-less poll answers expired (SEC-121 unchanged):
+    // the CLI MUST present the capability, a leaked URL alone stays useless.
+    let pv = poll_state_cli(addr, &state_token, None).await;
+    assert_eq!(pv["status"], json!("expired"));
+
+    // The browser opens loginUrl (not authorizeUrl): cookies minted there.
+    let browser = no_redirect_client();
+    let boot = open_login_bootstrap(&browser, addr, &state_token).await;
+    assert_eq!(boot.status(), reqwest::StatusCode::SEE_OTHER);
+    // The browser follows the redirect to the provider and comes back via the
+    // callback — carrying the minted csrf cookie, so the login-CSRF gate
+    // passes (with oauth_login_csrf=true) where the direct authorizeUrl would
+    // have been rejected.
+    let resp = callback(&browser, addr, &state_token).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = resp.text().await?;
+    assert!(body.contains("window.close();"));
+
+    // The CLI polls with the capability pair: state (URL) + secret (header),
+    // the same strength /auth/state/revoke requires. Delivers the one-shot
+    // token.
+    let pv = poll_state_cli(addr, &state_token, Some(&secret)).await;
+    assert_eq!(pv["status"], json!("complete"));
+    let token = pv["token"]
+        .as_str()
+        .expect("secret-header poll delivers the token")
+        .to_string();
+    assert_eq!(pv["user"]["email"], json!(email));
+    let me = reqwest::Client::new()
+        .get(format!("http://{addr}/auth/me"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    assert_eq!(me.status(), reqwest::StatusCode::OK);
+
+    // Wrong secret → expired (uniform, no mode or existence leak).
+    let pv = poll_state_cli(addr, &state_token, Some("wrong-secret")).await;
+    assert_eq!(pv["status"], json!("expired"));
+    // One-shot: consumed by the correct poll, a second correct poll is expired.
+    let pv = poll_state_cli(addr, &state_token, Some(&secret)).await;
+    assert_eq!(pv["status"], json!("expired"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn secret_header_poll_answers_expired_without_verifier() -> anyhow::Result<()> {
+    // A default-delivery row carries no revoke verifier: the header path must
+    // answer the same expired as a cookie miss (no mode leak).
+    let mock = MockServer::start().await;
+    let (_state, addr) = bearer_state(&mock).await;
+    let client = no_redirect_client();
+    let state_token = begin_login(&client, addr, None).await;
+    let pv = poll_state_cli(addr, &state_token, Some("any-secret")).await;
+    assert_eq!(pv["status"], json!("expired"));
+    Ok(())
+}
 
 #[tokio::test]
 async fn default_flow_regression_unchanged() -> anyhow::Result<()> {
