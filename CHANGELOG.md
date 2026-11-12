@@ -127,6 +127,29 @@ alter observable behavior on upgrade.
 
 ### Added
 
+- **Background bulk delete (`POST /api/bulk/delete` + `GET /api/bulk/{id}`,
+  ARC-005, `489955f` + mirrors `0e96f3e`..`bcb22ed`).** Deletes a filter's
+  whole matching set without monopolizing the single serialized writer: the
+  matching ids freeze once per op inside a read-only turn (cap 100k, over-cap
+  `400` "narrow the filter"), then a per-op driver deletes them in 500-row
+  chunks across committer turns — each chunk commits with its own
+  subscription re-runs, so subscribers see progressive updates and
+  interactive writes interleave between chunks (measured with 100
+  subscribers: the 5k-row `deleteByQuery` transaction holds the turn a
+  median 882.6ms; the bulk path trades ~33% total wall for interactive-write
+  p99 of 131ms during the op). Status polling returns
+  `{id, state, matched, deleted, error?}`; the op registry is per-instance
+  (a restart loses running ops — rows remain, and re-submitting is safe
+  because deletes are idempotent). Mirrored in all six clients
+  (`bulkDelete`/`bulkStatus`) and pinned by the http-shapes drift cases in
+  `wire-corpus/http-shapes.json`.
+- **TS client transport hardening options (`60e9948`).** `RtDbHttpClient` and
+  `RtDbAdminClient` accept `requestTimeoutMs` (per-request deadline: a single
+  timer races the fetch, aborts it, and rejects with the new client-local
+  `RtDbDeadlineError` — `DEADLINE_EXCEEDED` never crosses the wire, so it is
+  deliberately absent from the error corpus) and `connectionClose` (opt-in
+  `Connection: close` per request, for pools with dead sockets). Defaults
+  leave behavior unchanged.
 - **Tag-driven release pipeline adopted in-tree (enh-031, squash `e6c74db` +
   corpus sync `44f27d7`).** `release.yml` publishes npm/crates.io/PyPI on
   green `main` pushes (serial runs, already-published versions skipped),
@@ -533,6 +556,18 @@ alter observable behavior on upgrade.
 
 ### Fixed
 
+- **`POST /api/schedule/claim` now delivers the `tz` field (`8a55d03`).**
+  The wire struct and five of six client mirrors documented `tz` on
+  `ClaimedSchedule`, but the claim response never populated it — the drift
+  the new http-shapes verification exists to catch.
+- **Request-path cold guards no longer run scheduler DDL per request
+  (`38a98a6`).** Every claim/finalize/manage/list/enqueue call executed
+  `ensure_table`'s eleven ACCESS EXCLUSIVE DDL statements; external claim
+  pollers held a production instance at ~2.2 full ensures/second for 10
+  hours, starving per-database scheduler queries for up to 604s. The cold
+  guards now memoize per process (first call runs the DDL, then a set
+  lookup); boot/spawn paths keep the uncached ensure so a dropped table
+  self-heals on the next scheduler respawn.
 - **Schema pushes and the backup window can no longer starve the query pool
   (2026-11-04 prod incident).** A push whose tables map already matches the
   committed schema is now a true no-op (no DDL, no transaction, no history
