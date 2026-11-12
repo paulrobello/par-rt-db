@@ -38,7 +38,7 @@ relative to `server/src/`.
 
 ## The single-writer committer
 
-The correctness core lives in `committer/` + `subs.rs`. Each database has one
+The correctness core lives in `committer/` + `subs/`. Each database has one
 task that serializes all writes, then — before dequeuing the next message —
 re-runs affected subscriptions, diffs against the last pushed value, and pushes
 only on change. Subscription registration rides the same queue.
@@ -118,7 +118,7 @@ graph TD
         HTTP["One-shot HTTP — http_api.rs"]
     end
 
-    CO["Committer task (per-db, single writer)<br />committer/ + subs.rs"]
+    CO["Committer task (per-db, single writer)<br />committer/ + subs/"]
 
     WS -->|"CommitterRequest::Mutate"| CO
     HTTP -->|"Committers::mutate (same arm)"| CO
@@ -493,7 +493,7 @@ predicate, soft-delete and host-policy visibility) — an unauthorized child
 row is never fetched, not errored (a re-run error would freeze the
 subscription). Validation lives in the compile cascade, so HTTP one-shots,
 the WS initial push, `/explain`, and subscription re-runs reject the same
-shapes. The `subs.rs` dispatch gate unions the lookup tables into the
+shapes. The `subs/` dispatch gate unions the lookup tables into the
 write-set check (a lookup-table write forces a re-run; the parent-table
 window skip classes stay parent-only), and joined keys are part of the
 canonical the projected-subscription diff compares (which strips `_version`
@@ -790,7 +790,7 @@ is added takes the link step, and every later login matches at step one.
 
 On top of the db-level gate:
 
-- **`ownerField`** (`schema/`, enforced in `query/`/`txn.rs`/`subs.rs`): an
+- **`ownerField`** (`schema/`, enforced in `query/`/`txn/`/`subs/`): an
   authenticated user reads/mutates only rows they own, or rows that list them
   in a declared `collaboratorsField` (an optional array-of-strings field) —
   owner OR collaborator (inserts are server-stamped; `patch`/`replace`/
@@ -913,7 +913,7 @@ standalone), presence, storage, change feeds — is denied at the surface gate.
 
 Live revocation reuses the existing machine-token revocation/expiry gate on
 every REST and WS operation; for subscriptions, a restricted credential's
-liveness is re-checked on the push path (`subs.rs`'s `host_may_push` /
+liveness is re-checked on the push path (`subs/liveness.rs`'s `host_may_push` /
 `authorize_host_push`), so a revoked or expired token stops receiving data
 pushes, not just new-request acceptance. Under `RTDB_MULTI_INSTANCE`,
 forwarded writes carry the capability and the lease owner enforces the same

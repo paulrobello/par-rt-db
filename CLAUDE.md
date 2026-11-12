@@ -34,7 +34,7 @@ Tests share one Postgres, isolating via uniquely-named databases per test. Never
 
 ## Architecture — high-level map
 
-Full detail and reasoning: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The one load-bearing fact: **each database has a single serialized committer task** (`committer/` + `subs.rs`) — all writes flow through it, then it re-runs affected subscriptions and pushes only on change. Reads run READ COMMITTED with no row locking, so this serialization is what makes correctness hold. **Never call `execute_txn` outside the committer; never add a second writer.**
+Full detail and reasoning: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The one load-bearing fact: **each database has a single serialized committer task** (`committer/` + `subs/`) — all writes flow through it, then it re-runs affected subscriptions and pushes only on change. Reads run READ COMMITTED with no row locking, so this serialization is what makes correctness hold. **Never call `execute_txn` outside the committer; never add a second writer.**
 
 - **Per-db background tasks** (scheduler, workflows, TTL reaper) never write document tables — they only enqueue work back through committer request arms.
 - **Data pipeline** (`schema.rs` → `ddl.rs` → `txn.rs`/`query/`): pushed schemas compile to Postgres DDL (one typed column per indexed field + `doc` jsonb, additive-only changes); the read and write paths share index-value typing — keep them aligned.
