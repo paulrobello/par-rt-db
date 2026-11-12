@@ -22,6 +22,16 @@ export interface RtDbAdminClientOptions {
    * Optional custom fetch implementation to override the global fetch.
    */
   fetch?: typeof fetch;
+  /** Opt-in per-request deadline in milliseconds. When set, every admin
+   *  request races against a timer that aborts the fetch and rejects with
+   *  `RtDbDeadlineError` (`DEADLINE_EXCEEDED`, client-local — never a server
+   *  envelope code). The timer is cleared when the fetch settles first. */
+  requestTimeoutMs?: number;
+  /** Opt-in keep-alive control: `true` sends `Connection: close` on every
+   *  admin request (fresh connection per request). Unset keeps default
+   *  undici keep-alive. Browsers drop the `Connection` header; meaningful on
+   *  undici/Node/Bun fetch. */
+  connectionClose?: boolean;
   /** Injectable WebSocket constructor (browser/Node/bun). Defaults to the global
    *  `WebSocket`. The second arg carries the WS subprotocol(s) — `/admin/stream`
    *  authenticates via the `rtdb-admin.<token>` subprotocol in bearer mode; in

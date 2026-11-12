@@ -1,6 +1,6 @@
 import type { EnrollResult } from "./admin.js";
 import { ChangeFeedStream, type StreamChangesOptions } from "./change-feed.js";
-import { RtDbError } from "./errors.js";
+import { RtDbDeadlineError, RtDbError } from "./errors.js";
 import { parseStepResults, type StepResult } from "./mutation.js";
 import type {
   AuthedUser,
@@ -53,9 +53,34 @@ export async function enrollRequest(
 }
 
 /**
+ * Opt-in transport hardening shared by `RtDbHttpClient` and
+ * `RtDbAdminClient`: a per-request deadline and keep-alive control. Both
+ * fields default to today's behavior (no deadline, undici keep-alive).
+ */
+export interface RtDbHttpTransportOptions {
+  /**
+   * Opt-in per-request deadline in milliseconds. When set, every HTTP request
+   * races against a single timer that aborts the fetch and rejects with
+   * {@link RtDbDeadlineError} once the deadline fires; the timer is cleared
+   * when the fetch settles first. Client-originated: a deadline failure never
+   * crosses the wire, and `DEADLINE_EXCEEDED` is deliberately absent from the
+   * wire error corpus.
+   */
+  requestTimeoutMs?: number;
+  /**
+   * Opt-in keep-alive control: when `true`, every request carries
+   * `Connection: close` (forcing a fresh connection per request, for pools
+   * with dead sockets). When unset, default keep-alive behavior is unchanged.
+   * Note: browsers treat `Connection` as a forbidden header and drop it; this
+   * option is meaningful on undici/Node/Bun fetch.
+   */
+  connectionClose?: boolean;
+}
+
+/**
  * Options for configuring the `RtDbHttpClient`.
  */
-export interface RtDbHttpClientOptions {
+export interface RtDbHttpClientOptions extends RtDbHttpTransportOptions {
   /**
    * Base URL of the Realtime Database instance.
    */
@@ -127,12 +152,63 @@ export function appendImageParams(url: string, opts: TransformOpts): string {
   return parts.length ? `${url}?${parts.join("&")}` : url;
 }
 
+/**
+ * Runs one `fetchImpl` call under an optional per-request deadline. With
+ * `timeoutMs` undefined this is a plain passthrough (behavior unchanged).
+ * With a deadline, the request races against a SINGLE timer that, when it
+ * fires first, aborts the fetch via `AbortController` and rejects with
+ * {@link RtDbDeadlineError} exactly once; when the fetch settles first the
+ * timer is cleared. An existing `init.signal` from caller code is composed
+ * (never clobbered): its aborts are forwarded to the internal controller, so
+ * a caller abort still rejects the fetch with the caller's own reason while
+ * the deadline remains armed.
+ */
+export async function fetchWithDeadline(
+  fetchImpl: typeof fetch,
+  url: string,
+  init: RequestInit,
+  timeoutMs: number | undefined,
+): Promise<Response> {
+  if (timeoutMs === undefined) {
+    return fetchImpl(url, init);
+  }
+  const controller = new AbortController();
+  const callerSignal = init.signal;
+  const forwardCallerAbort = () => controller.abort(callerSignal?.reason);
+  if (callerSignal) {
+    if (callerSignal.aborted) {
+      forwardCallerAbort();
+    } else {
+      callerSignal.addEventListener("abort", forwardCallerAbort);
+    }
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = new RtDbDeadlineError(
+        `request exceeded its ${timeoutMs}ms deadline`,
+        timeoutMs,
+      );
+      controller.abort(error);
+      reject(error);
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([fetchImpl(url, { ...init, signal: controller.signal }), deadline]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    callerSignal?.removeEventListener("abort", forwardCallerAbort);
+  }
+}
+
 /** One-shot HTTP client for machine callers (or any Bearer token). */
 export class RtDbHttpClient {
   private readonly url: string;
   private readonly db: string;
   private readonly token: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly requestTimeoutMs: number | undefined;
+  private readonly connectionClose: boolean;
 
   constructor(options: RtDbHttpClientOptions) {
     this.url = options.url.replace(/\/+$/, "");
@@ -141,8 +217,21 @@ export class RtDbHttpClient {
     // Bind the global: browsers require Window as fetch's receiver, and a
     // stored-unbound reference throws "Illegal invocation" when called.
     this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
+    this.requestTimeoutMs = options.requestTimeoutMs;
+    this.connectionClose = options.connectionClose === true;
   }
 
+  /** Issues one request through this client's fetch under its transport
+   *  options: `Connection: close` is appended when `connectionClose` is set,
+   *  and the request runs under `requestTimeoutMs` via
+   *  {@link fetchWithDeadline}. Every outgoing call site routes through here. */
+  private doFetch(url: string, init: RequestInit = {}): Promise<Response> {
+    const headers: HeadersInit = {
+      ...(init.headers as Record<string, string>),
+      ...(this.connectionClose ? { Connection: "close" } : {}),
+    };
+    return fetchWithDeadline(this.fetchImpl, url, { ...init, headers }, this.requestTimeoutMs);
+  }
   /**
    * Redeems a one-time enrollment grant for a machine token
    * (`POST /auth/enroll`). Public and unauthenticated: this method
@@ -154,7 +243,11 @@ export class RtDbHttpClient {
    * as the standard `RtDbError` UNAUTHORIZED envelope.
    */
   async enroll(grant: string): Promise<EnrollResult> {
-    return (await enrollRequest(this.fetchImpl, this.url, grant)) as EnrollResult;
+    return (await enrollRequest(
+      (url, init) => this.doFetch(url as string, init),
+      this.url,
+      grant,
+    )) as EnrollResult;
   }
 
   /**
@@ -485,7 +578,7 @@ export class RtDbHttpClient {
       headers["content-type"] = contentType;
     }
     const path = `/api/storage/${encodeURIComponent(this.db)}`;
-    const response = await this.fetchImpl(`${this.url}${path}`, {
+    const response = await this.doFetch(`${this.url}${path}`, {
       method: "POST",
       headers,
       body: body as BodyInit,
@@ -497,7 +590,7 @@ export class RtDbHttpClient {
    * Deletes a stored file by its unique identifier.
    */
   async deleteFile(id: string): Promise<void> {
-    await this.fetchImpl(
+    await this.doFetch(
       `${this.url}/api/storage/${encodeURIComponent(this.db)}/${encodeURIComponent(id)}`,
       {
         method: "DELETE",
@@ -542,7 +635,7 @@ export class RtDbHttpClient {
   }
 
   private async post(path: string, payload: unknown): Promise<unknown> {
-    const response = await this.fetchImpl(`${this.url}${path}`, {
+    const response = await this.doFetch(`${this.url}${path}`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -557,7 +650,7 @@ export class RtDbHttpClient {
   }
 
   private async get(path: string, bearer: string): Promise<unknown> {
-    const response = await this.fetchImpl(`${this.url}${path}`, {
+    const response = await this.doFetch(`${this.url}${path}`, {
       method: "GET",
       headers: {
         Authorization: `Bearer ${bearer}`,

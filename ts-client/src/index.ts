@@ -99,16 +99,17 @@ export type {
 } from "./client.js";
 export { RtDbClient } from "./client.js";
 export type { RtDbErrorCode, RtDbErrorEnvelope } from "./errors.js";
-export { RtDbError } from "./errors.js";
+export { RtDbDeadlineError, RtDbError } from "./errors.js";
 export type {
   FileMetadata,
   RtDbHttpClientOptions,
+  RtDbHttpTransportOptions,
   SignedUrl,
   TransformOpts,
   UploadInput,
   UploadResult,
 } from "./http.js";
-export { appendImageParams, RtDbHttpClient } from "./http.js";
+export { appendImageParams, fetchWithDeadline, RtDbHttpClient } from "./http.js";
 export type { InMemoryRtDbClientOptions } from "./in_memory/index.js";
 export { InMemoryAdminClient, InMemoryRtDbClient, PresenceRooms } from "./in_memory/index.js";
 export { Migration } from "./migration.js";

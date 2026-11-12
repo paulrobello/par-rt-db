@@ -104,3 +104,31 @@ export class RtDbError extends Error {
     return new RtDbError(envelope.code, envelope.message, envelope.retryAfter, status);
   }
 }
+
+/**
+ * Thrown when an HTTP/admin request exceeds its `requestTimeoutMs` deadline.
+ * Client-local by design: the deadline is armed by this client, not the
+ * server, so `DEADLINE_EXCEEDED` is deliberately absent from the wire error
+ * corpus (`errors_gen.ts`) and never appears in a server envelope. It does not
+ * extend {@link RtDbError} — whose `code` is the generated wire-union type —
+ * so a consumer branching on `instanceof RtDbError` sees server failures and
+ * this client-originated timeout as distinct classes. Branch on this class
+ * (or `RtDbDeadlineError.is`) to handle deadlines.
+ */
+export class RtDbDeadlineError extends Error {
+  /** Stable client-local code, never emitted on the wire. */
+  readonly code = "DEADLINE_EXCEEDED" as const;
+  /** The deadline that fired, in milliseconds. */
+  readonly timeoutMs: number;
+
+  constructor(message: string, timeoutMs: number) {
+    super(message);
+    this.name = "RtDbDeadlineError";
+    this.timeoutMs = timeoutMs;
+  }
+
+  /** Type guard: whether `value` is a deadline error thrown by this client. */
+  static is(value: unknown): value is RtDbDeadlineError {
+    return value instanceof RtDbDeadlineError;
+  }
+}
