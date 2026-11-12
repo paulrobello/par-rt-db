@@ -1054,16 +1054,21 @@ fresh snapshot.
 `server/src/protocol.rs`, `ts-client/src/protocol.ts`,
 `rust-client/src/wire.rs`, `python-client/src/par_rt_db/wire.py`,
 `swift-client/Sources/ParRtDbClient/Wire.swift` (query/txn wire structs in
-`Query.swift`/`Mutation.swift` alongside it), and `go-client/wire/` are six
-implementations of the same protocol and must stay byte-identical (serde tags
-and field names). The casing is deliberately non-uniform and load-bearing —
-match the protocol files exactly (see the spec). Since ARC-004 the Rust-side
-txn vocabulary (`Step`/`Transaction`) is defined once in the shared `core`
-crate and re-exported by both `server/src/dsl.rs` and
-`rust-client/src/mutation.rs`, so that subset cannot drift between the two
-Rust surfaces; the WS envelopes remain per-implementation mirrors. The SDKs
-are no-codegen: a schema object is both pushed to the server and the source
-of inferred types.
+`Query.swift`/`Mutation.swift` alongside it), `go-client/wire/`, and
+`kotlin-client/src/main/kotlin/dev/parrtdb/wire/` are seven implementations of
+the same protocol and must stay byte-identical (serde tags and field names).
+The casing is deliberately non-uniform and load-bearing — match the protocol
+files exactly (see the spec). Since ARC-004 the Rust-side txn vocabulary
+(`Step`/`Transaction`) is defined once in the shared `core` crate and
+re-exported by both `server/src/dsl.rs` and `rust-client/src/mutation.rs`, so
+that subset cannot drift between the two Rust surfaces. Since ARC-008 (stage
+1) the WS envelope vocabulary (`ClientMessage`/`ServerMessage`,
+`PROTOCOL_VERSION`, presence/workflow payload types) is likewise single-sourced
+in `core/src/envelope.rs` and re-exported by `server/src/protocol.rs` and
+`rust-client/src/wire.rs` (`ServerMessage` is generic over each crate's error
+and change-op types); the five non-Rust wire modules remain hand-maintained
+mirrors. The SDKs are no-codegen: a schema object is both pushed to the server
+and the source of inferred types.
 The Rust client ports the TS SDK (design at
 [`superpowers/specs/2026-07-22-rust-client-design.md`](superpowers/specs/2026-07-22-rust-client-design.md));
 its `http`, reactive `ws`, and `admin` features all ship, plus
