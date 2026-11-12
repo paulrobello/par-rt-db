@@ -128,6 +128,48 @@ pub struct ClaimedSchedule {
     pub lease_deadline_ms: i64,
 }
 
+/// Accepted response for a background bulk delete (`POST /api/bulk/delete`):
+/// the op runs asynchronously, so the ack carries its `opId` (poll it with
+/// [`BulkOpInfo`]) plus the filter's match count and the starting state.
+/// Like [`ClaimedSchedule`], deliberately lenient — no `deny_unknown_fields`
+/// — since this is a decode-only response shape. Mirrors the canonical
+/// fixture `wire-corpus/http-shapes.json::bulkDeleteAccepted`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkOpAccepted {
+    /// The background op's id, for [`crate::http::RtDbHttpClient::bulk_status`]
+    /// polling.
+    pub op_id: String,
+    /// How many documents the filter matched when the op was enqueued.
+    pub matched: u64,
+    /// The op's starting state (`running`).
+    pub state: String,
+}
+
+/// One background bulk op's current state (`GET /api/bulk/{id}`), for polling
+/// an op started with [`BulkOpAccepted::op_id`]. `error` is present ONLY on
+/// the `failed` state — the server omits the key entirely otherwise, so it
+/// carries `default` (missing key decodes as `None`) as well as
+/// `skip_serializing_if`, the same contract as `StepOutcome::error`. Like
+/// [`ClaimedSchedule`], deliberately lenient — no `deny_unknown_fields`.
+/// Mirrors the canonical fixtures
+/// `wire-corpus/http-shapes.json::{bulkOpInfoRunning,bulkOpInfoFailed}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkOpInfo {
+    /// The op's id (same value as the polled [`BulkOpAccepted::op_id`]).
+    pub id: String,
+    /// `running`, `succeeded`, or `failed`.
+    pub state: String,
+    /// How many documents the filter matched when the op was enqueued.
+    pub matched: u64,
+    /// How many documents the op has deleted so far.
+    pub deleted: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The failure reason, present only on the `failed` state.
+    pub error: Option<String>,
+}
+
 /// Per-step retry policy (FM-29). `maxAttempts` counts TOTAL attempts — the
 /// first try included. `StepRetry`/`AwaitSignalSpec`/`WorkflowStepSpec`/
 /// `WorkflowSpec`/`WorkflowStatus` are now `par_rt_db_core::mutation` types

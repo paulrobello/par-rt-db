@@ -4,6 +4,7 @@
 
 #[cfg(feature = "admin")]
 mod admin;
+mod bulk;
 mod changefeed;
 mod client;
 mod scheduling;
