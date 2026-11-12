@@ -291,6 +291,15 @@ pub struct Limits {
     pub signed_url_key: Arc<ring::hmac::Key>,
 }
 
+/// OpFeed sizing, boot-pinned with no config surface (ARC-007). The ring
+/// replays the last [`OP_FEED_RING_CAP`] events on (re)connect — the value
+/// ARCHITECTURE.md's "Op-feed ring" note documents as "the last 500 events" —
+/// and [`OP_FEED_BROADCAST_CAP`] bounds each lagging receiver's broadcast
+/// buffer. Update the docs in the same change as these consts, or the
+/// documented numbers drift.
+const OP_FEED_BROADCAST_CAP: usize = 1024;
+const OP_FEED_RING_CAP: usize = 500;
+
 pub struct AppState {
     pub pool: sqlx::PgPool,
     pub config: Config,
@@ -323,7 +332,7 @@ impl AppState {
             Some(metrics.clone()),
             config.subs_verify_skip_every,
         );
-        let op_feed = op_feed::OpFeed::new(1024, 500);
+        let op_feed = op_feed::OpFeed::new(OP_FEED_BROADCAST_CAP, OP_FEED_RING_CAP);
         let hot = Arc::new(ArcSwap::from_pointee(hot));
         // Per-db storage-usage cache (ENH-011). Built before the committers so
         // it can be threaded into `Committers::new` (the committer arms enforce
