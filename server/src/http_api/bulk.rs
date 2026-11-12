@@ -171,3 +171,58 @@ pub(crate) async fn bulk_status_handler(
         error: status.error,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn http_shapes_fixture() -> serde_json::Value {
+        serde_json::from_str(include_str!("../../../wire-corpus/http-shapes.json"))
+            .expect("wire-corpus/http-shapes.json is valid JSON")
+    }
+
+    /// Drift verification (wave 2): the bulk-delete DTOs' serialized shapes
+    /// must match wire-corpus/http-shapes.json byte-for-byte, and `error`
+    /// must stay absent while running/complete.
+    #[test]
+    fn bulk_http_shapes_fixture_parity() {
+        let fx = http_shapes_fixture();
+
+        assert_eq!(
+            serde_json::to_value(BulkDeleteResponse {
+                op_id: "bulk_01JENQ9Z7K3M2V8R5T4W6X8Y0A".to_string(),
+                matched: 1500,
+                state: "running",
+            })
+            .unwrap(),
+            fx["bulkDeleteAccepted"],
+            "BulkDeleteResponse wire shape drifted from wire-corpus/http-shapes.json"
+        );
+
+        assert_eq!(
+            serde_json::to_value(BulkStatusResponse {
+                id: "bulk_01JENQ9Z7K3M2V8R5T4W6X8Y0A".to_string(),
+                state: "running",
+                matched: 1500,
+                deleted: 500,
+                error: None,
+            })
+            .unwrap(),
+            fx["bulkOpInfoRunning"],
+            "BulkStatusResponse (running) drifted — error must stay absent while running"
+        );
+
+        assert_eq!(
+            serde_json::to_value(BulkStatusResponse {
+                id: "bulk_01JENQ9Z7K3M2V8R5T4W6X8Y0A".to_string(),
+                state: "failed",
+                matched: 1500,
+                deleted: 500,
+                error: Some("chunk turn failed: schema changed mid-op".to_string()),
+            })
+            .unwrap(),
+            fx["bulkOpInfoFailed"],
+            "BulkStatusResponse (failed) drifted"
+        );
+    }
+}

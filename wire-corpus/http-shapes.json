@@ -1,5 +1,5 @@
 {
-  "$comment": "Canonical HTTP-surface wire shapes (drift verification wave 1: the schedule/claim surface). The server-side parity test (server/src/protocol.rs tests::http_shapes_fixture_parity) constructs the real wire structs and fails when their serialized shape no longer matches this file; every client mirrors this file with strict decode/field-parity tests (ts-client/tests/schedule.test.ts, python-client/tests/test_http_shapes.py, go-client/wire/http_shapes_test.go, kotlin-client DTO test, swift-client HttpShapesTests.swift). Update-means-deliberate: a shape change must land on all seven surfaces in the same commit - this fixture exists because the ClaimedSchedule tz drift shipped undetected (fixed 8a55d03); the WS corpus does not cover HTTP-only shapes.",
+  "$comment": "Canonical HTTP-surface wire shapes (drift verification: the schedule/claim surface (wave 1) and the bulk-delete surface (wave 2, ARC-005)). The server-side parity test (server/src/protocol.rs tests::http_shapes_fixture_parity) constructs the real wire structs and fails when their serialized shape no longer matches this file; every client mirrors this file with strict decode/field-parity tests (ts-client/tests/schedule.test.ts, python-client/tests/test_http_shapes.py, go-client/wire/http_shapes_test.go, kotlin-client DTO test, swift-client HttpShapesTests.swift). Update-means-deliberate: a shape change must land on all seven surfaces in the same commit - this fixture exists because the ClaimedSchedule tz drift shipped undetected (fixed 8a55d03); the WS corpus does not cover HTTP-only shapes.",
   "claimedScheduleCron": {
     "id": "job_cron_1",
     "kind": "cron",
@@ -59,5 +59,23 @@
     "status": "pending",
     "createdAt": 1794470000000,
     "firedCount": 0
+  },
+  "bulkDeleteAccepted": {
+    "opId": "bulk_01JENQ9Z7K3M2V8R5T4W6X8Y0A",
+    "matched": 1500,
+    "state": "running"
+  },
+  "bulkOpInfoRunning": {
+    "id": "bulk_01JENQ9Z7K3M2V8R5T4W6X8Y0A",
+    "state": "running",
+    "matched": 1500,
+    "deleted": 500
+  },
+  "bulkOpInfoFailed": {
+    "id": "bulk_01JENQ9Z7K3M2V8R5T4W6X8Y0A",
+    "state": "failed",
+    "matched": 1500,
+    "deleted": 500,
+    "error": "chunk turn failed: schema changed mid-op"
   }
 }
