@@ -196,7 +196,7 @@ mem.tick(System.currentTimeMillis())   // deterministic scheduler/TTL/presence c
 ## Build
 
 Requires a JDK 17+ (the build targets JVM 17 bytecode; CI builds on Temurin
-21). The Gradle wrapper (9.8.2, Kotlin 2.4.21) bootstraps itself:
+21). The Gradle wrapper (9.9.1, Kotlin 2.4.21) bootstraps itself:
 
 ```bash
 ./gradlew build          # compile + test, warnings are errors

@@ -8,7 +8,7 @@ Authoritative sources: [README.md](README.md) for the HTTP/WS surface, the DSL, 
 
 ## Workspace & commands
 
-Ten packages run from the root `Makefile` (swift-client's lines are Darwin-guarded; a macOS CI job runs `make swift-client-checkall`; kotlin-client's gradle legs run wherever a JDK 21+ is present):
+Ten packages run from the root `Makefile` (swift-client's lines are Darwin-guarded; a macOS CI job runs `make swift-client-checkall`; kotlin-client's gradle legs run wherever a JDK 17+ is present):
 
 | Package | Path | Tool |
 | --- | --- | --- |
@@ -19,7 +19,7 @@ Ten packages run from the root `Makefile` (swift-client's lines are Darwin-guard
 | Python client — `par-rt-db` | `python-client/` | uv |
 | Swift client — `ParRtDbClient`/`ParRtDbUI` | `swift-client/` | swift |
 | Go client | `go-client/` | go |
-| Kotlin client — `par-rt-db-clientkt` | `kotlin-client/` | gradle (JVM 21+) |
+| Kotlin client — `par-rt-db-clientkt` | `kotlin-client/` | gradle (JDK 17+) |
 | Operator dashboard SPA | `dashboard/` | bun (Vite + React) |
 | `rtdb` CLI — wraps the rust client | `cli/` | cargo |
 
