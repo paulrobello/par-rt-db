@@ -732,6 +732,7 @@ mod spec_corpus {
 // with this engine, and asserted per key — a JSON-null expected value means
 // the key must be ABSENT after stamping. A semantics change regenerates the
 // fixture in the same commit (`make gen-spec-computed-stamping`).
+#[cfg(feature = "in_memory")]
 mod computed_stamping_corpus {
     use par_rt_db_client::in_memory::stamp_computed;
     use par_rt_db_client::schema::TableDef;
