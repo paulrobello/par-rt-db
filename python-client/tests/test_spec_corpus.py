@@ -98,3 +98,65 @@ def test_every_fixture_row_matches_this_engine() -> None:
         resolved = _index_column_type(_ADAPTER.validate_python(row["fieldType"]))
         assert _RAW_PG[resolved.pg] == row["columnType"]
         assert resolved.nullable == row["nullable"]
+
+
+_STAMP_CORPUS = json.loads(
+    (
+        Path(__file__).resolve().parents[2] / "wire-corpus" / "spec" / "computed-stamping.json"
+    ).read_text(encoding="utf-8")
+)
+
+
+def test_every_computed_stamping_op_has_a_fixture_row() -> None:
+    """The corpus README's own-op coverage rule: every ValueExpr op this
+    engine's ``eval_value_expr`` distinguishes must be exercised by a fixture
+    row — a grammar node without a row fails."""
+    seen: set[str] = set()
+    for row in _STAMP_CORPUS["rows"]:
+        for expr in row["computed"].values():
+            seen.add(expr["op"])
+    for op in (
+        "field",
+        "literal",
+        "concat",
+        "add",
+        "sub",
+        "mul",
+        "div",
+        "coalesce",
+        "lower",
+        "upper",
+        "trim",
+        "cast",
+        "now",
+        "case",
+    ):
+        assert op in seen, f"no fixture row exercises op '{op}'"
+
+
+def test_every_computed_stamping_row_matches_this_engine() -> None:
+    """Each row's wire schema fragment is decoded through the client's real
+    pydantic ``TableDef`` (the same spelling ``pushSchema`` parses), stamped
+    with the engine's ``_stamp_computed``, and asserted per key — an expected
+    JSON null means the key must be ABSENT after stamping; anything else
+    compares with ``==``, which treats ``42`` and ``42.0`` as equal the way
+    the cross-engine contract requires."""
+    from par_rt_db.in_memory.value_expr import _stamp_computed
+    from par_rt_db.schema import TableDef
+
+    adapter = TypeAdapter(TableDef)
+    for i, row in enumerate(_STAMP_CORPUS["rows"]):
+        table = adapter.validate_python({"fields": row["fields"], "computed": row["computed"]})
+        doc = dict(row["inputDoc"])
+        if row["expect"].get("error"):
+            with pytest.raises(RtDbError) as ei:
+                _stamp_computed(table, doc, row["now"])
+            assert ei.value.code is ErrorCode.BAD_REQUEST, f"row {i}: error code"
+            continue
+        stamped = _stamp_computed(table, doc, row["now"])
+        for name, expected in row["expect"]["stampedValues"].items():
+            if expected is None:
+                assert name not in stamped, f"row {i}: key '{name}' must be absent after stamping"
+            else:
+                assert name in stamped, f"row {i}: missing computed key '{name}'"
+                assert stamped[name] == expected, f"row {i}: stamped value of '{name}'"

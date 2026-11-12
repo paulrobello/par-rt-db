@@ -41,6 +41,7 @@ SWIFT_CLIENT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(
 	go-client-typecheck go-client-checkall gen-error-codes gen-error-codes-ts \
 	gen-error-codes-ts-check gen-error-codes-rust gen-error-codes-rust-check \
 	gen-spec-index-column-types gen-spec-index-column-types-check \
+	gen-spec-computed-stamping gen-spec-computed-stamping-check \
 	kotlin-client-install kotlin-client-build kotlin-client-lint kotlin-client-typecheck \
 	kotlin-client-test kotlin-client-checkall \
 	swift-client-build swift-client-test swift-client-lint swift-client-fmt \
@@ -356,6 +357,26 @@ gen-spec-index-column-types-check:
 		exit $$status; \
 	fi
 
+# ENH-052 family 2: wire-corpus/spec/computed-stamping.json — the computed-field
+# stamping decision table (ENH-028), generated from
+# server/src/txn/stamp.rs::stamp_computed + value_expr.rs::eval_value_expr
+# (see server/src/spec_corpus.rs). Run after any ValueExpr/stamping semantics
+# change, in the same change. The -check leg in checkall fails when the
+# committed fixture disagrees with a fresh generation.
+gen-spec-computed-stamping:
+	cd server && cargo run --quiet --bin gen-spec-computed-stamping
+
+gen-spec-computed-stamping-check:
+	@tmpdir=$$(mktemp -d); \
+	if (cd server && cargo run --quiet --bin gen-spec-computed-stamping -- --out "$$tmpdir/computed-stamping.json") \
+		&& diff -u wire-corpus/spec/computed-stamping.json "$$tmpdir/computed-stamping.json"; then \
+		rm -rf "$$tmpdir"; \
+	else \
+		status=$$?; rm -rf "$$tmpdir"; \
+		echo "wire-corpus/spec/computed-stamping.json is stale — run 'make gen-spec-computed-stamping' and commit the result" >&2; \
+		exit $$status; \
+	fi
+
 # Kotlin/JVM client. The Gradle wrapper pins Gradle itself; the only host
 # requirement is a JDK 17+ (CI installs Temurin 21). Compiler warnings are
 # errors (build.gradle.kts), so compile doubles as lint and typecheck, and the
@@ -516,7 +537,7 @@ hostname-leak-check:
 ts-dist-preflight:
 	./scripts/ts-dist-preflight.sh
 
-checkall: ts-dist-preflight env-drift-check dockerfile-stub-check backup-persistence-check hostname-leak-check cli-docs-check gen-error-codes-ts-check gen-error-codes-rust-check gen-spec-index-column-types-check docs-api fmt-check lint typecheck test rust-client-check-features publish-check dev-db-clean-check
+checkall: ts-dist-preflight env-drift-check dockerfile-stub-check backup-persistence-check hostname-leak-check cli-docs-check gen-error-codes-ts-check gen-error-codes-rust-check gen-spec-index-column-types-check gen-spec-computed-stamping-check docs-api fmt-check lint typecheck test rust-client-check-features publish-check dev-db-clean-check
 	@mkdir -p target && echo "$(GATE_KEY)" > $(GATE_STAMP)
 
 # Content-addressed gate reuse for deploys: `checkall` stamps the gate key

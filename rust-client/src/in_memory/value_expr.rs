@@ -201,7 +201,7 @@ fn eval_case(whens: &[CaseWhen], otherwise: &ValueExpr, cx: &EvalCtx) -> Result<
 /// last in the insert/replace stamp chains and inside `apply_patch` (so patch,
 /// upsert's update branch, patchByQuery, and cascade setNull are all covered),
 /// always before `validate_doc`.
-pub(super) fn stamp_computed(
+pub fn stamp_computed(
     table_def: &TableDef,
     mut doc: Map<String, Value>,
     now: i64,

@@ -2708,7 +2708,6 @@ mod value_expr;
 use migrate::{InMemorySchemaValidateExt, detect_destructive_changes};
 use query::{collect_index_key, diff_canonical, require_index};
 use validate::{apply_defaults, matches_filter, stamp_ttl_default, stamp_updated_at};
-use value_expr::stamp_computed;
 
 // Public API re-exports (preserves `par_rt_db_client::in_memory::*`).
 pub use presence::{PresenceHandle, PresenceRooms};
@@ -2721,7 +2720,7 @@ pub use validate::{
     is_hex_id, is_int64_string, is_plain_object, strip_unset_optionals, validate_by_query_filter,
     validate_doc, validate_filter, validate_value,
 };
-pub use value_expr::eval_value_expr;
+pub use value_expr::{eval_value_expr, stamp_computed};
 
 #[cfg(test)]
 mod tests;

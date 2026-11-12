@@ -1,11 +1,14 @@
 package dev.parrtdb.inmemory
 
+import dev.parrtdb.corpus.Compare
 import dev.parrtdb.corpus.CorpusPaths
 import dev.parrtdb.errors.ErrorCode
 import dev.parrtdb.errors.RtDbException
+import dev.parrtdb.wire.ValueExpr
 import dev.parrtdb.wire.WireJson
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.boolean
@@ -126,3 +129,124 @@ class SpecCorpusTest {
         }
     }
 }
+
+/**
+ * ENH-052 family 2 — spec-table corpus runner: computed-field stamping
+ * (wire-corpus/spec/computed-stamping.json).
+ *
+ * Asserts the engine's `stampComputed` port of server `txn::stamp_computed` +
+ * `value_expr::eval_value_expr` against every fixture row: each row's wire
+ * schema fragment (`fields` + `computed`) is decoded through the engine's own
+ * `parseSchema`, stamped with the engine, and asserted per key with
+ * `Compare.equalNumeric` — a JSON-null expected value means the key must be
+ * ABSENT after stamping. A semantics change regenerates the fixture in the
+ * same commit (`make gen-spec-computed-stamping`).
+ */
+class ComputedStampingSpecCorpusTest {
+    private fun rows(): List<JsonObject> {
+        val doc = WireJson.parse(CorpusPaths.read("spec", "computed-stamping.json")) as? JsonObject
+            ?: error("computed stamping corpus is not a JSON object")
+        val arr = doc["rows"] as? JsonArray ?: error("spec corpus has no rows array")
+        return arr.map { it as JsonObject }
+    }
+
+    /** The wire op tags this engine's evalValueExpr distinguishes — the
+     *  corpus README's own-op coverage rule: a grammar node without a fixture
+     *  row fails. */
+    private val ownOps: Set<String> =
+        setOf(
+            "field", "literal", "concat", "add", "sub", "mul", "div",
+            "coalesce", "lower", "upper", "trim", "cast", "now", "case",
+        )
+
+    private fun fragmentTable(row: JsonObject): TableDef {
+        val schema = WireJson.parse(
+            WireJson.encode(
+                JsonObject(
+                    mapOf(
+                        "tables" to JsonObject(
+                            mapOf(
+                                "t" to JsonObject(
+                                    mapOf(
+                                        "fields" to row["fields"]!!,
+                                        "computed" to row["computed"]!!,
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        return parseSchema(schema).tables.getValue("t")
+    }
+
+    @Test
+    fun everyOpHasAFixtureRow() {
+        val seen = mutableSetOf<String>()
+        for (row in rows()) {
+            val computed = row["computed"] as JsonObject
+            for (expr in computed.values) {
+                seen.add(
+                    when (ValueExpr.fromJson(expr)) {
+                        is ValueExpr.Field -> "field"
+                        is ValueExpr.Literal -> "literal"
+                        is ValueExpr.Concat -> "concat"
+                        is ValueExpr.Add -> "add"
+                        is ValueExpr.Sub -> "sub"
+                        is ValueExpr.Mul -> "mul"
+                        is ValueExpr.Div -> "div"
+                        is ValueExpr.Coalesce -> "coalesce"
+                        is ValueExpr.Lower -> "lower"
+                        is ValueExpr.Upper -> "upper"
+                        is ValueExpr.Trim -> "trim"
+                        is ValueExpr.CastTo -> "cast"
+                        is ValueExpr.Now -> "now"
+                        is ValueExpr.Case -> "case"
+                    },
+                )
+            }
+        }
+        for (op in ownOps) {
+            assertTrue(op in seen, "no fixture row exercises op '$op'")
+        }
+    }
+
+    @Test
+    fun everyFixtureRowMatchesThisEngine() {
+        for ((i, row) in rows().withIndex()) {
+            val table = fragmentTable(row)
+            val doc = row["inputDoc"] as JsonObject
+            val expect = row["expect"] as JsonObject
+            if (expect["error"] != null) {
+                val ei =
+                    assertFailsWith<RtDbException>("row $i: expected the stamp to fail") {
+                        stampComputed(table, doc, row["now"]!!.jsonLong())
+                    }
+                assertEquals(ErrorCode.BAD_REQUEST, ei.code, "row $i error code")
+                continue
+            }
+            val nowV = row["now"] as JsonPrimitive
+            val stamped = stampComputed(table, doc, nowV.jsonLong())
+            val stampedValues = expect["stampedValues"] as JsonObject
+            for ((name, expected) in stampedValues) {
+                if (expected is JsonNull) {
+                    assertTrue(
+                        name !in stamped,
+                        "row $i: key '$name' must be absent after stamping",
+                    )
+                    continue
+                }
+                val got = stamped[name]
+                    ?: throw AssertionError("row $i: missing computed key '$name'")
+                assertTrue(
+                    Compare.equalNumeric(got, expected),
+                    "row $i: stamped value of '$name' is $got, want $expected",
+                )
+            }
+        }
+    }
+}
+
+/** Reads a JSON number primitive as a Long (epoch-ms / small fixture values). */
+private fun JsonElement.jsonLong(): Long = (this as JsonPrimitive).content.toLong()

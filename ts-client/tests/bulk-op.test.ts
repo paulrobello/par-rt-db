@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import type { BulkOpAccepted, BulkOpInfo, FilterExpr } from "../src/protocol.js";
+import type { BulkOpAccepted, BulkOpInfo } from "../src/protocol.js";
 
 /** wire-corpus/http-shapes.json (repo root — the single source of truth; same fixture the other six runners consume). */
 const HTTP_SHAPES_PATH = resolve(__dirname, "../../wire-corpus/http-shapes.json");

@@ -44,11 +44,15 @@ implementations honest against each other. These artifacts live here:
   checkers with one evaluator that reads this table. See
   [Query combination rules](#query-combination-rules) below.
 - [`spec/`](spec/) — the **in-memory semantics spec-table corpus** (ENH-052):
-  pure decision tables generated from the server's own implementation, one row
-  per representative per `FieldType` variant. Today:
+  pure decision tables generated from the server's own implementation. Today,
+  two families:
   [`spec/index-column-types.json`](spec/index-column-types.json) pins the
   FieldType → Postgres column-type mapping (`schema::indexed_column_type` and
-  its six client ports). See [Spec-table corpus](#spec-table-corpus) below.
+  its six client ports), and
+  [`spec/computed-stamping.json`](spec/computed-stamping.json) pins the
+  computed-field stamping decision table (`txn::stamp_computed` +
+  `value_expr::eval_value_expr` and their six client `stampComputed` ports).
+  See [Spec-table corpus](#spec-table-corpus) below.
 
 **Runner scope:** the server and all six client in-memory engines
 (`ts-client`, `rust-client`, `python-client`, `swift-client`, `go-client`, `kotlin-client`) execute
@@ -444,9 +448,10 @@ stale case left behind after a rule is renamed or removed).
 generated from the server's own implementation**, not hand-authored cases.
 Each fixture is a `{"$comment", "rows"}` document whose rows are computed by
 calling the server function the table pins (today:
-`schema::indexed_column_type`, via
-`server/src/spec_corpus.rs`), so the committed fixture can never disagree with
-the code that owns the semantics.
+`schema::indexed_column_type` for the column-type family and
+`txn::stamp_computed` + `value_expr::eval_value_expr` for the computed-field
+stamping family, both via `server/src/spec_corpus.rs`), so the committed
+fixture can never disagree with the code that owns the semantics.
 
 - [`spec/index-column-types.json`](spec/index-column-types.json) — the
   FieldType → Postgres column-type mapping shared by the server and all six
@@ -458,22 +463,46 @@ the code that owns the semantics.
   raw Postgres string (`"double precision"`, not a client enum spelling);
   non-indexable rows carry `{"fieldType", "error": true}`.
 
-**Authoring rule:** a change to the pinned semantics (a new `FieldType`
-variant, or a mapping change in `indexed_column_type` or any of its six
-client ports) regenerates the fixture — `make gen-spec-index-column-types` —
-and lands the regenerated table **in the same change**, updating whichever
-client ports moved with it. A client port that drifts from the committed
-table fails that client's spec-corpus runner; a variant added without a
-representative row fails the generator's exhaustive match (a compile error in
-`server/src/spec_corpus.rs`).
+- [`spec/computed-stamping.json`](spec/computed-stamping.json) — the
+  computed-field stamping decision table (ENH-028) shared by the server and
+  all six client in-memory engines. One row per representative per closed
+  `ValueExpr` grammar node (`field`, `literal`, `concat`, `add`/`sub`/`mul`/
+  `div`, `coalesce`, `lower`/`upper`/`trim`, `cast` over all four targets,
+  `now`, `case`) and per stamping-layer rule (null removes the key, non-null
+  overwrites any client-supplied value, an evaluation error fails the write
+  as `BAD_REQUEST` naming the field; SQL-NULL propagation precedes the
+  divide-by-zero check; `trim` strips spaces only; `coalesce` evaluates
+  lazily). Each row carries the wire schema fragment (`fields` + `computed`,
+  the spelling every client parses for pushSchema), an `inputDoc`, and the
+  stamp's outcome — `{"stampedValues": {...}}` where a JSON-null entry means
+  the key must be ABSENT after stamping, or `{"error": true}`. Two rows the
+  JS number model cannot express are deliberately excluded: `cast.toInt64`
+  of a float-spelled integer payload (`3.0` — JSON.parse erases the
+  int/double payload distinction) and the field text form of a float-spelled
+  integral number (`5.0` vs `5`); both are pinned server-side by
+  `server/src/value_expr.rs`'s unit tests instead.
 
-**Enforcement:** `make gen-spec-index-column-types-check` (a `checkall` leg)
-diffs the committed fixture against a fresh generation; the server's
-`spec_corpus.rs` test pins the same property in-crate. Each of the seven
-runners — server, ts-client (`tests/spec-corpus.test.ts`), rust-client
-(`tests/wire_corpus.rs::spec_corpus`), python-client
-(`tests/test_spec_corpus.py`), go-client (`inmemory/spec_corpus_test.go`),
-kotlin-client (`inmemory/SpecCorpusTest.kt`), swift-client
-(`SpecCorpusTests.swift`) — asserts its own port of the mapping against every
-row (client `PgType` four-value enums mapped back to the raw column strings)
-and that its own FieldType variant set is covered by the fixture.
+**Authoring rule:** a change to the pinned semantics (a new `FieldType`
+variant, a mapping change in `indexed_column_type`, a new `ValueExpr` node,
+a new `Cast` target, or a stamping-semantics change in `stamp_computed` or
+any of its six client ports) regenerates the fixture —
+`make gen-spec-index-column-types` /
+`make gen-spec-computed-stamping` — and lands the regenerated table **in the
+same change**, updating whichever client ports moved with it. A client port
+that drifts from a committed table fails that client's spec-corpus runner; a
+variant or grammar node added without a representative row fails the
+generator's exhaustive match (a compile error in `server/src/spec_corpus.rs`).
+
+**Enforcement:** `make gen-spec-index-column-types-check` and
+`make gen-spec-computed-stamping-check` (`checkall` legs) diff each committed
+fixture against a fresh generation; the server's `spec_corpus.rs` tests pin
+the same property in-crate. Each of the seven runners — server, ts-client
+(`tests/spec-corpus.test.ts`), rust-client
+(`tests/wire_corpus.rs::spec_corpus` + `::computed_stamping_corpus`),
+python-client (`tests/test_spec_corpus.py`), go-client
+(`inmemory/spec_corpus_test.go`), kotlin-client
+(`inmemory/SpecCorpusTest.kt` + `ComputedStampingSpecCorpusTest`), and
+swift-client (`SpecCorpusTests.swift` +
+`ComputedStampingSpecCorpusTests`) — asserts its own port against every row
+of both families, plus each surface's own variant/op coverage check (a
+variant added without a fixture row fails that surface's coverage test).

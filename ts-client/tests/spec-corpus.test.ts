@@ -2,8 +2,9 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { RtDbError } from "../src/errors.js";
+import { stampComputed } from "../src/in_memory/doc_stamp.js";
 import { indexColumnType, type PgType } from "../src/in_memory/validate.js";
-import type { FieldTypeJson } from "../src/protocol.js";
+import type { FieldTypeJson, TableJson, ValueExprJson } from "../src/protocol.js";
 
 /**
  * ENH-052 family 1 — spec-table corpus runner: asserts this engine's
@@ -97,6 +98,110 @@ describe("spec corpus: index column types", () => {
       const resolved = indexColumnType(row.fieldType);
       expect(RAW_PG[resolved.pg]).toBe(row.columnType);
       expect(resolved.nullable).toBe(row.nullable);
+    }
+  });
+});
+
+describe("spec corpus: computed stamping", () => {
+  const CORPUS: {
+    rows: {
+      id: string;
+      fields: Record<string, unknown>;
+      computed: Record<string, ValueExprJson>;
+      inputDoc: Record<string, unknown>;
+      now: number;
+      expect: { stampedValues?: Record<string, unknown>; error?: boolean };
+    }[];
+  } = JSON.parse(
+    readFileSync(resolve(__dirname, "../../wire-corpus/spec/computed-stamping.json"), "utf8"),
+  );
+
+  /** One representative per ValueExpr op this engine's evalValueExpr
+   *  distinguishes, in the wire spelling (the corpus README's own-op coverage
+   *  rule: a grammar node without a fixture row fails). */
+  const OWN_OPS: ValueExprJson[] = [
+    { op: "field", field: "f" },
+    { op: "literal", value: "x" },
+    { op: "concat", parts: [{ op: "literal", value: "x" }] },
+    { op: "add", left: { op: "literal", value: 1 }, right: { op: "literal", value: 1 } },
+    { op: "sub", left: { op: "literal", value: 1 }, right: { op: "literal", value: 1 } },
+    { op: "mul", left: { op: "literal", value: 1 }, right: { op: "literal", value: 1 } },
+    { op: "div", left: { op: "literal", value: 1 }, right: { op: "literal", value: 1 } },
+    { op: "coalesce", parts: [{ op: "literal", value: "x" }] },
+    { op: "lower", value: { op: "literal", value: "x" } },
+    { op: "upper", value: { op: "literal", value: "x" } },
+    { op: "trim", value: { op: "literal", value: "x" } },
+    { op: "cast", value: { op: "literal", value: "x" }, to: "toString" },
+    { op: "now" },
+    {
+      op: "case",
+      whens: [
+        {
+          when: { field: "f", op: "eq", value: "v" },
+          // biome-ignore lint/suspicious/noThenProperty: wire CaseWhenJson field is named `then`
+          then: { op: "literal", value: "x" },
+        },
+      ],
+      otherwise: { op: "literal", value: "y" },
+    },
+  ];
+
+  /** Per-key assertion: an expected JSON null means the stamped doc must NOT
+   *  carry the key; anything else deep-equals (vitest's toEqual compares
+   *  numbers by value). */
+  function assertStamped(
+    row: (typeof CORPUS.rows)[number],
+    stamped: Record<string, unknown>,
+  ): void {
+    const exp = row.expect;
+    if (exp.error) {
+      throw new Error(`row ${row.id}: expected the stamp to fail`);
+    }
+    for (const [name, expected] of Object.entries(exp.stampedValues ?? {})) {
+      if (expected === null) {
+        expect(name in stamped, `row ${row.id}: key '${name}' must be absent after stamping`).toBe(
+          false,
+        );
+      } else {
+        expect(stamped[name], `row ${row.id}: stamped value of '${name}'`).toEqual(expected);
+      }
+    }
+  }
+
+  it("every ValueExpr op this engine carries has a fixture row", () => {
+    const seen = new Set<string>();
+    for (const row of CORPUS.rows) {
+      for (const expr of Object.values(row.computed)) {
+        seen.add(expr.op);
+      }
+    }
+    for (const own of OWN_OPS) {
+      expect(seen.has(own.op), `no fixture row exercises op '${own.op}'`).toBe(true);
+    }
+  });
+
+  it("stamps every fixture row identically to the server contract", () => {
+    for (const row of CORPUS.rows) {
+      const table = { fields: row.fields, computed: row.computed } as unknown as TableJson;
+      let stamped: Record<string, unknown>;
+      try {
+        stamped = stampComputed(table, { ...row.inputDoc }, row.now);
+      } catch (err) {
+        if (row.expect.error) {
+          expect(
+            err instanceof RtDbError && err.code === "BAD_REQUEST",
+            `row ${row.id}: expected BAD_REQUEST, got ${String(err)}`,
+          ).toBe(true);
+          continue;
+        }
+        throw err;
+      }
+      if (row.expect.error) {
+        throw new Error(
+          `row ${row.id}: expected the stamp to fail, got ${JSON.stringify(stamped)}`,
+        );
+      }
+      assertStamped(row, stamped);
     }
   });
 });

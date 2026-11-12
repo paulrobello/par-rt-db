@@ -722,3 +722,81 @@ mod spec_corpus {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// ENH-052 family 2 — spec-table corpus: computed-field stamping
+// (wire-corpus/spec/computed-stamping.json). The fixture pins this engine's
+// `stamp_computed` port of server `txn::stamp_computed` +
+// `value_expr::eval_value_expr`: each row's wire schema fragment (`fields` +
+// `computed`) is decoded through this crate's own serde `TableDef`, stamped
+// with this engine, and asserted per key — a JSON-null expected value means
+// the key must be ABSENT after stamping. A semantics change regenerates the
+// fixture in the same commit (`make gen-spec-computed-stamping`).
+mod computed_stamping_corpus {
+    use par_rt_db_client::in_memory::stamp_computed;
+    use par_rt_db_client::schema::TableDef;
+
+    use super::{Value, json};
+
+    fn load_rows() -> Vec<Value> {
+        let doc: Value = serde_json::from_str(include_str!(
+            "../../wire-corpus/spec/computed-stamping.json"
+        ))
+        .unwrap_or_else(|e| panic!("parse computed-stamping.json: {e}"));
+        doc["rows"]
+            .as_array()
+            .expect("spec corpus missing rows array")
+            .clone()
+    }
+
+    /// Per-key assertion: an expected JSON null means the stamped doc must NOT
+    /// carry the key; anything else must deep-equal (serde `Value` equality is
+    /// recursive and number-payload-sensitive — the fixture and this engine
+    /// both spell whole floats `5.0`, so the spellings agree).
+    fn assert_stamped(i: usize, stamped: &Value, expect: &Value) {
+        for (name, expected) in expect["stampedValues"]
+            .as_object()
+            .expect("row expect.stampedValues")
+        {
+            match expected {
+                Value::Null => assert!(
+                    !stamped.get(name).is_some(),
+                    "row {i} ({name}): key must be absent after stamping"
+                ),
+                expected => assert_eq!(
+                    stamped
+                        .get(name)
+                        .unwrap_or_else(|| panic!("row {i}: missing computed key {name}")),
+                    expected,
+                    "row {i}: stamped value of {name}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn every_fixture_row_stamps_identically_to_the_server_contract() {
+        for (i, row) in load_rows().into_iter().enumerate() {
+            let table: TableDef = serde_json::from_value(json!({
+                "fields": row["fields"],
+                "computed": row["computed"],
+            }))
+            .unwrap_or_else(|e| panic!("row {i}: decode schema fragment: {e}"));
+            let doc = row["inputDoc"].clone();
+            let now = row["now"].as_i64().unwrap_or(0);
+            let stamped = stamp_computed(&table, doc.as_object().cloned().unwrap_or_default(), now);
+            if row["expect"]["error"].as_bool().unwrap_or(false) {
+                let err = stamped.expect_err(&format!("row {i}: expected a stamp error"));
+                assert_eq!(
+                    err.code,
+                    par_rt_db_client::error::ErrorCode::BadRequest,
+                    "row {i}: error code"
+                );
+                continue;
+            }
+            let stamped =
+                stamped.unwrap_or_else(|e| panic!("row {i}: unexpected stamp error: {e}"));
+            assert_stamped(i, &Value::Object(stamped), &row["expect"]);
+        }
+    }
+}

@@ -1,0 +1,2372 @@
+{
+  "$comment": "SPEC-TABLE CORPUS (ENH-052 family 2) — GENERATED, do not edit. The computed-field stamping decision table (ENH-028), one row per representative per ValueExpr grammar node, Cast target, and stamping-layer rule, computed from server/src/txn/stamp.rs::stamp_computed + server/src/value_expr.rs::eval_value_expr by 'make gen-spec-computed-stamping'. Each row carries the wire schema fragment (`fields` + `computed`) and an `inputDoc`; `expect.stampedValues` maps every computed field to its stamped output, where a JSON null means the key must be ABSENT after stamping, and `expect.error` marks rows whose stamp must fail (BAD_REQUEST). Each runner decodes the fragment with its own schema parser and asserts its own stampComputed port against every row. Two rows the JS number model cannot express are excluded (see wire-corpus/README.md): cast-toInt64 of a float-spelled integer payload ('3.0') and the text form of a float-spelled integral number ('5.0') — JSON.parse erases both distinctions. A semantics change regenerates this file in the same commit — see wire-corpus/README.md 'Spec-table corpus'.",
+  "rows": [
+    {
+      "computed": {
+        "echo": {
+          "field": "name",
+          "op": "field"
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "echo": "Ada"
+        }
+      },
+      "fields": {
+        "echo": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "id": "field-reads-text-form-string",
+      "inputDoc": {
+        "name": "Ada"
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "echo": {
+          "field": "ghost",
+          "op": "field"
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "echo": null
+        }
+      },
+      "fields": {
+        "echo": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "ghost": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "field-absent-key-yields-null-removes",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "echo": {
+          "field": "ghost",
+          "op": "field"
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "echo": null
+        }
+      },
+      "fields": {
+        "echo": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "ghost": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "field-json-null-yields-null-removes",
+      "inputDoc": {
+        "ghost": null
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "echo": {
+          "field": "num",
+          "op": "field"
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "echo": "42"
+        }
+      },
+      "fields": {
+        "echo": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "num": {
+          "type": "number"
+        }
+      },
+      "id": "field-number-text-form",
+      "inputDoc": {
+        "num": 42
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "echo": {
+          "field": "num",
+          "op": "field"
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "echo": "42.5"
+        }
+      },
+      "fields": {
+        "echo": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "num": {
+          "type": "number"
+        }
+      },
+      "id": "field-float-text-form",
+      "inputDoc": {
+        "num": 42.5
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "echo": {
+          "field": "flag",
+          "op": "field"
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "echo": "true"
+        }
+      },
+      "fields": {
+        "echo": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "flag": {
+          "type": "boolean"
+        }
+      },
+      "id": "field-bool-text-form",
+      "inputDoc": {
+        "flag": true
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "echo": {
+          "field": "obj",
+          "op": "field"
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "echo": "{\"a\":1,\"b\":2}"
+        }
+      },
+      "fields": {
+        "echo": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "obj": {
+          "inner": {
+            "fields": {
+              "a": {
+                "type": "number"
+              },
+              "b": {
+                "type": "number"
+              }
+            },
+            "type": "object"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "field-object-compact-json-text",
+      "inputDoc": {
+        "obj": {
+          "a": 1,
+          "b": 2
+        }
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "echo": {
+          "field": "arr",
+          "op": "field"
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "echo": "[\"x\",2,true,null]"
+        }
+      },
+      "fields": {
+        "arr": {
+          "inner": {
+            "element": {
+              "type": "any"
+            },
+            "type": "array"
+          },
+          "type": "optional"
+        },
+        "echo": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "field-array-compact-json-text",
+      "inputDoc": {
+        "arr": [
+          "x",
+          2,
+          true,
+          null
+        ]
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "k": {
+          "op": "literal",
+          "value": "v"
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "k": "v"
+        }
+      },
+      "fields": {
+        "k": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "literal-string",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "k": {
+          "op": "literal",
+          "value": 42
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "k": 42
+        }
+      },
+      "fields": {
+        "k": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "literal-number",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "k": {
+          "op": "literal",
+          "value": 42.5
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "k": 42.5
+        }
+      },
+      "fields": {
+        "k": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "literal-float",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "k": {
+          "op": "literal",
+          "value": true
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "k": true
+        }
+      },
+      "fields": {
+        "k": {
+          "inner": {
+            "type": "boolean"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "literal-boolean",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "k": {
+          "op": "literal",
+          "value": {
+            "a": "x",
+            "b": "y"
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "k": {
+            "a": "x",
+            "b": "y"
+          }
+        }
+      },
+      "fields": {
+        "k": {
+          "inner": {
+            "fields": {
+              "a": {
+                "type": "string"
+              },
+              "b": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "literal-object-round-trips",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "k": {
+          "op": "literal",
+          "value": [
+            "p",
+            "q"
+          ]
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "k": [
+            "p",
+            "q"
+          ]
+        }
+      },
+      "fields": {
+        "k": {
+          "inner": {
+            "element": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "literal-array-round-trips",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "k": {
+          "op": "literal",
+          "value": null
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "k": null
+        }
+      },
+      "fields": {
+        "k": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "literal-null-removes-client-value",
+      "inputDoc": {
+        "k": "client"
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "full": {
+          "op": "concat",
+          "parts": [
+            {
+              "op": "literal",
+              "value": "Ms. "
+            },
+            {
+              "field": "name",
+              "op": "field"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "full": "Ms. Ada"
+        }
+      },
+      "fields": {
+        "full": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "id": "concat-joins-text-forms",
+      "inputDoc": {
+        "name": "Ada"
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "full": {
+          "op": "concat",
+          "parts": [
+            {
+              "field": "ghost",
+              "op": "field"
+            },
+            {
+              "op": "literal",
+              "value": "x"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "full": "x"
+        }
+      },
+      "fields": {
+        "full": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "ghost": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "concat-skips-null-parts",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "full": {
+          "op": "concat",
+          "parts": [
+            {
+              "field": "num",
+              "op": "field"
+            },
+            {
+              "field": "flag",
+              "op": "field"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "full": "42true"
+        }
+      },
+      "fields": {
+        "flag": {
+          "type": "boolean"
+        },
+        "full": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "num": {
+          "type": "number"
+        }
+      },
+      "id": "concat-renders-numbers-and-bools",
+      "inputDoc": {
+        "flag": true,
+        "num": 42
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "sum": {
+          "left": {
+            "op": "literal",
+            "value": 2
+          },
+          "op": "add",
+          "right": {
+            "op": "literal",
+            "value": 3
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "sum": 5.0
+        }
+      },
+      "fields": {
+        "sum": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "add-literal-numbers",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "sum": {
+          "left": {
+            "field": "a",
+            "op": "field"
+          },
+          "op": "add",
+          "right": {
+            "field": "bb",
+            "op": "field"
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "sum": 7.0
+        }
+      },
+      "fields": {
+        "a": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "bb": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "sum": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "add-parses-numeric-strings",
+      "inputDoc": {
+        "a": "3",
+        "bb": "4"
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "sum": {
+          "left": {
+            "field": "a",
+            "op": "field"
+          },
+          "op": "add",
+          "right": {
+            "op": "literal",
+            "value": 1
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "sum": 4.0
+        }
+      },
+      "fields": {
+        "a": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "sum": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "add-trims-string-operands",
+      "inputDoc": {
+        "a": " 3 "
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "diff": {
+          "left": {
+            "op": "literal",
+            "value": 10
+          },
+          "op": "sub",
+          "right": {
+            "op": "literal",
+            "value": 4
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "diff": 6.0
+        }
+      },
+      "fields": {
+        "diff": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "sub-literal-numbers",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "diff": {
+          "left": {
+            "op": "literal",
+            "value": 2.5
+          },
+          "op": "sub",
+          "right": {
+            "op": "literal",
+            "value": 1.25
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "diff": 1.25
+        }
+      },
+      "fields": {
+        "diff": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "sub-float-result",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "prod": {
+          "left": {
+            "op": "literal",
+            "value": 6
+          },
+          "op": "mul",
+          "right": {
+            "op": "literal",
+            "value": 7
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "prod": 42.0
+        }
+      },
+      "fields": {
+        "prod": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "mul-literal-numbers",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "quot": {
+          "left": {
+            "op": "literal",
+            "value": 7
+          },
+          "op": "div",
+          "right": {
+            "op": "literal",
+            "value": 2
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "quot": 3.5
+        }
+      },
+      "fields": {
+        "quot": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "div-fractional-result",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "sum": {
+          "left": {
+            "field": "ghost",
+            "op": "field"
+          },
+          "op": "add",
+          "right": {
+            "op": "literal",
+            "value": 5
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "sum": null
+        }
+      },
+      "fields": {
+        "ghost": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        },
+        "sum": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "add-null-propagation-removes-key",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "quot": {
+          "left": {
+            "op": "literal",
+            "value": 5
+          },
+          "op": "div",
+          "right": {
+            "op": "literal",
+            "value": 0
+          }
+        }
+      },
+      "expect": {
+        "error": true
+      },
+      "fields": {
+        "quot": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "div-by-zero-errors",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "quot": {
+          "left": {
+            "field": "ghost",
+            "op": "field"
+          },
+          "op": "div",
+          "right": {
+            "op": "literal",
+            "value": 0
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "quot": null
+        }
+      },
+      "fields": {
+        "ghost": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        },
+        "quot": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "null-divisor-propagates-before-zero-check",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "prod": {
+          "left": {
+            "op": "literal",
+            "value": 1e+308
+          },
+          "op": "mul",
+          "right": {
+            "op": "literal",
+            "value": 10
+          }
+        }
+      },
+      "expect": {
+        "error": true
+      },
+      "fields": {
+        "prod": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "mul-overflow-errors",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "sum": {
+          "left": {
+            "field": "str",
+            "op": "field"
+          },
+          "op": "add",
+          "right": {
+            "op": "literal",
+            "value": 1
+          }
+        }
+      },
+      "expect": {
+        "error": true
+      },
+      "fields": {
+        "str": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "sum": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "add-non-numeric-string-errors",
+      "inputDoc": {
+        "str": "abc"
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "sum": {
+          "left": {
+            "op": "literal",
+            "value": true
+          },
+          "op": "add",
+          "right": {
+            "op": "literal",
+            "value": 1
+          }
+        }
+      },
+      "expect": {
+        "error": true
+      },
+      "fields": {
+        "sum": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "add-bool-operand-errors",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "picked": {
+          "op": "coalesce",
+          "parts": [
+            {
+              "field": "ghost",
+              "op": "field"
+            },
+            {
+              "op": "literal",
+              "value": "fallback"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "picked": "fallback"
+        }
+      },
+      "fields": {
+        "ghost": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "picked": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "coalesce-first-non-null",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "picked": {
+          "op": "coalesce",
+          "parts": [
+            {
+              "field": "ghost",
+              "op": "field"
+            },
+            {
+              "op": "literal",
+              "value": null
+            }
+          ]
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "picked": null
+        }
+      },
+      "fields": {
+        "ghost": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "picked": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "coalesce-all-null-removes-key",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "picked": {
+          "op": "coalesce",
+          "parts": [
+            {
+              "op": "literal",
+              "value": "first"
+            },
+            {
+              "left": {
+                "op": "literal",
+                "value": 1
+              },
+              "op": "div",
+              "right": {
+                "op": "literal",
+                "value": 0
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "picked": "first"
+        }
+      },
+      "fields": {
+        "picked": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "coalesce-short-circuits-lazily",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "low": {
+          "op": "lower",
+          "value": {
+            "field": "name",
+            "op": "field"
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "low": "ada"
+        }
+      },
+      "fields": {
+        "low": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "id": "lower-text",
+      "inputDoc": {
+        "name": "Ada"
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "up": {
+          "op": "upper",
+          "value": {
+            "field": "num",
+            "op": "field"
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "up": "42"
+        }
+      },
+      "fields": {
+        "num": {
+          "type": "number"
+        },
+        "up": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "upper-renders-number-text",
+      "inputDoc": {
+        "num": 42
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "trimmed": {
+          "op": "trim",
+          "value": {
+            "field": "str",
+            "op": "field"
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "trimmed": "a"
+        }
+      },
+      "fields": {
+        "str": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "trimmed": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "trim-strips-spaces-only",
+      "inputDoc": {
+        "str": "  a  "
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "trimmed": {
+          "op": "trim",
+          "value": {
+            "field": "str",
+            "op": "field"
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "trimmed": "\ta"
+        }
+      },
+      "fields": {
+        "str": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "trimmed": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "trim-tab-survives",
+      "inputDoc": {
+        "str": "\ta "
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "low": {
+          "op": "lower",
+          "value": {
+            "field": "ghost",
+            "op": "field"
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "low": null
+        }
+      },
+      "fields": {
+        "ghost": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "low": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "lower-null-removes-key",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "out": {
+          "op": "cast",
+          "to": "toString",
+          "value": {
+            "field": "num",
+            "op": "field"
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "out": "42"
+        }
+      },
+      "fields": {
+        "num": {
+          "type": "number"
+        },
+        "out": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "cast-toString-number-text",
+      "inputDoc": {
+        "num": 42
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "out": {
+          "op": "cast",
+          "to": "toString",
+          "value": {
+            "field": "ghost",
+            "op": "field"
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "out": null
+        }
+      },
+      "fields": {
+        "ghost": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        },
+        "out": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "cast-toString-null-removes-key",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "out": {
+          "op": "cast",
+          "to": "toNumber",
+          "value": {
+            "op": "literal",
+            "value": "12.5"
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "out": 12.5
+        }
+      },
+      "fields": {
+        "out": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "cast-toNumber-string",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "out": {
+          "op": "cast",
+          "to": "toNumber",
+          "value": {
+            "op": "literal",
+            "value": "42"
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "out": 42.0
+        }
+      },
+      "fields": {
+        "out": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "cast-toNumber-integer-string",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "out": {
+          "op": "cast",
+          "to": "toNumber",
+          "value": {
+            "op": "literal",
+            "value": true
+          }
+        }
+      },
+      "expect": {
+        "error": true
+      },
+      "fields": {
+        "out": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "cast-toNumber-bool-errors",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "out": {
+          "op": "cast",
+          "to": "toInt64",
+          "value": {
+            "op": "literal",
+            "value": "42"
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "out": 42
+        }
+      },
+      "fields": {
+        "out": {
+          "inner": {
+            "type": "int64"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "cast-toInt64-string",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "out": {
+          "op": "cast",
+          "to": "toInt64",
+          "value": {
+            "op": "literal",
+            "value": "42.5"
+          }
+        }
+      },
+      "expect": {
+        "error": true
+      },
+      "fields": {
+        "out": {
+          "inner": {
+            "type": "int64"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "cast-toInt64-non-integer-string-errors",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "out": {
+          "op": "cast",
+          "to": "toInt64",
+          "value": {
+            "op": "literal",
+            "value": false
+          }
+        }
+      },
+      "expect": {
+        "error": true
+      },
+      "fields": {
+        "out": {
+          "inner": {
+            "type": "int64"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "cast-toInt64-bool-errors",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "out": {
+          "op": "cast",
+          "to": "toBoolean",
+          "value": {
+            "op": "literal",
+            "value": "YES"
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "out": true
+        }
+      },
+      "fields": {
+        "out": {
+          "inner": {
+            "type": "boolean"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "cast-toBoolean-true-words-case-insensitive",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "out": {
+          "op": "cast",
+          "to": "toBoolean",
+          "value": {
+            "op": "literal",
+            "value": "off"
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "out": false
+        }
+      },
+      "fields": {
+        "out": {
+          "inner": {
+            "type": "boolean"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "cast-toBoolean-false-words",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "f0": {
+          "op": "cast",
+          "to": "toBoolean",
+          "value": {
+            "op": "literal",
+            "value": 0
+          }
+        },
+        "t1": {
+          "op": "cast",
+          "to": "toBoolean",
+          "value": {
+            "op": "literal",
+            "value": 1
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "f0": false,
+          "t1": true
+        }
+      },
+      "fields": {
+        "f0": {
+          "inner": {
+            "type": "boolean"
+          },
+          "type": "optional"
+        },
+        "t1": {
+          "inner": {
+            "type": "boolean"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "cast-toBoolean-numbers-one-and-zero",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "out": {
+          "op": "cast",
+          "to": "toBoolean",
+          "value": {
+            "op": "literal",
+            "value": "maybe"
+          }
+        }
+      },
+      "expect": {
+        "error": true
+      },
+      "fields": {
+        "out": {
+          "inner": {
+            "type": "boolean"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "cast-toBoolean-invalid-word-errors",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "out": {
+          "op": "cast",
+          "to": "toBoolean",
+          "value": {
+            "op": "literal",
+            "value": 2
+          }
+        }
+      },
+      "expect": {
+        "error": true
+      },
+      "fields": {
+        "out": {
+          "inner": {
+            "type": "boolean"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "cast-toBoolean-out-of-range-number-errors",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "out": {
+          "op": "cast",
+          "to": "toBoolean",
+          "value": {
+            "field": "ghost",
+            "op": "field"
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "out": null
+        }
+      },
+      "fields": {
+        "ghost": {
+          "inner": {
+            "type": "boolean"
+          },
+          "type": "optional"
+        },
+        "out": {
+          "inner": {
+            "type": "boolean"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "cast-toBoolean-null-removes-key",
+      "inputDoc": {},
+      "now": 0
+    },
+    {
+      "computed": {
+        "ts": {
+          "op": "now"
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "ts": 1700000000000
+        }
+      },
+      "fields": {
+        "ts": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "now-stamps-epoch-ms",
+      "inputDoc": {},
+      "now": 1700000000000
+    },
+    {
+      "computed": {
+        "tier": {
+          "op": "case",
+          "otherwise": {
+            "op": "literal",
+            "value": "standard"
+          },
+          "whens": [
+            {
+              "then": {
+                "op": "literal",
+                "value": "gold"
+              },
+              "when": {
+                "field": "status",
+                "op": "eq",
+                "value": "vip"
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "tier": "gold"
+        }
+      },
+      "fields": {
+        "status": {
+          "type": "string"
+        },
+        "tier": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "case-first-matching-when-wins",
+      "inputDoc": {
+        "status": "vip"
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "tier": {
+          "op": "case",
+          "otherwise": {
+            "op": "literal",
+            "value": "standard"
+          },
+          "whens": [
+            {
+              "then": {
+                "op": "literal",
+                "value": "gold"
+              },
+              "when": {
+                "field": "status",
+                "op": "eq",
+                "value": "vip"
+              }
+            },
+            {
+              "then": {
+                "op": "literal",
+                "value": "silver"
+              },
+              "when": {
+                "field": "status",
+                "op": "eq",
+                "value": "regular"
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "tier": "silver"
+        }
+      },
+      "fields": {
+        "status": {
+          "type": "string"
+        },
+        "tier": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "case-second-when-matches",
+      "inputDoc": {
+        "status": "regular"
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "tier": {
+          "op": "case",
+          "otherwise": {
+            "op": "literal",
+            "value": "standard"
+          },
+          "whens": [
+            {
+              "then": {
+                "op": "literal",
+                "value": "gold"
+              },
+              "when": {
+                "field": "status",
+                "op": "eq",
+                "value": "vip"
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "tier": "standard"
+        }
+      },
+      "fields": {
+        "status": {
+          "type": "string"
+        },
+        "tier": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "case-falls-through-to-otherwise",
+      "inputDoc": {
+        "status": "other"
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "adj": {
+          "op": "case",
+          "otherwise": {
+            "field": "base",
+            "op": "field"
+          },
+          "whens": [
+            {
+              "then": {
+                "left": {
+                  "field": "base",
+                  "op": "field"
+                },
+                "op": "add",
+                "right": {
+                  "op": "literal",
+                  "value": 100
+                }
+              },
+              "when": {
+                "field": "base",
+                "op": "gt",
+                "value": 10
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "adj": 150.0
+        }
+      },
+      "fields": {
+        "adj": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        },
+        "base": {
+          "type": "number"
+        }
+      },
+      "id": "case-then-branch-arithmetic",
+      "inputDoc": {
+        "base": 50
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "label": {
+          "op": "case",
+          "otherwise": {
+            "op": "literal",
+            "value": "none"
+          },
+          "whens": [
+            {
+              "then": {
+                "op": "literal",
+                "value": "contains-arm"
+              },
+              "when": {
+                "field": "tags",
+                "op": "contains",
+                "value": "vip"
+              }
+            },
+            {
+              "then": {
+                "op": "literal",
+                "value": "in-arm"
+              },
+              "when": {
+                "field": "status",
+                "op": "in",
+                "values": [
+                  "x",
+                  "y"
+                ]
+              }
+            },
+            {
+              "then": {
+                "op": "literal",
+                "value": "lte-arm"
+              },
+              "when": {
+                "field": "score",
+                "op": "lte",
+                "value": 5
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "label": "contains-arm"
+        }
+      },
+      "fields": {
+        "label": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "score": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string"
+        },
+        "tags": {
+          "inner": {
+            "element": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "case-predicate-contains-arm",
+      "inputDoc": {
+        "score": 3,
+        "status": "z",
+        "tags": [
+          "a",
+          "vip"
+        ]
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "label": {
+          "op": "case",
+          "otherwise": {
+            "op": "literal",
+            "value": "none"
+          },
+          "whens": [
+            {
+              "then": {
+                "op": "literal",
+                "value": "contains-arm"
+              },
+              "when": {
+                "field": "tags",
+                "op": "contains",
+                "value": "vip"
+              }
+            },
+            {
+              "then": {
+                "op": "literal",
+                "value": "in-arm"
+              },
+              "when": {
+                "field": "status",
+                "op": "in",
+                "values": [
+                  "x",
+                  "y"
+                ]
+              }
+            },
+            {
+              "then": {
+                "op": "literal",
+                "value": "lte-arm"
+              },
+              "when": {
+                "field": "score",
+                "op": "lte",
+                "value": 5
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "label": "in-arm"
+        }
+      },
+      "fields": {
+        "label": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "score": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string"
+        },
+        "tags": {
+          "inner": {
+            "element": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "case-predicate-in-arm",
+      "inputDoc": {
+        "score": 9,
+        "status": "y",
+        "tags": [
+          "a"
+        ]
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "label": {
+          "op": "case",
+          "otherwise": {
+            "op": "literal",
+            "value": "none"
+          },
+          "whens": [
+            {
+              "then": {
+                "op": "literal",
+                "value": "contains-arm"
+              },
+              "when": {
+                "field": "tags",
+                "op": "contains",
+                "value": "vip"
+              }
+            },
+            {
+              "then": {
+                "op": "literal",
+                "value": "in-arm"
+              },
+              "when": {
+                "field": "status",
+                "op": "in",
+                "values": [
+                  "x",
+                  "y"
+                ]
+              }
+            },
+            {
+              "then": {
+                "op": "literal",
+                "value": "lte-arm"
+              },
+              "when": {
+                "field": "score",
+                "op": "lte",
+                "value": 5
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "label": "lte-arm"
+        }
+      },
+      "fields": {
+        "label": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "score": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string"
+        },
+        "tags": {
+          "inner": {
+            "element": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "case-predicate-lte-arm",
+      "inputDoc": {
+        "score": 3,
+        "status": "z",
+        "tags": []
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "label": {
+          "op": "case",
+          "otherwise": {
+            "op": "literal",
+            "value": "none"
+          },
+          "whens": [
+            {
+              "then": {
+                "op": "literal",
+                "value": "contains-arm"
+              },
+              "when": {
+                "field": "tags",
+                "op": "contains",
+                "value": "vip"
+              }
+            },
+            {
+              "then": {
+                "op": "literal",
+                "value": "in-arm"
+              },
+              "when": {
+                "field": "status",
+                "op": "in",
+                "values": [
+                  "x",
+                  "y"
+                ]
+              }
+            },
+            {
+              "then": {
+                "op": "literal",
+                "value": "lte-arm"
+              },
+              "when": {
+                "field": "score",
+                "op": "lte",
+                "value": 5
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "label": "none"
+        }
+      },
+      "fields": {
+        "label": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "score": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string"
+        },
+        "tags": {
+          "inner": {
+            "element": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "case-predicate-all-false-uses-otherwise",
+      "inputDoc": {
+        "score": 9,
+        "status": "z",
+        "tags": []
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "total": {
+          "left": {
+            "field": "a",
+            "op": "field"
+          },
+          "op": "add",
+          "right": {
+            "field": "bb",
+            "op": "field"
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "total": 5.0
+        }
+      },
+      "fields": {
+        "a": {
+          "type": "number"
+        },
+        "bb": {
+          "type": "number"
+        },
+        "total": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "overwrite-client-supplied-computed-value",
+      "inputDoc": {
+        "a": 2,
+        "bb": 3,
+        "total": 999
+      },
+      "now": 0
+    },
+    {
+      "computed": {
+        "double": {
+          "left": {
+            "field": "a",
+            "op": "field"
+          },
+          "op": "mul",
+          "right": {
+            "op": "literal",
+            "value": 2
+          }
+        },
+        "shout": {
+          "op": "upper",
+          "value": {
+            "field": "bb",
+            "op": "field"
+          }
+        }
+      },
+      "expect": {
+        "stampedValues": {
+          "double": 42.0,
+          "shout": "HI"
+        }
+      },
+      "fields": {
+        "a": {
+          "type": "number"
+        },
+        "bb": {
+          "type": "string"
+        },
+        "double": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        },
+        "shout": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "multiple-computed-entries-stamp-independently",
+      "inputDoc": {
+        "a": 21,
+        "bb": "hi"
+      },
+      "now": 0
+    }
+  ]
+}
