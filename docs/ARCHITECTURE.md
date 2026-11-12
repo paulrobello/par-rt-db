@@ -1404,5 +1404,14 @@ interleave between chunk turns. Measured on the development host with 100
 subscribers (2026-11-12): the 5k-row `deleteByQuery` transaction the audit
 profiled holds the turn a median 882.6ms (post-ENH-034; the documented
 3418.6ms baseline predates it), while the bulk path's per-chunk holds stay an
-order of magnitude under that — the numbers land here once the scenario-(e)
-bench measurement runs at this change's tip.
+order of magnitude under that. Measured at the bulk-path tip (scenario e,
+same host, 3 trials, 2026-11-12): the full 5k-row op completes in a median
+1172.1ms of wall time (~33% over the single-turn shape — the price of
+splitting), while interactive writes submitted during the op complete at
+p50 ≈ 80ms / p99 ≈ 131ms — the write that lands mid-delete no longer waits
+out the whole delete — and subscribers receive ~2 pushes per chunk
+(21 total across the op) instead of one end-of-turn flood. (Bench-script
+note, inherited from scenario d: rows are tagged with `Date.now() * 1e6`
+seeds, which exceed JS's safe-integer range, so ~2% of seeds round outside
+the delete filter's window — both paths lose the same ~115 rows, so the
+comparison is unaffected.)
