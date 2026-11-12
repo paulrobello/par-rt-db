@@ -237,6 +237,52 @@ func (s *ClaimedSchedule) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// Mirrors server/src/http_api/bulk.rs::BulkDeleteResponse — the reply to
+// POST /api/bulk/delete (ARC-005 background bulk delete): the op was
+// accepted and its per-op driver kicked. Matched is the number of ids the
+// filter froze at submit time; State is always "running" in this reply —
+// poll BulkOpInfo via the HTTP client's BulkStatus for progress.
+type BulkOpAccepted struct {
+	OpID    string `json:"opId"`
+	Matched int64  `json:"matched"`
+	State   string `json:"state"`
+}
+
+// Mirrors server/src/http_api/bulk.rs::BulkStatusResponse — the poll reply
+// for GET /api/bulk/{id}?db=. Matched is the frozen id count; Deleted the
+// cumulative rows removed so far. Error is present ONLY when State is
+// "failed" (the server skip_serializing_ifs it — running/complete payloads
+// carry no error key at all).
+type BulkOpInfo struct {
+	ID      string  `json:"id"`
+	State   string  `json:"state"`
+	Matched int64   `json:"matched"`
+	Deleted int64   `json:"deleted"`
+	Error   *string `json:"error,omitempty"`
+}
+
+// UnmarshalJSON rejects unknown fields.
+func (a *BulkOpAccepted) UnmarshalJSON(b []byte) error {
+	type alias BulkOpAccepted
+	v, err := StrictUnmarshal[alias](b)
+	if err != nil {
+		return err
+	}
+	*a = BulkOpAccepted(v)
+	return nil
+}
+
+// UnmarshalJSON rejects unknown fields.
+func (o *BulkOpInfo) UnmarshalJSON(b []byte) error {
+	type alias BulkOpInfo
+	v, err := StrictUnmarshal[alias](b)
+	if err != nil {
+		return err
+	}
+	*o = BulkOpInfo(v)
+	return nil
+}
+
 // Mirrors core/src/mutation.rs::ScheduleKind — snake_case values.
 type ScheduleKind string
 
