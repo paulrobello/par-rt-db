@@ -317,8 +317,8 @@ fun evalValueExpr(ve: ValueExpr, doc: JsonObject, nowMs: Long, fields: Map<Strin
         if (lhs.nullProp || rhs.nullProp) return JsonNull
         lhs.err?.let { throw it }
         rhs.err?.let { throw it }
-        val a = lhs.value!!
-        val b = rhs.value!!
+        val a = requireNotNull(lhs.value) { "valueNumeric returned no value and no error" }
+        val b = requireNotNull(rhs.value) { "valueNumeric returned no value and no error" }
         if (isDiv && b == 0.0) throw badRequest("division by zero")
         return finiteJsonNumber(op(a, b))
     }

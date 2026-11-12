@@ -300,8 +300,8 @@ private fun stepUpsertMany(s: Store, t: Step.UpsertMany): StepOut {
                 doc[f] ?: throw badRequest("upsertMany docs[$n] is missing indexed field '$f' of index '${t.index}'")
             }
         val res = executeUpsert(s, Step.Upsert(t.table, t.index, eq, doc, doc)).result
-        ids += res.id!!
-        flags += res.inserted!!
+        ids += requireNotNull(res.id) { "upsertMany: upsert result is missing 'id'" }
+        flags += requireNotNull(res.inserted) { "upsertMany: upsert result is missing 'inserted'" }
     }
     return StepOut(StepResult(ids = ids, insertedMany = flags), listOf(t.table))
 }

@@ -72,7 +72,7 @@ private fun validateConstraintsTable(table: TableDef, tableName: String) {
 }
 
 private fun validateTtl(table: TableDef) {
-    val ttl = table.ttl!!
+    val ttl = requireNotNull(table.ttl) { "table.ttl required for ttl validation" }
     val fty = table.fields[ttl.field] ?: throw schemaViolation("ttl.field '${ttl.field}' is not a declared field")
     if (fty.kind != "number" && fty.kind != "int64") throw schemaViolation("ttl.field '${ttl.field}' must be a number or bigint field")
     val hasIndex = table.indexes.any { isPlainBtree(it) && it.fields.size == 1 && it.fields[0] == ttl.field }
@@ -83,7 +83,7 @@ private fun validateTtl(table: TableDef) {
 }
 
 private fun validateUpdatedAtField(table: TableDef) {
-    val field = table.updatedAtField!!
+    val field = requireNotNull(table.updatedAtField) { "table.updatedAtField required for updatedAtField validation" }
     val fty = table.fields[field] ?: throw schemaViolation("updatedAtField '$field' is not a declared field")
     if (fty.kind != "number" && fty.kind != "int64") throw schemaViolation("updatedAtField '$field' must be a number or bigint field")
     if (table.ttl?.field == field) {
@@ -94,7 +94,7 @@ private fun validateUpdatedAtField(table: TableDef) {
 }
 
 private fun validateAutoIncrementField(table: TableDef) {
-    val field = table.autoIncrementField!!
+    val field = requireNotNull(table.autoIncrementField) { "table.autoIncrementField required for autoIncrementField validation" }
     val fty = table.fields[field] ?: throw schemaViolation("autoIncrementField '$field' is not a declared field")
     if (fty.kind != "int64") throw schemaViolation("autoIncrementField '$field' must be an int64 field")
     if (table.ttl?.field == field) {
