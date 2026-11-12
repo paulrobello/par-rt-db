@@ -110,7 +110,9 @@ A similar surface with no network (method names may differ from the HTTP/WS clie
 the server's `SCHEMA_VIOLATION`/`BAD_REQUEST` codes, the full query DSL,
 atomic transactions, migrations, a deterministic `Tick`, presence, and
 subscriptions. The wire-corpus semantics runner drives exactly this engine
-(175 cases, zero Go skips), so harness behavior is pinned to the server's.
+(every semantics case, zero Go skips; see
+[`wire-corpus/README.md`](../wire-corpus/README.md) for current counts), so
+harness behavior is pinned to the server's.
 
 ```go
 c := inmemory.New(inmemory.Options{})
