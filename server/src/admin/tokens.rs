@@ -157,8 +157,16 @@ pub(super) struct TokensResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct TokensParams {
     db: String,
+    /// Audit 2026-11-11 (SEC-003): filter to never-expiring credentials.
+    /// `true` lists only tokens whose `expires_at` IS NULL (candidates for
+    /// rotation); `false` only tokens with an expiry; absent lists all. A
+    /// request-side filter, not a response-shape change, so no client DTO
+    /// mirrors are needed — old clients simply never send it.
+    #[serde(default)]
+    never_expires: Option<bool>,
 }
 
 pub(super) async fn list_tokens(
@@ -169,6 +177,9 @@ pub(super) async fn list_tokens(
     if !db::database_exists(&state.pool, &params.db).await? {
         return Err(RtDbError::bad_request("unknown database"));
     }
+    // The tri-state filter binds as a parameter (`NULL` = no filter, `true` =
+    // only never-expiring, `false` = only expiring) so the statement stays a
+    // static &str — no interpolated SQL, values bind via $n.
     // Column order matches the SELECT below; aliased to keep clippy's
     // type-complexity lint happy without inlining an 8-tuple into the
     // signature.
@@ -184,9 +195,15 @@ pub(super) async fn list_tokens(
     );
     let rows: Vec<TokenRowDb> = sqlx::query_as(
         "SELECT id, name, created_at, revoked, expires_at, read_only, tables, capability \
-         FROM rtdb_auth.machine_tokens WHERE db_name = $1 ORDER BY created_at",
+         FROM rtdb_auth.machine_tokens \
+         WHERE db_name = $1 \
+           AND CASE WHEN $2 IS NULL THEN true \
+                    WHEN $2 THEN expires_at IS NULL \
+                    ELSE expires_at IS NOT NULL END \
+         ORDER BY created_at",
     )
     .bind(&params.db)
+    .bind(params.never_expires)
     .fetch_all(&state.pool)
     .await?;
     let mut tokens = Vec::with_capacity(rows.len());

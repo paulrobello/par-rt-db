@@ -1773,6 +1773,67 @@ async fn mint_and_list_token_with_capabilities() -> anyhow::Result<()> {
     Ok(())
 }
 
+// --- Audit 2026-11-11 (SEC-003): never-expiring credential rotation audit ---
+//
+// Tokens minted without `expiresAt` never expire. `GET /admin/tokens` gained
+// the optional `neverExpires` filter so an operator can list exactly those
+// candidates for rotation. The filter is request-side only — the response row
+// shape is unchanged, so no client DTO mirror is needed.
+
+#[tokio::test]
+async fn list_tokens_never_expires_filter() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+
+    // One never-expiring token (`expiresAt` omitted) and one expiring token.
+    let never: serde_json::Value = admin_post(
+        addr,
+        "/admin/mint-token",
+        serde_json::json!({"db": db, "name": "never"}),
+    )
+    .await
+    .json()
+    .await?;
+    let never_id = never["tokenId"].as_str().expect("tokenId").to_string();
+
+    let expiring: serde_json::Value = admin_post(
+        addr,
+        "/admin/mint-token",
+        serde_json::json!({"db": db, "name": "expiring", "expiresAt": 1_700_000_000_000_i64}),
+    )
+    .await
+    .json()
+    .await?;
+    let expiring_id = expiring["tokenId"].as_str().expect("tokenId").to_string();
+
+    // `neverExpires=true` → only the never-expiring row; `false` → only the
+    // expiring row; absent → both.
+    let only_never = listed_ids(addr, &format!("/admin/tokens?db={db}&neverExpires=true")).await?;
+    assert_eq!(only_never, vec![never_id.clone()]);
+    let only_expiring =
+        listed_ids(addr, &format!("/admin/tokens?db={db}&neverExpires=false")).await?;
+    assert_eq!(only_expiring, vec![expiring_id.clone()]);
+    let all = listed_ids(addr, &format!("/admin/tokens?db={db}")).await?;
+    assert_eq!(all.len(), 2);
+    assert!(all.contains(&never_id));
+    assert!(all.contains(&expiring_id));
+
+    Ok(())
+}
+
+/// Lists the token ids for one `query` against the spawned app, sorted.
+async fn listed_ids(addr: SocketAddr, query: &str) -> anyhow::Result<Vec<String>> {
+    let listed: serde_json::Value = admin_get(addr, query).await.json().await?;
+    let tokens = listed["tokens"].as_array().expect("tokens array");
+    let mut ids: Vec<String> = tokens
+        .iter()
+        .filter_map(|r| r["id"].as_str().map(str::to_string))
+        .collect();
+    ids.sort();
+    Ok(ids)
+}
+
 // ===== SEC-106 admin CSRF double-submit nonce =====
 //
 // Cookie-authenticated admin requests (the browser dashboard path) must carry
