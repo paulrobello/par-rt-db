@@ -596,3 +596,129 @@ fn error_codes_known_to_rust_client() {
         "rust-client ErrorCode drifted from wire-corpus/error-codes.json"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ENH-052 family 1 — spec-table corpus: the FieldType → Postgres column-type
+// mapping (wire-corpus/spec/index-column-types.json). The fixture pins this
+// engine's `index_column_type` port of server `schema::indexed_column_type`
+// for every FieldType variant; `columnType` carries the server's raw Postgres
+// string, which the engine's `PgType` enum maps back to. A mapping change
+// regenerates the fixture in the same commit
+// (`make gen-spec-index-column-types`).
+#[cfg(feature = "in_memory")]
+mod spec_corpus {
+    use par_rt_db_client::in_memory::{PgType, index_column_type};
+    use par_rt_db_client::schema::{FieldType, OnDeleteAction};
+
+    use super::{Value, json};
+
+    fn load_rows() -> Vec<Value> {
+        let doc: Value = serde_json::from_str(include_str!(
+            "../../wire-corpus/spec/index-column-types.json"
+        ))
+        .unwrap_or_else(|e| panic!("parse index-column-types.json: {e}"));
+        doc["rows"]
+            .as_array()
+            .expect("spec corpus missing rows array")
+            .clone()
+    }
+
+    fn raw_pg(pg: PgType) -> &'static str {
+        match pg {
+            PgType::Text => "text",
+            PgType::Number => "double precision",
+            PgType::Boolean => "boolean",
+            PgType::Int64 => "bigint",
+        }
+    }
+
+    /// One representative per FieldType variant this engine's
+    /// `index_column_type` distinguishes, in the wire spelling (the corpus
+    /// README's own-variant coverage rule: a variant without a fixture row
+    /// fails).
+    fn own_variants() -> Vec<FieldType> {
+        fn lit(v: Value) -> FieldType {
+            FieldType::Literal { value: v }
+        }
+        vec![
+            FieldType::String,
+            FieldType::Number,
+            FieldType::Boolean,
+            FieldType::Int64,
+            FieldType::Id {
+                table: "t".into(),
+                on_delete: None,
+            },
+            FieldType::Id {
+                table: "t".into(),
+                on_delete: Some(OnDeleteAction::Cascade),
+            },
+            lit(json!("x")),
+            lit(json!(42)),
+            FieldType::Optional {
+                inner: Box::new(FieldType::String),
+            },
+            FieldType::Union {
+                variants: vec![lit(json!("a")), lit(json!("b"))],
+            },
+            FieldType::Union {
+                variants: Vec::new(),
+            },
+            FieldType::Union {
+                variants: vec![lit(json!("a")), FieldType::Number],
+            },
+            FieldType::Null,
+            FieldType::Array {
+                element: Box::new(FieldType::String),
+            },
+            FieldType::Object {
+                fields: [("a".to_string(), FieldType::String)].into_iter().collect(),
+            },
+            FieldType::Bytes,
+            FieldType::Any,
+            FieldType::Record {
+                value: Box::new(FieldType::String),
+            },
+            FieldType::Vector { dimensions: 3 },
+        ]
+    }
+
+    #[test]
+    fn every_own_variant_has_a_fixture_row() {
+        let rows = load_rows();
+        for own in own_variants() {
+            let wire = serde_json::to_value(&own).unwrap();
+            assert!(
+                rows.iter().any(|row| row["fieldType"] == wire),
+                "no fixture row for {wire}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_fixture_row_matches_this_engine() {
+        for (i, row) in load_rows().into_iter().enumerate() {
+            let ty: FieldType = serde_json::from_value(row["fieldType"].clone())
+                .unwrap_or_else(|e| panic!("row {i}: decode fieldType: {e}"));
+            let resolved = index_column_type(&ty);
+            if row["error"].as_bool().unwrap_or(false) {
+                assert!(
+                    resolved.is_err(),
+                    "row {i}: expected an error for a non-indexable type"
+                );
+                continue;
+            }
+            let resolved = resolved.unwrap_or_else(|e| panic!("row {i}: unexpected error: {e}"));
+            assert_eq!(
+                raw_pg(resolved.pg),
+                row["columnType"].as_str().expect("row columnType"),
+                "row {i} columnType"
+            );
+            assert_eq!(
+                resolved.nullable,
+                row["nullable"].as_bool().expect("row nullable"),
+                "row {i} nullable"
+            );
+        }
+    }
+}

@@ -1079,7 +1079,12 @@ def _index_column_type(ty: Any) -> _IndexedType:
                 return _IndexedType(_TEXT, False)
             raise RtDbError(ErrorCode.SCHEMA_VIOLATION, "field type 'literal' is not indexable")
         case _FUnion(variants=variants):
-            if all(isinstance(v, _FLiteral) and isinstance(v.value, str) for v in variants):
+            # The server requires a NON-empty all-string-literal union
+            # (`is_string_literal_union` rejects `variants.is_empty()`); an
+            # empty `all(...)` is vacuously true, so guard the length.
+            if variants and all(
+                isinstance(v, _FLiteral) and isinstance(v.value, str) for v in variants
+            ):
                 return _IndexedType(_TEXT, False)
             raise RtDbError(ErrorCode.SCHEMA_VIOLATION, "field type 'union' is not indexable")
         case _FOptional(inner=inner):

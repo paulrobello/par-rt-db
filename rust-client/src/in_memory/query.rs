@@ -2030,14 +2030,19 @@ pub fn index_column_type(ty: &FieldType) -> Result<IndexedType, RtDbError> {
             ));
         }
         FieldType::Union { variants } => {
-            if variants.iter().all(|v| {
-                matches!(
-                    v,
-                    FieldType::Literal {
-                        value: Value::String(_)
-                    }
-                )
-            }) {
+            // The server requires a NON-empty all-string-literal union
+            // (`is_string_literal_union` rejects `variants.is_empty()`); an
+            // empty `iter().all(...)` is vacuously true, so guard the length.
+            if !variants.is_empty()
+                && variants.iter().all(|v| {
+                    matches!(
+                        v,
+                        FieldType::Literal {
+                            value: Value::String(_)
+                        }
+                    )
+                })
+            {
                 PgType::Text
             } else {
                 return Err(RtDbError::new(

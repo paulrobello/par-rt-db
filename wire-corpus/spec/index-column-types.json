@@ -1,0 +1,178 @@
+{
+  "$comment": "SPEC-TABLE CORPUS (ENH-052 family 1) — GENERATED, do not edit. The FieldType -> Postgres column-type decision table, one row per representative per server FieldType variant, computed from server/src/schema/value.rs::indexed_column_type by 'make gen-spec-index-column-types'. `columnType` is the server's raw Postgres type string and `nullable` whether the source field was wrapped in Optional; non-indexable rows carry `error: true`. Each runner asserts its own port of the mapping (the client PgType four-value enum mapped back to these raw strings) against every row, and that its own FieldType variant set is covered. A mapping change regenerates this file in the same commit — see wire-corpus/README.md 'Spec-table corpus'.",
+  "rows": [
+    {
+      "columnType": "text",
+      "fieldType": {
+        "type": "string"
+      },
+      "nullable": false
+    },
+    {
+      "columnType": "double precision",
+      "fieldType": {
+        "type": "number"
+      },
+      "nullable": false
+    },
+    {
+      "columnType": "boolean",
+      "fieldType": {
+        "type": "boolean"
+      },
+      "nullable": false
+    },
+    {
+      "columnType": "bigint",
+      "fieldType": {
+        "type": "int64"
+      },
+      "nullable": false
+    },
+    {
+      "columnType": "text",
+      "fieldType": {
+        "table": "t",
+        "type": "id"
+      },
+      "nullable": false
+    },
+    {
+      "columnType": "text",
+      "fieldType": {
+        "onDelete": "cascade",
+        "table": "t",
+        "type": "id"
+      },
+      "nullable": false
+    },
+    {
+      "columnType": "text",
+      "fieldType": {
+        "type": "literal",
+        "value": "x"
+      },
+      "nullable": false
+    },
+    {
+      "error": true,
+      "fieldType": {
+        "type": "literal",
+        "value": 42
+      }
+    },
+    {
+      "columnType": "text",
+      "fieldType": {
+        "inner": {
+          "type": "string"
+        },
+        "type": "optional"
+      },
+      "nullable": true
+    },
+    {
+      "columnType": "double precision",
+      "fieldType": {
+        "inner": {
+          "type": "number"
+        },
+        "type": "optional"
+      },
+      "nullable": true
+    },
+    {
+      "columnType": "text",
+      "fieldType": {
+        "type": "union",
+        "variants": [
+          {
+            "type": "literal",
+            "value": "a"
+          },
+          {
+            "type": "literal",
+            "value": "b"
+          }
+        ]
+      },
+      "nullable": false
+    },
+    {
+      "error": true,
+      "fieldType": {
+        "type": "union",
+        "variants": []
+      }
+    },
+    {
+      "error": true,
+      "fieldType": {
+        "type": "union",
+        "variants": [
+          {
+            "type": "literal",
+            "value": "a"
+          },
+          {
+            "type": "number"
+          }
+        ]
+      }
+    },
+    {
+      "error": true,
+      "fieldType": {
+        "type": "null"
+      }
+    },
+    {
+      "error": true,
+      "fieldType": {
+        "element": {
+          "type": "string"
+        },
+        "type": "array"
+      }
+    },
+    {
+      "error": true,
+      "fieldType": {
+        "fields": {
+          "a": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "error": true,
+      "fieldType": {
+        "type": "bytes"
+      }
+    },
+    {
+      "error": true,
+      "fieldType": {
+        "type": "any"
+      }
+    },
+    {
+      "error": true,
+      "fieldType": {
+        "type": "record",
+        "value": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "error": true,
+      "fieldType": {
+        "dimensions": 3,
+        "type": "vector"
+      }
+    }
+  ]
+}

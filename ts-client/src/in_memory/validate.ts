@@ -88,7 +88,13 @@ export function indexColumnType(ty: TableJson["fields"][string]): IndexedType {
       }
       throw new RtDbError("SCHEMA_VIOLATION", `field type '${typeTag(ty)}' is not indexable`);
     case "union":
-      if (ty.variants.every((v) => v.type === "literal" && typeof v.value === "string")) {
+      // The server requires a NON-empty all-string-literal union
+      // (`is_string_literal_union` rejects `variants.is_empty()`); an empty
+      // `every()` on a JS array is vacuously true, so guard the length.
+      if (
+        ty.variants.length > 0 &&
+        ty.variants.every((v) => v.type === "literal" && typeof v.value === "string")
+      ) {
         return { pg: "text", nullable: false };
       }
       throw new RtDbError("SCHEMA_VIOLATION", `field type '${typeTag(ty)}' is not indexable`);

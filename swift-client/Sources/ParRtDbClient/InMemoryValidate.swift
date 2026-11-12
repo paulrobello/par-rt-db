@@ -134,7 +134,10 @@ public func indexColumnType(_ ty: FieldType) throws -> IndexedType {
             code: .schemaViolation, message: "field type '\(fieldTypeTag(ty))' is not indexable"
         )
     case let .union(variants):
-        let allStringLiterals = variants.allSatisfy { variant in
+        // The server requires a NON-empty all-string-literal union
+        // (`is_string_literal_union` rejects `variants.is_empty()`); an empty
+        // `allSatisfy` is vacuously true, so guard the count.
+        let allStringLiterals = !variants.isEmpty && variants.allSatisfy { variant in
             if case let .literal(value) = variant, case .string = value {
                 return true
             }

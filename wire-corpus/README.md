@@ -1,7 +1,7 @@
 # wire-corpus — shared parity fixtures
 
 This directory holds the fixture data that keeps the server and the client
-implementations honest against each other. Three artifacts live here:
+implementations honest against each other. These artifacts live here:
 
 - [`golden-vector.json`](golden-vector.json) — the **wire/behavior parity
   vector** for the query DSL over one shared seeded dataset (added by
@@ -43,6 +43,12 @@ implementations honest against each other. Three artifacts live here:
   terminal executors on the six clients) — a later phase replaces those seven
   checkers with one evaluator that reads this table. See
   [Query combination rules](#query-combination-rules) below.
+- [`spec/`](spec/) — the **in-memory semantics spec-table corpus** (ENH-052):
+  pure decision tables generated from the server's own implementation, one row
+  per representative per `FieldType` variant. Today:
+  [`spec/index-column-types.json`](spec/index-column-types.json) pins the
+  FieldType → Postgres column-type mapping (`schema::indexed_column_type` and
+  its six client ports). See [Spec-table corpus](#spec-table-corpus) below.
 
 **Runner scope:** the server and all six client in-memory engines
 (`ts-client`, `rust-client`, `python-client`, `swift-client`, `go-client`, `kotlin-client`) execute
@@ -65,6 +71,7 @@ layers. A divergence between any client engine and these fixtures is a bug in th
 - [Adding a case](#adding-a-case)
 - [Error-code parity](#error-code-parity)
 - [Query combination rules](#query-combination-rules)
+- [Spec-table corpus](#spec-table-corpus)
 
 ## The authoring rule
 
@@ -430,3 +437,43 @@ case's filename; `server/src/query/combinations_coverage.rs`'s tests fail the
 build if a rule has no matching case, or a `query-combo-*` case has no
 matching rule (guarding both directions — a rule added without a case, and a
 stale case left behind after a rule is renamed or removed).
+
+## Spec-table corpus
+
+`spec/` holds the ENH-052 spec-table corpora — **pure decision tables
+generated from the server's own implementation**, not hand-authored cases.
+Each fixture is a `{"$comment", "rows"}` document whose rows are computed by
+calling the server function the table pins (today:
+`schema::indexed_column_type`, via
+`server/src/spec_corpus.rs`), so the committed fixture can never disagree with
+the code that owns the semantics.
+
+- [`spec/index-column-types.json`](spec/index-column-types.json) — the
+  FieldType → Postgres column-type mapping shared by the server and all six
+  client in-memory engines. One row per representative per `FieldType`
+  variant (plus the sub-shapes the mapping distinguishes: `Id` with/without
+  `onDelete`, string vs non-string `Literal`, empty vs string-literal vs
+  mixed `Union`, `Optional` over two inner types). Indexable rows carry
+  `{"fieldType", "columnType", "nullable"}` — `columnType` is the server's
+  raw Postgres string (`"double precision"`, not a client enum spelling);
+  non-indexable rows carry `{"fieldType", "error": true}`.
+
+**Authoring rule:** a change to the pinned semantics (a new `FieldType`
+variant, or a mapping change in `indexed_column_type` or any of its six
+client ports) regenerates the fixture — `make gen-spec-index-column-types` —
+and lands the regenerated table **in the same change**, updating whichever
+client ports moved with it. A client port that drifts from the committed
+table fails that client's spec-corpus runner; a variant added without a
+representative row fails the generator's exhaustive match (a compile error in
+`server/src/spec_corpus.rs`).
+
+**Enforcement:** `make gen-spec-index-column-types-check` (a `checkall` leg)
+diffs the committed fixture against a fresh generation; the server's
+`spec_corpus.rs` test pins the same property in-crate. Each of the seven
+runners — server, ts-client (`tests/spec-corpus.test.ts`), rust-client
+(`tests/wire_corpus.rs::spec_corpus`), python-client
+(`tests/test_spec_corpus.py`), go-client (`inmemory/spec_corpus_test.go`),
+kotlin-client (`inmemory/SpecCorpusTest.kt`), swift-client
+(`SpecCorpusTests.swift`) — asserts its own port of the mapping against every
+row (client `PgType` four-value enums mapped back to the raw column strings)
+and that its own FieldType variant set is covered by the fixture.

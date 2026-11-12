@@ -51,6 +51,7 @@ pub mod schema_history;
 pub mod shutdown;
 pub mod signed_url;
 pub mod snapshot;
+pub mod spec_corpus;
 pub mod storage;
 pub mod subs;
 pub mod tracing_setup;
