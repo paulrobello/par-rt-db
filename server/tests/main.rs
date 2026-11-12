@@ -21,6 +21,7 @@ mod audit_test;
 mod auth_test;
 mod auto_increment_test;
 mod bearer_oauth_test;
+mod bulk_test;
 mod cascade_test;
 mod change_feed_test;
 mod compression_test;

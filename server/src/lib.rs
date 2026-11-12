@@ -16,6 +16,7 @@ pub mod admin;
 pub mod audit;
 pub mod auth;
 pub mod backup;
+pub mod bulk;
 pub mod change_log;
 pub mod committer;
 pub mod config;
@@ -313,6 +314,9 @@ pub struct AppState {
     pub runtime: Runtime,
     pub auth: Auth,
     pub limits: Limits,
+    /// ARC-005 background bulk-op registry (in-memory, per-instance — see
+    /// `bulk`'s module docs for the restart semantics).
+    pub bulk: Arc<bulk::BulkRegistry>,
     /// ARC-009: cancellation + join handles for every task `AppState::new`
     /// spawns. `main.rs` drains this on graceful shutdown; tests cancel it
     /// via a `Drop` guard (`tests/common/mod.rs`'s `background_guard`) so
@@ -577,10 +581,14 @@ impl AppState {
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        // ARC-005: the bulk-op registry holds no connections or tasks at
+        // construction; op drivers spawn per POST (see `bulk::run_op`).
+        let bulk = Arc::new(bulk::BulkRegistry::new());
         Arc::new(Self {
             pool,
             config,
             schemas,
+            bulk,
             realtime: Realtime {
                 subs,
                 committers,

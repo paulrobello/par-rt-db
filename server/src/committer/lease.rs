@@ -190,6 +190,12 @@ pub(in crate::committer) async fn reply_ownership_conflict(
         CommitterRequest::RunPurge { reply, .. } => {
             let _ = reply.send(Err(err));
         }
+        CommitterRequest::RunBulkDeleteStart { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
+        CommitterRequest::RunBulkDeleteChunk { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
         CommitterRequest::RunRestoreSchema { reply, .. } => {
             let _ = reply.send(Err(err));
         }
@@ -219,6 +225,8 @@ pub(in crate::committer) fn request_needs_write(req: &CommitterRequest) -> bool 
             | CommitterRequest::RunMigrate { .. }
             | CommitterRequest::RunReaper { .. }
             | CommitterRequest::RunPurge { .. }
+            | CommitterRequest::RunBulkDeleteStart { .. }
+            | CommitterRequest::RunBulkDeleteChunk { .. }
             | CommitterRequest::RunWorkflowAdvance { .. }
             | CommitterRequest::RunMergeUsers { .. }
             | CommitterRequest::RunPushSchema { .. }

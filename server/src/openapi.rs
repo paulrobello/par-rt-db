@@ -124,6 +124,36 @@ pub fn document() -> Value {
         )],
     );
 
+    // Bulk (data plane, ARC-005)
+    add(
+        &mut paths,
+        "/api/bulk/delete",
+        &[(
+            "post",
+            ok_json(
+                body(
+                    op(
+                        "Start a background bulk delete (chunked across committer turns)",
+                        "Bulk",
+                    ),
+                    "BulkDeleteRequest",
+                ),
+                "BulkDeleteResponse",
+            ),
+        )],
+    );
+    add(
+        &mut paths,
+        "/api/bulk/{id}",
+        &[(
+            "get",
+            ok_json(
+                op("Bulk op status (db query parameter required)", "Bulk"),
+                "BulkOpStatus",
+            ),
+        )],
+    );
+
     // Schedules (data plane)
     add(
         &mut paths,

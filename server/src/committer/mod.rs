@@ -5,7 +5,8 @@
 //! run READ COMMITTED with no row locking, so every durable write must pass
 //! through here. Handles all eleven `CommitterRequest` arms — `Mutate`,
 //! `Subscribe`, `RunScheduled`, `RunMigrate`, `RunPushSchema`, `RunReaper`,
-//! `RunPurge`, `RunWorkflowAdvance`, `RunMergeUsers`, `RunRestoreSchema`, and
+//! `RunPurge`, `RunBulkDeleteStart`, `RunBulkDeleteChunk`,
+//! `RunWorkflowAdvance`, `RunMergeUsers`, `RunRestoreSchema`, and
 //! `Shutdown` —
 //! and publishes the write arms at the four tap sites (subscription fan-out,
 //! op-feed, audit log, webhooks). Never add a second writer.
@@ -38,6 +39,10 @@ mod lease;
 mod supervisor;
 mod taps;
 
+/// Public re-export: integration tests exercise the over-cap branch by
+/// submitting `RunBulkDeleteStart` with a test-only tiny cap, which needs the
+/// reply type nameable.
+pub use arms::bulk::BulkStartResult;
 use arms::merge::handle_merge_users;
 use arms::migrate::handle_migrate;
 use arms::mutate::handle_mutate;
@@ -183,6 +188,29 @@ pub enum CommitterRequest {
         confirm: Option<String>,
         admission_epoch: i64,
         reply: oneshot::Sender<Result<PurgeResult, RtDbError>>,
+    },
+    /// ARC-005 background bulk delete. `RunBulkDeleteStart` is the read-only
+    /// id freeze (a scan compiled with the submitting caller's per-row auth,
+    /// capped at `id_cap + 1` rows so over-cap is detectable); each
+    /// `RunBulkDeleteChunk` deletes exactly the ids it carries inside one
+    /// serialized turn and publishes through the four tap sites with
+    /// `source = "bulk"`. The arms are deliberately NOT forwardable (see
+    /// `arms::bulk`'s module docs): the op lives in the submitting replica's
+    /// registry, so a shadow's submit falls to the local CONFLICT backstop.
+    RunBulkDeleteStart {
+        table: String,
+        filter: Option<crate::query::FilterExpr>,
+        principal_ctx: PrincipalCtx,
+        id_cap: usize,
+        admission_epoch: i64,
+        reply: oneshot::Sender<Result<crate::committer::BulkStartResult, RtDbError>>,
+    },
+    RunBulkDeleteChunk {
+        table: String,
+        ids: Vec<String>,
+        owner: Option<String>,
+        admission_epoch: i64,
+        reply: oneshot::Sender<Result<u64, RtDbError>>,
     },
     /// A claimed workflow run is due for advancement (FM-29). Fire-and-forget
     /// like `RunReaper`: the scheduler claims the row; the committer executes
@@ -1659,6 +1687,56 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                     filter.as_ref(),
                     limit,
                     confirm.as_deref(),
+                    admission_epoch,
+                )
+                .instrument(span)
+                .await;
+                let _ = reply.send(outcome);
+            }
+            CommitterRequest::RunBulkDeleteStart {
+                table,
+                filter,
+                principal_ctx,
+                id_cap,
+                admission_epoch,
+                reply,
+            } => {
+                let span = tracing::info_span!(
+                    "committer.bulk_start",
+                    db = %ctx.db,
+                    table = %table,
+                    id_cap,
+                );
+                let result = arms::bulk::handle_bulk_delete_start(
+                    &ctx,
+                    &table,
+                    filter.as_ref(),
+                    &principal_ctx,
+                    id_cap,
+                    admission_epoch,
+                )
+                .instrument(span)
+                .await;
+                let _ = reply.send(result);
+            }
+            CommitterRequest::RunBulkDeleteChunk {
+                table,
+                ids,
+                owner,
+                admission_epoch,
+                reply,
+            } => {
+                let span = tracing::info_span!(
+                    "committer.bulk_chunk",
+                    db = %ctx.db,
+                    table = %table,
+                    ids = ids.len(),
+                );
+                let outcome = arms::bulk::handle_bulk_delete_chunk(
+                    &ctx,
+                    &table,
+                    &ids,
+                    owner.as_deref(),
                     admission_epoch,
                 )
                 .instrument(span)

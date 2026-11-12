@@ -173,6 +173,11 @@ pub fn http_api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/api/query-batch", post(batch_query_handler))
         .route("/api/mutate", post(mutate_handler))
         .route("/api/mutate-batch", post(mutate_batch_handler))
+        // ARC-005 background bulk delete: start + status. The start route is
+        // a write (mutate-level auth + rate limits); the status route is an
+        // authed read.
+        .route("/api/bulk/delete", post(bulk_delete_handler))
+        .route("/api/bulk/{id}", get(bulk_status_handler))
         .route("/api/schedule", post(schedule_handler))
         .route("/api/schedule/claim", post(claim_schedules_handler))
         .route(
@@ -489,6 +494,7 @@ mod client_ip_tests {
     }
 }
 
+mod bulk;
 mod changes;
 mod data;
 pub(crate) mod schedule;
@@ -496,6 +502,7 @@ mod share;
 mod storage;
 mod workflow;
 
+pub(crate) use bulk::{bulk_delete_handler, bulk_status_handler};
 pub(crate) use changes::changes_handler;
 pub(crate) use data::{batch_query_handler, mutate_batch_handler, mutate_handler, query_handler};
 pub(crate) use schedule::{

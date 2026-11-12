@@ -3,6 +3,7 @@
 //! op-feed/audit/webhook completeness contract, and keeping the arms here
 //! is what makes the set of call sites enumerable.
 
+pub(in crate::committer) mod bulk;
 pub(in crate::committer) mod merge;
 pub(in crate::committer) mod migrate;
 pub(in crate::committer) mod mutate;
