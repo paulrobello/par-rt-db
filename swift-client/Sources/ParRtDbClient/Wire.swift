@@ -1070,6 +1070,96 @@ public struct ClaimedSchedule: Equatable, Codable, Sendable {
     }
 }
 
+// MARK: - Bulk ops
+
+/// Reply to `POST /api/bulk/delete` (ARC-005): the background bulk delete was
+/// accepted and its per-op driver kicked. `matched` is the number of ids the
+/// filter froze at submit time; `state` is always `"running"` in this reply —
+/// poll `BulkOpInfo` via `bulkStatus` for progress. Mirrors server
+/// `http_api::bulk::BulkDeleteResponse` byte-for-byte (camelCase).
+public struct BulkOpAccepted: Equatable, Codable, Sendable {
+    /// The background op's id — pass to `bulkStatus`.
+    public var opId: String
+    /// How many ids the filter froze at submit time.
+    public var matched: Int64
+    /// Always `"running"` in this reply.
+    public var state: String
+
+    public init(opId: String, matched: Int64, state: String) {
+        self.opId = opId
+        self.matched = matched
+        self.state = state
+    }
+
+    enum CodingKeys: String, CodingKey, CaseIterable {
+        case opId, matched, state
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        opId = try container.decode(String.self, forKey: .opId)
+        matched = try container.decode(Int64.self, forKey: .matched)
+        state = try container.decode(String.self, forKey: .state)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(opId, forKey: .opId)
+        try container.encode(matched, forKey: .matched)
+        try container.encode(state, forKey: .state)
+    }
+}
+
+/// Poll reply for `GET /api/bulk/{id}?db=` (ARC-005). `matched` is the frozen
+/// id count; `deleted` the cumulative rows removed so far. `error` is present
+/// ONLY when `state` is `"failed"` (the server `skip_serializing_if`s it —
+/// running/complete payloads carry no `error` key at all). Mirrors server
+/// `http_api::bulk::BulkStatusResponse` byte-for-byte (camelCase).
+public struct BulkOpInfo: Equatable, Codable, Sendable {
+    /// The op's id.
+    public var id: String
+    /// One of `running`, `complete`, `failed`.
+    public var state: String
+    /// How many ids the filter froze at submit time.
+    public var matched: Int64
+    /// Cumulative rows removed so far.
+    public var deleted: Int64
+    /// Failure text — present only when `state` is `"failed"`.
+    public var error: String?
+
+    public init(
+        id: String, state: String, matched: Int64, deleted: Int64, error: String? = nil
+    ) {
+        self.id = id
+        self.state = state
+        self.matched = matched
+        self.deleted = deleted
+        self.error = error
+    }
+
+    enum CodingKeys: String, CodingKey, CaseIterable {
+        case id, state, matched, deleted, error
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        state = try container.decode(String.self, forKey: .state)
+        matched = try container.decode(Int64.self, forKey: .matched)
+        deleted = try container.decode(Int64.self, forKey: .deleted)
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(state, forKey: .state)
+        try container.encode(matched, forKey: .matched)
+        try container.encode(deleted, forKey: .deleted)
+        try container.encodeIfPresent(error, forKey: .error)
+    }
+}
+
 // MARK: - Change feed
 
 /// Mirrors server/src/change_log.rs::ChangeRow — one committed document

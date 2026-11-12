@@ -358,6 +358,32 @@ public actor RtDbHttpClient {
         return response.schedules
     }
 
+    // MARK: Bulk ops
+
+    /// Starts a background bulk delete (ARC-005): `filter` (the same DSL
+    /// `FilterExpr` a deleteByQuery step takes) is frozen at submit — ids are
+    /// snapshotted by a read-only serialized turn, and an over-cap match
+    /// rejects `BAD_REQUEST` ("narrow the filter"). The delete then progresses
+    /// chunk by chunk through the committer queue, so interactive writes
+    /// interleave between chunk turns. Poll progress with `bulkStatus` using
+    /// the returned `opId`.
+    public func bulkDelete(table: String, filter: FilterExpr) async throws -> BulkOpAccepted {
+        try await postJson(
+            "bulk delete", "/api/bulk/delete",
+            BulkDeleteRequest(db: db, table: table, filter: filter)
+        )
+    }
+
+    /// Polls a bulk op started with `bulkDelete`
+    /// (`GET /api/bulk/{id}?db=`). `error` is present ONLY when `state` is
+    /// `"failed"`.
+    public func bulkStatus(_ id: String) async throws -> BulkOpInfo {
+        try await getJson(
+            "bulk status", "/api/bulk/\(encodePath(id))",
+            query: [URLQueryItem(name: "db", value: db)]
+        )
+    }
+
     // MARK: Workflows
 
     /// Start a durable workflow run (`POST /api/workflows` `{db, spec}`);
@@ -797,6 +823,12 @@ private struct ClaimSchedulesRequest: Encodable {
     let db: String
     let limit: Int64?
     let leaseMs: Int64?
+}
+
+private struct BulkDeleteRequest: Encodable {
+    let db: String
+    let table: String
+    let filter: FilterExpr
 }
 
 /// `POST /auth/enroll` request — the server accepts ONLY this field

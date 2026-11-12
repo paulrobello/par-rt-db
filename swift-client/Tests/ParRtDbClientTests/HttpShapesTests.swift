@@ -114,4 +114,52 @@ struct HttpShapesTests {
         #expect(info.missedCount == 0)
         #expect(info.lastMissedAt == nil)
     }
+
+    @Test func bulkDeleteAcceptedDecodesEveryField() throws {
+        let data = try loadHttpShapesData(forKey: "bulkDeleteAccepted")
+        let accepted = try JSONDecoder().decode(BulkOpAccepted.self, from: data)
+        #expect(accepted.opId == "bulk_01JENQ9Z7K3M2V8R5T4W6X8Y0A")
+        #expect(accepted.matched == 1500)
+        #expect(accepted.state == "running")
+    }
+
+    @Test func bulkOpInfoRunningDecodesWithNoErrorKey() throws {
+        let data = try loadHttpShapesData(forKey: "bulkOpInfoRunning")
+        let info = try JSONDecoder().decode(BulkOpInfo.self, from: data)
+        #expect(info.id == "bulk_01JENQ9Z7K3M2V8R5T4W6X8Y0A")
+        #expect(info.state == "running")
+        #expect(info.matched == 1500)
+        #expect(info.deleted == 500)
+        #expect(info.error == nil)
+        // The server skip_serializing_ifs `error`, so the running fixture must
+        // not carry the key at all — assert key absence, not just nil decode.
+        let raw = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        #expect(raw["error"] == nil)
+    }
+
+    @Test func bulkOpInfoFailedDecodesError() throws {
+        let data = try loadHttpShapesData(forKey: "bulkOpInfoFailed")
+        let info = try JSONDecoder().decode(BulkOpInfo.self, from: data)
+        #expect(info.id == "bulk_01JENQ9Z7K3M2V8R5T4W6X8Y0A")
+        #expect(info.state == "failed")
+        #expect(info.matched == 1500)
+        #expect(info.deleted == 500)
+        #expect(info.error == "chunk turn failed: schema changed mid-op")
+    }
+
+    @Test func bulkOpRoundTripsToFixtureShapes() throws {
+        let acceptedData = try loadHttpShapesData(forKey: "bulkDeleteAccepted")
+        let accepted = try JSONDecoder().decode(BulkOpAccepted.self, from: acceptedData)
+        let gotAccepted = try #require(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(accepted)) as? [String: Any]
+        )
+        #expect(try (gotAccepted as NSDictionary) == (loadHttpShapesObject(forKey: "bulkDeleteAccepted") as NSDictionary))
+
+        let infoData = try loadHttpShapesData(forKey: "bulkOpInfoFailed")
+        let info = try JSONDecoder().decode(BulkOpInfo.self, from: infoData)
+        let gotInfo = try #require(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(info)) as? [String: Any]
+        )
+        #expect(try (gotInfo as NSDictionary) == (loadHttpShapesObject(forKey: "bulkOpInfoFailed") as NSDictionary))
+    }
 }
