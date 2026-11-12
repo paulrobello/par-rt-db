@@ -89,12 +89,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Rust (from rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: stable
 
       - name: Rust build cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
 
       # cli-docs-check builds the cli (workspace deps included); the other four
       # checks are pure shell over committed files.
@@ -125,18 +125,18 @@ jobs:
       # image and by rustup locally. The dtolnay action still needs an explicit
       # `toolchain:` input (it does not auto-read the file), so it is pinned to
       # `stable` here matching the file. SEC-138: the action ref is pinned to an
-      # immutable master-history SHA — `e2a55d2ffb04f378e9626c28d38b36d230d1e12f`
-      # (master HEAD 2026-10-09; master-history SHAs are the only ones dtolnay
+      # immutable master-history SHA — `683b588c487a69d01f6c6ddf40f036ff682cc2c8`
+      # (master HEAD 2026-11-11; master-history SHAs are the only ones dtolnay
       # guarantees are not garbage-collected). Bump deliberately: re-verify the
       # new SHA resolves and is on master.
       - name: Set up Rust (from rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: stable
           components: rustfmt, clippy
 
       - name: Rust build cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
 
       # --- Bun (ts-client + dashboard) -------------------------------------
       # `oven-sh` is the Bun team's org (the bare `oven/` org has no setup-bun
@@ -169,9 +169,9 @@ jobs:
       # cache. These targets are NOT prerequisites of the make gate — the
       # Makefile assumes they have already been run once (see CLAUDE.md).
       # kotlin-client runs under the Gradle wrapper; only a JDK is required.
-      # setup-java pinned to the v6.1.0 tag's commit (verified to resolve).
+      # setup-java pinned to the v6.2.0 tag's commit (verified to resolve).
       - name: Set up JDK (kotlin-client)
-        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: temurin
           java-version: "21"
@@ -224,9 +224,9 @@ jobs:
           cache-dependency-path: go-client/go.sum
 
       # kotlin-client runs under the Gradle wrapper; only a JDK is required.
-      # setup-java pinned to the v6.1.0 tag's commit (verified to resolve).
+      # setup-java pinned to the v6.2.0 tag's commit (verified to resolve).
       - name: Set up JDK (kotlin-client)
-        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: temurin
           java-version: "21"
@@ -276,12 +276,12 @@ jobs:
         uses: ./.github/actions/free-runner-disk
 
       - name: Set up Rust (from rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: stable
 
       - name: Rust build cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -298,9 +298,9 @@ jobs:
           cache-dependency-path: go-client/go.sum
 
       # kotlin-client runs under the Gradle wrapper; only a JDK is required.
-      # setup-java pinned to the v6.1.0 tag's commit (verified to resolve).
+      # setup-java pinned to the v6.2.0 tag's commit (verified to resolve).
       - name: Set up JDK (kotlin-client)
-        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: temurin
           java-version: "21"
@@ -337,7 +337,7 @@ jobs:
       # SEC-138: pinned to the v2.87.28 tag's commit, verified to resolve
       # (1168f6810a3cb30a3514bf5756a3b7f0422c6df8). Bump deliberately.
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-nextest
 
@@ -362,12 +362,12 @@ jobs:
         uses: ./.github/actions/free-runner-disk
 
       - name: Set up Rust (from rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: stable
 
       - name: Rust build cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
 
       # ARC-110: `make checkall` exercises rust-client only under
       # `--all-features`. This extra gate checks the library AND every test
@@ -395,12 +395,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Rust (from rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: stable
 
       - name: Rust build cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -494,11 +494,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: stable
       - name: Rust build cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
       - name: Start dev database
         run: make dev-db-up
       - name: Run property tests
@@ -571,11 +571,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: stable
       - name: Rust build cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - name: Set up uv
@@ -591,7 +591,7 @@ jobs:
       # the installer; this pins the audit scanner itself so a weekly run
       # reproduces the locally-verified verdict. Bump both deliberately.
       - name: Install cargo-audit
-        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-audit@0.22.2
       - name: Run dependency audit
