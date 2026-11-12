@@ -20,7 +20,7 @@ let package = Package(
         .library(name: "ParRtDbUI", targets: ["ParRtDbUI"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.4.3"),
+        .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.5.0"),
     ],
     targets: [
         .target(
