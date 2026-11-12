@@ -41,11 +41,11 @@ VPS and no reverse proxy is needed — TLS is terminated at Cloudflare's edge.
 
 ## Deploy / update
 
-The default path is continuous deployment (adopted 2026-10-25, the "Lenny2 CD
-recipe" established across par-hack, read-it-to-me, and par-artifacts): every
+The default path is continuous deployment (adopted 2026-10-25, the CD recipe
+established across par-hack, read-it-to-me, and par-artifacts): every
 green push to `main` runs the CI `deploy` job, which SSHes to the deploy host
 with a forced-command key and rolls that exact commit. The private key lives
-only in the repo's `LENNY2_SSH_KEY` GitHub secret; on the host it is
+only in the repo's `DEPLOY_SSH_KEY` GitHub secret; on the host it is
 half of a keypair whose `authorized_keys` line restricts it to
 `command="/usr/local/bin/parrtdb-deploy $SSH_ORIGINAL_COMMAND",restrict` — the
 key can do nothing but run that script, and the script accepts ONLY a bare

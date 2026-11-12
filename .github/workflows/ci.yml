@@ -657,7 +657,7 @@ jobs:
   # builder with CPU clamps, the same host-reservation lease check `make
   # deploy` runs) and polls /healthz until the new rollout is ready. Exactly
   # ONE ssh invocation per deploy; the private key lives only in the
-  # LENNY2_SSH_KEY secret and the hostname only in LENNY2_DEPLOY_HOST (the
+  # DEPLOY_SSH_KEY secret and the hostname only in DEPLOY_HOST (the
   # hostname-leak-check gate forbids real hostnames in tracked files).
   deploy:
     name: Deploy to production host
@@ -677,14 +677,14 @@ jobs:
     steps:
       - name: Deploy ${{ github.sha }} via the forced-command deploy key
         env:
-          LENNY2_SSH_KEY: ${{ secrets.LENNY2_SSH_KEY }}
-          LENNY2_DEPLOY_HOST: ${{ secrets.LENNY2_DEPLOY_HOST }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
           mkdir -p ~/.ssh
           install -m 600 /dev/null ~/.ssh/id_ed25519
-          printf '%s\n' "$LENNY2_SSH_KEY" > ~/.ssh/id_ed25519
-          ssh-keyscan -t ed25519 "$LENNY2_DEPLOY_HOST" >> ~/.ssh/known_hosts
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 "$DEPLOY_HOST" >> ~/.ssh/known_hosts
           ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes \
             -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
-            "root@$LENNY2_DEPLOY_HOST" "${{ github.sha }}"
+            "root@$DEPLOY_HOST" "${{ github.sha }}"
           rm -f ~/.ssh/id_ed25519
