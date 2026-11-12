@@ -106,6 +106,7 @@ from .migrate import (
 from .migrate import (
     _where_signature as _where_signature,
 )
+from .presence import _PresenceEngine
 from .query import (
     _WEBSEARCH_SNIPPET_MAX_WORDS as _WEBSEARCH_SNIPPET_MAX_WORDS,
 )
@@ -409,6 +410,7 @@ class InMemoryRtDbClient(
     _ScheduleEngine,
     _WorkflowEngine,
     _StorageEngine,
+    _PresenceEngine,
     _InMemoryStoreCore,
 ):
     """In-memory par-rt-db client for unit tests.
