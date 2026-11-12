@@ -127,8 +127,11 @@ from .wire import (
     AuthedUser,
     BatchMutateOutcome,
     BatchQueryOutcome,
+    BulkOpAccepted,
+    BulkOpInfo,
     ChangeFeedResponse,
     ClaimedSchedule,
+    FilterExpr,
     ScheduleInfo,
     ScheduleWhen,
     WorkflowInfo,
@@ -519,6 +522,35 @@ class RtDbHttpClient:
             json={"db": self._db, "lease": lease, "error": error},
         )
         return bool(resp.json()["ok"])
+
+    # --- data plane: bulk ops (POST /api/bulk/delete, GET /api/bulk/{id}) — ARC-005 ---
+
+    def bulk_delete(self, db: str, table: str, filter: FilterExpr) -> BulkOpAccepted:
+        """``POST /api/bulk/delete`` ``{db, table, filter}`` → :class:`BulkOpAccepted`.
+
+        Freezes the filter's matching ids and deletes them chunk-by-chunk in
+        the background, replying immediately with the op id and match count.
+        An over-cap match count is rejected ``BAD_REQUEST`` ("narrow the
+        filter") — an unfiltered whole-table delete goes through the admin
+        purge route instead. Poll with :meth:`bulk_status`.
+        """
+        body: dict[str, Any] = {
+            "db": db,
+            "table": table,
+            "filter": filter.model_dump(by_alias=True, mode="json"),
+        }
+        resp = self._send("POST", "/api/bulk/delete", json=body)
+        return BulkOpAccepted.model_validate(resp.json())
+
+    def bulk_status(self, db: str, id: str) -> BulkOpInfo:
+        """``GET /api/bulk/{id}?db=<db>`` → :class:`BulkOpInfo`.
+
+        ``state`` is ``running``/``complete``/``failed``; ``error`` is present
+        only on ``failed``. An unknown id (or one lost to a restart) is
+        ``NOT_FOUND``.
+        """
+        resp = self._send("GET", f"/api/bulk/{id}", params={"db": db})
+        return BulkOpInfo.model_validate(resp.json())
 
     # --- data plane: workflows (POST /api/workflows*) — FM-29 ---
 

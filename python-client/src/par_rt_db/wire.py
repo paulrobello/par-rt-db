@@ -234,6 +234,40 @@ class ClaimedSchedule(_Camel):
         return out
 
 
+# --- Bulk ops (ARC-005) ---
+
+
+class BulkOpAccepted(_Camel):
+    """``POST /api/bulk/delete`` acceptance — mirrors the server's
+    ``BulkDeleteResponse`` (``server/src/http_api/bulk.rs``). ``state`` is
+    always ``"running"`` on accept; the delete then progresses chunk-by-chunk
+    in the background. Poll with :meth:`bulk_status`."""
+
+    op_id: str
+    matched: int
+    state: Literal["running"]
+
+
+class BulkOpInfo(_Camel):
+    """One bulk op's status — mirrors the server's ``BulkStatusResponse``
+    (``server/src/http_api/bulk.rs``). ``state`` ∈ ``running``/``complete``/
+    ``failed``; ``error`` is present on the wire ONLY when ``failed`` (the
+    ``model_serializer`` drops it when ``None``)."""
+
+    id: str
+    state: Literal["running", "complete", "failed"]
+    matched: int
+    deleted: int
+    error: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_none_optional(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("error") is None:
+            out.pop("error", None)
+        return out
+
+
 # --- Workflows (FM-29) ---
 
 
