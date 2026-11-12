@@ -491,7 +491,7 @@ mod client_ip_tests {
 
 mod changes;
 mod data;
-mod schedule;
+pub(crate) mod schedule;
 mod share;
 mod storage;
 mod workflow;

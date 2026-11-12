@@ -1,0 +1,63 @@
+{
+  "$comment": "Canonical HTTP-surface wire shapes (drift verification wave 1: the schedule/claim surface). The server-side parity test (server/src/protocol.rs tests::http_shapes_fixture_parity) constructs the real wire structs and fails when their serialized shape no longer matches this file; every client mirrors this file with strict decode/field-parity tests (ts-client/tests/schedule.test.ts, python-client/tests/test_http_shapes.py, go-client/wire/http_shapes_test.go, kotlin-client DTO test, swift-client HttpShapesTests.swift). Update-means-deliberate: a shape change must land on all seven surfaces in the same commit - this fixture exists because the ClaimedSchedule tz drift shipped undetected (fixed 8a55d03); the WS corpus does not cover HTTP-only shapes.",
+  "claimedScheduleCron": {
+    "id": "job_cron_1",
+    "kind": "cron",
+    "dueAt": 1794470400000,
+    "txn": {
+      "steps": []
+    },
+    "cron": "0 5 * * *",
+    "tz": "America/Los_Angeles",
+    "leaseGeneration": 7,
+    "leaseDeadlineMs": 1794470500000
+  },
+  "claimedScheduleOneshot": {
+    "id": "job_oneshot_1",
+    "kind": "oneshot",
+    "dueAt": 1794470400000,
+    "txn": {
+      "steps": []
+    },
+    "leaseGeneration": 8,
+    "leaseDeadlineMs": 1794470500000
+  },
+  "claimSchedulesResponse": {
+    "jobs": [
+      {
+        "id": "job_cron_1",
+        "kind": "cron",
+        "dueAt": 1794470400000,
+        "txn": {
+          "steps": []
+        },
+        "cron": "0 5 * * *",
+        "tz": "America/Los_Angeles",
+        "leaseGeneration": 7,
+        "leaseDeadlineMs": 1794470500000
+      }
+    ]
+  },
+  "scheduleInfoCron": {
+    "id": "job_cron_1",
+    "kind": "cron",
+    "dueAt": 1794470400000,
+    "cron": "0 5 * * *",
+    "tz": "America/Los_Angeles",
+    "status": "paused",
+    "lastError": "connection reset",
+    "createdAt": 1794470000000,
+    "firedCount": 3,
+    "external": true,
+    "missedCount": 2,
+    "lastMissedAt": 1794470300000
+  },
+  "scheduleInfoMinimal": {
+    "id": "job_oneshot_1",
+    "kind": "oneshot",
+    "dueAt": 1794470400000,
+    "status": "pending",
+    "createdAt": 1794470000000,
+    "firedCount": 0
+  }
+}

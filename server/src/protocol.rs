@@ -170,6 +170,111 @@ mod tests {
         Transaction { steps: vec![] }
     }
 
+    fn http_shapes_fixture() -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("manifest parent is the repo root")
+            .join("wire-corpus/http-shapes.json");
+        serde_json::from_str(
+            &std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display())),
+        )
+        .expect("fixture parses as JSON")
+    }
+
+    // Drift-verification wave 1 (ARC-008 stage 2): the HTTP-only wire shapes
+    // have no WS-corpus coverage — the gap that let the ClaimedSchedule tz
+    // drift ship undetected. Constructing the real structs and comparing to
+    // wire-corpus/http-shapes.json fails the gate when their serialized shape
+    // no longer matches; update-means-deliberate, mirrored on all seven
+    // surfaces in the same commit.
+    #[test]
+    fn http_shapes_fixture_parity() {
+        let fx = http_shapes_fixture();
+
+        let cron_claim = ClaimedSchedule {
+            id: "job_cron_1".to_string(),
+            kind: ScheduleKind::Cron,
+            due_at: 1794470400000,
+            txn: sample_txn(),
+            cron: Some("0 5 * * *".to_string()),
+            tz: Some("America/Los_Angeles".to_string()),
+            every_ms: None,
+            lease_generation: 7,
+            lease_deadline_ms: 1794470500000,
+        };
+        assert_eq!(
+            serde_json::to_value(&cron_claim).unwrap(),
+            fx["claimedScheduleCron"],
+            "ClaimedSchedule (cron+tz) wire shape drifted from wire-corpus/http-shapes.json"
+        );
+        assert_eq!(
+            serde_json::to_value(ClaimedSchedule {
+                id: "job_oneshot_1".to_string(),
+                kind: ScheduleKind::Oneshot,
+                due_at: 1794470400000,
+                txn: sample_txn(),
+                cron: None,
+                tz: None,
+                every_ms: None,
+                lease_generation: 8,
+                lease_deadline_ms: 1794470500000,
+            })
+            .unwrap(),
+            fx["claimedScheduleOneshot"],
+            "ClaimedSchedule (bare one-shot) wire shape drifted — optionals must stay omitted"
+        );
+        assert_eq!(
+            serde_json::to_value(crate::http_api::schedule::ClaimSchedulesResponse {
+                jobs: vec![cron_claim]
+            })
+            .unwrap(),
+            fx["claimSchedulesResponse"],
+            "claim response envelope drifted"
+        );
+
+        assert_eq!(
+            serde_json::to_value(ScheduleInfo {
+                id: "job_cron_1".to_string(),
+                kind: ScheduleKind::Cron,
+                due_at: 1794470400000,
+                cron: Some("0 5 * * *".to_string()),
+                tz: Some("America/Los_Angeles".to_string()),
+                every_ms: None,
+                status: ScheduleStatus::Paused,
+                last_error: Some("connection reset".to_string()),
+                created_at: 1794470000000,
+                fired_count: 3,
+                external: true,
+                missed_count: 2,
+                last_missed_at: Some(1794470300000),
+            })
+            .unwrap(),
+            fx["scheduleInfoCron"],
+            "ScheduleInfo (full cron row) wire shape drifted"
+        );
+        assert_eq!(
+            serde_json::to_value(ScheduleInfo {
+                id: "job_oneshot_1".to_string(),
+                kind: ScheduleKind::Oneshot,
+                due_at: 1794470400000,
+                cron: None,
+                tz: None,
+                every_ms: None,
+                status: ScheduleStatus::Pending,
+                last_error: None,
+                created_at: 1794470000000,
+                fired_count: 0,
+                external: false,
+                missed_count: 0,
+                last_missed_at: None,
+            })
+            .unwrap(),
+            fx["scheduleInfoMinimal"],
+            "ScheduleInfo (minimal row) wire shape drifted — external/missed fields must stay omitted at their defaults"
+        );
+    }
+
     // Client tags/fields exactly match the wire vocabulary consumed by
     // Task 9's WS handler and the TS client.
     #[test]

@@ -1,5 +1,20 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import type { ClientMessage, ScheduleInfo, ScheduleWhen, ServerMessage } from "../src/protocol.js";
+import type {
+  ClaimedSchedule,
+  ClientMessage,
+  ScheduleInfo,
+  ScheduleWhen,
+  ServerMessage,
+} from "../src/protocol.js";
+
+/** wire-corpus/http-shapes.json (repo root — the single source of truth; same fixture the other six runners consume). */
+const HTTP_SHAPES_PATH = resolve(__dirname, "../../wire-corpus/http-shapes.json");
+
+function loadHttpShapes(): Record<string, any> {
+  return JSON.parse(readFileSync(HTTP_SHAPES_PATH, "utf8"));
+}
 
 describe("schedule wire types", () => {
   it("ScheduleWhen mirrors server tags (afterMs / runAt / cron / interval)", () => {
@@ -197,6 +212,48 @@ describe("schedule wire types", () => {
       createdAt: 1700000000000,
       firedCount: 0,
       external: true,
+    });
+  });
+
+  describe("wire-corpus/http-shapes.json field parity (ClaimedSchedule)", () => {
+    const shapes = loadHttpShapes();
+
+    it("claimedScheduleCron decodes as the exported ClaimedSchedule literal", () => {
+      // Typed literal: every fixture key must exist on the interface (tsc
+      // rejects unknown keys on an exhaustively-typed literal).
+      const cron: ClaimedSchedule = {
+        id: "job_cron_1",
+        kind: "cron",
+        dueAt: 1794470400000,
+        txn: { steps: [] },
+        cron: "0 5 * * *",
+        tz: "America/Los_Angeles",
+        leaseGeneration: 7,
+        leaseDeadlineMs: 1794470500000,
+      };
+      // toEqual is order-insensitive; exact key-set equality (extra or
+      // missing fixture keys fail).
+      expect(cron).toEqual(shapes.claimedScheduleCron);
+    });
+
+    it("claimedScheduleOneshot omits cron/tz/everyMs entirely", () => {
+      const oneshot: ClaimedSchedule = {
+        id: "job_oneshot_1",
+        kind: "oneshot",
+        dueAt: 1794470400000,
+        txn: { steps: [] },
+        leaseGeneration: 8,
+        leaseDeadlineMs: 1794470500000,
+      };
+      expect(oneshot).toEqual(shapes.claimedScheduleOneshot);
+      // The oneshot fixture carries no cron/tz/everyMs keys at all.
+      expect(Object.hasOwn(shapes.claimedScheduleOneshot, "cron")).toBe(false);
+      expect(Object.hasOwn(shapes.claimedScheduleOneshot, "tz")).toBe(false);
+      expect(Object.hasOwn(shapes.claimedScheduleOneshot, "everyMs")).toBe(false);
+    });
+
+    it("claimSchedulesResponse.jobs[0] equals the cron claim instance", () => {
+      expect(shapes.claimSchedulesResponse).toEqual({ jobs: [shapes.claimedScheduleCron] });
     });
   });
 });

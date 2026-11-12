@@ -80,7 +80,7 @@ pub(crate) struct ClaimSchedulesRequest {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ClaimSchedulesResponse {
-    jobs: Vec<ClaimedSchedule>,
+    pub(crate) jobs: Vec<ClaimedSchedule>,
 }
 
 pub(crate) async fn claim_schedules_handler(
