@@ -125,6 +125,7 @@ pub(crate) async fn claim_schedules_handler(
                 due_at: job.due_at,
                 txn: job.txn,
                 cron: job.cron,
+                tz: job.tz,
                 every_ms: job.every_ms,
                 lease_generation: job.lease_generation,
                 lease_deadline_ms: job.lease_deadline_ms,

@@ -603,6 +603,84 @@ async fn external_schedule_claim_over_http() -> anyhow::Result<()> {
     Ok(())
 }
 
+// (k3) The claim response carries the cron timezone: an external cron job
+// created with `tz` claims with `tz` echoed — the field five client mirrors
+// already document but the wire struct never delivered — while a tz-less job
+// omits the key entirely.
+#[tokio::test]
+async fn schedule_claim_response_carries_tz_http() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let name = fresh_db(&state).await;
+    let (_, token) = mint_token(addr, &name).await;
+
+    // A cron job whose next fire is far away; its row is backdated so the
+    // external claim (due_at <= now) picks it up alongside a due-now
+    // tz-less one-shot for the omission arm.
+    let resp = api_post(
+        addr,
+        "/api/schedule",
+        &token,
+        json!({
+            "db": name,
+            "when": {"type": "cron", "expr": "0 5 * * *", "tz": "America/Los_Angeles"},
+            "txn": {"steps": []},
+            "external": true,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let cron_id = body["id"].as_str().expect("schedule id").to_string();
+
+    let resp = api_post(
+        addr,
+        "/api/schedule",
+        &token,
+        json!({
+            "db": name,
+            "when": {"type": "afterMs", "ms": 0},
+            "txn": {"steps": []},
+            "external": true,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let schema = rtdb_server::ddl::pg_schema(&name);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE \"{schema}\".scheduled_txns SET due_at = 0 WHERE id = $1"
+    )))
+    .bind(&cron_id)
+    .execute(&state.pool)
+    .await?;
+
+    let resp = api_post(
+        addr,
+        "/api/schedule/claim",
+        &token,
+        json!({"db": name, "limit": 8, "leaseMs": 1_000}),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let jobs = body["jobs"].as_array().expect("jobs array");
+    assert_eq!(jobs.len(), 2);
+    // The cron job echoes its timezone.
+    assert_eq!(jobs[0]["id"], json!(cron_id));
+    assert_eq!(jobs[0]["tz"], json!("America/Los_Angeles"));
+    assert!(jobs[0]["cron"].is_string());
+    // The tz-less one-shot omits the key (skip_serializing_if), matching
+    // the wire shape every client mirror decodes.
+    assert_eq!(jobs[1]["kind"], json!("oneshot"));
+    assert!(
+        jobs[1].get("tz").is_none(),
+        "tz must be omitted when the job declares none"
+    );
+
+    Ok(())
+}
+
 // (l) negative afterMs is rejected before any row is written.
 #[tokio::test]
 async fn schedule_rejects_negative_after_ms_http() -> anyhow::Result<()> {

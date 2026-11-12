@@ -999,10 +999,10 @@ public struct ScheduleInfo: Equatable, Codable, Sendable {
 }
 
 /// Mirrors server/src/protocol.rs::ClaimedSchedule — one job returned by
-/// `POST /api/schedule/claim`, camelCase; `cron`/`everyMs` are omitted when
-/// absent. The `leaseGeneration` is the per-job monotonic fencing token: it
-/// increments on every claim, and the worker's complete/retry/fail calls are
-/// rejected CONFLICT once a newer generation exists.
+/// `POST /api/schedule/claim`, camelCase; `cron`/`tz`/`everyMs` are omitted
+/// when absent. The `leaseGeneration` is the per-job monotonic fencing token:
+/// it increments on every claim, and the worker's complete/retry/fail calls
+/// are rejected CONFLICT once a newer generation exists.
 public struct ClaimedSchedule: Equatable, Codable, Sendable {
     /// The claimed job's id.
     public var id: String
@@ -1014,6 +1014,8 @@ public struct ClaimedSchedule: Equatable, Codable, Sendable {
     public var txn: Transaction
     /// The cron expression, for cron jobs.
     public var cron: String?
+    /// The IANA timezone for cron evaluation, when the job declares one.
+    public var tz: String?
     /// The fixed recurrence in ms, for interval jobs.
     public var everyMs: Int64?
     /// Per-job monotonic fencing token assigned atomically by the claim.
@@ -1024,20 +1026,21 @@ public struct ClaimedSchedule: Equatable, Codable, Sendable {
 
     public init(
         id: String, kind: ScheduleKind, dueAt: Int64, txn: Transaction, cron: String? = nil,
-        everyMs: Int64? = nil, leaseGeneration: Int64, leaseDeadlineMs: Int64
+        tz: String? = nil, everyMs: Int64? = nil, leaseGeneration: Int64, leaseDeadlineMs: Int64
     ) {
         self.id = id
         self.kind = kind
         self.dueAt = dueAt
         self.txn = txn
         self.cron = cron
+        self.tz = tz
         self.everyMs = everyMs
         self.leaseGeneration = leaseGeneration
         self.leaseDeadlineMs = leaseDeadlineMs
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
-        case id, kind, dueAt, txn, cron, everyMs, leaseGeneration, leaseDeadlineMs
+        case id, kind, dueAt, txn, cron, tz, everyMs, leaseGeneration, leaseDeadlineMs
     }
 
     public init(from decoder: Decoder) throws {
@@ -1047,6 +1050,7 @@ public struct ClaimedSchedule: Equatable, Codable, Sendable {
         dueAt = try container.decode(Int64.self, forKey: .dueAt)
         txn = try container.decode(Transaction.self, forKey: .txn)
         cron = try container.decodeIfPresent(String.self, forKey: .cron)
+        tz = try container.decodeIfPresent(String.self, forKey: .tz)
         everyMs = try container.decodeIfPresent(Int64.self, forKey: .everyMs)
         leaseGeneration = try container.decode(Int64.self, forKey: .leaseGeneration)
         leaseDeadlineMs = try container.decode(Int64.self, forKey: .leaseDeadlineMs)
@@ -1059,6 +1063,7 @@ public struct ClaimedSchedule: Equatable, Codable, Sendable {
         try container.encode(dueAt, forKey: .dueAt)
         try container.encode(txn, forKey: .txn)
         try container.encodeIfPresent(cron, forKey: .cron)
+        try container.encodeIfPresent(tz, forKey: .tz)
         try container.encodeIfPresent(everyMs, forKey: .everyMs)
         try container.encode(leaseGeneration, forKey: .leaseGeneration)
         try container.encode(leaseDeadlineMs, forKey: .leaseDeadlineMs)

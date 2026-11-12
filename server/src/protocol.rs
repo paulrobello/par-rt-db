@@ -80,6 +80,9 @@ pub struct ClaimedSchedule {
     /// The cron expression, for cron jobs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cron: Option<String>,
+    /// IANA timezone for cron evaluation, when the job declares one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tz: Option<String>,
     /// The fixed recurrence in ms, for interval jobs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub every_ms: Option<i64>,
