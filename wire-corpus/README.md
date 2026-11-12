@@ -77,6 +77,13 @@ cross-engine agreement, and an uncovered behavior is a standing regression risk
 for the other five engines. A semantics change without a fixture fails review
 the same way an untested code change does.
 
+The rule binds the six client mirrors' in-memory engines just as tightly: a
+change to any of the engines' shared semantics — value-expression evaluation,
+aggregate evaluation, validation, pagination — that alters a query result, a
+step result, an error code, or document visibility ships with its pinning case
+in the same change, with the server (the source of truth for every expected
+value) and the fixture updated together.
+
 When a behavior is already pinned by a case, CHANGE the existing case in the
 same commit as the server change — all seven runners consume the files directly,
 so a deliberate semantic flip turns exactly the cases that pinned the old
