@@ -23,6 +23,7 @@ VPS and no reverse proxy is needed — TLS is terminated at Cloudflare's edge.
 - [Monitoring](#monitoring)
 - [Tracing (OpenTelemetry / OTLP, ENH-018)](#tracing-opentelemetry--otlp-enh-018)
 - [Secrets (`/docker/par-rt-db/.env`, not committed)](#secrets-dockerpar-rt-dbenv-not-committed)
+- [Rate limiting behind the tunnel](#rate-limiting-behind-the-tunnel)
 - [Dashboard / SPA](#dashboard--spa)
 - [Admin bootstrap (after first deploy)](#admin-bootstrap-after-first-deploy)
 - [Hot config beats env](#hot-config-beats-env)
@@ -626,6 +627,28 @@ operator-critical subset.
 - `RTDB_COOKIE_SECURE` (default `true`) — sets the `Secure` attribute on every
   session/CSRF cookie unconditionally. Only set it `false` for local HTTP
   development (e.g. `http://localhost`); never disable it on a public deploy.
+
+## Rate limiting behind the tunnel
+
+Per-IP rate limiting (admin login, anonymous token mint, public storage serve)
+keys off `CF-Connecting-IP` / `X-Forwarded-For` **only when
+`RTDB_TRUSTED_PROXY=true`**; otherwise the connection peer address is the key
+(see the `RTDB_TRUSTED_PROXY` bullet under
+[Secrets](#secrets-dockerpar-rt-dbenv-not-committed)). Two failure modes bound
+this design, and only one is detectable from inside the server:
+
+- **Shared-bucket lockout** — proxy in front, `RTDB_TRUSTED_PROXY` unset:
+  every request arrives from the proxy hop's peer address, so all clients
+  collapse into one bucket per route. An attacker can exhaust the admin-login
+  budget and lock operators out. The server logs a `WARN` at boot when the
+  flag is unset so the posture is visible in the boot log. Production sets
+  `RTDB_TRUSTED_PROXY=true` (`docker-compose.yml` and `.env.example` ship it
+  `true`).
+- **Forged-XFF bucket rotation** — directly reachable deploy with
+  `RTDB_TRUSTED_PROXY=true`: the forwarding headers are caller-controlled, so
+  a client can rotate its own bucket by varying `X-Forwarded-For`. This is why
+  the flag stays boot-only and defaults `false` (SEC-201): the safe default is
+  ignoring the headers unless the operator asserts a trusted hop exists.
 
 ## Dashboard / SPA
 

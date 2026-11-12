@@ -210,6 +210,7 @@ async fn main() {
     let port = config.port;
     // Read before `config` moves into `AppState`.
     let drain_bound = std::time::Duration::from_millis(config.shutdown_drain_ms);
+    let trusted_proxy = config.trusted_proxy;
     let state = AppState::new(pool, config, hot);
 
     // The managed backup task (see the block above for why it waits for
@@ -240,6 +241,22 @@ async fn main() {
         });
 
     tracing::info!("listening on 0.0.0.0:{port}");
+
+    // Audit 2026-11-11 (SEC-001): with the flag false, `client_ip_key` keys
+    // every per-IP rate-limit bucket off the connection peer address — the safe
+    // posture for a directly reachable deploy (SEC-201), but behind a reverse
+    // proxy or tunnel every request shares the proxy hop's peer address, so
+    // per-IP ceilings (admin login, anonymous mint, public storage serve)
+    // collapse onto one bucket an attacker can exhaust to lock operators out.
+    if !trusted_proxy {
+        tracing::warn!(
+            "RTDB_TRUSTED_PROXY is unset/false: per-IP rate-limit buckets key \
+             off the connection peer address. Directly reachable, this is the \
+             safe posture; behind a reverse proxy or tunnel every client \
+             collapses into one shared bucket — set RTDB_TRUSTED_PROXY=true \
+             (see deploy/README.md, \"Rate limiting behind the tunnel\")"
+        );
+    }
 
     // `into_make_service_with_connect_info` makes the peer `SocketAddr`
     // available to handlers via the `ConnectInfo<SocketAddr>` extractor — used
