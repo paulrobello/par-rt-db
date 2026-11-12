@@ -102,7 +102,7 @@ pub(crate) async fn claim_schedules_handler(
     check_http_rate_limits(&state, &principal, &body.db).await?;
     // Cold-db guard (claim is direct table access; no scheduler task needed —
     // external jobs are never internally executed).
-    scheduler::ensure_table(&state.pool, &body.db).await?;
+    scheduler::ensure_table_cached(&state.pool, &body.db).await?;
 
     let limit = body
         .limit
@@ -158,7 +158,7 @@ pub(crate) async fn run_finalize_op(
         ));
     }
     check_http_rate_limits(state, &principal, db).await?;
-    scheduler::ensure_table(&state.pool, db).await?;
+    scheduler::ensure_table_cached(&state.pool, db).await?;
     scheduler::finalize_external(&state.pool, db, id, lease, outcome, error_text).await?;
     Ok(Json(ManageResponse { ok: true }))
 }
@@ -273,7 +273,7 @@ pub(crate) async fn run_manage_op(
     // Cold-db guard (the table is ensured only at scheduler startup for dbs
     // predating the create-time side-table rollout): ensure inline so manage
     // ops on a db with no spawned tasks are a clean `false`, not a 500.
-    scheduler::ensure_table(&state.pool, db).await?;
+    scheduler::ensure_table_cached(&state.pool, db).await?;
     let ok = match op {
         ManageOp::Cancel => scheduler::cancel(&state.pool, db, id).await?,
         ManageOp::Pause => scheduler::set_paused(&state.pool, db, id, true).await?,
@@ -330,7 +330,7 @@ pub(crate) async fn list_schedules_handler(
     // Cold-db guard (the table is ensured only at scheduler startup for dbs
     // predating the create-time side-table rollout): ensure inline so a db
     // with no spawned tasks lists empty, not 500.
-    scheduler::ensure_table(&state.pool, &body.db).await?;
+    scheduler::ensure_table_cached(&state.pool, &body.db).await?;
     let schedules = scheduler::list(&state.pool, &body.db).await?;
     Ok(Json(ListResponse { schedules }))
 }

@@ -6,6 +6,9 @@
 //! as `RunWorkflowAdvance`; the committer alone advances them. See
 //! `docs/superpowers/specs/2026-07-23-scheduled-cron-transactions-design.md`.
 
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
+
 use crate::auth::{EnqueuerIdentity, Principal, PrincipalCtx};
 use crate::db::{new_id, now_ms, validate_db_name};
 use crate::error::RtDbError;
@@ -216,8 +219,48 @@ pub struct ClaimedJob {
 /// re-exported here so `list` and existing call sites resolve one struct.
 pub use crate::protocol::ScheduleInfo;
 
+/// Process-lifetime memo of dbs whose `scheduled_txns` a request-path cold
+/// guard has verified this process. Each [`ensure_table`] runs eleven
+/// ACCESS EXCLUSIVE DDL statements, and external claim pollers hit the cold
+/// guard every poll (measured prod, 2026-11-12: ~2.2 ensures/s continuously
+/// for 10 hours — the DDL churn took ACCESS EXCLUSIVE locks on
+/// `scheduled_txns` thousands of times per hour and starved per-db scheduler
+/// queries for up to 604s, the lenny2 livelock). The cached variant runs the
+/// full DDL once per db per process; boot/spawn paths keep the uncached
+/// [`ensure_table`] so a table dropped out-of-band self-heals on the next
+/// scheduler respawn. The memo never needs eviction: a re-created table is
+/// always ensured by that boot before any cached caller can reach it.
+static ENSURED_SCHEDULE_DBS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn ensured_schedule_dbs() -> &'static Mutex<HashSet<String>> {
+    ENSURED_SCHEDULE_DBS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Cold-guard ensure for request paths (claim/finalize/manage/list/enqueue):
+/// full DDL on the first call per db, then a lock-free memo hit. Never use on
+/// a boot/spawn path — those must re-run the DDL to self-heal a dropped
+/// table.
+pub async fn ensure_table_cached(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
+    validate_db_name(db)?;
+    if ensured_schedule_dbs()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains(db)
+    {
+        return Ok(());
+    }
+    ensure_table(pool, db).await?;
+    ensured_schedule_dbs()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(db.to_string());
+    Ok(())
+}
+
 /// `CREATE TABLE IF NOT EXISTS` for databases that predate this feature.
-/// Mirrors `mutation_log::ensure_table`; called once at committer startup.
+/// Mirrors `mutation_log::ensure_table`. Request paths must call
+/// [`ensure_table_cached`] instead — this uncached form is for boot/spawn
+/// paths, where re-running the DDL is what lets a dropped table self-heal.
 pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
@@ -435,7 +478,7 @@ pub async fn enqueue(
     // ensure the table inline too or a cold-db insert can lose the race and
     // error once.
     state.realtime.committers.ensure_spawned(db).await?;
-    ensure_table(&state.pool, db).await?;
+    ensure_table_cached(&state.pool, db).await?;
     let (kind, due_at, cron, every_ms, tz) = resolve_when(when, now_ms())?;
     insert(
         &state.pool,
