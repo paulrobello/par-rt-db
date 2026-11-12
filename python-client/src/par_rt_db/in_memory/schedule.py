@@ -57,6 +57,9 @@ class _ScheduleEngine(_Core):
             touched: set[str],
         ) -> None: ...
 
+        # Provided by _WorkflowEngine at assembly (workflow.py).
+        def _advance_workflows(self, now: int) -> None: ...
+
     def _prepare_job(self, when: ScheduleWhen) -> tuple[str, int, str | None, int | None]:
         """(kind, due_at, cron, every_ms) for a ``ScheduleWhen`` — shared by the
         standalone ``schedule`` op and the ``schedule`` txn step. The clock

@@ -15,6 +15,7 @@ from ..errors import ErrorCode, RtDbError
 from ..mutation import (
     Step,
     StepResult,
+    Transaction,
     _AdjustCounter,
     _CancelSchedule,
     _CancelWorkflow,
@@ -38,6 +39,10 @@ from ..mutation import (
     _UpsertMany,
 )
 from ..schema import TableDef, _FNumber, _FOptional
+from ..wire import (
+    ScheduleWhen,
+    WorkflowSpec,
+)
 from . import store as _store
 from .field_guard import check_field_expectations
 from .migrate import (
@@ -130,6 +135,17 @@ else:
 
 class _WritesEngine(_Core):
     """_WritesEngine: methods extracted verbatim from ``_InMemoryStoreCore``."""
+
+    if TYPE_CHECKING:
+        # Provided by sibling engine mixins at assembly (schedule.py /
+        # workflow.py).
+        def schedule(
+            self, txn: Transaction, when: ScheduleWhen, *, external: bool = False
+        ) -> str: ...
+
+        def _insert_workflow(self, spec: WorkflowSpec) -> str: ...
+
+        def cancel_workflow(self, id: str) -> bool: ...
 
     def _stamp_auto_increment(
         self, table_name: str, table_def: TableDef, doc: dict[str, Any]
