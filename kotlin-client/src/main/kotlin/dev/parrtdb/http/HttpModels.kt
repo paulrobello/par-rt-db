@@ -79,6 +79,39 @@ data class ClaimedSchedule(
     }
 }
 
+/** Reply to `POST /api/bulk/delete` (ARC-005): the background bulk delete was
+ * accepted and its per-op driver kicked; `matched` is the number of ids the
+ * filter froze at submit time and `state` is always "running" in this reply.
+ * Mirrors server `http_api::bulk::BulkDeleteResponse` (camelCase). */
+data class BulkOpAccepted(val opId: String, val matched: Long, val state: String) {
+    companion object {
+        fun fromJson(e: JsonElement): BulkOpAccepted {
+            val o = StrictObj.of(e, "bulkOpAccepted")
+            return BulkOpAccepted(o.str("opId"), o.long("matched"), o.str("state")).also { o.finish() }
+        }
+    }
+}
+
+/** Poll reply for `GET /api/bulk/{id}?db=` (ARC-005). `state` is one of
+ * running | complete | failed; `deleted` is the cumulative row count. `error`
+ * is present ONLY when `state` is "failed" (the server `skip_serializing_if`s
+ * it, so running/complete payloads carry no `error` key at all). Mirrors
+ * server `http_api::bulk::BulkStatusResponse` (camelCase). */
+data class BulkOpInfo(
+    val id: String,
+    val state: String,
+    val matched: Long,
+    val deleted: Long,
+    val error: String? = null,
+) {
+    companion object {
+        fun fromJson(e: JsonElement): BulkOpInfo {
+            val o = StrictObj.of(e, "bulkOpInfo")
+            return BulkOpInfo(o.str("id"), o.str("state"), o.long("matched"), o.long("deleted"), o.optStr("error")).also { o.finish() }
+        }
+    }
+}
+
 /** POST /api/storage/{db} response. */
 data class UploadResult(val id: String, val sha256: String, val size: Long, val contentType: String? = null) {
     companion object {

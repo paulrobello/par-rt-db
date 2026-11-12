@@ -6,6 +6,7 @@ import dev.parrtdb.transport.HttpTransport
 import dev.parrtdb.transport.JdkTransport
 import dev.parrtdb.wire.AuthedUser
 import dev.parrtdb.wire.ChangeFeedResponse
+import dev.parrtdb.wire.FilterExpr
 import dev.parrtdb.wire.Query
 import dev.parrtdb.wire.ScheduleInfo
 import dev.parrtdb.wire.ScheduleWhen
@@ -114,6 +115,23 @@ class RtDbHttpClient(
         }
         throw last ?: RtDbException(ErrorCode.INTERNAL, "mutate_with_retry: no attempts made")
     }
+
+    // ---- bulk operations -----------------------------------------------------------------
+
+    /**
+     * POST /api/bulk/delete (ARC-005): freezes [filter]'s matching ids in a read-only
+     * serialized turn, registers the op, and kicks its per-op driver. Replies immediately;
+     * poll [bulkStatus] for progress. A filter matching more than the server's id cap fails
+     * with 400 before any delete starts.
+     */
+    suspend fun bulkDelete(table: String, filter: FilterExpr): BulkOpAccepted {
+        val body = jsonObj("db" to jsonStr(db), "table" to jsonStr(table), "filter" to filter.toJson())
+        return BulkOpAccepted.fromJson(core.json("POST", "/api/bulk/delete", body))
+    }
+
+    /** GET /api/bulk/{id}?db= — poll one bulk op; [BulkOpInfo.error] is null unless the op failed. */
+    suspend fun bulkStatus(id: String): BulkOpInfo =
+        BulkOpInfo.fromJson(core.json("GET", withQuery("/api/bulk/${pathEscape(id)}", listOf("db" to db))))
 
     // ---- schedules -----------------------------------------------------------------------
 
