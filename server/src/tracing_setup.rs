@@ -3,7 +3,7 @@
 //! The default build writes structured logs to stdout via `tracing-subscriber`'s
 //! fmt layer — identical to the pre-ENH-018 behavior. When the `otel` cargo
 //! feature is compiled in AND `RTDB_OTEL_ENABLED=true`, an
-//! [`OpenTelemetryLayer`] is composed on top so spans export over OTLP/gRPC to
+//! `OpenTelemetryLayer` is composed on top so spans export over OTLP/gRPC to
 //! a collector. The layer is the only thing the feature gates; the span
 //! instrumentation in the committer/subs/query/txn modules is unconditional
 //! `tracing` macros, which are no-ops when no otel layer is installed (and

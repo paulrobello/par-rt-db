@@ -504,8 +504,8 @@ impl OtelEnv {
 impl Config {
     /// Reads boot-only values from env. Errors (String) name the missing or
     /// invalid variable. Per ARC-118, a numeric knob that is PRESENT but
-    /// UNPARSEABLE (e.g. a typo) fails boot loudly via [`env_parsed`]; only
-    /// absence falls back to the documented default. Booleans use [`env_bool`]
+    /// UNPARSEABLE (e.g. a typo) fails boot loudly via `env_parsed`; only
+    /// absence falls back to the documented default. Booleans use `env_bool`
     /// (recognized spellings; unrecognized ⇒ the documented default, so a typo
     /// cannot flip a security posture).
     pub fn from_env() -> Result<Self, String> {

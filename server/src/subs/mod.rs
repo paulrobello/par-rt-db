@@ -13,8 +13,8 @@
 //! `ReadSet::Indexed` window: a write provably outside the eq-prefix/range
 //! window cannot move an aggregate scoped to that window.
 //!
-//! QA-003 split: read-set classification lives in [`read_set`], the skip
-//! decision in [`decide`], credential liveness gating in [`liveness`], and
+//! QA-003 split: read-set classification lives in `read_set`, the skip
+//! decision in `decide`, credential liveness gating in `liveness`, and
 //! this module keeps the registry and fan-out execution.
 
 mod decide;

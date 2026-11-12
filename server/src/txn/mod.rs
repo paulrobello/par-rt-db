@@ -98,7 +98,7 @@ const MAX_BY_QUERY_ROWS: u32 = 1000;
 
 /// Hard cap on the number of by-query (`PatchByQuery`/`DeleteByQuery`) steps a
 /// single transaction may contain. Each such step can sweep up to
-/// [`MAX_BY_QUERY_ROWS`] rows, so without a step-count cap the worst-case
+/// `MAX_BY_QUERY_ROWS` rows, so without a step-count cap the worst-case
 /// committer turn would be `MAX_STEPS * MAX_BY_QUERY_ROWS` (~1,000,000 rows) —
 /// enough to stall the single-writer for a database for the duration and starve
 /// every other writer/subscription on it. This const composes with
@@ -108,7 +108,7 @@ pub const MAX_BY_QUERY_STEPS_PER_TXN: usize = 16;
 
 /// Aggregate worst-case affected-document budget for a single transaction: a
 /// hard ceiling on [`worst_case_affected`] (per-id steps count 1 each; each
-/// by-query step counts up to its `limit`, default [`MAX_BY_QUERY_ROWS`]).
+/// by-query step counts up to its `limit`, default `MAX_BY_QUERY_ROWS`).
 /// Checked before execution so an over-budget txn commits nothing. This is the
 /// single-writer stall bound — one `/api/mutate` cannot monopolize the
 /// serialized committer turn. SEC-104.
@@ -299,7 +299,7 @@ pub struct TxnOutcome {
 /// writes for a database being serialized through the per-db committer.
 /// Never call `execute_txn` from a non-committer production path.
 /// Worst-case number of documents `txn` could affect, capped per by-query
-/// step at [`MAX_BY_QUERY_ROWS`]. Used by [`execute_txn`]'s
+/// step at `MAX_BY_QUERY_ROWS`. Used by [`execute_txn`]'s
 /// [`MAX_AFFECTED_ROWS_PER_TXN`] budget check and the admin `max_affected_docs`
 /// guardrail (admin/docs.rs, ws.rs). SEC-104. Thin wrapper over
 /// [`par_rt_db_core::engine::worst_case_affected`] (ARC-004 follow-up) — see

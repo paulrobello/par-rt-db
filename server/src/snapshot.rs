@@ -77,7 +77,7 @@ fn encode_snapshot_line(
 /// Buffered variant that materializes the whole JSONL in memory. Kept for
 /// in-process callers (`clone-db`, backup restore) whose call sites want a
 /// `String`; the HTTP export endpoint streams via [`export_stream`]. Both share
-/// [`encode_snapshot_line`], so they are byte-identical by construction.
+/// `encode_snapshot_line`, so they are byte-identical by construction.
 pub async fn export_database(
     pool: &PgPool,
     db: &str,
@@ -130,7 +130,7 @@ const EXPORT_BATCH_ROWS: usize = 500;
 /// Bounded-memory export: the schema line, then one `doc` line per row,
 /// fetched per table in keyset-paginated batches (`WHERE (created_at, id) >`
 /// the last emitted row, `LIMIT {EXPORT_BATCH_ROWS}`). Byte-format identical
-/// to the buffered [`export_database`] via the shared [`encode_snapshot_line`];
+/// to the buffered [`export_database`] via the shared `encode_snapshot_line`;
 /// the HTTP export endpoint serves this stream directly.
 ///
 /// Implemented as an `async-stream` generator: sqlx `fetch` streams cannot
@@ -313,7 +313,7 @@ where
 /// pushing the schema line via `ddl::push_schema`, replaying each `doc` line
 /// with `txn::insert_snapshot_row` (id/createdAt/version preserved), and
 /// stamping the change feed in bounded batches — flush once
-/// [`STAMP_FLUSH_ROWS`] rows or [`STAMP_FLUSH_BYTES`] bytes of raw line input
+/// `STAMP_FLUSH_ROWS` rows or `STAMP_FLUSH_BYTES` bytes of raw line input
 /// have accumulated, whichever comes first. All doc writes and stamps run on
 /// ONE transaction: any error — malformed JSON, unknown table, oversized line,
 /// transport failure — aborts and rolls back every inserted row. The schema

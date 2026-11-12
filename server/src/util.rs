@@ -63,7 +63,7 @@ const DEFAULT_SCHEMA_CACHE_MAX_ENTRIES: u64 = 1024;
 
 impl SchemaCache {
     /// Constructs a cache with the default entry cap
-    /// ([`DEFAULT_SCHEMA_CACHE_MAX_ENTRIES`]). Kept parameterless so existing
+    /// (`DEFAULT_SCHEMA_CACHE_MAX_ENTRIES`). Kept parameterless so existing
     /// test call sites are unchanged; production uses [`Self::with_capacity`].
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_SCHEMA_CACHE_MAX_ENTRIES)

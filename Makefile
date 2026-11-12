@@ -35,7 +35,7 @@ SWIFT_CLIENT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(
 	python-client-install python-client-test python-client-lint python-client-fmt \
 	python-client-typecheck python-client-checkall rust-client-check-features rtdb-cli deploy \
 	env-drift-check dockerfile-stub-check backup-persistence-check publish-check cli-docs cli-docs-check \
-	rust-client-doc ts-client-doc python-client-doc swift-client-doc docs-api \
+	rust-client-doc ts-client-doc python-client-doc swift-client-doc docs-api server-doc \
 	host-reserve host-release host-reservation-check \
 	go-client-install go-client-fmt go-client-fmt-check go-client-lint go-client-test \
 	go-client-typecheck go-client-checkall gen-error-codes gen-error-codes-ts \
@@ -405,6 +405,9 @@ rust-client-check-features:
 rust-client-doc:
 	RUSTDOCFLAGS="-D warnings -D rustdoc::broken_intra_doc_links" cargo doc --no-deps --all-features --manifest-path rust-client/Cargo.toml
 
+server-doc:
+	RUSTDOCFLAGS="-D warnings -D rustdoc::broken_intra_doc_links" cargo doc --no-deps --all-features -p rtdb-server
+
 ts-client-doc:
 	cd ts-client && bun run doc
 
@@ -414,7 +417,7 @@ python-client-doc:
 swift-client-doc:
 	$(call SWIFT_IF_DARWIN,mkdir -p swift-client/docs-api && swift package --allow-writing-to-directory swift-client/docs-api generate-documentation --target ParRtDbClient --output-path swift-client/docs-api/ParRtDbClient.doccarchive --transform-for-static-hosting --hosting-base-path par-rt-db/swift --warnings-as-errors)
 
-docs-api: rust-client-doc ts-client-doc python-client-doc swift-client-doc
+docs-api: rust-client-doc ts-client-doc python-client-doc swift-client-doc server-doc
 
 rtdb-cli:
 	cd cli && cargo build --release

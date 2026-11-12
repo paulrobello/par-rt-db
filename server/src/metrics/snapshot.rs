@@ -89,7 +89,7 @@ pub struct MetricsSnapshot {
     pub workflow_steps_fail_total: u64,
     /// Per-database workflow-run counts by status (FM-29). Populated only by
     /// the `/admin/metrics` handler (a live side-table read — see
-    /// [`per_db_workflows_rows`]), so the periodic `/admin/stream` gauge ticks
+    /// [`per_db_workflows_rows`](crate::metrics::per_db_workflows_rows)), so the periodic `/admin/stream` gauge ticks
     /// and other `snapshot()` callers see an empty list. JSON-snapshot only —
     /// deliberately absent from the Prometheus scrape (per-db labels would
     /// blow up cardinality on the public export).

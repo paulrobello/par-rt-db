@@ -12,7 +12,7 @@
 //! 1. **Concurrency cap** — at most [`MAX_CONCURRENT_SCHEMA_DDL`] DDL passes
 //!    execute at once server-wide, so lock waits can hold only that many pool
 //!    connections no matter how many databases are mid-migration. Late
-//!    pushers wait at most [`DDL_PERMIT_WAIT`] for a slot and then get a
+//!    pushers wait at most `DDL_PERMIT_WAIT` for a slot and then get a
 //!    retryable 409 instead of piling on.
 //! 2. **Backup gate** — a backup (cron or manual) sets `backup_in_flight`
 //!    BEFORE draining the permits, so new DDL defers with a clear retryable
@@ -100,13 +100,13 @@ impl SchemaGate {
     }
 
     /// Admits one schema-DDL pass. Fails fast with a retryable 409 while a
-    /// backup holds the gate; otherwise waits up to [`DDL_PERMIT_WAIT`] for a
+    /// backup holds the gate; otherwise waits up to `DDL_PERMIT_WAIT` for a
     /// slot. The flag check before the acquire is race-safe: a backup that
     /// sets the flag after this check is still draining permits, so this
     /// pass's acquire blocks until the backup completes — it runs after the
     /// dump, never during it. (Sole exception: a backup whose drain timed out
     /// is running without holding the permits; the cap still bounds that
-    /// pass to one of 2 connections — see [`BACKUP_DRAIN_WAIT`].)
+    /// pass to one of 2 connections — see `BACKUP_DRAIN_WAIT`.)
     pub async fn begin_ddl(&self) -> Result<tokio::sync::SemaphorePermit<'_>, RtDbError> {
         if self.backup_in_flight.load(Ordering::Acquire) {
             tracing::warn!(
@@ -134,7 +134,7 @@ impl SchemaGate {
     /// Marks the backup in flight, then drains every DDL slot so the dump does
     /// not start on top of a half-applied migration. New DDL defers (409) from
     /// the flag onward; the returned hold keeps the slots until dropped. If
-    /// draining exceeds [`BACKUP_DRAIN_WAIT`] the backup proceeds anyway —
+    /// draining exceeds `BACKUP_DRAIN_WAIT` the backup proceeds anyway —
     /// see the constant's doc.
     pub async fn begin_backup(self: &Arc<Self>) -> BackupHold {
         self.backup_in_flight.store(true, Ordering::Release);

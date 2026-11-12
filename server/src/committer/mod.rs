@@ -1374,7 +1374,7 @@ impl Committers {
     }
 
     /// One idle-reclamation sweep pass (ARC-102 step 4). A no-op when
-    /// `idle_threshold` is zero. Delegates to [`reclaim_idle_pass`]; tests call
+    /// `idle_threshold` is zero. Delegates to `reclaim_idle_pass`; tests call
     /// this directly for determinism instead of waiting on the sweep loop's
     /// cadence.
     pub async fn reclaim_idle_once(&self) -> usize {

@@ -24,7 +24,7 @@
 //! mirroring the storage-quota refresh spawn, so a large batch's NOTIFY round
 //! trips never hold up the next queued request. `DocOp`s are serialized in
 //! chunks (ARC-006): each chunk's JSON array of per-op payload objects stays
-//! under [`OP_NOTIFY_CHUNK_LIMIT`] bytes and is sent as one `pg_notify(
+//! under `OP_NOTIFY_CHUNK_LIMIT` bytes and is sent as one `pg_notify(
 //! 'rtdb_ops', …)`, so a 1000-row delete or TTL sweep costs a handful of round
 //! trips instead of one per op. All ops in one call share a single `ts`
 //! (mirroring `OpFeed::publish`), so ordering across chunks is preserved by
@@ -34,7 +34,7 @@
 //! `PgListener` subscribed to the `rtdb_ops` channel. On each notification it
 //! decodes either a single payload object or a batch array (backward
 //! compatible with a peer mid-rolling-deploy still sending one-per-op), and
-//! for each payload reconstructs an [`OpEvent`](crate::op_feed::OpEvent) and
+//! for each payload reconstructs an [`OpEvent`] and
 //! feeds it into the local ring via `OpFeed::publish_injected`. The listener
 //! performs NO write and NO committer interaction — it only mirrors the
 //! notification into local memory — so the single-writer invariant is
@@ -321,7 +321,7 @@ fn chunk_op_payloads(payloads: &[OpNotifyPayload], limit: usize) -> Vec<&[OpNoti
 /// until their next local write.
 ///
 /// A `WriteSet` for a bulk write easily exceeds Postgres's 8000-byte
-/// `pg_notify` cap, so payloads at or above [`WRITE_SET_INLINE_LIMIT`] travel
+/// `pg_notify` cap, so payloads at or above `WRITE_SET_INLINE_LIMIT` travel
 /// through the forward spool and the NOTIFY carries only the row id. The
 /// receiving side tells the two apart by shape: a JSON object starts with `{`,
 /// a spool reference is a bare uuid.

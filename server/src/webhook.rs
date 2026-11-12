@@ -323,7 +323,7 @@ impl reqwest::dns::Resolve for WebhookDnsResolver {
 ///     literal, if a name, must not be a known cloud-metadata hostname.
 ///   - The hostname is resolved via `tokio::net::lookup_host` and rejected if
 ///     ANY resolved address is in [`is_blocked_ip`]. The delivery client
-///     additionally routes connect-time resolution through [`WebhookDnsResolver`]
+///     additionally routes connect-time resolution through `WebhookDnsResolver`
 ///     so a DNS rebind between registration and delivery cannot land the
 ///     connection on a blocked IP (SEC-114); the worker's
 ///     `redirect(Policy::none())` closes the redirect bypass.
@@ -644,7 +644,7 @@ fn build_delivery_client() -> Result<reqwest::Client, RtDbError> {
         })
 }
 
-/// The delivery worker loop: drain, sleep [`WORKER_POLL_INTERVAL`], repeat.
+/// The delivery worker loop: drain, sleep `WORKER_POLL_INTERVAL`, repeat.
 /// Never panics — every drain error is logged and the loop continues, so a
 /// transient DB or network blip does not kill the worker. Runs until the
 /// process exits (the task is `tokio::spawn`ed at boot when webhooks are

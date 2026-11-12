@@ -10,7 +10,7 @@
 //! construction — only the serialized committer turn (or a whole-db admin
 //! import, which appends on its own transaction) advances the counter.
 //!
-//! Retention keeps the newest [`HotConfig::change_log_max_rows`] rows; the
+//! Retention keeps the newest [`HotConfig::change_log_max_rows`](crate::config::HotConfig::change_log_max_rows) rows; the
 //! head row and the newest row are never trimmed, so an empty `changes` table
 //! means "nothing was ever committed" and the expired-cursor test stays
 //! exact. Trimming rides `mutation_log::run_cleanup`'s per-db loop, off the

@@ -99,7 +99,7 @@ use tower_http::trace::TraceLayer;
 ///
 /// Most of the spawned loops live in `notify.rs`/`forward.rs`/`rate_limit.rs`/
 /// `presence.rs`/`committer/` and are not written to poll a token themselves,
-/// so [`BackgroundTasks::spawn`] races each future against
+/// so `BackgroundTasks::spawn` races each future against
 /// `token.cancelled()` from the outside: cancellation drops the inner future
 /// at its current await point (closing sockets/listeners via their own `Drop`
 /// impls) without requiring the task body to cooperate. [`BackgroundTasks::track`]
