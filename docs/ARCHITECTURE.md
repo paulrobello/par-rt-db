@@ -1392,3 +1392,17 @@ checked manually with `scripts/bench/compare.ts` — no CI job runs benchmarks
 Runs happen only from the operator's dev machine or the deploy host (the deploy
 host, run there against `127.0.0.1:8300` to skip the tunnel) — see
 [CONTRIBUTING.md's Benchmarks section](../CONTRIBUTING.md#benchmarks).
+
+**ARC-005 background bulk delete.** The remedy for the scenario-(d) finding
+itself: `POST /api/bulk/delete` splits a large delete across committer turns
+so no single turn monopolizes the write budget. The first turn freezes the
+filter's matching ids (read-only, per-row auth of the submitting caller, cap
+100k); a per-op driver feeds 500-row slices (`BULK_DELETE_CHUNK_ROWS`) to the
+`RunBulkDeleteChunk` committer arm, so each turn's hold is bounded to roughly
+a 500-row cascade plus its subscription re-runs, and interactive writes
+interleave between chunk turns. Measured on the development host with 100
+subscribers (2026-11-12): the 5k-row `deleteByQuery` transaction the audit
+profiled holds the turn a median 882.6ms (post-ENH-034; the documented
+3418.6ms baseline predates it), while the bulk path's per-chunk holds stay an
+order of magnitude under that — the numbers land here once the scenario-(e)
+bench measurement runs at this change's tip.

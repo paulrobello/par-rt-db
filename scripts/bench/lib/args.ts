@@ -2,9 +2,9 @@
  * an env-var fallback so `make bench` (a later phase) can compose this script
  * with the same `RTDB_*` variables it uses to start the servers under test. */
 
-export type Scenario = "a" | "b" | "c" | "d";
+export type Scenario = "a" | "b" | "c" | "d" | "e";
 
-export const ALL_SCENARIOS: Scenario[] = ["a", "b", "c", "d"];
+export const ALL_SCENARIOS: Scenario[] = ["a", "b", "c", "d", "e"];
 
 export interface LoadOptions {
   /** Base URL of the server under test (scenario a/b/d, and the "primary"
@@ -57,11 +57,11 @@ Options:
   --admin-key <key>      Server admin bearer (default: RTDB_TEST_ADMIN_KEY or
                           RTDB_ADMIN_KEY env)
   --db <name>            Database name to create/reuse (default: bench)
-  --scenario <a|b|c|d|all>  Comma-separated scenario list, or "all" (default: all)
+  --scenario <a|b|c|d|e|all>  Comma-separated scenario list, or "all" (default: all)
   --duration <sec>       Scenario a write duration in seconds (default: 30)
   --concurrency <n>      Writer/subscriber concurrency for a/b (default: 8)
-  --subscribers <n>      Subscriber count for scenario d (default: 100)
-  --bulk-rows <n>        Row count for scenario d's bulk delete (default: 5000)
+  --subscribers <n>      Subscriber count for scenarios d/e (default: 100)
+  --bulk-rows <n>        Row count for scenarios d/e (default: 5000)
   --owner-pid <pid>      PID of the current lease owner, for scenario c's
                           takeover-time measurement (optional)
   --sha <sha>            git sha this run is attributed to (default: git rev-parse --short HEAD)

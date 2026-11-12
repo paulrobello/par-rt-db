@@ -23,6 +23,7 @@ import { runScenarioA, type ScenarioAResult } from "./lib/scenarioA.js";
 import { runScenarioB, type ScenarioBResult } from "./lib/scenarioB.js";
 import { runScenarioC, type ScenarioCResult } from "./lib/scenarioC.js";
 import { runScenarioD, type ScenarioDResult } from "./lib/scenarioD.js";
+import { runScenarioE, type ScenarioEResult } from "./lib/scenarioE.js";
 
 interface BenchOutput {
   sha: string;
@@ -32,6 +33,7 @@ interface BenchOutput {
   b?: ScenarioBResult;
   c?: ScenarioCResult;
   d?: ScenarioDResult;
+  e?: ScenarioEResult;
   /** Subscription-invalidation effectiveness at the end of the run, from
    * `GET /admin/metrics` (`ts-client/src/admin.ts::MetricsSnapshot`) — the
    * `subsRerunsTotal`/`subsSkips*Total` counters ENH-024 already exposes.
@@ -79,6 +81,11 @@ async function main(): Promise<void> {
   if (opts.scenarios.includes("d")) {
     console.error(`[bench] scenario d: ${opts.bulkRows} rows, ${opts.subscribers} subscribers`);
     output.d = await runScenarioD(primary, opts.bulkRows, opts.subscribers);
+  }
+
+  if (opts.scenarios.includes("e")) {
+    console.error(`[bench] scenario e: ${opts.bulkRows} rows, ${opts.subscribers} subscribers`);
+    output.e = await runScenarioE(primary, opts.bulkRows, opts.subscribers);
   }
 
   output.adminMetrics = await readAdminMetrics(primary.admin);

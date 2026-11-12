@@ -153,7 +153,10 @@ struct HttpShapesTests {
         let gotAccepted = try #require(
             JSONSerialization.jsonObject(with: JSONEncoder().encode(accepted)) as? [String: Any]
         )
-        #expect(try (gotAccepted as NSDictionary) == (loadHttpShapesObject(forKey: "bulkDeleteAccepted") as NSDictionary))
+        #expect(
+            try (gotAccepted as NSDictionary)
+                == (loadHttpShapesObject(forKey: "bulkDeleteAccepted") as NSDictionary)
+        )
 
         let infoData = try loadHttpShapesData(forKey: "bulkOpInfoFailed")
         let info = try JSONDecoder().decode(BulkOpInfo.self, from: infoData)
