@@ -34,7 +34,13 @@ import type {
 } from "./admin/types.js";
 import type { WebSocketLike } from "./client.js";
 import { RtDbError } from "./errors.js";
-import { enrollRequest, type FileMetadata, type SignedUrl, type TransformOpts } from "./http.js";
+import {
+  enrollRequest,
+  fetchWithDeadline,
+  type FileMetadata,
+  type SignedUrl,
+  type TransformOpts,
+} from "./http.js";
 import type {
   ChangeFeedResponse,
   MigrateRequestJson,
@@ -188,6 +194,8 @@ export class RtDbAdminClient {
   /** True when no `adminKey` was supplied — requests ride the session cookie. */
   private readonly cookieMode: boolean;
   private readonly fetchImpl: typeof fetch;
+  private readonly requestTimeoutMs: number | undefined;
+  private readonly connectionClose: boolean;
   private readonly webSocketFactory: (url: string, protocols?: string | string[]) => WebSocketLike;
 
   constructor(options: RtDbAdminClientOptions) {
@@ -197,9 +205,24 @@ export class RtDbAdminClient {
     // Bind the global: browsers require Window as fetch's receiver, and a
     // stored-unbound reference throws "Illegal invocation" when called.
     this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
+    this.requestTimeoutMs = options.requestTimeoutMs;
+    this.connectionClose = options.connectionClose === true;
     this.webSocketFactory =
       options.webSocketFactory ??
       ((url, protocols) => new WebSocket(url, protocols) as unknown as WebSocketLike);
+  }
+
+  /** Issues one request through this client's fetch under its transport
+   *  options — same contract as `RtDbHttpClient.doFetch`: `Connection: close`
+   *  appended when `connectionClose` is set, and the request runs under
+   *  `requestTimeoutMs` via {@link fetchWithDeadline}. Every outgoing call
+   *  site routes through here. */
+  private doFetch(url: string, init: RequestInit = {}): Promise<Response> {
+    const headers: HeadersInit = {
+      ...(init.headers as Record<string, string>),
+      ...(this.connectionClose ? { Connection: "close" } : {}),
+    };
+    return fetchWithDeadline(this.fetchImpl, url, { ...init, headers }, this.requestTimeoutMs);
   }
 
   /** Auth + CSRF headers for the current mode. Bearer mode sets
@@ -314,7 +337,11 @@ export class RtDbAdminClient {
    *  the db or capability the grant fixes. An invalid/expired/revoked/used
    *  grant surfaces as the standard `RtDbError` UNAUTHORIZED envelope. */
   async enroll(grant: string): Promise<EnrollResult> {
-    return (await enrollRequest(this.fetchImpl, this.url, grant)) as EnrollResult;
+    return (await enrollRequest(
+      (url, init) => this.doFetch(url as string, init),
+      this.url,
+      grant,
+    )) as EnrollResult;
   }
 
   /** Adds `email` to `db`'s OAuth sign-in allowlist. */
@@ -407,7 +434,7 @@ export class RtDbAdminClient {
 
   /** Fetches `db`'s schema and every document as JSONL text (see server `snapshot::export_database`). */
   async exportDb(db: string): Promise<string> {
-    const response = await this.fetchImpl(
+    const response = await this.doFetch(
       `${this.url}/admin/export-db?db=${encodeURIComponent(db)}`,
       {
         method: "GET",
@@ -423,7 +450,7 @@ export class RtDbAdminClient {
 
   /** Loads a JSONL snapshot from `exportDb` into `db` (see server `snapshot::import_database`). */
   async importDb(db: string, jsonl: string): Promise<void> {
-    const response = await this.fetchImpl(
+    const response = await this.doFetch(
       `${this.url}/admin/import-db?db=${encodeURIComponent(db)}`,
       {
         method: "POST",
@@ -445,7 +472,7 @@ export class RtDbAdminClient {
    * buffered `exportDb` for big databases.
    */
   async exportDbStream(db: string): Promise<ReadableStream<Uint8Array>> {
-    const response = await this.fetchImpl(
+    const response = await this.doFetch(
       `${this.url}/admin/export-db?db=${encodeURIComponent(db)}`,
       {
         method: "GET",
@@ -476,7 +503,7 @@ export class RtDbAdminClient {
   ): Promise<void> {
     const stream =
       "getReader" in body ? (body as ReadableStream<Uint8Array>) : readableStreamFrom(body);
-    const response = await this.fetchImpl(
+    const response = await this.doFetch(
       `${this.url}/admin/import-db?db=${encodeURIComponent(db)}`,
       {
         method: "POST",
@@ -493,7 +520,7 @@ export class RtDbAdminClient {
 
   /** Clones `from` (schema + documents) into a freshly created `to` (see server `admin::dbs::clone_db`, ENH-009). */
   async cloneDb(from: string, to: string): Promise<void> {
-    const response = await this.fetchImpl(
+    const response = await this.doFetch(
       `${this.url}/admin/clone-db?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
       {
         method: "POST",
@@ -948,7 +975,7 @@ export class RtDbAdminClient {
    *  JSON `request` helper because the body is `application/octet-stream`. Error envelopes
    *  on non-OK still surface as `RtDbError` via `throwFromResponse`. */
   async downloadBackup(name: string): Promise<Response> {
-    const response = await this.fetchImpl(`${this.url}/admin/backups/${encodeURIComponent(name)}`, {
+    const response = await this.doFetch(`${this.url}/admin/backups/${encodeURIComponent(name)}`, {
       method: "GET",
       headers: this.authHeaders(),
       ...this.creds,
@@ -986,15 +1013,12 @@ export class RtDbAdminClient {
    *  back. The server enforces `maxFileSize` (413). Returns the new blob id. */
   async uploadFile(db: string, body: Blob | ArrayBuffer): Promise<{ id: string }> {
     const blob = body instanceof Blob ? body : new Blob([body]);
-    const response = await this.fetchImpl(
-      `${this.url}/admin/db/${encodeURIComponent(db)}/storage`,
-      {
-        method: "POST",
-        headers: { ...this.authHeaders(), "content-type": blob.type || "application/octet-stream" },
-        ...this.creds,
-        body: blob,
-      },
-    );
+    const response = await this.doFetch(`${this.url}/admin/db/${encodeURIComponent(db)}/storage`, {
+      method: "POST",
+      headers: { ...this.authHeaders(), "content-type": blob.type || "application/octet-stream" },
+      ...this.creds,
+      body: blob,
+    });
     if (!response.ok) {
       await this.throwFromResponse(response);
     }
@@ -1212,7 +1236,7 @@ export class RtDbAdminClient {
     path: string,
     payload?: unknown,
   ): Promise<unknown> {
-    const response = await this.fetchImpl(`${this.url}${path}`, {
+    const response = await this.doFetch(`${this.url}${path}`, {
       method,
       headers: {
         ...this.authHeaders(),
