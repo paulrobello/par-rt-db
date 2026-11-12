@@ -22,6 +22,12 @@ make install          # bun install + build the linked @par-rt-db/client SDK
 make dev              # vite on http://127.0.0.1:8310
 ```
 
+The dashboard imports `@par-rt-db/client` from the ts-client's build output
+(`ts-client/dist`, gitignored). `make install`'s `bun install` runs this
+package's `prepare` hook, which builds the SDK first; if `dist/` is ever
+missing or stale at gate time, the repo's `ts-dist-preflight` leg fails loudly
+naming the fix (`make ts-client-build`).
+
 Point at a different backend (default `http://127.0.0.1:8300`):
 
 ```bash
