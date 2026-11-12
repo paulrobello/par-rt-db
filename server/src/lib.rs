@@ -302,6 +302,9 @@ pub struct Limits {
 const OP_FEED_BROADCAST_CAP: usize = 1024;
 const OP_FEED_RING_CAP: usize = 500;
 
+/// Server-wide shared state: the Postgres pool, boot config, schema cache, and
+/// the grouped realtime/runtime/auth/limits handles, built once by
+/// [`AppState::new`].
 pub struct AppState {
     pub pool: sqlx::PgPool,
     pub config: Config,
@@ -321,6 +324,9 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Builds the shared [`AppState`] — caches, rate limiter, op feed,
+    /// committers — and spawns every background task it owns; returns it
+    /// `Arc`-wrapped for sharing across the HTTP and WS surfaces.
     pub fn new(pool: sqlx::PgPool, config: Config, hot: HotConfig) -> Arc<Self> {
         let schemas = SchemaCache::with_capacity(config.schema_cache_max_entries);
         let metrics = metrics::Metrics::with_slow_query_capacity(config.slow_query_capacity);
@@ -830,6 +836,8 @@ async fn prometheus_metrics_handler(
     (StatusCode::OK, h, body).into_response()
 }
 
+/// Assembles the complete axum [`Router`] — health/ops, client HTTP+WS, admin,
+/// storage, and the SPA static fallback — onto `state`.
 pub fn build_router(state: Arc<AppState>) -> Router {
     let cors = cors_layer(state.runtime.hot.clone());
 
