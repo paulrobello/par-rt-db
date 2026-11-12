@@ -1,7 +1,10 @@
-//! Wire vocabulary — the third implementation of the protocol contract
-//! (server `protocol.rs` first, TS `protocol.ts` second). Tags/fields are load-bearing.
+//! Wire vocabulary — the Rust client's HTTP/control-plane wire types plus
+//! re-exports of the core envelope vocabulary (ARC-008). The WS envelopes
+//! (`ClientMessage`/`ServerMessage`) are single-sourced in `par-rt-db-core`;
+//! the HTTP-only shapes here stay hand-mirrored against the server, and
+//! tags/fields are load-bearing.
 
-use crate::error::{ErrorEnvelope, RtDbError};
+use crate::error::ErrorEnvelope;
 use crate::mutation::Transaction;
 use crate::query::Query;
 use serde::{Deserialize, Serialize};
@@ -9,457 +12,31 @@ use serde::{Deserialize, Serialize};
 /// Alias kept for naming continuity with the server's protocol module.
 pub type QueryRef = Query;
 
-/// The wire protocol version this client speaks (ARC-013). Sent as
-/// `protocolVersion` on the WS `Auth` frame and as the `X-Rtdb-Protocol` HTTP
-/// header; a server whose `PROTOCOL_VERSION` is older rejects a value greater
-/// than its own with `UNSUPPORTED_PROTOCOL`. Mirrors server
-/// `protocol::PROTOCOL_VERSION`.
-///
-/// Version 3 (2026-09-22 presence deltas) adds the server's `presenceDelta`
-/// frame: the server emits it only to connections that authenticated with a
-/// version at or above its `PRESENCE_DELTA_MIN_VERSION` (3), so declaring 3
-/// here opts this client into deltas; every older client keeps receiving
-/// full `presenceSnapshot` frames.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// The wire protocol version this client speaks (ARC-013) — now the
+/// `par_rt_db_core::envelope` constant (ARC-008), re-exported here at its
+/// historical path. Sent as `protocolVersion` on the WS `Auth` frame and as
+/// the `X-Rtdb-Protocol` HTTP header.
+pub use par_rt_db_core::envelope::PROTOCOL_VERSION;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(
-    tag = "type",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-/// A client -> server `/sync` frame (tagged `{"type": "..."}`, camelCase).
-pub enum ClientMessage {
-    /// Authenticate the socket (first frame).
-    Auth {
-        // SEC-001 phase 2: optional — a browser dashboard authenticates over
-        // `/sync` from the HttpOnly cookie, sending only `db`. CLI/SDK/machine
-        // tokens still send `token` (the prior wire form); backward-compatible.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        /// Bearer token; `None` when authenticating from the session cookie.
-        token: Option<String>,
-        /// The database to authorize against.
-        db: String,
-        /// ARC-013: the protocol version this client speaks. Absent ⇒
-        /// version 1. A value greater than the server's `PROTOCOL_VERSION`
-        /// is rejected with `UNSUPPORTED_PROTOCOL`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        protocol_version: Option<u32>,
-    },
-    /// Start a live query subscription.
-    Subscribe {
-        /// Caller-chosen correlation id for subsequent updates.
-        query_id: String,
-        /// The built query.
-        query: Box<Query>,
-    },
-    /// Stop a subscription.
-    Unsubscribe {
-        /// The subscription to stop.
-        query_id: String,
-    },
-    /// Run a transaction.
-    Mutate {
-        /// Caller-chosen correlation id for the reply.
-        mut_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        /// Optional idempotency key (same key replays the cached result).
-        idempotency_key: Option<String>,
-        /// The transaction to apply.
-        txn: Transaction,
-    },
-    /// Schedule a transaction for later.
-    Schedule {
-        /// Caller-chosen correlation id for the reply.
-        schedule_id: String,
-        /// One-shot delay/absolute time, or cron.
-        when: ScheduleWhen,
-        /// The transaction to fire when due.
-        txn: Transaction,
-        /// External-claim job mode (2026-09-09): when set, the job is never
-        /// executed by the internal scheduler — an application worker claims
-        /// it via `POST /api/schedule/claim` and finalizes it with the returned
-        /// `leaseGeneration` fencing token. Omitted = ordinary internal job.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        external: Option<bool>,
-    },
-    /// Cancel a scheduled job.
-    CancelSchedule {
-        /// Correlation id for the reply.
-        schedule_id: String,
-        /// The job to cancel.
-        id: String,
-    },
-    /// Pause a cron job.
-    PauseSchedule {
-        /// Correlation id for the reply.
-        schedule_id: String,
-        /// The job to pause.
-        id: String,
-    },
-    /// Resume a paused cron job.
-    ResumeSchedule {
-        /// Correlation id for the reply.
-        schedule_id: String,
-        /// The job to resume.
-        id: String,
-    },
-    /// List scheduled jobs.
-    ListSchedules {
-        /// Correlation id for the reply.
-        schedule_id: String,
-    },
-    /// Start a durable workflow run.
-    StartWorkflow {
-        /// Caller-chosen correlation id for the reply.
-        workflow_id: String,
-        /// The run's spec (snapshotted server-side).
-        spec: WorkflowSpec,
-    },
-    /// Cancel a workflow run.
-    CancelWorkflow {
-        /// Correlation id for the reply.
-        workflow_id: String,
-        /// The run to cancel.
-        id: String,
-    },
-    /// Deliver a named signal to a waiting run (`awaitSignal` steps). The
-    /// reply reuses `ServerMessage::WorkflowAck`.
-    SignalWorkflow {
-        /// Correlation id for the reply.
-        workflow_id: String,
-        /// The waiting run to signal.
-        id: String,
-        /// The signal name (must match the step's `awaitSignal.name`).
-        name: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        /// Latest-wins payload; the step's outcome records it as `signal`.
-        payload: Option<serde_json::Value>,
-    },
-    /// List workflow runs.
-    ListWorkflows {
-        /// Correlation id for the reply.
-        workflow_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        /// Optional lifecycle filter.
-        status: Option<WorkflowStatus>,
-    },
-    /// Join a presence room (idempotent re-join refreshes `state`).
-    Presence {
-        /// Room name.
-        room: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        /// Opaque client-supplied presence blob.
-        state: Option<serde_json::Value>,
-    },
-    /// Update presence state without (re)joining.
-    PresenceState {
-        /// Room name.
-        room: String,
-        /// The new opaque blob (replaces the old).
-        state: serde_json::Value,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        /// Per-state expiry override.
-        ttl_ms: Option<u64>,
-    },
-    /// Leave a presence room.
-    LeavePresence {
-        /// Room to leave.
-        room: String,
-    },
-    /// Open a push channel over the durable change feed. `since` is the last
-    /// processed seq (omitted = start at the current head); `feed_epoch` is
-    /// the epoch a previous session saw (a mismatch answers
-    /// `CURSOR_EXPIRED`); `tables` filters server-side (empty = all).
-    FeedSubscribe {
-        /// Client-chosen feed id echoed on every reply frame.
-        feed_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        /// Resume cursor.
-        since: Option<i64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        /// Epoch of the log the cursor belongs to.
-        feed_epoch: Option<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        /// Server-side table filter.
-        tables: Vec<String>,
-    },
-    /// Flow-control acknowledgement: every op with `seq <= seq` is processed.
-    FeedAck {
-        /// Which feed.
-        feed_id: String,
-        /// Highest processed seq.
-        seq: i64,
-    },
-    /// Close a feed.
-    FeedUnsubscribe {
-        /// Which feed.
-        feed_id: String,
-    },
-    /// Keepalive; the server replies `Pong`.
-    Ping,
-}
+/// A client -> server `/sync` frame — now a `par_rt_db_core::envelope` type
+/// (ARC-008 — the WS envelope vocabulary is single-sourced in core, the same
+/// pattern as [`FilterExpr`]), re-exported here at its historical path so
+/// every existing `crate::wire::ClientMessage` call site keeps resolving.
+pub use par_rt_db_core::envelope::ClientMessage;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(
-    tag = "type",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-/// A server -> client `/sync` frame (tagged `{"type": "..."}`, camelCase).
-pub enum ServerMessage {
-    /// Authentication succeeded.
-    AuthOk {
-        /// The authed principal.
-        user: AuthedUser,
-        /// ARC-013: the server's `PROTOCOL_VERSION`, echoed back only when
-        /// this client's `Auth` frame carried a `protocolVersion`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        protocol_version: Option<u32>,
-    },
-    /// Authentication failed; the socket closes.
-    AuthErr {
-        /// Why.
-        error: RtDbError,
-    },
-    /// A live query's new result (sent only on change).
-    QueryUpdate {
-        /// Which subscription.
-        query_id: String,
-        /// The query's new full result value.
-        result: serde_json::Value,
-    },
-    /// Transaction applied; one entry per step.
-    MutateOk {
-        /// Correlation id from the request.
-        mut_id: String,
-        /// Positionally aligned step results.
-        results: Vec<serde_json::Value>,
-    },
-    /// Transaction failed and rolled back.
-    MutateErr {
-        /// Correlation id from the request.
-        mut_id: String,
-        /// Why.
-        error: RtDbError,
-    },
-    /// Subscription rejected (bad query, authz).
-    SubscribeErr {
-        /// Which subscription.
-        query_id: String,
-        /// Why.
-        error: RtDbError,
-    },
-    /// Job scheduled.
-    ScheduleOk {
-        /// Correlation id from the request.
-        schedule_id: String,
-        /// The created job's id.
-        id: String,
-    },
-    /// Scheduling failed.
-    ScheduleErr {
-        /// Correlation id from the request.
-        schedule_id: String,
-        /// Why.
-        error: RtDbError,
-    },
-    /// Reply to cancel/pause/resume. `error` is omitted on the wire when `ok`.
-    ScheduleAck {
-        /// Correlation id from the request.
-        schedule_id: String,
-        /// Whether the action applied.
-        ok: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        /// Why it failed (absent when ok).
-        error: Option<RtDbError>,
-    },
-    /// Reply to `listSchedules`.
-    ListSchedulesOk {
-        /// Correlation id from the request.
-        schedule_id: String,
-        /// All jobs for the db.
-        schedules: Vec<ScheduleInfo>,
-    },
-    /// Run started.
-    StartWorkflowOk {
-        /// Correlation id from the request.
-        workflow_id: String,
-        /// The run's initial info row.
-        info: WorkflowInfo,
-    },
-    /// Run rejected (spec validation, authz).
-    StartWorkflowErr {
-        /// Correlation id from the request.
-        workflow_id: String,
-        /// Why.
-        error: RtDbError,
-    },
-    /// Reply to cancelWorkflow — and, per the server's single-error-frame
-    /// design, to a failed `listWorkflows` too (no `listWorkflowsErr` frame
-    /// exists; the list's correlation id rides `StartWorkflowErr`). `error`
-    /// is omitted on the wire when `ok`.
-    WorkflowAck {
-        /// Correlation id from the request.
-        workflow_id: String,
-        /// Whether the action applied.
-        ok: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        /// Why it failed (absent when ok).
-        error: Option<RtDbError>,
-    },
-    /// Reply to `listWorkflows`.
-    ListWorkflowsOk {
-        /// Correlation id from the request.
-        workflow_id: String,
-        /// Matching runs, newest first.
-        workflows: Vec<WorkflowInfo>,
-    },
-    /// Full room membership (on join and on every change).
-    PresenceSnapshot {
-        /// Which room.
-        room: String,
-        /// Everyone currently in the room.
-        members: Vec<PresenceMember>,
-    },
-    /// Incremental room membership change, sent instead of a full
-    /// `PresenceSnapshot` to a connection the server knows is caught up
-    /// (its first broadcast for a room is always a full snapshot). `seq`
-    /// is a per-ROOM monotonic counter shared by every caught-up recipient:
-    /// it increments once per flush tick that had a prior baseline, so a
-    /// connection's first delta can arrive at any `seq`. It proves only
-    /// delta-to-delta contiguity — `PresenceSnapshot` carries no `seq` — so
-    /// a receiver detects a gap (`seq > last + 1`), discards its baseline,
-    /// and re-joins the room to force a fresh snapshot. Empty buckets are
-    /// omitted on the wire; the server emits this frame only to connections
-    /// that negotiated protocol version 3+ (ARC-013 gate). Mirrors server
-    /// `protocol.rs::ServerMessage::PresenceDelta`.
-    PresenceDelta {
-        /// Which room.
-        room: String,
-        /// Per-room broadcast counter (see above).
-        seq: u64,
-        /// Members that joined since the previous broadcast.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        joined: Vec<PresenceMember>,
-        /// Connection ids that left since the previous broadcast.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        left: Vec<String>,
-        /// Members whose `state` changed since the previous broadcast.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        state_changed: Vec<PresenceMember>,
-    },
-    /// Presence operation failed.
-    PresenceErr {
-        /// Which room.
-        room: String,
-        /// Why.
-        error: RtDbError,
-    },
-    /// One batch of durable change ops (oldest first, at-least-once). Dedupe
-    /// on `(feed_epoch, op.seq)`. The first frame after `FeedSubscribe` may
-    /// carry no ops (confirmation + head).
-    FeedEvents {
-        /// Which feed.
-        feed_id: String,
-        /// The change log's identity (`logId`).
-        feed_epoch: String,
-        /// The ops, oldest first.
-        ops: Vec<ChangeOp>,
-        /// The log's end when the batch was read.
-        head: i64,
-    },
-    /// Terminal feed failure; `CURSOR_EXPIRED` means resync over HTTP.
-    FeedErr {
-        /// Which feed.
-        feed_id: String,
-        /// Why.
-        error: RtDbError,
-    },
-    /// Reply to `Ping`.
-    Pong,
-}
+/// A server -> client `/sync` frame — now `par_rt_db_core::envelope`'s
+/// generic `ServerMessage<E, C>` (ARC-008), instantiated here with this
+/// client's error envelope and change-op types; the variant fields keep
+/// their exact serde shapes. Construction and pattern sites through
+/// `crate::wire::ServerMessage` keep working via the alias.
+pub type ServerMessage = par_rt_db_core::envelope::ServerMessage<crate::error::RtDbError, ChangeOp>;
 
-/// Whether an `AuthedUser` resolved from an OAuth session or a machine token.
-/// Mirrors `server/src/protocol.rs::UserKind` (ARC-004/QA-008): serializes as
-/// `"user"` / `"machine"`, byte-identical to the prior `String` form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UserKind {
-    /// An OAuth/anonymous session principal.
-    User,
-    /// A machine token principal.
-    Machine,
-}
-
-impl UserKind {
-    /// The wire string (`"user"` / `"machine"`).
-    pub fn as_wire_str(&self) -> &'static str {
-        match self {
-            UserKind::User => "user",
-            UserKind::Machine => "machine",
-        }
-    }
-}
-
-impl From<UserKind> for &'static str {
-    fn from(k: UserKind) -> &'static str {
-        k.as_wire_str()
-    }
-}
-
-impl std::str::FromStr for UserKind {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "user" => Ok(UserKind::User),
-            "machine" => Ok(UserKind::Machine),
-            other => Err(format!("unknown UserKind: {other}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-/// The authenticated principal returned by `authOk` / `GET /auth/me`.
-pub struct AuthedUser {
-    /// Session user or machine token.
-    pub kind: UserKind,
-    /// Email when known (always `None` for anonymous/machine).
-    pub email: Option<String>,
-    /// Display name when known.
-    pub name: Option<String>,
-    /// GitHub login. Absent on the wire for machine tokens / non-GitHub
-    /// users; serde defaults a missing field to `None` so this stays
-    /// backward-compatible with older servers that omit it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub github_login: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// GitHub numeric id when the login was via GitHub.
-    pub github_id: Option<i64>,
-    /// Stable opaque identity of a validated user principal (the server's
-    /// rtdb_auth.users.id). Absent on the wire for machine tokens; serde
-    /// defaults a missing field to `None` so this stays backward-compatible
-    /// with older servers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_id: Option<String>,
-}
-
-/// One entry in a presence room's member list. Mirrors
-/// `server/src/protocol.rs::PresenceMember` byte-for-byte (camelCase):
-/// `connectionId` is the opaque per-session key, `user` carries display
-/// identity, `state` is an opaque client-supplied blob.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PresenceMember {
-    /// Opaque per-session key (the liveness unit).
-    pub connection_id: String,
-    /// Who is connected.
-    pub user: AuthedUser,
-    /// Their opaque presence blob.
-    pub state: serde_json::Value,
-}
+/// `UserKind`, `AuthedUser`, and `PresenceMember` are now
+/// `par_rt_db_core::envelope` types (ARC-008), re-exported here at their
+/// historical paths so every existing `crate::wire::{..}` call site keeps
+/// resolving. Mirrored byte-for-byte by the server and the other five
+/// clients' wire modules.
+pub use par_rt_db_core::envelope::{AuthedUser, PresenceMember, UserKind};
 
 /// One committed change from the durable per-db change feed
 /// (`GET /api/db/{db}/changes`). Mirrors `server/src/change_log::ChangeRow`
@@ -595,48 +172,11 @@ pub enum OutcomeStatus {
     Failed,
 }
 
-/// List/get projection of one run (FM-29). Optional fields are omitted on the
-/// wire when absent. Mirrors `server/src/protocol.rs::WorkflowInfo`
-/// byte-for-byte.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkflowInfo {
-    /// Opaque run id.
-    pub id: String,
-    /// The spec's name.
-    pub name: String,
-    /// Lifecycle state.
-    pub status: WorkflowStatus,
-    /// 0-based index of the next/current step.
-    pub current_step: u32,
-    /// Total steps in the spec.
-    pub step_count: u32,
-    /// Current step's total attempts so far.
-    pub attempts: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Epoch-ms gate before the next advance.
-    pub sleep_until: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// The failure that ended the run.
-    pub last_error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// The signal name a `waiting` run is parked on.
-    pub waiting_for: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// When the run parked (epoch ms), while `waiting`.
-    pub waited_since: Option<i64>,
-    /// Submission time, epoch ms.
-    pub created_at: i64,
-    /// Last advance time, epoch ms.
-    pub updated_at: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// First advance time.
-    pub started_at: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Terminal transition time.
-    pub finished_at: Option<i64>,
-}
-
+/// `WorkflowInfo` is now a `par_rt_db_core::envelope` type (ARC-008 — the
+/// `StartWorkflowOk`/`ListWorkflowsOk` frame payload is part of the envelope
+/// vocabulary), re-exported at its historical path so every existing
+/// `crate::wire::WorkflowInfo` call site keeps resolving.
+pub use par_rt_db_core::envelope::WorkflowInfo;
 /// `GET .../{id}` shape: the info row plus the per-step outcome trail.
 /// Mirrors `server/src/protocol.rs::WorkflowInfoFull` byte-for-byte (the info
 /// fields flatten alongside `stepOutcomes`).
@@ -742,6 +282,7 @@ pub mod admin;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::RtDbError;
     use crate::mutation::Transaction;
     use crate::query::TableQuery;
     use serde_json::json;

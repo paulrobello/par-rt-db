@@ -9,6 +9,7 @@
 #![deny(warnings)]
 
 pub mod engine;
+pub mod envelope;
 pub mod field_guard;
 pub mod fields;
 pub mod host_capability;
