@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
-use crate::dsl::FilterExpr;
+use crate::dsl::{AggregateOp, AggregateSpec, FilterExpr, GroupBy};
 use crate::schema::{FieldType, OnDeleteAction, TableDef, indexed_column_type};
 use crate::txn::stamp_computed;
 use crate::value_expr::{CaseWhen, Cast, ValueExpr};
@@ -1188,6 +1188,680 @@ pub fn render_computed_stamping_spec() -> Result<String, serde_json::Error> {
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// ENH-052 family 3: aggregate terminals
+// ---------------------------------------------------------------------------
+//
+// The aggregate-terminal decision table: `count`/`sum`/`avg`/`min`/`max`
+// over a matching row set and over groups. On the server the terminal
+// compiles to SQL (`query/terminals.rs::compile_aggregate_*`) and Postgres
+// owns the reduction: SUM/AVG/MIN/MAX skip SQL NULLs and return NULL over an
+// empty or all-NULL input, COUNT(*) counts rows (0 over an empty match),
+// SUM/MIN/MAX over an int64 column project through the decimal-string wire
+// convention (exact past 2^53 and past i64::MAX), AVG over an int64 column
+// is a plain JSON number (the documented f64 form), and min/max return the
+// original column value. The reference reduction below encodes exactly those
+// wire-visible rules; its equivalence to the Postgres-backed execution is
+// pinned by `server/tests/query_test.rs` + `server/tests/aggregate_having_test.rs`
+// and the `aggregate-*` semantics cases, and the fixture pins the six client
+// in-memory aggregate ports to the same table. Two shapes Postgres cannot
+// put on the wire are excluded like family 2's two excluded rows: a float
+// sum overflowing to ±infinity fails the server query (`to_jsonb` cannot
+// encode infinity) while the engines deliberately return null — unpinned
+// here because the mirror's choice is not a server-observable value — and
+// text min/max, which the server orders by the column collation that no
+// client pins byte-safely (group keys stay ASCII letters for the same
+// reason).
+
+/// One representative `(op × input shape)` row: the wire schema fragment
+/// (`fields` + one btree `index`), the seed `docs`, the eq prefix, the wire
+/// [`AggregateSpec`], and the reference outcome. Order is the committed
+/// fixture's row order.
+struct AggregateSpecRow {
+    id: &'static str,
+    fields: BTreeMap<String, FieldType>,
+    index_name: &'static str,
+    index_fields: Vec<&'static str>,
+    docs: Vec<serde_json::Map<String, Value>>,
+    eq: Vec<Value>,
+    aggregate: AggregateSpec,
+}
+
+fn spec_row(
+    id: &'static str,
+    value_field: (&'static str, FieldType),
+    docs: &[(&str, Value)],
+    eq: &str,
+    aggregate: AggregateSpec,
+) -> AggregateSpecRow {
+    let (vname, vty) = value_field;
+    AggregateSpecRow {
+        id,
+        fields: spec_fields(&[("s", FieldType::String), (vname, vty.clone())]),
+        index_name: "by_s_v",
+        index_fields: vec!["s", vname],
+        docs: docs
+            .iter()
+            .map(|(s, v)| doc_sv(s, vname, v.clone()))
+            .collect(),
+        eq: vec![json!(eq)],
+        aggregate,
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn grouped_row(
+    id: &'static str,
+    value_field: (&'static str, FieldType),
+    docs: &[(Value, Value)],
+    aggregate: AggregateSpec,
+) -> AggregateSpecRow {
+    let (vname, vty) = value_field;
+    AggregateSpecRow {
+        // The group field is Optional so the null-key doc (JSON-null `s`)
+        // validates on insert.
+        id,
+        fields: spec_fields(&[("s", opt(FieldType::String)), (vname, vty.clone())]),
+        index_name: "by_s_v",
+        index_fields: vec!["s", vname],
+        docs: docs
+            .iter()
+            .map(|(s, v)| spec_doc(&[("s", s.clone()), (vname, v.clone())]))
+            .collect(),
+        eq: Vec::new(),
+        aggregate,
+    }
+}
+
+fn legacy_op(op: AggregateOp) -> AggregateSpec {
+    AggregateSpec {
+        op: Some(op),
+        aggregates: None,
+        group_by: GroupBy::Bool(false),
+        having: None,
+    }
+}
+
+fn legacy_op_grouped(op: AggregateOp) -> AggregateSpec {
+    AggregateSpec {
+        op: Some(op),
+        aggregates: None,
+        group_by: GroupBy::Bool(true),
+        having: None,
+    }
+}
+
+fn multi_op(ops: &[(&str, AggregateOp)]) -> AggregateSpec {
+    AggregateSpec {
+        op: None,
+        aggregates: Some(
+            ops.iter()
+                .map(|(a, op)| (a.to_string(), *op))
+                .collect::<BTreeMap<_, _>>(),
+        ),
+        group_by: GroupBy::Bool(false),
+        having: None,
+    }
+}
+
+fn doc_sv(s: &str, field: &str, v: Value) -> serde_json::Map<String, Value> {
+    spec_doc(&[("s", json!(s)), (field, v)])
+}
+
+#[allow(clippy::type_complexity)]
+fn grow_docs<const N: usize>(entries: [(Value, Value); N]) -> Vec<(Value, Value)> {
+    entries.to_vec()
+}
+
+/// The representative rows: every op over every input shape the wire outcome
+/// distinguishes (empty match, all-null, partial-null, float arithmetic,
+/// int64 exactness past 2^53 and past i64::MAX, booleans, grouped keys incl.
+/// a NULL-key group and an all-null group, and the wire-v2 multi-op object).
+/// Order is the committed fixture's row order.
+fn aggregate_spec_rows() -> Vec<AggregateSpecRow> {
+    let mut rows = Vec::new();
+    macro_rules! row {
+        ($id:expr, $vfield:expr, $docs:expr, $eq:expr, $agg:expr) => {
+            rows.push(spec_row($id, $vfield, &$docs, $eq, $agg));
+        };
+    }
+    macro_rules! grow {
+        ($id:expr, $vfield:expr, $docs:expr, $agg:expr) => {
+            rows.push(grouped_row($id, $vfield, &grow_docs($docs), $agg));
+        };
+    }
+
+    // -- Count: rows, not values; zero over an empty match -------------------
+    row!(
+        "count-empty-match-is-zero",
+        ("v", FieldType::Number),
+        [("todo", json!(3))],
+        "ghost",
+        legacy_op(AggregateOp::Count)
+    );
+    row!(
+        "count-counts-rows-not-values",
+        ("v", opt(FieldType::Number)),
+        [
+            ("todo", json!(3)),
+            ("todo", Value::Null),
+            ("todo", Value::Null)
+        ],
+        "todo",
+        legacy_op(AggregateOp::Count)
+    );
+
+    // -- Empty / all-null inputs: null, except count --------------------------
+    row!(
+        "sum-empty-match-null",
+        ("v", FieldType::Number),
+        [("todo", json!(3))],
+        "ghost",
+        legacy_op(AggregateOp::Sum)
+    );
+    row!(
+        "avg-empty-match-null",
+        ("v", FieldType::Number),
+        [("todo", json!(3))],
+        "ghost",
+        legacy_op(AggregateOp::Avg)
+    );
+    row!(
+        "min-empty-match-null",
+        ("v", FieldType::Number),
+        [("todo", json!(3))],
+        "ghost",
+        legacy_op(AggregateOp::Min)
+    );
+    row!(
+        "max-empty-match-null",
+        ("v", FieldType::Number),
+        [("todo", json!(3))],
+        "ghost",
+        legacy_op(AggregateOp::Max)
+    );
+    row!(
+        "sum-all-null-values-null",
+        ("v", opt(FieldType::Number)),
+        [("todo", Value::Null), ("todo", Value::Null)],
+        "todo",
+        legacy_op(AggregateOp::Sum)
+    );
+
+    // -- NULL values are skipped, not zero ------------------------------------
+    row!(
+        "min-ignores-null-values",
+        ("v", opt(FieldType::Number)),
+        [
+            ("todo", json!(5)),
+            ("todo", Value::Null),
+            ("todo", json!(2))
+        ],
+        "todo",
+        legacy_op(AggregateOp::Min)
+    );
+    row!(
+        "avg-skips-null-values",
+        ("v", opt(FieldType::Number)),
+        [
+            ("todo", json!(3)),
+            ("todo", Value::Null),
+            ("todo", json!(4))
+        ],
+        "todo",
+        legacy_op(AggregateOp::Avg)
+    );
+
+    // -- Float arithmetic: f64 sum, fractional/negative avg -------------------
+    row!(
+        "sum-float-fractional",
+        ("v", FieldType::Number),
+        [("todo", json!(2.5)), ("todo", json!(2))],
+        "todo",
+        legacy_op(AggregateOp::Sum)
+    );
+    row!(
+        "avg-float-negative-result",
+        ("v", FieldType::Number),
+        [("todo", json!(-3)), ("todo", json!(2.5))],
+        "todo",
+        legacy_op(AggregateOp::Avg)
+    );
+    row!(
+        "min-number-negative",
+        ("v", FieldType::Number),
+        [("todo", json!(5)), ("todo", json!(-5)), ("todo", json!(3))],
+        "todo",
+        legacy_op(AggregateOp::Min)
+    );
+    row!(
+        "max-number",
+        ("v", FieldType::Number),
+        [("todo", json!(5)), ("todo", json!(12)), ("todo", json!(3))],
+        "todo",
+        legacy_op(AggregateOp::Max)
+    );
+
+    // -- int64: decimal-string sum/min/max (exact past 2^53 and i64::MAX),
+    //    AVG as a plain JSON number -------------------------------------------
+    row!(
+        "sum-int64-exact-past-2^53",
+        ("v", FieldType::Int64),
+        [("todo", json!("9007199254740992")), ("todo", json!("1"))],
+        "todo",
+        legacy_op(AggregateOp::Sum)
+    );
+    row!(
+        "sum-int64-exact-past-i64-max",
+        ("v", FieldType::Int64),
+        [
+            ("todo", json!("9223372036854775807")),
+            ("todo", json!("9223372036854775807")),
+            ("todo", json!("9223372036854775807")),
+        ],
+        "todo",
+        legacy_op(AggregateOp::Sum)
+    );
+    row!(
+        "min-int64-decimal-string",
+        ("v", FieldType::Int64),
+        [
+            ("todo", json!("30")),
+            ("todo", json!("4")),
+            ("todo", json!("-7"))
+        ],
+        "todo",
+        legacy_op(AggregateOp::Min)
+    );
+    row!(
+        "max-int64-decimal-string",
+        ("v", FieldType::Int64),
+        [("todo", json!("30")), ("todo", json!("4"))],
+        "todo",
+        legacy_op(AggregateOp::Max)
+    );
+    row!(
+        "avg-int64-float-exact",
+        ("v", FieldType::Int64),
+        [("todo", json!("3")), ("todo", json!("4"))],
+        "todo",
+        legacy_op(AggregateOp::Avg)
+    );
+
+    // -- Booleans: false < true ------------------------------------------------
+    row!(
+        "min-boolean-false-beats-true",
+        ("v", FieldType::Boolean),
+        [("todo", json!(true)), ("todo", json!(false))],
+        "todo",
+        legacy_op(AggregateOp::Min)
+    );
+    row!(
+        "max-boolean-true-wins",
+        ("v", FieldType::Boolean),
+        [("todo", json!(false)), ("todo", json!(true))],
+        "todo",
+        legacy_op(AggregateOp::Max)
+    );
+
+    // -- Non-numeric rejection: sum/avg gate on the declared field type --------
+    row!(
+        "sum-over-text-field-rejected",
+        ("t", FieldType::String),
+        [("todo", json!("pear"))],
+        "todo",
+        legacy_op(AggregateOp::Sum)
+    );
+    row!(
+        "avg-over-boolean-field-rejected",
+        ("t", FieldType::Boolean),
+        [("todo", json!(true))],
+        "todo",
+        legacy_op(AggregateOp::Avg)
+    );
+
+    // -- Grouped (legacy groupBy: true): keys ascending, NULL key LAST,
+    //    all-null group values → null ------------------------------------------
+    grow!(
+        "grouped-sum-key-ascending",
+        ("v", FieldType::Number),
+        [
+            (json!("a"), json!(2)),
+            (json!("a"), json!(1.5)),
+            (json!("b"), json!(3.25))
+        ],
+        legacy_op_grouped(AggregateOp::Sum)
+    );
+    grow!(
+        "grouped-null-key-sorts-last",
+        ("v", opt(FieldType::Number)),
+        [(json!("a"), json!(2.5)), (Value::Null, json!(5.75))],
+        legacy_op_grouped(AggregateOp::Sum)
+    );
+    grow!(
+        "grouped-all-null-values-null",
+        ("v", opt(FieldType::Number)),
+        [(json!("a"), Value::Null), (json!("a"), Value::Null)],
+        legacy_op_grouped(AggregateOp::Sum)
+    );
+    grow!(
+        "grouped-count-counts-rows-per-group",
+        ("v", FieldType::Number),
+        [
+            (json!("a"), json!(1)),
+            (json!("a"), json!(2)),
+            (json!("b"), json!(3))
+        ],
+        legacy_op_grouped(AggregateOp::Count)
+    );
+
+    // -- Wire-v2 multi-op: one {alias: value} object, per-op conventions -------
+    row!(
+        "multi-op-count-and-int64-sum-object",
+        ("v", FieldType::Int64),
+        [
+            ("x", json!("6")),
+            ("x", json!("7")),
+            ("x", json!("9007199254740993")),
+        ],
+        "x",
+        multi_op(&[("n", AggregateOp::Count), ("total", AggregateOp::Sum)])
+    );
+
+    // The drift net: every AggregateOp variant must appear in a row (the
+    // guard below names every variant), and the seen-list assertion turns a
+    // missing representative into a generation failure.
+    let mut seen: Vec<AggregateOp> = Vec::new();
+    for r in &rows {
+        if let Some(op) = r.aggregate.op {
+            op_guard(op);
+            seen.push(op);
+        }
+        if let Some(map) = &r.aggregate.aggregates {
+            for op in map.values() {
+                op_guard(*op);
+                seen.push(*op);
+            }
+        }
+    }
+    for op in [
+        AggregateOp::Sum,
+        AggregateOp::Avg,
+        AggregateOp::Min,
+        AggregateOp::Max,
+        AggregateOp::Count,
+    ] {
+        assert!(
+            seen.contains(&op),
+            "no fixture row exercises aggregate op {op:?}"
+        );
+    }
+
+    rows
+}
+
+/// The compile-time drift net for the op set: names every `AggregateOp`
+/// variant so an added variant without a representative row fails this crate
+/// to compile.
+fn op_guard(op: AggregateOp) {
+    match op {
+        AggregateOp::Sum
+        | AggregateOp::Avg
+        | AggregateOp::Min
+        | AggregateOp::Max
+        | AggregateOp::Count => {}
+    }
+}
+
+/// Whether the declared field type qualifies for sum/avg (number/int64,
+/// looking through Optional like `query/terminals.rs::is_numeric_index_field`).
+fn is_numeric_decl(ty: &FieldType) -> bool {
+    match ty {
+        FieldType::Number | FieldType::Int64 => true,
+        FieldType::Optional { inner } => is_numeric_decl(inner),
+        _ => false,
+    }
+}
+
+/// Whether the declared field type projects sum/min/max through the int64
+/// decimal-string convention (same shape as
+/// `query/terminals.rs::is_int64_index_field`).
+fn is_int64_decl(ty: &FieldType) -> bool {
+    match ty {
+        FieldType::Int64 => true,
+        FieldType::Optional { inner } => is_int64_decl(inner),
+        _ => false,
+    }
+}
+
+/// One op over one row set. `Count` counts rows (the field values are
+/// irrelevant); the value ops skip nulls and return null over an empty or
+/// all-null input; int64 sums accumulate exactly; min/max return the
+/// original value under the column's ordering. The trailing `Count` arm
+/// keeps the match exhaustive and fails the row rather than guessing.
+fn reduce_op(
+    op: AggregateOp,
+    rows: &[&serde_json::Map<String, Value>],
+    int64: bool,
+    field: &str,
+) -> Result<Value, ()> {
+    if op == AggregateOp::Count {
+        return Ok(json!(rows.len()));
+    }
+    let values: Vec<&Value> = rows
+        .iter()
+        .map(|d| d.get(field).unwrap_or(&Value::Null))
+        .filter(|v| !v.is_null())
+        .collect();
+    if values.is_empty() {
+        return Ok(Value::Null);
+    }
+    match op {
+        AggregateOp::Sum if int64 => {
+            // Postgres SUM(int8) is exact numeric; i128 accumulation is exact
+            // for every i64-bounded input set.
+            let mut total: i128 = 0;
+            for v in &values {
+                total += v.as_str().and_then(|s| s.parse::<i128>().ok()).ok_or(())?;
+            }
+            Ok(json!(total.to_string()))
+        }
+        AggregateOp::Sum | AggregateOp::Avg => {
+            let mut sum = 0.0_f64;
+            for v in &values {
+                let x = if int64 {
+                    v.as_str().and_then(|s| s.parse::<f64>().ok())
+                } else {
+                    v.as_f64()
+                };
+                sum += x.ok_or(())?;
+            }
+            let out = if op == AggregateOp::Avg {
+                sum / values.len() as f64
+            } else {
+                sum
+            };
+            // Unpinnable on the wire (see the family header): the server
+            // query fails on infinite float aggregates while the mirrors
+            // return null. The matrix contains no such row; this arm exists
+            // so the evaluator cannot silently change the rule.
+            if out.is_nan() || out.is_infinite() {
+                return Ok(Value::Null);
+            }
+            serde_json::Number::from_f64(out)
+                .map(Value::Number)
+                .ok_or(())
+        }
+        AggregateOp::Min | AggregateOp::Max => {
+            let mut best = values[0];
+            for v in &values[1..] {
+                let c = if int64 {
+                    let (a, b) = (
+                        best.as_str()
+                            .and_then(|s| s.parse::<i128>().ok())
+                            .ok_or(())?,
+                        v.as_str().and_then(|s| s.parse::<i128>().ok()).ok_or(())?,
+                    );
+                    a.cmp(&b)
+                } else if best.is_boolean() && v.is_boolean() {
+                    u8::from(best.as_bool().unwrap_or(false))
+                        .cmp(&u8::from(v.as_bool().unwrap_or(false)))
+                } else {
+                    best.as_f64()
+                        .zip(v.as_f64())
+                        .and_then(|(x, y)| x.partial_cmp(&y))
+                        .ok_or(())?
+                };
+                // `c` orders best against v, so Min descends when v is
+                // SMALLER than the current best (c == Greater) and Max
+                // ascends when v is LARGER (c == Less).
+                if (op == AggregateOp::Min && c == std::cmp::Ordering::Greater)
+                    || (op == AggregateOp::Max && c == std::cmp::Ordering::Less)
+                {
+                    best = v;
+                }
+            }
+            Ok(best.clone())
+        }
+        AggregateOp::Count => Err(()),
+    }
+}
+
+/// The server-side reference reduction, mirroring the wire-visible Postgres
+/// semantics `compile_aggregate_*` relies on (see the family header): null
+/// inputs skipped, null over empty/all-null, count over rows, int64
+/// sum/min/max through decimal strings, min/max returning the original
+/// value, group keys ascending with NULL last.
+fn reference_aggregate(row: &AggregateSpecRow) -> Result<Value, ()> {
+    let grouped = matches!(row.aggregate.group_by, GroupBy::Bool(true));
+    let eq_field = row.index_fields[0];
+    let agg_field = row.index_fields[1];
+    let ty = row.fields.get(agg_field).ok_or(())?;
+    if (row.aggregate.op == Some(AggregateOp::Sum) || row.aggregate.op == Some(AggregateOp::Avg))
+        && !is_numeric_decl(ty)
+    {
+        return Err(());
+    }
+    let matched: Vec<&serde_json::Map<String, Value>> = if row.eq.is_empty() {
+        row.docs.iter().collect()
+    } else {
+        row.docs
+            .iter()
+            .filter(|d| {
+                d.get(eq_field)
+                    .map(|v| v == &row.eq[0])
+                    .unwrap_or(row.eq[0].is_null())
+            })
+            .collect()
+    };
+    let int64 = is_int64_decl(ty);
+    if !grouped {
+        return match (&row.aggregate.op, &row.aggregate.aggregates) {
+            (Some(op), _) => reduce_op(*op, &matched, int64, agg_field),
+            (None, Some(map)) => {
+                let mut out = serde_json::Map::new();
+                for (alias, op) in map {
+                    out.insert(alias.clone(), reduce_op(*op, &matched, int64, agg_field)?);
+                }
+                Ok(Value::Object(out))
+            }
+            (None, None) => Err(()),
+        };
+    }
+    // Grouped: group on index_fields[0], aggregate index_fields[1]. Keys
+    // ascend with the NULL group LAST (Postgres `ORDER BY k` NULLS LAST).
+    let mut groups: Vec<(Value, Vec<&serde_json::Map<String, Value>>)> = Vec::new();
+    for d in &matched {
+        let key = d.get(eq_field).unwrap_or(&Value::Null).clone();
+        if let Some(slot) = groups.iter_mut().find(|(k, _)| k == &key) {
+            slot.1.push(d);
+        } else {
+            groups.push((key, vec![d]));
+        }
+    }
+    groups.sort_by(|(a, _), (b, _)| match (a.is_null(), b.is_null()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => match (a.as_str(), b.as_str()) {
+            (Some(x), Some(y)) => x.cmp(y),
+            _ => match (a.as_f64(), b.as_f64()) {
+                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+                _ => u8::from(a.as_bool().unwrap_or(false))
+                    .cmp(&u8::from(b.as_bool().unwrap_or(false))),
+            },
+        },
+    });
+    let op = row.aggregate.op.ok_or(())?;
+    let mut out = Vec::with_capacity(groups.len());
+    for (k, rows) in groups {
+        let value = reduce_op(op, &rows, int64, agg_field)?;
+        out.push(json!({ "key": k, "value": value }));
+    }
+    Ok(Value::Array(out))
+}
+
+/// One fixture row per representative: the wire schema fragment (`fields` +
+/// one btree `index`), the seed `docs`, the eq prefix, the wire
+/// [`AggregateSpec`], and the outcome — the bare aggregate wire value
+/// (scalar, `{alias: value}` object, or `[{key, value}, …]` group rows) or
+/// `{"error": true}`.
+fn aggregate_spec_fixture_rows() -> Result<Vec<Value>, serde_json::Error> {
+    let mut rows = Vec::new();
+    for row in aggregate_spec_rows() {
+        let index = json!({
+            "name": row.index_name,
+            "fields": row.index_fields,
+        });
+        let expect = match reference_aggregate(&row) {
+            Ok(value) => value,
+            Err(()) => json!({ "error": true }),
+        };
+        rows.push(json!({
+            "id": row.id,
+            "fields": serde_json::to_value(&row.fields)?,
+            "index": index,
+            "docs": row.docs,
+            "eq": row.eq,
+            "aggregate": serde_json::to_value(&row.aggregate)?,
+            "expect": expect,
+        }));
+    }
+    Ok(rows)
+}
+
+/// Render the committed fixture's exact bytes (pretty JSON + trailing
+/// newline).
+pub fn render_aggregate_terminals_spec() -> Result<String, serde_json::Error> {
+    let doc = json!({
+        "$comment": "SPEC-TABLE CORPUS (ENH-052 family 3) — GENERATED, do not edit. \
+                     The aggregate-terminal decision table (count/sum/avg/min/max over a \
+                     matching set and over groups), computed from the server's reference \
+                     reduction of the SQL that query/terminals.rs::compile_aggregate_* \
+                     emits (see server/src/spec_corpus.rs) by \
+                     'make gen-spec-aggregate-terminals'. The wire-visible Postgres rules \
+                     pinned per row: SUM/AVG/MIN/MAX skip nulls and return null over an \
+                     empty or all-null input, COUNT counts rows (zero over an empty match), \
+                     SUM/MIN/MAX over an int64 field project through the exact \
+                     decimal-string wire convention (past 2^53 and past i64::MAX), AVG over \
+                     an int64 field is a plain JSON number, min/max return the original \
+                     value, booleans order false < true, group keys ascend with the NULL \
+                     group LAST, and sum/avg over a non-numeric field fail \
+                     (BAD_REQUEST). Each runner pushes the row's schema fragment, inserts \
+                     the docs, runs the aggregate query through its own engine, and asserts \
+                     the bare wire value (`expect.error` rows assert the failure). Two \
+                     shapes Postgres cannot put on the wire are deliberately excluded: a \
+                     float sum overflowing to infinity (the server query fails; the engines \
+                     return null) and text min/max (server collation is not pinned \
+                     cross-language). A semantics change regenerates this file in the same \
+                     commit — see wire-corpus/README.md 'Spec-table corpus'.",
+        "rows": aggregate_spec_fixture_rows()?,
+    });
+    let mut out = serde_json::to_string_pretty(&doc)?;
+    out.push('\n');
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     /// The server IS the source: the committed fixture must equal a fresh
@@ -1201,6 +1875,19 @@ mod tests {
             committed, generated,
             "wire-corpus/spec/computed-stamping.json is stale — run \
              'make gen-spec-computed-stamping' and commit the result"
+        );
+    }
+
+    /// Family 3's in-crate pin: same property as family 2's test above, for
+    /// the aggregate fixture.
+    #[test]
+    fn committed_aggregate_terminals_fixture_matches_generation() {
+        let committed = include_str!("../../wire-corpus/spec/aggregate-terminals.json");
+        let generated = super::render_aggregate_terminals_spec().expect("render spec fixture");
+        assert_eq!(
+            committed, generated,
+            "wire-corpus/spec/aggregate-terminals.json is stale — run \
+             'make gen-spec-aggregate-terminals' and commit the result"
         );
     }
 }

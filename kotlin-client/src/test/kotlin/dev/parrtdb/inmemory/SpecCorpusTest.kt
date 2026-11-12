@@ -4,8 +4,14 @@ import dev.parrtdb.corpus.Compare
 import dev.parrtdb.corpus.CorpusPaths
 import dev.parrtdb.errors.ErrorCode
 import dev.parrtdb.errors.RtDbException
+import dev.parrtdb.wire.Query
+import dev.parrtdb.wire.Step
+import dev.parrtdb.wire.Transaction
 import dev.parrtdb.wire.ValueExpr
 import dev.parrtdb.wire.WireJson
+import dev.parrtdb.wire.jsonArr
+import dev.parrtdb.wire.jsonObj
+import dev.parrtdb.wire.jsonStr
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
@@ -250,3 +256,82 @@ class ComputedStampingSpecCorpusTest {
 
 /** Reads a JSON number primitive as a Long (epoch-ms / small fixture values). */
 private fun JsonElement.jsonLong(): Long = (this as JsonPrimitive).content.toLong()
+
+/**
+ * ENH-052 family 3 — aggregate-terminals spec-table runner:
+ * wire-corpus/spec/aggregate-terminals.json. Each row pushes its schema
+ * fragment, inserts the docs through the real write path, runs the
+ * aggregate query through `InMemoryClient.query`, and asserts the bare wire
+ * value (`expect.error` rows assert the failure).
+ */
+class AggregateTerminalsSpecCorpusTest {
+    private fun rows(): List<JsonObject> {
+        val doc = WireJson.parse(CorpusPaths.read("spec", "aggregate-terminals.json")) as? JsonObject
+            ?: error("aggregate terminals corpus is not a JSON object")
+        val arr = doc["rows"] as? JsonArray ?: error("spec corpus has no rows array")
+        return arr.map { it as JsonObject }
+    }
+
+    private fun newClient(): InMemoryClient {
+        var clock = 1_700_000_000_000L
+        return InMemoryClient(InMemoryOptions(now = { ++clock }, random = { 0.0 }))
+    }
+
+    private fun aggOp(row: JsonObject, op: String): Boolean {
+        val agg = row["aggregate"] as JsonObject
+        (agg["op"] as? JsonPrimitive)?.let { if (it.content == op) return true }
+        (agg["aggregates"] as? JsonObject)?.forEach { (_, v) ->
+            if ((v as JsonPrimitive).content == op) return true
+        }
+        return false
+    }
+
+    /** The corpus README's own-op coverage rule. */
+    @Test
+    fun everyAggregateOpHasAFixtureRow() {
+        for (op in listOf("sum", "avg", "min", "max", "count")) {
+            assertTrue(rows().any { aggOp(it, op) }, "no fixture row exercises aggregate op '$op'")
+        }
+    }
+
+    @Test
+    fun everyRowMatchesThisEngine() {
+        for ((i, row) in rows().withIndex()) {
+            val id = (row["id"] as JsonPrimitive).content
+            val index = row["index"] as JsonObject
+            val client = newClient()
+            client.pushSchema(
+                jsonObj(
+                    "tables" to jsonObj(
+                        "items" to jsonObj(
+                            "fields" to row["fields"]!!,
+                            "indexes" to jsonArr(
+                                listOf(jsonObj("name" to index["name"]!!, "fields" to index["fields"]!!)),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            val docs = (row["docs"] as JsonArray).toList()
+            client.mutate(Transaction(listOf(Step.InsertMany("items", docs))))
+            val q =
+                Query.fromJson(
+                    jsonObj(
+                        "table" to jsonStr("items"),
+                        "index" to index["name"]!!,
+                        "eq" to row["eq"]!!,
+                        "aggregate" to row["aggregate"]!!,
+                    ),
+                )
+            val expect = row["expect"]!!
+            val isErrRow = expect is JsonObject && expect.containsKey("error")
+            if (isErrRow) {
+                assertFailsWith<RtDbException>("row $i ($id): expected the aggregate to fail") {
+                    client.query(q)
+                }
+                continue
+            }
+            assertEquals(expect, client.query(q), "row $i ($id): aggregate result")
+        }
+    }
+}

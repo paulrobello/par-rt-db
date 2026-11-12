@@ -240,7 +240,7 @@ func compareIndexValues(_ left: JSONValue, _ right: JSONValue, _ pg: PgType?) ->
         if first == second {
             return 0
         }
-        return first ? -1 : 1 // false sorts before true
+        return first ? 1 : -1 // false sorts before true
     default:
         // Mixed kinds (never produced by a typed scan): JS relational ops on
         // mixed types coerce to NaN and compare false both ways.

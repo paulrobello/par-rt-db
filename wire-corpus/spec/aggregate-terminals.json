@@ -1,0 +1,1053 @@
+{
+  "$comment": "SPEC-TABLE CORPUS (ENH-052 family 3) — GENERATED, do not edit. The aggregate-terminal decision table (count/sum/avg/min/max over a matching set and over groups), computed from the server's reference reduction of the SQL that query/terminals.rs::compile_aggregate_* emits (see server/src/spec_corpus.rs) by 'make gen-spec-aggregate-terminals'. The wire-visible Postgres rules pinned per row: SUM/AVG/MIN/MAX skip nulls and return null over an empty or all-null input, COUNT counts rows (zero over an empty match), SUM/MIN/MAX over an int64 field project through the exact decimal-string wire convention (past 2^53 and past i64::MAX), AVG over an int64 field is a plain JSON number, min/max return the original value, booleans order false < true, group keys ascend with the NULL group LAST, and sum/avg over a non-numeric field fail (BAD_REQUEST). Each runner pushes the row's schema fragment, inserts the docs, runs the aggregate query through its own engine, and asserts the bare wire value (`expect.error` rows assert the failure). Two shapes Postgres cannot put on the wire are deliberately excluded: a float sum overflowing to infinity (the server query fails; the engines return null) and text min/max (server collation is not pinned cross-language). A semantics change regenerates this file in the same commit — see wire-corpus/README.md 'Spec-table corpus'.",
+  "rows": [
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "count"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "v": 3
+        }
+      ],
+      "eq": [
+        "ghost"
+      ],
+      "expect": 0,
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        }
+      },
+      "id": "count-empty-match-is-zero",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "count"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "v": 3
+        },
+        {
+          "s": "todo",
+          "v": null
+        },
+        {
+          "s": "todo",
+          "v": null
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": 3,
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "count-counts-rows-not-values",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "sum"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "v": 3
+        }
+      ],
+      "eq": [
+        "ghost"
+      ],
+      "expect": null,
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        }
+      },
+      "id": "sum-empty-match-null",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "avg"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "v": 3
+        }
+      ],
+      "eq": [
+        "ghost"
+      ],
+      "expect": null,
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        }
+      },
+      "id": "avg-empty-match-null",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "min"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "v": 3
+        }
+      ],
+      "eq": [
+        "ghost"
+      ],
+      "expect": null,
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        }
+      },
+      "id": "min-empty-match-null",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "max"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "v": 3
+        }
+      ],
+      "eq": [
+        "ghost"
+      ],
+      "expect": null,
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        }
+      },
+      "id": "max-empty-match-null",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "sum"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "v": null
+        },
+        {
+          "s": "todo",
+          "v": null
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": null,
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "sum-all-null-values-null",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "min"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "v": 5
+        },
+        {
+          "s": "todo",
+          "v": null
+        },
+        {
+          "s": "todo",
+          "v": 2
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": 2,
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "min-ignores-null-values",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "avg"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "v": 3
+        },
+        {
+          "s": "todo",
+          "v": null
+        },
+        {
+          "s": "todo",
+          "v": 4
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": 3.5,
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "avg-skips-null-values",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "sum"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "v": 2.5
+        },
+        {
+          "s": "todo",
+          "v": 2
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": 4.5,
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        }
+      },
+      "id": "sum-float-fractional",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "avg"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "v": -3
+        },
+        {
+          "s": "todo",
+          "v": 2.5
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": -0.25,
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        }
+      },
+      "id": "avg-float-negative-result",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "min"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "v": 5
+        },
+        {
+          "s": "todo",
+          "v": -5
+        },
+        {
+          "s": "todo",
+          "v": 3
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": -5,
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        }
+      },
+      "id": "min-number-negative",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "max"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "v": 5
+        },
+        {
+          "s": "todo",
+          "v": 12
+        },
+        {
+          "s": "todo",
+          "v": 3
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": 12,
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        }
+      },
+      "id": "max-number",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "sum"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "v": "9007199254740992"
+        },
+        {
+          "s": "todo",
+          "v": "1"
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": "9007199254740993",
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "int64"
+        }
+      },
+      "id": "sum-int64-exact-past-2^53",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "sum"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "v": "9223372036854775807"
+        },
+        {
+          "s": "todo",
+          "v": "9223372036854775807"
+        },
+        {
+          "s": "todo",
+          "v": "9223372036854775807"
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": "27670116110564327421",
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "int64"
+        }
+      },
+      "id": "sum-int64-exact-past-i64-max",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "min"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "v": "30"
+        },
+        {
+          "s": "todo",
+          "v": "4"
+        },
+        {
+          "s": "todo",
+          "v": "-7"
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": "-7",
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "int64"
+        }
+      },
+      "id": "min-int64-decimal-string",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "max"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "v": "30"
+        },
+        {
+          "s": "todo",
+          "v": "4"
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": "30",
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "int64"
+        }
+      },
+      "id": "max-int64-decimal-string",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "avg"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "v": "3"
+        },
+        {
+          "s": "todo",
+          "v": "4"
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": 3.5,
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "int64"
+        }
+      },
+      "id": "avg-int64-float-exact",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "min"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "v": true
+        },
+        {
+          "s": "todo",
+          "v": false
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": false,
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "boolean"
+        }
+      },
+      "id": "min-boolean-false-beats-true",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "max"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "v": false
+        },
+        {
+          "s": "todo",
+          "v": true
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": true,
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "boolean"
+        }
+      },
+      "id": "max-boolean-true-wins",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "sum"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "t": "pear"
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "error": true
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "t": {
+          "type": "string"
+        }
+      },
+      "id": "sum-over-text-field-rejected",
+      "index": {
+        "fields": [
+          "s",
+          "t"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": false,
+        "op": "avg"
+      },
+      "docs": [
+        {
+          "s": "todo",
+          "t": true
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "error": true
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "t": {
+          "type": "boolean"
+        }
+      },
+      "id": "avg-over-boolean-field-rejected",
+      "index": {
+        "fields": [
+          "s",
+          "t"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": true,
+        "op": "sum"
+      },
+      "docs": [
+        {
+          "s": "a",
+          "v": 2
+        },
+        {
+          "s": "a",
+          "v": 1.5
+        },
+        {
+          "s": "b",
+          "v": 3.25
+        }
+      ],
+      "eq": [],
+      "expect": [
+        {
+          "key": "a",
+          "value": 3.5
+        },
+        {
+          "key": "b",
+          "value": 3.25
+        }
+      ],
+      "fields": {
+        "s": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "v": {
+          "type": "number"
+        }
+      },
+      "id": "grouped-sum-key-ascending",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": true,
+        "op": "sum"
+      },
+      "docs": [
+        {
+          "s": "a",
+          "v": 2.5
+        },
+        {
+          "s": null,
+          "v": 5.75
+        }
+      ],
+      "eq": [],
+      "expect": [
+        {
+          "key": "a",
+          "value": 2.5
+        },
+        {
+          "key": null,
+          "value": 5.75
+        }
+      ],
+      "fields": {
+        "s": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "v": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "grouped-null-key-sorts-last",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": true,
+        "op": "sum"
+      },
+      "docs": [
+        {
+          "s": "a",
+          "v": null
+        },
+        {
+          "s": "a",
+          "v": null
+        }
+      ],
+      "eq": [],
+      "expect": [
+        {
+          "key": "a",
+          "value": null
+        }
+      ],
+      "fields": {
+        "s": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "v": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "grouped-all-null-values-null",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "groupBy": true,
+        "op": "count"
+      },
+      "docs": [
+        {
+          "s": "a",
+          "v": 1
+        },
+        {
+          "s": "a",
+          "v": 2
+        },
+        {
+          "s": "b",
+          "v": 3
+        }
+      ],
+      "eq": [],
+      "expect": [
+        {
+          "key": "a",
+          "value": 2
+        },
+        {
+          "key": "b",
+          "value": 1
+        }
+      ],
+      "fields": {
+        "s": {
+          "inner": {
+            "type": "string"
+          },
+          "type": "optional"
+        },
+        "v": {
+          "type": "number"
+        }
+      },
+      "id": "grouped-count-counts-rows-per-group",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    },
+    {
+      "aggregate": {
+        "aggregates": {
+          "n": "count",
+          "total": "sum"
+        },
+        "groupBy": false
+      },
+      "docs": [
+        {
+          "s": "x",
+          "v": "6"
+        },
+        {
+          "s": "x",
+          "v": "7"
+        },
+        {
+          "s": "x",
+          "v": "9007199254740993"
+        }
+      ],
+      "eq": [
+        "x"
+      ],
+      "expect": {
+        "n": 3,
+        "total": "9007199254741006"
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "int64"
+        }
+      },
+      "id": "multi-op-count-and-int64-sum-object",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      }
+    }
+  ]
+}

@@ -377,6 +377,26 @@ gen-spec-computed-stamping-check:
 		exit $$status; \
 	fi
 
+# ENH-052 family 3: wire-corpus/spec/aggregate-terminals.json — the aggregate
+# terminal decision table (count/sum/avg/min/max over row sets and groups),
+# generated from the server's reference reduction of the aggregate SQL
+# semantics (see server/src/spec_corpus.rs). Run after any aggregate-terminal
+# semantics change, in the same change. The -check leg in checkall fails when
+# the committed fixture disagrees with a fresh generation.
+gen-spec-aggregate-terminals:
+	cd server && cargo run --quiet --bin gen-spec-aggregate-terminals
+
+gen-spec-aggregate-terminals-check:
+	@tmpdir=$$(mktemp -d); \
+	if (cd server && cargo run --quiet --bin gen-spec-aggregate-terminals -- --out "$$tmpdir/aggregate-terminals.json") \
+		&& diff -u wire-corpus/spec/aggregate-terminals.json "$$tmpdir/aggregate-terminals.json"; then \
+		rm -rf "$$tmpdir"; \
+	else \
+		status=$$?; rm -rf "$$tmpdir"; \
+		echo "wire-corpus/spec/aggregate-terminals.json is stale — run 'make gen-spec-aggregate-terminals' and commit the result" >&2; \
+		exit $$status; \
+	fi
+
 # Kotlin/JVM client. The Gradle wrapper pins Gradle itself; the only host
 # requirement is a JDK 17+ (CI installs Temurin 21). Compiler warnings are
 # errors (build.gradle.kts), so compile doubles as lint and typecheck, and the
@@ -537,7 +557,8 @@ hostname-leak-check:
 ts-dist-preflight:
 	./scripts/ts-dist-preflight.sh
 
-checkall: ts-dist-preflight env-drift-check dockerfile-stub-check backup-persistence-check hostname-leak-check cli-docs-check gen-error-codes-ts-check gen-error-codes-rust-check gen-spec-index-column-types-check gen-spec-computed-stamping-check docs-api fmt-check lint typecheck test rust-client-check-features publish-check dev-db-clean-check
+checkall: ts-dist-preflight env-drift-check dockerfile-stub-check backup-persistence-check hostname-leak-check cli-docs-check gen-error-codes-ts-check gen-error-codes-rust-check gen-spec-index-column-types-check gen-spec-computed-stamping-check \
+	gen-spec-aggregate-terminals-check docs-api fmt-check lint typecheck test rust-client-check-features publish-check dev-db-clean-check
 	@mkdir -p target && echo "$(GATE_KEY)" > $(GATE_STAMP)
 
 # Content-addressed gate reuse for deploys: `checkall` stamps the gate key

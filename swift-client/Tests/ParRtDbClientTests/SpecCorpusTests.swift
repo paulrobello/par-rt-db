@@ -241,3 +241,135 @@ struct ComputedStampingSpecCorpusTests {
         }
     }
 }
+
+/// The schema JSON object the aggregate rows' fragments decode through: the
+/// same shape pushSchema parses (file scope keeps swiftlint's nesting rule
+/// happy).
+private struct AggregateIndexFragment: Codable {
+    let name: String
+    let fields: [String]
+}
+
+private struct AggregateSchemaFragment: Encodable {
+    struct Table: Encodable {
+        let fields: JSONValue
+        let indexes: [AggregateIndexFragment]
+    }
+
+    let tables: [String: Table]
+}
+
+/// ENH-052 family 3 — aggregate-terminals spec-table runner:
+/// wire-corpus/spec/aggregate-terminals.json. Each row pushes its schema
+/// fragment, inserts the docs through the real write path, runs the
+/// aggregate query through `query`, and asserts the bare wire value
+/// (`expect.error` rows assert the failure).
+struct AggregateTerminalsSpecCorpusTests {
+    private struct SpecDoc: Decodable {
+        let rows: [SpecRow]
+    }
+
+    private struct SpecRow: Decodable {
+        let id: String
+        let fields: JSONValue
+        let index: IndexFragment
+        let docs: [JSONValue]
+        let eq: [JSONValue]
+        let aggregate: JSONValue
+        let expect: JSONValue
+    }
+
+    private typealias IndexFragment = AggregateIndexFragment
+
+    /// The schema JSON object the row's fragment decodes through: the same
+    /// shape pushSchema parses.
+    private typealias SchemaFragment = AggregateSchemaFragment
+
+    private struct QueryWire: Encodable {
+        let table: String
+        let index: String
+        let eq: [JSONValue]
+        let aggregate: JSONValue
+    }
+
+    private func loadCorpus() throws -> SpecDoc {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // ParRtDbClientTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // swift-client
+            .deletingLastPathComponent() // repo root
+            .appendingPathComponent("wire-corpus/spec/aggregate-terminals.json")
+        return try JSONDecoder().decode(SpecDoc.self, from: Data(contentsOf: url))
+    }
+
+    private static let ownOps = ["sum", "avg", "min", "max", "count"]
+
+    /// The corpus README's own-op coverage rule.
+    @Test func everyAggregateOpHasAFixtureRow() throws {
+        let corpus = try loadCorpus()
+        var seen = Set<String>()
+        for row in corpus.rows {
+            if case let .object(agg) = row.aggregate {
+                if case let .string(op) = agg["op"] {
+                    seen.insert(op)
+                }
+                if case let .object(map) = agg["aggregates"] {
+                    for opValue in map.values {
+                        if case let .string(op) = opValue {
+                            seen.insert(op)
+                        }
+                    }
+                }
+            }
+        }
+        for op in Self.ownOps {
+            #expect(seen.contains(op), "no fixture row exercises aggregate op '\(op)'")
+        }
+    }
+
+    @Test func everyRowMatchesThisEngine() throws {
+        let corpus = try loadCorpus()
+        for (rowIndex, row) in corpus.rows.enumerated() {
+            let clock = MonotonicMs(1_700_000_000_000)
+            let client = InMemoryRtDbClient(options: InMemoryRtDbClientOptions(
+                now: { clock.next() },
+                random: { 0 }
+            ))
+            let schemaData = try JSONEncoder().encode(SchemaFragment(tables: [
+                "items": .init(fields: row.fields, indexes: [row.index])
+            ]))
+            let schema = try JSONDecoder().decode(SchemaDef.self, from: schemaData)
+            try client.pushSchema(schema)
+
+            let docs: [[String: JSONValue]] = try row.docs.map { doc in
+                guard case let .object(object) = doc else {
+                    struct DocShapeFailure: Error {}
+                    throw DocShapeFailure()
+                }
+                return object
+            }
+            _ = try client.mutate(Transaction(steps: [.insertMany(table: "items", docs: docs)]))
+
+            let queryData = try JSONEncoder().encode(QueryWire(
+                table: "items",
+                index: row.index.name,
+                eq: row.eq,
+                aggregate: row.aggregate
+            ))
+            let query = try JSONDecoder().decode(Query.self, from: queryData)
+
+            var isErrRow = false
+            if case let .object(expect) = row.expect, expect["error"] != nil {
+                isErrRow = true
+            }
+            if isErrRow {
+                #expect(throws: (any Error).self, "\(row.id): expected the aggregate to fail") {
+                    _ = try client.query(query)
+                }
+                continue
+            }
+            let result = try client.query(query)
+            #expect(result == row.expect, "\(rowIndex) (\(row.id)): aggregate result")
+        }
+    }
+}

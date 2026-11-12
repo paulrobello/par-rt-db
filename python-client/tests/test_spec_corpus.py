@@ -160,3 +160,84 @@ def test_every_computed_stamping_row_matches_this_engine() -> None:
             else:
                 assert name in stamped, f"row {i}: missing computed key '{name}'"
                 assert stamped[name] == expected, f"row {i}: stamped value of '{name}'"
+
+
+def _aggregate_corpus() -> dict[str, Any]:
+    path = Path(__file__).resolve().parents[2] / "wire-corpus" / "spec" / "aggregate-terminals.json"
+    return json.loads(path.read_text())
+
+
+def test_every_aggregate_op_has_a_fixture_row() -> None:
+    """The corpus README's own-op coverage rule: every AggregateOp this
+    engine distinguishes must be exercised by a fixture row."""
+    seen: set[str] = set()
+    for row in _aggregate_corpus()["rows"]:
+        agg = row["aggregate"]
+        if "op" in agg:
+            seen.add(agg["op"])
+        for op in (agg.get("aggregates") or {}).values():
+            seen.add(op)
+    for op in ("sum", "avg", "min", "max", "count"):
+        assert op in seen, f"no fixture row exercises aggregate op '{op}'"
+
+
+def test_every_aggregate_row_matches_this_engine() -> None:
+    """Each row pushes its schema fragment, inserts the docs through the real
+    write path, runs the aggregate query through ``run_query``, and asserts
+    the bare wire value (``expect.error`` rows assert the failure)."""
+    from pydantic import ValidationError
+
+    from par_rt_db.in_memory import InMemoryRtDbClient
+    from par_rt_db.in_memory.store import InMemoryRtDbClientOptions
+    from par_rt_db.mutation import Mutation
+    from par_rt_db.query import Query
+    from par_rt_db.schema import SchemaDef
+
+    def make_runner(client: Any) -> Any:
+        """A shape Query validates eagerly raises at model_validate; both
+        that and an execution-time rejection surface as RtDbError."""
+
+        def run_query(q_json: dict[str, Any]) -> Any:
+            try:
+                q = Query.model_validate(q_json)
+            except ValidationError as err:
+                raise RtDbError(ErrorCode.BAD_REQUEST, str(err)) from err
+            return client.run_query(q)
+
+        return run_query
+
+    for i, row in enumerate(_aggregate_corpus()["rows"]):
+        ms = 1_700_000_000_000
+
+        def _now() -> int:
+            nonlocal ms
+            ms += 1
+            return ms
+
+        client = InMemoryRtDbClient(InMemoryRtDbClientOptions(now=_now, random=lambda: 0.0))
+        client.push_schema(
+            SchemaDef.model_validate(
+                {
+                    "tables": {
+                        "items": {
+                            "fields": row["fields"],
+                            "indexes": [row["index"]],
+                        }
+                    }
+                }
+            )
+        )
+        client.mutate(Mutation.builder().insert_many("items", row["docs"]).build())
+        q_json = {
+            "table": "items",
+            "index": row["index"]["name"],
+            "eq": row["eq"],
+            "aggregate": row["aggregate"],
+        }
+        run_query = make_runner(client)
+        expect = row["expect"]
+        if isinstance(expect, dict) and "error" in expect:
+            with pytest.raises(RtDbError):
+                run_query(q_json)
+            continue
+        assert run_query(q_json) == expect, f"row {i} ({row['id']}): aggregate result"

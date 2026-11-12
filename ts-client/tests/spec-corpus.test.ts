@@ -2,9 +2,16 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { RtDbError } from "../src/errors.js";
+import { InMemoryRtDbClient } from "../src/in_memory/index.js";
 import { stampComputed } from "../src/in_memory/doc_stamp.js";
 import { indexColumnType, type PgType } from "../src/in_memory/validate.js";
-import type { FieldTypeJson, TableJson, ValueExprJson } from "../src/protocol.js";
+import type {
+  FieldTypeJson,
+  IndexJson,
+  SchemaJson,
+  TableJson,
+  ValueExprJson,
+} from "../src/protocol.js";
 
 /**
  * ENH-052 family 1 — spec-table corpus runner: asserts this engine's
@@ -202,6 +209,72 @@ describe("spec corpus: computed stamping", () => {
         );
       }
       assertStamped(row, stamped);
+    }
+  });
+});
+
+describe("spec corpus: aggregate terminals", () => {
+  const CORPUS: {
+    rows: {
+      id: string;
+      fields: Record<string, FieldTypeJson>;
+      index: IndexJson;
+      docs: Record<string, unknown>[];
+      eq: unknown[];
+      aggregate: Record<string, unknown>;
+      expect: unknown;
+    }[];
+  } = JSON.parse(
+    readFileSync(resolve(__dirname, "../../wire-corpus/spec/aggregate-terminals.json"), "utf8"),
+  );
+
+  const OWN_OPS = ["sum", "avg", "min", "max", "count"];
+
+  /** The corpus README's own-op coverage rule: every AggregateOp this engine
+   *  distinguishes must be exercised by a fixture row. */
+  it("every aggregate op this engine distinguishes has a fixture row", () => {
+    const seen = new Set<string>();
+    for (const row of CORPUS.rows) {
+      const agg = row.aggregate as { op?: string; aggregates?: Record<string, string> };
+      if (agg.op) seen.add(agg.op);
+      for (const op of Object.values(agg.aggregates ?? {})) seen.add(op);
+    }
+    for (const op of OWN_OPS) {
+      expect(seen.has(op), `no fixture row exercises aggregate op '${op}'`).toBe(true);
+    }
+  });
+
+  /** Per-surface execution: push the row's schema fragment, insert the docs
+   *  through the real write path, run the aggregate query through the real
+   *  query terminal, and compare the bare wire value. */
+  it("evaluates every fixture row identically to the server contract", async () => {
+    let ms = 1_700_000_000_000;
+    for (const row of CORPUS.rows) {
+      const client = new InMemoryRtDbClient({ now: () => ++ms, random: () => 0 });
+      const schema: SchemaJson = {
+        tables: { items: { fields: row.fields, indexes: [row.index] } },
+      };
+      client.pushSchema(schema);
+      await client.mutate({
+        steps: [{ op: "insertMany", table: "items", docs: row.docs }],
+      });
+      const q = {
+        table: "items",
+        index: row.index.name,
+        eq: row.eq,
+        aggregate: row.aggregate,
+      };
+      const expectErr =
+        row.expect !== null &&
+        typeof row.expect === "object" &&
+        !Array.isArray(row.expect) &&
+        (row.expect as { error?: boolean }).error === true;
+      if (expectErr) {
+        await expect(client.query({ json: q }), row.id).rejects.toThrow(RtDbError);
+        continue;
+      }
+      const result = await client.query({ json: q });
+      expect(result, row.id).toEqual(row.expect);
     }
   });
 });

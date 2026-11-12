@@ -9,6 +9,7 @@
 package inmemory
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -369,4 +370,153 @@ func mustMarshal(t *testing.T, v wire.JSONValue) string {
 		t.Fatalf("marshal: %v", err)
 	}
 	return string(out)
+}
+
+// ENH-052 family 3 — aggregate-terminals spec-table runner:
+// wire-corpus/spec/aggregate-terminals.json. Each row pushes its schema
+// fragment, inserts the docs through the real write path, runs the
+// aggregate query through EvalQuery, and asserts the bare wire value
+// (expect.error rows assert the query fails).
+
+type aggregateSpecRow struct {
+	ID     string          `json:"id"`
+	Fields json.RawMessage `json:"fields"`
+	Index  struct {
+		Name   string   `json:"name"`
+		Fields []string `json:"fields"`
+	} `json:"index"`
+	Docs      []json.RawMessage `json:"docs"`
+	Eq        []json.RawMessage `json:"eq"`
+	Aggregate json.RawMessage   `json:"aggregate"`
+	Expect    json.RawMessage   `json:"expect"`
+}
+
+func aggregateTerminalsCorpusPath(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot resolve corpus path")
+	}
+	return filepath.Join(filepath.Dir(thisFile), "..", "..", "wire-corpus", "spec", "aggregate-terminals.json")
+}
+
+func loadAggregateSpecRows(t *testing.T) []aggregateSpecRow {
+	t.Helper()
+	raw, err := os.ReadFile(aggregateTerminalsCorpusPath(t))
+	if err != nil {
+		t.Fatalf("read aggregate terminals corpus: %v", err)
+	}
+	var doc struct {
+		Rows []aggregateSpecRow `json:"rows"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parse aggregate terminals corpus: %v", err)
+	}
+	return doc.Rows
+}
+
+func TestAggregateTerminalsEveryOpHasAFixtureRow(t *testing.T) {
+	rows := loadAggregateSpecRows(t)
+	seen := map[string]bool{}
+	for _, r := range rows {
+		var agg struct {
+			Op         string            `json:"op"`
+			Aggregates map[string]string `json:"aggregates"`
+		}
+		if err := json.Unmarshal(r.Aggregate, &agg); err != nil {
+			t.Fatalf("%s: aggregate does not parse: %v", r.ID, err)
+		}
+		if agg.Op != "" {
+			seen[agg.Op] = true
+		}
+		for _, op := range agg.Aggregates {
+			seen[op] = true
+		}
+	}
+	for _, op := range []string{"sum", "avg", "min", "max", "count"} {
+		if !seen[op] {
+			t.Fatalf("no fixture row exercises aggregate op '%s'", op)
+		}
+	}
+}
+
+func TestAggregateTerminalsSpecCorpus(t *testing.T) {
+	rows := loadAggregateSpecRows(t)
+	for _, r := range rows {
+		t.Run(r.ID, func(t *testing.T) {
+			var clock int64 = 1_700_000_000_000
+			client := New(Options{
+				Now:    func() int64 { clock++; return clock },
+				Random: func() float64 { return 0.0 },
+			})
+			schema := wire.Object{"tables": wire.Object{"items": wire.Object{
+				"fields":  mustWire(t, r.Fields),
+				"indexes": wire.Array{wire.Object{"name": wire.String(r.Index.Name), "fields": fieldsArray(t, r.Index.Fields)}},
+			}}}
+			if err := client.PushSchema(schema); err != nil {
+				t.Fatalf("%s: push schema: %v", r.ID, err)
+			}
+			docs := make([]wire.JSONValue, 0, len(r.Docs))
+			for _, d := range r.Docs {
+				docs = append(docs, mustWire(t, d))
+			}
+			if _, err := client.Mutate(nil, wire.Transaction{Steps: []wire.Step{wire.StepInsertMany{
+				Table: "items",
+				Docs:  docs,
+			}}}, ""); err != nil {
+				t.Fatalf("%s: insert docs: %v", r.ID, err)
+			}
+			eq := make([]wire.JSONValue, 0, len(r.Eq))
+			for _, e := range r.Eq {
+				eq = append(eq, mustWire(t, e))
+			}
+			var agg wire.AggregateSpec
+			if err := json.Unmarshal(r.Aggregate, &agg); err != nil {
+				t.Fatalf("%s: aggregate spec does not parse: %v", r.ID, err)
+			}
+			q := wire.Query{Table: "items", Index: &r.Index.Name, Eq: eq, Aggregate: &agg}
+			result, qerr := EvalQuery(client.Store(), q)
+			var probe map[string]json.RawMessage
+			isErrRow := json.Unmarshal(r.Expect, &probe) == nil &&
+				func() bool { _, ok := probe["error"]; return ok }()
+			if isErrRow {
+				if qerr == nil {
+					t.Fatalf("%s: expected the aggregate to fail", r.ID)
+				}
+				return
+			}
+			if qerr != nil {
+				t.Fatalf("%s: aggregate query failed: %v", r.ID, qerr)
+			}
+			got, merr := json.Marshal(result)
+			if merr != nil {
+				t.Fatalf("%s: marshal result: %v", r.ID, merr)
+			}
+			var wantCompact bytes.Buffer
+			if err := json.Compact(&wantCompact, r.Expect); err != nil {
+				t.Fatalf("%s: expect does not compact: %v", r.ID, err)
+			}
+			if string(got) != wantCompact.String() {
+				t.Fatalf("%s: result mismatch:\n got: %s\nwant: %s", r.ID, got, wantCompact.String())
+			}
+		})
+	}
+}
+
+func mustWire(t *testing.T, raw json.RawMessage) wire.JSONValue {
+	t.Helper()
+	v, err := wire.UnmarshalJSON(raw)
+	if err != nil {
+		t.Fatalf("decode wire value: %v", err)
+	}
+	return v
+}
+
+func fieldsArray(t *testing.T, fields []string) wire.Array {
+	t.Helper()
+	out := make(wire.Array, 0, len(fields))
+	for _, f := range fields {
+		out = append(out, wire.String(f))
+	}
+	return out
 }

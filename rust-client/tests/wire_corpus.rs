@@ -801,3 +801,115 @@ mod computed_stamping_corpus {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// ENH-052 family 3 — spec-table corpus: the aggregate-terminal decision table
+// (wire-corpus/spec/aggregate-terminals.json). Each row pushes its schema
+// fragment, inserts the docs through the real write path, runs the aggregate
+// query through `run_query`, and asserts the bare wire value
+// (`expect.error` rows assert the failure).
+#[cfg(feature = "in_memory")]
+mod aggregate_terminals_corpus {
+    use par_rt_db_client::Query;
+    use par_rt_db_client::in_memory::{InMemoryRtDbClient, InMemoryRtDbClientOptions};
+    use par_rt_db_client::mutation::Mutation;
+    use par_rt_db_client::schema::SchemaDef;
+
+    use super::{Value, json};
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    static CLOCK: AtomicI64 = AtomicI64::new(1_700_000_000_000);
+
+    fn new_client() -> InMemoryRtDbClient {
+        InMemoryRtDbClient::new(
+            InMemoryRtDbClientOptions::default()
+                .now(|| CLOCK.fetch_add(1, Ordering::SeqCst))
+                .random(|| 0.0),
+        )
+    }
+
+    fn load_rows() -> Vec<Value> {
+        let doc: Value = serde_json::from_str(include_str!(
+            "../../wire-corpus/spec/aggregate-terminals.json"
+        ))
+        .unwrap_or_else(|e| panic!("parse aggregate-terminals.json: {e}"));
+        doc["rows"]
+            .as_array()
+            .expect("spec corpus missing rows array")
+            .clone()
+    }
+
+    #[test]
+    fn every_aggregate_op_has_a_fixture_row() {
+        let mut seen = Vec::new();
+        for row in load_rows() {
+            let agg = &row["aggregate"];
+            if let Some(op) = agg["op"].as_str() {
+                seen.push(op.to_string());
+            }
+            if let Some(map) = agg["aggregates"].as_object() {
+                for op in map.values() {
+                    seen.push(op.as_str().expect("aggregate op").to_string());
+                }
+            }
+        }
+        for op in ["sum", "avg", "min", "max", "count"] {
+            assert!(
+                seen.iter().any(|s| s == op),
+                "no fixture row exercises aggregate op '{op}'"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_row_matches_this_engine() {
+        for (i, row) in load_rows().into_iter().enumerate() {
+            let id = row["id"].as_str().unwrap_or("?");
+            let schema: SchemaDef = serde_json::from_value(json!({
+                "tables": {
+                    "items": {
+                        "fields": row["fields"],
+                        "indexes": [row["index"]],
+                    }
+                }
+            }))
+            .unwrap_or_else(|e| panic!("row {i} ({id}): schema does not parse: {e}"));
+            let mut client = new_client();
+            client
+                .push_schema(&schema)
+                .unwrap_or_else(|e| panic!("row {i} ({id}): push schema: {e:?}"));
+
+            let docs: Vec<Value> = row["docs"].as_array().expect("row docs").clone();
+            let txn = Mutation::new().insert_many("items", docs).build();
+            client
+                .mutate(&txn, None)
+                .await
+                .unwrap_or_else(|e| panic!("row {i} ({id}): insert docs: {e:?}"));
+
+            let q_json = json!({
+                "table": "items",
+                "index": row["index"]["name"],
+                "eq": row["eq"],
+                "aggregate": row["aggregate"],
+            });
+            let q: Query = serde_json::from_value(q_json)
+                .unwrap_or_else(|e| panic!("row {i} ({id}): query does not parse: {e}"));
+
+            let is_err_row = row["expect"].is_object() && row["expect"].get("error").is_some();
+            let result = client.run_query(&q);
+            if is_err_row {
+                let err = result
+                    .err()
+                    .unwrap_or_else(|| panic!("row {i} ({id}): expected the aggregate to fail"));
+                assert_eq!(
+                    err.code,
+                    par_rt_db_client::ErrorCode::BadRequest,
+                    "row {i} ({id}): rejection code"
+                );
+                continue;
+            }
+            let result = result.unwrap_or_else(|e| panic!("row {i} ({id}): query failed: {e:?}"));
+            assert_eq!(result, row["expect"], "row {i} ({id}): aggregate result");
+        }
+    }
+}

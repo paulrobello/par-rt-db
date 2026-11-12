@@ -45,13 +45,17 @@ implementations honest against each other. These artifacts live here:
   [Query combination rules](#query-combination-rules) below.
 - [`spec/`](spec/) — the **in-memory semantics spec-table corpus** (ENH-052):
   pure decision tables generated from the server's own implementation. Today,
-  two families:
+  three families:
   [`spec/index-column-types.json`](spec/index-column-types.json) pins the
   FieldType → Postgres column-type mapping (`schema::indexed_column_type` and
-  its six client ports), and
+  its six client ports),
   [`spec/computed-stamping.json`](spec/computed-stamping.json) pins the
   computed-field stamping decision table (`txn::stamp_computed` +
-  `value_expr::eval_value_expr` and their six client `stampComputed` ports).
+  `value_expr::eval_value_expr` and their six client `stampComputed` ports),
+  and [`spec/aggregate-terminals.json`](spec/aggregate-terminals.json) pins
+  the aggregate-terminal decision table (count/sum/avg/min/max over row sets
+  and groups, per the server's reference reduction of its aggregate SQL and
+  the six client ports).
   See [Spec-table corpus](#spec-table-corpus) below.
 
 **Runner scope:** the server and all six client in-memory engines
@@ -463,6 +467,23 @@ fixture can never disagree with the code that owns the semantics.
   raw Postgres string (`"double precision"`, not a client enum spelling);
   non-indexable rows carry `{"fieldType", "error": true}`.
 
+- [`spec/aggregate-terminals.json`](spec/aggregate-terminals.json) — the
+  aggregate-terminal decision table shared by the server and all six client
+  in-memory engines. One row per representative per `(aggregate op × input
+  shape)` the wire outcome distinguishes: count over an empty match (0) vs
+  rows-not-values, sum/avg/min/max over empty/all-null/partial-null inputs,
+  float arithmetic, int64 exactness (decimal-string sums past 2^53 and past
+  `i64::MAX`, min/max through the same convention, avg as a plain JSON
+  number), booleans (false < true), the plan-time non-numeric rejection of
+  sum/avg, grouped keys ascending with the NULL group last, an all-null
+  group (null value), grouped count, and the wire-v2 multi-op
+  `{alias: value}` object. Each row carries the wire schema fragment
+  (`fields` + one btree `index`), seed `docs`, the `eq` prefix, the wire
+  `AggregateSpec`, and the bare wire value. Two shapes Postgres cannot put
+  on the wire are deliberately excluded: a float sum overflowing to infinity
+  (the server query fails; the engines return null) and text min/max (server
+  collation is not pinned cross-language).
+
 - [`spec/computed-stamping.json`](spec/computed-stamping.json) — the
   computed-field stamping decision table (ENH-028) shared by the server and
   all six client in-memory engines. One row per representative per closed
@@ -484,17 +505,21 @@ fixture can never disagree with the code that owns the semantics.
 
 **Authoring rule:** a change to the pinned semantics (a new `FieldType`
 variant, a mapping change in `indexed_column_type`, a new `ValueExpr` node,
-a new `Cast` target, or a stamping-semantics change in `stamp_computed` or
-any of its six client ports) regenerates the fixture —
+a new `Cast` target, a stamping-semantics change in `stamp_computed` or
+any of its six client ports, a new `AggregateOp` variant, or an
+aggregate-reduction change in the server's aggregate terminal or any of its
+six client ports) regenerates the fixture —
 `make gen-spec-index-column-types` /
-`make gen-spec-computed-stamping` — and lands the regenerated table **in the
-same change**, updating whichever client ports moved with it. A client port
+`make gen-spec-computed-stamping` /
+`make gen-spec-aggregate-terminals` — and lands the regenerated table **in
+the same change**, updating whichever client ports moved with it. A client port
 that drifts from a committed table fails that client's spec-corpus runner; a
 variant or grammar node added without a representative row fails the
 generator's exhaustive match (a compile error in `server/src/spec_corpus.rs`).
 
-**Enforcement:** `make gen-spec-index-column-types-check` and
-`make gen-spec-computed-stamping-check` (`checkall` legs) diff each committed
+**Enforcement:** `make gen-spec-index-column-types-check`,
+`make gen-spec-computed-stamping-check`, and
+`make gen-spec-aggregate-terminals-check` (`checkall` legs) diff each committed
 fixture against a fresh generation; the server's `spec_corpus.rs` tests pin
 the same property in-crate. Each of the seven runners — server, ts-client
 (`tests/spec-corpus.test.ts`), rust-client
