@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionProvider, useSession } from "./session";
 
@@ -209,5 +209,79 @@ describe("SessionProvider", () => {
 
     expect(captured).toBeInstanceOf(Error);
     expect((captured as Error).message).toBe("invalid admin key");
+  });
+});
+
+// ENH-053: pin the admin-key login quirks. The HttpOnly cookie authenticates
+// requests, but `/auth/me` resolves OAuth users only — an admin-key session has
+// no resolvable identity, so a full reload re-prompts for the key. In-SPA
+// navigation (pushState/popstate) keeps the provider mounted, so its React
+// state survives; that is the supported path.
+
+describe("SessionProvider reload quirks (ENH-053)", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+  });
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+    localStorage.clear();
+  });
+
+  function mountProbe() {
+    render(
+      <SessionProvider>
+        <Probe />
+      </SessionProvider>,
+    );
+  }
+
+  it("admin-key session does NOT survive a remount (full reload): /auth/me restores OAuth only", async () => {
+    // /auth/me always 401: the admin-key cookie resolves no user identity.
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/admin/login") return new Response(null, { status: 204 });
+      if (url === "/admin/logout") return new Response(null, { status: 204 });
+      return new Response(null, { status: 401 }); // /auth/me and everything else
+    }) as unknown as typeof fetch;
+
+    // Session 1: sign in with the admin key.
+    const { unmount } = render(
+      <SessionProvider>
+        <Probe />
+      </SessionProvider>,
+    );
+    await act(async () => {
+      screen.getByText("sign-in-admin").click();
+    });
+    expect(screen.getByTestId("method").textContent).toBe("adminkey");
+    unmount();
+
+    // Session 2: a fresh provider (what a full reload builds) finds nothing to
+    // restore — the operator is back at the login prompt.
+    mountProbe();
+    await waitFor(() => {
+      expect(screen.getByTestId("method").textContent).toBe("(null)");
+    });
+  });
+
+  it("OAuth session DOES survive a remount (full reload) via /auth/me", async () => {
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/auth/me") {
+        return new Response(JSON.stringify({ email: "oauth@example.com" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(null, { status: 404 });
+    }) as unknown as typeof fetch;
+
+    mountProbe();
+    await waitFor(() => {
+      expect(screen.getByTestId("method").textContent).toBe("oauth");
+    });
+    expect(screen.getByTestId("user").textContent).toBe("oauth@example.com");
   });
 });
