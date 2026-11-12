@@ -47,3 +47,49 @@ async fn scheduler_exits_when_its_database_is_deleted() -> anyhow::Result<()> {
         )),
     }
 }
+
+/// Regression for the 2026-11-12 lenny2 livelock (card 01a1d0899): request-path
+/// cold guards must not re-run the eleven-statement exclusive-lock DDL on
+/// every call. External claim pollers hit them every poll; at prod cadence the
+/// churn starved per-db scheduler queries for up to 604s. The cached variant
+/// memoizes per process — a second call runs no DDL — while the uncached boot
+/// path still recreates a table dropped behind the memo (the self-heal a
+/// scheduler respawn relies on).
+#[tokio::test]
+async fn cold_guard_ensure_memoizes_per_process() -> anyhow::Result<()> {
+    use rtdb_server::ddl::pg_schema;
+    use sqlx::Row;
+
+    let state = crate::common::test_state().await;
+    let pool = state.pool.clone();
+    let db = format!("t{}", uuid::Uuid::now_v7().simple());
+    db::create_database(&pool, &db).await?;
+
+    scheduler::ensure_table_cached(&pool, &db).await?;
+    // Drop the table BEHIND the memo. The cached call must stay a no-op (no
+    // DDL, table stays dropped); the uncached boot-path ensure recreates it.
+    let schema = pg_schema(&db);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TABLE \"{schema}\".scheduled_txns"
+    )))
+    .execute(&pool)
+    .await?;
+    scheduler::ensure_table_cached(&pool, &db).await?;
+    let missing = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT to_regclass('\"{schema}\".scheduled_txns') IS NULL AS absent"
+    )))
+    .fetch_one(&pool)
+    .await?
+    .get::<bool, _>("absent");
+    assert!(missing, "cached ensure must not have recreated the table");
+
+    scheduler::ensure_table(&pool, &db).await?;
+    let present = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT to_regclass('\"{schema}\".scheduled_txns') IS NOT NULL AS present"
+    )))
+    .fetch_one(&pool)
+    .await?
+    .get::<bool, _>("present");
+    assert!(present, "uncached boot-path ensure must self-heal");
+    Ok(())
+}

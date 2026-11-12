@@ -193,6 +193,7 @@ export type {
   WorkflowStatus,
   WorkflowStepSpec,
 } from "./protocol.js";
+export { PROTOCOL_VERSION } from "./protocol.js";
 export type { ClientApi, RtQuery, TableApi } from "./query.js";
 export { createApi, TableQuery } from "./query.js";
 export { retryOnPrecondition } from "./retry.js";
