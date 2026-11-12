@@ -274,11 +274,13 @@ pub struct Auth {
 /// the HTTP surfaces that enforce caps and serve derived content can reach
 /// for `state.limits` as a unit.
 pub struct Limits {
-    /// Instance-local (ARC-126): the fixed-window rate limiter is an
-    /// in-process counter map. A second replica sees none of the first's
+    /// Instance-local (ARC-126): an in-process counter map in the default
+    /// single-instance mode — a second replica would see none of the first's
     /// requests, so a client's effective budget becomes `N × replicas` per
-    /// window — a silent weakening of the cap. This server is single-instance
-    /// by design (see the boot WARN in `main.rs`).
+    /// window, silently weakening the cap. Under `RTDB_MULTI_INSTANCE` the
+    /// constructor swaps in the Postgres-backed `RateLimiter::new_pg` (counters
+    /// in `rtdb_auth.rate_counters`, one shared budget per token/db/ip — see
+    /// the construction in `AppState::new`).
     pub rate_limiter: Arc<rate_limit::RateLimiter>,
     /// On-the-fly image transform cache (ENH-014). `Arc` because every storage
     /// serve request shares the one moka cache + concurrency semaphore.
