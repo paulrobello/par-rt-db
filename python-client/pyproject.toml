@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = {text = "MIT"}
 authors = [{name = "Paul Robello", email = "probello@gmail.com"}]
-dependencies = ["pydantic>=2.14.2,<3"]
+dependencies = ["pydantic>=2.14.3,<3"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -39,8 +39,8 @@ aio = ["par-rt-db[http]"]    # alias for [http] (ARC-124): async surface no long
 # `make checkall` works from a clean checkout without a prior `make install`.
 dev = [
     "pytest>=9.2.0",
-    "pytest-asyncio>=1.4.1",
-    "ruff>=0.17.3",
+    "pytest-asyncio>=1.4.1.post1",
+    "ruff>=0.17.4",
     "pyright>=1.1.414",
     "pdoc>=16.0.0",
     "pytest-cov>=7.1.0",
