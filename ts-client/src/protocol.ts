@@ -272,6 +272,30 @@ export interface ClaimedSchedule {
   leaseDeadlineMs: number;
 }
 
+/** Reply to `POST /api/bulk/delete` (ARC-005): the background bulk delete was
+ * accepted and its per-op driver kicked. `matched` is the number of ids the
+ * filter froze at submit time; `state` is always `"running"` in this reply —
+ * poll {@link BulkOpInfo} via `bulkStatus` for progress. Mirrors server
+ * `http_api::bulk::BulkDeleteResponse` byte-for-byte (camelCase). */
+export interface BulkOpAccepted {
+  opId: string;
+  matched: number;
+  state: string;
+}
+
+/** Poll reply for `GET /api/bulk/{id}?db=` (ARC-005). `matched` is the frozen
+ * id count; `deleted` the cumulative rows removed so far. `error` is present
+ * ONLY when `state` is `"failed"` (the server `skip_serializing_if`s it —
+ * running/complete payloads carry no `error` key at all). Mirrors server
+ * `http_api::bulk::BulkStatusResponse` byte-for-byte (camelCase). */
+export interface BulkOpInfo {
+  id: string;
+  state: "running" | "complete" | "failed";
+  matched: number;
+  deleted: number;
+  error?: string;
+}
+
 // ---- Change feed wire types --------------------------------------------------
 //
 // Mirror server `change_log::ChangeRow` / `protocol::ChangeFeedResponse`

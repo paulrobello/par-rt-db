@@ -140,6 +140,8 @@ export type {
   AuthedUserKind,
   AwaitSignalSpec,
   BatchQueryOutcomeJson,
+  BulkOpAccepted,
+  BulkOpInfo,
   CaseWhenJson,
   Cast,
   CastFailureJson,

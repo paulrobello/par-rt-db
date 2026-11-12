@@ -5,8 +5,11 @@ import { parseStepResults, type StepResult } from "./mutation.js";
 import type {
   AuthedUser,
   BatchQueryOutcomeJson,
+  BulkOpAccepted,
+  BulkOpInfo,
   ChangeFeedResponse,
   ClaimedSchedule,
+  FilterExpr,
   QueryJson,
   ScheduleInfo,
   ScheduleWhen,
@@ -335,6 +338,26 @@ export class RtDbHttpClient {
       lease,
       error,
     });
+  }
+
+  /** Starts a background bulk delete (ARC-005): `filter` (the same DSL
+   * `FilterExpr` a deleteByQuery step takes) is frozen at submit — ids are
+   * snapshotted by a read-only serialized turn, and an over-cap match rejects
+   * `BAD_REQUEST` ("narrow the filter"). The delete then progresses chunk by
+   * chunk through the committer queue, so interactive writes interleave
+   * between chunk turns. Poll progress with {@link bulkStatus} using the
+   * returned `opId`. */
+  async bulkDelete(db: string, table: string, filter: FilterExpr): Promise<BulkOpAccepted> {
+    const body = await this.post("/api/bulk/delete", { db, table, filter });
+    return body as BulkOpAccepted;
+  }
+
+  /** Polls a bulk op started with {@link bulkDelete}
+   * (`GET /api/bulk/{id}?db=`). `error` is present ONLY when `state` is
+   * `"failed"`. */
+  async bulkStatus(db: string, id: string): Promise<BulkOpInfo> {
+    const path = `/api/bulk/${encodeURIComponent(id)}?db=${encodeURIComponent(db)}`;
+    return (await this.get(path, this.token)) as BulkOpInfo;
   }
 
   /**
