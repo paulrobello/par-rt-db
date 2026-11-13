@@ -6,5 +6,26 @@
 # operations only; the vulnerable private-key path (Apple client-secret
 # signing is ES256 via ring) is not used. No fixed release exists upstream.
 # Re-evaluate when jsonwebtoken adopts rsa 0.10.
+#
+# RUSTSEC-2026-0387 — crypto-bigint 0.5.x timing variability in operations
+# intended to be constant-time (fix >= 0.7.6, semver-incompatible). Arrives
+# via jsonwebtoken 11.1 -> p256/p384 0.13 -> elliptic-curve 0.13; jsonwebtoken
+# still pins p256 ^0.13.2, and p256 0.14 / elliptic-curve 0.14 (crypto-bigint
+# 0.7) are not consumable until it moves. Same reachability family as the rsa
+# entry above: par-rt-db exercises only ES256 client-secret signing (Apple),
+# whose timing is observable by no third party; no private-key-signing oracle
+# is exposed to untrusted input. Re-evaluate when jsonwebtoken adopts
+# p256 0.14.
+#
+# RUSTSEC-2026-0459 — libsqlite3-sys 0.37 bundles C SQLite CVE-2026-119375
+# (fix >= 0.39, semver-incompatible). Lockfile-only: the crate enters
+# Cargo.lock via sqlx's optional sqlite driver (sqlx-sqlite <0.38 cap), but
+# par-rt-db builds with postgres-only features and never compiles it —
+# `cargo tree -i libsqlite3-sys` finds no build-graph path. Re-evaluate when
+# sqlx-sqlite declares libsqlite3-sys >= 0.39.
 [advisories]
-ignore = ["RUSTSEC-2023-0071"]
+ignore = [
+    "RUSTSEC-2023-0071",
+    "RUSTSEC-2026-0387",
+    "RUSTSEC-2026-0459",
+]
