@@ -193,6 +193,142 @@ async fn cascade_delete_reaches_insert_only_child() {
     assert!(matches!(res, QueryResult::Docs(ref d) if d.is_empty()));
 }
 
+/// The par-mesh row-replay boundary (upstream card, par-mesh SEC-005): a
+/// writer who captures a whole message row cannot resurrect it by delete +
+/// identical re-insert under the same unique `(msgid, target)` coordinates
+/// when the table is `insertOnly` — every transaction-driven removal is
+/// rejected, so the coordinate stays occupied until a sanctioned removal
+/// (TTL reaping, admin purge) releases it. Copying a captured row to fresh
+/// coordinates (same msgid, different target) is an ordinary insert no
+/// unique index can distinguish from a legitimate recipient copy; replay
+/// prevention for THAT is app-layer (writer-attested msgid dedup). On a
+/// regular table the delete-and-reinsert is allowed by design — a general
+/// document DB cannot tell replay from a legitimate re-create — which is
+/// why replay-sensitive tables must declare `insertOnly`. See README
+/// "Append-only tables (`insertOnly`)".
+#[tokio::test]
+async fn insert_only_blocks_delete_and_reinsert_replay_of_captured_row() {
+    let state = test_state().await;
+    let s: SchemaDef = serde_json::from_value(json!({"tables": {"messages": {
+        "fields": {
+            "msgid": {"type": "string"},
+            "target": {"type": "string"},
+            "body": {"type": "string"}
+        },
+        "indexes": [
+            {"name": "by_msgid", "fields": ["msgid", "target"], "unique": true}
+        ],
+        "insertOnly": true
+    }}}))
+    .expect("parse schema");
+    let db = fresh(&state, &s).await;
+    let ctx = PrincipalCtx::bypass();
+    let seeded = run(
+        &state,
+        &db,
+        &s,
+        &ctx,
+        json!([{"op": "insert", "table": "messages", "doc": {"msgid": "m-1", "target": "host-a:proj", "body": "sealed"}}]),
+    )
+    .await
+    .expect("insert");
+    let id = id_of(&seeded, 0);
+
+    for step in [
+        json!({"op": "delete", "table": "messages", "id": id}),
+        json!({"op": "deleteByQuery", "table": "messages",
+               "filter": {"op": "eq", "field": "msgid", "value": "m-1"}}),
+        // An upsert against the live coordinate must not become a
+        // delete-and-reinsert in disguise (its patch branch would land first,
+        // but the gate rejects the step before any branch runs).
+        json!({"op": "upsert", "table": "messages", "index": "by_msgid", "eq": ["m-1", "host-a:proj"],
+               "insert": {"msgid": "m-1", "target": "host-a:proj", "body": "sealed"},
+               "patch": {"body": "sealed"}}),
+    ] {
+        let err = run(&state, &db, &s, &ctx, json!([step.clone()]))
+            .await
+            .expect_err(&format!("{step} must be rejected on an insertOnly table"));
+        assert_eq!(err.code, ErrorCode::SchemaViolation, "{step}: {err:?}");
+    }
+
+    // Nothing was removed, so the captured coordinate is still occupied: the
+    // identical re-insert fails on the unique index, not on replay semantics.
+    let err = run(
+        &state,
+        &db,
+        &s,
+        &ctx,
+        json!([{"op": "insert", "table": "messages", "doc": {"msgid": "m-1", "target": "host-a:proj", "body": "sealed"}}]),
+    )
+    .await
+    .expect_err("identical re-insert while the row lives conflicts");
+    assert_eq!(err.code, ErrorCode::Conflict, "{err:?}");
+
+    // Copying to fresh coordinates is an ordinary insert and passes — the
+    // documented app-layer residual, not a guard gap.
+    run(
+        &state,
+        &db,
+        &s,
+        &ctx,
+        json!([{"op": "insert", "table": "messages", "doc": {"msgid": "m-1", "target": "host-b:proj", "body": "sealed"}}]),
+    )
+    .await
+    .expect("fresh-coordinate copy is an ordinary insert");
+}
+
+/// Pins the OTHER side of the replay boundary: on a regular (mutable) table,
+/// delete + identical re-insert succeeds by design. A general document DB
+/// cannot structurally distinguish a replay from a legitimate re-create, so
+/// unique indexes guard only live coordinates — replay-sensitive tables must
+/// declare `insertOnly` (see the sibling test and the README section).
+#[tokio::test]
+async fn regular_table_allows_delete_and_reinsert_replay_by_design() {
+    let state = test_state().await;
+    let s: SchemaDef = serde_json::from_value(json!({"tables": {"messages": {
+        "fields": {
+            "msgid": {"type": "string"},
+            "target": {"type": "string"},
+            "body": {"type": "string"}
+        },
+        "indexes": [
+            {"name": "by_msgid", "fields": ["msgid", "target"], "unique": true}
+        ]
+    }}}))
+    .expect("parse schema");
+    let db = fresh(&state, &s).await;
+    let ctx = PrincipalCtx::bypass();
+    let seeded = run(
+        &state,
+        &db,
+        &s,
+        &ctx,
+        json!([{"op": "insert", "table": "messages", "doc": {"msgid": "m-1", "target": "host-a:proj", "body": "sealed"}}]),
+    )
+    .await
+    .expect("insert");
+    let id = id_of(&seeded, 0);
+    run(
+        &state,
+        &db,
+        &s,
+        &ctx,
+        json!([{"op": "delete", "table": "messages", "id": id}]),
+    )
+    .await
+    .expect("delete");
+    let reinserted = run(
+        &state,
+        &db,
+        &s,
+        &ctx,
+        json!([{"op": "insert", "table": "messages", "doc": {"msgid": "m-1", "target": "host-a:proj", "body": "sealed"}}]),
+    )
+    .await
+    .expect("identical re-insert of a deleted row is allowed on a regular table");
+    assert_ne!(id, id_of(&reinserted, 0), "re-insert mints a fresh id");
+}
+
 #[tokio::test]
 async fn ttl_reaper_still_reaps_insert_only_table() {
     let state = test_state_with_ttl_sweep(1).await;

@@ -1525,6 +1525,27 @@ kotlin clients' schema DSLs and in-memory engines); see the `insert-only-*` /
 `error-insert-only-*` cases in [`wire-corpus/semantics/`](wire-corpus/semantics/)
 and [FEATURE_MATRIX #48](FEATURE_MATRIX.md).
 
+#### Row-write replay (delete + re-insert)
+
+A writer who can read a row can always re-send its content. `insertOnly` is the
+server-side structural guard for the replay shape a unique index cannot cover:
+every transaction-driven removal is rejected (delete, deleteByQuery, undelete,
+and the replace branch of upsert — the step gate runs before any branch of the
+step runs), so a captured row cannot be deleted and re-inserted under the same
+unique coordinates; the coordinate stays occupied until a sanctioned removal
+(TTL reaping or the admin purge) releases it. Two residual shapes are documented
+boundaries, not guard gaps:
+
+- **Copy to fresh coordinates** (same msgid, different target) is an ordinary
+  insert no unique index can distinguish from a legitimate recipient copy —
+  broadcast recipient copies rely on exactly that. Preventing it needs
+  app-layer attestation (e.g. writer-attested msgid dedup).
+- **Regular tables allow delete + identical re-insert by design.** A general
+  document DB cannot structurally distinguish replay from a legitimate
+  re-create, so unique indexes guard only live coordinates; replay-sensitive
+  tables must declare `insertOnly`. Both sides of this boundary are pinned by
+  server tests (`insert_only_test.rs`, the replay-boundary tests).
+
 ### Reclaiming insertOnly rows (TTL vs purge vs neither)
 
 `insertOnly` tables grow without bound by design; two sanctioned paths remove
