@@ -548,11 +548,7 @@ jobs:
       - name: Upload to codecov
         uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
         with:
-          files: |
-            ts-client/coverage/lcov.info
-            dashboard/coverage/lcov.info
-            target/coverage/python.lcov
-            target/coverage/go.out
+          files: ts-client/coverage/lcov.info,dashboard/coverage/lcov.info,target/coverage/python.lcov,target/coverage/go.out
           fail_ci_if_error: false
       - name: Upload coverage reports
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
