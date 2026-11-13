@@ -661,6 +661,49 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
 
+  # Deploy-scope gate: a push that touches no deploy-relevant path must not
+  # restart production. Native git diff over the pushed range; the ignore set
+  # mirrors release.yml's paths-ignore (docs, CI meta, cargo-audit config).
+  # Any ambiguity (new branch tip, force-push, unresolvable base) defaults to
+  # deploy — a pointless deploy beats a stale one.
+  changes:
+    name: Resolve deploy scope
+    outputs:
+      deploy: ${{ steps.scope.outputs.deploy }}
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Detect deploy-relevant changes
+        id: scope
+        run: |
+          set -euo pipefail
+          base='${{ github.event.before }}'
+          head='${{ github.sha }}'
+          changed=''
+          if [ "${#base}" -eq 40 ] && [ "$base" != '0000000000000000000000000000000000000000' ] && git cat-file -e "$base" 2>/dev/null; then
+            changed=$(git diff --name-only "$base..$head" || true)
+          fi
+          if [ -z "$changed" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "Unresolvable or empty range; defaulting to deploy."
+            exit 0
+          fi
+          relevant=$(printf '%s\n' "$changed" | grep -vE '(^|/)\.github/|\.md$|^\.cargo/audit\.toml$' || true)
+          if [ -n "$relevant" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "Deploy-relevant paths changed:"
+            printf '%s\n' "$relevant"
+          else
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "Only docs/CI-meta paths changed; skipping deploy."
+          fi
+
   # Deploy-host CD recipe (established across par-hack, read-it-to-me,
   # par-artifacts): on a green main push, the runner SSHes the deploy host with
   # a forced-command deploy key. The server-side /usr/local/bin/parrtdb-deploy
@@ -673,11 +716,13 @@ jobs:
   # hostname-leak-check gate forbids real hostnames in tracked files).
   deploy:
     name: Deploy to production host
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.changes.outputs.deploy == 'true'
     runs-on: ubuntu-latest
     # docs is excluded: it self-skips on plain main pushes (heavy artifact
-    # tiering), and a needs on a skipped job skips this job too.
-    needs: [drift, lint, typecheck, test, features, swift]
+    # tiering), and a needs on a skipped job skips this job too. The changes
+    # job is push-only like this one, so its deploy output is always present
+    # when this `if` evaluates.
+    needs: [changes, drift, lint, typecheck, test, features, swift]
     # 90: the first post-feature build compiles the otel dependency tree
     # (tonic/prost/opentelemetry) on the throttled 2-CPU deploy builder — a
     # one-time ~50 min cost that exceeded the previous 45-min job cap and got

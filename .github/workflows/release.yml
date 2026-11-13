@@ -12,6 +12,16 @@ name: Release
 on:
   push:
     branches: [main]
+    # Docs and CI-meta changes cannot affect the deployed image; skipping the
+    # whole Release run for them keeps pushes like README edits from
+    # restarting production. The list is deliberately short: anything that
+    # might reach the server build (server/, core/, dashboard/, ts-client/,
+    # lockfiles) still triggers a deploy. paths filters do not apply to
+    # workflow_dispatch, so recovery runs are unaffected.
+    paths-ignore:
+      - '**/*.md'
+      - '.github/**'
+      - '.cargo/audit.toml'
   workflow_dispatch:
 
 concurrency:
