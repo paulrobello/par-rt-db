@@ -1605,6 +1605,27 @@ pub(crate) fn build_cursor_conditions(
     for i in 0..sort_cols.len() {
         let mut conjuncts: Vec<String> = Vec::new();
         for j in 0..=i {
+            if cursor_values[j].is_null() && matches!(sort_col_types[j], SortCol::IndexField(_)) {
+                // A null cursor value carries a NULL sort group: Postgres
+                // `= NULL` never matches, so the null-aware conjuncts mirror
+                // the engines' null-safe comparator (null sorts last in asc /
+                // first in desc). Prefix equality binds nothing and compares
+                // group membership; an asc boundary ends the walk (nothing
+                // sorts after NULLS LAST); a desc boundary reaches every
+                // non-null row. Bindless — placeholder numbering of later
+                // conjuncts shifts down naturally with `binds.len()`. The
+                // tiebreakers (created_at/id) stay kind-strict on nulls — no
+                // doc ever carries a null there, so a null in those slots is
+                // a garbage cursor.
+                conjuncts.push(if j < i {
+                    format!("{} IS NULL", sort_cols[j])
+                } else if dirs[j] == "DESC" {
+                    format!("({} IS NOT NULL)", sort_cols[j])
+                } else {
+                    "FALSE".to_string()
+                });
+                continue;
+            }
             let pos = next_bind_idx + binds.len();
             let (placeholder, bind) = sort_col_types[j].cursor_bind(&cursor_values[j], pos)?;
             let cmp = if j < i {
@@ -1751,4 +1772,97 @@ pub(crate) fn merge_doc(
     map.insert("_creationTime".to_string(), serde_json::json!(created_at));
     map.insert("_version".to_string(), serde_json::json!(version));
     Ok(serde_json::Value::Object(map))
+}
+
+#[cfg(test)]
+mod cursor_null_tests {
+    use super::*;
+
+    fn cols(vty: &FieldType) -> (Vec<String>, Vec<SortCol<'_>>) {
+        (
+            vec![
+                "\"v\"".to_string(),
+                "\"created_at\"".to_string(),
+                "\"id\"".to_string(),
+            ],
+            vec![SortCol::IndexField(vty), SortCol::CreatedAt, SortCol::Id],
+        )
+    }
+
+    #[test]
+    fn null_boundary_asc_ends_the_walk() {
+        let vty = FieldType::Optional {
+            inner: Box::new(FieldType::Number),
+        };
+        let (cols, types) = cols(&vty);
+        let (sql, binds) = build_cursor_conditions(
+            &[
+                serde_json::json!(null),
+                serde_json::json!(0),
+                serde_json::json!(""),
+            ],
+            &cols,
+            &types,
+            &["ASC", "ASC", "ASC"],
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "(FALSE OR \"v\" IS NULL AND \"created_at\" > $1::bigint OR \"v\" IS NULL AND \"created_at\" = $2::bigint AND \"id\" > $3)"
+        );
+        assert_eq!(binds.len(), 3);
+    }
+
+    #[test]
+    fn null_boundary_desc_reaches_non_null_rows() {
+        let vty = FieldType::Optional {
+            inner: Box::new(FieldType::Number),
+        };
+        let (cols, types) = cols(&vty);
+        let (sql, binds) = build_cursor_conditions(
+            &[
+                serde_json::json!(null),
+                serde_json::json!(0),
+                serde_json::json!(""),
+            ],
+            &cols,
+            &types,
+            &["DESC", "DESC", "DESC"],
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "((\"v\" IS NOT NULL) OR \"v\" IS NULL AND \"created_at\" < $1::bigint OR \"v\" IS NULL AND \"created_at\" = $2::bigint AND \"id\" < $3)"
+        );
+        assert_eq!(binds.len(), 3);
+    }
+
+    #[test]
+    fn null_prefix_uses_is_null_and_keeps_numbering() {
+        let vty = FieldType::Optional {
+            inner: Box::new(FieldType::Number),
+        };
+        let (cols, types) = cols(&vty);
+        // v null (prefix), boundary on created_at: the IS NULL conjunct binds
+        // nothing, so created_at takes $1, not $2.
+        let (sql, binds) = build_cursor_conditions(
+            &[
+                serde_json::json!(null),
+                serde_json::json!(1700000000000i64),
+                serde_json::json!("m"),
+            ],
+            &cols,
+            &types,
+            &["DESC", "DESC", "DESC"],
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "((\"v\" IS NOT NULL) OR \"v\" IS NULL AND \"created_at\" < $1::bigint OR \"v\" IS NULL AND \"created_at\" = $2::bigint AND \"id\" < $3)"
+        );
+        assert_eq!(binds.len(), 3);
+    }
 }

@@ -1135,7 +1135,10 @@ in `server/src/spec_corpus_pagination.rs` that encodes the wire-visible rules
 that SQL relies on (the OR-of-AND resume predicate with its prefix-equal and
 past-end branches, asc NULLS LAST / desc NULLS FIRST, insertion-order
 tie-breaks, the truncate-before-mint order, int64 columns sorting numerically
-through decimal strings, the cursor arity/kind rejections), whose equivalence
+through decimal strings, the cursor arity/kind rejections, and the null-safe
+resume over a NULL sort group — a null index cursor value binds nothing:
+prefix `IS NULL`, asc boundary `FALSE`, desc boundary `IS NOT NULL`, the
+server-side gap this family's run surfaced and fixed), whose equivalence
 to the Postgres-backed execution is pinned by the existing pagination suites;
 cursor values are carried RAW with engine-neutral tiebreaker extremes so no
 engine-private clock or id participates, and every client engine's

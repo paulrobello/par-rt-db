@@ -507,6 +507,66 @@ fn paginate_spec_rows() -> Vec<PaginateSpecRow> {
         json!(""),
     ));
 
+    // -- Null cursor values over a NULL sort group: the null-safe resume
+    //    predicate (prefix `IS NULL`, asc boundary FALSE — nothing sorts
+    //    after NULLS LAST; desc boundary IS NOT NULL — every non-null row
+    //    sorts after NULLS FIRST). The engine comparators already place nulls
+    //    this way, so the server's typed bind was the only side rejecting its
+    //    own minted cursors past a NULL group ------------------------------
+    rows.push(pag_row(
+        "cursor-null-boundary-desc",
+        pag_opt(FieldType::Number),
+        &[
+            ("todo", json!(1)),
+            ("todo", json!(2)),
+            ("todo", json!(null)),
+        ],
+        "todo",
+        PagOrder::Desc,
+        1,
+        Some(cursor_at(&[json!(null)], true)),
+    ));
+    rows.push(pag_row(
+        "cursor-null-boundary-asc",
+        pag_opt(FieldType::Number),
+        &[
+            ("todo", json!(1)),
+            ("todo", json!(2)),
+            ("todo", json!(null)),
+        ],
+        "todo",
+        PagOrder::Asc,
+        1,
+        Some(cursor_at(&[json!(null)], false)),
+    ));
+    rows.push(PaginateSpecRow {
+        id: "multi-column-cursor-null-prefix",
+        // v must be Optional: this row's doc set inserts an absent-v doc
+        // (JSON null normalizes to a missing key on insert), which the
+        // engines reject for a required field.
+        fields: pag_fields(&[
+            ("s", FieldType::String),
+            ("v", pag_opt(FieldType::Number)),
+            ("w", FieldType::String),
+        ]),
+        index_name: "by_s_v_w",
+        index_fields: vec!["s", "v", "w"],
+        docs: vec![
+            pag_doc(&[("s", json!("todo")), ("w", json!("c"))]),
+            pag_doc(&[("s", json!("todo")), ("v", json!(1)), ("w", json!("b"))]),
+            pag_doc(&[("s", json!("todo")), ("v", json!(1)), ("w", json!("a"))]),
+        ],
+        eq: vec![json!("todo")],
+        order: PagOrder::Desc,
+        num_items: 2,
+        cursor: Some(vec![
+            json!(null),
+            json!("a"),
+            json!(CREATED_AT_PAST_END),
+            json!(ID_MAX),
+        ]),
+    });
+
     // The drift net: every wire Order spelling and every keyset value kind
     // must appear in a row; a missing representative fails generation. A new
     // wire-visible paginate rule belongs here as a new representative row.
@@ -645,10 +705,10 @@ fn reference_paginate(row: &PaginateSpecRow) -> Result<Value, &'static str> {
     // The typed cursor binds (server `SortCol::cursor_bind` + `eq_bind_for`):
     // the arity must match the keyset, created_at must be a JSON number, id a
     // JSON string, and an int64 index column a decimal STRING (a JSON number
-    // rejects as bad_request). Null index cursor values are deliberately
-    // absent from the matrix (see the render header): the engines skip the
-    // kind check for nulls while the server's typed bind rejects them — a
-    // known server-side resume gap, not a rule this corpus pins.
+    // rejects as bad_request). Null index cursor values ARE pinned: a null
+    // carries its NULL sort group (prefix `IS NULL`, asc boundary FALSE, desc
+    // boundary IS NOT NULL — mirroring the engines' null-safe comparator).
+    // Only the tiebreaker kind checks stay kind-strict on nulls.
     let mut cursor: Option<Vec<Value>> = None;
     if let Some(raw) = &row.cursor {
         if raw.len() != cols {
@@ -828,11 +888,14 @@ pub fn render_pagination_spec() -> Result<String, serde_json::Error> {
                      envelope where nextCursorPrefix, when present, is the \
                      unbound-index prefix of the decoded minted cursor \
                      (`expect.error` rows assert the failure with its code). \
-                     Deliberately excluded: cursors carrying a JSON-null index \
-                     value (the engines skip the kind check for nulls while the \
-                     server's typed bind rejects them — a server-side resume gap \
-                     past a NULL sort group, pinned nowhere), cursors over the \
-                     ranked terminals (search/vectorSearch rank keys are \
+                     Cursors carrying a JSON-null INDEX value are pinned: the \
+                     null-safe resume predicate binds nothing and emits prefix \
+                     `IS NULL`, asc boundary FALSE (nothing sorts after \
+                     NULLS LAST), desc boundary IS NOT NULL (every non-null \
+                     row sorts after NULLS FIRST), mirroring the engines' \
+                     null-safe comparator; the created_at/id tiebreaker kind \
+                     checks stay strict on nulls. Deliberately excluded: \
+                     cursors over the ranked terminals (search/vectorSearch rank keys are \
                      engine-minted stand-ins, covered by the semantics corpus), \
                      the numItems > 4096 clamp (a fixture would need 4097 docs), \
                      and malformed-base64 cursors (semantics corpus \

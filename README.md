@@ -991,7 +991,10 @@ cursor (omitted for the first page) and a page size; the response is
 `{docs, nextCursor}`, where `nextCursor` is omitted when there is no next page.
 The cursor encodes the sort-column values of the last row on the page, so the
 server resumes strictly *after* it — stable under concurrent inserts/deletes
-unlike offset pagination.
+unlike offset pagination. Resume is null-safe over indexed columns: a cursor
+whose index value is null carries that NULL sort group, and the server resumes
+past it the same way every client engine orders nulls (nulls last ascending,
+first descending).
 
 `paginate` composes with `index`, `eq`, range bounds (`gt`/`gte`/`lt`/`lte`),
 and `order`, and is mutually exclusive with `get`, `take`, `unique`, `first`,

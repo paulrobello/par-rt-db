@@ -1,5 +1,5 @@
 {
-  "$comment": "SPEC-TABLE CORPUS (ENH-052 family 4) — GENERATED, do not edit. The btree keyset-pagination decision table, computed from the server's reference walk of the SQL that query/terminals.rs::compile_paginate_terminal emits (see server/src/spec_corpus_pagination.rs) by 'make gen-spec-pagination'. The wire-visible Postgres rules pinned per row: the sort spans the unbound index columns after the eq prefix then created_at/id, asc NULLS LAST / desc NULLS FIRST, the OR-of-AND resume predicate (a prefix-equal cursor re-serves its boundary row via the tiebreaker tail; a past-end tail skips the whole boundary group), ties within an equal prefix resolve by insertion order (created_at desc in desc order), int64 columns sort numerically through decimal strings past 2^53, booleans order false < true, LIMIT n+1 truncates before minting (numItems 0 pages empty with NO next cursor), and cursors reject on wrong arity or wrong value kind (created_at must be a number, id a string, an int64 column a decimal string) with BAD_REQUEST. Cursor values are carried RAW and each runner encodes them through its own codec; tiebreaker extremes (created_at 0 / 4e12, id '' / 'zzzz') keep every expected page engine-neutral. Each runner pushes the row's schema fragment, inserts the docs, and runs the paginate query through its own engine, asserting the page envelope where nextCursorPrefix, when present, is the unbound-index prefix of the decoded minted cursor (`expect.error` rows assert the failure with its code). Deliberately excluded: cursors carrying a JSON-null index value (the engines skip the kind check for nulls while the server's typed bind rejects them — a server-side resume gap past a NULL sort group, pinned nowhere), cursors over the ranked terminals (search/vectorSearch rank keys are engine-minted stand-ins, covered by the semantics corpus), the numItems > 4096 clamp (a fixture would need 4097 docs), and malformed-base64 cursors (semantics corpus `error-paginate-malformed-cursor`). A semantics change regenerates this file in the same commit — see wire-corpus/README.md 'Spec-table corpus'.",
+  "$comment": "SPEC-TABLE CORPUS (ENH-052 family 4) — GENERATED, do not edit. The btree keyset-pagination decision table, computed from the server's reference walk of the SQL that query/terminals.rs::compile_paginate_terminal emits (see server/src/spec_corpus_pagination.rs) by 'make gen-spec-pagination'. The wire-visible Postgres rules pinned per row: the sort spans the unbound index columns after the eq prefix then created_at/id, asc NULLS LAST / desc NULLS FIRST, the OR-of-AND resume predicate (a prefix-equal cursor re-serves its boundary row via the tiebreaker tail; a past-end tail skips the whole boundary group), ties within an equal prefix resolve by insertion order (created_at desc in desc order), int64 columns sort numerically through decimal strings past 2^53, booleans order false < true, LIMIT n+1 truncates before minting (numItems 0 pages empty with NO next cursor), and cursors reject on wrong arity or wrong value kind (created_at must be a number, id a string, an int64 column a decimal string) with BAD_REQUEST. Cursor values are carried RAW and each runner encodes them through its own codec; tiebreaker extremes (created_at 0 / 4e12, id '' / 'zzzz') keep every expected page engine-neutral. Each runner pushes the row's schema fragment, inserts the docs, and runs the paginate query through its own engine, asserting the page envelope where nextCursorPrefix, when present, is the unbound-index prefix of the decoded minted cursor (`expect.error` rows assert the failure with its code). Cursors carrying a JSON-null INDEX value are pinned: the null-safe resume predicate binds nothing and emits prefix `IS NULL`, asc boundary FALSE (nothing sorts after NULLS LAST), desc boundary IS NOT NULL (every non-null row sorts after NULLS FIRST), mirroring the engines' null-safe comparator; the created_at/id tiebreaker kind checks stay strict on nulls. Deliberately excluded: cursors over the ranked terminals (search/vectorSearch rank keys are engine-minted stand-ins, covered by the semantics corpus), the numItems > 4096 clamp (a fixture would need 4097 docs), and malformed-base64 cursors (semantics corpus `error-paginate-malformed-cursor`). A semantics change regenerates this file in the same commit — see wire-corpus/README.md 'Spec-table corpus'.",
   "rows": [
     {
       "docs": [
@@ -1217,6 +1217,183 @@
           9500000000000000,
           0,
           ""
+        ],
+        "numItems": 2
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": 1
+        },
+        {
+          "s": "todo",
+          "v": 2
+        },
+        {
+          "s": "todo"
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "docs": [
+          {
+            "s": "todo"
+          }
+        ],
+        "nextCursorPrefix": [
+          null
+        ]
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "cursor-null-boundary-desc",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      },
+      "order": "desc",
+      "paginate": {
+        "cursor": [
+          null,
+          4000000000000,
+          "zzzz"
+        ],
+        "numItems": 1
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": 1
+        },
+        {
+          "s": "todo",
+          "v": 2
+        },
+        {
+          "s": "todo"
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "docs": [
+          {
+            "s": "todo"
+          }
+        ]
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "cursor-null-boundary-asc",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      },
+      "order": "asc",
+      "paginate": {
+        "cursor": [
+          null,
+          0,
+          ""
+        ],
+        "numItems": 1
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "w": "c"
+        },
+        {
+          "s": "todo",
+          "v": 1,
+          "w": "b"
+        },
+        {
+          "s": "todo",
+          "v": 1,
+          "w": "a"
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "docs": [
+          {
+            "s": "todo",
+            "v": 1,
+            "w": "b"
+          },
+          {
+            "s": "todo",
+            "v": 1,
+            "w": "a"
+          }
+        ]
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        },
+        "w": {
+          "type": "string"
+        }
+      },
+      "id": "multi-column-cursor-null-prefix",
+      "index": {
+        "fields": [
+          "s",
+          "v",
+          "w"
+        ],
+        "name": "by_s_v_w"
+      },
+      "order": "desc",
+      "paginate": {
+        "cursor": [
+          null,
+          "a",
+          4000000000000,
+          "zzzz"
         ],
         "numItems": 2
       }
