@@ -46,6 +46,7 @@
 * [License](#license)
 
 [![CI](https://github.com/paulrobello/par-rt-db/actions/workflows/ci.yml/badge.svg)](https://github.com/paulrobello/par-rt-db/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/paulrobello/par-rt-db/graph/badge.svg)](https://codecov.io/gh/paulrobello/par-rt-db)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)  
 ![Runs on Linux | MacOS](https://img.shields.io/badge/runs%20on-Linux%20%7C%20MacOS-blue)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange)

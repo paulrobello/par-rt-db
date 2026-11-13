@@ -504,16 +504,20 @@ jobs:
       - name: Run property tests
         run: cargo test --manifest-path server/Cargo.toml --all-features --test main proptest_parity
 
-  # ENH-050: weekly coverage artifact, report-only. Runs the FAST legs only
-  # (ts-client, dashboard, python, go — seconds each, no Rust, no dev
-  # Postgres); the instrumented Rust leg is local-only by policy: CI carries
-  # no long-running suites (Paul, 2026-10-12). No thresholds, never part of
-  # `make checkall`. Dispatch keeps the same os-scope gate as the other jobs.
+  # ENH-050: coverage over the FAST legs only (ts-client, dashboard, python,
+  # go — seconds each, no Rust, no dev Postgres); the instrumented Rust leg is
+  # local-only by policy: CI carries no long-running suites (Paul,
+  # 2026-10-12). No thresholds, never part of `make checkall`. Reports are
+  # uploaded to codecov (tokenless — the repo is public) so the README badge
+  # stays live, on every push to main plus the weekly schedule; artifact
+  # upload stays as the local-inspection copy. Dispatch keeps the same
+  # os-scope gate as the other jobs.
   coverage-weekly:
-    name: coverage (fast legs, report-only)
+    name: coverage (fast legs)
     needs: [scope]
     if: >-
       github.event_name == 'schedule' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
       (github.event_name == 'workflow_dispatch' && contains(fromJSON(needs.scope.outputs.os-matrix), 'ubuntu-latest'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -541,6 +545,15 @@ jobs:
         run: make python-client-install
       - name: Run make coverage-fast
         run: make coverage-fast
+      - name: Upload to codecov
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
+        with:
+          files: |
+            ts-client/coverage/lcov.info
+            dashboard/coverage/lcov.info
+            target/coverage/python.lcov
+            target/coverage/go.out
+          fail_ci_if_error: false
       - name: Upload coverage reports
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
