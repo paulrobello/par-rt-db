@@ -51,6 +51,19 @@ pub struct Metrics {
     query_latency: Mutex<LatencySamples>,
     mutate_latency: Mutex<LatencySamples>,
     subscribe_latency: Mutex<LatencySamples>,
+    // ---- Request-path stage latency (P1 stall investigation) ----
+    /// Time spent in each pre-execute stage of HTTP `/api/query` (and the
+    /// shared pre-loop stages of `/api/query-batch`): `authed()`,
+    /// `check_http_rate_limits`, and `schemas.get()`. Each stage can
+    /// independently wait out the pool's acquire timeout, and `query_latency`
+    /// times only `execute_query`, so a stall in any of these is otherwise
+    /// invisible on the server. Prometheus-only like the lease series
+    /// (ENH-049): deliberately absent from `MetricsSnapshot` so the admin JSON
+    /// wire (mirrored in four clients, Python's extra="forbid") stays
+    /// byte-identical.
+    auth_stage_latency: Mutex<LatencySamples>,
+    rate_limit_stage_latency: Mutex<LatencySamples>,
+    schema_stage_latency: Mutex<LatencySamples>,
     // ---- Slow-query log (ENH-019) ----
     /// Bounded ring buffer of recent slow-query records. Populated at the
     /// HTTP query timing call sites when a query's wall-clock duration
@@ -230,6 +243,27 @@ impl Metrics {
     /// `subs.register`.
     pub fn record_subscribe_duration(&self, us: u64) {
         if let Ok(mut s) = self.subscribe_latency.lock() {
+            s.record(us);
+        }
+    }
+    /// Record time spent in the `authed()` stage of the HTTP query path
+    /// (microseconds) — its token/session lookup can wait on the pool.
+    pub fn record_auth_stage_duration(&self, us: u64) {
+        if let Ok(mut s) = self.auth_stage_latency.lock() {
+            s.record(us);
+        }
+    }
+    /// Record time spent in the HTTP rate-limit check stage of the query path
+    /// (microseconds).
+    pub fn record_rate_limit_stage_duration(&self, us: u64) {
+        if let Ok(mut s) = self.rate_limit_stage_latency.lock() {
+            s.record(us);
+        }
+    }
+    /// Record time spent resolving the target database's schema for the query
+    /// path (microseconds) — a cache miss reads through to the pool.
+    pub fn record_schema_stage_duration(&self, us: u64) {
+        if let Ok(mut s) = self.schema_stage_latency.lock() {
             s.record(us);
         }
     }

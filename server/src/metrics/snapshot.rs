@@ -350,6 +350,71 @@ pub fn render_prometheus(
         ));
     }
 
+    // Request-path stage latency (P1 stall investigation). Rendered from the
+    // live ring buffers (ENH-049 pattern — Prometheus-only, absent from the
+    // admin JSON snapshot): how long each pre-execute stage of the HTTP query
+    // path took, so a pool-acquire stall OUTSIDE `execute_query` is visible on
+    // the scrape instead of hiding inside the client's own request timeout.
+    let auth_stage = m
+        .auth_stage_latency
+        .lock()
+        .map(|s| s.percentiles())
+        .unwrap_or_default();
+    s.push_str("# HELP rtdb_auth_stage_us Time spent authenticating /api/query (token/session lookup; can wait on the pool), nearest-rank percentiles in microseconds.\n");
+    s.push_str("# TYPE rtdb_auth_stage_us gauge\n");
+    s.push_str(&format!(
+        "rtdb_auth_stage_us{{pct=\"p50\"}} {}\n",
+        auth_stage.p50
+    ));
+    s.push_str(&format!(
+        "rtdb_auth_stage_us{{pct=\"p95\"}} {}\n",
+        auth_stage.p95
+    ));
+    s.push_str(&format!(
+        "rtdb_auth_stage_us{{pct=\"p99\"}} {}\n",
+        auth_stage.p99
+    ));
+
+    let rate_limit_stage = m
+        .rate_limit_stage_latency
+        .lock()
+        .map(|s| s.percentiles())
+        .unwrap_or_default();
+    s.push_str("# HELP rtdb_rate_limit_stage_us Time spent in the /api/query HTTP rate-limit check, nearest-rank percentiles in microseconds.\n");
+    s.push_str("# TYPE rtdb_rate_limit_stage_us gauge\n");
+    s.push_str(&format!(
+        "rtdb_rate_limit_stage_us{{pct=\"p50\"}} {}\n",
+        rate_limit_stage.p50
+    ));
+    s.push_str(&format!(
+        "rtdb_rate_limit_stage_us{{pct=\"p95\"}} {}\n",
+        rate_limit_stage.p95
+    ));
+    s.push_str(&format!(
+        "rtdb_rate_limit_stage_us{{pct=\"p99\"}} {}\n",
+        rate_limit_stage.p99
+    ));
+
+    let schema_stage = m
+        .schema_stage_latency
+        .lock()
+        .map(|s| s.percentiles())
+        .unwrap_or_default();
+    s.push_str("# HELP rtdb_schema_stage_us Time spent resolving the target database's schema for /api/query (cache miss reads through to the pool), nearest-rank percentiles in microseconds.\n");
+    s.push_str("# TYPE rtdb_schema_stage_us gauge\n");
+    s.push_str(&format!(
+        "rtdb_schema_stage_us{{pct=\"p50\"}} {}\n",
+        schema_stage.p50
+    ));
+    s.push_str(&format!(
+        "rtdb_schema_stage_us{{pct=\"p95\"}} {}\n",
+        schema_stage.p95
+    ));
+    s.push_str(&format!(
+        "rtdb_schema_stage_us{{pct=\"p99\"}} {}\n",
+        schema_stage.p99
+    ));
+
     // Ownership-lease observability (ENH-049). Aggregate gauges + counters —
     // per-db detail belongs in the tracing logs (each lease event carries the
     // `db` field), not metric labels (cardinality).

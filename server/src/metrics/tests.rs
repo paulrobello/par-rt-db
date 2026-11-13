@@ -564,3 +564,156 @@ fn lease_series_record_and_render() {
     // No fingerprint => no build_info line at all (SEC-129 unchanged).
     assert!(!body.contains("rtdb_build_info"), "{body}");
 }
+
+#[test]
+fn stage_latency_series_record_and_render() {
+    // P1 stall instrumentation: the pre-execute query-path stages record into
+    // their rings and render as Prometheus percentile gauges. Like the ENH-049
+    // lease test, the compile-time proof that these are Prometheus-only (the
+    // admin JSON wire stays frozen) is that the snapshot literal below carries
+    // no stage fields at all.
+    let m = Metrics::default();
+    m.record_auth_stage_duration(100);
+    m.record_auth_stage_duration(300);
+    m.record_auth_stage_duration(200);
+    m.record_rate_limit_stage_duration(50);
+    m.record_schema_stage_duration(700);
+
+    // Ring-buffer invariants per stage: expected nearest-rank percentiles and
+    // p50 <= p95 <= p99 monotonicity.
+    let auth_p = m.auth_stage_latency.lock().unwrap().percentiles();
+    assert_eq!(auth_p.p50, 200);
+    assert_eq!(auth_p.p95, 300);
+    assert_eq!(auth_p.p99, 300);
+    assert!(auth_p.p50 <= auth_p.p95 && auth_p.p95 <= auth_p.p99);
+    let rl_p = m.rate_limit_stage_latency.lock().unwrap().percentiles();
+    assert_eq!(rl_p.p50, 50);
+    assert!(rl_p.p50 <= rl_p.p95 && rl_p.p95 <= rl_p.p99);
+    let schema_p = m.schema_stage_latency.lock().unwrap().percentiles();
+    assert_eq!(schema_p.p99, 700);
+    assert!(schema_p.p50 <= schema_p.p95 && schema_p.p95 <= schema_p.p99);
+
+    let snap = MetricsSnapshot {
+        queries_total: 0,
+        mutations_total: 0,
+        uploads_total: 0,
+        ws_connections: 0,
+        active_subscriptions: 0,
+        pool_size: 0,
+        pool_idle: 0,
+        uptime_seconds: 0,
+        query_latency: LatencyStats::default(),
+        mutate_latency: LatencyStats::default(),
+        subscribe_latency: LatencyStats::default(),
+        subs_reruns_total: 0,
+        subs_skips_point_total: 0,
+        subs_skips_indexed_total: 0,
+        subs_skips_ordered_total: 0,
+        subs_skip_verifications_total: 0,
+        subs_missed_pushes_total: 0,
+        ttl_expired_total: 0,
+        scheduled_missed_total: 0,
+        merge_docs_total: 0,
+        image_transforms_hit_total: 0,
+        image_transforms_miss_total: 0,
+        image_transforms_error_total: 0,
+        image_transform_bytes_total: 0,
+        presence_updates_total: 0,
+        presence_broadcasts_total: 0,
+        presence_ttl_expiries_total: 0,
+        presence_rooms: 0,
+        presence_sessions: 0,
+        per_db_subs: Vec::new(),
+        quota_rejections_tables_total: 0,
+        quota_rejections_storage_total: 0,
+        quota_rejections_subs_total: 0,
+        admin_auth_failures_total: 0,
+        per_db_quota: Vec::new(),
+        workflow_steps_success_total: 0,
+        workflow_steps_retry_total: 0,
+        workflow_steps_fail_total: 0,
+        per_db_workflows: Vec::new(),
+        presence_detail: Vec::new(),
+    };
+    let body = render_prometheus(&snap, &m, None, "inst-1");
+    assert!(body.contains("# TYPE rtdb_auth_stage_us gauge"), "{body}");
+    assert!(
+        body.contains("rtdb_auth_stage_us{pct=\"p50\"} 200"),
+        "{body}"
+    );
+    assert!(
+        body.contains("rtdb_auth_stage_us{pct=\"p95\"} 300"),
+        "{body}"
+    );
+    assert!(
+        body.contains("rtdb_auth_stage_us{pct=\"p99\"} 300"),
+        "{body}"
+    );
+    assert!(
+        body.contains("rtdb_rate_limit_stage_us{pct=\"p50\"} 50"),
+        "{body}"
+    );
+    assert!(
+        body.contains("rtdb_schema_stage_us{pct=\"p99\"} 700"),
+        "{body}"
+    );
+
+    // A fresh Metrics renders all three series at zero rather than omitting
+    // them, so a scrape shows the gauges exist before the first request.
+    let body = render_prometheus(&snap, &Metrics::default(), None, "inst-1");
+    assert!(body.contains("rtdb_auth_stage_us{pct=\"p50\"} 0"), "{body}");
+    assert!(
+        body.contains("rtdb_rate_limit_stage_us{pct=\"p95\"} 0"),
+        "{body}"
+    );
+    assert!(
+        body.contains("rtdb_schema_stage_us{pct=\"p99\"} 0"),
+        "{body}"
+    );
+}
+
+#[test]
+fn slow_query_record_stage_fields_serialize_additively() {
+    // The stage split (P1 stall investigation) is additive on the
+    // /admin/slow-queries wire: present when measured, entirely absent (not
+    // null) when not — the same convention as `params`.
+    let with = SlowQueryRecord {
+        started_at_ms: 1,
+        duration_ms: 2,
+        db: "db".into(),
+        table: "t".into(),
+        terminal: "collect".into(),
+        sql: "SELECT 1".into(),
+        params: None,
+        auth_stage_us: Some(10),
+        rate_limit_stage_us: Some(20),
+        schema_stage_us: Some(30),
+    };
+    let v = serde_json::to_value(&with).unwrap();
+    assert_eq!(v["authStageUs"], 10);
+    assert_eq!(v["rateLimitStageUs"], 20);
+    assert_eq!(v["schemaStageUs"], 30);
+
+    let without = SlowQueryRecord {
+        auth_stage_us: None,
+        rate_limit_stage_us: None,
+        schema_stage_us: None,
+        ..with.clone()
+    };
+    let v = serde_json::to_value(&without).unwrap();
+    assert!(v.get("authStageUs").is_none(), "{v}");
+    assert!(v.get("rateLimitStageUs").is_none(), "{v}");
+    assert!(v.get("schemaStageUs").is_none(), "{v}");
+    assert!(v.get("params").is_none(), "{v}");
+
+    // The ring preserves the split: record through the public Metrics API
+    // (with_slow_query_capacity — the default cap of 0 short-circuits) and
+    // read back.
+    let m = Metrics::with_slow_query_capacity(4);
+    m.record_slow_query(with.clone());
+    let recent = m.recent_slow_queries();
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].auth_stage_us, Some(10));
+    assert_eq!(recent[0].rate_limit_stage_us, Some(20));
+    assert_eq!(recent[0].schema_stage_us, Some(30));
+}

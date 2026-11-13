@@ -36,10 +36,34 @@ pub(crate) async fn query_handler(
     headers: HeaderMap,
     ApiJson(body): ApiJson<QueryRequest>,
 ) -> Result<(HeaderMap, Json<QueryResponse>), RtDbError> {
-    let principal = authed(&state, &headers, &body.db).await?;
-    check_http_rate_limits(&state, &principal, &body.db).await?;
-
-    let schema = state.schemas.get(&state.pool, &body.db).await?;
+    // P1 stall instrumentation: each pre-execute stage can independently wait
+    // out the pool's acquire timeout, and `query_latency` times only
+    // `execute_query`, so every stage is timed separately — including its own
+    // error path — and recorded before the `?`.
+    let auth_started = Instant::now();
+    let authed_result = authed(&state, &headers, &body.db).await;
+    let auth_stage_us = auth_started.elapsed().as_micros() as u64;
+    state
+        .runtime
+        .metrics
+        .record_auth_stage_duration(auth_stage_us);
+    let principal = authed_result?;
+    let rate_limit_started = Instant::now();
+    let rate_limit_result = check_http_rate_limits(&state, &principal, &body.db).await;
+    let rate_limit_stage_us = rate_limit_started.elapsed().as_micros() as u64;
+    state
+        .runtime
+        .metrics
+        .record_rate_limit_stage_duration(rate_limit_stage_us);
+    rate_limit_result?;
+    let schema_started = Instant::now();
+    let schema_result = state.schemas.get(&state.pool, &body.db).await;
+    let schema_stage_us = schema_started.elapsed().as_micros() as u64;
+    state
+        .runtime
+        .metrics
+        .record_schema_stage_duration(schema_stage_us);
+    let schema = schema_result?;
     let principal_ctx = principal.row_ctx();
     let started = Instant::now();
     let started_at_ms = now_ms();
@@ -61,8 +85,13 @@ pub(crate) async fn query_handler(
         &body.query,
         &schema,
         &principal_ctx,
-        started_at_ms,
-        elapsed_us,
+        RequestTimings {
+            started_at_ms,
+            elapsed_us,
+            auth_us: Some(auth_stage_us),
+            rate_limit_us: Some(rate_limit_stage_us),
+            schema_us: Some(schema_stage_us),
+        },
     );
     let server_time = HeaderValue::from_bytes(now_ms().to_string().as_bytes())
         .map_err(|_| RtDbError::internal("failed to encode server time header"))?;
@@ -133,10 +162,33 @@ pub(crate) async fn batch_query_handler(
             body.queries.len()
         )));
     }
-    let principal = authed(&state, &headers, &body.db).await?;
-    check_http_rate_limits(&state, &principal, &body.db).await?;
-
-    let schema = state.schemas.get(&state.pool, &body.db).await?;
+    // Same stage instrumentation as `query_handler` — the batch runs the three
+    // pre-execute stages ONCE, so every per-query slow record below carries
+    // the same split (truthful: that is where those stages spent their time).
+    let auth_started = Instant::now();
+    let authed_result = authed(&state, &headers, &body.db).await;
+    let auth_stage_us = auth_started.elapsed().as_micros() as u64;
+    state
+        .runtime
+        .metrics
+        .record_auth_stage_duration(auth_stage_us);
+    let principal = authed_result?;
+    let rate_limit_started = Instant::now();
+    let rate_limit_result = check_http_rate_limits(&state, &principal, &body.db).await;
+    let rate_limit_stage_us = rate_limit_started.elapsed().as_micros() as u64;
+    state
+        .runtime
+        .metrics
+        .record_rate_limit_stage_duration(rate_limit_stage_us);
+    rate_limit_result?;
+    let schema_started = Instant::now();
+    let schema_result = state.schemas.get(&state.pool, &body.db).await;
+    let schema_stage_us = schema_started.elapsed().as_micros() as u64;
+    state
+        .runtime
+        .metrics
+        .record_schema_stage_duration(schema_stage_us);
+    let schema = schema_result?;
     let principal_ctx = principal.row_ctx();
     let mut results = Vec::with_capacity(body.queries.len());
     for query in &body.queries {
@@ -157,8 +209,13 @@ pub(crate) async fn batch_query_handler(
                         query,
                         &schema,
                         &principal_ctx,
-                        started_at_ms,
-                        elapsed_us,
+                        RequestTimings {
+                            started_at_ms,
+                            elapsed_us,
+                            auth_us: Some(auth_stage_us),
+                            rate_limit_us: Some(rate_limit_stage_us),
+                            schema_us: Some(schema_stage_us),
+                        },
                     );
                     BatchQueryOutcome {
                         ok: true,
@@ -177,6 +234,18 @@ pub(crate) async fn batch_query_handler(
     Ok(Json(BatchQueryResponse { results }))
 }
 
+/// Request-path timings (P1 stall instrumentation): where a request spent
+/// its time. `started_at_ms`/`elapsed_us` cover `execute_query`; the three
+/// stage fields cover the pre-execute stages, `None` for a stage this
+/// request never reached.
+struct RequestTimings {
+    started_at_ms: i64,
+    elapsed_us: u64,
+    auth_us: Option<u64>,
+    rate_limit_us: Option<u64>,
+    schema_us: Option<u64>,
+}
+
 /// Slow-query log hook (ENH-019). Called after every successful query in
 /// `query_handler` and each iteration of `batch_query_handler`. When the query
 /// exceeded `Config::slow_query_ms`, re-compiles via the same `compile_query`
@@ -184,23 +253,25 @@ pub(crate) async fn batch_query_handler(
 /// pure/deterministic, so a second compile yields the same string), formats
 /// the bound parameters (only when `slow_query_log_params` is set, to keep
 /// document content out of the log by default), and pushes a [`SlowQueryRecord`]
-/// into the bounded ring buffer on [`Metrics`]. The threshold check runs first
-/// and short-circuits both the re-compile and the record construction when the
-/// log is off (`slow_query_ms == 0`) or the query was fast — the common case.
+/// into the bounded ring buffer on [`Metrics`]. The three pre-execute stage
+/// timings ride along (P1 stall investigation) so `/admin/slow-queries` shows
+/// WHERE a slow request spent its time before `execute_query`. The threshold
+/// check runs first and short-circuits both the re-compile and the record
+/// construction when the log is off (`slow_query_ms == 0`) or the query was
+/// fast — the common case.
 fn record_slow_query_if_threshold(
     state: &Arc<AppState>,
     db: &str,
     q: &Query,
     schema: &crate::schema::SchemaDef,
     principal_ctx: &PrincipalCtx,
-    started_at_ms: i64,
-    elapsed_us: u64,
+    timings: RequestTimings,
 ) {
     let threshold_ms = state.config.slow_query_ms;
     if threshold_ms == 0 {
         return;
     }
-    let elapsed_ms = elapsed_us / 1000;
+    let elapsed_ms = timings.elapsed_us / 1000;
     if elapsed_ms < threshold_ms {
         return;
     }
@@ -228,13 +299,16 @@ fn record_slow_query_if_threshold(
         None
     };
     state.runtime.metrics.record_slow_query(SlowQueryRecord {
-        started_at_ms,
+        started_at_ms: timings.started_at_ms,
         duration_ms: elapsed_ms,
         db: db.to_string(),
         table: q.table.clone(),
         terminal: cq.terminal.to_string(),
         sql: cq.sql,
         params,
+        auth_stage_us: timings.auth_us,
+        rate_limit_stage_us: timings.rate_limit_us,
+        schema_stage_us: timings.schema_us,
     });
 }
 

@@ -92,6 +92,19 @@ pub struct SlowQueryRecord {
     /// `None` otherwise to keep document content out of the log by default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<Vec<String>>,
+    /// Pre-execute request-path stage timings (microseconds), captured by the
+    /// HTTP query handlers so `/admin/slow-queries` shows WHERE a slow request
+    /// spent its time before `execute_query` (each stage can independently
+    /// wait on the pool's acquire timeout). `None` when the stage was not
+    /// measured; omitted from the JSON when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_stage_us: Option<u64>,
+    /// Time spent in the HTTP rate-limit check (microseconds).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_stage_us: Option<u64>,
+    /// Time spent resolving the target database's schema (microseconds).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_stage_us: Option<u64>,
 }
 
 /// Bounded ring buffer of recent slow-query records (ENH-019). `record`

@@ -616,6 +616,9 @@ class SlowQueryEntry(_Wire):
     terminal: str
     sql: str
     params: list[str] | None = None
+    auth_stage_us: int | None = None
+    rate_limit_stage_us: int | None = None
+    schema_stage_us: int | None = None
 
 
 class SlowQueriesResponse(_Wire):
