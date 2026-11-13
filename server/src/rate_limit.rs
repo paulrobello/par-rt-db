@@ -38,10 +38,52 @@
 //! propagate). The failure mode is always over-admission, never
 //! under-admission: a request is never denied below the configured limit.
 use std::collections::HashMap;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
+
+/// Test-only pinned clock (`test-support` feature): when non-zero,
+/// [`now_secs`] returns this value instead of the wall clock, so the fixed
+/// minute buckets stay put no matter where a test run crosses a wall-clock
+/// minute boundary (the flake that hit `rate_limit_test` twice in CI). 0
+/// means the wall clock.
+#[cfg(any(test, feature = "test-support"))]
+static TEST_NOW_SECS: AtomicU64 = AtomicU64::new(0);
+
+/// Pins the limiter's clock at `secs` (seconds since the epoch). Integration
+/// tests pin to a mid-minute second and hold the returned guard, whose Drop
+/// restores the wall clock.
+#[cfg(any(test, feature = "test-support"))]
+pub fn pin_rate_limit_clock(secs: u64) {
+    TEST_NOW_SECS.store(secs, Ordering::Relaxed);
+}
+
+/// Restores the wall clock. Prefer a Drop guard over calling this directly.
+#[cfg(any(test, feature = "test-support"))]
+pub fn unpin_rate_limit_clock() {
+    TEST_NOW_SECS.store(0, Ordering::Relaxed);
+}
+
+/// The limiter's time source: the pinned test clock when set, else the wall
+/// clock. Feeds the admission/decision paths (`check`, `check_approx`,
+/// `check_pg`, `mark_idempotent`); the counter-sweep retention task keeps its
+/// own wall-clock cutoff so a pinned admission clock never freezes cleanup.
+fn now_secs() -> u64 {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        let pinned = TEST_NOW_SECS.load(Ordering::Relaxed);
+        if pinned != 0 {
+            return pinned;
+        }
+    }
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 use crate::AppState;
 use crate::auth::Principal;
@@ -162,10 +204,7 @@ impl RateLimiter {
             }
             return self.check_approx(key, limit_rpm);
         }
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now_secs = now_secs();
         let current_bucket = now_secs / 60;
         let mut map = self.inner.lock().await;
         match map.get_mut(&key) {
@@ -214,10 +253,7 @@ impl RateLimiter {
     /// SEC-112 reasoning as `check`: the key space is caller-controlled, so
     /// memory must stay bounded under a varying-key flood).
     pub fn mark_idempotent(&self, token_id: &str, idem_key: &str) -> bool {
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now_secs = now_secs();
         let current_bucket = now_secs / 60;
         let pair = (token_id.to_string(), idem_key.to_string());
         let mut map = self.seen_idem.lock().unwrap_or_else(|e| e.into_inner());
@@ -243,10 +279,7 @@ impl RateLimiter {
     /// the in-memory exact map (SEC-112): this map is exposed to the same
     /// varying-key-flood threat model.
     fn check_approx(&self, key: RateKey, limit_rpm: u32) -> RateDecision {
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now_secs = now_secs();
         let current_bucket = now_secs / 60;
         let mut map = self.approx.lock().unwrap_or_else(|e| e.into_inner());
         if !map.contains_key(&key) && map.len() >= MAX_BUCKETS {
@@ -450,10 +483,7 @@ pub async fn run_counter_sweep(pool: sqlx::PgPool) {
 /// limiter outage must not take writes down with it (the flood valve the
 /// limiter is would become its own outage).
 async fn check_pg(pool: &sqlx::PgPool, key: &RateKey, limit_rpm: u32) -> RateDecision {
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now_secs = now_secs();
     let current_bucket = now_secs / 60;
     let (key_type, key_text) = key_type_text(key);
     let count: i64 = match sqlx::query_scalar(
@@ -662,11 +692,7 @@ mod tests {
         assert!(!limiter.mark_idempotent("other", "k"));
         // The entry is stored under the current wall-clock minute bucket, so
         // it expires exactly like a counter bucket on rollover.
-        let now_bucket = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            / 60;
+        let now_bucket = now_secs() / 60;
         let map = limiter.seen_idem.lock().unwrap();
         assert_eq!(
             map.get(&("tok".to_string(), "k".to_string())),

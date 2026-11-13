@@ -31,6 +31,30 @@ async fn api_post(
         .expect("send api request")
 }
 
+/// Pins the rate limiter's clock to the middle of the current wall-clock
+/// minute for the test's duration: a boundary-exact test can otherwise
+/// straddle a minute rollover when CI load stretches its request sequence,
+/// which flaked the Release gate twice in one evening. Drop restores the
+/// wall clock, so pins never leak into other tests sharing the process.
+struct PinnedMinute;
+
+impl PinnedMinute {
+    fn pin() -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs();
+        rtdb_server::rate_limit::pin_rate_limit_clock((now / 60) * 60 + 30);
+        PinnedMinute
+    }
+}
+
+impl Drop for PinnedMinute {
+    fn drop(&mut self) {
+        rtdb_server::rate_limit::unpin_rate_limit_clock();
+    }
+}
+
 /// Mints a real machine token for `db` via the admin route. Returns
 /// `(token_id, token)` — the id is unused here but mirrors `http_api_test`.
 async fn mint_token(addr: SocketAddr, db: &str) -> (String, String) {
@@ -208,6 +232,7 @@ async fn arc007_approx_limiters_converge_within_two_sync_windows() -> anyhow::Re
 
 #[tokio::test]
 async fn per_token_limit_allows_n_then_denials_carry_retry_after() -> anyhow::Result<()> {
+    let _pinned = PinnedMinute::pin();
     let state = test_state_with_rate_limits(3, 0).await;
     let addr = spawn_app(state.clone()).await;
     let name = fresh_db(&state).await;
@@ -258,6 +283,7 @@ async fn per_token_limit_allows_n_then_denials_carry_retry_after() -> anyhow::Re
 // the same db is denied — the per-db bucket doesn't care which token spent it.
 #[tokio::test]
 async fn per_db_limit_is_shared_across_tokens() -> anyhow::Result<()> {
+    let _pinned = PinnedMinute::pin();
     let state = test_state_with_rate_limits(0, 2).await;
     let addr = spawn_app(state.clone()).await;
     let name = fresh_db(&state).await;
@@ -308,6 +334,7 @@ async fn disabled_limits_never_throttle() -> anyhow::Result<()> {
 // per-token, which is 0 here.)
 #[tokio::test]
 async fn per_db_budget_does_not_leak_across_dbs() -> anyhow::Result<()> {
+    let _pinned = PinnedMinute::pin();
     // per_db_rpm=1 makes the cross-db contrast crisp: one request saturates a
     // db's bucket for the minute, so the second db is the only place a fresh
     // request can still succeed.
@@ -422,6 +449,7 @@ fn insert_work_item_txn() -> serde_json::Value {
 
 #[tokio::test]
 async fn replayed_idempotent_mutate_skips_the_per_token_budget() -> anyhow::Result<()> {
+    let _pinned = PinnedMinute::pin();
     let state = test_state_with_rate_limits(2, 0).await;
     let addr = spawn_app(state.clone()).await;
     let name = fresh_db(&state).await;
@@ -515,6 +543,7 @@ async fn replayed_idempotent_mutate_skips_the_per_token_budget() -> anyhow::Resu
 
 #[tokio::test]
 async fn patched_rate_limits_apply_on_next_request_without_restart() -> anyhow::Result<()> {
+    let _pinned = PinnedMinute::pin();
     for field in ["perTokenRpm", "perDbRpm"] {
         let state = test_state_with_rate_limits(10, 10).await;
         let addr = spawn_app(state.clone()).await;

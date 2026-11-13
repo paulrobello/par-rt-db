@@ -748,9 +748,29 @@ async fn lease_backend_termination_demotes_owner() -> anyhow::Result<()> {
         .execute(&pool)
         .await?;
 
-    // Give the terminated backend a moment to fully release the lock and A's
-    // pool to notice the dead connection.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Wait (bounded) until the terminated backend has fully released the
+    // advisory lock: under CI load the old fixed 500ms sleep could fire
+    // before Postgres released the lock, racing B's takeover into A still
+    // owning it. The lock actually disappearing is the state transition the
+    // rest of the test depends on; 10s is far past any sane release delay.
+    let lock_free_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (held,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' AND granted \
+             AND ((classid::bigint << 32) | objid::bigint) = $1",
+        )
+        .bind(key)
+        .fetch_one(&pool)
+        .await?;
+        if held == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < lock_free_deadline,
+            "lease advisory lock not released within 10s of backend termination"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
     // B's failover write: forwards to A (A's is_owner is now false or its
     // write CONFLICTs), times out, takes the lease itself, and lands. Retry
