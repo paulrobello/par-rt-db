@@ -48,7 +48,7 @@ async fn scheduler_exits_when_its_database_is_deleted() -> anyhow::Result<()> {
     }
 }
 
-/// Regression for the 2026-11-12 lenny2 livelock (card 01a1d0899): request-path
+/// Regression for the 2026-11-12 prod livelock (card 01a1d0899): request-path
 /// cold guards must not re-run the eleven-statement exclusive-lock DDL on
 /// every call. External claim pollers hit them every poll; at prod cadence the
 /// churn starved per-db scheduler queries for up to 604s. The cached variant

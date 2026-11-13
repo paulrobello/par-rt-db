@@ -225,7 +225,7 @@ pub use crate::protocol::ScheduleInfo;
 /// guard every poll (measured prod, 2026-11-12: ~2.2 ensures/s continuously
 /// for 10 hours — the DDL churn took ACCESS EXCLUSIVE locks on
 /// `scheduled_txns` thousands of times per hour and starved per-db scheduler
-/// queries for up to 604s, the lenny2 livelock). The cached variant runs the
+/// queries for up to 604s, the 2026-11-12 prod livelock). The cached variant runs the
 /// full DDL once per db per process; boot/spawn paths keep the uncached
 /// [`ensure_table`] so a table dropped out-of-band self-heals on the next
 /// scheduler respawn. The memo never needs eviction: a re-created table is
