@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { RtDbError } from "../src/errors.js";
+import { decodeCursor, encodeCursor } from "../src/pagination.js";
 import { InMemoryRtDbClient } from "../src/in_memory/index.js";
 import { stampComputed } from "../src/in_memory/doc_stamp.js";
 import { indexColumnType, type PgType } from "../src/in_memory/validate.js";
@@ -275,6 +276,120 @@ describe("spec corpus: aggregate terminals", () => {
       }
       const result = await client.query({ json: q });
       expect(result, row.id).toEqual(row.expect);
+    }
+  });
+});
+
+describe("spec corpus: pagination", () => {
+  const CORPUS: {
+    rows: {
+      id: string;
+      fields: Record<string, FieldTypeJson>;
+      index: IndexJson;
+      docs: Record<string, unknown>[];
+      eq: unknown[];
+      order: "asc" | "desc";
+      paginate: { numItems: number; cursor?: unknown[] };
+      expect: {
+        docs?: Record<string, unknown>[];
+        nextCursorPrefix?: unknown[];
+        error?: { code: string };
+      };
+    }[];
+  } = JSON.parse(
+    readFileSync(resolve(__dirname, "../../wire-corpus/spec/pagination.json"), "utf8"),
+  );
+
+  const OWN_ORDERS = ["asc", "desc"];
+  const OWN_KINDS = ["number", "int64", "boolean", "optional"];
+
+  /** The corpus README's own-coverage rule: every Order spelling and keyset
+   *  value kind this engine distinguishes must be exercised by a fixture
+   *  row. */
+  it("every order spelling and value kind this engine distinguishes has a fixture row", () => {
+    const seenOrders = new Set<string>();
+    const seenKinds = new Set<string>();
+    for (const row of CORPUS.rows) {
+      seenOrders.add(row.order);
+      const ty = row.fields.v?.type ?? "string";
+      seenKinds.add(ty === "optional" ? "optional" : ty);
+    }
+    for (const order of OWN_ORDERS) {
+      expect(seenOrders.has(order), `no fixture row exercises order '${order}'`).toBe(true);
+    }
+    for (const kind of OWN_KINDS) {
+      expect(seenKinds.has(kind), `no fixture row exercises value kind '${kind}'`).toBe(true);
+    }
+  });
+
+  /** Per-row execution: push the row's schema fragment, insert the docs
+   *  through the real write path, encode the RAW cursor values through this
+   *  engine's codec, run the paginate query through the real terminal, and
+   *  assert the page envelope — `nextCursorPrefix` is the unbound-index
+   *  prefix of the decoded minted cursor. */
+  it("pages every fixture row identically to the server contract", async () => {
+    let ms = 1_700_000_000_000;
+    for (const row of CORPUS.rows) {
+      const client = new InMemoryRtDbClient({ now: () => ++ms, random: () => 0 });
+      const schema: SchemaJson = {
+        tables: { items: { fields: row.fields, indexes: [row.index] } },
+      };
+      client.pushSchema(schema);
+      await client
+        .mutate({
+          steps: [{ op: "insertMany", table: "items", docs: row.docs }],
+        })
+        .catch((e: unknown) => {
+          throw new Error(`row ${row.id}: insert failed: ${String(e)}`);
+        });
+      const cursor =
+        row.paginate.cursor !== undefined ? encodeCursor(row.paginate.cursor) : undefined;
+      const q = {
+        table: "items",
+        index: row.index.name,
+        eq: row.eq,
+        order: row.order,
+        paginate: { numItems: row.paginate.numItems, ...(cursor !== undefined ? { cursor } : {}) },
+      };
+      const expectedCode = row.expect.error?.code;
+      if (expectedCode !== undefined) {
+        const err = await client.query({ json: q }).then(
+          () => null,
+          (e: unknown) => e,
+        );
+        expect(err, row.id).toBeInstanceOf(RtDbError);
+        expect((err as RtDbError).code, row.id).toBe(expectedCode);
+        continue;
+      }
+      const result = (await client.query({ json: q })) as {
+        docs: Record<string, unknown>[];
+        nextCursor?: string;
+      };
+      // The wire page docs carry the system fields (`_id`, `_creationTime`,
+      // `_version`) — minted per engine, so asserted under the semantics
+      // corpus's normalize projection (README "Semantics corpus format").
+      const SYSTEM_KEYS = ["_id", "_creationTime", "_version"];
+      const projected = result.docs.map((doc) => {
+        const clone = { ...doc };
+        for (const key of SYSTEM_KEYS) {
+          delete clone[key];
+        }
+        return clone;
+      });
+      expect(projected, row.id).toEqual(row.expect.docs);
+      const prefix = row.expect.nextCursorPrefix;
+      if (prefix === undefined) {
+        expect(result.nextCursor, `${row.id}: no nextCursor expected`).toBeUndefined();
+        continue;
+      }
+      expect(result.nextCursor, `${row.id}: nextCursor must be present`).toBeDefined();
+      const decoded = decodeCursor(result.nextCursor as string);
+      expect(decoded.length, `${row.id}: minted cursor arity`).toBe(prefix.length + 2);
+      expect(decoded.slice(0, prefix.length), `${row.id}: minted cursor prefix`).toEqual(prefix);
+      expect(typeof decoded[decoded.length - 2], `${row.id}: created_at cursor kind`).toBe(
+        "number",
+      );
+      expect(typeof decoded[decoded.length - 1], `${row.id}: id cursor kind`).toBe("string");
     }
   });
 });

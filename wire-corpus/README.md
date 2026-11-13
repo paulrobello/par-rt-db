@@ -52,10 +52,13 @@ implementations honest against each other. These artifacts live here:
   [`spec/computed-stamping.json`](spec/computed-stamping.json) pins the
   computed-field stamping decision table (`txn::stamp_computed` +
   `value_expr::eval_value_expr` and their six client `stampComputed` ports),
-  and [`spec/aggregate-terminals.json`](spec/aggregate-terminals.json) pins
+  [`spec/aggregate-terminals.json`](spec/aggregate-terminals.json) pins
   the aggregate-terminal decision table (count/sum/avg/min/max over row sets
   and groups, per the server's reference reduction of its aggregate SQL and
-  the six client ports).
+  the six client ports),
+  and [`spec/pagination.json`](spec/pagination.json) pins the btree
+  keyset-pagination decision table (per the server's reference walk of its
+  paginate SQL and the six client `paginateResult` ports).
   See [Spec-table corpus](#spec-table-corpus) below.
 
 **Runner scope:** the server and all six client in-memory engines
@@ -503,31 +506,64 @@ fixture can never disagree with the code that owns the semantics.
   integral number (`5.0` vs `5`); both are pinned server-side by
   `server/src/value_expr.rs`'s unit tests instead.
 
+- [`spec/pagination.json`](spec/pagination.json) — the btree keyset-pagination
+  decision table shared by the server and all six client in-memory engines,
+  computed from the server's reference walk of the paginate SQL
+  (`query/terminals.rs::compile_paginate_terminal` +
+  `build_cursor_conditions` + `execute_paginate_terminal`'s minting, via
+  `server/src/spec_corpus_pagination.rs`). One row per representative per
+  wire-visible rule: first-page derivation, asc/desc walks over the OR-of-AND
+  resume predicate (a prefix-equal cursor re-serves its boundary row via the
+  tiebreaker tail; a past-end tail skips the whole boundary group), asc NULLS
+  LAST / desc NULLS FIRST, absent optional keys, insertion-order tie-breaks
+  within an equal prefix, exhausted cursors, the truncate-before-mint order
+  (numItems 0 pages empty with NO next cursor), multi-column keysets, int64
+  columns sorting numerically through decimal strings, booleans (false <
+  true), and the cursor arity/kind rejections (BAD_REQUEST). Cursor values
+  are carried RAW and each runner encodes them through its own codec;
+  tiebreaker extremes (created_at 0 / 4e12, id '' / 'zzzz') keep every
+  expected page engine-neutral. Deliberately excluded: cursors carrying a
+  JSON-null index value (the engines skip the kind check for nulls while the
+  server's typed bind rejects them — a server-side resume gap past a NULL
+  sort group, pinned nowhere), cursors over the ranked terminals
+  (search/vectorSearch rank keys are engine-minted stand-ins, covered by the
+  semantics corpus), the numItems > 4096 clamp (a fixture would need 4097
+  docs), and malformed-base64 cursors (semantics corpus
+  `error-paginate-malformed-cursor`).
+
 **Authoring rule:** a change to the pinned semantics (a new `FieldType`
 variant, a mapping change in `indexed_column_type`, a new `ValueExpr` node,
 a new `Cast` target, a stamping-semantics change in `stamp_computed` or
 any of its six client ports, a new `AggregateOp` variant, or an
 aggregate-reduction change in the server's aggregate terminal or any of its
-six client ports) regenerates the fixture —
+six client ports, or a paginate/cursor-semantics change in the server's
+paginate terminal or any of its six client ports) regenerates the fixture —
 `make gen-spec-index-column-types` /
 `make gen-spec-computed-stamping` /
-`make gen-spec-aggregate-terminals` — and lands the regenerated table **in
+`make gen-spec-aggregate-terminals` /
+`make gen-spec-pagination` — and lands the regenerated table **in
 the same change**, updating whichever client ports moved with it. A client port
 that drifts from a committed table fails that client's spec-corpus runner; a
 variant or grammar node added without a representative row fails the
-generator's exhaustive match (a compile error in `server/src/spec_corpus.rs`).
+generator's exhaustive match (a compile error in `server/src/spec_corpus.rs`
+or `server/src/spec_corpus_pagination.rs`).
 
 **Enforcement:** `make gen-spec-index-column-types-check`,
-`make gen-spec-computed-stamping-check`, and
-`make gen-spec-aggregate-terminals-check` (`checkall` legs) diff each committed
-fixture against a fresh generation; the server's `spec_corpus.rs` tests pin
-the same property in-crate. Each of the seven runners — server, ts-client
+`make gen-spec-computed-stamping-check`,
+`make gen-spec-aggregate-terminals-check`, and
+`make gen-spec-pagination-check` (`checkall` legs) diff each committed
+fixture against a fresh generation; the server's `spec_corpus.rs` and
+`spec_corpus_pagination.rs` tests pin the same property in-crate. Each of the
+seven runners — server, ts-client
 (`tests/spec-corpus.test.ts`), rust-client
-(`tests/wire_corpus.rs::spec_corpus` + `::computed_stamping_corpus`),
+(`tests/wire_corpus.rs::spec_corpus` + `::computed_stamping_corpus` +
+`::pagination_corpus`),
 python-client (`tests/test_spec_corpus.py`), go-client
 (`inmemory/spec_corpus_test.go`), kotlin-client
-(`inmemory/SpecCorpusTest.kt` + `ComputedStampingSpecCorpusTest`), and
+(`inmemory/SpecCorpusTest.kt` + `ComputedStampingSpecCorpusTest` +
+`PaginationSpecCorpusTest`), and
 swift-client (`SpecCorpusTests.swift` +
-`ComputedStampingSpecCorpusTests`) — asserts its own port against every row
-of both families, plus each surface's own variant/op coverage check (a
-variant added without a fixture row fails that surface's coverage test).
+`ComputedStampingSpecCorpusTests` + `PaginationSpecCorpusTests`) — asserts
+its own port against every row of all four families, plus each surface's own
+variant/op coverage check (a variant added without a fixture row fails that
+surface's coverage test).

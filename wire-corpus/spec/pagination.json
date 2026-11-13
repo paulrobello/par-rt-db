@@ -1,0 +1,1225 @@
+{
+  "$comment": "SPEC-TABLE CORPUS (ENH-052 family 4) — GENERATED, do not edit. The btree keyset-pagination decision table, computed from the server's reference walk of the SQL that query/terminals.rs::compile_paginate_terminal emits (see server/src/spec_corpus_pagination.rs) by 'make gen-spec-pagination'. The wire-visible Postgres rules pinned per row: the sort spans the unbound index columns after the eq prefix then created_at/id, asc NULLS LAST / desc NULLS FIRST, the OR-of-AND resume predicate (a prefix-equal cursor re-serves its boundary row via the tiebreaker tail; a past-end tail skips the whole boundary group), ties within an equal prefix resolve by insertion order (created_at desc in desc order), int64 columns sort numerically through decimal strings past 2^53, booleans order false < true, LIMIT n+1 truncates before minting (numItems 0 pages empty with NO next cursor), and cursors reject on wrong arity or wrong value kind (created_at must be a number, id a string, an int64 column a decimal string) with BAD_REQUEST. Cursor values are carried RAW and each runner encodes them through its own codec; tiebreaker extremes (created_at 0 / 4e12, id '' / 'zzzz') keep every expected page engine-neutral. Each runner pushes the row's schema fragment, inserts the docs, and runs the paginate query through its own engine, asserting the page envelope where nextCursorPrefix, when present, is the unbound-index prefix of the decoded minted cursor (`expect.error` rows assert the failure with its code). Deliberately excluded: cursors carrying a JSON-null index value (the engines skip the kind check for nulls while the server's typed bind rejects them — a server-side resume gap past a NULL sort group, pinned nowhere), cursors over the ranked terminals (search/vectorSearch rank keys are engine-minted stand-ins, covered by the semantics corpus), the numItems > 4096 clamp (a fixture would need 4097 docs), and malformed-base64 cursors (semantics corpus `error-paginate-malformed-cursor`). A semantics change regenerates this file in the same commit — see wire-corpus/README.md 'Spec-table corpus'.",
+  "rows": [
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": 4
+        },
+        {
+          "s": "todo",
+          "v": 2
+        },
+        {
+          "s": "todo",
+          "v": 5
+        },
+        {
+          "s": "todo",
+          "v": 1
+        },
+        {
+          "s": "todo",
+          "v": 3
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "docs": [
+          {
+            "s": "todo",
+            "v": 1
+          },
+          {
+            "s": "todo",
+            "v": 2
+          }
+        ],
+        "nextCursorPrefix": [
+          2
+        ]
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        }
+      },
+      "id": "first-page-asc",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      },
+      "order": "asc",
+      "paginate": {
+        "numItems": 2
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": 4
+        },
+        {
+          "s": "todo",
+          "v": 2
+        },
+        {
+          "s": "todo",
+          "v": 5
+        },
+        {
+          "s": "todo",
+          "v": 1
+        },
+        {
+          "s": "todo",
+          "v": 3
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "docs": [
+          {
+            "s": "todo",
+            "v": 2
+          },
+          {
+            "s": "todo",
+            "v": 3
+          }
+        ],
+        "nextCursorPrefix": [
+          3
+        ]
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        }
+      },
+      "id": "cursor-prefix-equal-resumes-by-tiebreakers",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      },
+      "order": "asc",
+      "paginate": {
+        "cursor": [
+          2,
+          0,
+          ""
+        ],
+        "numItems": 2
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": 4
+        },
+        {
+          "s": "todo",
+          "v": 2
+        },
+        {
+          "s": "todo",
+          "v": 5
+        },
+        {
+          "s": "todo",
+          "v": 1
+        },
+        {
+          "s": "todo",
+          "v": 3
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "docs": [
+          {
+            "s": "todo",
+            "v": 3
+          },
+          {
+            "s": "todo",
+            "v": 4
+          }
+        ],
+        "nextCursorPrefix": [
+          4
+        ]
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        }
+      },
+      "id": "cursor-past-end-skips-boundary-group",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      },
+      "order": "asc",
+      "paginate": {
+        "cursor": [
+          2,
+          4000000000000,
+          "zzzz"
+        ],
+        "numItems": 2
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": 2
+        },
+        {
+          "s": "todo"
+        },
+        {
+          "s": "todo",
+          "v": 1
+        },
+        {
+          "s": "todo"
+        },
+        {
+          "s": "todo",
+          "v": 3
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "docs": [
+          {
+            "s": "todo",
+            "v": 1
+          },
+          {
+            "s": "todo",
+            "v": 2
+          },
+          {
+            "s": "todo",
+            "v": 3
+          },
+          {
+            "s": "todo"
+          }
+        ],
+        "nextCursorPrefix": [
+          null
+        ]
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "asc-nulls-last",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      },
+      "order": "asc",
+      "paginate": {
+        "numItems": 4
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": 2
+        },
+        {
+          "s": "todo"
+        },
+        {
+          "s": "todo",
+          "v": 1
+        },
+        {
+          "s": "todo"
+        },
+        {
+          "s": "todo",
+          "v": 3
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "docs": [
+          {
+            "s": "todo"
+          },
+          {
+            "s": "todo"
+          }
+        ]
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "asc-cursor-yields-null-tail",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      },
+      "order": "asc",
+      "paginate": {
+        "cursor": [
+          3,
+          4000000000000,
+          "zzzz"
+        ],
+        "numItems": 4
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": 2
+        },
+        {
+          "s": "todo"
+        },
+        {
+          "s": "todo",
+          "v": 1
+        },
+        {
+          "s": "todo"
+        },
+        {
+          "s": "todo",
+          "v": 3
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "docs": [
+          {
+            "s": "todo"
+          },
+          {
+            "s": "todo"
+          },
+          {
+            "s": "todo",
+            "v": 3
+          },
+          {
+            "s": "todo",
+            "v": 2
+          }
+        ],
+        "nextCursorPrefix": [
+          2
+        ]
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "inner": {
+            "type": "number"
+          },
+          "type": "optional"
+        }
+      },
+      "id": "desc-nulls-first-and-tiebreakers",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      },
+      "order": "desc",
+      "paginate": {
+        "numItems": 4
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": 1
+        },
+        {
+          "s": "todo",
+          "v": 4
+        },
+        {
+          "s": "todo",
+          "v": 3
+        },
+        {
+          "s": "todo",
+          "v": 2
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "docs": [
+          {
+            "s": "todo",
+            "v": 2
+          },
+          {
+            "s": "todo",
+            "v": 1
+          }
+        ]
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        }
+      },
+      "id": "desc-cursor-resumes-strictly-below",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      },
+      "order": "desc",
+      "paginate": {
+        "cursor": [
+          3,
+          0,
+          ""
+        ],
+        "numItems": 2
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": 1
+        },
+        {
+          "s": "todo",
+          "v": 2
+        },
+        {
+          "s": "todo",
+          "v": 3
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "docs": []
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        }
+      },
+      "id": "exhausted-cursor-pages-empty",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      },
+      "order": "asc",
+      "paginate": {
+        "cursor": [
+          3,
+          4000000000000,
+          "zzzz"
+        ],
+        "numItems": 2
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": 1
+        },
+        {
+          "s": "todo",
+          "v": 2
+        },
+        {
+          "s": "todo",
+          "v": 3
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "docs": [
+          {
+            "s": "todo",
+            "v": 1
+          },
+          {
+            "s": "todo",
+            "v": 2
+          },
+          {
+            "s": "todo",
+            "v": 3
+          }
+        ]
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        }
+      },
+      "id": "exact-fit-page-no-cursor",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      },
+      "order": "asc",
+      "paginate": {
+        "numItems": 3
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": 1
+        },
+        {
+          "s": "todo",
+          "v": 2
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "docs": []
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        }
+      },
+      "id": "num-items-zero-empty-page",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      },
+      "order": "asc",
+      "paginate": {
+        "numItems": 0
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": "9007199254740992"
+        },
+        {
+          "s": "todo",
+          "v": "10000000000000000"
+        },
+        {
+          "s": "todo",
+          "v": "2"
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "docs": [
+          {
+            "s": "todo",
+            "v": "2"
+          },
+          {
+            "s": "todo",
+            "v": "9007199254740992"
+          },
+          {
+            "s": "todo",
+            "v": "10000000000000000"
+          }
+        ]
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "int64"
+        }
+      },
+      "id": "int64-sorts-numerically-asc",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      },
+      "order": "asc",
+      "paginate": {
+        "numItems": 3
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": "9007199254740992"
+        },
+        {
+          "s": "todo",
+          "v": "10000000000000000"
+        },
+        {
+          "s": "todo",
+          "v": "2"
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "docs": [
+          {
+            "s": "todo",
+            "v": "10000000000000000"
+          }
+        ]
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "int64"
+        }
+      },
+      "id": "int64-cursor-mid-numeric",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      },
+      "order": "asc",
+      "paginate": {
+        "cursor": [
+          "9500000000000000",
+          4000000000000,
+          "zzzz"
+        ],
+        "numItems": 3
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": true
+        },
+        {
+          "s": "todo",
+          "v": false
+        },
+        {
+          "s": "todo",
+          "v": true
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "docs": [
+          {
+            "s": "todo",
+            "v": false
+          },
+          {
+            "s": "todo",
+            "v": true
+          }
+        ],
+        "nextCursorPrefix": [
+          true
+        ]
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "boolean"
+        }
+      },
+      "id": "boolean-false-before-true",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      },
+      "order": "asc",
+      "paginate": {
+        "numItems": 2
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": 1,
+          "w": "b"
+        },
+        {
+          "s": "todo",
+          "v": 1,
+          "w": "a"
+        },
+        {
+          "s": "todo",
+          "v": 2,
+          "w": "b"
+        },
+        {
+          "s": "todo",
+          "v": 2,
+          "w": "a"
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "docs": [
+          {
+            "s": "todo",
+            "v": 1,
+            "w": "a"
+          },
+          {
+            "s": "todo",
+            "v": 1,
+            "w": "b"
+          }
+        ],
+        "nextCursorPrefix": [
+          1,
+          "b"
+        ]
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        },
+        "w": {
+          "type": "string"
+        }
+      },
+      "id": "multi-column-first-page-asc",
+      "index": {
+        "fields": [
+          "s",
+          "v",
+          "w"
+        ],
+        "name": "by_s_v_w"
+      },
+      "order": "asc",
+      "paginate": {
+        "numItems": 2
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": 1,
+          "w": "b"
+        },
+        {
+          "s": "todo",
+          "v": 1,
+          "w": "a"
+        },
+        {
+          "s": "todo",
+          "v": 2,
+          "w": "b"
+        },
+        {
+          "s": "todo",
+          "v": 2,
+          "w": "a"
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "docs": [
+          {
+            "s": "todo",
+            "v": 1,
+            "w": "a"
+          },
+          {
+            "s": "todo",
+            "v": 1,
+            "w": "b"
+          },
+          {
+            "s": "todo",
+            "v": 2,
+            "w": "a"
+          }
+        ],
+        "nextCursorPrefix": [
+          2,
+          "a"
+        ]
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        },
+        "w": {
+          "type": "string"
+        }
+      },
+      "id": "multi-column-cursor-prefix-equal",
+      "index": {
+        "fields": [
+          "s",
+          "v",
+          "w"
+        ],
+        "name": "by_s_v_w"
+      },
+      "order": "asc",
+      "paginate": {
+        "cursor": [
+          1,
+          "a",
+          0,
+          ""
+        ],
+        "numItems": 3
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": 1,
+          "w": "b"
+        },
+        {
+          "s": "todo",
+          "v": 1,
+          "w": "a"
+        },
+        {
+          "s": "todo",
+          "v": 2,
+          "w": "b"
+        },
+        {
+          "s": "todo",
+          "v": 2,
+          "w": "a"
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "docs": [
+          {
+            "s": "todo",
+            "v": 2,
+            "w": "a"
+          },
+          {
+            "s": "todo",
+            "v": 1,
+            "w": "b"
+          }
+        ],
+        "nextCursorPrefix": [
+          1,
+          "b"
+        ]
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        },
+        "w": {
+          "type": "string"
+        }
+      },
+      "id": "multi-column-cursor-past-end-desc",
+      "index": {
+        "fields": [
+          "s",
+          "v",
+          "w"
+        ],
+        "name": "by_s_v_w"
+      },
+      "order": "desc",
+      "paginate": {
+        "cursor": [
+          2,
+          "a",
+          4000000000000,
+          "zzzz"
+        ],
+        "numItems": 2
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": 1,
+          "w": "b"
+        },
+        {
+          "s": "todo",
+          "v": 1,
+          "w": "a"
+        }
+      ],
+      "eq": [
+        "todo",
+        1
+      ],
+      "expect": {
+        "docs": [
+          {
+            "s": "todo",
+            "v": 1,
+            "w": "a"
+          }
+        ],
+        "nextCursorPrefix": [
+          "a"
+        ]
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        },
+        "w": {
+          "type": "string"
+        }
+      },
+      "id": "eq-prefix-shrinks-keyset",
+      "index": {
+        "fields": [
+          "s",
+          "v",
+          "w"
+        ],
+        "name": "by_s_v_w"
+      },
+      "order": "asc",
+      "paginate": {
+        "cursor": [
+          "a",
+          0,
+          ""
+        ],
+        "numItems": 1
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": 1
+        },
+        {
+          "s": "todo",
+          "v": 2
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "error": {
+          "code": "BAD_REQUEST"
+        }
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        }
+      },
+      "id": "cursor-arity-mismatch-rejected",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      },
+      "order": "asc",
+      "paginate": {
+        "cursor": [
+          1
+        ],
+        "numItems": 2
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": 1
+        },
+        {
+          "s": "todo",
+          "v": 2
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "error": {
+          "code": "BAD_REQUEST"
+        }
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        }
+      },
+      "id": "cursor-created-at-kind-rejected",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      },
+      "order": "asc",
+      "paginate": {
+        "cursor": [
+          1,
+          "not-a-number",
+          ""
+        ],
+        "numItems": 2
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": 1
+        },
+        {
+          "s": "todo",
+          "v": 2
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "error": {
+          "code": "BAD_REQUEST"
+        }
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "number"
+        }
+      },
+      "id": "cursor-id-kind-rejected",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      },
+      "order": "asc",
+      "paginate": {
+        "cursor": [
+          1,
+          0,
+          42
+        ],
+        "numItems": 2
+      }
+    },
+    {
+      "docs": [
+        {
+          "s": "todo",
+          "v": "1"
+        },
+        {
+          "s": "todo",
+          "v": "2"
+        }
+      ],
+      "eq": [
+        "todo"
+      ],
+      "expect": {
+        "error": {
+          "code": "BAD_REQUEST"
+        }
+      },
+      "fields": {
+        "s": {
+          "type": "string"
+        },
+        "v": {
+          "type": "int64"
+        }
+      },
+      "id": "int64-cursor-number-value-rejected",
+      "index": {
+        "fields": [
+          "s",
+          "v"
+        ],
+        "name": "by_s_v"
+      },
+      "order": "asc",
+      "paginate": {
+        "cursor": [
+          9500000000000000,
+          0,
+          ""
+        ],
+        "numItems": 2
+      }
+    }
+  ]
+}

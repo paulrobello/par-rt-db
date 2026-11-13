@@ -241,3 +241,110 @@ def test_every_aggregate_row_matches_this_engine() -> None:
                 run_query(q_json)
             continue
         assert run_query(q_json) == expect, f"row {i} ({row['id']}): aggregate result"
+
+
+# ---------------------------------------------------------------------------
+# ENH-052 family 4 — spec-table corpus: the btree keyset-pagination decision
+# table (wire-corpus/spec/pagination.json). Each row pushes its schema
+# fragment, inserts the docs through the real write path, encodes the RAW
+# cursor values through this engine's codec, runs the paginate query through
+# ``run_query``, and asserts the page envelope — ``nextCursorPrefix`` is the
+# unbound-index prefix of the decoded minted cursor (``expect.error`` rows
+# assert the failure with its code).
+# ---------------------------------------------------------------------------
+
+_PAGINATION_CORPUS_PATH = (
+    Path(__file__).resolve().parents[2] / "wire-corpus" / "spec" / "pagination.json"
+)
+_PAGINATION_CORPUS = json.loads(_PAGINATION_CORPUS_PATH.read_text(encoding="utf-8"))
+
+
+def test_every_pagination_order_and_kind_has_a_fixture_row() -> None:
+    """The corpus README's own-coverage rule: every Order spelling and keyset
+    value kind this engine distinguishes must be exercised by a fixture row."""
+    orders: set[str] = set()
+    kinds: set[str] = set()
+    for row in _PAGINATION_CORPUS["rows"]:
+        orders.add(row["order"])
+        kinds.add(row["fields"]["v"]["type"])
+    for order in ("asc", "desc"):
+        assert order in orders, f"no fixture row exercises order '{order}'"
+    for kind in ("number", "int64", "boolean", "optional"):
+        assert kind in kinds, f"no fixture row exercises value kind '{kind}'"
+
+
+def test_every_pagination_row_matches_this_engine() -> None:
+    from par_rt_db.cursor import decode_cursor, encode_cursor
+    from par_rt_db.errors import ErrorCode
+    from par_rt_db.in_memory import InMemoryRtDbClient
+    from par_rt_db.in_memory.store import InMemoryRtDbClientOptions
+    from par_rt_db.mutation import Mutation
+    from par_rt_db.query import Query
+    from par_rt_db.schema import SchemaDef
+
+    SYSTEM_KEYS = ("_id", "_creationTime", "_version")
+
+    for i, row in enumerate(_PAGINATION_CORPUS["rows"]):
+        ms = 1_700_000_000_000
+
+        def _now() -> int:
+            nonlocal ms
+            ms += 1
+            return ms
+
+        client = InMemoryRtDbClient(InMemoryRtDbClientOptions(now=_now, random=lambda: 0.0))
+        client.push_schema(
+            SchemaDef.model_validate(
+                {
+                    "tables": {
+                        "items": {
+                            "fields": row["fields"],
+                            "indexes": [row["index"]],
+                        }
+                    }
+                }
+            )
+        )
+        try:
+            client.mutate(Mutation.builder().insert_many("items", row["docs"]).build())
+        except RtDbError as err:
+            raise AssertionError(f"row {i} ({row['id']}): insert failed: {err}") from err
+        paginate: dict[str, Any] = {"numItems": row["paginate"]["numItems"]}
+        if "cursor" in row["paginate"]:
+            paginate["cursor"] = encode_cursor(row["paginate"]["cursor"])
+        q_json = {
+            "table": "items",
+            "index": row["index"]["name"],
+            "eq": row["eq"],
+            "order": row["order"],
+            "paginate": paginate,
+        }
+        try:
+            q = Query.model_validate(q_json)
+        except Exception as err:
+            raise AssertionError(f"row {i} ({row['id']}): query does not parse: {err}") from err
+        want_code = (row["expect"].get("error") or {}).get("code")
+        if want_code is not None:
+            try:
+                result = client.run_query(q)
+            except RtDbError as err:
+                assert err.code == ErrorCode[want_code], (
+                    f"row {i} ({row['id']}): rejection code {err.code}"
+                )
+                continue
+            raise AssertionError(f"row {i} ({row['id']}): expected the query to fail, got {result}")
+        result = client.run_query(q)
+        got_docs = [
+            {k: v for k, v in doc.items() if k not in SYSTEM_KEYS} for doc in result["docs"]
+        ]
+        assert got_docs == row["expect"]["docs"], f"row {i} ({row['id']}): page docs"
+        prefix = row["expect"].get("nextCursorPrefix")
+        if prefix is None:
+            assert "nextCursor" not in result, f"row {i} ({row['id']}): expected no next cursor"
+            continue
+        assert "nextCursor" in result, f"row {i} ({row['id']}): expected a next cursor"
+        decoded = decode_cursor(result["nextCursor"])
+        assert len(decoded) == len(prefix) + 2, f"row {i} ({row['id']}): minted cursor arity"
+        assert decoded[:-2] == prefix, f"row {i} ({row['id']}): minted cursor prefix"
+        assert isinstance(decoded[-2], (int, float)), f"row {i} ({row['id']}): created_at kind"
+        assert isinstance(decoded[-1], str), f"row {i} ({row['id']}): id kind"

@@ -1127,7 +1127,19 @@ NULL last), whose equivalence to the Postgres-backed execution is pinned by
 `query_test.rs`, `aggregate_having_test.rs`, and the `aggregate-*` semantics
 cases; every client engine's aggregate port asserts itself against every row —
 which is how the family exposed and fixed an inverted boolean ordering in the
-swift engine's shared index-value comparator on its first run.
+swift engine's shared index-value comparator on its first run. Family 4,
+`spec/pagination.json`, applies the pattern to the
+btree paginate terminal's keyset walk: the server's paginate SQL hands the
+resume predicate to Postgres, so the table is generated from a reference walk
+in `server/src/spec_corpus_pagination.rs` that encodes the wire-visible rules
+that SQL relies on (the OR-of-AND resume predicate with its prefix-equal and
+past-end branches, asc NULLS LAST / desc NULLS FIRST, insertion-order
+tie-breaks, the truncate-before-mint order, int64 columns sorting numerically
+through decimal strings, the cursor arity/kind rejections), whose equivalence
+to the Postgres-backed execution is pinned by the existing pagination suites;
+cursor values are carried RAW with engine-neutral tiebreaker extremes so no
+engine-private clock or id participates, and every client engine's
+`paginateResult` port asserts itself against every row.
 
 ## Admin surface and the op-feed tap
 

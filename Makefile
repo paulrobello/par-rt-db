@@ -42,6 +42,7 @@ SWIFT_CLIENT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(
 	gen-error-codes-ts-check gen-error-codes-rust gen-error-codes-rust-check \
 	gen-spec-index-column-types gen-spec-index-column-types-check \
 	gen-spec-computed-stamping gen-spec-computed-stamping-check \
+	gen-spec-pagination gen-spec-pagination-check \
 	kotlin-client-install kotlin-client-build kotlin-client-lint kotlin-client-typecheck \
 	kotlin-client-test kotlin-client-checkall \
 	swift-client-build swift-client-test swift-client-lint swift-client-fmt \
@@ -397,6 +398,26 @@ gen-spec-aggregate-terminals-check:
 		exit $$status; \
 	fi
 
+# ENH-052 family 4: wire-corpus/spec/pagination.json — the btree
+# keyset-pagination decision table, generated from the server's reference walk
+# of the paginate SQL semantics (see server/src/spec_corpus_pagination.rs).
+# Run after any paginate/cursor semantics change, in the same change. The
+# -check leg in checkall fails when the committed fixture disagrees with a
+# fresh generation.
+gen-spec-pagination:
+	cd server && cargo run --quiet --bin gen-spec-pagination
+
+gen-spec-pagination-check:
+	@tmpdir=$$(mktemp -d); \
+	if (cd server && cargo run --quiet --bin gen-spec-pagination -- --out "$$tmpdir/pagination.json") \
+		&& diff -u wire-corpus/spec/pagination.json "$$tmpdir/pagination.json"; then \
+		rm -rf "$$tmpdir"; \
+	else \
+		status=$$?; rm -rf "$$tmpdir"; \
+		echo "wire-corpus/spec/pagination.json is stale — run 'make gen-spec-pagination' and commit the result" >&2; \
+		exit $$status; \
+	fi
+
 # Kotlin/JVM client. The Gradle wrapper pins Gradle itself; the only host
 # requirement is a JDK 17+ (CI installs Temurin 21). Compiler warnings are
 # errors (build.gradle.kts), so compile doubles as lint and typecheck, and the
@@ -558,7 +579,7 @@ ts-dist-preflight:
 	./scripts/ts-dist-preflight.sh
 
 checkall: ts-dist-preflight env-drift-check dockerfile-stub-check backup-persistence-check hostname-leak-check cli-docs-check gen-error-codes-ts-check gen-error-codes-rust-check gen-spec-index-column-types-check gen-spec-computed-stamping-check \
-	gen-spec-aggregate-terminals-check docs-api fmt-check lint typecheck test rust-client-check-features publish-check dev-db-clean-check
+	gen-spec-aggregate-terminals-check gen-spec-pagination-check docs-api fmt-check lint typecheck test rust-client-check-features publish-check dev-db-clean-check
 	@mkdir -p target && echo "$(GATE_KEY)" > $(GATE_STAMP)
 
 # Content-addressed gate reuse for deploys: `checkall` stamps the gate key

@@ -1890,4 +1890,18 @@ mod tests {
              'make gen-spec-aggregate-terminals' and commit the result"
         );
     }
+
+    /// Family 4's in-crate pin: same property as the tests above, for the
+    /// pagination fixture.
+    #[test]
+    fn committed_pagination_fixture_matches_generation() {
+        let committed = include_str!("../../wire-corpus/spec/pagination.json");
+        let generated =
+            crate::spec_corpus_pagination::render_pagination_spec().expect("render spec fixture");
+        assert_eq!(
+            committed, generated,
+            "wire-corpus/spec/pagination.json is stale — run \
+             'make gen-spec-pagination' and commit the result"
+        );
+    }
 }

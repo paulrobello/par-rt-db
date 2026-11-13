@@ -913,3 +913,182 @@ mod aggregate_terminals_corpus {
         }
     }
 }
+
+// ENH-052 family 4 — spec-table corpus: the btree keyset-pagination decision
+// table (wire-corpus/spec/pagination.json). Each row pushes its schema
+// fragment, inserts the docs through the real write path, encodes the RAW
+// cursor values through this crate's codec, runs the paginate query through
+// `run_query`, and asserts the page envelope — `nextCursorPrefix` is the
+// unbound-index prefix of the decoded minted cursor (`expect.error` rows
+// assert the failure with its code).
+#[cfg(feature = "in_memory")]
+mod pagination_corpus {
+    use par_rt_db_client::Query;
+    use par_rt_db_client::cursor::{decode_cursor, encode_cursor};
+    use par_rt_db_client::in_memory::{InMemoryRtDbClient, InMemoryRtDbClientOptions};
+    use par_rt_db_client::mutation::Mutation;
+    use par_rt_db_client::schema::SchemaDef;
+
+    use super::{Value, json};
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    static CLOCK: AtomicI64 = AtomicI64::new(1_700_000_000_000);
+
+    fn new_client() -> InMemoryRtDbClient {
+        InMemoryRtDbClient::new(
+            InMemoryRtDbClientOptions::default()
+                .now(|| CLOCK.fetch_add(1, Ordering::SeqCst))
+                .random(|| 0.0),
+        )
+    }
+
+    fn load_rows() -> Vec<Value> {
+        let doc: Value =
+            serde_json::from_str(include_str!("../../wire-corpus/spec/pagination.json"))
+                .unwrap_or_else(|e| panic!("parse pagination.json: {e}"));
+        doc["rows"]
+            .as_array()
+            .expect("spec corpus missing rows array")
+            .clone()
+    }
+
+    /// The corpus README's own-coverage rule: every Order spelling and keyset
+    /// value kind this engine distinguishes must be exercised by a fixture
+    /// row.
+    #[test]
+    fn every_order_and_kind_has_a_fixture_row() {
+        let mut orders = Vec::new();
+        let mut kinds = Vec::new();
+        for row in load_rows() {
+            orders.push(row["order"].as_str().expect("row order").to_string());
+            let ty = row["fields"]["v"]["type"].as_str().unwrap_or("string");
+            kinds.push(ty.to_string());
+        }
+        for order in ["asc", "desc"] {
+            assert!(
+                orders.iter().any(|s| s == order),
+                "no fixture row exercises order '{order}'"
+            );
+        }
+        for kind in ["number", "int64", "boolean", "optional"] {
+            assert!(
+                kinds.iter().any(|s| s == kind),
+                "no fixture row exercises value kind '{kind}'"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_row_matches_this_engine() {
+        for (i, row) in load_rows().into_iter().enumerate() {
+            let id = row["id"].as_str().unwrap_or("?");
+            let schema: SchemaDef = serde_json::from_value(json!({
+                "tables": {
+                    "items": {
+                        "fields": row["fields"],
+                        "indexes": [row["index"]],
+                    }
+                }
+            }))
+            .unwrap_or_else(|e| panic!("row {i} ({id}): schema does not parse: {e}"));
+            let mut client = new_client();
+            client
+                .push_schema(&schema)
+                .unwrap_or_else(|e| panic!("row {i} ({id}): push schema: {e:?}"));
+
+            let docs: Vec<Value> = row["docs"].as_array().expect("row docs").clone();
+            let txn = Mutation::new().insert_many("items", docs).build();
+            client
+                .mutate(&txn, None)
+                .await
+                .unwrap_or_else(|e| panic!("row {i} ({id}): insert docs: {e:?}"));
+
+            let num_items = row["paginate"]["numItems"].as_u64().expect("numItems");
+            let mut paginate = json!({ "numItems": num_items });
+            let mut q_json = json!({
+                "table": "items",
+                "index": row["index"]["name"],
+                "eq": row["eq"],
+                "order": row["order"],
+            });
+            if let Some(cursor) = row["paginate"]["cursor"].as_array() {
+                let encoded = encode_cursor(cursor)
+                    .unwrap_or_else(|e| panic!("row {i} ({id}): encode cursor: {e:?}"));
+                paginate["cursor"] = json!(encoded);
+            }
+            q_json["paginate"] = paginate;
+            let q: Query = serde_json::from_value(q_json)
+                .unwrap_or_else(|e| panic!("row {i} ({id}): query does not parse: {e}"));
+
+            let want_code = row["expect"]["error"]["code"].as_str().map(str::to_string);
+            if let Some(want) = want_code {
+                let err = client
+                    .run_query(&q)
+                    .err()
+                    .unwrap_or_else(|| panic!("row {i} ({id}): expected the query to fail"));
+                // The paginate family's only error row code.
+                assert_eq!(want, "BAD_REQUEST", "row {i} ({id}): unknown code");
+                assert_eq!(
+                    err.code,
+                    par_rt_db_client::ErrorCode::BadRequest,
+                    "row {i} ({id}): rejection code"
+                );
+                continue;
+            }
+            let result = client
+                .run_query(&q)
+                .unwrap_or_else(|e| panic!("row {i} ({id}): query failed: {e:?}"));
+            let got: Vec<Value> = result["docs"]
+                .as_array()
+                .unwrap_or_else(|| panic!("row {i} ({id}): expected a paginated envelope"))
+                .iter()
+                .map(|d| {
+                    let mut doc = d.clone();
+                    if let Some(map) = doc.as_object_mut() {
+                        for key in ["_id", "_creationTime", "_version"] {
+                            map.remove(key);
+                        }
+                    }
+                    doc
+                })
+                .collect();
+            assert_eq!(
+                json!(got),
+                row["expect"]["docs"],
+                "row {i} ({id}): page docs"
+            );
+            let prefix = row["expect"]["nextCursorPrefix"].as_array();
+            match prefix {
+                None => assert!(
+                    result["nextCursor"].is_null(),
+                    "row {i} ({id}): expected no next cursor"
+                ),
+                Some(want_prefix) => {
+                    let encoded = result["nextCursor"]
+                        .as_str()
+                        .unwrap_or_else(|| panic!("row {i} ({id}): expected a next cursor"));
+                    let decoded = decode_cursor(encoded)
+                        .unwrap_or_else(|e| panic!("row {i} ({id}): decode cursor: {e:?}"));
+                    assert_eq!(
+                        decoded.len(),
+                        want_prefix.len() + 2,
+                        "row {i} ({id}): minted cursor arity"
+                    );
+                    assert_eq!(
+                        &decoded[..want_prefix.len()],
+                        want_prefix.as_slice(),
+                        "row {i} ({id}): minted cursor prefix"
+                    );
+                    assert!(
+                        decoded[decoded.len() - 2].is_number(),
+                        "row {i} ({id}): created_at cursor kind"
+                    );
+                    assert!(
+                        decoded[decoded.len() - 1].is_string(),
+                        "row {i} ({id}): id cursor kind"
+                    );
+                }
+            }
+        }
+    }
+}

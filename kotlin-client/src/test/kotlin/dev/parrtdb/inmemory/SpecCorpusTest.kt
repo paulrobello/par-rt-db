@@ -335,3 +335,136 @@ class AggregateTerminalsSpecCorpusTest {
         }
     }
 }
+
+/**
+ * ENH-052 family 4 — pagination spec-table runner:
+ * wire-corpus/spec/pagination.json. Each row pushes its schema fragment,
+ * inserts the docs through the real write path, encodes the RAW cursor
+ * values through this engine's codec, runs the paginate query through
+ * `InMemoryClient.query`, and asserts the page envelope —
+ * `nextCursorPrefix` is the unbound-index prefix of the decoded minted
+ * cursor (`expect.error` rows assert the failure with its code).
+ */
+class PaginationSpecCorpusTest {
+    private fun rows(): List<JsonObject> {
+        val doc = WireJson.parse(CorpusPaths.read("spec", "pagination.json")) as? JsonObject
+            ?: error("pagination corpus is not a JSON object")
+        val arr = doc["rows"] as? JsonArray ?: error("pagination corpus has no rows array")
+        return arr.map { it as JsonObject }
+    }
+
+    private fun newClient(): InMemoryClient {
+        var clock = 1_700_000_000_000L
+        return InMemoryClient(InMemoryOptions(now = { ++clock }, random = { 0.0 }))
+    }
+
+    /** The corpus README's own-coverage rule: every Order spelling and keyset
+     *  value kind this engine distinguishes must be exercised by a row. */
+    @Test
+    fun everyOrderAndKindHasAFixtureRow() {
+        val orders = HashSet<String>()
+        val kinds = HashSet<String>()
+        for (row in rows()) {
+            orders.add((row["order"] as JsonPrimitive).content)
+            val fields = row["fields"] as JsonObject
+            val v = fields["v"] as? JsonObject
+            kinds.add((v?.get("type") as? JsonPrimitive)?.content ?: "string")
+        }
+        for (order in listOf("asc", "desc")) {
+            assertTrue(order in orders, "no fixture row exercises order '$order'")
+        }
+        for (kind in listOf("number", "int64", "boolean", "optional")) {
+            assertTrue(kind in kinds, "no fixture row exercises value kind '$kind'")
+        }
+    }
+
+    @Test
+    fun everyRowMatchesThisEngine() {
+        for ((i, row) in rows().withIndex()) {
+            val id = (row["id"] as JsonPrimitive).content
+            val index = row["index"] as JsonObject
+            val client = newClient()
+            client.pushSchema(
+                jsonObj(
+                    "tables" to jsonObj(
+                        "items" to jsonObj(
+                            "fields" to row["fields"]!!,
+                            "indexes" to jsonArr(
+                                listOf(jsonObj("name" to index["name"]!!, "fields" to index["fields"]!!)),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            val docs = (row["docs"] as JsonArray).toList()
+            client.mutate(Transaction(listOf(Step.InsertMany("items", docs))))
+            val pagJson = (row["paginate"] as JsonObject).toMutableMap()
+            (pagJson["cursor"] as? JsonArray)?.let { raw ->
+                pagJson["cursor"] = JsonPrimitive(encodeCursorForEngine(raw.toList()))
+            }
+            val q =
+                Query.fromJson(
+                    jsonObj(
+                        "table" to jsonStr("items"),
+                        "index" to index["name"]!!,
+                        "eq" to row["eq"]!!,
+                        "order" to row["order"]!!,
+                        "paginate" to JsonObject(pagJson),
+                    ),
+                )
+            val expect = row["expect"] as JsonObject
+            val wantCode = (expect["error"] as? JsonObject)?.get("code")?.let {
+                (it as JsonPrimitive).content
+            }
+            if (wantCode != null) {
+                val err = assertFailsWith<RtDbException>("row $i ($id): expected the query to fail") {
+                    client.query(q)
+                }
+                assertEquals(ErrorCode.fromWire(wantCode), err.code, "row $i ($id): rejection code")
+                continue
+            }
+            val result = client.query(q) as JsonObject
+            val gotDocs = (result["docs"] as JsonArray).map { doc ->
+                (doc as JsonObject).toMutableMap().apply {
+                    remove("_id")
+                    remove("_creationTime")
+                    remove("_version")
+                }.let { JsonObject(it) }
+            }
+            assertEquals(
+                expect["docs"],
+                JsonArray(gotDocs),
+                "row $i ($id): page docs",
+            )
+            val prefix = expect["nextCursorPrefix"] as? JsonArray
+            if (prefix == null) {
+                assertTrue(
+                    result.containsKey("nextCursor").not(),
+                    "row $i ($id): expected no next cursor",
+                )
+                continue
+            }
+            val encoded = result["nextCursor"] as? JsonPrimitive
+                ?: error("row $i ($id): expected a next cursor")
+            val decoded = decodeCursorForEngine(encoded.content)
+            assertEquals(
+                prefix.size + 2,
+                decoded.size,
+                "row $i ($id): minted cursor arity",
+            )
+            assertEquals(
+                prefix,
+                JsonArray(decoded.take(prefix.size)),
+                "row $i ($id): minted cursor prefix",
+            )
+            assertTrue(
+                decoded[decoded.size - 2] is JsonPrimitive && (decoded[decoded.size - 2] as JsonPrimitive).content.toDoubleOrNull() != null,
+                "row $i ($id): created_at cursor kind",
+            )
+            assertTrue(
+                decoded.last() is JsonPrimitive && (decoded.last() as JsonPrimitive).isString,
+                "row $i ($id): id cursor kind",
+            )
+        }
+    }
+}

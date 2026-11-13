@@ -373,3 +373,250 @@ struct AggregateTerminalsSpecCorpusTests {
         }
     }
 }
+
+/// File-scope scalar comparison for the pagination rows (int/double cross
+/// compare mirrors the stamping corpus's valuesEqual).
+private func paginateValuesEqual(_ lhs: JSONValue, _ rhs: JSONValue) -> Bool {
+    switch (lhs, rhs) {
+    case (.null, .null):
+        true
+    case let (.string(left), .string(right)):
+        left == right
+    case let (.bool(left), .bool(right)):
+        left == right
+    case let (.int(left), .int(right)):
+        left == right
+    case let (.double(left), .double(right)):
+        left == right
+    case let (.int(left), .double(right)), let (.double(right), .int(left)):
+        Double(left) == right
+    case let (.array(left), .array(right)):
+        left.count == right.count && zip(left, right).allSatisfy { paginateValuesEqual($0, $1) }
+    case let (.object(left), .object(right)):
+        left.count == right.count && left.allSatisfy { key, value in
+            right[key].map { paginateValuesEqual(value, $0) } ?? false
+        }
+    default:
+        false
+    }
+}
+
+/// ENH-052 family 4 — pagination spec-table runner:
+/// wire-corpus/spec/pagination.json. Each row pushes its schema fragment,
+/// inserts the docs through the real write path, encodes the RAW cursor
+/// values through this engine's codec, runs the paginate query through
+/// `query`, and asserts the page envelope — `nextCursorPrefix` is the
+/// unbound-index prefix of the decoded minted cursor (`expect.error` rows
+/// assert the failure with its code).
+struct PaginationSpecCorpusTests {
+    private struct SpecDoc: Decodable {
+        let rows: [SpecRow]
+    }
+
+    private struct PaginateSpec: Decodable {
+        let numItems: Int
+        let cursor: [JSONValue]?
+    }
+
+    private struct SpecRow: Decodable {
+        let id: String
+        let fields: JSONValue
+        let index: AggregateIndexFragment
+        let docs: [JSONValue]
+        let eq: [JSONValue]
+        let order: String
+        let paginate: PaginateSpec
+        let expect: JSONValue
+    }
+
+    private struct QueryWire: Encodable {
+        let table: String
+        let index: String
+        let eq: [JSONValue]
+        let order: String
+        let paginate: PaginateWire
+    }
+
+    private struct PaginateWire: Encodable {
+        let numItems: Int
+        let cursor: String?
+    }
+
+    private func loadCorpus() throws -> SpecDoc {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // ParRtDbClientTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // swift-client
+            .deletingLastPathComponent() // repo root
+            .appendingPathComponent("wire-corpus/spec/pagination.json")
+        return try JSONDecoder().decode(SpecDoc.self, from: Data(contentsOf: url))
+    }
+
+    /// The corpus README's own-coverage rule: every Order spelling and keyset
+    /// value kind this engine distinguishes must be exercised by a row.
+    @Test func everyOrderAndKindHasAFixtureRow() throws {
+        let corpus = try loadCorpus()
+        var orders = Set<String>()
+        var kinds = Set<String>()
+        for row in corpus.rows {
+            orders.insert(row.order)
+            guard case let .object(fields) = row.fields,
+                  case let .object(vType) = fields["v"] ?? .object([:]),
+                  case let .string(ty) = vType["type"] ?? .string("string")
+            else {
+                Issue.record("\(row.id): fields.v does not parse")
+                continue
+            }
+            kinds.insert(ty)
+        }
+        for order in ["asc", "desc"] {
+            #expect(orders.contains(order), "no fixture row exercises order '\(order)'")
+        }
+        for kind in ["number", "int64", "boolean", "optional"] {
+            #expect(kinds.contains(kind), "no fixture row exercises value kind '\(kind)'")
+        }
+    }
+
+    @Test func everyRowMatchesThisEngine() throws {
+        let corpus = try loadCorpus()
+        for (rowIndex, row) in corpus.rows.enumerated() {
+            let clock = MonotonicMs(1_700_000_000_000)
+            let client = InMemoryRtDbClient(options: InMemoryRtDbClientOptions(
+                now: { clock.next() },
+                random: { 0 }
+            ))
+            let schemaData = try JSONEncoder().encode(AggregateSchemaFragment(tables: [
+                "items": .init(fields: row.fields, indexes: [row.index])
+            ]))
+            let schema = try JSONDecoder().decode(SchemaDef.self, from: schemaData)
+            try client.pushSchema(schema)
+            let docs: [[String: JSONValue]] = try row.docs.map { doc in
+                guard case let .object(object) = doc else {
+                    struct DocShapeFailure: Error {}
+                    throw DocShapeFailure()
+                }
+                return object
+            }
+            _ = try client.mutate(Transaction(steps: [.insertMany(table: "items", docs: docs)]))
+            let query = try buildQuery(row)
+            if let wantCode = rejectCode(of: row.expect) {
+                try assertRowRejects(query, row, wantCode, client)
+                continue
+            }
+            let envelope = try client.query(query)
+            try assertPage(envelope, row, rowIndex)
+        }
+    }
+
+    private func buildQuery(_ row: SpecRow) throws -> Query {
+        let queryData = try JSONEncoder().encode(QueryWire(
+            table: "items",
+            index: row.index.name,
+            eq: row.eq,
+            order: row.order,
+            paginate: PaginateWire(
+                numItems: row.paginate.numItems,
+                cursor: row.paginate.cursor.map { encodeCursor($0) }
+            )
+        ))
+        return try JSONDecoder().decode(Query.self, from: queryData)
+    }
+
+    private func rejectCode(of expect: JSONValue) -> String? {
+        guard case let .object(expectObj) = expect,
+              case let .object(err) = expectObj["error"] ?? .null,
+              case let .string(code) = err["code"] ?? .null
+        else {
+            return nil
+        }
+        return code
+    }
+
+    private func assertRowRejects(
+        _ query: Query,
+        _ row: SpecRow,
+        _ wantCode: String,
+        _ client: InMemoryRtDbClient
+    ) throws {
+        do {
+            _ = try client.query(query)
+            Issue.record("\(row.id): expected the query to fail")
+        } catch let error as RtDbError {
+            #expect(error.code.rawValue == wantCode, "\(row.id): rejection code")
+        }
+    }
+
+    private func assertPage(
+        _ envelope: JSONValue,
+        _ row: SpecRow,
+        _ rowIndex: Int
+    ) throws {
+        guard case let .object(env) = envelope,
+              case let .array(pageDocs) = env["docs"] ?? .array([])
+        else {
+            Issue.record("\(rowIndex) (\(row.id)): expected a paginated envelope")
+            return
+        }
+        let projected = pageDocs.map { doc -> JSONValue in
+            guard case let .object(map) = doc else { return doc }
+            var stripped = map
+            for key in ["_id", "_creationTime", "_version"] {
+                stripped.removeValue(forKey: key)
+            }
+            return .object(stripped)
+        }
+        guard case let .object(expectObj) = row.expect,
+              case let .array(wantDocs) = expectObj["docs"] ?? .array([])
+        else {
+            Issue.record("\(rowIndex) (\(row.id)): expect.docs does not parse")
+            return
+        }
+        #expect(
+            projected.count == wantDocs.count
+                && zip(projected, wantDocs).allSatisfy { paginateValuesEqual($0, $1) },
+            "\(rowIndex) (\(row.id)): page docs"
+        )
+        if expectObj["nextCursorPrefix"] == nil {
+            #expect(env["nextCursor"] == nil, "\(row.id): expected no next cursor")
+            return
+        }
+        guard case let .array(wantPrefix) = expectObj["nextCursorPrefix"] else {
+            Issue.record("\(row.id): expect.nextCursorPrefix does not parse")
+            return
+        }
+        assertMintedCursor(env, row, wantPrefix)
+    }
+
+    private func assertMintedCursor(
+        _ envelope: [String: JSONValue],
+        _ row: SpecRow,
+        _ wantPrefix: [JSONValue]
+    ) {
+        guard case let .string(encoded) = envelope["nextCursor"] ?? .null else {
+            Issue.record("\(row.id): expected a next cursor")
+            return
+        }
+        guard let decoded = decodeCursor(encoded) else {
+            Issue.record("\(row.id): minted cursor does not decode")
+            return
+        }
+        #expect(decoded.count == wantPrefix.count + 2, "\(row.id): minted cursor arity")
+        let prefixMatches = wantPrefix.count <= decoded.count
+            && zip(decoded.prefix(wantPrefix.count), wantPrefix)
+            .allSatisfy { paginateValuesEqual($0, $1) }
+        #expect(prefixMatches, "\(row.id): minted cursor prefix")
+        let createdAtIsNumber = switch decoded.dropLast(1).last {
+        case .int, .double:
+            true
+        default:
+            false
+        }
+        #expect(createdAtIsNumber, "\(row.id): created_at cursor kind")
+        let idIsString = if case .string = decoded.last ?? .null {
+            true
+        } else {
+            false
+        }
+        #expect(idIsString, "\(row.id): id cursor kind")
+    }
+}

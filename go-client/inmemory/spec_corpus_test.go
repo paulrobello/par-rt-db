@@ -16,7 +16,9 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/paulrobello/par-rt-db/go-client/dsl"
 	"github.com/paulrobello/par-rt-db/go-client/errors"
+	rtdberrors "github.com/paulrobello/par-rt-db/go-client/errors"
 	"github.com/paulrobello/par-rt-db/go-client/wire"
 )
 
@@ -519,4 +521,242 @@ func fieldsArray(t *testing.T, fields []string) wire.Array {
 		out = append(out, wire.String(f))
 	}
 	return out
+}
+
+// ENH-052 family 4 — pagination spec-table runner:
+// wire-corpus/spec/pagination.json. Each row pushes its schema fragment,
+// inserts the docs through the real write path, encodes the RAW cursor
+// values through dsl.EncodeCursor, runs the paginate query through EvalQuery,
+// and asserts the page envelope — nextCursorPrefix is the unbound-index
+// prefix of the decoded minted cursor (expect.error rows assert the failure
+// with its code).
+
+type paginateSpecRow struct {
+	ID     string          `json:"id"`
+	Fields json.RawMessage `json:"fields"`
+	Index  struct {
+		Name   string   `json:"name"`
+		Fields []string `json:"fields"`
+	} `json:"index"`
+	Docs     []json.RawMessage `json:"docs"`
+	Eq       []json.RawMessage `json:"eq"`
+	Order    string            `json:"order"`
+	Paginate struct {
+		NumItems int               `json:"numItems"`
+		Cursor   []json.RawMessage `json:"cursor"`
+	} `json:"paginate"`
+	Expect json.RawMessage `json:"expect"`
+}
+
+func paginationCorpusPath(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot resolve corpus path")
+	}
+	return filepath.Join(filepath.Dir(thisFile), "..", "..", "wire-corpus", "spec", "pagination.json")
+}
+
+func loadPaginateSpecRows(t *testing.T) []paginateSpecRow {
+	t.Helper()
+	raw, err := os.ReadFile(paginationCorpusPath(t))
+	if err != nil {
+		t.Fatalf("read pagination corpus: %v", err)
+	}
+	var doc struct {
+		Rows []paginateSpecRow `json:"rows"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parse pagination corpus: %v", err)
+	}
+	return doc.Rows
+}
+
+func TestPaginationSpecEveryOrderAndKindHasAFixtureRow(t *testing.T) {
+	rows := loadPaginateSpecRows(t)
+	orders := map[string]bool{}
+	kinds := map[string]bool{}
+	for _, r := range rows {
+		orders[r.Order] = true
+		var fields struct {
+			V struct {
+				Type string `json:"type"`
+			} `json:"v"`
+		}
+		if err := json.Unmarshal(r.Fields, &fields); err != nil {
+			t.Fatalf("%s: fields do not parse: %v", r.ID, err)
+		}
+		kinds[fields.V.Type] = true
+	}
+	for _, order := range []string{"asc", "desc"} {
+		if !orders[order] {
+			t.Fatalf("no fixture row exercises order '%s'", order)
+		}
+	}
+	for _, kind := range []string{"number", "int64", "boolean", "optional"} {
+		if !kinds[kind] {
+			t.Fatalf("no fixture row exercises value kind '%s'", kind)
+		}
+	}
+}
+
+func TestPaginationSpecCorpus(t *testing.T) {
+	rows := loadPaginateSpecRows(t)
+	for _, r := range rows {
+		t.Run(r.ID, func(t *testing.T) {
+			var clock int64 = 1_700_000_000_000
+			client := New(Options{
+				Now:    func() int64 { clock++; return clock },
+				Random: func() float64 { return 0.0 },
+			})
+			schema := wire.Object{"tables": wire.Object{"items": wire.Object{
+				"fields":  mustWire(t, r.Fields),
+				"indexes": wire.Array{wire.Object{"name": wire.String(r.Index.Name), "fields": fieldsArray(t, r.Index.Fields)}},
+			}}}
+			if err := client.PushSchema(schema); err != nil {
+				t.Fatalf("%s: push schema: %v", r.ID, err)
+			}
+			docs := make([]wire.JSONValue, 0, len(r.Docs))
+			for _, d := range r.Docs {
+				docs = append(docs, mustWire(t, d))
+			}
+			if _, err := client.Mutate(nil, wire.Transaction{Steps: []wire.Step{wire.StepInsertMany{
+				Table: "items",
+				Docs:  docs,
+			}}}, ""); err != nil {
+				t.Fatalf("%s: insert docs: %v", r.ID, err)
+			}
+			eq := make([]wire.JSONValue, 0, len(r.Eq))
+			for _, e := range r.Eq {
+				eq = append(eq, mustWire(t, e))
+			}
+			order := wire.Order(r.Order)
+			pag := wire.Paginate{NumItems: r.Paginate.NumItems}
+			if len(r.Paginate.Cursor) > 0 {
+				values := make([]wire.JSONValue, 0, len(r.Paginate.Cursor))
+				for _, c := range r.Paginate.Cursor {
+					values = append(values, mustWire(t, c))
+				}
+				encoded, err := dsl.EncodeCursor(values)
+				if err != nil {
+					t.Fatalf("%s: encode cursor: %v", r.ID, err)
+				}
+				pag.Cursor = &encoded
+			}
+			q := wire.Query{Table: "items", Index: &r.Index.Name, Eq: eq, Order: &order, Paginate: &pag}
+			result, qerr := EvalQuery(client.Store(), q)
+			var probe map[string]json.RawMessage
+			isErrRow := json.Unmarshal(r.Expect, &probe) == nil && func() bool {
+				_, ok := probe["error"]
+				return ok
+			}()
+			if isErrRow {
+				if qerr == nil {
+					t.Fatalf("%s: expected the query to fail", r.ID)
+				}
+				re, ok := qerr.(*rtdberrors.RtDbError)
+				if !ok || re.Code != rtdberrors.CodeBadRequest {
+					t.Fatalf("%s: rejection code: %v", r.ID, qerr)
+				}
+				return
+			}
+			if qerr != nil {
+				t.Fatalf("%s: query failed: %v", r.ID, qerr)
+			}
+			obj, ok := result.(wire.Object)
+			if !ok {
+				t.Fatalf("%s: expected a paginated envelope, got %T", r.ID, result)
+			}
+			docsOut, _ := obj["docs"].(wire.Array)
+			gotDocs := make([]string, 0, len(docsOut))
+			for _, d := range docsOut {
+				do, ok := d.(wire.Object)
+				if !ok {
+					t.Fatalf("%s: page doc is not an object", r.ID)
+				}
+				for _, k := range []string{"_id", "_creationTime", "_version"} {
+					delete(do, k)
+				}
+				b, err := json.Marshal(do)
+				if err != nil {
+					t.Fatalf("%s: marshal doc: %v", r.ID, err)
+				}
+				gotDocs = append(gotDocs, string(b))
+			}
+			var wantDocs []string
+			var wantDocsRaw []json.RawMessage
+			if err := json.Unmarshal(probe["docs"], &wantDocsRaw); err != nil {
+				t.Fatalf("%s: expect docs do not parse: %v", r.ID, err)
+			}
+			for _, d := range wantDocsRaw {
+				var compact bytes.Buffer
+				if err := json.Compact(&compact, d); err != nil {
+					t.Fatalf("%s: compact doc: %v", r.ID, err)
+				}
+				wantDocs = append(wantDocs, compact.String())
+			}
+			if len(gotDocs) != len(wantDocs) {
+				t.Fatalf("%s: page docs mismatch:\n got: %v\nwant: %v", r.ID, gotDocs, wantDocs)
+			}
+			for gi := range gotDocs {
+				var gotAny, wantAny any
+				if err := json.Unmarshal([]byte(gotDocs[gi]), &gotAny); err != nil {
+					t.Fatalf("%s: decode got doc: %v", r.ID, err)
+				}
+				if err := json.Unmarshal([]byte(wantDocs[gi]), &wantAny); err != nil {
+					t.Fatalf("%s: decode want doc: %v", r.ID, err)
+				}
+				gb, _ := json.Marshal(gotAny)
+				wb, _ := json.Marshal(wantAny)
+				// Map key order is deterministic after a round-trip through
+				// `any` (Go marshals map keys sorted).
+				if string(gb) != string(wb) {
+					t.Fatalf("%s: page doc %d mismatch:\n got: %s\nwant: %s", r.ID, gi, gb, wb)
+				}
+			}
+			prefixRaw, hasPrefix := probe["nextCursorPrefix"]
+			if !hasPrefix {
+				if obj["nextCursor"] != nil {
+					t.Fatalf("%s: expected no next cursor", r.ID)
+				}
+				return
+			}
+			encodedAny, ok := obj["nextCursor"].(wire.String)
+			if !ok {
+				t.Fatalf("%s: expected a next cursor", r.ID)
+			}
+			decoded, err := dsl.DecodeCursor(string(encodedAny))
+			if err != nil {
+				t.Fatalf("%s: decode minted cursor: %v", r.ID, err)
+			}
+			var wantPrefix []json.RawMessage
+			if err := json.Unmarshal(prefixRaw, &wantPrefix); err != nil {
+				t.Fatalf("%s: expect prefix does not parse: %v", r.ID, err)
+			}
+			if len(decoded) != len(wantPrefix)+2 {
+				t.Fatalf("%s: minted cursor arity %d, want %d", r.ID, len(decoded), len(wantPrefix)+2)
+			}
+			for pi, wp := range wantPrefix {
+				want := mustWire(t, wp)
+				if !paginateValuesEqual(decoded[pi], want) {
+					t.Fatalf("%s: minted cursor prefix %d:\n got: %v\nwant: %v", r.ID, pi, decoded[pi], want)
+				}
+			}
+			if _, ok := decoded[len(decoded)-2].(wire.Number); !ok {
+				t.Fatalf("%s: created_at cursor kind: %T", r.ID, decoded[len(decoded)-2])
+			}
+			if _, ok := decoded[len(decoded)-1].(wire.String); !ok {
+				t.Fatalf("%s: id cursor kind: %T", r.ID, decoded[len(decoded)-1])
+			}
+		})
+	}
+}
+
+// paginateValuesEqual compares one decoded minted-cursor value against its
+// fixture expectation — scalars only in this corpus, so the canonical JSON
+// render is exact (wire numbers keep their literal spelling).
+func paginateValuesEqual(a, b wire.JSONValue) bool {
+	ab, _ := json.Marshal(a)
+	bb, _ := json.Marshal(b)
+	return string(ab) == string(bb)
 }
