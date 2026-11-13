@@ -152,7 +152,7 @@ pub async fn resolve_session(pool: &PgPool, token: &str) -> Result<Option<Princi
 
 /// Deletes a session by its plaintext token — the logout resolver. Not an
 /// error if the token doesn't exist — logout is idempotent (see
-/// `auth::provider::logout`).
+/// `auth::provider::session::logout`).
 ///
 /// Capability-bearing rows (`revoke_secret_hash IS NOT NULL`) are TOMBSTONED
 /// rather than deleted: the row is the only durable anchor

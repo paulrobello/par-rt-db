@@ -8,11 +8,20 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use serde::Serialize;
+use axum::extract::{Form, State};
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
+use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use crate::AppState;
 use crate::auth::jwks;
 use crate::auth::provider::OAuthProvider;
+use crate::auth::provider::callback::{bearer_callback_close_response, callback_close_response};
+use crate::auth::provider::{
+    DELIVERY_BEARER, claim_pending, merge_anon_into_real, set_outcome, stamp_session_capability,
+    unconfigured_response,
+};
 use crate::auth::{self, ConflictStyle, ProviderIdentity, session};
 use crate::config::Config;
 use crate::error::RtDbError;
@@ -27,8 +36,8 @@ use crate::error::RtDbError;
 ///
 /// 2. Apple posts the authorization code to the redirect URI with
 ///    `response_mode=form_post`, not as a query string. The dedicated POST
-///    `/auth/apple/callback` handler (in `provider.rs`) reads the form body; it
-///    can't share the GET `provider_callback` generic.
+///    `/auth/apple/callback` handler (at the bottom of this file) reads the
+///    form body; it can't share the GET `provider_callback` generic.
 ///
 /// Identity is keyed on Apple's stable `sub`, mirrored from `github_id`: Apple
 /// may relay the email through `@privaterelay.appleid.com` and rotate it if the
@@ -328,6 +337,75 @@ fn parse_identity(value: serde_json::Value) -> Result<AppleIdentity, RtDbError> 
         .map(String::from);
 
     Ok(AppleIdentity { sub, email, name })
+}
+
+/// Apple POSTs the authorization code + state as a URL-encoded form body
+/// (`response_mode=form_post`).
+#[derive(Deserialize)]
+pub(super) struct AppleCallbackForm {
+    code: String,
+    state: String,
+}
+
+/// `POST /auth/apple/callback`: Apple's `response_mode=form_post` variant of
+/// `provider_callback`. Apple POSTs `code` + `state` (URL-encoded form body) to
+/// the redirect URI instead of appending them as query params, so the GET
+/// generic can't serve it. The flow is otherwise identical: the login-CSRF
+/// nonce cookie (SameSite=None, so it survives Apple's cross-site POST) is
+/// constant-time-checked, the state entry is claimed single-use, and on success
+/// the popup-closing HTML + HttpOnly session cookie are returned exactly as the
+/// GET path returns them.
+pub(super) async fn apple_callback(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<AppleCallbackForm>,
+) -> Response {
+    if state.config.oauth_login_csrf {
+        let ok = crate::auth::cookie::oauth_csrf_cookie(&headers)
+            .is_some_and(|c| bool::from(c.as_bytes().ct_eq(form.state.as_bytes())));
+        if !ok {
+            return RtDbError::bad_request("login CSRF check failed").into_response();
+        }
+    }
+
+    let (anon_user_id, delivery, revoke_verifier) =
+        match claim_pending(&state, &form.state, AppleProvider::name()).await {
+            Some((anon, delivery, verifier)) => (anon, delivery, verifier),
+            None => return RtDbError::bad_request("invalid or expired state").into_response(),
+        };
+
+    let Some(provider) = AppleProvider::from_config(&state.config) else {
+        set_outcome(&state, &form.state, None).await;
+        return unconfigured_response(AppleProvider::name());
+    };
+
+    let secure = state.config.cookie_secure
+        || crate::auth::cookie::request_is_secure(&headers, state.config.trusted_proxy);
+    match provider.complete_login(&state, &form.code).await {
+        Ok(token) => {
+            // FM-27: merge the anon footprint into the real account before the
+            // terminal outcome is recorded (see merge_anon_into_real).
+            if let Some(anon_id) = &anon_user_id {
+                merge_anon_into_real(&state, anon_id, &token).await;
+            }
+            // Bearer deliveries stamp the durable capability (see
+            // stamp_session_capability); see the GET callback for the ordering
+            // and failure posture.
+            if let Some(verifier) = revoke_verifier.as_deref() {
+                stamp_session_capability(&state, &token, verifier).await;
+            }
+            set_outcome(&state, &form.state, Some(&token)).await;
+            if delivery == DELIVERY_BEARER {
+                bearer_callback_close_response()
+            } else {
+                callback_close_response(&token, secure)
+            }
+        }
+        Err(err) => {
+            set_outcome(&state, &form.state, None).await;
+            err.into_response()
+        }
+    }
 }
 
 #[cfg(test)]

@@ -718,7 +718,7 @@ async fn set_static_cache_headers(req: Request, next: Next) -> Response {
 /// local dev).
 ///
 /// A response that already carries a `Content-Security-Policy` header (the
-/// OAuth callback page at `auth/provider.rs` sets a stricter per-page one) is
+/// OAuth callback page at `auth/provider/callback.rs` sets a stricter per-page one) is
 /// left alone — one source of truth per route, never overwrite an existing
 /// policy.
 async fn security_headers(

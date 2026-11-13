@@ -35,7 +35,7 @@ is a historical record of the original design.
 - **sqlx 0.8** + **Postgres 17** — storage: one typed column per indexed field,
   documents stored as `doc jsonb` (system fields merged in at read time).
 - **tracing** — structured logs.
-- Auth: multi-provider OAuth trait (`auth/provider.rs`) — six providers ship
+- Auth: multi-provider OAuth trait (`auth/provider/`) — six providers ship
   behind it: GitHub (`auth/github.rs`), Google (`auth/google.rs`),
   GitLab (`auth/gitlab.rs`), Microsoft / Entra ID v2 (`auth/microsoft.rs`),
   Apple (`auth/apple.rs`, ES256 JWT `client_secret` + `response_mode=form_post`),
@@ -142,7 +142,7 @@ Paths below are relative to `server/src/` (this directory's `src/`).
 | Cross-replica fan-out (ENH-022) | `src/notify.rs` (`pg_notify` on the `rtdb_ops` channel; per-process LISTEN mirrors peer replicas into the local op-feed ring) |
 | Privacy policy | `src/privacy.rs` (serves `GET /privacy` from `src/static/privacy.html`, the only file `src/static/` holds) |
 | Static SPA serving | `src/lib.rs` (`ServeDir`/`ServeFile` mounted as the router's last-resort fallback, reading `RTDB_STATIC_DIR`; hashed assets get an immutable `Cache-Control`, `index.html` gets `no-cache`) |
-| Auth (six OAuth providers + sessions + machine tokens + anonymous) | `src/auth/` — `mod.rs`, `provider.rs` (trait + dispatcher), `github.rs`, `google.rs`, `gitlab.rs`, `microsoft.rs` (Entra ID/Azure AD v2), `apple.rs` (ES256 JWT `client_secret` + `form_post`), `oidc.rs` (generic), `session.rs`, `tokens.rs`, `cookie.rs`, `jwks.rs` (JWKS fetch/cache for OIDC discovery). Anonymous auth (`POST /auth/anonymous`, gated `RTDB_AUTH_ANONYMOUS_ENABLED` default off) mints an ephemeral `Principal::User` (`anonymous = true`, `email = None`) that bypasses the per-db allowlist via its boot gate and owns its own documents via per-row `ownerField`. On a later OAuth sign-in, the anon footprint is merged into the real account (`src/merge.rs` — doc restamps in the committer, storage owner swap, session re-point, guarded anon-row delete); `POST /admin/merge-users` is the operator escape hatch. |
+| Auth (six OAuth providers + sessions + machine tokens + anonymous) | `src/auth/` — `mod.rs`, `provider/` (trait + dispatcher + route arms), `github.rs`, `google.rs`, `gitlab.rs`, `microsoft.rs` (Entra ID/Azure AD v2), `apple.rs` (ES256 JWT `client_secret` + `form_post`), `oidc.rs` (generic), `session.rs`, `tokens.rs`, `cookie.rs`, `jwks.rs` (JWKS fetch/cache for OIDC discovery). Anonymous auth (`POST /auth/anonymous`, gated `RTDB_AUTH_ANONYMOUS_ENABLED` default off) mints an ephemeral `Principal::User` (`anonymous = true`, `email = None`) that bypasses the per-db allowlist via its boot gate and owns its own documents via per-row `ownerField`. On a later OAuth sign-in, the anon footprint is merged into the real account (`src/merge.rs` — doc restamps in the committer, storage owner swap, session re-point, guarded anon-row delete); `POST /admin/merge-users` is the operator escape hatch. |
 
 The read path compiles a db-side `filter()` predicate DSL to SQL, a full-text
 `search` query terminal backed by a generated tsvector column + GIN index,

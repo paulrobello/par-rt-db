@@ -6,7 +6,7 @@ How to register OAuth apps and wire them into par-rt-db. Each provider is
 working with zero providers configured.
 
 > **Source of truth:** the provider implementations in `server/src/auth/`
-> (`provider.rs` for the shared trait/plumbing, then `github.rs`, `google.rs`,
+> (`provider/` — `mod.rs` for the shared trait/plumbing, `begin.rs`/`callback.rs`/`revoke.rs`/`session.rs` for the route arms, then `github.rs`, `google.rs`,
 > `gitlab.rs`, `microsoft.rs`, `apple.rs`, `oidc.rs`). This guide mirrors those
 > files — if the code and this doc disagree, the code wins; fix this doc.
 
@@ -595,7 +595,7 @@ or integrate with par-rt-db:
 ## Adding a new provider (e.g. a future IdP)
 
 Each new provider is a small, self-contained implementation behind the
-`OAuthProvider` trait (`server/src/auth/provider.rs`):
+`OAuthProvider` trait (`server/src/auth/provider/`):
 
 - Implement `OAuthProvider` in a new module under `server/src/auth/`
   (`name`, `from_config` reading the provider's `Config` fields, `callback_path`,

@@ -423,7 +423,7 @@ pub fn document() -> Value {
         )],
     );
 
-    // --- Auth (auth/provider.rs) ------------------------------------------
+    // --- Auth (auth/provider/) ------------------------------------------
     for provider in ["github", "google", "gitlab", "oidc", "microsoft", "apple"] {
         add(
             &mut paths,
