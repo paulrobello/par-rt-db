@@ -1139,7 +1139,18 @@ through decimal strings, the cursor arity/kind rejections), whose equivalence
 to the Postgres-backed execution is pinned by the existing pagination suites;
 cursor values are carried RAW with engine-neutral tiebreaker extremes so no
 engine-private clock or id participates, and every client engine's
-`paginateResult` port asserts itself against every row.
+`paginateResult` port asserts itself against every row. Family 5,
+`spec/validation.json`, applies the pattern to push-schema validation: the
+input matrix (`server/src/spec_corpus_validation_rows.json`) enumerates one
+representative per validation rule the wire outcome distinguishes, and the
+generator computes every row's outcome by running the server's own
+`SchemaDef::validate` over it — the decision function IS the generator — so a
+rule change flips the pinned row automatically; each reject row violates
+exactly one rule, keeping cascade ordering out of the picture. Every client
+engine's `pushSchema` path asserts the same accept/reject outcome with the
+same code, which is how the family caught the rust engine shipping no
+push-time `onDelete` validation at all while the other five mirrors
+implemented the FM-33 rules.
 
 ## Admin surface and the op-feed tap
 

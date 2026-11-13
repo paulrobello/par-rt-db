@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/paulrobello/par-rt-db/go-client/dsl"
@@ -759,4 +760,99 @@ func paginateValuesEqual(a, b wire.JSONValue) bool {
 	ab, _ := json.Marshal(a)
 	bb, _ := json.Marshal(b)
 	return string(ab) == string(bb)
+}
+
+// ENH-052 family 5 — validation spec-table runner:
+// wire-corpus/spec/validation.json. Each row pushes its wire schema fragment
+// through the real PushSchema path and asserts the same accept/reject
+// outcome with the same code as the server's own SchemaDef::validate.
+
+type validationSpecRow struct {
+	ID     string          `json:"id"`
+	Schema json.RawMessage `json:"schema"`
+	Expect json.RawMessage `json:"expect"`
+}
+
+func validationCorpusPath(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot resolve corpus path")
+	}
+	return filepath.Join(filepath.Dir(thisFile), "..", "..", "wire-corpus", "spec", "validation.json")
+}
+
+func loadValidationSpecRows(t *testing.T) []validationSpecRow {
+	t.Helper()
+	raw, err := os.ReadFile(validationCorpusPath(t))
+	if err != nil {
+		t.Fatalf("read validation corpus: %v", err)
+	}
+	var doc struct {
+		Rows []validationSpecRow `json:"rows"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parse validation corpus: %v", err)
+	}
+	return doc.Rows
+}
+
+func TestValidationSpecEveryRuleFamilyHasAFixtureRow(t *testing.T) {
+	rows := loadValidationSpecRows(t)
+	ids := map[string]bool{}
+	for _, r := range rows {
+		ids[r.ID] = true
+	}
+	for _, family := range []string{"index", "ttl", "updated-at", "auto-increment", "on-delete", "constraints", "computed", "accept"} {
+		found := false
+		for id := range ids {
+			if strings.HasPrefix(id, family) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("no fixture row exercises rule family '%s'", family)
+		}
+	}
+}
+
+func TestValidationSpecCorpus(t *testing.T) {
+	rows := loadValidationSpecRows(t)
+	for _, r := range rows {
+		t.Run(r.ID, func(t *testing.T) {
+			var clock int64 = 1_700_000_000_000
+			client := New(Options{
+				Now:    func() int64 { clock++; return clock },
+				Random: func() float64 { return 0.0 },
+			})
+			schema, ok := mustWire(t, r.Schema).(wire.Object)
+			if !ok {
+				t.Fatalf("%s: schema is not an object", r.ID)
+			}
+			err := client.PushSchema(schema)
+			var probe struct {
+				Accepts *bool `json:"accepts"`
+				Error   *struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			}
+			if jerr := json.Unmarshal(r.Expect, &probe); jerr != nil {
+				t.Fatalf("%s: expect does not parse: %v", r.ID, jerr)
+			}
+			if probe.Error != nil {
+				if err == nil {
+					t.Fatalf("%s: expected the push to fail", r.ID)
+				}
+				re, ok := err.(*rtdberrors.RtDbError)
+				if !ok || string(re.Code) != probe.Error.Code {
+					t.Fatalf("%s: rejection code: got %v, want %s", r.ID, err, probe.Error.Code)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("%s: expected the push to accept, got %v", r.ID, err)
+			}
+		})
+	}
 }

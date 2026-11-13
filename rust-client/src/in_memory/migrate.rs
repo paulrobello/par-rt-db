@@ -1082,3 +1082,121 @@ impl InMemorySchemaValidateExt for SchemaDef {
         Ok(())
     }
 }
+
+/// Push-time `onDelete` validation — the port of server
+/// `schema::validate_on_delete` (FM-33) the ts/go/kotlin/swift/python engines
+/// already mirror. An action is legal only on a top-level `id` field (or one
+/// `optional` wrapping it — deeper nesting has no well-defined "the ref
+/// field" to index or null), `setNull` requires the optional wrapper (the
+/// cleared doc must stay valid), the referencing field needs a single-field,
+/// non-unique, non-partial btree index (the cascade lookup must be an index
+/// scan, and a partial `where` could hide children), and the referenced
+/// table must exist in the same schema. Self-reference is legal. Called from
+/// `push_schema` after [`InMemorySchemaValidateExt::validate`].
+pub(super) fn validate_on_delete(schema: &SchemaDef) -> Result<(), RtDbError> {
+    for (table_name, table) in &schema.tables {
+        for (field_name, field_ty) in &table.fields {
+            let mut decl: Option<(&String, OnDeleteAction)> = None;
+            let mut is_optional = false;
+            match field_ty {
+                FieldType::Id {
+                    table,
+                    on_delete: Some(action),
+                } => decl = Some((table, *action)),
+                FieldType::Optional { inner } => {
+                    is_optional = true;
+                    if let FieldType::Id {
+                        table,
+                        on_delete: Some(action),
+                    } = inner.as_ref()
+                    {
+                        decl = Some((table, *action));
+                    }
+                }
+                _ => {}
+            }
+            let Some((ref_table, action)) = decl else {
+                if field_has_nested_on_delete(field_ty) {
+                    return Err(RtDbError::new(
+                        ErrorCode::SchemaViolation,
+                        format!(
+                            "field '{field_name}' on table '{table_name}': onDelete is legal only on a top-level id or optional-id field"
+                        ),
+                    ));
+                }
+                continue;
+            };
+            if action == OnDeleteAction::SetNull && !is_optional {
+                return Err(RtDbError::new(
+                    ErrorCode::SchemaViolation,
+                    format!(
+                        "field '{field_name}' on table '{table_name}': onDelete 'setNull' requires the id field to be optional"
+                    ),
+                ));
+            }
+            let has_ref_index = table.indexes.iter().any(|idx| {
+                !idx.search
+                    && idx.vector.is_none()
+                    && !idx.unique
+                    && idx.r#where.is_none()
+                    && idx.fields.len() == 1
+                    && idx.fields[0] == *field_name
+            });
+            if !has_ref_index {
+                return Err(RtDbError::new(
+                    ErrorCode::SchemaViolation,
+                    format!(
+                        "onDelete field '{field_name}' on table '{table_name}' requires a single-field, non-unique, non-partial btree index on it"
+                    ),
+                ));
+            }
+            let _ = ref_table;
+        }
+    }
+    // Second pass (whole-schema access): every top-level `onDelete` id field
+    // must reference a table declared in this schema.
+    for (table_name, table) in &schema.tables {
+        for (field_name, field_ty) in &table.fields {
+            let ref_table = match field_ty {
+                FieldType::Id {
+                    table,
+                    on_delete: Some(_),
+                } => Some(table),
+                FieldType::Optional { inner } => match inner.as_ref() {
+                    FieldType::Id {
+                        table,
+                        on_delete: Some(_),
+                    } => Some(table),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(ref_table) = ref_table
+                && !schema.tables.contains_key(ref_table)
+            {
+                return Err(RtDbError::new(
+                    ErrorCode::SchemaViolation,
+                    format!(
+                        "onDelete field '{field_name}' on table '{table_name}' references unknown table '{ref_table}'"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether any `Id` variant reachable through the type's compositors carries
+/// an `onDelete` action — the probe behind the FM-33 rule that confines
+/// `onDelete` to the two legal top-level shapes.
+fn field_has_nested_on_delete(ty: &FieldType) -> bool {
+    match ty {
+        FieldType::Id { on_delete, .. } => on_delete.is_some(),
+        FieldType::Optional { inner }
+        | FieldType::Array { element: inner }
+        | FieldType::Record { value: inner } => field_has_nested_on_delete(inner),
+        FieldType::Union { variants } => variants.iter().any(field_has_nested_on_delete),
+        FieldType::Object { fields } => fields.values().any(field_has_nested_on_delete),
+        _ => false,
+    }
+}

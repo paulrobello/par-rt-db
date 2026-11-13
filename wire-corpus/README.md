@@ -56,9 +56,13 @@ implementations honest against each other. These artifacts live here:
   the aggregate-terminal decision table (count/sum/avg/min/max over row sets
   and groups, per the server's reference reduction of its aggregate SQL and
   the six client ports),
-  and [`spec/pagination.json`](spec/pagination.json) pins the btree
+  [`spec/pagination.json`](spec/pagination.json) pins the btree
   keyset-pagination decision table (per the server's reference walk of its
-  paginate SQL and the six client `paginateResult` ports).
+  paginate SQL and the six client `paginateResult` ports),
+  and [`spec/validation.json`](spec/validation.json) pins the push-schema
+  validation decision table (computed by running the server's own
+  `SchemaDef::validate` over every row of the input matrix
+  `server/src/spec_corpus_validation_rows.json`).
   See [Spec-table corpus](#spec-table-corpus) below.
 
 **Runner scope:** the server and all six client in-memory engines
@@ -531,27 +535,61 @@ fixture can never disagree with the code that owns the semantics.
   docs), and malformed-base64 cursors (semantics corpus
   `error-paginate-malformed-cursor`).
 
+- [`spec/validation.json`](spec/validation.json) — the push-schema
+  validation decision table shared by the server and all six client
+  in-memory engines, computed by running the server's own
+  `SchemaDef::validate` over every row of the hand-maintained input matrix
+  (`server/src/spec_corpus_validation_rows.json`), so a rule change flips the
+  pinned row automatically. One row per representative per rule the wire
+  outcome distinguishes; each reject row violates exactly one rule, so
+  cascade ordering never changes the outcome. Index/ttl/updatedAtField/
+  autoIncrementField/onDelete/constraints rules reject as SCHEMA_VIOLATION;
+  computed rules reject as BAD_REQUEST; the accept rows pin the inclusive
+  boundary cases (ttl with its required index, int64 autoIncrement,
+  optional-id setNull with its required index, min == max bounds, the
+  string-kind-over-int64 computed special case, search and vector indexes,
+  and every declaration combined in one table). Deliberately excluded: rules
+  the existing semantics corpus already pins (authorize olderThan,
+  partial-index where olderThan, computed undeclared-reference, computed
+  static-kind string-to-number, computed case-when principal markers,
+  constraints invalid-regex, constraints min-on-string-field) and rules that
+  stay server-side (identifier formats, case-collision, owner/collaborator
+  field type rules, defaults validation, vector-spec deep rules,
+  search-language placement/format, trgm placement — the in-memory engines
+  deliberately mirror a subset). The family's first run caught a real
+  divergence: the rust engine shipped no push-time `onDelete` validation at
+  all (its own docs said the shapes "stay server-side" while the other five
+  mirrors implemented the FM-33 rules), and two rust cascade fixtures lacked
+  the required single-field index — both fixed to the server contract.
+
 **Authoring rule:** a change to the pinned semantics (a new `FieldType`
 variant, a mapping change in `indexed_column_type`, a new `ValueExpr` node,
 a new `Cast` target, a stamping-semantics change in `stamp_computed` or
 any of its six client ports, a new `AggregateOp` variant, or an
 aggregate-reduction change in the server's aggregate terminal or any of its
-six client ports, or a paginate/cursor-semantics change in the server's
-paginate terminal or any of its six client ports) regenerates the fixture —
+six client ports, a paginate/cursor-semantics change in the server's
+paginate terminal or any of its six client ports, or a push-validation rule
+change in `schema::validate` or any of its six client mirrors) regenerates
+the affected fixture —
 `make gen-spec-index-column-types` /
 `make gen-spec-computed-stamping` /
 `make gen-spec-aggregate-terminals` /
-`make gen-spec-pagination` — and lands the regenerated table **in
+`make gen-spec-pagination` /
+`make gen-spec-validation` — and lands the regenerated table **in
 the same change**, updating whichever client ports moved with it. A client port
 that drifts from a committed table fails that client's spec-corpus runner; a
 variant or grammar node added without a representative row fails the
-generator's exhaustive match (a compile error in `server/src/spec_corpus.rs`
-or `server/src/spec_corpus_pagination.rs`).
+generator's exhaustive match (a compile error in `server/src/spec_corpus.rs`,
+`server/src/spec_corpus_pagination.rs`, or
+`server/src/spec_corpus_validation.rs`'s rule-family list; the validation
+matrix's rows live in `server/src/spec_corpus_validation_rows.json` and the
+server's own `SchemaDef::validate` computes every row's outcome).
 
 **Enforcement:** `make gen-spec-index-column-types-check`,
 `make gen-spec-computed-stamping-check`,
-`make gen-spec-aggregate-terminals-check`, and
-`make gen-spec-pagination-check` (`checkall` legs) diff each committed
+`make gen-spec-aggregate-terminals-check`,
+`make gen-spec-pagination-check`, and
+`make gen-spec-validation-check` (`checkall` legs) diff each committed
 fixture against a fresh generation; the server's `spec_corpus.rs` and
 `spec_corpus_pagination.rs` tests pin the same property in-crate. Each of the
 seven runners — server, ts-client
@@ -563,7 +601,8 @@ python-client (`tests/test_spec_corpus.py`), go-client
 (`inmemory/SpecCorpusTest.kt` + `ComputedStampingSpecCorpusTest` +
 `PaginationSpecCorpusTest`), and
 swift-client (`SpecCorpusTests.swift` +
-`ComputedStampingSpecCorpusTests` + `PaginationSpecCorpusTests`) — asserts
-its own port against every row of all four families, plus each surface's own
+`ComputedStampingSpecCorpusTests` + `PaginationSpecCorpusTests` +
+`ValidationSpecCorpusTests`) — asserts
+its own port against every row of all five families, plus each surface's own
 variant/op coverage check (a variant added without a fixture row fails that
 surface's coverage test).

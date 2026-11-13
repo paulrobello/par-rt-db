@@ -393,3 +393,64 @@ describe("spec corpus: pagination", () => {
     }
   });
 });
+
+describe("spec corpus: validation", () => {
+  const CORPUS: {
+    rows: {
+      id: string;
+      schema: SchemaJson;
+      expect: { accepts?: boolean; error?: { code: string } };
+    }[];
+  } = JSON.parse(
+    readFileSync(resolve(__dirname, "../../wire-corpus/spec/validation.json"), "utf8"),
+  );
+
+  const OWN_FAMILIES = [
+    "index",
+    "ttl",
+    "updated-at",
+    "auto-increment",
+    "on-delete",
+    "constraints",
+    "computed",
+    "accept",
+  ];
+
+  /** The corpus README's own-coverage rule: every rule family this engine
+   *  mirrors must be exercised by a fixture row (ids carry the family
+   *  prefix; accepts are prefixed `accept-`). */
+  it("every rule family this engine mirrors has a fixture row", () => {
+    const ids = CORPUS.rows.map((row) => row.id);
+    for (const family of OWN_FAMILIES) {
+      expect(
+        ids.some((id) => id.startsWith(family)),
+        `no fixture row exercises rule family '${family}'`,
+      ).toBe(true);
+    }
+  });
+
+  /** Per-row execution: push the row's schema fragment through this engine's
+   *  real pushSchema path and assert the same outcome with the same code. */
+  it("pushes every fixture fragment identically to the server contract", () => {
+    let ms = 1_700_000_000_000;
+    for (const row of CORPUS.rows) {
+      const client = new InMemoryRtDbClient({ now: () => ++ms, random: () => 0 });
+      const wantCode = row.expect.error?.code;
+      if (wantCode !== undefined) {
+        let code: string | null = null;
+        try {
+          client.pushSchema(row.schema);
+        } catch (err) {
+          if (err instanceof RtDbError) {
+            code = err.code;
+          } else {
+            throw err;
+          }
+        }
+        expect(code, row.id).toBe(wantCode);
+        continue;
+      }
+      expect(() => client.pushSchema(row.schema), row.id).not.toThrow();
+    }
+  });
+});

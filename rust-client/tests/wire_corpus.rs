@@ -1092,3 +1092,92 @@ mod pagination_corpus {
         }
     }
 }
+
+// ENH-052 family 5 — spec-table corpus: the push-schema validation decision
+// table (wire-corpus/spec/validation.json). Each row pushes its wire schema
+// fragment through this crate's real push_schema path and asserts the same
+// accept/reject outcome with the same code as the server's own
+// SchemaDef::validate.
+#[cfg(feature = "in_memory")]
+mod validation_corpus {
+    use par_rt_db_client::in_memory::{InMemoryRtDbClient, InMemoryRtDbClientOptions};
+    use par_rt_db_client::schema::SchemaDef;
+
+    use super::Value;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    static CLOCK: AtomicI64 = AtomicI64::new(1_700_000_000_000);
+
+    fn new_client() -> InMemoryRtDbClient {
+        InMemoryRtDbClient::new(
+            InMemoryRtDbClientOptions::default()
+                .now(|| CLOCK.fetch_add(1, Ordering::SeqCst))
+                .random(|| 0.0),
+        )
+    }
+
+    fn load_rows() -> Vec<Value> {
+        let doc: Value =
+            serde_json::from_str(include_str!("../../wire-corpus/spec/validation.json"))
+                .unwrap_or_else(|e| panic!("parse validation.json: {e}"));
+        doc["rows"]
+            .as_array()
+            .expect("spec corpus missing rows array")
+            .clone()
+    }
+
+    /// The corpus README's own-coverage rule: every rule family this engine
+    /// mirrors must be exercised by a fixture row.
+    #[test]
+    fn every_rule_family_has_a_fixture_row() {
+        let families = [
+            "index",
+            "ttl",
+            "updated-at",
+            "auto-increment",
+            "on-delete",
+            "constraints",
+            "computed",
+            "accept",
+        ];
+        let ids: Vec<String> = load_rows()
+            .iter()
+            .map(|row| row["id"].as_str().expect("row id").to_string())
+            .collect();
+        for family in families {
+            assert!(
+                ids.iter().any(|id| id.starts_with(family)),
+                "no fixture row exercises rule family '{family}'"
+            );
+        }
+    }
+
+    #[test]
+    fn every_row_matches_this_engine() {
+        for (i, row) in load_rows().into_iter().enumerate() {
+            let id = row["id"].as_str().unwrap_or("?").to_string();
+            let schema: SchemaDef = serde_json::from_value(row["schema"].clone())
+                .unwrap_or_else(|e| panic!("row {i} ({id}): schema does not parse: {e}"));
+            let mut client = new_client();
+            let want = row["expect"]["error"]["code"].as_str();
+            match want {
+                Some(want) => match client.push_schema(&schema) {
+                    Ok(()) => panic!("row {i} ({id}): expected the push to fail"),
+                    Err(err) => {
+                        let got = match err.code {
+                            par_rt_db_client::ErrorCode::SchemaViolation => "SCHEMA_VIOLATION",
+                            par_rt_db_client::ErrorCode::BadRequest => "BAD_REQUEST",
+                            other => panic!("row {i} ({id}): unexpected code {other:?}"),
+                        };
+                        assert_eq!(got, want, "row {i} ({id}): rejection code");
+                    }
+                },
+                None => {
+                    client.push_schema(&schema).unwrap_or_else(|e| {
+                        panic!("row {i} ({id}): expected the push to accept, got {e:?}")
+                    });
+                }
+            }
+        }
+    }
+}

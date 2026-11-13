@@ -470,6 +470,7 @@ impl InMemoryRtDbClient {
     /// conversion needed since the builder already produces the wire shape).
     pub fn push_schema(&mut self, schema: &SchemaDef) -> Result<(), RtDbError> {
         schema.validate()?;
+        migrate::validate_on_delete(schema)?;
         let mut schema = schema.clone();
         // FM-30: mirrors server `ddl::push_schema` — grandfather `trgm` on a
         // search index that already existed before this push declared it,

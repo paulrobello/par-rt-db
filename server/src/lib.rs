@@ -53,6 +53,7 @@ pub mod signed_url;
 pub mod snapshot;
 pub mod spec_corpus;
 pub mod spec_corpus_pagination;
+pub mod spec_corpus_validation;
 pub mod storage;
 pub mod subs;
 pub mod tracing_setup;

@@ -1,0 +1,699 @@
+{
+  "$comment": "ENH-052 family 5 input matrix — the push-schema validation rule rows the generator (server/src/spec_corpus_validation.rs) runs through the server's own SchemaDef::validate to compute wire-corpus/spec/validation.json. Hand-maintained, one row per representative per rule the wire outcome distinguishes; each reject row violates exactly one rule so cascade ordering never changes the outcome. Reject codes: index/ttl/updated-at/auto-increment/on-delete/constraints rules reject as SCHEMA_VIOLATION, computed rules as BAD_REQUEST. Deliberately EXCLUDED (see wire-corpus/README.md 'Spec-table corpus'): rules the existing semantics corpus already pins (authorize olderThan, partial-index where olderThan, computed undeclared-reference, computed static-kind string-to-number, computed case-when principal markers, constraints invalid-regex, constraints min-on-string-field) and rules that stay server-side (identifier formats, case-collision, owner/collaborators field type rules, defaults validation, vector-spec deep rules, search-language placement/format, trgm placement — the in-memory engines deliberately mirror a subset).",
+  "rows": [
+    {
+      "id": "index-empty-fields",
+      "rule": "index",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" } },
+            "indexes": [{ "name": "by_s", "fields": [] }]
+          }
+        }
+      }
+    },
+    {
+      "id": "index-unknown-field",
+      "rule": "index",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" } },
+            "indexes": [{ "name": "by_s", "fields": ["ghost"] }]
+          }
+        }
+      }
+    },
+    {
+      "id": "index-non-indexable-field",
+      "rule": "index",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": {
+              "s": { "type": "string" },
+              "obj": {
+                "type": "object",
+                "fields": { "a": { "type": "string" } }
+              }
+            },
+            "indexes": [{ "name": "by_obj", "fields": ["obj"] }]
+          }
+        }
+      }
+    },
+    {
+      "id": "search-index-non-text-field",
+      "rule": "index",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" }, "n": { "type": "number" } },
+            "indexes": [{ "name": "by_text", "fields": ["n"], "search": true }]
+          }
+        }
+      }
+    },
+    {
+      "id": "ttl-undeclared-field",
+      "rule": "ttl",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" } },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "ttl": { "field": "ghost" }
+          }
+        }
+      }
+    },
+    {
+      "id": "ttl-wrong-field-type",
+      "rule": "ttl",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" } },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "ttl": { "field": "s" }
+          }
+        }
+      }
+    },
+    {
+      "id": "ttl-missing-index",
+      "rule": "ttl",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" }, "exp": { "type": "int64" } },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "ttl": { "field": "exp" }
+          }
+        }
+      }
+    },
+    {
+      "id": "ttl-default-duration-nonpositive",
+      "rule": "ttl",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" }, "exp": { "type": "int64" } },
+            "indexes": [{ "name": "by_exp", "fields": ["exp"] }],
+            "ttl": { "field": "exp", "defaultDurationMs": 0 }
+          }
+        }
+      }
+    },
+    {
+      "id": "updated-at-undeclared-field",
+      "rule": "updated-at",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" } },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "updatedAtField": "ghost"
+          }
+        }
+      }
+    },
+    {
+      "id": "updated-at-wrong-field-type",
+      "rule": "updated-at",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" }, "b": { "type": "boolean" } },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "updatedAtField": "b"
+          }
+        }
+      }
+    },
+    {
+      "id": "updated-at-collides-with-ttl",
+      "rule": "updated-at",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" }, "exp": { "type": "int64" } },
+            "indexes": [{ "name": "by_exp", "fields": ["exp"] }],
+            "ttl": { "field": "exp" },
+            "updatedAtField": "exp"
+          }
+        }
+      }
+    },
+    {
+      "id": "auto-increment-undeclared-field",
+      "rule": "auto-increment",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" } },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "autoIncrementField": "ghost"
+          }
+        }
+      }
+    },
+    {
+      "id": "auto-increment-wrong-field-type",
+      "rule": "auto-increment",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" }, "n": { "type": "number" } },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "autoIncrementField": "n"
+          }
+        }
+      }
+    },
+    {
+      "id": "auto-increment-collides-with-ttl",
+      "rule": "auto-increment",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" }, "exp": { "type": "int64" } },
+            "indexes": [{ "name": "by_exp", "fields": ["exp"] }],
+            "ttl": { "field": "exp" },
+            "autoIncrementField": "exp"
+          }
+        }
+      }
+    },
+    {
+      "id": "auto-increment-collides-with-updated-at",
+      "rule": "auto-increment",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" }, "at": { "type": "int64" } },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "updatedAtField": "at",
+            "autoIncrementField": "at"
+          }
+        }
+      }
+    },
+    {
+      "id": "on-delete-set-null-requires-optional",
+      "rule": "on-delete",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": {
+              "s": { "type": "string" },
+              "ref": { "type": "id", "table": "items", "onDelete": "setNull" }
+            },
+            "indexes": [
+              { "name": "by_s", "fields": ["s"] },
+              { "name": "by_ref", "fields": ["ref"] }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "on-delete-requires-single-field-index",
+      "rule": "on-delete",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": {
+              "s": { "type": "string" },
+              "ref": {
+                "type": "optional",
+                "inner": { "type": "id", "table": "items", "onDelete": "cascade" }
+              }
+            },
+            "indexes": [{ "name": "by_s_ref", "fields": ["s", "ref"] }]
+          }
+        }
+      }
+    },
+    {
+      "id": "on-delete-nested-action-rejected",
+      "rule": "on-delete",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": {
+              "s": { "type": "string" },
+              "wrap": {
+                "type": "union",
+                "variants": [
+                  { "type": "literal", "value": "a" },
+                  { "type": "id", "table": "items", "onDelete": "cascade" }
+                ]
+              }
+            },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }]
+          }
+        }
+      }
+    },
+    {
+      "id": "on-delete-unknown-referenced-table",
+      "rule": "on-delete",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": {
+              "s": { "type": "string" },
+              "ref": {
+                "type": "optional",
+                "inner": { "type": "id", "table": "ghost", "onDelete": "cascade" }
+              }
+            },
+            "indexes": [
+              { "name": "by_s", "fields": ["s"] },
+              { "name": "by_ref", "fields": ["ref"] }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "constraints-undeclared-key",
+      "rule": "constraints",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" } },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "constraints": { "ghost": { "minLength": 1 } }
+          }
+        }
+      }
+    },
+    {
+      "id": "constraints-int64-bound-fractional",
+      "rule": "constraints",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" }, "seq": { "type": "int64" } },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "constraints": { "seq": { "min": 1.5 } }
+          }
+        }
+      }
+    },
+    {
+      "id": "constraints-min-exceeds-max",
+      "rule": "constraints",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" }, "n": { "type": "number" } },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "constraints": { "n": { "min": 5, "max": 1 } }
+          }
+        }
+      }
+    },
+    {
+      "id": "constraints-min-length-exceeds-max-length",
+      "rule": "constraints",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" } },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "constraints": { "s": { "minLength": 5, "maxLength": 2 } }
+          }
+        }
+      }
+    },
+    {
+      "id": "constraints-min-length-on-number-field",
+      "rule": "constraints",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" }, "n": { "type": "number" } },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "constraints": { "n": { "minLength": 1 } }
+          }
+        }
+      }
+    },
+    {
+      "id": "computed-collides-with-owner-field",
+      "rule": "computed",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": {
+              "s": { "type": "string" },
+              "echo": {
+                "type": "optional",
+                "inner": { "type": "string" }
+              }
+            },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "ownerField": "s",
+            "computed": {
+              "s": {
+                "op": "concat",
+                "parts": [
+                  { "op": "literal", "value": "x" },
+                  { "op": "field", "field": "s" }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "computed-collides-with-collaborators-field",
+      "rule": "computed",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": {
+              "s": { "type": "string" },
+              "tags": { "type": "array", "element": { "type": "string" } },
+              "echo": {
+                "type": "optional",
+                "inner": { "type": "string" }
+              }
+            },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "collaboratorsField": "tags",
+            "computed": {
+              "tags": {
+                "op": "concat",
+                "parts": [{ "op": "literal", "value": "x" }]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "computed-collides-with-auto-increment-field",
+      "rule": "computed",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": {
+              "s": { "type": "string" },
+              "seq": { "type": "int64" }
+            },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "autoIncrementField": "seq",
+            "computed": {
+              "seq": {
+                "op": "concat",
+                "parts": [{ "op": "literal", "value": "x" }]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "computed-references-computed-field",
+      "rule": "computed",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": {
+              "s": { "type": "string" },
+              "echo1": {
+                "type": "optional",
+                "inner": { "type": "string" }
+              },
+              "echo2": {
+                "type": "optional",
+                "inner": { "type": "string" }
+              }
+            },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "computed": {
+              "echo2": {
+                "op": "concat",
+                "parts": [{ "op": "literal", "value": "x" }]
+              },
+              "echo1": {
+                "op": "concat",
+                "parts": [
+                  { "op": "literal", "value": "y" },
+                  { "op": "field", "field": "echo2" }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "computed-authorize-references-computed",
+      "rule": "computed",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": {
+              "s": { "type": "string" },
+              "echo": {
+                "type": "optional",
+                "inner": { "type": "string" }
+              }
+            },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "authorize": { "field": "echo", "op": "eq", "value": "x" },
+            "computed": {
+              "echo": {
+                "op": "concat",
+                "parts": [{ "op": "literal", "value": "x" }]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "computed-number-kind-on-string-field",
+      "rule": "computed",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": {
+              "s": { "type": "string" },
+              "out": {
+                "type": "optional",
+                "inner": { "type": "string" }
+              }
+            },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "computed": {
+              "out": {
+                "op": "add",
+                "left": { "op": "literal", "value": 1 },
+                "right": { "op": "literal", "value": 1 }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "computed-number-kind-on-int64-field",
+      "rule": "computed",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": {
+              "s": { "type": "string" },
+              "out": { "type": "int64" }
+            },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "computed": {
+              "out": {
+                "op": "add",
+                "left": { "op": "literal", "value": 1 },
+                "right": { "op": "literal", "value": 1 }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "accept-ttl-int64-indexed",
+      "rule": "accept",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" }, "exp": { "type": "int64" } },
+            "indexes": [{ "name": "by_exp", "fields": ["exp"] }],
+            "ttl": { "field": "exp", "defaultDurationMs": 3600000 }
+          }
+        }
+      }
+    },
+    {
+      "id": "accept-auto-increment-int64",
+      "rule": "accept",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" }, "seq": { "type": "int64" } },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "autoIncrementField": "seq"
+          }
+        }
+      }
+    },
+    {
+      "id": "accept-on-delete-optional-set-null",
+      "rule": "accept",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": {
+              "s": { "type": "string" },
+              "ref": {
+                "type": "optional",
+                "inner": { "type": "id", "table": "items", "onDelete": "setNull" }
+              }
+            },
+            "indexes": [
+              { "name": "by_s", "fields": ["s"] },
+              { "name": "by_ref", "fields": ["ref"] }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "accept-constraints-inclusive-bounds",
+      "rule": "accept",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" }, "n": { "type": "number" } },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "constraints": { "n": { "min": 5, "max": 5 } }
+          }
+        }
+      }
+    },
+    {
+      "id": "accept-computed-string-kind-on-int64-field",
+      "rule": "accept",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": {
+              "s": { "type": "string" },
+              "out": { "type": "int64" }
+            },
+            "indexes": [{ "name": "by_s", "fields": ["s"] }],
+            "computed": {
+              "out": {
+                "op": "concat",
+                "parts": [
+                  { "op": "literal", "value": "42" }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "accept-search-index-with-language",
+      "rule": "accept",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": { "s": { "type": "string" } },
+            "indexes": [
+              {
+                "name": "by_text",
+                "fields": ["s"],
+                "search": true,
+                "language": "english"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "accept-vector-index",
+      "rule": "accept",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": {
+              "s": { "type": "string" },
+              "emb": { "type": "vector", "dimensions": 4 }
+            },
+            "indexes": [
+              { "name": "by_s", "fields": ["s"] },
+              {
+                "name": "by_emb",
+                "fields": ["emb"],
+                "vector": { "dimensions": 4 }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "accept-combined-declarations",
+      "rule": "accept",
+      "schema": {
+        "tables": {
+          "items": {
+            "fields": {
+              "s": { "type": "string" },
+              "owner": { "type": "string" },
+              "exp": { "type": "int64" },
+              "at": { "type": "int64" },
+              "seq": { "type": "int64" },
+              "ref": {
+                "type": "optional",
+                "inner": { "type": "id", "table": "items", "onDelete": "cascade" }
+              },
+              "echo": {
+                "type": "optional",
+                "inner": { "type": "string" }
+              }
+            },
+            "indexes": [
+              { "name": "by_s", "fields": ["s"] },
+              { "name": "by_exp", "fields": ["exp"] },
+              { "name": "by_ref", "fields": ["ref"] }
+            ],
+            "ownerField": "owner",
+            "ttl": { "field": "exp", "defaultDurationMs": 60000 },
+            "updatedAtField": "at",
+            "autoIncrementField": "seq",
+            "constraints": { "s": { "minLength": 1 } },
+            "computed": {
+              "echo": {
+                "op": "concat",
+                "parts": [
+                  { "op": "literal", "value": "x" },
+                  { "op": "field", "field": "s" }
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

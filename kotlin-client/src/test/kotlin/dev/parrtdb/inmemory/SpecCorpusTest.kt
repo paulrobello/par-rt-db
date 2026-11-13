@@ -468,3 +468,59 @@ class PaginationSpecCorpusTest {
         }
     }
 }
+
+/**
+ * ENH-052 family 5 — validation spec-table runner:
+ * wire-corpus/spec/validation.json. Each row pushes its wire schema fragment
+ * through the real `pushSchema` path and asserts the same accept/reject
+ * outcome with the same code as the server's own `SchemaDef::validate`.
+ */
+class ValidationSpecCorpusTest {
+    private fun rows(): List<JsonObject> {
+        val doc = WireJson.parse(CorpusPaths.read("spec", "validation.json")) as? JsonObject
+            ?: error("validation corpus is not a JSON object")
+        val arr = doc["rows"] as? JsonArray ?: error("validation corpus has no rows array")
+        return arr.map { it as JsonObject }
+    }
+
+    private fun newClient(): InMemoryClient {
+        var clock = 1_700_000_000_000L
+        return InMemoryClient(InMemoryOptions(now = { ++clock }, random = { 0.0 }))
+    }
+
+    /** The corpus README's own-coverage rule. */
+    @Test
+    fun everyRuleFamilyHasAFixtureRow() {
+        val ids = rows().map { (it["id"] as JsonPrimitive).content }
+        for (family in listOf("index", "ttl", "updated-at", "auto-increment", "on-delete", "constraints", "computed", "accept")) {
+            assertTrue(
+                ids.any { it.startsWith(family) },
+                "no fixture row exercises rule family '$family'",
+            )
+        }
+    }
+
+    @Test
+    fun everyRowMatchesThisEngine() {
+        for ((i, row) in rows().withIndex()) {
+            val id = (row["id"] as JsonPrimitive).content
+            val client = newClient()
+            val expect = row["expect"] as JsonObject
+            val wantCode = (expect["error"] as? JsonObject)?.get("code")?.let {
+                (it as JsonPrimitive).content
+            }
+            val err =
+                try {
+                    client.pushSchema(row["schema"]!!)
+                    null
+                } catch (e: RtDbException) {
+                    e
+                }
+            if (wantCode != null) {
+                assertEquals(ErrorCode.fromWire(wantCode), err?.code, "row $i ($id): rejection code")
+                continue
+            }
+            assertTrue(err == null, "row $i ($id): expected the push to accept, got $err")
+        }
+    }
+}

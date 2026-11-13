@@ -115,10 +115,13 @@ fn soft_child_schema(action: OnDeleteAction) -> SchemaDef {
         )
         .table(
             "grandchildren",
-            Table::new().field("note", FieldType::String).field(
-                "childId",
-                FieldType::id("children").on_delete(OnDeleteAction::Cascade),
-            ),
+            Table::new()
+                .field("note", FieldType::String)
+                .field(
+                    "childId",
+                    FieldType::id("children").on_delete(OnDeleteAction::Cascade),
+                )
+                .index("by_child", &["childId"]),
         )
         .build()
 }
@@ -172,10 +175,13 @@ fn reaper_schema() -> SchemaDef {
         )
         .table(
             "children",
-            Table::new().field("note", FieldType::String).field(
-                "sessionId",
-                FieldType::id("sessions").on_delete(OnDeleteAction::Cascade),
-            ),
+            Table::new()
+                .field("note", FieldType::String)
+                .field(
+                    "sessionId",
+                    FieldType::id("sessions").on_delete(OnDeleteAction::Cascade),
+                )
+                .index("by_session", &["sessionId"]),
         )
         .build()
 }

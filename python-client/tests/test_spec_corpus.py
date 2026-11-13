@@ -348,3 +348,67 @@ def test_every_pagination_row_matches_this_engine() -> None:
         assert decoded[:-2] == prefix, f"row {i} ({row['id']}): minted cursor prefix"
         assert isinstance(decoded[-2], (int, float)), f"row {i} ({row['id']}): created_at kind"
         assert isinstance(decoded[-1], str), f"row {i} ({row['id']}): id kind"
+
+
+# ---------------------------------------------------------------------------
+# ENH-052 family 5 — spec-table corpus: the push-schema validation decision
+# table (wire-corpus/spec/validation.json). Each row pushes its wire schema
+# fragment through the real ``push_schema`` path and asserts the same
+# accept/reject outcome with the same code as the server's own
+# ``SchemaDef::validate``.
+# ---------------------------------------------------------------------------
+
+_VALIDATION_CORPUS_PATH = (
+    Path(__file__).resolve().parents[2] / "wire-corpus" / "spec" / "validation.json"
+)
+_VALIDATION_CORPUS = json.loads(_VALIDATION_CORPUS_PATH.read_text(encoding="utf-8"))
+
+_OWN_RULE_FAMILIES = (
+    "index",
+    "ttl",
+    "updated-at",
+    "auto-increment",
+    "on-delete",
+    "constraints",
+    "computed",
+    "accept",
+)
+
+
+def test_every_validation_rule_family_has_a_fixture_row() -> None:
+    """The corpus README's own-coverage rule: every rule family this engine
+    mirrors must be exercised by a fixture row."""
+    ids = [row["id"] for row in _VALIDATION_CORPUS["rows"]]
+    for family in _OWN_RULE_FAMILIES:
+        assert any(i.startswith(family) for i in ids), (
+            f"no fixture row exercises rule family '{family}'"
+        )
+
+
+def test_every_validation_row_matches_this_engine() -> None:
+    from par_rt_db.in_memory import InMemoryRtDbClient
+    from par_rt_db.in_memory.store import InMemoryRtDbClientOptions
+    from par_rt_db.schema import SchemaDef
+
+    for i, row in enumerate(_VALIDATION_CORPUS["rows"]):
+        ms = 1_700_000_000_000
+
+        def _now() -> int:
+            nonlocal ms
+            ms += 1
+            return ms
+
+        client = InMemoryRtDbClient(InMemoryRtDbClientOptions(now=_now, random=lambda: 0.0))
+        want_code = (row["expect"].get("error") or {}).get("code")
+        got_code: str | None
+        try:
+            client.push_schema(SchemaDef.model_validate(row["schema"]))
+            got_code = None
+        except RtDbError as err:
+            got_code = err.code.value
+        if want_code is not None:
+            assert got_code == want_code, f"row {i} ({row['id']}): rejection code {got_code}"
+            continue
+        assert got_code is None, (
+            f"row {i} ({row['id']}): expected the push to accept, got {got_code}"
+        )

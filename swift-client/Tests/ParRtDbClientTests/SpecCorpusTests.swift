@@ -620,3 +620,86 @@ struct PaginationSpecCorpusTests {
         #expect(idIsString, "\(row.id): id cursor kind")
     }
 }
+
+/// ENH-052 family 5 — validation spec-table runner:
+/// wire-corpus/spec/validation.json. Each row pushes its wire schema
+/// fragment through the real `pushSchema` path and asserts the same
+/// accept/reject outcome with the same code as the server's own
+/// `SchemaDef::validate`.
+struct ValidationSpecCorpusTests {
+    private struct SpecDoc: Decodable {
+        let rows: [SpecRow]
+    }
+
+    private struct SpecRow: Decodable {
+        let id: String
+        let schema: JSONValue
+        let expect: JSONValue
+    }
+
+    private static let ownFamilies = [
+        "index", "ttl", "updated-at", "auto-increment",
+        "on-delete", "constraints", "computed", "accept"
+    ]
+
+    private func loadCorpus() throws -> SpecDoc {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // ParRtDbClientTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // swift-client
+            .deletingLastPathComponent() // repo root
+            .appendingPathComponent("wire-corpus/spec/validation.json")
+        return try JSONDecoder().decode(SpecDoc.self, from: Data(contentsOf: url))
+    }
+
+    /// The wire code a rejection carries, or nil when the row expects the
+    /// push to accept.
+    private func rejectCode(of expect: JSONValue) -> String? {
+        guard case let .object(expectObj) = expect,
+              case let .object(err) = expectObj["error"] ?? .null,
+              case let .string(code) = err["code"] ?? .null
+        else {
+            return nil
+        }
+        return code
+    }
+
+    /// The corpus README's own-coverage rule: every rule family this engine
+    /// mirrors must be exercised by a fixture row.
+    @Test func everyRuleFamilyHasAFixtureRow() throws {
+        let corpus = try loadCorpus()
+        let ids = corpus.rows.map(\.id)
+        for family in Self.ownFamilies {
+            #expect(
+                ids.contains { $0.hasPrefix(family) },
+                "no fixture row exercises rule family '\(family)'"
+            )
+        }
+    }
+
+    @Test func everyRowMatchesThisEngine() throws {
+        let corpus = try loadCorpus()
+        for (rowIndex, row) in corpus.rows.enumerated() {
+            let clock = MonotonicMs(1_700_000_000_000)
+            let client = InMemoryRtDbClient(options: InMemoryRtDbClientOptions(
+                now: { clock.next() },
+                random: { 0 }
+            ))
+            let schemaData = try JSONEncoder().encode(row.schema)
+            let schema = try JSONDecoder().decode(SchemaDef.self, from: schemaData)
+            let wantCode = rejectCode(of: row.expect)
+            do {
+                try client.pushSchema(schema)
+                #expect(
+                    wantCode == nil,
+                    "\(rowIndex) (\(row.id)): expected the push to fail"
+                )
+            } catch let error as RtDbError {
+                #expect(
+                    wantCode != nil && error.code.rawValue == wantCode,
+                    "\(rowIndex) (\(row.id)): rejection code \(error.code.rawValue)"
+                )
+            }
+        }
+    }
+}
