@@ -242,6 +242,16 @@ pub fn patch(
                                     .is_some_and(|note| note.len() <= MAX_CLAIM_ID_LEN)
                             })
                     }
+                    Some("queued") => {
+                        // Redelivery revert: a channel push failure un-claims a
+                        // row it delivered on this host so the drain surfaces
+                        // can re-deliver it. Exact reset shape only — a caller
+                        // can requeue a delivered row, never an acked one, and
+                        // cannot smuggle any other field into the transition.
+                        text(previous, "state") == Some("delivered")
+                            && fields.len() == 2
+                            && fields.get("delivered_ms").and_then(Value::as_f64) == Some(0.0)
+                    }
                     _ => false,
                 }
         }
@@ -477,6 +487,73 @@ mod tests {
             try_message_patch(
                 &delivered,
                 json!({"state":"acked","acked_ms":3,"ack_note":"done","claim_id":"c"})
+            )
+            .is_err()
+        );
+    }
+
+    fn delivered_message(extra: &str) -> Value {
+        let mut doc = queued_message("");
+        doc["state"] = json!("delivered");
+        doc["delivered_ms"] = json!(2);
+        if !extra.is_empty() {
+            doc.as_object_mut()
+                .unwrap()
+                .insert("claim_id".into(), json!(extra));
+        }
+        doc
+    }
+
+    #[test]
+    fn delivered_to_queued_revert_admits_exact_reset_shape() {
+        // The channel push-failure redelivery revert, with and without a
+        // stored claim (a stamped claim survives the revert untouched —
+        // patches only rewrite named fields).
+        assert!(
+            try_message_patch(
+                &delivered_message(""),
+                json!({"state":"queued","delivered_ms":0})
+            )
+            .is_ok()
+        );
+        assert!(
+            try_message_patch(
+                &delivered_message("claim-1"),
+                json!({"state":"queued","delivered_ms":0})
+            )
+            .is_ok()
+        );
+        // Any other shape stays denied: reverting a queued or acked row,
+        // re-queuing with a non-zero delivered_ms, or smuggling a third
+        // field into the transition.
+        assert!(
+            try_message_patch(
+                &queued_message(""),
+                json!({"state":"queued","delivered_ms":0})
+            )
+            .is_err()
+        );
+        assert!(
+            try_message_patch(
+                &delivered_message(""),
+                json!({"state":"acked","acked_ms":3,"ack_note":"n"})
+            )
+            .is_ok()
+        );
+        let mut acked = delivered_message("");
+        acked["state"] = json!("acked");
+        assert!(try_message_patch(&acked, json!({"state":"queued","delivered_ms":0})).is_err());
+        assert!(
+            try_message_patch(
+                &delivered_message(""),
+                json!({"state":"queued","delivered_ms":5})
+            )
+            .is_err()
+        );
+        assert!(
+            try_message_patch(
+                &delivered_message(""),
+                json!({"state":"queued","delivered_ms":0,"claim_id":"c"})
             )
             .is_err()
         );

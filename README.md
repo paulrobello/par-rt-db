@@ -628,10 +628,13 @@ schema lacks the expected fields:
   recipient host may patch a message, with exactly one of two receipt shapes: queued →
   delivered (`state = "delivered"` plus a finite positive `delivered_ms`, optionally also a
   string `claim_id` stamping the delivery claim for transport-failure recovery — the only
-  field the delivered transition may set besides its receipt) or queued/delivered
-  → acked (`state = "acked"` plus a finite positive `acked_ms` and string `ack_note`).
-  Rewriting a completed receipt, extra fields, arbitrary state transitions, and sender-side
-  forged receipts are rejected. Every other message mutation variant is denied.
+  field the delivered transition may set besides its receipt); queued/delivered
+  → acked (`state = "acked"` plus a finite positive `acked_ms` and string `ack_note`); or a
+  delivered → queued redelivery revert (`state = "queued"` plus `delivered_ms = 0`), which
+  re-queues a delivered row for redelivery after a channel push failure and is never
+  admitted from `acked`. Rewriting a completed receipt, extra fields, arbitrary state
+  transitions, and sender-side forged receipts are rejected. Every other message mutation
+  variant is denied.
 - **Everything else is denied** for a `parMeshV1` credential: schedules and workflows (nested
   and standalone), presence, storage/blob operations, change feeds, and all other
   non-document surfaces. `expectFields`/`expectVersion`/`expectAbsent` preconditions enforce
