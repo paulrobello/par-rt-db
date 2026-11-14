@@ -24,6 +24,7 @@ use crate::AppState;
 use crate::auth::{
     Principal, PrincipalCtx, authed_user, authorize, is_admin, resolve_bearer, session_still_valid,
 };
+use crate::db::now_ms;
 use crate::error::{ErrorCode, RtDbError};
 use crate::protocol::{ClientMessage, ScheduleWhen, ServerMessage, WorkflowSpec, WorkflowStatus};
 use crate::rate_limit::{RateDecision, evaluate, evaluate_mutate};
@@ -544,7 +545,8 @@ async fn handle_text_frame(
 /// interactive WS frames. Re-justifies the admin bypass against the live
 /// `rtdb_auth.admins` allowlist (`is_admin`, fails safe to "not admin" on DB
 /// error) and, depending on the branch, either checks the admin session is
-/// still live (`session_still_valid`) or runs the per-db `authorize`.
+/// still live and unexpired (`session_still_valid` + the cached `expires_at`
+/// comparison, SEC-201) or runs the per-db `authorize`.
 /// Returns the per-row principal context to use for the op plus whether the
 /// principal is currently a server-wide admin (the admin flag governs the
 /// `max_affected_docs` guardrail in [`handle_mutate`]). Subscribe, Mutate,
@@ -562,6 +564,16 @@ async fn authorize_op(
     let admin = is_admin(pool, principal).await;
     if admin {
         session_still_valid(pool, principal).await?;
+        // SEC-201: `session_still_valid` covers revocation only — expiry is the
+        // one control that must not rely on the handshake, or a connection
+        // opened while the session was live keeps `admin_bypass()` after the
+        // session TTL passes. The HTTP admin path denies on expiry; this cached
+        // `expires_at` comparison mirrors it per op.
+        if let Principal::User { expires_at, .. } = principal
+            && *expires_at < now_ms()
+        {
+            return Err(RtDbError::unauthorized("session expired"));
+        }
         Ok((PrincipalCtx::admin_bypass(), true))
     } else {
         authorize(pool, principal, db).await?;

@@ -1264,6 +1264,89 @@ async fn revoked_admin_session_is_rejected_on_next_ws_op() -> anyhow::Result<()>
     Ok(())
 }
 
+// SEC-201: `session_still_valid` covers revocation only, so the admin WS
+// branch must compare the cached `expires_at` itself — an admin session that
+// EXPIRES mid-connection (the row still exists, `revoked_at` untouched) loses
+// `admin_bypass()` on the NEXT op over the SAME open connection
+// (UNAUTHORIZED, not a close). Mirrors the revocation sibling above.
+#[tokio::test]
+async fn expired_admin_session_is_rejected_on_next_ws_op() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    let suffix = uuid::Uuid::now_v7().simple();
+    let user_id = format!("u-adm-exp-{suffix}");
+    let email = format!("adm-exp-{suffix}@example.com");
+
+    let token = mint_user_session(&state.pool, &user_id, &email).await;
+    sqlx::query("INSERT INTO rtdb_auth.admins (email, github_id, added_at) VALUES ($1, NULL, $2)")
+        .bind(&email)
+        .bind(rtdb_server::db::now_ms())
+        .execute(&state.pool)
+        .await?;
+
+    // The per-op expiry check compares the `expires_at` CACHED on the
+    // principal at auth time (the same contract the HTTP user branch runs), so
+    // the TTL must pass in real time. Give the session a 1.5s window: connect,
+    // auth, subscribe, and one admin mutate all land inside it, then the test
+    // sleeps past it. (Setting a past `expires_at` post-connect would not
+    // exercise anything — the cached value is a fixed future timestamp.)
+    let hash = rtdb_server::db::sha256_hex(&token);
+    sqlx::query("UPDATE rtdb_auth.sessions SET expires_at = $1 WHERE token_hash = $2")
+        .bind(rtdb_server::db::now_ms() + 1_500)
+        .bind(&hash)
+        .execute(&state.pool)
+        .await?;
+
+    let mut ws = ws_connect(addr).await;
+    let auth_msg = auth(&mut ws, &token, db.as_str()).await;
+    assert_eq!(auth_msg["type"], json!("authOk"));
+
+    send_json(
+        &mut ws,
+        json!({"type": "subscribe", "queryId": "q1", "query": {"table": "workItems"}}),
+    )
+    .await;
+    recv_json(&mut ws).await; // initial queryUpdate
+
+    // admin mutate succeeds (bypasses authorize) while the session is live
+    send_json(
+        &mut ws,
+        json!({"type": "mutate", "mutId": "m1", "txn": insert_work_item_txn()}),
+    )
+    .await;
+    let mut saw_ok = false;
+    for _ in 0..2 {
+        let m = recv_json(&mut ws).await;
+        if m["type"] == json!("mutateOk") {
+            assert_eq!(m["mutId"], json!("m1"));
+            saw_ok = true;
+        }
+    }
+    assert!(saw_ok, "expected mutateOk before expiry");
+
+    // let the wall clock pass the cached `expires_at`
+    tokio::time::sleep(std::time::Duration::from_millis(1_600)).await;
+
+    // the NEXT mutate on the SAME open connection is now rejected — proves the
+    // admin branch runs the expiry comparison per op.
+    send_json(
+        &mut ws,
+        json!({"type": "mutate", "mutId": "m2", "txn": insert_work_item_txn()}),
+    )
+    .await;
+    let err_msg = recv_json(&mut ws).await;
+    assert_eq!(err_msg["type"], json!("mutateErr"));
+    assert_eq!(err_msg["mutId"], json!("m2"));
+    assert_eq!(err_msg["error"]["code"], json!("UNAUTHORIZED"));
+
+    // connection stays open (expiry errors the op, does not close)
+    send_json(&mut ws, json!({"type": "ping"})).await;
+    assert_eq!(recv_json(&mut ws).await["type"], json!("pong"));
+
+    Ok(())
+}
+
 // SEC-105: the /sync WS upgrade must reject an Origin that is neither on the
 // hot-reloaded allowlist nor equal to public_url, since the cookie
 // authenticates a browser-opened handshake and CORS does not apply to WS.
