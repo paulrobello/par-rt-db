@@ -490,6 +490,17 @@ dashboard. `RTDB_SLOW_QUERY_LOG_PARAMS=true` also records the query's bound
 parameter values — a privacy tradeoff, since params can contain user content;
 it defaults to `false`. See `.env.example` for the full set.
 
+Write-path stall signals (committer): the scrape renders
+`rtdb_committer_queue_wait_us{pct="p50"|"p95"|"p99"}` — how long each write
+request waited in its database's serialized committer queue (enqueue to
+dequeue, microseconds) — and `rtdb_committer_queue_depth`, the last-sampled
+depth of a per-db committer queue. A livelock-class slowdown shows up as the
+queue-wait percentiles spiking while the read-path stage gauges
+(`rtdb_auth_stage_us`/`rtdb_rate_limit_stage_us`/`rtdb_schema_stage_us`, the
+P1 stall investigation's series) stay fast. Note the depth gauge freezes
+rather than grows when a committer is wedged inside a single hung turn —
+a flat depth with rising queue-wait p99 is the louder alarm.
+
 ## Tracing (OpenTelemetry / OTLP, ENH-018)
 
 `/metrics` answers "how much"; OTLP tracing answers "why was *this* request

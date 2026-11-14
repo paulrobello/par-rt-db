@@ -64,6 +64,22 @@ pub struct Metrics {
     auth_stage_latency: Mutex<LatencySamples>,
     rate_limit_stage_latency: Mutex<LatencySamples>,
     schema_stage_latency: Mutex<LatencySamples>,
+    // ---- Committer write-path stall observability (prod degradation hardening) ----
+    /// Time each write request spent waiting in its database's serialized
+    /// committer queue (enqueue → dequeue; ENH-018's `queue_wait_ms` delta,
+    /// recorded in microseconds). The recurring prod degradation episodes
+    /// present as "updates wedged while queries serve" — exactly this queue
+    /// spiking while the read-path stage gauges stay fast. Prometheus-only
+    /// like the stage series above, deliberately absent from `MetricsSnapshot`
+    /// so the admin JSON wire stays byte-identical.
+    committer_queue_wait_latency: Mutex<LatencySamples>,
+    /// Last-sampled depth of a per-db committer queue (`rx.len()` taken at the
+    /// top of each committer loop iteration, before the blocking `recv`). Each
+    /// committer task stores its own depth into this shared gauge; a scrape
+    /// therefore shows the most recent sample across dbs, not a global total.
+    /// Best-effort by construction — a committer wedged inside a single hung
+    /// turn stops sampling, which is itself diagnostic.
+    committer_queue_depth: AtomicU64,
     // ---- Slow-query log (ENH-019) ----
     /// Bounded ring buffer of recent slow-query records. Populated at the
     /// HTTP query timing call sites when a query's wall-clock duration
@@ -266,6 +282,19 @@ impl Metrics {
         if let Ok(mut s) = self.schema_stage_latency.lock() {
             s.record(us);
         }
+    }
+    /// Record the time a write request spent waiting in its database's
+    /// serialized committer queue (microseconds, enqueue → dequeue; the
+    /// ENH-018 `queue_wait_ms` delta, now also on the scrape).
+    pub fn record_committer_queue_wait(&self, us: u64) {
+        if let Ok(mut s) = self.committer_queue_wait_latency.lock() {
+            s.record(us);
+        }
+    }
+    /// Store the last-sampled depth of a per-db committer queue. Called at the
+    /// top of each committer loop iteration, before the blocking `recv`.
+    pub fn set_committer_queue_depth(&self, depth: u64) {
+        self.committer_queue_depth.store(depth, Ordering::Relaxed);
     }
 
     /// Append a slow-query record to the bounded log (ENH-019). Callers

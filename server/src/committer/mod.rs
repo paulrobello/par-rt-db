@@ -1502,7 +1502,16 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
         // created before the change feed existed.
         tracing::error!(db = %ctx.db, error = %err, "committer: change_log::ensure_table failed");
     }
-    while let Some(req) = rx.recv().await {
+    loop {
+        // Write-path stall observability: sample the queue depth each
+        // iteration, before the blocking `recv` — a scrape during a slowdown
+        // sees how far behind this database's serialized queue is. A committer
+        // wedged inside a single hung turn stops sampling, which is itself
+        // diagnostic (the depth gauge freezes instead of growing).
+        ctx.metrics.set_committer_queue_depth(rx.len() as u64);
+        let Some(req) = rx.recv().await else {
+            break;
+        };
         // ENH-022 Stage 4: a SHADOW committer (non-owner replica) serves read
         // arms only — a write arm reaching here lost the ownership-upgrade
         // race in `submit` (another replica holds the lease), so it replies
@@ -1586,7 +1595,13 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
                 // signal (the ARC-102 idle-poller class of problem). The span
                 // wraps the whole mutate via `.instrument` so the child
                 // `txn.execute` and `subs.fan_out` spans nest under it.
-                let queue_wait_ms = enqueued_at.elapsed().as_millis() as u64;
+                let queue_wait_us = enqueued_at.elapsed().as_micros() as u64;
+                let queue_wait_ms = queue_wait_us / 1000;
+                // Degradation-watchdog groundwork: the queue-wait percentiles
+                // are the primary "updates wedged while queries serve" signal
+                // on the scrape (the read-path stage gauges stay fast during
+                // the prod livelock episodes).
+                ctx.metrics.record_committer_queue_wait(queue_wait_us);
                 let span = tracing::info_span!(
                     "committer.mutate",
                     db = %ctx.db,

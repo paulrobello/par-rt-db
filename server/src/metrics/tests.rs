@@ -658,6 +658,24 @@ fn stage_latency_series_record_and_render() {
         "{body}"
     );
 
+    // Committer write-path stall observability: queue-wait percentiles render
+    // from the same ring-buffer pattern, and the depth gauge renders the
+    // last-sampled value.
+    m.record_committer_queue_wait(1000);
+    m.record_committer_queue_wait(3000);
+    m.record_committer_queue_wait(2000);
+    m.set_committer_queue_depth(7);
+    let body = render_prometheus(&snap, &m, None, "inst-1");
+    assert!(
+        body.contains("rtdb_committer_queue_wait_us{pct=\"p50\"} 2000"),
+        "{body}"
+    );
+    assert!(
+        body.contains("rtdb_committer_queue_wait_us{pct=\"p99\"} 3000"),
+        "{body}"
+    );
+    assert!(body.contains("rtdb_committer_queue_depth 7"), "{body}");
+
     // A fresh Metrics renders all three series at zero rather than omitting
     // them, so a scrape shows the gauges exist before the first request.
     let body = render_prometheus(&snap, &Metrics::default(), None, "inst-1");
@@ -670,6 +688,11 @@ fn stage_latency_series_record_and_render() {
         body.contains("rtdb_schema_stage_us{pct=\"p99\"} 0"),
         "{body}"
     );
+    assert!(
+        body.contains("rtdb_committer_queue_wait_us{pct=\"p99\"} 0"),
+        "{body}"
+    );
+    assert!(body.contains("rtdb_committer_queue_depth 0"), "{body}");
 }
 
 #[test]

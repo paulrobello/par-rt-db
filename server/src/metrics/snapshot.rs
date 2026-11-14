@@ -415,6 +415,35 @@ pub fn render_prometheus(
         schema_stage.p99
     ));
 
+    // Committer write-path stall observability (prod degradation hardening).
+    // Same pattern as the stage series: Prometheus-only, rendered from live
+    // ring buffers.
+    let committer_queue_wait = m
+        .committer_queue_wait_latency
+        .lock()
+        .map(|s| s.percentiles())
+        .unwrap_or_default();
+    s.push_str("# HELP rtdb_committer_queue_wait_us Time each write request spent waiting in its database's serialized committer queue (enqueue to dequeue), nearest-rank percentiles in microseconds.\n");
+    s.push_str("# TYPE rtdb_committer_queue_wait_us gauge\n");
+    s.push_str(&format!(
+        "rtdb_committer_queue_wait_us{{pct=\"p50\"}} {}\n",
+        committer_queue_wait.p50
+    ));
+    s.push_str(&format!(
+        "rtdb_committer_queue_wait_us{{pct=\"p95\"}} {}\n",
+        committer_queue_wait.p95
+    ));
+    s.push_str(&format!(
+        "rtdb_committer_queue_wait_us{{pct=\"p99\"}} {}\n",
+        committer_queue_wait.p99
+    ));
+    s.push_str("# HELP rtdb_committer_queue_depth Last-sampled depth of a per-db committer queue (most recent sample across databases, not a global total).\n");
+    s.push_str("# TYPE rtdb_committer_queue_depth gauge\n");
+    s.push_str(&format!(
+        "rtdb_committer_queue_depth {}\n",
+        m.committer_queue_depth.load(Ordering::Relaxed)
+    ));
+
     // Ownership-lease observability (ENH-049). Aggregate gauges + counters —
     // per-db detail belongs in the tracing logs (each lease event carries the
     // `db` field), not metric labels (cardinality).
