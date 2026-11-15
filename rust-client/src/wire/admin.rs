@@ -1496,6 +1496,10 @@ pub struct ExplainResult {
     pub terminal: String,
     /// Compile-time concerns (e.g. unindexed filter field).
     pub warnings: Vec<String>,
+    /// `EXPLAIN (ANALYZE, FORMAT JSON)` plan when the request asked for one
+    /// (`analyze: true`); absent in the compile-only default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<serde_json::Value>,
 }
 
 /// One row of [`SlowQueriesResponse::queries`]: a recorded slow-query event

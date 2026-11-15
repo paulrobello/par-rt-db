@@ -36,8 +36,8 @@ import type { WebSocketLike } from "./client.js";
 import { RtDbError } from "./errors.js";
 import {
   enrollRequest,
-  fetchWithDeadline,
   type FileMetadata,
+  fetchWithDeadline,
   type SignedUrl,
   type TransformOpts,
 } from "./http.js";
@@ -688,12 +688,22 @@ export class RtDbAdminClient {
   /** Compile-time query introspection (POST /admin/db/{db}/explain). Accepts
    *  either a typed `RtQuery<R>` builder or a raw `QueryJson` and returns the
    *  compiled SQL (`$1`-bound, never interpolated literals), the bind params
-   *  formatted as strings, the terminal kind, and any compile warnings. */
-  async explainQuery(db: string, query: RtQuery<unknown> | QueryJson): Promise<ExplainResult> {
+   *  formatted as strings, the terminal kind, and any compile warnings. Pass
+   *  `{ analyze: true }` to also run the compiled statement under
+   *  EXPLAIN (ANALYZE, FORMAT JSON) and get the runtime plan as `plan`. */
+  async explainQuery(
+    db: string,
+    query: RtQuery<unknown> | QueryJson,
+    opts?: { analyze?: boolean },
+  ): Promise<ExplainResult> {
     const json = "json" in query ? query.json : query;
-    return (await this.request("POST", `/admin/db/${encodeURIComponent(db)}/explain`, {
-      query: json,
-    })) as ExplainResult;
+    const body: Record<string, unknown> = { query: json };
+    if (opts?.analyze !== undefined) body.analyze = opts.analyze;
+    return (await this.request(
+      "POST",
+      `/admin/db/${encodeURIComponent(db)}/explain`,
+      body,
+    )) as ExplainResult;
   }
 
   /** Slow-query log inspector (GET /admin/slow-queries). Returns recent slow

@@ -2261,7 +2261,7 @@ async fn explain_query_posts_to_admin_db_singular_path_and_deserializes() {
         .mount(&server)
         .await;
     let q = TableQuery::new("items").take(10);
-    let got = client.explain_query("kanban", &q).await.unwrap();
+    let got = client.explain_query("kanban", &q, None).await.unwrap();
     assert_eq!(got.sql, "SELECT doc FROM kanban.items LIMIT 10");
     assert_eq!(got.params, vec!["active".to_string(), "50".to_string()]);
     assert_eq!(got.terminal, "collect");

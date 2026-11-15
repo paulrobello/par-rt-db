@@ -1417,17 +1417,21 @@ class RtDbAdminClient:
 
     # --- query introspection (ENH-019) ---
 
-    def explain_query(self, db: str, query: Query | TableQuery) -> ExplainResult:
-        """``POST /admin/db/{db}/explain`` ``{query}`` → compiled SQL + params +
-        terminal + warnings.
+    def explain_query(
+        self, db: str, query: Query | TableQuery, *, analyze: bool | None = None
+    ) -> ExplainResult:
+        """``POST /admin/db/{db}/explain`` ``{query, analyze?}`` → compiled SQL +
+        params + terminal + warnings, plus the runtime plan when ``analyze``.
 
         Owner-bypass is implicit (admin route). The body shape mirrors
         :meth:`admin_query` — ``db`` rides in the URL, the (optionally built)
         :class:`Query` rides as ``{query}``. ``params`` is the bind-parameter
         list (already stringified server-side); ``warnings`` carries any
-        over-approximation or redaction notices.
+        over-approximation or redaction notices. ``analyze=True`` has the
+        server run the compiled statement under ``EXPLAIN (ANALYZE,
+        FORMAT JSON)`` and return the plan as ``plan``.
         """
-        return self._executor.run(_op_explain(db, query))
+        return self._executor.run(_op_explain(db, query, analyze=analyze))
 
     def get_slow_queries(
         self,
@@ -2240,12 +2244,15 @@ class AsyncRtDbAdminClient:
 
     # --- query introspection (ENH-019) ---
 
-    async def explain_query(self, db: str, query: Query | TableQuery) -> ExplainResult:
+    async def explain_query(
+        self, db: str, query: Query | TableQuery, *, analyze: bool | None = None
+    ) -> ExplainResult:
         """``POST /admin/db/{db}/explain`` → compiled SQL + params + warnings (async).
 
-        See :meth:`RtDbAdminClient.explain_query` for body semantics.
+        See :meth:`RtDbAdminClient.explain_query` for body semantics;
+        ``analyze=True`` returns the runtime plan as ``plan``.
         """
-        return await self._executor.run(_op_explain(db, query))
+        return await self._executor.run(_op_explain(db, query, analyze=analyze))
 
     async def get_slow_queries(
         self,

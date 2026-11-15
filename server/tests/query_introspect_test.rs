@@ -367,6 +367,65 @@ async fn explain_route_rejects_peer_incompatible_query() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// HTTP test: `analyze: true` runs the compiled statement under
+/// `EXPLAIN (ANALYZE, FORMAT JSON)` through the server pool and returns the
+/// plan array; the compile-only default (no `analyze`) keeps the response
+/// plan-free, so legacy callers see an unchanged shape.
+#[tokio::test]
+async fn explain_route_analyze_returns_runtime_plan() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+
+    let resp = admin_post(
+        addr,
+        &format!("/admin/db/{}/explain", db.as_str()),
+        serde_json::json!({
+            "query": {
+                "table": "projects",
+                "filter": {"op": "eq", "field": "status", "value": "active"}
+            },
+            "analyze": true
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&resp.text().await?)?;
+    let plan = body["plan"]
+        .as_array()
+        .expect("plan should be the FORMAT JSON array");
+    assert!(!plan.is_empty(), "plan array should be non-empty");
+    let plan_text = serde_json::to_string(plan)?;
+    assert!(
+        plan_text.contains("Node Type"),
+        "plan should carry a Postgres plan node, got: {plan_text}"
+    );
+    assert!(
+        plan_text.contains("Actual Rows"),
+        "ANALYZE plan should carry actual rows, got: {plan_text}"
+    );
+
+    // The compile-only default stays byte-for-byte legacy: no `plan` key.
+    let resp2 = admin_post(
+        addr,
+        &format!("/admin/db/{}/explain", db.as_str()),
+        serde_json::json!({
+            "query": {
+                "table": "projects",
+                "filter": {"op": "eq", "field": "status", "value": "active"}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(resp2.status(), reqwest::StatusCode::OK);
+    let body2: serde_json::Value = serde_json::from_str(&resp2.text().await?)?;
+    assert!(
+        body2.get("plan").is_none(),
+        "compile-only response must not carry a plan field, got: {body2}"
+    );
+    Ok(())
+}
+
 /// HTTP test: `/admin/slow-queries` returns 200 with an empty list and the
 /// configured threshold when the log is off (`RTDB_SLOW_QUERY_MS=0` in
 /// `test_state`).

@@ -127,6 +127,19 @@ alter observable behavior on upgrade.
 
 ### Added
 
+- **Opt-in runtime EXPLAIN on the admin explain route (`analyze: true`,
+  ENH-019 follow-up).** `POST /admin/db/{db}/explain` now accepts
+  `analyze: true`, which runs the compiled statement under
+  `EXPLAIN (ANALYZE, FORMAT JSON)` through the server's own pool and returns
+  the plan as `plan` — actual timings, the answer to planner-choice-vs-I/O
+  the compile-only default cannot give (motivated by the recurring slow
+  kanban `t_items` collects on card 01a1de50). Postgres cannot PREPARE an
+  EXPLAIN and sqlx always prepares, so the typed binds inline as literals
+  rendered from the server's own typed bind decode; the plan column decodes
+  both the Postgres 16+ `json` shape and the older `text` shape. The
+  compile-only default is byte-identical to the prior behavior (no `plan`
+  field). Mirrored in all four admin clients (python `analyze=` kwarg, ts
+  `opts.analyze`, go `analyze *bool`, rust `analyze: Option<bool>`).
 - **Cross-replica hot-config coherence (`rtdb_config` NOTIFY + config
   listener, ARC-201).** Under `RTDB_MULTI_INSTANCE` a `PATCH /admin/config`
   on one replica now converges every other replica without a restart: the

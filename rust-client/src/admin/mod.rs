@@ -674,21 +674,30 @@ impl RtDbAdminClient {
         crate::http_common::json_result::<T>(resp).await
     }
 
-    /// `POST /admin/db/{db}/explain` `{query}` → `{sql, params, terminal,
-    /// warnings}` (ENH-019). Compiles a Query DSL body for inspection without
-    /// executing it; the returned `sql` is byte-identical to what the read
-    /// path would run. Mirrors server `admin::observability::explain_query`.
+    /// `POST /admin/db/{db}/explain` `{query, analyze?}` → `{sql, params,
+    /// terminal, warnings, plan?}` (ENH-019 + follow-up). Compiles a Query DSL
+    /// body for inspection; `analyze: Some(true)` additionally runs the
+    /// compiled statement under `EXPLAIN (ANALYZE, FORMAT JSON)` through the
+    /// server's own pool and returns the plan (executes the read once). The
+    /// compile-only default stays byte-identical to the pre-analyze server.
+    /// Mirrors server `admin::observability::admin_explain`.
     pub async fn explain_query(
         &self,
         db: &str,
         query: &crate::query::Query,
+        analyze: Option<bool>,
     ) -> Result<crate::wire::admin::ExplainResult, RtDbError> {
         #[derive(Serialize)]
         struct Body<'a> {
             query: &'a crate::query::Query,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            analyze: Option<bool>,
         }
         let resp = self
-            .post_json(&format!("/admin/db/{}/explain", db), &Body { query })
+            .post_json(
+                &format!("/admin/db/{}/explain", db),
+                &Body { query, analyze },
+            )
             .await?;
         crate::http_common::deserialize(resp).await
     }

@@ -632,6 +632,8 @@ export interface ExplainResult {
   params: string[];
   terminal: string;
   warnings: string[];
+  /** EXPLAIN (ANALYZE, FORMAT JSON) plan when the request set analyze. */
+  plan?: unknown;
 }
 
 /** One entry from GET /admin/slow-queries. `params` is omitted from the server

@@ -381,6 +381,16 @@ async fn send_stream_json(
 #[derive(Deserialize)]
 pub(super) struct ExplainBody {
     query: crate::query::Query,
+    /// Opt-in runtime plan (ENH-019 follow-up): when true, the handler runs
+    /// `EXPLAIN (ANALYZE, FORMAT JSON)` for the compiled statement through the
+    /// server's own pool and returns it as `plan`. ANALYZE executes the read
+    /// once — safe by construction (compile output is a capped, quoted,
+    /// fully-bound SELECT) and the only way to see actual timings, which is
+    /// exactly the planner-choice-vs-I/O question the compile-only default
+    /// cannot answer. Absent/false keeps the historical compile-only behavior
+    /// (no Postgres round-trip, no `plan` field in the response).
+    #[serde(default)]
+    analyze: bool,
 }
 
 /// One row of the `/explain` response. `binds` is the ordered list of typed
@@ -396,6 +406,11 @@ pub(super) struct ExplainResponse {
     params: Vec<String>,
     terminal: String,
     warnings: Vec<String>,
+    /// `EXPLAIN (ANALYZE, FORMAT JSON)` output when the request set
+    /// `analyze: true` — the top-level array Postgres returns (one object
+    /// per plan). Absent in the compile-only default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan: Option<serde_json::Value>,
 }
 
 /// `POST /admin/db/{db}/explain` — compile a Query DSL body for inspection
@@ -443,11 +458,62 @@ pub(super) async fn admin_explain(
             crate::txn::EqBind::I64(v) => v.to_string(),
         })
         .collect::<Vec<String>>();
+    // Opt-in runtime plan (see the field doc on ExplainBody): the compiled
+    // statement is a capped, quoted, fully-bound SELECT, so executing it once
+    // under EXPLAIN ANALYZE is exactly one ordinary read's cost.
+    let plan = if body.analyze {
+        let mut explain_sql = String::from("EXPLAIN (ANALYZE, FORMAT JSON) ");
+        explain_sql.push_str(&cq.sql);
+        // Postgres cannot PREPARE an EXPLAIN and sqlx always prepares, so the
+        // typed binds inline as literals via the unprepared raw_sql path.
+        // Every literal renders from a typed EqBind the DSL decoder produced:
+        // Num/Bool/I64 render by Display (serde_json rejects NaN/Inf, so f64
+        // is always finite), Text uses the standard '' escaping — the single
+        // special character inside a string literal under
+        // standard_conforming_strings. Placeholders replace highest-first so
+        // $10 cannot clobber $1.
+        for (i, bind) in cq.binds.iter().enumerate().rev() {
+            let literal = match bind {
+                crate::txn::EqBind::Text(v) => format!("'{}'", v.replace('\'', "''")),
+                crate::txn::EqBind::Num(v) => v.to_string(),
+                crate::txn::EqBind::Bool(v) => v.to_string(),
+                crate::txn::EqBind::I64(v) => v.to_string(),
+            };
+            let ph = format!("${}", i + 1);
+            explain_sql = explain_sql.replacen(&ph, &literal, 1);
+        }
+        let row = sqlx::raw_sql(sqlx::AssertSqlSafe(explain_sql))
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "explain analyze failed");
+                RtDbError::internal("explain analyze failed; see server logs")
+            })?;
+        // The plan column's SQL type is version-dependent: Postgres 16+
+        // returns `json`, older returns `text` — decode either shape.
+        let plan: serde_json::Value = match sqlx::Row::try_get::<serde_json::Value, _>(&row, 0) {
+            Ok(v) => v,
+            Err(_) => {
+                let raw: String = sqlx::Row::try_get(&row, 0).map_err(|e| {
+                    tracing::error!(error = %e, "explain plan column decode failed");
+                    RtDbError::internal("explain plan decode failed; see server logs")
+                })?;
+                serde_json::from_str(&raw).map_err(|e| {
+                    tracing::error!(error = %e, "explain analyze plan decode failed");
+                    RtDbError::internal("explain plan decode failed; see server logs")
+                })?
+            }
+        };
+        Some(plan)
+    } else {
+        None
+    };
     Ok(Json(ExplainResponse {
         sql: cq.sql,
         params,
         terminal: cq.terminal.to_string(),
         warnings,
+        plan,
     }))
 }
 

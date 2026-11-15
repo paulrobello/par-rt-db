@@ -129,12 +129,18 @@ func (c *AdminClient) AdminQuery(ctx context.Context, db string, query wire.Quer
 	return wire.UnmarshalJSON(resp.Result)
 }
 
-// ExplainQuery: POST /admin/db/{db}/explain {query} → the compiled SQL +
-// binds, byte-identical to what execution runs.
-func (c *AdminClient) ExplainQuery(ctx context.Context, db string, query wire.Query) (*ExplainResult, error) {
+// ExplainQuery: POST /admin/db/{db}/explain {query, analyze?} → the compiled
+// SQL + binds, byte-identical to what execution runs. When analyze is set,
+// the server additionally runs the statement under EXPLAIN (ANALYZE,
+// FORMAT JSON) and returns the plan in ExplainResult.Plan.
+func (c *AdminClient) ExplainQuery(ctx context.Context, db string, query wire.Query, analyze *bool) (*ExplainResult, error) {
+	body := map[string]any{"query": query}
+	if analyze != nil {
+		body["analyze"] = *analyze
+	}
 	var out ExplainResult
 	if err := c.api.Call(ctx, methodPost, fmt.Sprintf("/admin/db/%s/explain", db),
-		map[string]any{"query": query}, &out); err != nil {
+		body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

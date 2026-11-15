@@ -57,9 +57,13 @@ def _op_get_subscriptions(db: str | None = None) -> _AdminRequest:
     )
 
 
-def _op_explain(db: str, query: Query | TableQuery) -> _AdminRequest:
+def _op_explain(
+    db: str, query: Query | TableQuery, *, analyze: bool | None = None
+) -> _AdminRequest:
     built = query.build() if isinstance(query, TableQuery) else query
-    body = {"query": built.model_dump(by_alias=True, mode="json")}
+    body: dict[str, Any] = {"query": built.model_dump(by_alias=True, mode="json")}
+    if analyze is not None:
+        body["analyze"] = analyze
     return _AdminRequest(
         "POST", f"/admin/db/{db}/explain", {"json": body}, _parse_model(ExplainResult)
     )

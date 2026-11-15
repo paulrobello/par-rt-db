@@ -155,7 +155,7 @@ pub(crate) async fn run_explain(cli: &Cli, query: &str) -> Result<()> {
     let json = read_json_arg(query)?;
     let q: Query = serde_json::from_str(&json).context("parsing Query JSON")?;
     let c = admin_client(cli)?;
-    let result = c.explain_query(&db, &q).await.map_err(map_err)?;
+    let result = c.explain_query(&db, &q, None).await.map_err(map_err)?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }

@@ -492,6 +492,18 @@ pub async fn replica_state(pool: &PgPool, opts: &ReplicaOpts) -> Arc<AppState> {
     cfg.multi_instance.forward_concurrency = opts.forward_concurrency;
     cfg.presence_enabled = opts.presence_enabled;
     cfg.presence_broadcast_interval_ms = opts.presence_broadcast_interval_ms;
+    // ARC-201 follow-up: the hot-config row (rtdb_config, id=1) is GLOBAL in
+    // the shared dev Postgres, and since the config listener lands, every
+    // multi-instance replica RELOADS it at listener connect. A patch persisted
+    // by an earlier test (config_convergence_test's 101/202 ceilings, for
+    // example) would otherwise override this replica's env seed and corrupt
+    // exact-limit expectations (the shared rate-budget test denies at 4). The
+    // row is this test harness's own fixture state on the dev db — wipe it so
+    // every cluster starts config-clean regardless of test order.
+    sqlx::query("DELETE FROM rtdb_config")
+        .execute(pool)
+        .await
+        .expect("wipe shared rtdb_config row");
     AppState::new(pool.clone(), cfg, hot)
 }
 

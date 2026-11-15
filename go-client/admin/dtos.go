@@ -206,12 +206,14 @@ type RestoreResult struct {
 }
 
 // ExplainResult is POST /admin/db/{db}/explain — the compiled SQL plus the
-// ordered binds, byte-identical to what execution runs.
+// ordered binds, byte-identical to what execution runs. Plan carries the
+// EXPLAIN (ANALYZE, FORMAT JSON) output when the request set analyze.
 type ExplainResult struct {
-	SQL      string   `json:"sql"`
-	Params   []string `json:"params"`
-	Terminal string   `json:"terminal"`
-	Warnings []string `json:"warnings"`
+	SQL      string          `json:"sql"`
+	Params   []string        `json:"params"`
+	Terminal string          `json:"terminal"`
+	Warnings []string        `json:"warnings"`
+	Plan     json.RawMessage `json:"plan,omitempty"`
 }
 
 // SlowQueryEntry is one recorded slow query.

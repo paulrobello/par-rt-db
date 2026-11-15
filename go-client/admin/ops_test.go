@@ -119,7 +119,7 @@ func TestExplainQuery(t *testing.T) {
 	c := &capture{t: t, method: "POST", path: "/admin/db/app/explain",
 		status: 200, respBody: `{"sql":"SELECT * FROM t","params":["7"],"terminal":"select","warnings":[]}`}
 	client := stub(t, c.handler)
-	got, err := client.ExplainQuery(context.Background(), "app", wire.Query{Table: "t"})
+	got, err := client.ExplainQuery(context.Background(), "app", wire.Query{Table: "t"}, nil)
 	if err != nil {
 		t.Fatalf("ExplainQuery: %v", err)
 	}

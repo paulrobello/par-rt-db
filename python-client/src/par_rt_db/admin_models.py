@@ -601,6 +601,7 @@ class ExplainResult(_Wire):
     params: list[str]
     terminal: str
     warnings: list[str]
+    plan: Any | None = None
 
 
 class SlowQueryEntry(_Wire):
