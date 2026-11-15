@@ -219,7 +219,7 @@ ENGINE_FLOOR_KOTLIN := 90.0
 ENGINE_FLOOR_SWIFT := 83.0
 # ENGINE_FLOOR_TS has no Makefile variable: ts-client's floor lives as a vitest
 # glob threshold in ts-client/vitest.config.ts (its single source of truth).
-ENGINE_FLOOR_RUST := 0.0
+ENGINE_FLOOR_RUST := 87.0
 
 coverage-rust: dev-db-up
 	@mkdir -p target/coverage
@@ -234,14 +234,13 @@ else
 	cargo llvm-cov --workspace --all-features --lcov --output-path target/coverage/rust.lcov -- --skip merge_users_skips_stale_registry_rows_without_paying_a_committer_spawn
 endif
 	cargo llvm-cov report --summary-only
-# ENH-054: rust-client in_memory engine floor. The floor value needs the FIRST
-# local `make coverage-rust` run to set (measured minus a ratchet step) — no
-# measured number existed at floor-setup time (2026-11-14) and cargo runs were
-# off-limits on the shared checkout. To activate, set ENGINE_FLOOR_RUST above
-# to measured − step and append this line to the recipe above:
-#   ./scripts/coverage-floor-check.sh lcov target/coverage/rust.lcov rust-client/src/in_memory $(ENGINE_FLOOR_RUST)
-# The check parses the same rust.lcov llvm-cov already writes; the script's
-# lcov handler is already exercised by the python leg.
+# ENH-054: rust-client in_memory engine floor. Floor = measured 89.5
+# (2026-11-14 `make coverage-rust`, 4662/5208 lines) minus a ratchet step,
+# same convention as the other engines. Ratchet-only: never lower a floor to
+# get a leg green; raising one after genuine test improvements is the point.
+# Parses the same rust.lcov llvm-cov already writes; the lcov handler is
+# exercised by the python leg.
+	./scripts/coverage-floor-check.sh lcov target/coverage/rust.lcov rust-client/src/in_memory $(ENGINE_FLOOR_RUST)
 
 coverage-ts:
 	cd ts-client && bun run coverage

@@ -15,7 +15,7 @@ the engine directories only, never the packages as a whole.
 | `ts-client/src/in_memory/` | 92.7% lines | **90.0** | vitest native glob threshold in `ts-client/vitest.config.ts` (runs on every `coverage-ts`, including CI) |
 | `kotlin-client` `dev.parrtdb.inmemory` | 92.7% lines | **90.0** | `coverage-kotlin` (local-only) |
 | swift-client `InMemory*` sources | 85.7% lines | **83.0** | `coverage-swift` (local-only) |
-| `rust-client/src/in_memory/` | not yet measured | **not set** | wired, awaiting first local `make coverage-rust` run |
+| `rust-client/src/in_memory/` | 89.5% lines | **87.0** | `coverage-rust` (local-only; floor check reads the lcov llvm-cov already writes) |
 | dashboard `src/**` | (whole-package vitest) | none | report-only (unchanged) |
 
 ## Ratchet policy
@@ -36,7 +36,7 @@ make coverage-ts      # vitest --coverage (fast, CI-enforced; threshold in vites
 make coverage-dashboard   # report-only, unchanged
 make coverage-kotlin  # gradle jacocoTestReport + floor check (local-only)
 make coverage-swift   # swift test --enable-code-coverage + llvm-cov + floor check (local-only)
-make coverage-rust    # llvm-cov workspace run; engine floor check pending activation
+make coverage-rust    # llvm-cov workspace run + rust floor check (local-only)
 ```
 
 The fast legs (go, python, ts) run inside CI's `coverage-weekly` job via
@@ -54,23 +54,18 @@ coverage report and exits nonzero when the aggregate coverage of files matching
 --summary-only` JSON). A pattern that matches nothing fails loudly rather than
 passing an empty match.
 
-## Rust floor activation (pending)
+## Rust floor (active)
 
-No measured number for `rust-client/src/in_memory/` existed at floor-setup time
-(2026-11-14): the instrumented workspace run is local-only and cargo runs were
-off-limits on the shared checkout that day. The wiring is done; activation is
-one line:
-
-1. Run `make coverage-rust` (needs the dev Postgres, ~minutes).
-2. Read the engine number from the last table in the summary, or run
-   `scripts/coverage-floor-check.sh lcov target/coverage/rust.lcov rust-client/src/in_memory 0` —
-   it prints the measured percentage and line counts even when passing floor 0.
-3. Set `ENGINE_FLOOR_RUST` in the root `Makefile` to that number minus a small
-   step and append the floor-check line to the `coverage-rust` recipe (the
-   exact line is in the comment at the recipe's end).
+The rust floor activated on 2026-11-14, the day after the other engines: the
+first measured `make coverage-rust` run gave `rust-client/src/in_memory/` **89.5%
+lines (4662/5208)**, so `ENGINE_FLOOR_RUST := 87.0` and the `coverage-rust`
+recipe now ends with the floor-check line parsing `target/coverage/rust.lcov`
+(the same lcov llvm-cov already writes — no second pass). With this, every
+mirror engine directory carries a ratchet floor.
 
 ## History
 
 - 2026-11-14 — floors created (ENH-054). Measured: go 80.4% statements
   (3635/4522), python 91.3% lines (3308/3622), ts 92.7% lines (2360/2547),
-  kotlin 92.7% lines (2662/2872), swift 85.7% (5117/5970).
+  kotlin 92.7% lines (2662/2872), swift 85.7% (5117/5970). Rust activation
+  same day: measured 89.5% lines (4662/5208), floor set to 87.0.
