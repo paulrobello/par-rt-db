@@ -58,7 +58,10 @@ use arms::workflow::handle_workflow_advance;
 use forwarding::{
     decode_or_internal, fail_forwarded_reply, forward_write_of, mint_forward_idempotency_key,
 };
-use lease::{acquire_ownership_lease, reply_ownership_conflict, request_needs_write, verify_lease};
+use lease::{
+    LeaseVerification, acquire_ownership_lease, reply_ownership_conflict, request_needs_write,
+    verify_write_lease_and_demote,
+};
 
 pub(crate) use lease::SHADOW_CONFLICT_MARKER;
 use supervisor::{reclaim_idle_pass, run_quota_warmer};
@@ -1520,67 +1523,21 @@ async fn run_committer(ctx: CommitterCtx, mut rx: mpsc::Receiver<CommitterReques
             reply_ownership_conflict(&ctx, req).await;
             continue;
         }
-        // ARC-001: belt-and-braces lease verification for a multi-instance
-        // OWNER before any write turn. The `after_connect` hook catches a
-        // backend REPLACEMENT; this covers the remaining gap — a still-alive
-        // backend whose lock was taken away (e.g. `pg_advisory_unlock_all`)
-        // — and first-turn detection when the flag was set by a concurrent
-        // arm. Fail closed: a verification error counts as lost. On a lost
-        // lease the write replies CONFLICT (shadow behavior) and the task
-        // shuts itself down so the supervisor clears the entry; the next
-        // submit respawns via `channel_for`, which re-acquires the lease (or
-        // becomes a shadow). `Committers::submit` routing is untouched.
-        if ctx.multi_instance && ctx.owns_writes && request_needs_write(&req) {
-            let lost_by_flag = ctx
-                .lease_lost
-                .as_ref()
-                .is_some_and(|lost| lost.load(std::sync::atomic::Ordering::SeqCst));
-            let lease_ok = if lost_by_flag {
-                false
-            } else {
-                match ctx.pool.acquire().await {
-                    Ok(mut conn) => verify_lease(&mut conn, &ctx.db).await,
-                    Err(err) => {
-                        tracing::error!(
-                            db = %ctx.db,
-                            error = %err,
-                            "ownership lease connection lost before write"
-                        );
-                        false
-                    }
-                }
-            };
-            if !lease_ok {
-                // ENH-049: this is ARC-001's demotion point — the held lease
-                // is gone, so count it and log with the replica identity.
-                ctx.metrics.record_lease_lost();
-                tracing::warn!(
-                    db = %ctx.db,
-                    instance_id = %ctx.instance_id,
-                    "ownership lease lost mid-life; demoting committer to shadow"
-                );
-                if let Some(lost) = &ctx.lease_lost {
-                    lost.store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-                reply_ownership_conflict(&ctx, req).await;
-                // ARC-001: drain anything already queued behind this request
-                // and answer CONFLICT, otherwise those oneshot reply channels
-                // would be dropped silently when this task exits (surfacing
-                // as a generic "task dropped the reply" error instead of the
-                // honest lease-conflict retry signal).
-                while let Ok(queued) = rx.try_recv() {
-                    reply_ownership_conflict(&ctx, queued).await;
-                }
-                // Self-shutdown: the supervisor clears the channel entry on
-                // task exit, so the next submit re-enters `channel_for` and
-                // either re-acquires the lease or becomes a shadow.
-                break;
-            }
-        }
+        // ARC-001: verify the write lease before any write turn; on a lost
+        // lease `verify_write_lease_and_demote` answers CONFLICT to this
+        // request and everything queued behind it and returns `Lost`, which
+        // shuts the committer down so the next submit re-acquires (or
+        // demotes to a shadow). See `lease.rs` for the full contract.
+        let LeaseVerification::Held(req) = verify_write_lease_and_demote(&ctx, req, &mut rx).await
+        else {
+            break;
+        };
         // ENH-018: the `db` field on every span is bounded (one per database
         // name, not per document), so it is safe to put on a span attribute —
         // unlike doc ids or content, which would blow up cardinality.
-        match req {
+        // `Held` boxes the request (clippy large-enum-variant); deref-move it
+        // back out for dispatch.
+        match *req {
             CommitterRequest::Mutate {
                 idempotency_key,
                 txn,

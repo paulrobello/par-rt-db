@@ -234,6 +234,89 @@ pub(in crate::committer) fn request_needs_write(req: &CommitterRequest) -> bool 
     )
 }
 
+/// What [`verify_write_lease_and_demote`] decided about the current turn.
+pub(in crate::committer) enum LeaseVerification {
+    /// The lease holds (or the turn needs no lease) — `req` comes back for
+    /// normal dispatch by `run_committer`.
+    Held(Box<CommitterRequest>),
+    /// The lease is lost: this request and everything queued behind it were
+    /// answered CONFLICT and the committer task must shut itself down so the
+    /// supervisor clears the entry and the next submit re-acquires (or
+    /// demotes to a shadow).
+    Lost,
+}
+
+/// ARC-001 belt-and-braces per-turn lease verification for a multi-instance
+/// OWNER before any write turn, extracted verbatim from `run_committer`'s
+/// dispatch loop. The `after_connect` hook catches a backend REPLACEMENT;
+/// this covers the remaining gap — a still-alive backend whose lock was taken
+/// away (e.g. `pg_advisory_unlock_all`) — and first-turn detection when the
+/// flag was set by a concurrent arm. Fail closed: a verification error counts
+/// as lost. On a lost lease the write replies CONFLICT (shadow behavior),
+/// everything already queued behind it is drained and answered CONFLICT too,
+/// and [`LeaseVerification::Lost`] tells the caller to shut the task down so
+/// the supervisor clears the entry; the next submit respawns via
+/// `channel_for`, which re-acquires the lease (or becomes a shadow).
+/// `Committers::submit` routing is untouched.
+pub(in crate::committer) async fn verify_write_lease_and_demote(
+    ctx: &CommitterCtx,
+    req: CommitterRequest,
+    rx: &mut mpsc::Receiver<CommitterRequest>,
+) -> LeaseVerification {
+    // Only a multi-instance owner holding the lease needs the check; every
+    // other combination (single-instance, shadow, read arm) passes straight
+    // through.
+    let needs_lease_check = ctx.multi_instance && ctx.owns_writes && request_needs_write(&req);
+    if !needs_lease_check {
+        return LeaseVerification::Held(Box::new(req));
+    }
+    let lost_by_flag = ctx
+        .lease_lost
+        .as_ref()
+        .is_some_and(|lost| lost.load(std::sync::atomic::Ordering::SeqCst));
+    let lease_ok = if lost_by_flag {
+        false
+    } else {
+        match ctx.pool.acquire().await {
+            Ok(mut conn) => verify_lease(&mut conn, &ctx.db).await,
+            Err(err) => {
+                tracing::error!(
+                    db = %ctx.db,
+                    error = %err,
+                    "ownership lease connection lost before write"
+                );
+                false
+            }
+        }
+    };
+    if lease_ok {
+        return LeaseVerification::Held(Box::new(req));
+    }
+    // ENH-049: this is ARC-001's demotion point — the held lease is gone, so
+    // count it and log with the replica identity.
+    ctx.metrics.record_lease_lost();
+    tracing::warn!(
+        db = %ctx.db,
+        instance_id = %ctx.instance_id,
+        "ownership lease lost mid-life; demoting committer to shadow"
+    );
+    if let Some(lost) = &ctx.lease_lost {
+        lost.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    reply_ownership_conflict(ctx, req).await;
+    // ARC-001: drain anything already queued behind this request and answer
+    // CONFLICT, otherwise those oneshot reply channels would be dropped
+    // silently when this task exits (surfacing as a generic "task dropped the
+    // reply" error instead of the honest lease-conflict retry signal).
+    while let Ok(queued) = rx.try_recv() {
+        reply_ownership_conflict(ctx, queued).await;
+    }
+    // Self-shutdown: the supervisor clears the channel entry on task exit, so
+    // the next submit re-enters `channel_for` and either re-acquires the
+    // lease or becomes a shadow.
+    LeaseVerification::Lost
+}
+
 #[cfg(test)]
 mod tests {
     use super::db_ownership_key;
