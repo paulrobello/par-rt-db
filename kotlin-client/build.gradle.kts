@@ -1,6 +1,11 @@
 plugins {
     kotlin("jvm") version "2.4.21"
     kotlin("plugin.serialization") version "2.4.21"
+    // ENH-054: JaCoCo (bundled with Gradle, unlike Kover which breaks on
+    // KotlinWithJavaCompilation) produces the XML line-coverage report the
+    // in_memory engine floor check parses. Local coverage leg only —
+    // `gradlew test` alone is untouched, see Makefile coverage-kotlin.
+    id("jacoco")
 }
 
 group = "dev.parrtdb"
@@ -31,4 +36,11 @@ java { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaV
 tasks.test {
     useJUnitPlatform()
     testLogging { events("failed", "skipped"); showStandardStreams = false }
+}
+
+// ENH-054: the local coverage-kotlin Makefile leg runs this target (it depends
+// on test, so plain `gradlew test` stays untouched).
+tasks.jacocoTestReport {
+    dependsOn(tasks.test)
+    reports { xml.required.set(true) }
 }

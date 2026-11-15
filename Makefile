@@ -49,7 +49,7 @@ SWIFT_CLIENT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(
 	swift-client-build swift-client-test swift-client-lint swift-client-fmt \
 	swift-client-fmt-check swift-client-typecheck swift-client-checkall \
 	swift-client-deps audit-deps \
-	coverage coverage-fast coverage-rust coverage-ts coverage-dashboard coverage-python coverage-go \
+	coverage coverage-fast coverage-rust coverage-ts coverage-dashboard coverage-python coverage-go coverage-kotlin coverage-swift \
 	bench-micro bench bench-baseline \
 	grind-start grind-start-anthropic grind-start-zai grind-start-grok grind-start-codex \
 	grind-start-omp grind-stop grind-clean-logs
@@ -202,12 +202,24 @@ endif
 # (dev-db-up prerequisite), and mirrors `test:`'s nextest branch. `cargo
 # llvm-cov report --summary-only` re-prints the summary from the run's
 # profiling data without re-executing anything.
-coverage: coverage-rust coverage-ts coverage-dashboard coverage-python coverage-go
+coverage: coverage-rust coverage-ts coverage-dashboard coverage-python coverage-go coverage-kotlin coverage-swift
 
 # The CI-lean set (coverage-weekly job): no Rust, no dev Postgres — every leg
 # finishes in seconds. The instrumented Rust leg is local-only by policy: CI
 # carries no long-running suites (Paul, 2026-10-12).
 coverage-fast: coverage-ts coverage-dashboard coverage-python coverage-go
+
+# ENH-054: engine coverage floors (docs/coverage-floors.md) — measured line
+# coverage over each client-mirror in-memory engine directory at floor setup
+# (2026-11-14), minus a small ratchet step. Ratchet-only: never lower a floor
+# to get a leg green; raising one after genuine test improvements is the point.
+ENGINE_FLOOR_GO := 78.0
+ENGINE_FLOOR_PYTHON := 89.0
+ENGINE_FLOOR_KOTLIN := 90.0
+ENGINE_FLOOR_SWIFT := 83.0
+# ENGINE_FLOOR_TS has no Makefile variable: ts-client's floor lives as a vitest
+# glob threshold in ts-client/vitest.config.ts (its single source of truth).
+ENGINE_FLOOR_RUST := 0.0
 
 coverage-rust: dev-db-up
 	@mkdir -p target/coverage
@@ -222,6 +234,14 @@ else
 	cargo llvm-cov --workspace --all-features --lcov --output-path target/coverage/rust.lcov -- --skip merge_users_skips_stale_registry_rows_without_paying_a_committer_spawn
 endif
 	cargo llvm-cov report --summary-only
+# ENH-054: rust-client in_memory engine floor. The floor value needs the FIRST
+# local `make coverage-rust` run to set (measured minus a ratchet step) — no
+# measured number existed at floor-setup time (2026-11-14) and cargo runs were
+# off-limits on the shared checkout. To activate, set ENGINE_FLOOR_RUST above
+# to measured − step and append this line to the recipe above:
+#   ./scripts/coverage-floor-check.sh lcov target/coverage/rust.lcov rust-client/src/in_memory $(ENGINE_FLOOR_RUST)
+# The check parses the same rust.lcov llvm-cov already writes; the script's
+# lcov handler is already exercised by the python leg.
 
 coverage-ts:
 	cd ts-client && bun run coverage
@@ -232,12 +252,29 @@ coverage-dashboard:
 coverage-python:
 	@mkdir -p target/coverage
 	cd python-client && uv run pytest --cov=par_rt_db --cov-report=lcov:../target/coverage/python.lcov --cov-report=term
+	./scripts/coverage-floor-check.sh lcov target/coverage/python.lcov par_rt_db/in_memory $(ENGINE_FLOOR_PYTHON)
 
 coverage-go:
 	@mkdir -p target/coverage
 	cd go-client && go test -coverprofile=../target/coverage/go.out ./...
 	cd go-client && go tool cover -func=../target/coverage/go.out > ../target/coverage/go-func.txt
 	@tail -1 target/coverage/go-func.txt
+	./scripts/coverage-floor-check.sh go target/coverage/go.out inmemory/ $(ENGINE_FLOOR_GO)
+
+# ENH-054: local-only legs (gradle + a full instrumented swift test run don't
+# fit CI's lean-coverage budget; the fast legs above ride CI's coverage-weekly
+# job as before). coverage-kotlin runs `jacocoTestReport`, which depends on
+# test, so the report leg never skips the tests that feed it.
+coverage-kotlin:
+	@mkdir -p target/coverage
+	cd kotlin-client && ./gradlew --console=plain jacocoTestReport
+	./scripts/coverage-floor-check.sh kover kotlin-client/build/reports/jacoco/test/jacocoTestReport.xml dev.parrtdb.inmemory $(ENGINE_FLOOR_KOTLIN)
+
+coverage-swift:
+	@mkdir -p target/coverage
+	$(call SWIFT_IF_DARWIN,cd swift-client && swift test --enable-code-coverage)
+	$(call SWIFT_IF_DARWIN,xcrun llvm-cov export -summary-only -instr-profile .build/debug/codecov/default.profdata .build/debug/ParRtDbClientTests.xctest/Contents/MacOS/ParRtDbClientTests > target/coverage/swift-llvm-cov.json)
+	$(call SWIFT_IF_DARWIN,./scripts/coverage-floor-check.sh llvmcov target/coverage/swift-llvm-cov.json Sources/ParRtDbClient/InMemory $(ENGINE_FLOOR_SWIFT))
 
 go-client-install:
 	cd go-client && go mod download
@@ -619,9 +656,9 @@ checkall-cached:
 # ENH-031: validate every registry artifact before a release tag — lockstep
 # manifests, crates dry-runs, npm pack contents, uv build + twine check
 # (scripts/publish-check.sh). PUBLISH_CHECK_ARGS passes flags through to the
-# script; the release workflow's verify job runs
-# `make publish-check PUBLISH_CHECK_ARGS=--require-tag` on a tag checkout,
-# where a tag/manifest version mismatch must hard-fail instead of NOTICE.
+# script; the release workflow's verify job runs plain `make publish-check`
+# on a push-to-main (release.yml gated by vars.ENABLE_AUTO_PUBLISH), where
+# publish-check has no tag checkout to pin against — NOTICEs stay notices.
 publish-check:
 	./scripts/publish-check.sh $(PUBLISH_CHECK_ARGS)
 
