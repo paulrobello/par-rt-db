@@ -10,7 +10,9 @@
 //! - `rtdb_write_sets` — subscription invalidation
 //!   ([`publish_write_set`] / [`run_write_set_listener`]). This is the one that
 //!   keeps a client's live query correct when the write landed on a different
-//!   replica; the op-feed channel below only feeds the dashboard.
+//!   replica; the op-feed channel below only feeds the dashboard. LISTEN/NOTIFY
+//!   has no replay, so on reconnect the write-set listener sweeps every live
+//!   subscription (ARC-205 — see the listener's doc comment for the contract).
 //!
 //! The op-feed ring (`op_feed::OpFeed`) is in-process and instance-local: a
 //! write committed on replica A publishes into A's ring only, so a dashboard
@@ -458,13 +460,31 @@ pub async fn run_schema_listener(
 /// queries only, and reads are safe outside the serialized turn under READ
 /// COMMITTED. The single-writer invariant is intact — this is a second
 /// *reader*, not a second writer.
+///
+/// ## Reconnect gap (ARC-205)
+///
+/// LISTEN/NOTIFY has no replay: every `rtdb_write_sets` notification
+/// published while this listener is disconnected is lost, and a lost
+/// notification means a shadow replica's subscriptions stay stale until the
+/// next write touches their tables. The reconnect path therefore converges
+/// instead of replaying: on the first successful re-LISTEN after a connection
+/// loss it re-runs EVERY subscription on every database that has one
+/// (`refan_all_dbs`, which drives `SubscriptionManager::refan`) — bounded by the
+/// live subscription set, read-only, and idempotent (each re-run pushes only
+/// when the canonical result actually changed). Each reconnect is counted on
+/// the Prometheus scrape (`rtdb_notify_write_set_reconnects_total`).
 pub async fn run_write_set_listener(
     pool: PgPool,
     subs: Arc<crate::subs::SubscriptionManager>,
     schemas: crate::db::SchemaCache,
     own_instance_id: String,
+    metrics: Arc<crate::metrics::Metrics>,
 ) {
     let backoff = std::time::Duration::from_secs(2);
+    // False until the first successful LISTEN; flipped after each successful
+    // connect+listen, so the very next success after a connection loss runs
+    // the ARC-205 convergence sweep exactly once per gap.
+    let mut ever_connected = false;
     loop {
         let mut listener = match PgListener::connect_with(&pool).await {
             Ok(l) => l,
@@ -487,6 +507,18 @@ pub async fn run_write_set_listener(
             tokio::time::sleep(backoff).await;
             continue;
         }
+        if ever_connected {
+            // ARC-205: the previous LISTEN connection died and everything
+            // published on `rtdb_write_sets` while it was down is gone.
+            // Re-fan-out every live subscription instead of replaying, count
+            // the reconnect, then resume the recv loop — new notifications
+            // already published between listen_all and here are also covered,
+            // because the sweep re-runs unconditionally rather than
+            // diffing against notification timestamps.
+            metrics.record_notify_write_set_reconnect();
+            refan_all_dbs(&pool, &subs, &schemas).await;
+        }
+        ever_connected = true;
         tracing::info!(
             "write-set listener: LISTENing on '{}' for cross-replica subscription invalidation (instance_id={})",
             WRITE_SET_CHANNEL,
@@ -557,6 +589,33 @@ pub async fn run_write_set_listener(
             backoff
         );
         tokio::time::sleep(backoff).await;
+    }
+}
+
+/// Re-run every subscription on every database that has one (ARC-205) — the
+/// write-set listener's reconnect convergence sweep. Bounded by the set of
+/// dbs with live subscriptions; a db whose schema can no longer be resolved
+/// (e.g. it was deleted during the gap) is skipped with a warn, matching the
+/// per-notification schema-fetch failure posture above. Read-only: no write,
+/// no committer interaction.
+async fn refan_all_dbs(
+    pool: &PgPool,
+    subs: &crate::subs::SubscriptionManager,
+    schemas: &crate::db::SchemaCache,
+) {
+    for db in subs.dbs_with_subs().await {
+        let schema = match schemas.get(pool, &db).await {
+            Ok(schema) => schema,
+            Err(e) => {
+                tracing::warn!(
+                    db = %db,
+                    error = %e,
+                    "write-set listener: reconnect re-fan-out schema fetch failed; skipping db"
+                );
+                continue;
+            }
+        };
+        subs.refan(pool, &db, &schema).await;
     }
 }
 

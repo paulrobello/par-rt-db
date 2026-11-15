@@ -502,6 +502,7 @@ impl AppState {
                 subs.clone(),
                 schemas.clone(),
                 instance_id.clone(),
+                metrics.clone(),
             ));
             // ARC-004: cross-replica schema-cache invalidation. A push/migrate/
             // restore on one replica drops the cached schema entry on every

@@ -696,6 +696,75 @@ fn stage_latency_series_record_and_render() {
 }
 
 #[test]
+fn notify_reconnect_counter_record_and_render() {
+    // ARC-205: the write-set LISTEN reconnect counter records from the notify
+    // listener path and renders as a Prometheus-only counter. Like the ENH-049
+    // lease test, the compile-time proof that it is absent from the admin JSON
+    // wire is that the snapshot literal below carries no reconnect field.
+    let m = Metrics::default();
+    m.record_notify_write_set_reconnect();
+    m.record_notify_write_set_reconnect();
+
+    let snap = MetricsSnapshot {
+        queries_total: 0,
+        mutations_total: 0,
+        uploads_total: 0,
+        ws_connections: 0,
+        active_subscriptions: 0,
+        pool_size: 0,
+        pool_idle: 0,
+        uptime_seconds: 0,
+        query_latency: LatencyStats::default(),
+        mutate_latency: LatencyStats::default(),
+        subscribe_latency: LatencyStats::default(),
+        subs_reruns_total: 0,
+        subs_skips_point_total: 0,
+        subs_skips_indexed_total: 0,
+        subs_skips_ordered_total: 0,
+        subs_skip_verifications_total: 0,
+        subs_missed_pushes_total: 0,
+        ttl_expired_total: 0,
+        scheduled_missed_total: 0,
+        merge_docs_total: 0,
+        image_transforms_hit_total: 0,
+        image_transforms_miss_total: 0,
+        image_transforms_error_total: 0,
+        image_transform_bytes_total: 0,
+        presence_updates_total: 0,
+        presence_broadcasts_total: 0,
+        presence_ttl_expiries_total: 0,
+        presence_rooms: 0,
+        presence_sessions: 0,
+        per_db_subs: Vec::new(),
+        quota_rejections_tables_total: 0,
+        quota_rejections_storage_total: 0,
+        quota_rejections_subs_total: 0,
+        admin_auth_failures_total: 0,
+        per_db_quota: Vec::new(),
+        workflow_steps_success_total: 0,
+        workflow_steps_retry_total: 0,
+        workflow_steps_fail_total: 0,
+        per_db_workflows: Vec::new(),
+        presence_detail: Vec::new(),
+    };
+    let body = render_prometheus(&snap, &m, None, "inst-1");
+    assert!(
+        body.contains("rtdb_notify_write_set_reconnects_total 2"),
+        "{body}"
+    );
+    assert!(
+        body.contains("# TYPE rtdb_notify_write_set_reconnects_total counter"),
+        "{body}"
+    );
+    // A fresh Metrics renders the series at zero rather than omitting it.
+    let body = render_prometheus(&snap, &Metrics::default(), None, "inst-1");
+    assert!(
+        body.contains("rtdb_notify_write_set_reconnects_total 0"),
+        "{body}"
+    );
+}
+
+#[test]
 fn slow_query_record_stage_fields_serialize_additively() {
     // The stage split (P1 stall investigation) is additive on the
     // /admin/slow-queries wire: present when measured, entirely absent (not

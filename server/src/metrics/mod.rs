@@ -3,7 +3,7 @@
 //! on demand by `GET /admin/metrics`. Rates are derived client-side from successive
 //! snapshots; the realtime push stream + op feed live in Phase 3b.
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -166,6 +166,33 @@ pub struct Metrics {
     /// Forwards to an owner that hit the timeout with no reply (the takeover
     /// trigger). Notify-send failures are not timeouts and are not counted.
     forward_timeouts_total: AtomicU64,
+    // ---- Write-set LISTEN reconnects (ARC-205) ----
+    // Prometheus-only like the lease series above: rendered by
+    // `render_prometheus` from the live `Metrics`, deliberately absent from
+    // `MetricsSnapshot` so the admin JSON wire (mirrored in four clients,
+    // Python's extra="forbid") stays byte-identical.
+    /// Times the write-set listener re-established its LISTEN after a
+    /// connection loss. Every reconnect loses the `rtdb_write_sets`
+    /// notifications published during the gap (LISTEN/NOTIFY has no replay),
+    /// so the reconnect path re-fans out this replica's subscriptions to
+    /// converge them; a sustained climb alongside lagging realtime clients
+    /// means Postgres connection churn is starving cross-replica
+    /// invalidation.
+    notify_write_set_reconnects_total: AtomicU64,
+    // ---- Committer watchdog degradation (prod degradation hardening) ----
+    // Set by `watchdog::run` when queue-wait p99 stays wedge-scale for 60s
+    // (see `watchdog.rs` for the thresholds). Surfaced on `/healthz` as an
+    // additive field only — the admin JSON wire stays byte-identical (same
+    // reasoning as the stage series above).
+    committer_degraded: AtomicBool,
+    committer_degraded_transitions_total: AtomicU64,
+}
+
+/// One watchdog sample of the committer write path: queue-wait p99 in
+/// microseconds plus the last-sampled per-db queue depth (see `watchdog.rs`).
+pub struct CommitterWatchSample {
+    pub queue_wait_p99_us: u64,
+    pub queue_depth: u64,
 }
 
 impl Metrics {
@@ -421,6 +448,47 @@ impl Metrics {
     /// A lease-holding channel entry was removed, by any removal path.
     pub fn lease_owned_dec(&self) {
         self.leases_owned.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// The write-set listener re-established its LISTEN after a connection
+    /// loss (ARC-205). Each reconnect also triggers the bounded re-fan-out
+    /// over this replica's subscribed databases, so the counter doubles as
+    /// the "convergence sweep happened" signal on the scrape.
+    pub fn record_notify_write_set_reconnect(&self) {
+        self.notify_write_set_reconnects_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One watchdog sample of the committer write path (see `watchdog.rs`):
+    /// queue-wait p99 in microseconds plus the last-sampled per-db queue
+    /// depth.
+    pub fn committer_watch_sample(&self) -> CommitterWatchSample {
+        let wait = self
+            .committer_queue_wait_latency
+            .lock()
+            .map(|s| s.percentiles())
+            .unwrap_or_default();
+        CommitterWatchSample {
+            queue_wait_p99_us: wait.p99,
+            queue_depth: self.committer_queue_depth.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Watchdog degradation flag (see `watchdog.rs`). Surfaced on `/healthz`
+    /// only; never enters the admin JSON wire.
+    pub fn set_committer_degraded(&self, degraded: bool) {
+        self.committer_degraded.store(degraded, Ordering::Relaxed);
+    }
+
+    pub fn committer_degraded(&self) -> bool {
+        self.committer_degraded.load(Ordering::Relaxed)
+    }
+
+    /// Flag transitions (set or clear) — the fleet-visible flappiness signal
+    /// for the watchdog itself.
+    pub fn record_committer_degraded_transition(&self) {
+        self.committer_degraded_transitions_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Snapshot of the per-db subscription-invalidation counters, sorted by db

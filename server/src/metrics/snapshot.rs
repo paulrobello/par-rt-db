@@ -443,6 +443,24 @@ pub fn render_prometheus(
         "rtdb_committer_queue_depth {}\n",
         m.committer_queue_depth.load(Ordering::Relaxed)
     ));
+    // Committer-watchdog degradation (prod degradation hardening): the
+    // current flag plus how many times it has flipped. The flag alone is
+    // point-in-time; the transitions counter is the flappiness signal.
+    s.push_str("# HELP rtdb_committer_degraded Watchdog flag: committer queue-wait p99 has been wedge-scale for 60s continuously (see /healthz degraded_reason).\n");
+    s.push_str("# TYPE rtdb_committer_degraded gauge\n");
+    s.push_str(&format!(
+        "rtdb_committer_degraded {}\n",
+        m.committer_degraded.load(Ordering::Relaxed) as i32
+    ));
+    s.push_str(
+        "# HELP rtdb_committer_degraded_transitions_total Watchdog degradation flag transitions (set or clear).\n",
+    );
+    s.push_str("# TYPE rtdb_committer_degraded_transitions_total counter\n");
+    s.push_str(&format!(
+        "rtdb_committer_degraded_transitions_total {}\n",
+        m.committer_degraded_transitions_total
+            .load(Ordering::Relaxed)
+    ));
 
     // Ownership-lease observability (ENH-049). Aggregate gauges + counters —
     // per-db detail belongs in the tracing logs (each lease event carries the
@@ -499,6 +517,20 @@ pub fn render_prometheus(
     s.push_str(&format!(
         "rtdb_forward_timeouts_total {}\n",
         m.forward_timeouts_total.load(Ordering::Relaxed)
+    ));
+
+    // Write-set LISTEN reconnects (ARC-205). Prometheus-only like the lease
+    // series above — MetricsSnapshot (the admin JSON wire, mirrored in four
+    // clients) stays untouched. Each reconnect loses the rtdb_write_sets
+    // notifications published during the gap and triggers the bounded
+    // re-fan-out, so a spike is the first signal of cross-replica staleness.
+    s.push_str(
+        "# HELP rtdb_notify_write_set_reconnects_total Write-set LISTEN reconnects after a connection loss; each triggers a subscription re-fan-out to converge notifications missed during the gap.\n",
+    );
+    s.push_str("# TYPE rtdb_notify_write_set_reconnects_total counter\n");
+    s.push_str(&format!(
+        "rtdb_notify_write_set_reconnects_total {}\n",
+        m.notify_write_set_reconnects_total.load(Ordering::Relaxed)
     ));
     s
 }

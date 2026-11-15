@@ -215,6 +215,30 @@ impl SubscriptionManager {
         self.shard_get(db).await.is_some()
     }
 
+    /// Names of databases holding at least one live subscription, sorted for
+    /// stable iteration. Used by the write-set listener's reconnect path
+    /// (ARC-205) to bound its re-fan-out to dbs that actually have subscribers.
+    /// Lock discipline matches `shard_get`/`register`: shard Arcs clone out
+    /// under the outer lock, which is dropped before any inner shard lock is
+    /// taken (a `fan_out` can hold a shard lock across re-run round-trips).
+    pub(crate) async fn dbs_with_subs(&self) -> Vec<String> {
+        let shards: Vec<(String, Arc<Mutex<DbSubs>>)> = {
+            let guard = self.subs.lock().await;
+            guard
+                .iter()
+                .map(|(db, shard)| (db.clone(), shard.clone()))
+                .collect()
+        };
+        let mut out = Vec::new();
+        for (db, shard) in shards {
+            if !shard.lock().await.is_empty() {
+                out.push(db);
+            }
+        }
+        out.sort();
+        out
+    }
+
     pub async fn remove(&self, db: &str, conn: ConnId, query_id: &str) {
         let Some(shard) = self.shard_get(db).await else {
             return;
@@ -445,7 +469,22 @@ impl SubscriptionManager {
         // block because a sync `Span::enter` guard is `!Send` and would poison
         // this `Send` future across the `.await`s in `fan_out_inner`.
         let span = tracing::info_span!("subs.fan_out", db, tables = ?write_set.tables);
-        self.fan_out_inner(pool, db, schema, write_set)
+        self.fan_out_inner(pool, db, schema, Some(write_set))
+            .instrument(span)
+            .await;
+    }
+
+    /// ARC-205: re-run EVERY subscription on `db`, ignoring read-set skip
+    /// logic entirely. The write-set listener's reconnect path calls this so
+    /// subscriptions converge after a LISTEN gap (Postgres NOTIFY has no
+    /// replay — whatever was published while the connection was down is
+    /// unrecoverable). Read-only, same posture as `fan_out`: no write, no
+    /// committer interaction. Bounded by this db's live subscription count;
+    /// each re-run goes through the same `FAN_OUT_CONCURRENCY` gate as a
+    /// write-driven fan-out.
+    pub(crate) async fn refan(&self, pool: &PgPool, db: &str, schema: &SchemaDef) {
+        let span = tracing::info_span!("subs.refan", db);
+        self.fan_out_inner(pool, db, schema, None)
             .instrument(span)
             .await;
     }
@@ -455,7 +494,7 @@ impl SubscriptionManager {
         pool: &PgPool,
         db: &str,
         schema: &SchemaDef,
-        write_set: &WriteSet,
+        write_set: Option<&WriteSet>,
     ) {
         // Clone the shard Arc out under the outer lock, then drop the outer
         // guard before the per-subscription re-runs. This is the heart of
@@ -473,6 +512,20 @@ impl SubscriptionManager {
         // `.await`s below, so it doesn't have to.
         let mut pending = Vec::new();
         for (key, entry) in db_subs.iter() {
+            // ARC-205 reconnect re-fan-out: no write set to reason against, so
+            // every subscription re-runs — no skip, no shadow verification.
+            let Some(write_set) = write_set else {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_subs_rerun(db);
+                }
+                pending.push((
+                    key.clone(),
+                    entry.query.clone(),
+                    entry.principal_ctx.clone(),
+                    None,
+                ));
+                continue;
+            };
             // A query with lookups reads its parent table plus every lookup
             // table, so the dispatch gate consults the union: a write naming a
             // lookup table must reach the re-run pass even though the
