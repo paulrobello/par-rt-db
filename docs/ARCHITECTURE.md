@@ -1358,7 +1358,15 @@ persisted in a single-row
 warns and falls back to env rather than blocking startup). Every consumer
 reads `state.runtime.hot.load()` (the committer reads `idempotency_ttl_ms` live at
 mutate-dedup time via the same shared `Arc`); `PATCH /admin/config` validates
-+ persists + swaps live (no restart). The `CorsLayer` is built once but its
++ persists + swaps live (no restart). Under `RTDB_MULTI_INSTANCE` the patch
+path additionally single-flights on `runtime.config_lock`, re-reads the
+authoritative persisted row while holding it, and publishes the `rtdb_config`
+NOTIFY channel; a sibling listener reloads the row into the local `ArcSwap`
+on every notification and every listener (re)connect (ARC-201) — so a patch
+on one replica converges the others without restart, and a sequenced patch
+chain never reverts an earlier patch (two replicas patching in the same
+instant remains a documented residual: the reload happens at lock-acquire,
+not under a cross-replica CAS). The `CorsLayer` is built once but its
 origin check is an `AllowOrigin::predicate` that re-reads live
 `allowed_origins` per request. `GET /admin/config` is structurally redacted —
 `admin_key`, OAuth secrets, and `database_url` are configured-bools, never

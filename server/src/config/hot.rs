@@ -314,6 +314,25 @@ pub async fn save_hot(pool: &sqlx::PgPool, hot: &HotConfig) -> Result<(), RtDbEr
     Ok(())
 }
 
+/// ARC-201: reloads the authoritative persisted row into `hot`'s `ArcSwap`,
+/// overlaying it onto the CURRENT in-memory view as the defaults seed. Since
+/// `save_hot` persists the full merged config, the row always carries every
+/// field's authoritative value, so the current view and the boot-time env
+/// seed are equivalent reload seeds; overlaying the fresh row is exact. A
+/// missing row (first boot) leaves the current view untouched. Used by both
+/// the config listener (on every notification and every (re)connect) and the
+/// PATCH path (under the single-flight lock).
+pub async fn reload_hot_into(
+    pool: &sqlx::PgPool,
+    hot: &std::sync::Arc<arc_swap::ArcSwap<HotConfig>>,
+) -> Result<(), RtDbError> {
+    let defaults = (**hot.load()).clone();
+    if let Some(merged) = load_hot(pool, &defaults).await? {
+        hot.store(std::sync::Arc::new(merged));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

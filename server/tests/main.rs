@@ -26,6 +26,7 @@ mod cascade_test;
 mod change_feed_test;
 mod compression_test;
 mod computed_test;
+mod config_convergence_test;
 mod dashboard_test;
 mod db_cleanup_test;
 mod deadline_test;

@@ -133,6 +133,14 @@ pub const WRITE_SET_CHANNEL: &str = "rtdb_write_sets";
 /// Postgres. Server-internal payload — not part of the wire protocol.
 pub const SCHEMA_CHANNEL: &str = "rtdb_schema";
 
+/// Postgres NOTIFY channel for cross-replica hot-config coherence (ARC-201).
+/// After a replica persists a `PATCH /admin/config` result it publishes its
+/// instance id here (the listener's self-dedupe key — the patcher already
+/// swapped its own `ArcSwap`), and every OTHER replica reloads the
+/// authoritative `rtdb_config` row without a restart. Server-internal — not
+/// part of the wire protocol. See [`run_config_listener`].
+pub const CONFIG_CHANNEL: &str = "rtdb_config";
+
 /// Serialized-size threshold above which a write set travels through the
 /// forward spool instead of inline in the NOTIFY. Postgres caps a `pg_notify`
 /// payload at 8000 bytes; 7500 leaves headroom for multi-byte escaping in the
@@ -446,6 +454,88 @@ pub async fn run_schema_listener(
                 continue;
             }
             schemas.invalidate(&db).await;
+        }
+    }
+}
+
+/// Long-lived LISTEN loop for the `rtdb_config` channel (ARC-201): converges
+/// THIS replica's hot-config `ArcSwap` with patches persisted by OTHER
+/// replicas, no restart. Spawned by `AppState::new` only when
+/// `RTDB_MULTI_INSTANCE` is true — a single-instance deploy never pays the
+/// `PgListener` connection. The payload is the publisher's instance id (the
+/// self-dedupe key: the patcher already swapped its own `ArcSwap`).
+///
+/// Unlike the subscription path (ARC-205), convergence here needs no replay
+/// sweep: a reload is idempotent and unconditional, so the listener reloads
+/// after EVERY successful (re)connect — that single step both catches the
+/// boot race (a patch persisted between this replica's boot-time `load_hot`
+/// and its first LISTEN) and replays any notifications lost to a disconnect
+/// gap. Each notification then triggers one reload. Reads only: no write and
+/// no committer interaction.
+pub async fn run_config_listener(
+    pool: PgPool,
+    hot: Arc<arc_swap::ArcSwap<crate::config::HotConfig>>,
+    own_instance_id: String,
+) {
+    let backoff = std::time::Duration::from_secs(2);
+    loop {
+        let mut listener = match PgListener::connect_with(&pool).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "config listener: connect_with failed; retrying in {:?}",
+                    backoff
+                );
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+        };
+        if let Err(e) = listener.listen_all([CONFIG_CHANNEL]).await {
+            tracing::error!(
+                error = %e,
+                "config listener: listen_all failed; retrying in {:?}",
+                backoff
+            );
+            tokio::time::sleep(backoff).await;
+            continue;
+        }
+        // Reload-on-(re)connect: boot catch-up and disconnect-gap replay in
+        // one idempotent step (see the doc above).
+        if let Err(e) = crate::config::reload_hot_into(&pool, &hot).await {
+            tracing::error!(
+                error = %e,
+                "config listener: post-connect reload failed; continuing (the next notification or reconnect retries)"
+            );
+        }
+        tracing::info!(
+            "config listener: LISTENing on '{}' for cross-replica hot-config coherence (instance_id={})",
+            CONFIG_CHANNEL,
+            own_instance_id
+        );
+        loop {
+            let notif = match listener.recv().await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "config listener: recv failed; reconnecting in {:?}",
+                        backoff
+                    );
+                    break;
+                }
+            };
+            // Self-dedupe: this replica already swapped its own ArcSwap in
+            // patch_config before publishing.
+            if notif.payload() == own_instance_id {
+                continue;
+            }
+            if let Err(e) = crate::config::reload_hot_into(&pool, &hot).await {
+                tracing::error!(
+                    error = %e,
+                    "config listener: reload failed; continuing"
+                );
+            }
         }
     }
 }

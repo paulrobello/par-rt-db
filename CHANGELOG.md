@@ -127,6 +127,19 @@ alter observable behavior on upgrade.
 
 ### Added
 
+- **Cross-replica hot-config coherence (`rtdb_config` NOTIFY + config
+  listener, ARC-201).** Under `RTDB_MULTI_INSTANCE` a `PATCH /admin/config`
+  on one replica now converges every other replica without a restart: the
+  patch persists, publishes its instance id on the `rtdb_config` NOTIFY
+  channel, and each peer's config listener reloads the authoritative row
+  into its local `ArcSwap` — on every notification and on every listener
+  (re)connect (which also replays notifications lost to a disconnect gap).
+  The patch path itself single-flights in-process and re-reads the
+  authoritative row under the lock, so concurrent PATCHes can no longer
+  last-store-win (ARC-203) and a sequenced patch chain can never revert an
+  earlier patch from a stale replica. Two replicas patching in the same
+  instant is a documented residual. Two-replica convergence and
+  same-replica concurrency pinned by `config_convergence_test`.
 - **Background bulk delete (`POST /api/bulk/delete` + `GET /api/bulk/{id}`,
   ARC-005, `489955f` + mirrors `0e96f3e`..`bcb22ed`).** Deletes a filter's
   whole matching set without monopolizing the single serialized writer: the

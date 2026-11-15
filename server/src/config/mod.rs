@@ -16,7 +16,7 @@ mod oauth;
 mod storage;
 pub use backup::BackupConfig;
 pub(crate) use hot::HARD_MAX_FILE_SIZE;
-pub use hot::{HotConfig, load_hot, save_hot};
+pub use hot::{HotConfig, load_hot, reload_hot_into, save_hot};
 pub use limits::LimitsConfig;
 pub use multi_instance::MultiInstanceConfig;
 pub use oauth::{

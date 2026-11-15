@@ -109,12 +109,30 @@ pub(super) struct HotConfigPatch {
 /// persist the merged row to `rtdb_config`, swap the `ArcSwap`, and return the
 /// new redacted config. Unknown fields (`deny_unknown_fields`) and invalid
 /// values are `BadRequest`; each provided field fully replaces the prior value.
+///
+/// ARC-201/ARC-203: the whole load-apply-save turn runs under
+/// `runtime.config_lock` and re-reads the authoritative persisted row while
+/// holding it, so concurrent PATCHes serialize and a replica with a stale
+/// in-memory view applies its patch onto the latest committed state instead
+/// of durably reverting it. After the save it publishes `rtdb_config` with
+/// its instance id so every OTHER replica reloads without a restart (see
+/// `notify::run_config_listener`). Two replicas patching in the same instant
+/// remains a documented residual — the reload happens at lock-acquire, not
+/// under a cross-replica CAS — but a sequenced patch chain never reverts an
+/// earlier patch, which is the failure mode the audit flagged.
 pub(super) async fn patch_config(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
     ApiJson(patch): ApiJson<HotConfigPatch>,
 ) -> Result<Json<ConfigResponse>, RtDbError> {
-    let mut next: crate::config::HotConfig = (**state.runtime.hot.load()).clone();
+    let _guard = state.runtime.config_lock.lock().await;
+    // Reload the authoritative row (defaults seed = the current in-memory
+    // view; see config::reload_hot_into for why that is exact).
+    let mut next: crate::config::HotConfig =
+        match crate::config::load_hot(&state.pool, &(**state.runtime.hot.load()).clone()).await? {
+            Some(merged) => merged,
+            None => (**state.runtime.hot.load()).clone(),
+        };
     if let Some(origins) = &patch.allowed_origins {
         next.allowed_origins = origins
             .iter()
@@ -186,5 +204,21 @@ pub(super) async fn patch_config(
     }
     crate::config::save_hot(&state.pool, &next).await?;
     state.runtime.hot.store(Arc::new(next));
+    // ARC-201: converge the other replicas (payload = instance id, the
+    // config listener's self-dedupe key). A failed NOTIFY never fails the
+    // PATCH — the change is already persisted, and the peers' reload on
+    // their next (re)connect or the next patch's authoritative reload still
+    // converges them.
+    if let Err(e) = sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(crate::notify::CONFIG_CHANNEL)
+        .bind(&state.runtime.instance_id)
+        .execute(&state.pool)
+        .await
+    {
+        tracing::error!(
+            error = %e,
+            "config patch: pg_notify failed; peers converge on their next reconnect"
+        );
+    }
     Ok(Json(build_config_response(&state).await?))
 }

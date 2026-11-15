@@ -249,6 +249,14 @@ pub struct Runtime {
     /// with the per-db committers (via `CommitterConfig`), the managed backup
     /// task, and the manual `/admin/backup` trigger. See `schema_gate`.
     pub schema_gate: Arc<schema_gate::SchemaGate>,
+    /// ARC-201: serializes `PATCH /admin/config` load-apply-save turns so
+    /// concurrent patches cannot last-store-win within this process (ARC-203).
+    /// The patch path re-reads the authoritative `rtdb_config` row while
+    /// holding it; cross-replica convergence rides the `rtdb_config` NOTIFY
+    /// plus `notify::run_config_listener`. Two replicas patching in the same
+    /// instant is a documented residual — each patch reloads first, so a
+    /// sequenced patch chain never reverts an earlier one.
+    pub config_lock: tokio::sync::Mutex<()>,
 }
 
 /// Per-instance auth bookkeeping that is neither a config value nor a realtime
@@ -513,6 +521,14 @@ impl AppState {
                 schemas.clone(),
                 instance_id.clone(),
             ));
+            // ARC-201: cross-replica hot-config coherence. Same shape as the
+            // schema listener — reads the rtdb_config row and swaps the local
+            // ArcSwap only; performs NO write and NO committer interaction.
+            background.spawn(notify::run_config_listener(
+                pool.clone(),
+                hot.clone(),
+                instance_id.clone(),
+            ));
         }
         // ENH-022 Stage 3: cross-instance presence LISTEN task. Only spawned
         // when BOTH `RTDB_MULTI_INSTANCE=true` AND `RTDB_PRESENCE_ENABLED=true`
@@ -614,6 +630,7 @@ impl AppState {
                 backup_running: Arc::new(AtomicBool::new(false)),
                 instance_id,
                 schema_gate,
+                config_lock: tokio::sync::Mutex::new(()),
             },
             auth: Auth { http },
             limits: Limits {
