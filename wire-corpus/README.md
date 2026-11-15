@@ -128,6 +128,18 @@ existing wire vocabulary — there is no corpus fixture to flip. Should a future
 capability version add public wire vocabulary, this decision is revisited per
 the authoring rule above.
 
+**Documented decision — storage and admin surfaces (2026-11-15, QA-008 sweep
+follow-up).** File storage (`/storage/*`) and the admin/auth control plane
+(`/admin/*`, `/auth/*`) are intentionally OUTSIDE the WS wire corpus: they are
+HTTP-only vocabulary with no WS wire-frame change, consumed not by the
+client-facing corpus but by their dedicated surfaces — the server transport
+tests, the per-client admin-surface tests, and (for HTTP-shape drift) the
+`http-shapes.json` fixture. That fixture additionally pins the two
+batch-transport bodies (`/api/query-batch`, `/api/mutate-batch` request and
+slot-response shapes) under `queryBatch*`/`mutateBatch*` keys, verified
+server-side by `protocol::tests::http_shapes_fixture_parity` and mirrored by
+per-client tests wherever the client models the batch slots.
+
 ## Every wire section must be consumed
 
 Every top-level section in `wire-corpus.json` must be consumed by all seven

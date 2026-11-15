@@ -1,5 +1,5 @@
 {
-  "$comment": "Canonical cross-client wire-parity corpus (ARC-008). Every entry is the raw JSON object as it appears on the wire. Each client's parity test parses -> serializes -> deep-compares to the input. Bytes are authoritative; tag/field names are load-bearing (see server/src/protocol.rs header). Sections: 'client_messages' (incl. ENH-015 presence join/state/leave frames, FM-29 startWorkflow/cancelWorkflow txn steps, FM-33 undelete txn step, awaitSignal spec steps + signalWorkflow frames \u2014 payload/timeoutMs present and omitted), 'server_messages' (incl. ENH-015 presenceSnapshot/presenceErr, FM-29 startWorkflowOk/startWorkflowErr/workflowAck/listWorkflowsOk \u2014 incl. a waiting-status WorkflowInfo with waitingFor/waitedSince and a CONFLICT workflowAck), 'authed_users', 'schedule_whens', 'schedule_infos', 'query_results', 'error_envelopes', 'queries' (embedded query shapes covering filter/search/vectorSearch/paginate), 'migrate_requests' / 'migrate_results' (admin migrate Directive list + response \u2014 op tag, camelCase, `where`/`from` aliases, cast literals), 'db_stats' (admin GET /admin/dbs/{db}/stats response, ENH-011 quota/usage fields \u2014 ARC-112), 'rejects_client_message_unknown_field' and 'rejects_workflow_spec_unknown_field' (must fail to parse where deny_unknown_fields / extra='forbid' applies \u2014 the workflow-spec section is a bare WorkflowSpec, the nested-shape pattern of 'rejects_schedule_when_unknown_field', because python's ClientMessage types txn as dict).",
+  "$comment": "Canonical cross-client wire-parity corpus (ARC-008). Every entry is the raw JSON object as it appears on the wire. Each client's parity test parses -> serializes -> deep-compares to the input. Bytes are authoritative; tag/field names are load-bearing (see server/src/protocol.rs header). Sections: 'client_messages' (incl. ENH-015 presence join/state/leave frames, FM-29 startWorkflow/cancelWorkflow txn steps, FM-33 undelete txn step, awaitSignal spec steps + signalWorkflow frames — payload/timeoutMs present and omitted), 'server_messages' (incl. ENH-015 presenceSnapshot/presenceErr, FM-29 startWorkflowOk/startWorkflowErr/workflowAck/listWorkflowsOk — incl. a waiting-status WorkflowInfo with waitingFor/waitedSince and a CONFLICT workflowAck), 'authed_users', 'schedule_whens', 'schedule_infos', 'query_results', 'error_envelopes', 'queries' (embedded query shapes covering filter/search/vectorSearch/paginate), 'migrate_requests' / 'migrate_results' (admin migrate Directive list + response — op tag, camelCase, `where`/`from` aliases, cast literals), 'db_stats' (admin GET /admin/dbs/{db}/stats response, ENH-011 quota/usage fields — ARC-112), 'rejects_client_message_unknown_field' and 'rejects_workflow_spec_unknown_field' (must fail to parse where deny_unknown_fields / extra='forbid' applies — the workflow-spec section is a bare WorkflowSpec, the nested-shape pattern of 'rejects_schedule_when_unknown_field', because python's ClientMessage types txn as dict).",
   "client_messages": [
     {
       "type": "auth",
@@ -666,6 +666,39 @@
           }
         ]
       }
+    },
+    {
+      "type": "startWorkflow",
+      "workflowId": "w5",
+      "spec": {
+        "name": "gated",
+        "steps": [
+          {
+            "awaitSignal": {
+              "name": "approve"
+            }
+          },
+          {
+            "txn": {
+              "steps": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "cancelWorkflow",
+      "workflowId": "w5",
+      "id": "wf-9"
+    },
+    {
+      "type": "listWorkflows",
+      "workflowId": "w5",
+      "status": "running"
+    },
+    {
+      "type": "listWorkflows",
+      "workflowId": "w6"
     }
   ],
   "server_messages": [
@@ -1370,7 +1403,7 @@
     },
     {
       "code": "CURSOR_EXPIRED",
-      "message": "cursor 41 predates the retention window (oldest retained seq 900) \u2014 resync from 0"
+      "message": "cursor 41 predates the retention window (oldest retained seq 900) — resync from 0"
     }
   ],
   "queries": [

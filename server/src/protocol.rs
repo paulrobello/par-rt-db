@@ -273,6 +273,79 @@ mod tests {
             fx["scheduleInfoMinimal"],
             "ScheduleInfo (minimal row) wire shape drifted — external/missed fields must stay omitted at their defaults"
         );
+
+        // Wave 3 (QA-008 sweep follow-up): the batch-transport shapes. Request
+        // bodies are Deserialize-only (the server decodes them; clients
+        // encode), so they are pinned by decode + typed field assertions plus
+        // re-serializing their inner core types; response bodies are
+        // Serialize-only (the server encodes them; clients decode) and are
+        // pinned by constructing the real structs.
+        let qreq: crate::http_api::BatchQueryRequest =
+            serde_json::from_value(fx["queryBatchRequest"].clone()).expect("queryBatchRequest");
+        assert_eq!(qreq.db, "app1");
+        assert_eq!(
+            serde_json::to_value(&qreq.queries).unwrap(),
+            fx["queryBatchRequest"]["queries"],
+            "query-batch request queries drifted"
+        );
+
+        assert_eq!(
+            serde_json::to_value(crate::http_api::BatchQueryResponse {
+                results: vec![
+                    crate::http_api::BatchQueryOutcome {
+                        ok: true,
+                        result: Some(crate::query::QueryResult::Docs(vec![
+                            serde_json::json!({"id": "i1", "status": "done", "title": "First"}),
+                            serde_json::json!({"id": "i2", "status": "done", "title": "Second"}),
+                        ])),
+                        error: None,
+                    },
+                    crate::http_api::BatchQueryOutcome {
+                        ok: false,
+                        result: None,
+                        error: Some(crate::error::RtDbError::bad_request("unknown terminal")),
+                    },
+                ]
+            })
+            .unwrap(),
+            fx["queryBatchResponse"],
+            "query-batch response slot vocabulary drifted — ok/result and ok/error pairing must stay omit-when-None"
+        );
+
+        let mreq: crate::http_api::BatchMutateRequest =
+            serde_json::from_value(fx["mutateBatchRequest"].clone()).expect("mutateBatchRequest");
+        assert_eq!(mreq.db, "app1");
+        assert_eq!(mreq.txns.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&mreq.txns[0].txn).unwrap(),
+            fx["mutateBatchRequest"]["txns"][0]["txn"],
+            "mutate-batch entry txn drifted"
+        );
+        assert_eq!(mreq.txns[0].idempotency_key.as_deref(), Some("idem-1"));
+        assert!(mreq.txns[1].idempotency_key.is_none());
+
+        assert_eq!(
+            serde_json::to_value(crate::http_api::BatchMutateResponse {
+                results: vec![
+                    crate::http_api::BatchMutateOutcome {
+                        ok: true,
+                        results: Some(vec![
+                            serde_json::json!({"op": "insert", "table": "items", "id": "i1", "version": 1}),
+                            serde_json::json!({"op": "insert", "table": "items", "id": "i2", "version": 1}),
+                        ]),
+                        error: None,
+                    },
+                    crate::http_api::BatchMutateOutcome {
+                        ok: false,
+                        results: None,
+                        error: Some(crate::error::RtDbError::conflict("committed elsewhere")),
+                    },
+                ]
+            })
+            .unwrap(),
+            fx["mutateBatchResponse"],
+            "mutate-batch response slot vocabulary drifted — ok/results and ok/error pairing must stay omit-when-None"
+        );
     }
 
     // Client tags/fields exactly match the wire vocabulary consumed by

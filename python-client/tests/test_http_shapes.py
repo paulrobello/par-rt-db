@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from par_rt_db.wire import ClaimedSchedule, ScheduleInfo
+from par_rt_db.wire import BatchMutateOutcome, BatchQueryOutcome, ClaimedSchedule, ScheduleInfo
 
 _FIXTURE = Path(__file__).resolve().parents[2] / "wire-corpus" / "http-shapes.json"
 
@@ -80,3 +80,47 @@ def test_claim_schedules_response_shape() -> None:
     shapes = _shapes()
     model = ClaimedSchedule.model_validate(shapes["claimSchedulesResponse"]["jobs"][0])
     assert model.model_dump(by_alias=True, mode="json") == shapes["claimedScheduleCron"]
+
+
+def test_query_batch_slots_roundtrip() -> None:
+    shapes = _shapes()
+    slots = shapes["queryBatchResponse"]["results"]
+    assert len(slots) == 2
+    ok_slot = BatchQueryOutcome.model_validate(slots[0])
+    assert ok_slot.ok is True
+    assert ok_slot.result == slots[0]["result"]
+    dumped = ok_slot.model_dump(by_alias=True, mode="json")
+    assert dumped == slots[0]
+    # The omit-when-None contract: an ok slot carries no `error` key.
+    assert "error" not in dumped
+
+    err_slot = BatchQueryOutcome.model_validate(slots[1])
+    assert err_slot.ok is False
+    assert err_slot.error is not None
+    assert err_slot.error.code == "BAD_REQUEST"
+    assert (
+        BatchQueryOutcome.model_validate(slots[1]).model_dump(by_alias=True, mode="json")
+        == slots[1]
+    )
+
+
+def test_mutate_batch_slots_roundtrip() -> None:
+    shapes = _shapes()
+    slots = shapes["mutateBatchResponse"]["results"]
+    assert len(slots) == 2
+    ok_slot = BatchMutateOutcome.model_validate(slots[0])
+    assert ok_slot.ok is True
+    assert ok_slot.results is not None and len(ok_slot.results) == 2
+    assert ok_slot.model_dump(by_alias=True, mode="json") == slots[0]
+
+    err_slot = BatchMutateOutcome.model_validate(slots[1])
+    assert err_slot.ok is False
+    assert err_slot.error is not None and err_slot.error.code == "CONFLICT"
+    assert "results" not in err_slot.model_dump(by_alias=True, mode="json")
+
+
+def test_query_batch_slot_rejects_unknown_field() -> None:
+    bogus = dict(_shapes()["queryBatchResponse"]["results"][0])
+    bogus["bogusKey"] = 1
+    with pytest.raises(ValidationError):
+        BatchQueryOutcome.model_validate(bogus)

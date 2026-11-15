@@ -376,6 +376,25 @@ func (c *Client) LeavePresence(ctx context.Context, room string) error {
 	return c.sendFrame(ctx, frame)
 }
 
+// UpdatePresence refreshes a joined room's state blob without re-joining: it
+// sends the `presenceState` frame (the server fans a fresh snapshot out to
+// every member) and updates the cached join state so a seq-gap resync re-joins
+// with the latest state. The fold baseline is untouched — an update is not a
+// join — and for a room never joined the frame still goes out (the server has
+// no member to update and ignores it).
+func (c *Client) UpdatePresence(ctx context.Context, room string, state wire.JSONValue, ttlMs *uint64) error {
+	c.presenceMu.Lock()
+	if _, joined := c.presenceJoins[room]; joined {
+		c.presenceJoins[room] = state
+	}
+	c.presenceMu.Unlock()
+	frame, err := json.Marshal(wire.ClientPresenceState{Room: room, State: state, TtlMs: ttlMs})
+	if err != nil {
+		return err
+	}
+	return c.sendFrame(ctx, frame)
+}
+
 // OnPresence registers a callback for presence updates. The callback always
 // receives the room's full member list: a presenceSnapshot replaces it, and
 // a presenceDelta is folded in (joined upserted, left removed, stateChanged

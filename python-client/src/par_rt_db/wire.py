@@ -1099,6 +1099,18 @@ class BatchQueryOutcome(_Camel):
     result: object | None = None
     error: _ErrorEnvelope | None = None
 
+    @model_serializer(mode="wrap")
+    def _drop_optional(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Drop ``result``/``error`` when ``None`` — the wire contract is
+        omit-when-None (an ok slot carries no ``error`` key; an errored slot
+        no ``result`` key), matching ``BatchMutateOutcome`` above."""
+        out = handler(self)
+        if out.get("result") is None:
+            out.pop("result", None)
+        if out.get("error") is None:
+            out.pop("error", None)
+        return out
+
 
 # --- F7 change feed (GET /api/db/{db}/changes) ---
 

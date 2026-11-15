@@ -105,8 +105,8 @@ pub(crate) async fn query_handler(
 
 #[derive(Deserialize)]
 pub(crate) struct BatchQueryRequest {
-    db: String,
-    queries: Vec<Query>,
+    pub(crate) db: String,
+    pub(crate) queries: Vec<Query>,
 }
 
 /// One slot of a `/api/query-batch` response. `ok` is always present; exactly
@@ -117,11 +117,11 @@ pub(crate) struct BatchQueryRequest {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BatchQueryOutcome {
-    ok: bool,
+    pub(crate) ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<QueryResult>,
+    pub(crate) result: Option<QueryResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<RtDbError>,
+    pub(crate) error: Option<RtDbError>,
 }
 
 /// SEC-119: hard cap on the number of queries a single
@@ -135,7 +135,7 @@ const MAX_BATCH_QUERIES: usize = 64;
 
 #[derive(Serialize)]
 pub(crate) struct BatchQueryResponse {
-    results: Vec<BatchQueryOutcome>,
+    pub(crate) results: Vec<BatchQueryOutcome>,
 }
 
 /// Fan out over many queries against one db in a single round trip. Auth and
@@ -379,16 +379,16 @@ const MAX_BATCH_TXNS: usize = 64;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BatchMutateEntry {
-    txn: Transaction,
+    pub(crate) txn: Transaction,
     #[serde(default)]
-    idempotency_key: Option<String>,
+    pub(crate) idempotency_key: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BatchMutateRequest {
-    db: String,
-    txns: Vec<BatchMutateEntry>,
+    pub(crate) db: String,
+    pub(crate) txns: Vec<BatchMutateEntry>,
 }
 
 /// One slot of a `/api/mutate-batch` response, aligned by position with the
@@ -400,16 +400,16 @@ pub(crate) struct BatchMutateRequest {
 /// `ok` (omit-when-None).
 #[derive(Serialize)]
 pub(crate) struct BatchMutateOutcome {
-    ok: bool,
+    pub(crate) ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    results: Option<Vec<serde_json::Value>>,
+    pub(crate) results: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<RtDbError>,
+    pub(crate) error: Option<RtDbError>,
 }
 
 #[derive(Serialize)]
 pub(crate) struct BatchMutateResponse {
-    results: Vec<BatchMutateOutcome>,
+    pub(crate) results: Vec<BatchMutateOutcome>,
 }
 
 /// Fan out over N independent transactions against one db in a single round

@@ -505,6 +505,15 @@ mod workflow;
 pub(crate) use bulk::{bulk_delete_handler, bulk_status_handler};
 pub(crate) use changes::changes_handler;
 pub(crate) use data::{batch_query_handler, mutate_batch_handler, mutate_handler, query_handler};
+
+// Test-only: `protocol::tests::http_shapes_fixture_parity` pins the batch
+// wire shapes against `wire-corpus/http-shapes.json` by constructing these
+// structs; production code consumes them through `data::` directly.
+#[cfg(test)]
+pub(crate) use data::{
+    BatchMutateOutcome, BatchMutateRequest, BatchMutateResponse, BatchQueryOutcome,
+    BatchQueryRequest, BatchQueryResponse,
+};
 pub(crate) use schedule::{
     cancel_handler, claim_schedules_handler, complete_schedule_handler, fail_schedule_handler,
     list_schedules_handler, pause_handler, resume_handler, retry_schedule_handler,

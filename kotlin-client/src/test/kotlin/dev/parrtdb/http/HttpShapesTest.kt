@@ -1,6 +1,8 @@
 package dev.parrtdb.http
 
 import dev.parrtdb.wire.ScheduleInfo
+import dev.parrtdb.wire.StepResult
+import dev.parrtdb.wire.StrictObj
 import dev.parrtdb.wire.ScheduleKind
 import dev.parrtdb.wire.ScheduleStatus
 import dev.parrtdb.wire.WireException
@@ -106,5 +108,63 @@ class HttpShapesTest {
         assertEquals(1, jobs.size)
         assertEquals("job_cron_1", jobs[0].id)
         assertEquals("America/Los_Angeles", jobs[0].tz)
+    }
+
+    @Test
+    fun queryBatchResponseSlotsParseLikeTheClient() {
+        // Mirrors RtDbHttpClient.queryBatch's StrictObj slot parse over the
+        // fixture: exact keys, omit-when-None pairing (an ok slot carries no
+        // `error` key; an errored slot no `result` key).
+        val resp = shapes["queryBatchResponse"]!!
+        val o = StrictObj.of(resp, "queryBatchResponse")
+        val slots = o.arr("results").map { s ->
+            val so = StrictObj.of(s, "querySlot")
+            val err = so.opt("error")
+            val ok = so.bool("ok")
+            val res = so.raw("result")
+            so.finish()
+            if (err != null) QuerySlot(false) else if (ok) QuerySlot(true, result = res) else QuerySlot(false)
+        }
+        assertEquals(2, slots.size)
+        assertEquals(true, slots[0].ok)
+        assertEquals(2, (slots[0].result as kotlinx.serialization.json.JsonArray).size)
+        assertNull(slots[0].error)
+        assertEquals(false, slots[1].ok)
+        assertNull(slots[1].result)
+        // The errored slot carries the {code, message} envelope only.
+        val errSlot = (shapes["queryBatchResponse"]!!.jsonObject["results"] as kotlinx.serialization.json.JsonArray)[1].jsonObject
+        assertEquals(setOf("ok", "error"), errSlot.keys)
+        assertEquals(setOf("code", "message"), errSlot["error"]!!.jsonObject.keys)
+    }
+
+    @Test
+    fun mutateBatchResponseSlotsParseLikeTheClient() {
+        val resp = shapes["mutateBatchResponse"]!!
+        val o = StrictObj.of(resp, "mutateBatchResponse")
+        val slots = o.arr("results").map { s ->
+            val so = StrictObj.of(s, "mutateBatchSlot")
+            val ok = so.bool("ok")
+            val results = so.optArr("results")?.map { StepResult.fromJson(it) }
+            val err = so.opt("error")
+            so.finish()
+            MutateBatchSlot(ok, if (err == null) results else null)
+        }
+        assertEquals(2, slots.size)
+        assertEquals(true, slots[0].ok)
+        assertEquals(2, slots[0].results?.size)
+        assertNull(slots[0].error)
+        assertEquals(false, slots[1].ok)
+        assertNull(slots[1].results)
+    }
+
+    @Test
+    fun batchRequestShapesCarryExactKeys() {
+        val qb = shapes["queryBatchRequest"]!!.jsonObject
+        assertEquals(setOf("db", "queries"), qb.keys)
+        val mb = shapes["mutateBatchRequest"]!!.jsonObject
+        assertEquals(setOf("db", "txns"), mb.keys)
+        val entries = mb["txns"] as kotlinx.serialization.json.JsonArray
+        assertEquals(setOf("txn", "idempotencyKey"), entries[0].jsonObject.keys)
+        assertEquals(setOf("txn"), entries[1].jsonObject.keys)
     }
 }

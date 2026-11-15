@@ -127,6 +127,20 @@ alter observable behavior on upgrade.
 
 ### Added
 
+- **Wire-corpus coverage batch (QA-008 sweep follow-up).** The workflow
+  client frames (`startWorkflow` with a spec, `cancelWorkflow`, `listWorkflows`
+  with and without the optional status filter) now have corpus cases — the
+  server replies were pinned but the client→server requests were not — and all
+  seven runners pass them. `wire-corpus/http-shapes.json` additionally pins
+  the batch-transport bodies (`queryBatchRequest`/`queryBatchResponse`,
+  `mutateBatchRequest`/`mutateBatchResponse`): verified server-side by
+  `protocol::tests::http_shapes_fixture_parity` constructing the real structs,
+  and mirrored by per-client slot decode tests (rust
+  `tests/http_shapes_batches.rs`, python `test_http_shapes.py`, ts
+  `tests/batch-op.test.ts`, kotlin `HttpShapesTest.kt`). The corpus README
+  records the storage/admin intentional-exclusion decision, and the go
+  wsclient gained the missing `UpdatePresence` (the `presenceState` sender
+  every other client already exposed), tested over the fakePeer transport.
 - **Opt-in runtime EXPLAIN on the admin explain route (`analyze: true`,
   ENH-019 follow-up).** `POST /admin/db/{db}/explain` now accepts
   `analyze: true`, which runs the compiled statement under

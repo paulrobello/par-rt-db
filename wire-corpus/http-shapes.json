@@ -77,5 +77,88 @@
     "matched": 1500,
     "deleted": 500,
     "error": "chunk turn failed: schema changed mid-op"
+  },
+  "queryBatchRequest": {
+    "db": "app1",
+    "queries": [
+      {
+        "table": "workItems",
+        "filter": {
+          "op": "eq",
+          "field": "status",
+          "value": "done"
+        }
+      }
+    ]
+  },
+  "queryBatchResponse": {
+    "results": [
+      {
+        "ok": true,
+        "result": [
+          {
+            "id": "i1",
+            "status": "done",
+            "title": "First"
+          },
+          {
+            "id": "i2",
+            "status": "done",
+            "title": "Second"
+          }
+        ]
+      },
+      {
+        "ok": false,
+        "error": {
+          "code": "BAD_REQUEST",
+          "message": "unknown terminal"
+        }
+      }
+    ]
+  },
+  "mutateBatchRequest": {
+    "db": "app1",
+    "txns": [
+      {
+        "txn": {
+          "steps": []
+        },
+        "idempotencyKey": "idem-1"
+      },
+      {
+        "txn": {
+          "steps": []
+        }
+      }
+    ]
+  },
+  "mutateBatchResponse": {
+    "results": [
+      {
+        "ok": true,
+        "results": [
+          {
+            "op": "insert",
+            "table": "items",
+            "id": "i1",
+            "version": 1
+          },
+          {
+            "op": "insert",
+            "table": "items",
+            "id": "i2",
+            "version": 1
+          }
+        ]
+      },
+      {
+        "ok": false,
+        "error": {
+          "code": "CONFLICT",
+          "message": "committed elsewhere"
+        }
+      }
+    ]
   }
 }

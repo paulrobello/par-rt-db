@@ -521,3 +521,52 @@ func TestOptStr(t *testing.T) {
 		t.Fatal("non-empty string must map to a pointer carrying it")
 	}
 }
+
+func TestUpdatePresenceRefreshesJoinStateAndSends(t *testing.T) {
+	fp := newFakePeer(t)
+	c, _ := newConnectedClient(t, fp)
+	ttl := uint64(3000)
+	if err := c.JoinPresence(context.Background(), "r", wire.Object{"k": wire.String("v")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.UpdatePresence(context.Background(), "r", wire.Object{"k": wire.String("v2")}, &ttl); err != nil {
+		t.Fatal(err)
+	}
+	// The presenceState frame must reach the peer with room, state and ttlMs.
+	deadline := time.After(2 * time.Second)
+	var sawState bool
+	for !sawState {
+		select {
+		case data := <-fp.frames:
+			if frameType(data) == "presenceState" &&
+				strings.Contains(string(data), `"room":"r"`) &&
+				strings.Contains(string(data), `"ttlMs":3000`) &&
+				strings.Contains(string(data), `"k":"v2"`) {
+				sawState = true
+			}
+		case <-deadline:
+			t.Fatal("presenceState frame never reached the peer")
+		}
+	}
+	// The cached join state must carry the latest blob for a seq-gap re-join.
+	c.presenceMu.Lock()
+	joined := c.presenceJoins["r"]
+	c.presenceMu.Unlock()
+	b, err := json.Marshal(joined)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != `{"k":"v2"}` {
+		t.Fatalf("join state not refreshed, got %s", b)
+	}
+	// An update for a room never joined must not mint a join entry.
+	if err := c.UpdatePresence(context.Background(), "ghost", wire.Object{"k": wire.String("g")}, nil); err != nil {
+		t.Fatal(err)
+	}
+	c.presenceMu.Lock()
+	_, ghostJoined := c.presenceJoins["ghost"]
+	c.presenceMu.Unlock()
+	if ghostJoined {
+		t.Fatal("update for an unjoined room must not create a join entry")
+	}
+}
