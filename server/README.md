@@ -103,42 +103,42 @@ Paths below are relative to `server/src/` (this directory's `src/`).
 
 | Area | Files |
 | --- | --- |
-| Correctness core (serialized writes + subscription fan-out) | `src/committer/` (`mod.rs` — lease + dispatch; `lease.rs`, `forwarding.rs`, `supervisor.rs`, `taps.rs`; `arms/` — one file per committer request arm: `mutate.rs`, `subscribe.rs`, `scheduled.rs`, `workflow.rs`, `reaper.rs`, `migrate.rs`, `schema.rs`, `merge.rs`), `src/subs.rs` |
-| Cross-replica write forwarding (ENH-022 Stage 4c) | `src/forward.rs` (spools a non-owner write into the `rtdb_auth.forward_queue` table when the local replica doesn't hold the write lease; `src/db.rs` owns the table DDL) |
+| Correctness core (serialized writes + subscription fan-out) | `src/committer/` (`mod.rs` — lease + dispatch; `lease.rs`, `forwarding.rs`, `supervisor.rs`, `taps.rs`; `arms/` — one file per committer request arm: `mutate.rs`, `subscribe.rs`, `scheduled.rs`, `workflow.rs`, `reaper.rs`, `migrate.rs`, `schema.rs`, `merge.rs`), `src/subs/` (`mod.rs`, `decide.rs`, `liveness.rs`, `read_set.rs`) |
+| Cross-replica write forwarding (ENH-022 Stage 4c) | `src/forward.rs` (spools a non-owner write into the `rtdb_auth.forward_queue` table when the local replica doesn't hold the write lease; `src/db/` owns the table DDL) |
 | Scheduled / cron transactions | `src/scheduler.rs` (+ the `RunScheduled` arm in `src/committer/arms/scheduled.rs`) |
 | Durable declarative workflows (FM-29) | `src/workflows.rs` (+ the `RunWorkflowAdvance` arm in `src/committer/arms/workflow.rs`; scheduler polls both tables) |
 | TTL reaper | `src/reaper.rs` (+ the `RunReaper` arm in `src/committer/arms/reaper.rs`) |
-| Schema migration (destructive transforms) | `src/migrate.rs` (+ the `RunMigrate` arm in `src/committer/arms/migrate.rs`) |
+| Schema migration (destructive transforms) | `src/migrate/` (+ the `RunMigrate` arm in `src/committer/arms/migrate.rs`) |
 | Schema change history + restore | `src/schema_history.rs`, `src/schema_diff.rs` (+ the `RunRestoreSchema` arm in `src/committer/arms/schema.rs`) |
-| File storage (blobs) | `src/storage.rs` (+ the storage routes in `src/http_api.rs`) |
+| File storage (blobs) | `src/storage.rs` (+ the storage routes in `src/http_api/storage.rs`) |
 | On-the-fly image transforms (ENH-014) | `src/image_transform.rs` (read-time, both serve routes; `moka` cache + decode semaphore + pixel cap; `RTDB_IMAGE_*` knobs) |
 | Per-database resource quotas (ENH-011) | `src/quota.rs` (three global caps on `HotConfig`; tables/subs/storage enforcement; `QUOTA_EXCEEDED` 507) |
-| Realtime presence (ENH-015) | `src/presence.rs` (in-memory, connection-bound, not committer-bound; `RTDB_PRESENCE_*` knobs) |
+| Realtime presence (ENH-015) | `src/presence/` (in-memory, connection-bound, not committer-bound; `RTDB_PRESENCE_*` knobs) |
 | Audit log (when `RTDB_AUDIT_LOG_ENABLED=true`) | `src/audit.rs` (best-effort row per `DocOp` at the committer tap sites) |
 | Webhook outbox (when `RTDB_WEBHOOKS_ENABLED=true`) | `src/webhook.rs` (per-`DocOp` outbox row drained by a boot worker; at-least-once) |
 | Backup lifecycle (when `RTDB_BACKUP_ENABLED=true`) | `src/backup.rs` (manual `pg_dump` trigger + dump list/download/delete; `pg_restore --no-owner --no-privileges` into a fresh `rtdb_restored_<stamp>` DB) |
 | Rate limiter (per-token + per-db fixed window) | `src/rate_limit.rs` (`RTDB_RATE_LIMIT_PER_TOKEN_RPM` / `RTDB_RATE_LIMIT_PER_DB_RPM`, 0 = off; hot-configurable via `PATCH /admin/config` — `perTokenRpm`/`perDbRpm` — the per-IP guards stay boot-pinned) |
-| OpenTelemetry / OTLP tracing (ENH-018, opt-in) | `src/tracing_setup.rs` (subscriber init + `OtelGuard` flush); span instrumentation in `src/committer/`/`src/subs.rs`/`src/query/`/`src/txn/`. The `otel` cargo feature (default off) gates the deps + subscriber; `RTDB_OTEL_ENABLED` (default false) gates it at runtime. `committer.mutate` carries `queue_wait_ms`. |
-| Query introspection (ENH-019) | `POST /admin/db/{db}/explain` (re-compiles a Query JSON via `compile_query`, returns `{sql, params, terminal, warnings}` — no rows) and `GET /admin/slow-queries` (bounded ring of queries that exceeded `RTDB_SLOW_QUERY_MS`). Ring + `SlowQueryRecord` in `src/metrics.rs`; explain + slow-query recording in `src/http_api.rs`; list endpoint in `src/admin/observability.rs`. `RTDB_SLOW_QUERY_MS=0` (default) disables; `RTDB_SLOW_QUERY_LOG_PARAMS=false` (default) keeps document content out of the log. |
+| OpenTelemetry / OTLP tracing (ENH-018, opt-in) | `src/tracing_setup.rs` (subscriber init + `OtelGuard` flush); span instrumentation in `src/committer/`/`src/subs/`/`src/query/`/`src/txn/`. The `otel` cargo feature (default off) gates the deps + subscriber; `RTDB_OTEL_ENABLED` (default false) gates it at runtime. `committer.mutate` carries `queue_wait_ms`. |
+| Query introspection (ENH-019) | `POST /admin/db/{db}/explain` (re-compiles a Query JSON via `compile_query`, returns `{sql, params, terminal, warnings}` — no rows) and `GET /admin/slow-queries` (bounded ring of queries that exceeded `RTDB_SLOW_QUERY_MS`). Ring + `SlowQueryRecord` in `src/metrics/`; slow-query recording in `src/http_api/data.rs`; explain + list endpoints in `src/admin/observability.rs`. `RTDB_SLOW_QUERY_MS=0` (default) disables; `RTDB_SLOW_QUERY_LOG_PARAMS=false` (default) keeps document content out of the log. |
 | Mutation-log dedup (idempotency) | `src/mutation_log.rs` |
 | Op feed (in-memory ring + `/admin/stream`) | `src/op_feed.rs` |
 | Snapshot export/import | `src/snapshot.rs` |
-| Metrics | `src/metrics.rs` |
+| Metrics | `src/metrics/` |
 | Hot config + dynamic CORS | `src/config/` (hot row in `src/config/hot.rs`; `Arc<ArcSwap<HotConfig>>` on `AppState`) |
 | Health | `src/health.rs` |
 | Schema model + validation | `src/schema/` |
-| Computed-field expression grammar + evaluation (ENH-028) | `src/value_expr.rs` (shared by push validation, the write-path stamp in `src/txn/`, push/restore backfill, and migrate re-stamps in `src/migrate.rs`) |
+| Computed-field expression grammar + evaluation (ENH-028) | `src/value_expr.rs` (shared by push validation, the write-path stamp in `src/txn/`, push/restore backfill, and migrate re-stamps in `src/migrate/`) |
 | Schema → Postgres DDL | `src/ddl.rs` |
 | Write / read paths | `src/txn/` (`mod.rs`, `row_ops.rs`, `stamp.rs`, `auth.rs`, `steps.rs`, `cascade.rs`), `src/query/` (`mod.rs` compile + dispatch, `filter.rs`, `terminals.rs`, `search.rs`, `row_auth.rs`) |
 | Pagination (cursor keyset) | `src/pagination.rs` |
 | Wire messages + query/txn DSL types | `src/protocol.rs`, `src/dsl.rs` (pure wire/DSL types shared by protocol/txn/query — zero SQL) |
 | Error envelope | `src/error.rs` |
-| Transports | `src/ws.rs` (reactive), `src/http_api/` (one-shot — `mod.rs` router, `data.rs`, `schedule.rs`, `workflow.rs`, `changes.rs`, `storage.rs`) |
+| Transports | `src/ws.rs` (reactive), `src/http_api/` (one-shot — `mod.rs` router, `data.rs`, `bulk.rs`, `schedule.rs`, `workflow.rs`, `changes.rs`, `storage.rs`, `share.rs`) |
 | Durable change feed (FM-27) | `src/change_log.rs` (per-db op log behind `GET /api/db/{db}/changes`; retention via the `change_log_max_rows` hot setting) |
 | Graceful shutdown | `src/shutdown.rs` (bounded drain race, `RTDB_SHUTDOWN_DRAIN_MS`) |
 | Admin control plane | `src/admin/` — `mod.rs` (shared core + assembled router) + fourteen per-domain submodules (`login`, `dbs`, `schema_ops`, `tokens`, `docs`, `schedules`, `storage_ops`, `webhooks`, `backups`, `settings`, `observability`, `sessions`, `merge`, `workflows`); all `/admin/*` routes + `/admin/stream` WS. `sessions` is the active-session management surface (`GET/DELETE /admin/sessions`, per-user + per-token-hash revocation; revocation takes effect on the next op over an already-open connection). |
 | Signed, time-limited storage URLs (ENH-017) | `src/signed_url.rs` (HMAC over `admin_key`, `?exp=&sig=` verified on `GET /storage/{id}`) |
-| Database bootstrap + admin SQL | `src/db.rs` (create/drop database, `storage_index`, the `rtdb_auth` schema) |
+| Database bootstrap + admin SQL | `src/db/` (create/drop database, `storage_index`, the `rtdb_auth` schema) |
 | Cross-replica fan-out (ENH-022) | `src/notify.rs` (`pg_notify` on the `rtdb_ops` channel; per-process LISTEN mirrors peer replicas into the local op-feed ring) |
 | Privacy policy | `src/privacy.rs` (serves `GET /privacy` from `src/static/privacy.html`, the only file `src/static/` holds) |
 | Static SPA serving | `src/lib.rs` (`ServeDir`/`ServeFile` mounted as the router's last-resort fallback, reading `RTDB_STATIC_DIR`; hashed assets get an immutable `Cache-Control`, `index.html` gets `no-cache`) |
@@ -155,11 +155,16 @@ operator and carrying an optional full `FilterExpr` (the same predicate DSL
 generation); the Postgres image is `pgvector/pgvector:pg17`. The `search`
 terminal also takes an optional `mode: "trgm"` (FM-30): substring/autocomplete
 matching via `pg_trgm` — case-insensitive `ILIKE '%q%'` over the index's text
-fields, ranked by `similarity()`, composing with `filter` and `take`. Every
-search index carries a GIN trigram index (`tg_<table>_<index>`) beside its
-tsvector GIN, created on push with `IF NOT EXISTS` so existing deployments
-backfill on the next schema push; the tradeoff is roughly double the index
-storage over search fields. `mode` omitted (or `"tsquery"`) is today's
+fields, ranked by `similarity()`, composing with `filter` and `take`. A
+search index carries its GIN trigram index (`tg_<table>_<index>`) beside its
+tsvector GIN only when the schema declares `trgm: true` on that index —
+opt-in per index, create-time-only; an index that omits the flag pays no
+extra storage, and `mode: "trgm"` against it is a `BAD_REQUEST` naming the
+missing declaration. Creation uses `IF NOT EXISTS`, so re-push is idempotent,
+and an index that predates the flag is grandfathered to `trgm: true` on its
+next `push_schema` when the push still omits it, so existing deployments keep
+working unchanged; the tradeoff is roughly double that index's storage over
+the tsvector GIN alone. `mode` omitted (or `"tsquery"`) is today's
 full-text behavior, unchanged — except that query text is now parsed as
 websearch syntax (FM-31, `websearch_to_tsquery`): quoted phrases require
 adjacency, a bare `or` unions alternatives, `-term` excludes. An optional
@@ -170,7 +175,7 @@ server-fixed word bounds (`MaxWords=35`, `MinWords=15`); `snippet` with
 
 ## HTTP surface
 
-Top-level routes registered in `src/lib.rs` / `src/http_api.rs` (the full
+Top-level routes registered in `src/lib.rs` / `src/http_api/` (the full
 endpoint table, including `/sync`, `/auth/*`, `/admin/*`, and storage, lives in
 the [root README](../README.md#endpoints)):
 

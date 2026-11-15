@@ -31,7 +31,7 @@ Crate name: `par-rt-db-client` → in Rust, `use par_rt_db_client::...`.
 | Feature | Default | Surface |
 | --- | --- | --- |
 | `http` | yes | `RtDbHttpClient` — typed query / mutate / `auth_me` / `fetch_schema` (machine-token schema read-back) / `changes` (durable change-feed cursor polling) / `stream_changes` (auto-resuming change-feed iterator: yields ops one by one, advances the resume cursor to the last yielded seq, retries failed polls on a jittered backoff, and treats `CursorExpired` and a `log_id` change as terminal; `ChangeFeedStream::cursor` is the value the caller persists) |
-| `ws` | no | `RtDbClient` (`src/ws.rs`) — reactive WebSocket client (live query subscriptions, mutate, presence, optimistic updates, schedules, workflows) |
+| `ws` | no | `RtDbClient` (`src/ws/`) — reactive WebSocket client (live query subscriptions, mutate, presence, optimistic updates, schedules, workflows) |
 | `admin` | no | `RtDbAdminClient` (`src/admin/mod.rs`) — `/admin/*` control-plane client: db create/list/push-schema, schema/stats read-back, token mint/revoke/list, db + server-wide admin allowlist CRUD, metrics, hot config GET/PATCH, op-feed `recent`, `stream_admin(db, table)` —
 the `/admin/stream` WebSocket consumer (features `admin` + `ws`; carries the
 admin key as an Authorization bearer), owner-bypass query/mutate (incl. `include_deleted` for soft-deleted rows), snapshot export/import, schema preview (advisory additive/reject diff), admin schedules CRUD (list/create/cancel/pause/resume), admin storage (list/upload/delete), per-db anonymous-access toggle (SEC-103). Browser-only `login`/`logout` (cookie flows) are excluded (the Rust client is a machine client); `/admin/stream` is available via `stream_admin`. Construct via `RtDbAdminClient::new(url, admin_key)` or `RtDbHttpClient::admin_client()` (shares the connection pool). The admin methods also remain on `RtDbHttpClient` as `#[deprecated]` re-exports (ARC-121, non-breaking). |
@@ -435,11 +435,12 @@ server's `SCREAMING_SNAKE_CASE` codes (`UNAUTHORIZED`, `PRECONDITION_FAILED`,
 
 ## Wire contract
 
-`src/wire.rs` is one of **four** implementations of par-rt-db's protocol
-contract (alongside `server/src/protocol.rs`, `ts-client/src/protocol.ts`, and
-`python-client/src/par_rt_db/wire.py`). They must stay byte-identical (same
+`src/wire.rs` is one of **seven** implementations of par-rt-db's protocol
+contract (alongside `server/src/protocol.rs`, `ts-client/src/protocol.ts`,
+`python-client/src/par_rt_db/wire.py`, Swift's `Wire.swift`, Go's `wire/`, and
+Kotlin's `wire/`). They must stay byte-identical (same
 serde tags and field names); changing the wire format on any side is a
-breaking change unless mirrored on all four. See
+breaking change unless mirrored on all seven. See
 [`../CLAUDE.md`](../CLAUDE.md) and the design spec
 [`../docs/superpowers/specs/2026-07-22-rust-client-design.md`](../docs/superpowers/specs/2026-07-22-rust-client-design.md).
 

@@ -501,6 +501,22 @@ P1 stall investigation's series) stay fast. Note the depth gauge freezes
 rather than grows when a committer is wedged inside a single hung turn —
 a flat depth with rising queue-wait p99 is the louder alarm.
 
+The committer watchdog turns that alarm fleet-visible: it samples the queue
+gauges every 10s and, when queue-wait p99 stays at wedge scale (≥5s) for six
+consecutive samples, sets `rtdb_committer_degraded` (plus a
+`rtdb_committer_degraded_transitions_total` counter) and adds
+`degraded_reason: "committer_queue_sustained_wait"` with the live p99/depth
+to `/healthz`. `/healthz` stays HTTP 200 while the watchdog flag is set —
+probers and the container healthcheck keep treating the route as alive;
+shedding/restart is deliberately not wired yet. Alert on
+`rtdb_committer_degraded == 1` or any increase of
+`rtdb_committer_degraded_transitions_total`. In multi-instance mode, also
+watch `rtdb_notify_write_set_reconnects_total`: every write-set LISTEN
+reconnect drops the notifications published during the gap, and the server
+re-fans-out subscriptions for dbs with live subscribers to converge — a
+sustained climb alongside lagging realtime clients means Postgres connection
+churn is starving cross-replica invalidation.
+
 ## Tracing (OpenTelemetry / OTLP, ENH-018)
 
 `/metrics` answers "how much"; OTLP tracing answers "why was *this* request

@@ -469,6 +469,15 @@ alter observable behavior on upgrade.
   hand-maintained copies. Both crates re-export at their historical paths, so no
   call site changed. A drift between them is now a compile error rather than a
   corpus failure.
+- **Per-stage request-path timing gauges (`f130391`, P1 stall investigation).**
+  `/metrics` exposes per-stage timings for the request pipeline so a stall can
+  be located to a stage from the scrape alone.
+- **Committer queue-wait and depth gauges on the Prometheus scrape
+  (`33687c5`).** The committer's queue wait and queue depth are now gauges on
+  `/metrics`, making write-path saturation visible without log sampling.
+- **ParMeshV1 delivered→queued redelivery revert (`eea4aab`).** A delivered
+  claim can revert to `queued`, so a lost worker redelivers the message
+  instead of wedging it in `delivered` forever.
 
 ### Changed
 
@@ -553,6 +562,9 @@ alter observable behavior on upgrade.
   `export-db` / `import-db` exactly. Storage blobs and scheduled transactions
   are outside the snapshot format and are not copied. Behavior is unchanged;
   only the `0.1.0` changelog entry was wrong.
+- **Auth `provider.rs` God file split into the `auth/provider/` module tree
+  (ARC-003, `beea806`).** Trait, dispatcher, and route arms now live in
+  separate modules; a pure move with no behavior change.
 
 ### Fixed
 
@@ -630,6 +642,11 @@ alter observable behavior on upgrade.
 - **In-memory `push_schema` parity across the client engines** — index-flip
   detection, schema validation, and TTL/indexable-field validation now match the
   server.
+- **Closed critical coverage gaps in go-client and dashboard** (fast-leg
+  batch, `c5be668`), pinned the `insertOnly` row-replay boundary and
+  documented it upstream to par-mesh (SEC-005, `cc9ab0c`), and pinned the
+  rate-limit clock and the lease-lock poll, fixing two Release-flake sources
+  (`0f6a19c`).
 
 ### Security
 
@@ -662,6 +679,11 @@ alter observable behavior on upgrade.
   through.
 - **`/auth/state` omits the session token in cookie mode**, so a completion poll
   cannot hand a bearer token to a caller that should only ever hold the cookie.
+- **Expired admin sessions are denied on per-op WS authorization (SEC-201,
+  `3d7a9d4`).** The WebSocket handler re-runs `authorize` on every Subscribe
+  and Mutate but was accepting a session that had expired since the handshake;
+  revocation now takes effect on open admin connections at the same op
+  boundary as ordinary sessions.
 
 ### Documentation
 
@@ -678,6 +700,7 @@ alter observable behavior on upgrade.
   "unused" `WorkflowStatus::as_wire_str` has a grep-invisible caller
   (`server/src/workflows.rs:897`), and the SEC-001 dependency path runs via
   jsonwebtoken → p256 → elliptic-curve, not rsa.
+- **Prod hostname scrubbed from the livelock comments (`0c8a92e`).**
 
 This cycle included a full documentation audit and remediation. The 2026-07-21
 design spec is demoted to a historical record — `README.md`,

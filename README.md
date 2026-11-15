@@ -1819,7 +1819,7 @@ run.
 | 10. `typecheck` | `tsc`, pyright, `go vet`, `swift build`. | `make typecheck` |
 | 11. `test` | The full suite across all ten packages, against the dev Postgres. | `make test` |
 | 12. `rust-client-check-features` | The rust-client library **and** its test targets compile under every meaningful feature combination, not just `--all-features`. | `make rust-client-check-features` |
-| 13. `publish-check` | Release artifacts validate in dry-run — crates.io packaging, the npm tarball, the Python distributions — and the versioned manifests agree (the lockstep check). The release workflow's verify job reruns it with `--require-tag` on a tag checkout. | `make publish-check` |
+| 13. `publish-check` | Release artifacts validate in dry-run — crates.io packaging, the npm tarball, the Python distributions — and the versioned manifests agree (the lockstep check). The release workflow's verify job reruns it on `main` before any publish. | `make publish-check` |
 | 14. `dev-db-clean-check` | Proves `dev-db-clean.sql`'s merge-fixture section on the live dev Postgres: seeds throwaway pattern-matching rows plus a non-matching sentinel, runs the real clean, asserts zero fixtures remain and the sentinel survives. Runs after `test`, so the dev db is guaranteed up. | `make dev-db-clean-check` |
 
 Never `--no-verify` past the gate. If you do, fix the gate before anything
@@ -2010,13 +2010,13 @@ plus an operator SPA and a CLI built on top of them:
 * [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md) is the authoritative Convex-parity contract
 
 ### Where we're going
-* The next lockstep release cutting `[Unreleased]` — all packages version together per [`docs/RELEASING.md`](docs/RELEASING.md); publishing the SDKs to crates.io / npm / PyPI stays a separate, owner-approved decision
+* Releases are push-to-main: a green push runs [`release.yml`](.github/workflows/release.yml), which verifies the gate, publishes the version the tree declares to crates.io / npm / PyPI, and creates the matching `vX.Y.Z` tag and GitHub release. Publishing is armed by the `ENABLE_AUTO_PUBLISH` repository variable; the lockstep bump procedure lives in [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## What's new
 
 `0.1.0` is tagged; everything since lives under `[Unreleased]` in
-[`CHANGELOG.md`](CHANGELOG.md). Highlights: the Swift client (the fourth SDK and
-the fifth implementation of the wire contract), multi-instance write forwarding
+[`CHANGELOG.md`](CHANGELOG.md). Highlights: the Swift client (the fourth SDK;
+the wire contract now has seven implementations), multi-instance write forwarding
 with cross-replica subscription invalidation, computed fields, auto-increment
 counters, `awaitSignal` workflow approval gates, query field projection, and
 interval-recurrence scheduling. Read the **Breaking** group first — signed
@@ -2026,7 +2026,7 @@ database operations now answer `NOT_FOUND` rather than `INTERNAL`.
 ## Contributing
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development setup, the `make checkall`
-gate, Conventional Commits, the five-client wire-mirror rule, and the PR checklist.
+gate, Conventional Commits, the six-client wire-mirror rule, and the PR checklist.
 [`CLAUDE.md`](CLAUDE.md) is the agent-facing companion with the full invariant list.
 
 ## License

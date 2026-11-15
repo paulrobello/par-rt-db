@@ -109,7 +109,7 @@ What stays open is decided by which arm a request rides, not by who sent it:
 The flag is read fresh per write (one indexed lookup in the serialized turn —
 no cache, no invalidation), which is what makes PATCH-then-write ordering
 tight without any coherence machinery. Pinned by `server/tests/read_only_test.rs`
-and the `dbReadOnly` semantics-corpus cases (all six runners).
+and the `dbReadOnly` semantics-corpus cases (all seven runners).
 
 ```mermaid
 graph TD
@@ -1012,7 +1012,7 @@ constraint won't clear on retry). Over-cap is `QUOTA_EXCEEDED` (HTTP 507);
 metric `rtdb_quota_rejections_total{kind=tables|storage|subs}` with a per-db
 breakdown on the `/admin/metrics` JSON only (never the Prometheus scrape —
 per-db labels would blow up cardinality). `db_stats` exposes quota+usage;
-mirrored across all five clients (`HotConfig`/`HotConfigPatch` +
+mirrored across all six clients (`HotConfig`/`HotConfigPatch` +
 `QUOTA_EXCEEDED`).
 
 ## Realtime presence
@@ -1081,19 +1081,19 @@ its HTTP/admin/storage surfaces ship (a sync `httpx` client —
 `pip install par-rt-db[http]`), as does the reactive `ws` surface
 (`RtDbClient` async over `/sync` — `pip install par-rt-db[ws]`; live
 `subscribe` + at-most-once `mutate` + schedule ops), optimistic updates, and
-an in-memory test harness — the five clients are now at feature parity.
+an in-memory test harness — the six clients are now at feature parity.
 `FEATURE_MATRIX.md` tracks parity vs. Convex.
 
 ### The semantics corpus
 
 "Byte-identical" is a claim, and `wire-corpus/` is what tests it. Each case in
 `wire-corpus/semantics/` is a JSON description of a schema, a sequence of
-operations, and the expected outcome, and **six runners execute every case**:
-the real server against Postgres, and the five clients' in-memory engines
-(TypeScript, Rust, Python, Swift, Go). A behavior that differs between any two of
+operations, and the expected outcome, and **seven runners execute every case**:
+the real server against Postgres, and the six clients' in-memory engines
+(TypeScript, Rust, Python, Swift, Go, Kotlin). A behavior that differs between any two of
 them fails the corpus rather than surfacing later as a client bug.
 
-The corpus is what makes the "mirror every server change in all five clients"
+The corpus is what makes the "mirror every server change in all six clients"
 rule enforceable instead of aspirational, so every behavior-changing change
 ships with a case. `wire-corpus/README.md` states that authoring rule and the
 case format. `wire-corpus/golden-vector.json` separately pins the exact wire

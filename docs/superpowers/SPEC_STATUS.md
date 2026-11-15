@@ -87,7 +87,7 @@ authoritative source of truth; the spec is a historical design record. Point at
 - **Python client.** The wire + schema + query + mutation DSL, a sync `httpx`
   client (query/mutate, admin, storage — `pip install par-rt-db[http]`), and
   the reactive WebSocket client (`pip install par-rt-db[ws]`) all ship; the
-  four clients are at feature parity.
+  four clients were at feature parity (six, counting Go and Kotlin, now).
 - **Multi-instance.** ENH-022 shipped in stages: shared session/OAuth state and
   the cross-replica op feed (Stage 2), presence gossip (Stage 3), the
   advisory-lock ownership lease and shared rate counters (Stage 4), and write

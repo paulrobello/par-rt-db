@@ -20,12 +20,15 @@ covers and where its detailed documentation lives.
 
 No package has been published to a registry yet; consume
 each SDK from this repo — see its README for workspace setup. Registry
-publication is tag-driven by [`release.yml`](../.github/workflows/release.yml)
-and runs only after the full verification gate. Swift is the exception to local
+publication runs on a green push to `main` via
+[`release.yml`](../.github/workflows/release.yml) — the same run verifies the
+full gate first, publishes the version the tree declares, and creates the
+matching `vX.Y.Z` tag and GitHub release (armed by the `ENABLE_AUTO_PUBLISH`
+repository variable). Swift is the exception to local
 consumption: the repo's root `Package.swift` lets a Swift consumer add the
 package as a remote git dependency with `exact:` semantics — the declared
-semantic version (no `v` prefix) resolves against the corresponding `v`-tagged
-release.
+semantic version (no `v` prefix) resolves against the `vX.Y.Z` tag the
+release job creates.
 
 ## Surface comparison
 

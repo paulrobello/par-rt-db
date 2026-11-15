@@ -3,7 +3,7 @@
 Python client for [par-rt-db](..) — a port of the TypeScript SDK
 ([`../ts-client/`](../ts-client)) and Rust crate ([`../rust-client/`](../rust-client))
 for server-side and automation apps. Speaks the server's declarative
-query/transaction DSL; the wire layer is one of six implementations of
+query/transaction DSL; the wire layer is one of seven implementations of
 par-rt-db's JSON contract (alongside `server/src/protocol.rs`,
 `ts-client/src/protocol.ts`, `rust-client/src/wire.rs`, Swift's `Wire.swift`,
 and Go's `wire/`). No codegen: you
@@ -597,7 +597,7 @@ Published reference: https://paulrobello.github.io/par-rt-db/python/par_rt_db.ht
 
 ## Wire contract
 
-`src/par_rt_db/wire.py` is one of six implementations of par-rt-db's protocol
+`src/par_rt_db/wire.py` is one of seven implementations of par-rt-db's protocol
 contract (alongside the server, the TS SDK, the Rust crate, the Swift package,
 and the Go module). They must stay
 byte-identical — same discriminator tags (`type` / `op`), same camelCase field

@@ -131,7 +131,7 @@ Transactions support `.ExpectBefore(deadlineMs)` to require the authoritative cl
 
 ## Wire contract
 
-`wire/` is one of the six implementations of the par-rt-db protocol and must
+`wire/` is one of the seven implementations of the par-rt-db protocol and must
 stay byte-identical with the server (and the other clients' wire files).
 The [`wire-corpus/`](../wire-corpus/README.md) fixtures pin the envelope
 shapes, the error codes, the golden query vectors, and every semantics case —

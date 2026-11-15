@@ -310,8 +310,8 @@ the lockstep unit all the same. The seven implementations of the wire contract
 (`server/src/protocol.rs` plus the six client mirrors) are one unit;
 independent client versions would claim compatibility the seven-way mirror does
 not have. The release procedure,
-including the lockstep bump and tag-driven registry
-publication, is [`docs/RELEASING.md`](docs/RELEASING.md).
+including the lockstep bump and the push-to-main release
+publication pipeline, is [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## Pre-commit hooks
 
