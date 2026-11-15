@@ -60,6 +60,7 @@ pub mod tracing_setup;
 pub mod txn;
 mod util;
 pub mod value_expr;
+pub mod watchdog;
 pub mod webhook;
 pub mod workflows;
 pub mod ws;
@@ -555,6 +556,13 @@ impl AppState {
                 ),
             ));
         }
+        // Prod degradation hardening: committer write-path watchdog. Detection
+        // only — samples the committer queue gauges and flips the additive
+        // /healthz degraded_reason field when queue-wait p99 stays at wedge
+        // scale for 60s continuously (see `watchdog.rs`). Runs for the process
+        // lifetime regardless of multi-instance mode; the single-writer
+        // invariant is untouched (the watchdog only reads gauges).
+        background.spawn(watchdog::run(metrics.clone()));
         // ENH-022 Stage 4: rate-counter sweep. In multi-instance mode the
         // limiter's counters live in `rtdb_auth.rate_counters` (one row per
         // key per minute); this task drops buckets older than the current

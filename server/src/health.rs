@@ -3,9 +3,10 @@
 //! answer "what's running, and is it healthy?" without SSH.
 //!
 //! Security: the route is **unauthenticated** — the body is built only from
-//! build identity and reachability, never from `Config` (no tokens, secrets,
-//! OAuth credentials, allowlists, or internal hostnames). Reachability is
-//! probed with a bounded `SELECT 1`, never a value-bearing query.
+//! build identity, reachability, and aggregate committer queue gauges, never
+//! from `Config` (no tokens, secrets, OAuth credentials, allowlists, or
+//! internal hostnames). Reachability is probed with a bounded `SELECT 1`,
+//! never a value-bearing query.
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +42,19 @@ pub struct HealthReport {
     pub started_at: String,
     pub uptime_seconds: u64,
     pub postgres: bool,
+    /// Committer-watchdog signal: why the write path is degraded, when the
+    /// sustained queue-wait rule trips (see `watchdog.rs`). The HTTP status
+    /// stays bound to `postgres` so probers and the container healthcheck
+    /// keep treating this route as alive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<&'static str>,
+    /// Last watchdog sample of the committer queue-wait p99, microseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committer_queue_wait_p99_us: Option<u64>,
+    /// Last sampled per-db committer queue depth (best-effort; see the
+    /// gauge docs in `metrics`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committer_queue_depth: Option<u64>,
 }
 
 /// `GET /healthz`: 200 + `{status:"ok"}` when Postgres is reachable, 503 +
@@ -66,6 +80,9 @@ pub async fn handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
         None => (None, None, None),
     };
 
+    // Committer-watchdog sample: aggregate queue gauges only (no config or
+    // secrets), so they stay inside the unauthenticated body contract.
+    let watch = state.runtime.metrics.committer_watch_sample();
     let report = HealthReport {
         status: if postgres { "ok" } else { "degraded" },
         version,
@@ -74,6 +91,13 @@ pub async fn handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
         started_at: DateTime::<Utc>::from(state.runtime.started_at).to_rfc3339(),
         uptime_seconds,
         postgres,
+        degraded_reason: if state.runtime.metrics.committer_degraded() {
+            Some("committer_queue_sustained_wait")
+        } else {
+            None
+        },
+        committer_queue_wait_p99_us: Some(watch.queue_wait_p99_us),
+        committer_queue_depth: Some(watch.queue_depth),
     };
 
     let code = if postgres {
