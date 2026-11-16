@@ -411,12 +411,17 @@ async fn patch_clamps_retention_and_restores_default_on_zero() -> anyhow::Result
     let addr = spawn_app(state.clone()).await;
     let _guard = crate::common::background_guard(&state);
 
-    let patch = |addr: std::net::SocketAddr, body: serde_json::Value| {
+    // The PATCH persists to the GLOBAL rtdb_config row: hold the harness row
+    // lock across each send so the write cannot interleave into
+    // config_convergence_test's held span (CI flake).
+    let patch = |addr: std::net::SocketAddr, body: serde_json::Value| async move {
+        let _row_guard = crate::common::cluster::CONFIG_ROW_LOCK.lock().await;
         reqwest::Client::new()
             .patch(format!("http://{addr}/admin/config"))
             .header("Authorization", "Bearer test-admin-key")
             .json(&body)
             .send()
+            .await
     };
     // 5 clamps up to MIN_MAX_ROWS; 0 restores the default.
     let resp = patch(addr, serde_json::json!({"changeLogMaxRows": 5})).await?;

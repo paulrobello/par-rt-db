@@ -480,6 +480,17 @@ async fn spawn_replica(pool: &PgPool, _db: &str, opts: ReplicaOpts) -> Replica {
     }
 }
 
+/// The hot-config row (`rtdb_config`, id=1) is GLOBAL fixture state on the
+/// shared Postgres: `replica_state` wipes it before every multi-instance
+/// spawn, and `config_convergence_test` patches it and polls replicas'
+/// in-memory `ArcSwap`s while the row must stay intact. Under in-process
+/// parallel `cargo test` (CI has no nextest), a concurrent test's wipe landing
+/// between the convergence test's patch and the peer replica's reload leaves
+/// the peer an empty row forever — the CI-red flake this lock removes.
+/// `replica_state` holds it across the DELETE; the convergence tests hold it
+/// across their whole patch→converge span.
+pub static CONFIG_ROW_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub async fn replica_state(pool: &PgPool, opts: &ReplicaOpts) -> Arc<AppState> {
     let mut cfg = crate::common::test_config();
     cfg.multi_instance.enabled = true;
@@ -499,7 +510,9 @@ pub async fn replica_state(pool: &PgPool, opts: &ReplicaOpts) -> Arc<AppState> {
     // example) would otherwise override this replica's env seed and corrupt
     // exact-limit expectations (the shared rate-budget test denies at 4). The
     // row is this test harness's own fixture state on the dev db — wipe it so
-    // every cluster starts config-clean regardless of test order.
+    // every cluster starts config-clean regardless of test order, serialized
+    // against the convergence tests by CONFIG_ROW_LOCK (see that comment).
+    let _row_guard = CONFIG_ROW_LOCK.lock().await;
     sqlx::query("DELETE FROM rtdb_config")
         .execute(pool)
         .await

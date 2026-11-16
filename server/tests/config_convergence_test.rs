@@ -79,6 +79,12 @@ async fn patch_converges_across_replicas_without_restart() {
     let a = cluster.replica(crate::common::cluster::ReplicaId::A);
     let b = cluster.replica(crate::common::cluster::ReplicaId::B);
 
+    // The row is global fixture state: hold the harness lock across the whole
+    // patch→converge span so a concurrent test's replica_state DELETE cannot
+    // wipe the row between our PATCH and the peer's reload (CI flake — CI has
+    // no nextest, so the suite runs as in-process parallel cargo test).
+    let _row = crate::common::cluster::CONFIG_ROW_LOCK.lock().await;
+
     // Patch on A: B's in-memory view converges via the listener, no restart.
     patch_config(a.addr, json!({ "perTokenRpm": 1111 })).await;
     let hot_b = b.state.runtime.hot.clone();
@@ -115,6 +121,10 @@ async fn concurrent_patches_same_replica_all_survive() {
     let cluster = cluster().await;
     let a = cluster.replica(crate::common::cluster::ReplicaId::A);
     let b = cluster.replica(crate::common::cluster::ReplicaId::B);
+
+    // Same global-row hazard as the convergence test: hold the harness lock
+    // across the patches and both convergence polls.
+    let _row = crate::common::cluster::CONFIG_ROW_LOCK.lock().await;
 
     // Five concurrent PATCHes on ONE replica, each touching a different
     // field. Serialized by runtime.config_lock with an authoritative reload

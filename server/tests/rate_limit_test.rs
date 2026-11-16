@@ -560,6 +560,10 @@ async fn patched_rate_limits_apply_on_next_request_without_restart() -> anyhow::
             (1u32, reqwest::StatusCode::TOO_MANY_REQUESTS),
             (100, reqwest::StatusCode::OK),
         ] {
+            // The PATCH persists to the GLOBAL rtdb_config row: hold the
+            // harness row lock across the send (CI flake — see
+            // common::cluster::CONFIG_ROW_LOCK).
+            let _row_guard = crate::common::cluster::CONFIG_ROW_LOCK.lock().await;
             let patched = reqwest::Client::new()
                 .patch(format!("http://{addr}/admin/config"))
                 .header("Authorization", "Bearer test-admin-key")

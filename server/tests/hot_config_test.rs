@@ -19,8 +19,13 @@ use crate::common::{admin_get, admin_post, spawn_app, test_state, wrap_test_db};
 use rtdb_server::db;
 
 /// A PATCH helper, mirroring `crate::common::admin_post` (POST-only): bearer-authed
-/// with the test admin key `crate::common::test_config` seeds.
+/// with the test admin key `crate::common::test_config` seeds. The PATCH
+/// persists the merged row to the GLOBAL `rtdb_config`, so the send holds the
+/// harness `CONFIG_ROW_LOCK` — without it a hot-config patch interleaving into
+/// config_convergence_test's held span overwrites the values that test is
+/// polling for (the CI-red flake).
 async fn admin_patch(addr: SocketAddr, path: &str, body: serde_json::Value) -> reqwest::Response {
+    let _row = crate::common::cluster::CONFIG_ROW_LOCK.lock().await;
     reqwest::Client::new()
         .patch(format!("http://{addr}{path}"))
         .header("Authorization", "Bearer test-admin-key")
