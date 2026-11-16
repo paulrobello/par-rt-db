@@ -202,10 +202,14 @@ pub fn http_api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // clients). Machine tokens only; see the change-feed design spec.
         .route("/api/db/{db}/changes", get(changes_handler))
         // Upload bypasses axum's 2 MiB default body limit; `to_bytes` inside
-        // the handler enforces `RTDB_MAX_FILE_SIZE` as the sole ceiling.
+        // the handler enforces `RTDB_MAX_FILE_SIZE` as the sole ceiling. GET
+        // on the same path lists the db's files (bearer-authed like every
+        // sibling here; the disable-limit layer is a POST concern only).
         .route(
             "/api/storage/{db}",
-            post(upload_handler).layer(DefaultBodyLimit::disable()),
+            get(storage_list_handler)
+                .post(upload_handler)
+                .layer(DefaultBodyLimit::disable()),
         )
         // Authed serve lives in `storage_serve_routes` (kept outside the
         // router-wide gzip layer — see that fn's docs); this path stays here
@@ -525,7 +529,7 @@ pub(crate) use share::{
 };
 pub(crate) use storage::{
     delete_handler, metadata_handler, serve_authed_handler, serve_public_handler,
-    signed_url_handler, upload_handler,
+    signed_url_handler, storage_list_handler, upload_handler,
 };
 pub(crate) use workflow::{
     cancel_workflow_handler, list_workflows_handler, signal_workflow_handler,

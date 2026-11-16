@@ -666,6 +666,52 @@ def test_get_file_metadata_returns_file_metadata_model() -> None:
     assert meta.content_type is None  # omitted by the server → default
 
 
+def test_list_files_storage_returns_file_metadata_models() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["headers"] = dict(request.headers)
+        return httpx.Response(
+            200,
+            json={
+                "files": [
+                    {
+                        "id": "f2",
+                        "sha256": "bbb",
+                        "size": 3,
+                        "contentType": "text/plain",
+                        "creationTime": 20,
+                    },
+                    {"id": "f1", "sha256": "abc", "size": 9, "creationTime": 10},
+                ]
+            },
+        )
+
+    client = _client(handler)
+    files = client.list_files()
+    assert captured["path"] == f"/api/storage/{DB}"
+    assert captured["headers"]["authorization"] == BEARER
+    assert all(isinstance(f, FileMetadata) for f in files)
+    assert [f.id for f in files] == ["f2", "f1"]
+    assert files[0].content_type == "text/plain"
+    assert files[0].creation_time == 20
+    assert files[1].content_type is None  # contentType absent → default
+
+
+def test_list_files_storage_paging_query_params() -> None:
+    queries: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        queries.append(request.url.query.decode())
+        return httpx.Response(200, json={"files": []})
+
+    client = _client(handler)
+    client.list_files()
+    client.list_files(limit=2, offset=4)
+    assert queries == ["", "limit=2&offset=4"]
+
+
 def test_get_url_is_base_plus_storage_id_no_request() -> None:
     # No mock handler installed → any request would fail; get_url makes none.
     client = _client(lambda r: httpx.Response(500))

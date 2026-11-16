@@ -638,6 +638,22 @@ export class RtDbHttpClient {
     return body as FileMetadata;
   }
 
+  /**
+   * Lists stored files, newest first. `limit` (1..=1000, default 1000) and
+   * `offset` (>= 0, default 0) page the result; the server 400s on out-of-range values.
+   */
+  async listFiles(opts?: { limit?: number; offset?: number }): Promise<FileMetadata[]> {
+    const params = new URLSearchParams();
+    if (opts?.limit !== undefined) params.set("limit", String(opts.limit));
+    if (opts?.offset !== undefined) params.set("offset", String(opts.offset));
+    const qs = params.toString();
+    const body = await this.get(
+      `/api/storage/${encodeURIComponent(this.db)}${qs ? `?${qs}` : ""}`,
+      this.token,
+    );
+    return (body as { files: FileMetadata[] }).files;
+  }
+
   /** Mint a signed, time-limited URL for `id` via the server (GET mint endpoint). */
   async getSignedUrl(id: string, ttlSeconds?: number): Promise<SignedUrl> {
     let path = `/api/storage/${encodeURIComponent(this.db)}/${encodeURIComponent(id)}/signed-url`;

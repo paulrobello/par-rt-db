@@ -543,6 +543,23 @@ public actor RtDbHttpClient {
         }
     }
 
+    /// List the database's stored files (`GET /api/storage/{db}`) — newest
+    /// first. `limit` (1...1000, server default and ceiling 1000) and `offset`
+    /// (>= 0, default 0) page the listing; the server rejects invalid values.
+    public func listFiles(limit: Int? = nil, offset: Int? = nil) async throws -> [FileMetadata] {
+        var query: [URLQueryItem] = []
+        if let limit {
+            query.append(URLQueryItem(name: "limit", value: String(limit)))
+        }
+        if let offset {
+            query.append(URLQueryItem(name: "offset", value: String(offset)))
+        }
+        let response: FilesResponse = try await getJson(
+            "list files", "/api/storage/\(db)", query: query
+        )
+        return response.files
+    }
+
     /// Stored metadata for `id` (`GET /api/storage/{db}/{id}/metadata`);
     /// returns the raw `{id, sha256, size, contentType?, creationTime}` object.
     public func getFileMetadata(_ id: String) async throws -> JSONValue {
@@ -924,6 +941,10 @@ private struct MeResponse: Decodable {
 
 private struct UploadResponse: Decodable {
     let id: String
+}
+
+private struct FilesResponse: Decodable {
+    let files: [FileMetadata]
 }
 
 private struct SignedUrlResponse: Decodable {

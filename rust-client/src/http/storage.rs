@@ -202,6 +202,36 @@ impl RtDbHttpClient {
         crate::http_common::deserialize::<FileMetadata>(resp).await
     }
 
+    /// List stored files via `GET /api/storage/{db}` — newest-first.
+    /// `limit` (1..=1000, server default 1000) and `offset` (>= 0, default 0)
+    /// page the result; `None` omits the query parameter.
+    pub async fn list_files(
+        &self,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<Vec<FileMetadata>, RtDbError> {
+        let mut req = self
+            .client
+            .get(format!("{}/api/storage/{}", self.url, self.db))
+            .authed(&self.token);
+        if let Some(limit) = limit {
+            req = req.query(&[("limit", limit)]);
+        }
+        if let Some(offset) = offset {
+            req = req.query(&[("offset", offset)]);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| RtDbError::internal(format!("list files request failed: {e}")))?;
+        #[derive(serde::Deserialize)]
+        struct FileList {
+            files: Vec<FileMetadata>,
+        }
+        let parsed = crate::http_common::deserialize::<FileList>(resp).await?;
+        Ok(parsed.files)
+    }
+
     /// Mint an HMAC-signed, time-limited public URL for `id` via
     /// `GET /api/storage/{db}/{id}/signed-url`. Pass `ttl_seconds` to override
     /// the server default lifetime; `None` omits the query parameter. Unlike

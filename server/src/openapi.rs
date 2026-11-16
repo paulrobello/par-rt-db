@@ -321,13 +321,22 @@ pub fn document() -> Value {
     add(
         &mut paths,
         "/api/storage/{db}",
-        &[(
-            "post",
-            op(
-                "Upload a blob (body size capped by RTDB_MAX_FILE_SIZE)",
-                "Storage",
+        &[
+            (
+                "get",
+                op(
+                    "List the database's storage files (newest-first; page with limit (default 1000, ceiling 1000) and offset; per-file visibility follows the serve/metadata owner semantics)",
+                    "Storage",
+                ),
             ),
-        )],
+            (
+                "post",
+                op(
+                    "Upload a blob (body size capped by RTDB_MAX_FILE_SIZE)",
+                    "Storage",
+                ),
+            ),
+        ],
     );
     add(
         &mut paths,

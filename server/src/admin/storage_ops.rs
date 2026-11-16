@@ -38,7 +38,7 @@ pub(super) async fn admin_storage_list(
         return Err(RtDbError::not_found("unknown database"));
     }
     storage::ensure_table(&state.pool, &db).await?;
-    let files = storage::list(&state.pool, &db).await?;
+    let files = storage::list(&state.pool, &db, 1000, 0).await?;
     Ok(Json(AdminStorageListResponse { files }))
 }
 

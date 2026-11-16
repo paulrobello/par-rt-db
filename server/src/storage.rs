@@ -739,19 +739,29 @@ pub async fn get_meta(pool: &PgPool, db: &str, id: &str) -> Result<Option<FileMe
     Ok(row.map(storage_meta_to_file_meta))
 }
 
-/// Lists every file's metadata in a database, newest-first. Capped at 1000 so a
-/// huge store can't OOM the admin surface (operator listing, not a data path).
-/// Same column set as `get_meta`; identifiers are the validated schema + the
-/// fixed `storage` table name, so double-quoting via `format!` is safe.
-pub async fn list(pool: &PgPool, db: &str) -> Result<Vec<FileMeta>, RtDbError> {
+/// Lists file metadata in a database, newest-first, `limit` rows starting at
+/// `offset` (stable while no files are uploaded between pages). The `limit`
+/// ceiling of 1000 keeps a huge store from OOMing the operator listing surface
+/// (operator/consumer listing, not a data path). Same column set as
+/// `get_meta`; identifiers are the validated schema + the fixed `storage`
+/// table name, so double-quoting via `format!` is safe, and limit/offset are
+/// bound values, never interpolated.
+pub async fn list(
+    pool: &PgPool,
+    db: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<FileMeta>, RtDbError> {
     validate_db_name(db)?;
     let schema = pg_schema(db);
     let rows: Vec<StorageMetaRow> = sqlx::query_as(AssertSqlSafe(format!(
         "SELECT id, sha256, size, content_type, created_at, owner_id
          FROM \"{schema}\".storage
          ORDER BY created_at DESC
-         LIMIT 1000"
+         LIMIT $1 OFFSET $2"
     )))
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(storage_meta_to_file_meta).collect())

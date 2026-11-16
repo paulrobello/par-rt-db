@@ -683,6 +683,52 @@ async def test_get_file_metadata_returns_file_metadata_model() -> None:
     assert meta.content_type is None  # omitted by the server → default
 
 
+async def test_list_files_storage_returns_file_metadata_models() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["headers"] = dict(request.headers)
+        return httpx.Response(
+            200,
+            json={
+                "files": [
+                    {
+                        "id": "f2",
+                        "sha256": "bbb",
+                        "size": 3,
+                        "contentType": "text/plain",
+                        "creationTime": 20,
+                    },
+                    {"id": "f1", "sha256": "abc", "size": 9, "creationTime": 10},
+                ]
+            },
+        )
+
+    async with _client(handler) as c:
+        files = await c.list_files()
+    assert captured["path"] == f"/api/storage/{DB}"
+    assert captured["headers"]["authorization"] == BEARER
+    assert all(isinstance(f, FileMetadata) for f in files)
+    assert [f.id for f in files] == ["f2", "f1"]
+    assert files[0].content_type == "text/plain"
+    assert files[0].creation_time == 20
+    assert files[1].content_type is None  # contentType absent → default
+
+
+async def test_list_files_storage_paging_query_params() -> None:
+    queries: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        queries.append(request.url.query.decode())
+        return httpx.Response(200, json={"files": []})
+
+    async with _client(handler) as c:
+        await c.list_files()
+        await c.list_files(limit=2, offset=4)
+    assert queries == ["", "limit=2&offset=4"]
+
+
 async def test_async_get_signed_url_passes_ttl() -> None:
     seen: dict[str, str] = {}
 

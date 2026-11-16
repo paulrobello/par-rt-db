@@ -261,6 +261,35 @@ class HttpClientTest {
     }
 
     @Test
+    fun `storage list files decodes newest-first and maps errors`() = run10 {
+        TestHttpServer().use { srv ->
+            val c = RtDbHttpClient(srv.baseUrl, "app", "t")
+            srv.reply(200, """{"files":[{"id":"f2","sha256":"h2","size":5,"contentType":"text/plain","creationTime":20},{"id":"f1","sha256":"h1","size":3,"creationTime":10}]}""")
+            val files = c.listFiles()
+            assertEquals("/api/storage/app", srv.requests.last().path)
+            assertEquals("GET", srv.requests.last().method)
+            assertEquals("Bearer t", srv.requests.last().header("Authorization"))
+            assertEquals(2, files.size)
+            assertEquals("f2", files[0].id)
+            assertEquals("h2", files[0].sha256)
+            assertEquals(5, files[0].size)
+            assertEquals("text/plain", files[0].contentType)
+            assertEquals(20, files[0].creationTime)
+            assertNull(files[1].contentType)
+            assertEquals("", srv.requests.last().query ?: "")
+            srv.reply(200, """{"files":[]}""")
+            c.listFiles(limit = 2)
+            assertEquals("limit=2", srv.requests.last().query)
+            srv.reply(200, """{"files":[]}""")
+            c.listFiles(limit = 2, offset = 4)
+            assertEquals("limit=2&offset=4", srv.requests.last().query)
+            assertEquals("/api/storage/app", srv.requests.last().path)
+            srv.reply(403, """{"code":"FORBIDDEN","message":"wrong db"}""")
+            assertEquals(ErrorCode.FORBIDDEN, assertFailsWith<RtDbException> { c.listFiles() }.code)
+        }
+    }
+
+    @Test
     fun `url builders match go`() {
         val c = RtDbHttpClient("http://h:1/", "app", "t")
         assertEquals("http://h:1/storage/f", c.getUrl("f"))

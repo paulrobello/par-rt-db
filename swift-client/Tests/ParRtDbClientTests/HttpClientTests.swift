@@ -743,6 +743,55 @@ struct HttpClientTests {
         #expect(url == "http://x/storage/f1?exp=9&sig=ab")
     }
 
+    @Test func listFilesDecodesNewestFirstPage() async throws {
+        StubProtocol.handler = { request in
+            try demand(request.httpMethod == "GET", "expected GET")
+            try demand(request.url?.path == "/api/storage/app", "expected /api/storage/app")
+            try demand(
+                request.value(forHTTPHeaderField: "Authorization") == "Bearer tok",
+                "missing bearer authorization"
+            )
+            let files = """
+            {"files":[{"id":"f1","sha256":"abc","size":4,"contentType":"image/png",
+            "creationTime":9},{"id":"f2","sha256":"def","size":1,"creationTime":8}]}
+            """
+            return (200, Data(files.utf8))
+        }
+        let files = try await makeClient().listFiles()
+        #expect(files.count == 2)
+        #expect(files[0] == FileMetadata(id: "f1", sha256: "abc", size: 4, contentType: "image/png", creationTime: 9))
+        #expect(files[1].contentType == nil)
+    }
+
+    @Test func listFilesPagingQueryParams() async throws {
+        nonisolated(unsafe) var seen: [String?] = []
+        StubProtocol.handler = { request in
+            try demand(request.url?.path == "/api/storage/app", "expected /api/storage/app")
+            seen.append(request.url?.query)
+            return (200, Data(#"{"files":[]}"#.utf8))
+        }
+        let client = makeClient()
+        _ = try await client.listFiles()
+        _ = try await client.listFiles(limit: 2)
+        _ = try await client.listFiles(limit: 2, offset: 4)
+        _ = try await client.listFiles(offset: 4)
+        #expect(seen == [nil, "limit=2", "limit=2&offset=4", "offset=4"])
+    }
+
+    @Test func listFilesForbiddenEnvelopeBecomesRtDbError() async throws {
+        StubProtocol.handler = { request in
+            try demand(request.url?.path == "/api/storage/app", "expected /api/storage/app")
+            return (403, Data(#"{"code":"FORBIDDEN","message":"db mismatch"}"#.utf8))
+        }
+        do {
+            _ = try await makeClient().listFiles()
+            Issue.record("listFiles should throw on a 403 envelope")
+        } catch let error as RtDbError {
+            #expect(error.code == .forbidden)
+            #expect(error.message == "db mismatch")
+        }
+    }
+
     // MARK: change feed
 
     @Test func changesSendsCursorQueryAndDecodesPage() async throws {

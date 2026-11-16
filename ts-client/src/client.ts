@@ -649,6 +649,11 @@ export class RtDbClient {
     return this.httpForStorage().getFileMetadata(id);
   }
 
+  /** List stored files, newest first (server-capped at 1000). */
+  listFiles() {
+    return this.httpForStorage().listFiles();
+  }
+
   /** Mint an HMAC-signed, time-limited public URL for one blob (default 1h,
    * max 7d). Unlike `getUrl` this makes a network request. */
   getSignedUrl(id: string, ttlSeconds?: number) {

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -136,6 +137,31 @@ func (c *Client) GetFileMetadata(ctx context.Context, id string) (*FileMetadata,
 		return nil, err
 	}
 	return &out, nil
+}
+
+// ListFiles lists the db's files, newest-first, server-capped at 1000.
+// GET /api/storage/{db}. Optional paging: limit>0 is sent as ?limit (the
+// server clamps to 1..=1000), offset>=0 is sent as ?offset; limit<=0 or
+// offset<0 omits that query param, so ListFiles(ctx, 0, -1) sends no query.
+func (c *Client) ListFiles(ctx context.Context, limit, offset int) ([]FileMetadata, error) {
+	path := "/api/storage/" + c.db
+	q := url.Values{}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	if offset >= 0 {
+		q.Set("offset", strconv.Itoa(offset))
+	}
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	var out struct {
+		Files []FileMetadata `json:"files"`
+	}
+	if err := c.do(ctx, http_GET, path, nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Files, nil
 }
 
 // GetSignedURL mints a time-limited signed URL. GET .../signed-url.

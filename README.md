@@ -288,6 +288,7 @@ compression.
 
 | Method & path | Auth | Description |
 | --- | --- | --- |
+| `GET /api/storage/{db}` | Bearer token | Lists the db's files, newest-first, paged: optional `?limit=N` (default 1000, ceiling 1000) and `?offset=M` (default 0) → `{ files: [{ id, sha256, size, contentType?, creationTime }] }`; invalid values are 400s. Per-file visibility follows the serve/metadata owner semantics (SEC-118): rows the caller could not fetch via `/metadata` are excluded from the listing, not an error, and `ownerId` never appears on the wire. Lets a database-scoped token sweep its own orphans without the instance admin key. |
 | `POST /api/storage/{db}` | Bearer token | Upload: raw body + `Content-Type` → `{ id, sha256, size, contentType }`. Enforces `RTDB_MAX_FILE_SIZE`. |
 | `GET /storage/{id}` | **none** | **Unauthenticated public serve** — anyone with the opaque uuid-v7 URL fetches it (Convex parity; revoke by delete). The single unauthenticated route. |
 | `GET /api/storage/{db}/{id}` | Bearer token | Authed, caller-db-scoped serve. |

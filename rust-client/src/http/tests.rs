@@ -1313,6 +1313,69 @@ async fn protocol_header_rides_every_route_not_just_query_mutate_batch() {
 }
 
 #[tokio::test]
+async fn list_files_gets_the_db_route_with_bearer_and_parses_file_meta() {
+    let (server, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/api/storage/t%3Cuuid%3E"))
+        .and(header("authorization", "Bearer machine-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "files": [
+                {
+                    "id": "f2", "sha256": "def", "size": 13,
+                    "contentType": "image/png", "creationTime": 9
+                },
+                {
+                    "id": "f1", "sha256": "abc", "size": 9, "creationTime": 5
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+    let files = client.list_files(None, None).await.unwrap();
+    assert_eq!(files.len(), 2);
+    // Newest-first, as the server orders them; decode keeps every field.
+    assert_eq!(files[0].id, "f2");
+    assert_eq!(files[0].content_type.as_deref(), Some("image/png"));
+    assert_eq!(files[0].creation_time, 9);
+    // An entry without `contentType` decodes to None (additive/absent field).
+    assert_eq!(files[1].id, "f1");
+    assert_eq!(files[1].content_type, None);
+    assert_eq!(files[1].creation_time, 5);
+}
+
+#[tokio::test]
+async fn list_files_sends_paging_query_only_when_some() {
+    let (server, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/api/storage/t%3Cuuid%3E"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "files": [] })))
+        .mount(&server)
+        .await;
+    client.list_files(Some(2), Some(4)).await.unwrap();
+    client.list_files(None, None).await.unwrap();
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[0].url.query(), Some("limit=2&offset=4"));
+    assert_eq!(reqs[1].url.query(), None);
+}
+
+#[tokio::test]
+async fn list_files_surfaces_error_envelope() {
+    // A token scoped to another db hits the same auth/error path as the
+    // sibling storage routes: the standard {code,message} envelope.
+    let (server, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/api/storage/t%3Cuuid%3E"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "code": "FORBIDDEN", "message": "token is not valid for this db"
+        })))
+        .mount(&server)
+        .await;
+    let err = client.list_files(None, None).await.unwrap_err();
+    assert_eq!(err.code, crate::error::ErrorCode::Forbidden);
+}
+
+#[tokio::test]
 async fn get_signed_url_builds_get_with_optional_ttl() {
     let (server, client) = setup().await;
     // With ttl — asserts the query param is sent.

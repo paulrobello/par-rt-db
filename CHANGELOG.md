@@ -127,6 +127,17 @@ alter observable behavior on upgrade.
 
 ### Added
 
+- **Database-scoped storage listing (`GET /api/storage/{db}`)**. Storage
+  listing used to be admin-only, so a consumer needed the instance admin key
+  just to sweep its own orphans. The db-scoped route carries the same bearer
+  gate as the sibling storage routes and returns `{files: [...]}` newest-first,
+  paged with optional `limit` (default 1000, ceiling 1000) and `offset` query
+  params; per-file visibility follows the serve/metadata
+  owner semantics — rows the caller could not fetch via `/metadata` are
+  excluded from the listing rather than erroring it — and `ownerId` never
+  appears on the wire (SEC-118). Mirrored across all six clients: ts
+  `listFiles`, rust `list_files`, python `list_files` (sync + async), go
+  `ListFiles`, swift `listFiles`, kotlin `listFiles`.
 - **Wire-corpus coverage batch (QA-008 sweep follow-up).** The workflow
   client frames (`startWorkflow` with a spec, `cancelWorkflow`, `listWorkflows`
   with and without the optional status filter) now have corpus cases — the

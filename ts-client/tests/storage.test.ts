@@ -128,6 +128,67 @@ describe("in-memory storage", () => {
     });
   });
 
+  it("listFiles GETs the db storage route with bearer + protocol headers and decodes files (contentType absent-when-absent)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          files: [
+            { id: "f2", sha256: "def", size: 5, contentType: "image/png", creationTime: 200 },
+            { id: "f1", sha256: "abc", size: 3, creationTime: 100 },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    const http = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+    const files = await http.listFiles();
+    expect(files).toEqual([
+      { id: "f2", sha256: "def", size: 5, contentType: "image/png", creationTime: 200 },
+      { id: "f1", sha256: "abc", size: 3, creationTime: 100 },
+    ]);
+    // contentType stays a missing key when the server omitted it.
+    expect("contentType" in files[1]).toBe(false);
+    const [calledUrl, init] = fetchMock.mock.calls[0];
+    expect(calledUrl).toBe("http://h:8300/api/storage/kanban");
+    expect(init.method).toBe("GET");
+    expect(init.headers).toEqual({
+      Authorization: "Bearer tok",
+      "X-Rtdb-Protocol": String(PROTOCOL_VERSION),
+    });
+  });
+
+  it("listFiles appends limit/offset query params only when provided", async () => {
+    const fetchMock = vi.fn().mockImplementation(
+      async () =>
+        new Response(JSON.stringify({ files: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    const http = new RtDbHttpClient({
+      url: "http://h:8300",
+      db: "kanban",
+      token: "tok",
+      fetch: fetchMock,
+    });
+    await http.listFiles();
+    await http.listFiles({ limit: 2 });
+    await http.listFiles({ limit: 2, offset: 4 });
+    await http.listFiles({ offset: 4 });
+    const urls = fetchMock.mock.calls.map((c) => c[0]);
+    expect(urls).toEqual([
+      "http://h:8300/api/storage/kanban",
+      "http://h:8300/api/storage/kanban?limit=2",
+      "http://h:8300/api/storage/kanban?limit=2&offset=4",
+      "http://h:8300/api/storage/kanban?offset=4",
+    ]);
+  });
+
   it("forwards a ReadableStream body to fetch verbatim (ENH-021)", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ id: "f1", sha256: "abc", size: 3 }), {

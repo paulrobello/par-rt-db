@@ -643,6 +643,19 @@ class RtDbAsyncHttpClient:
         resp = await self._send("GET", f"/api/storage/{self._db}/{id}/metadata")
         return FileMetadata.model_validate(resp.json())
 
+    async def list_files(
+        self, limit: int | None = None, offset: int | None = None
+    ) -> list[FileMetadata]:
+        """``GET /api/storage/{db}[?limit=&offset=]`` → the db's stored files,
+        newest-first. The server defaults to 1000 files and caps ``limit`` at 1000."""
+        params: dict[str, Any] = {}
+        if limit is not None:
+            params["limit"] = limit
+        if offset is not None:
+            params["offset"] = offset
+        resp = await self._send("GET", f"/api/storage/{self._db}", params=params or None)
+        return [FileMetadata.model_validate(f) for f in resp.json()["files"]]
+
     async def get_signed_url(self, id: str, *, ttl_seconds: int | None = None) -> SignedUrl:
         """``GET /api/storage/{db}/{id}/signed-url`` → ``SignedUrl`` (async)."""
         params = {"ttlSeconds": ttl_seconds} if ttl_seconds is not None else None

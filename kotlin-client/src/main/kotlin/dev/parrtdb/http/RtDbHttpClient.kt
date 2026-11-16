@@ -231,6 +231,16 @@ class RtDbHttpClient(
 
     suspend fun getFileMetadata(id: String): FileMetadata = FileMetadata.fromJson(core.json("GET", "/api/storage/$db/$id/metadata"))
 
+    /** GET /api/storage/{db} → this db's file metadata, newest-first (server-capped at 1000); optional [limit] (1..=1000) and [offset] (>= 0) page it. */
+    suspend fun listFiles(limit: Int? = null, offset: Int? = null): List<FileMetadata> {
+        val params = buildList {
+            if (limit != null) add("limit" to limit.toString())
+            if (offset != null) add("offset" to offset.toString())
+        }
+        val o = StrictObj.of(core.json("GET", withQuery("/api/storage/$db", params)), "listFilesResponse")
+        return o.arr("files").map { FileMetadata.fromJson(it) }
+    }
+
     /** GET /api/storage/{db}/{id}/signed-url?ttlSeconds= */
     suspend fun getSignedUrl(id: String, ttlSeconds: Int? = null): SignedUrl {
         val path = "/api/storage/$db/$id/signed-url" + (ttlSeconds?.let { "?ttlSeconds=$it" } ?: "")

@@ -805,6 +805,76 @@ pub(crate) async fn metadata_handler(
     enforce_blob_owner(&principal, &meta.owner_id)?;
     Ok(Json(meta))
 }
+
+/// Response envelope for `GET /api/storage/{db}` — same `{files}` shape the
+/// admin listing returns, so a consumer can sweep orphans with its db token
+/// instead of the instance admin key (card 01a1e047).
+#[derive(Serialize)]
+pub(crate) struct StorageListResponse {
+    files: Vec<storage::FileMeta>,
+}
+
+/// `GET /api/storage/{db}?limit=&offset=` — list this db's files, newest-first,
+/// paged with `limit` (default 1000, ceiling 1000) and `offset` (default 0).
+/// Bearer-authed like every sibling db-scoped storage
+/// route (`authed` + rate limit). Per-file visibility follows the
+/// serve/metadata owner semantics (`enforce_blob_owner`): rows the principal
+/// could not fetch via `/metadata` are EXCLUDED rather than 403ing the whole
+/// listing — one foreign row must not fail an orphan sweep. `owner_id` never
+/// serializes (`#[serde(skip)]`), matching the metadata route's redaction.
+pub(crate) async fn storage_list_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(db): Path<String>,
+    AxumQuery(q): AxumQuery<HashMap<String, String>>,
+) -> Result<Json<StorageListResponse>, RtDbError> {
+    let principal = authed(&state, &headers, &db).await?;
+    check_http_rate_limits(&state, &principal, &db).await?;
+    storage::ensure_table(&state.pool, &db).await?;
+    let limit = parse_page_limit(&q)?;
+    let offset = parse_page_offset(&q)?;
+    let files: Vec<storage::FileMeta> = storage::list(&state.pool, &db, limit, offset)
+        .await?
+        .into_iter()
+        .filter(|meta| enforce_blob_owner(&principal, &meta.owner_id).is_ok())
+        .collect();
+    Ok(Json(StorageListResponse { files }))
+}
+
+/// Page-size ceiling for storage listings — the same 1000 the admin listing
+/// has always returned, so the db-scoped route can't exceed what an operator
+/// could already fetch.
+const STORAGE_LIST_MAX_LIMIT: i64 = 1000;
+
+fn parse_page_limit(q: &HashMap<String, String>) -> Result<i64, RtDbError> {
+    match q.get("limit") {
+        None => Ok(STORAGE_LIST_MAX_LIMIT),
+        Some(raw) => {
+            let limit: i64 = raw
+                .parse()
+                .map_err(|_| RtDbError::bad_request("limit must be an integer"))?;
+            if !(1..=STORAGE_LIST_MAX_LIMIT).contains(&limit) {
+                return Err(RtDbError::bad_request("limit must be between 1 and 1000"));
+            }
+            Ok(limit)
+        }
+    }
+}
+
+fn parse_page_offset(q: &HashMap<String, String>) -> Result<i64, RtDbError> {
+    match q.get("offset") {
+        None => Ok(0),
+        Some(raw) => {
+            let offset: i64 = raw
+                .parse()
+                .map_err(|_| RtDbError::bad_request("offset must be an integer"))?;
+            if offset < 0 {
+                return Err(RtDbError::bad_request("offset must not be negative"));
+            }
+            Ok(offset)
+        }
+    }
+}
 #[cfg(test)]
 mod range_tests {
     use super::{RangeOutcome, resolve_byte_range};

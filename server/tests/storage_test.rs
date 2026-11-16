@@ -1658,3 +1658,206 @@ async fn cross_token_delete_is_forbidden_but_read_stays_open() -> anyhow::Result
     assert_eq!(resp.status(), StatusCode::OK);
     Ok(())
 }
+
+/// `GET /api/storage/{db}` (card 01a1e047): a db-scoped listing so a consumer
+/// can sweep its own orphans without the instance admin key. Visibility
+/// follows the serve/metadata owner semantics (`enforce_blob_owner`) — rows
+/// the caller could not fetch via `/metadata` are EXCLUDED from the listing
+/// rather than 403ing it. `owner_id` never serializes (SEC-118 `#[serde(skip)]`).
+#[tokio::test]
+async fn storage_list_requires_bearer() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    storage::ensure_table(&state.pool, &db).await?;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/api/storage/{db}"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_list_machine_token_lists_db_files() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    storage::ensure_table(&state.pool, &db).await?;
+    let token = mint_token(addr, &db).await;
+    let a = upload(&addr, &db, &token, b"alpha").await;
+    let b = upload_no_ct(&addr, &db, &token, b"beta").await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/api/storage/{db}"))
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    let files = body["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 2);
+    let ids: Vec<&str> = files.iter().map(|f| f["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&a.as_str()) && ids.contains(&b.as_str()));
+    // Newest-first, SEC-118 owner redaction: the private owner column must
+    // never appear on the wire.
+    for f in files {
+        assert!(
+            f.get("ownerId").is_none(),
+            "ownerId must never serialize: {f}"
+        );
+        assert!(f["id"].is_string() && f["sha256"].is_string());
+        assert!(f["size"].is_i64() && f["creationTime"].is_i64());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_list_paging_limits_and_offsets() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    storage::ensure_table(&state.pool, &db).await?;
+    let token = mint_token(addr, &db).await;
+    let a = upload(&addr, &db, &token, b"alpha").await;
+    let b = upload(&addr, &db, &token, b"beta").await;
+    let c = upload(&addr, &db, &token, b"gamma").await;
+
+    // Page 1: limit=2, offset=0 → the two newest (c, b), owner filter idle.
+    let page1: serde_json::Value = reqwest::Client::new()
+        .get(format!("http://{addr}/api/storage/{db}?limit=2&offset=0"))
+        .bearer_auth(&token)
+        .send()
+        .await?
+        .json()
+        .await?;
+    let p1: Vec<&str> = page1["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(p1, vec![c.as_str(), b.as_str()]);
+
+    // Page 2: offset=2 → the oldest remaining (a).
+    let page2: serde_json::Value = reqwest::Client::new()
+        .get(format!("http://{addr}/api/storage/{db}?limit=2&offset=2"))
+        .bearer_auth(&token)
+        .send()
+        .await?
+        .json()
+        .await?;
+    let p2: Vec<&str> = page2["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(p2, vec![a.as_str()]);
+
+    // Beyond the end → empty, not an error.
+    let page3: serde_json::Value = reqwest::Client::new()
+        .get(format!("http://{addr}/api/storage/{db}?limit=2&offset=3"))
+        .bearer_auth(&token)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(page3["files"].as_array().unwrap().len(), 0);
+
+    // Invalid params are 400s, not silent clamps.
+    let bad_limit = reqwest::Client::new()
+        .get(format!("http://{addr}/api/storage/{db}?limit=0"))
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    assert_eq!(bad_limit.status(), StatusCode::BAD_REQUEST);
+    let big_limit = reqwest::Client::new()
+        .get(format!("http://{addr}/api/storage/{db}?limit=1001"))
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    assert_eq!(big_limit.status(), StatusCode::BAD_REQUEST);
+    let neg_offset = reqwest::Client::new()
+        .get(format!("http://{addr}/api/storage/{db}?offset=-1"))
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    assert_eq!(neg_offset.status(), 400);
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_list_foreign_db_token_rejected() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db1 = fresh_db(&state).await;
+    let db2 = fresh_db(&state).await;
+    storage::ensure_table(&state.pool, &db1).await?;
+    let token2 = mint_token(addr, &db2).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/api/storage/{db1}"))
+        .bearer_auth(&token2)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_list_user_visibility_filter() -> anyhow::Result<()> {
+    let state = test_state().await;
+    let addr = spawn_app(state.clone()).await;
+    let db = fresh_db(&state).await;
+    storage::ensure_table(&state.pool, &db).await?;
+    allowlist_add(addr, &db, "alice@example.com").await;
+    allowlist_add(addr, &db, "bob@example.com").await;
+    let alice = mint_user_session(&state.pool, "alice", "alice@example.com").await;
+    let bob = mint_user_session(&state.pool, "bob", "bob@example.com").await;
+    let machine = mint_token(addr, &db).await;
+
+    // Alice uploads (owner "alice"); the machine token uploads its own row
+    // (owner `machine:{token_id}`).
+    let alice_id = upload(&addr, &db, &alice, b"alice's file").await;
+    let machine_id = upload(&addr, &db, &machine, b"machine file").await;
+
+    // Bob lists: he passes the db gate, but Alice's row fails
+    // `enforce_blob_owner` — excluded, not a 403. The machine-owned row is
+    // visible to him (serve/metadata db-open semantics).
+    let bob_list = reqwest::Client::new()
+        .get(format!("http://{addr}/api/storage/{db}"))
+        .bearer_auth(&bob)
+        .send()
+        .await?;
+    assert_eq!(bob_list.status(), StatusCode::OK);
+    let bob_files: serde_json::Value = bob_list.json().await?;
+    let bob_ids: Vec<&str> = bob_files["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(bob_ids, [machine_id.as_str()]);
+
+    // Alice sees her own row plus the machine row.
+    let alice_list = reqwest::Client::new()
+        .get(format!("http://{addr}/api/storage/{db}"))
+        .bearer_auth(&alice)
+        .send()
+        .await?;
+    assert_eq!(alice_list.status(), StatusCode::OK);
+    let alice_files: serde_json::Value = alice_list.json().await?;
+    let mut alice_ids: Vec<&str> = alice_files["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    alice_ids.sort_unstable();
+    let mut expected = [alice_id.as_str(), machine_id.as_str()];
+    expected.sort_unstable();
+    assert_eq!(alice_ids, expected);
+    Ok(())
+}
