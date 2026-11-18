@@ -896,6 +896,17 @@ the argv.
 
 Common operator symptoms on the live deploy:
 
+- **A one-off client error right after a deploy: "2xx with no JSON object
+  body" or a truncated response on `/api/query`.** Known deploy transient
+  (verified 2026-11-18): during the container swap, `cloudflared`'s pooled
+  upstream connections to `127.0.0.1:8300` die with the old process, and for
+  a ~5s window requests raced onto the dead pooled conns (`connection reset
+  by peer` / `broken pipe` / `EOF` in the tunnel journal) before its pool
+  healed. The server's graceful drain is not involved — in-flight requests
+  the old process accepted complete normally (`shutdown_drain_ms` 30s sits
+  inside `stop_grace_period` 45s); only tunnel-pool churn is affected.
+  Immediate retry succeeds. Detect: `journalctl -u cloudflared --since
+  '<deploy timestamp>' | grep 'Unable to reach the origin service'`.
 - **`/healthz` returns 503 with `"status":"degraded"` / `"postgres":false`** —
   the server process is up but cannot reach Postgres. Check
   `docker compose ps`, the `rtdb-pg` container health, and the
