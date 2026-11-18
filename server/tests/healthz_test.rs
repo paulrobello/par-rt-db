@@ -136,6 +136,54 @@ async fn healthz_returns_diagnostics() -> anyhow::Result<()> {
         "uptime should be near zero for a freshly spawned server"
     );
 
+    // Pool-stall watchdog (prod degradation hardening): the monitor probes
+    // the pool immediately on spawn; poll briefly so the assertion doesn't
+    // race the probe cadence. The probe latency must land as a plain number
+    // and every degradation reason must stay within the two known watchdog
+    // values (structural pin for consumers — no threshold-dependent assert,
+    // so a loaded CI box cannot flake it).
+    let mut probed: Option<serde_json::Value> = None;
+    let mut reasons = Vec::new();
+    let mut primary_reason = Option::<String>::None;
+    for _ in 0..40 {
+        let text = reqwest::get(format!("http://{addr}/healthz"))
+            .await?
+            .text()
+            .await?;
+        let polled: serde_json::Value = serde_json::from_str(&text)?;
+        if polled["pool_probe_wait_us"].is_u64() {
+            probed = Some(polled["pool_probe_wait_us"].clone());
+        }
+        reasons = polled["degraded_reasons"]
+            .as_array()
+            .map(|a| a.to_vec())
+            .unwrap_or_default();
+        primary_reason = polled["degraded_reason"].as_str().map(str::to_string);
+        if probed.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let wait = probed.expect("pool monitor should complete its first probe within ~4s of spawn");
+    assert!(
+        wait.as_u64().unwrap() < 5_000_000,
+        "probe latency must stay under the probe timeout: {wait}"
+    );
+    let known = ["pool_stalled", "committer_queue_sustained_wait"];
+    for r in &reasons {
+        let v = r.as_str().expect("degraded_reasons entries are strings");
+        assert!(
+            known.contains(&v),
+            "unknown degraded_reason value {v:?} — a new watchdog reason must be added here"
+        );
+    }
+    // `degraded_reason` mirrors the PRIMARY (first) reason; null when none.
+    assert_eq!(
+        primary_reason.as_deref(),
+        reasons.first().and_then(|r| r.as_str()),
+        "degraded_reason must equal degraded_reasons[0]"
+    );
+
     // An admin-authed request DOES surface the fingerprint (SEC-129).
     let admin_resp = reqwest::Client::new()
         .get(format!("http://{addr}/healthz"))

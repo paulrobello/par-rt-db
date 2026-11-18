@@ -36,6 +36,7 @@ pub mod notify;
 pub mod op_feed;
 pub mod openapi;
 pub mod pagination;
+pub mod pool_watch;
 pub mod presence;
 pub mod privacy;
 pub mod protocol;
@@ -579,6 +580,17 @@ impl AppState {
         // lifetime regardless of multi-instance mode; the single-writer
         // invariant is untouched (the watchdog only reads gauges).
         background.spawn(watchdog::run(metrics.clone()));
+        // Prod degradation hardening, postgres-side class (2026-11-16
+        // evidence): episodic host I/O degradation stalls postgres and the
+        // connection pool stalls SILENTLY — the episode windows logged zero
+        // WARN/ERROR while every request hung, and the committer watchdog
+        // (queue-gauge based) correctly stayed quiet because the committer
+        // was never wedged. This monitor probes the pool on a 1s cadence
+        // (bounded acquire + `SELECT 1`), WARN-logs every slow/failed probe,
+        // and flips the additive /healthz degraded_reason "pool_stalled".
+        // Detection only (see `pool_watch.rs`); the probe holds at most one
+        // pool slot for at most 5s.
+        background.spawn(pool_watch::run(pool.clone(), metrics.clone()));
         // ENH-022 Stage 4: rate-counter sweep. In multi-instance mode the
         // limiter's counters live in `rtdb_auth.rate_counters` (one row per
         // key per minute); this task drops buckets older than the current

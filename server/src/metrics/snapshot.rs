@@ -462,6 +462,49 @@ pub fn render_prometheus(
             .load(Ordering::Relaxed)
     ));
 
+    // Pool-stall watchdog (prod degradation hardening): the monitor's last
+    // probe latency plus the current stall flag. The 2026-11-16 evidence:
+    // the pool stalls SILENTLY during the postgres I/O episodes, so this is
+    // the scrape-side fingerprint of that state — a probe wait climbing past
+    // ~2s while the committer gauges stay healthy is the DB-stall class, not
+    // a committer wedge. Renders 0 until the monitor's first probe completes.
+    s.push_str("# HELP rtdb_pool_probe_wait_us Last pool probe elapsed (bounded acquire + SELECT 1 through the connection pool, see pool_watch.rs), microseconds. Healthy baseline is sub-10ms; past ~1s is WARN-grade, past ~2s the stall flag flips.\n");
+    s.push_str("# TYPE rtdb_pool_probe_wait_us gauge\n");
+    s.push_str(&format!(
+        "rtdb_pool_probe_wait_us {}\n",
+        m.pool_probe_wait_us.load(Ordering::Relaxed)
+    ));
+    s.push_str(
+        "# HELP rtdb_pool_probe_failures_total Pool probes that timed out (5s bound) or errored — the postgres-unreachable / transport-failure discriminator.\n",
+    );
+    s.push_str("# TYPE rtdb_pool_probe_failures_total counter\n");
+    s.push_str(&format!(
+        "rtdb_pool_probe_failures_total {}\n",
+        m.pool_probe_failures_total.load(Ordering::Relaxed)
+    ));
+    s.push_str(
+        "# HELP rtdb_pool_probe_slow_total Pool probes that completed but past the 1s slow threshold (WARN-grade, not yet stall-grade).\n",
+    );
+    s.push_str("# TYPE rtdb_pool_probe_slow_total counter\n");
+    s.push_str(&format!(
+        "rtdb_pool_probe_slow_total {}\n",
+        m.pool_probe_slow_total.load(Ordering::Relaxed)
+    ));
+    s.push_str("# HELP rtdb_pool_stalled Watchdog flag: pool probes have been stall-scale (>=2s or failing) for 3s continuously (see /healthz degraded_reason).\n");
+    s.push_str("# TYPE rtdb_pool_stalled gauge\n");
+    s.push_str(&format!(
+        "rtdb_pool_stalled {}\n",
+        m.pool_stalled.load(Ordering::Relaxed) as i32
+    ));
+    s.push_str(
+        "# HELP rtdb_pool_stalled_transitions_total Pool-stall flag transitions (set or clear).\n",
+    );
+    s.push_str("# TYPE rtdb_pool_stalled_transitions_total counter\n");
+    s.push_str(&format!(
+        "rtdb_pool_stalled_transitions_total {}\n",
+        m.pool_stalled_transitions_total.load(Ordering::Relaxed)
+    ));
+
     // Ownership-lease observability (ENH-049). Aggregate gauges + counters —
     // per-db detail belongs in the tracing logs (each lease event carries the
     // `db` field), not metric labels (cardinality).

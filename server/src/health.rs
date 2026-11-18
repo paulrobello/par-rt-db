@@ -3,10 +3,10 @@
 //! answer "what's running, and is it healthy?" without SSH.
 //!
 //! Security: the route is **unauthenticated** — the body is built only from
-//! build identity, reachability, and aggregate committer queue gauges, never
-//! from `Config` (no tokens, secrets, OAuth credentials, allowlists, or
-//! internal hostnames). Reachability is probed with a bounded `SELECT 1`,
-//! never a value-bearing query.
+//! build identity, reachability, aggregate committer queue gauges, and the
+//! pool-probe latency, never from `Config` (no tokens, secrets, OAuth
+//! credentials, allowlists, or internal hostnames). Reachability is probed
+//! with a bounded `SELECT 1`, never a value-bearing query.
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,11 +43,31 @@ pub struct HealthReport {
     pub uptime_seconds: u64,
     pub postgres: bool,
     /// Committer-watchdog signal: why the write path is degraded, when the
-    /// sustained queue-wait rule trips (see `watchdog.rs`). The HTTP status
-    /// stays bound to `postgres` so probers and the container healthcheck
-    /// keep treating this route as alive.
+    /// sustained queue-wait rule trips (see `watchdog.rs`). With the pool
+    /// watchdog below this is the PRIMARY reason — the first element of
+    /// `degraded_reasons`, pool-stall first because a postgres I/O stall
+    /// (the 2026-11-16 episode class) trips the pool flag first and the
+    /// committer backlog second. The HTTP status stays bound to `postgres`
+    /// so probers and the container healthcheck keep treating this route as
+    /// alive. INWARIANT (additive-only wire surface): existing consumers
+    /// parse `status`/`postgres`/`degraded_reason`; new watchdog reasons
+    /// arrive as new values here plus the `degraded_reasons` list, never by
+    /// reshaping the body.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub degraded_reason: Option<&'static str>,
+    /// Every currently-tripped degradation reason, in stable order
+    /// (pool-stall first, committer second). Additive superset of
+    /// `degraded_reason` for consumers that must not lose the committer
+    /// signal when both watchdogs fire during the same episode. Empty when
+    /// healthy (the field is omitted).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub degraded_reasons: Vec<&'static str>,
+    /// Last completed pool-probe latency (bounded acquire + `SELECT 1`
+    /// through the connection pool), microseconds — the DB-stall signal
+    /// (see `pool_watch.rs`). Absent until the monitor's first probe
+    /// completes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_probe_wait_us: Option<u64>,
     /// Last watchdog sample of the committer queue-wait p99, microseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub committer_queue_wait_p99_us: Option<u64>,
@@ -80,9 +100,20 @@ pub async fn handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
         None => (None, None, None),
     };
 
-    // Committer-watchdog sample: aggregate queue gauges only (no config or
-    // secrets), so they stay inside the unauthenticated body contract.
+    // Watchdog samples: aggregate queue gauges + the pool probe latency only
+    // (no config or secrets), so they stay inside the unauthenticated body
+    // contract. `degraded_reasons` lists every tripped watchdog, pool-stall
+    // first (the postgres I/O episode class trips it before the committer
+    // backlog builds); `degraded_reason` mirrors the first element for the
+    // existing single-reason consumers.
     let watch = state.runtime.metrics.committer_watch_sample();
+    let mut degraded_reasons: Vec<&'static str> = Vec::new();
+    if state.runtime.metrics.pool_stalled() {
+        degraded_reasons.push("pool_stalled");
+    }
+    if state.runtime.metrics.committer_degraded() {
+        degraded_reasons.push("committer_queue_sustained_wait");
+    }
     let report = HealthReport {
         status: if postgres { "ok" } else { "degraded" },
         version,
@@ -91,11 +122,9 @@ pub async fn handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
         started_at: DateTime::<Utc>::from(state.runtime.started_at).to_rfc3339(),
         uptime_seconds,
         postgres,
-        degraded_reason: if state.runtime.metrics.committer_degraded() {
-            Some("committer_queue_sustained_wait")
-        } else {
-            None
-        },
+        degraded_reason: degraded_reasons.first().copied(),
+        degraded_reasons,
+        pool_probe_wait_us: state.runtime.metrics.pool_probe_wait_us(),
         committer_queue_wait_p99_us: Some(watch.queue_wait_p99_us),
         committer_queue_depth: Some(watch.queue_depth),
     };

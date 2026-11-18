@@ -186,6 +186,25 @@ pub struct Metrics {
     // reasoning as the stage series above).
     committer_degraded: AtomicBool,
     committer_degraded_transitions_total: AtomicU64,
+    // ---- Pool-stall watchdog (prod degradation hardening) ----
+    // Set by `pool_watch::run` when bounded pool probes (acquire + `SELECT 1`)
+    // stay stall-scale for 3s continuously (see `pool_watch.rs` for the
+    // thresholds). Surfaced on `/healthz` as additive fields only — the admin
+    // JSON wire stays byte-identical (same reasoning as the committer flag
+    // above). The 2026-11-16 evidence: the pool stalls SILENTLY during the
+    // postgres I/O episodes (zero WARN/ERROR while unreachable), so the
+    // monitor exists to make that state visible at all.
+    /// Last completed pool probe (acquire + `SELECT 1`), microseconds.
+    /// `pool_probe_seen` distinguishes "never probed" from a literal 0.
+    pool_probe_wait_us: AtomicU64,
+    pool_probe_seen: AtomicBool,
+    /// Probes that completed but past the 1s slow threshold (WARN-grade).
+    pool_probe_slow_total: AtomicU64,
+    /// Probes that timed out (5s bound) or errored — the transport-failure
+    /// discriminator on the scrape.
+    pool_probe_failures_total: AtomicU64,
+    pool_stalled: AtomicBool,
+    pool_stalled_transitions_total: AtomicU64,
 }
 
 /// One watchdog sample of the committer write path: queue-wait p99 in
@@ -488,6 +507,48 @@ impl Metrics {
     /// for the watchdog itself.
     pub fn record_committer_degraded_transition(&self) {
         self.committer_degraded_transitions_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one completed pool probe (see `pool_watch.rs`). `slow` and
+    /// `failed` are computed by the caller's pure `classify`; `wait_us` is
+    /// stored as the latest-sample gauge regardless of outcome.
+    pub fn record_pool_probe(&self, wait_us: u64, slow: bool, failed: bool) {
+        self.pool_probe_wait_us.store(wait_us, Ordering::Relaxed);
+        self.pool_probe_seen.store(true, Ordering::Relaxed);
+        if slow {
+            self.pool_probe_slow_total.fetch_add(1, Ordering::Relaxed);
+        }
+        if failed {
+            self.pool_probe_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Last completed pool probe latency (acquire + `SELECT 1`),
+    /// microseconds. `None` until the monitor's first probe completes —
+    /// surfaced on `/healthz` only; never enters the admin JSON wire.
+    pub fn pool_probe_wait_us(&self) -> Option<u64> {
+        self.pool_probe_seen
+            .load(Ordering::Relaxed)
+            .then(|| self.pool_probe_wait_us.load(Ordering::Relaxed))
+    }
+
+    /// Pool-stall watchdog flag (see `pool_watch.rs`). Surfaced on `/healthz`
+    /// as `degraded_reason: "pool_stalled"` only; never enters the admin JSON
+    /// wire.
+    pub fn set_pool_stalled(&self, stalled: bool) {
+        self.pool_stalled.store(stalled, Ordering::Relaxed);
+    }
+
+    pub fn pool_stalled(&self) -> bool {
+        self.pool_stalled.load(Ordering::Relaxed)
+    }
+
+    /// Flag transitions (set or clear) — the flappiness signal for the pool
+    /// watchdog itself.
+    pub fn record_pool_stalled_transition(&self) {
+        self.pool_stalled_transitions_total
             .fetch_add(1, Ordering::Relaxed);
     }
 

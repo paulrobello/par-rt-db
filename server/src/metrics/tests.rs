@@ -809,3 +809,95 @@ fn slow_query_record_stage_fields_serialize_additively() {
     assert_eq!(recent[0].rate_limit_stage_us, Some(20));
     assert_eq!(recent[0].schema_stage_us, Some(30));
 }
+
+#[test]
+fn render_prometheus_includes_pool_watch_gauges() {
+    let snap = MetricsSnapshot {
+        queries_total: 0,
+        mutations_total: 0,
+        uploads_total: 0,
+        ws_connections: 0,
+        active_subscriptions: 0,
+        pool_size: 0,
+        pool_idle: 0,
+        uptime_seconds: 0,
+        query_latency: LatencyStats::default(),
+        mutate_latency: LatencyStats::default(),
+        subscribe_latency: LatencyStats::default(),
+        subs_reruns_total: 0,
+        subs_skips_point_total: 0,
+        subs_skips_indexed_total: 0,
+        subs_skips_ordered_total: 0,
+        subs_skip_verifications_total: 0,
+        subs_missed_pushes_total: 0,
+        ttl_expired_total: 0,
+        scheduled_missed_total: 0,
+        merge_docs_total: 0,
+        image_transforms_hit_total: 0,
+        image_transforms_miss_total: 0,
+        image_transforms_error_total: 0,
+        image_transform_bytes_total: 0,
+        presence_updates_total: 0,
+        presence_broadcasts_total: 0,
+        presence_ttl_expiries_total: 0,
+        presence_rooms: 0,
+        presence_sessions: 0,
+        per_db_subs: Vec::new(),
+        quota_rejections_tables_total: 0,
+        quota_rejections_storage_total: 0,
+        quota_rejections_subs_total: 0,
+        admin_auth_failures_total: 0,
+        per_db_quota: Vec::new(),
+        workflow_steps_success_total: 0,
+        workflow_steps_retry_total: 0,
+        workflow_steps_fail_total: 0,
+        per_db_workflows: Vec::new(),
+        presence_detail: Vec::new(),
+    };
+    let m = Metrics::default();
+    // Before any probe the wait gauge renders 0 (never-probed sentinel), the
+    // flag is down, and the counters sit at their init values.
+    let body = render_prometheus(&snap, &m, None, "test-instance");
+    assert!(
+        body.contains("# HELP rtdb_pool_probe_wait_us"),
+        "missing pool probe gauge HELP: {body}"
+    );
+    assert!(
+        body.contains("rtdb_pool_probe_wait_us 0\n"),
+        "probe wait gauge should render 0 before any probe: {body}"
+    );
+    assert!(
+        body.contains("rtdb_pool_stalled 0\n"),
+        "stall flag should default down: {body}"
+    );
+
+    // One slow probe + a flag flip show up on the scrape.
+    m.record_pool_probe(1_500_000, true, false);
+    m.set_pool_stalled(true);
+    m.record_pool_stalled_transition();
+    let body = render_prometheus(&snap, &m, None, "test-instance");
+    assert!(
+        body.contains("rtdb_pool_probe_wait_us 1500000\n"),
+        "probe wait gauge should carry the last sample: {body}"
+    );
+    assert!(
+        body.contains("rtdb_pool_probe_slow_total 1\n"),
+        "slow-probe counter should tick: {body}"
+    );
+    assert!(
+        body.contains("rtdb_pool_probe_failures_total 0\n"),
+        "failures counter must stay separate from slow: {body}"
+    );
+    assert!(
+        body.contains("# TYPE rtdb_pool_stalled gauge\n"),
+        "missing stall flag TYPE: {body}"
+    );
+    assert!(
+        body.contains("rtdb_pool_stalled 1\n"),
+        "stall flag should render 1: {body}"
+    );
+    assert!(
+        body.contains("rtdb_pool_stalled_transitions_total 1\n"),
+        "transition counter should tick: {body}"
+    );
+}

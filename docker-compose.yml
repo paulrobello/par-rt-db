@@ -6,6 +6,40 @@ services:
   postgres:
     image: pgvector/pgvector:pg17
     restart: unless-stopped
+    # Checkpoint/I-O smoothing, sized from the 2026-11-16 episode evidence on
+    # this host (card 01a1dad76dd9): episodic host I/O degradation stalls
+    # postgres, and the STOCK pg17 settings fire a checkpoint roughly every
+    # 5 minutes whose write phase then drags — 63 checkpoints sampled since
+    # 04:00Z with baseline write=60-95s and 269s spikes EXACTLY at the 22:45
+    # and 01:06 flap windows. The server's pool stalls silently behind each
+    # phase (now watched: server `pool_watch` WARNs + /healthz
+    # degraded_reason "pool_stalled"; capture procedure in
+    # docs/FLAP_CAPTURE.md). These flags apply at every server start;
+    # POSTGRES_INITDB_ARGS below is untouched (collation stays deterministic)
+    # and they change nothing on a volume that is already initialized.
+    command:
+      - postgres
+      # WAL headroom 1GB -> 4GB: the stock ceiling makes the WAL-size trigger
+      # fire checkpoints frequently under this write volume; 4GB pushes the
+      # size trigger out of the way so the (longer) timeout becomes the
+      # binding trigger — fewer, planned phases instead of frequent forced
+      # ones. Tradeoff: crash recovery may replay up to 4GB of WAL.
+      - -c
+      - max_wal_size=4GB
+      # Checkpoint cadence 5min -> 15min: the evidence line "63 checkpoints
+      # since 04:00Z at ~5 min cadence, baseline write=60-95s" means the host
+      # spent a third of every 5 minutes inside a checkpoint write phase even
+      # when healthy; 15min cuts that duty cycle 3x and gives the I/O ceiling
+      # time to drain between phases (flap spikes were 269s against a 300s
+      # cadence — the episode never got to drain).
+      - -c
+      - checkpoint_timeout=15min
+      # Spread each checkpoint's writes across 90% of the interval (0.9 is
+      # already pg17's default — pinned explicitly so the smoothing intent
+      # survives a base-image default drift, e.g. a future pgvector image
+      # moving the default back to 0.5).
+      - -c
+      - checkpoint_completion_target=0.9
     environment:
       POSTGRES_USER: rtdb
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}

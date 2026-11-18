@@ -517,6 +517,32 @@ re-fans-out subscriptions for dbs with live subscribers to converge — a
 sustained climb alongside lagging realtime clients means Postgres connection
 churn is starving cross-replica invalidation.
 
+DB-stall signals (pool): the committer watchdog cannot see the 2026-11-16
+episode class — episodic host I/O degradation stalls postgres and the server's
+connection pool hangs SILENTLY (the episode windows logged zero WARN/ERROR
+while every request waited, and the committer gauges stayed healthy because
+the committer was never wedged). The pool watchdog closes that gap: it probes
+the pool every 1s with a bounded acquire+`SELECT 1` and WARN-logs every probe
+past 1s (`slow probe`) or failed (`probe FAILED`, 5s bound) with pool
+size/idle/open. Three consecutive bad probes (3s sustained) flip
+`rtdb_pool_stalled` (+ a `rtdb_pool_stalled_transitions_total` counter) and
+`/healthz` reports `degraded_reason: "pool_stalled"` — distinct from the
+committer value, so consumers can attribute a flap to DB-stall rather than
+transport failure. When both watchdogs fire in one episode, `degraded_reason`
+holds the primary (`pool_stalled` — the pool trips first and the committer
+backlog builds second) and the full list rides the additive
+`degraded_reasons` array. `/healthz` also carries `pool_probe_wait_us`, the
+last probe latency in microseconds; the same series are on the scrape
+(`rtdb_pool_probe_wait_us`, `rtdb_pool_probe_slow_total`,
+`rtdb_pool_probe_failures_total`, `rtdb_pool_stalled`). Alert on
+`rtdb_pool_stalled == 1`, any increase of
+`rtdb_pool_stalled_transitions_total`, or `pool_probe_wait_us` sustained
+past ~2s. The prod compose sizes postgres's checkpoints against the same
+evidence (`max_wal_size=4GB`, `checkpoint_timeout=15min`,
+`checkpoint_completion_target=0.9`); the full episode-capture procedure,
+including the two pre-existing log fingerprints (checkpoint write phases +
+migration-notice reconnect bursts), lives in `docs/FLAP_CAPTURE.md`.
+
 ## Tracing (OpenTelemetry / OTLP, ENH-018)
 
 `/metrics` answers "how much"; OTLP tracing answers "why was *this* request
