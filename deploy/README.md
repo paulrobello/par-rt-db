@@ -42,21 +42,35 @@ VPS and no reverse proxy is needed — TLS is terminated at Cloudflare's edge.
 ## Deploy / update
 
 The default path is continuous deployment (adopted 2026-10-25, the CD recipe
-established across par-hack, read-it-to-me, and par-artifacts): every
-green push to `main` runs the CI `deploy` job, which SSHes to the deploy host
-with a forced-command key and rolls that exact commit. The private key lives
-only in the repo's `DEPLOY_SSH_KEY` GitHub secret; on the host it is
-half of a keypair whose `authorized_keys` line restricts it to
+established across par-hack, read-it-to-me, and par-artifacts; the pinned-image
+stage added 2026-11-18, hardening card 01a1dad76dd9): every green push to
+`main` that touches deploy-relevant paths runs two CI jobs. The `image` job
+builds the server image on the runner (linux/amd64, native speed — this also
+moves the deploy-time build CPU/IO off the production host, whose I/O ceiling
+caused the 2026-11-16 episodes) and pushes it to the private GHCR package
+`ghcr.io/paulrobello/par-rt-db` pinned as `sha-<full-commit>`, with `latest`
+on the newest green build and `rollback` re-pointed at the previous green
+build before each push (server-side manifest retag via `imagetools create`).
+The `deploy` job then SSHes to the deploy host with the same forced-command
+key as before and rolls that exact commit. The private key lives only in the
+repo's `DEPLOY_SSH_KEY` GitHub secret; on the host it is half of a keypair
+whose `authorized_keys` line restricts it to
 `command="/usr/local/bin/parrtdb-deploy $SSH_ORIGINAL_COMMAND",restrict` — the
 key can do nothing but run that script, and the script accepts ONLY a bare
 40-hex SHA as its argument (anything else exits 2). Exactly one SSH invocation
 happens per deploy. The script re-runs the deploy-path invariants: the
 host-reservation lease check (an active quiet-window lease BLOCKS the deploy),
-git fetch + `checkout -f <sha>` in `/docker/par-rt-db`, the constrained
-`par-rt-db-builder` build (`RTDB_BUILD_COMMIT` baked in, builder clamped to
-two CPUs during the build and restored after, including on failure), and a
-bounded `/healthz` poll (5-minute ceiling) that fails the job if the rollout
-never serves.
+git fetch + `checkout -f <sha>` in `/docker/par-rt-db`, then pulls the
+commit-pinned image (BEFORE any container stops, so a failed pull leaves the
+old container serving) with the on-host buildx build (builder clamped to two
+CPUs during the build and restored after, including on failure) as the
+fallback when the pull fails, and a bounded `/healthz` poll (5-minute ceiling)
+that fails the job if the rollout never serves. The host authenticates to
+GHCR with a classic `read:packages` PAT (fine-grained tokens do not work
+against the package registry; the PAT lives in parvault as
+`GITHUB_READ_PACKAGES_PAT`, applied once via `docker login ghcr.io` and
+persisted root-only in `/root/.docker/config.json` — the par-prd incident
+pattern).
 
 The manual path remains `make deploy` from the repo root: it gates via
 `make checkall-cached` (reusing the green verdict stamped by a previous
@@ -64,7 +78,7 @@ The manual path remains `make deploy` from the repo root: it gates via
 changes the git tree hash and forces a full re-gate), then rsyncs to the
 deploy host and runs
 `BUILDX_BUILDER=par-rt-db-builder docker compose up -d --build` with
-`RTDB_BUILD_COMMIT` baked in. See
+`RTDB_BUILD_COMMIT` and `SERVER_IMAGE_TAG` pinned to the deployed commit. See
 the [`Makefile`](../Makefile) `deploy` target for the canonical commands.
 Use it for out-of-band deploys (e.g. with an emergency
 `RESERVATION_OVERRIDE=1`) or when the CD path is unavailable; the CD path is
@@ -966,30 +980,40 @@ Common operator symptoms on the live deploy:
 
 ## Rollback
 
-There are no image tags to pin: `make deploy` rsyncs the current checkout to
-docker-host and builds in place, so rolling back a bad deploy means redeploying an
-older commit.
+The pinned-image pipeline changed rollback from a full host rebuild to an
+image-tag flip (2026-11-18, hardening card 01a1dad76dd9). Every green build
+is pinned in the private GHCR package as `sha-<full-commit>`; `latest` and
+`rollback` are moving pointers to the newest and previous green builds. On
+the deploy host, `/usr/local/bin/parrtdb-deploy` (tracked source of truth:
+`deploy/parrtdb-deploy.sh`) pulls BEFORE stopping anything, so a failed pull
+leaves the old container serving.
 
-1. On the workstation, from the repo root, check out the last-known-good commit
-   and redeploy it:
+Fastest path — flip the compose tag on the host (no rebuild, no CI):
 
-   ```sh
-   git checkout <last-known-good-commit>
-   make deploy
-   ```
+```sh
+ssh root@<deploy-host> 'cd /docker/par-rt-db && \
+  SERVER_IMAGE_TAG=sha-<last-known-good-full-sha> docker compose up -d --no-build server && \
+  curl -fsS http://127.0.0.1:8300/healthz'
+```
 
-  `make deploy` re-runs the gate, rsyncs that commit's source over
-  `/docker/par-rt-db` (the `.env` excludes keep the live secrets intact), and
-  rebuilds the image on the host with the capped
-  `par-rt-db-builder` BuildKit builder.
+If that sha's image was already pruned locally, pull it from the registry
+first (`docker pull ghcr.io/paulrobello/par-rt-db:sha-<sha>`; the package is
+private — the host's stored `docker login` covers it). `SERVER_IMAGE_TAG=rollback`
+works the same way for "the build before latest". Equivalent CI path: push a
+bare 40-hex SHA at the deploy key — `parrtdb-deploy <last-known-good-sha>`
+pulls that commit's pinned image and rolls it (same command the CD job runs,
+so it is the tested path).
 
-2. Verify: `curl -fsS https://rtdb.example.com/healthz -H "Authorization: Bearer $RTDB_ADMIN_KEY" | jq .`
-   reports the expected `git_commit` (the redeployed sha; the fingerprint is
-   admin-only — SEC-129), and a spot query against a row
-   you know was affected by the bad deploy behaves correctly again.
+The manual rebuild path is unchanged for when the registry is unavailable:
+`git checkout <last-known-good-commit> && make deploy` re-runs the gate,
+rsyncs, and rebuilds on the host with the capped `par-rt-db-builder`. Return
+the workstation to `main` afterwards so the next deploy doesn't silently
+re-ship the old commit.
 
-3. Return the workstation to the deploy branch (`git checkout main`) so the
-   next deploy doesn't silently re-ship the old commit.
+Verify after either path: `curl -fsS https://rtdb.example.com/healthz -H "Authorization: Bearer $RTDB_ADMIN_KEY" | jq .`
+reports the expected `git_commit` (the redeployed sha; the fingerprint is
+admin-only — SEC-129), and a spot query against a row
+you know was affected by the bad deploy behaves correctly again.
 
 `docker compose down` only stops the stack (the named volume `rtdb-pg` persists
 data) — it is not a rollback. To wipe data too: `docker compose down -v`.

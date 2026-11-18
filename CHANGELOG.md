@@ -532,6 +532,22 @@ alter observable behavior on upgrade.
 
 ### Changed
 
+- **Pinned-image deploy pipeline (2026-11-18, hardening card 01a1dad76dd9,
+  deploy-pipeline approved by the owner).** CI now builds the server image on
+  the runner (linux/amd64) and pushes it to the private GHCR package
+  `ghcr.io/paulrobello/par-rt-db` pinned as `sha-<full-commit>`; `latest`
+  tracks the newest green build and `rollback` the previous one (re-pointed
+  before each push). The CD `deploy` job, and `make deploy` as its
+  break-glass twin, now pull that pinned image instead of compiling on the
+  production host — the on-host buildx build was the box's biggest periodic
+  I/O burst, and host I/O degradation caused the 2026-11-16 episodes. The
+  host-side forced-command script is now tracked as
+  `deploy/parrtdb-deploy.sh`; a failed registry pull falls back to the
+  on-host build, and rollback is an image-tag flip documented in
+  `deploy/README.md` (Rollback). Compose gains the `SERVER_IMAGE_TAG`
+  knob (documented in `.env.example`; not an `RTDB_*` runtime var, so
+  env-drift-check is unaffected).
+
 - **2026-11-04 audit remediation — quality and architecture rework (QA/ARC
   series).** The write-path god function was decomposed: admission guards now
   live in `txn/admission.rs` as a `TxnAdmission` enum plus the combined

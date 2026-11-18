@@ -69,6 +69,15 @@ services:
       - no-new-privileges:true
 
   server:
+    # Pinned-image CD (hardening card 01a1dad76dd9): CD pulls the CI-built,
+    # commit-pinned image `sha-<commit>` via SERVER_IMAGE_TAG (set by
+    # deploy/parrtdb-deploy.sh / the CI deploy job's fallback path); `latest`
+    # and `rollback` are moving pointers to the newest and previous green
+    # builds. `build:` below stays as the registry-less fallback (`make
+    # deploy`, `docker compose up -d --build`): with both keys present,
+    # compose builds AND tags the local build as this same image ref, so
+    # both paths address one name.
+    image: ghcr.io/paulrobello/par-rt-db:${SERVER_IMAGE_TAG:-latest}
     build:
       context: .
       args:

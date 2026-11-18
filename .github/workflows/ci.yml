@@ -704,16 +704,75 @@ jobs:
             echo "Only docs/CI-meta paths changed; skipping deploy."
           fi
 
+  # CI-built pinned image (hardening card 01a1dad76dd9, criterion 2; the
+  # deploy-pipeline was approved 2026-11-18): CI builds the server image and
+  # pushes it to GHCR pinned by the exact commit — `sha-<40-hex>` is the
+  # immutable deploy unit, `latest` tracks the newest green build, and
+  # `rollback` is the previous green build (the manifest `latest` pointed at
+  # before this push, re-tagged server-side with imagetools create — no
+  # image pull needed). This moves the deploy-time build CPU/IO off the
+  # production host: the 2026-11-16 degradation episodes were host I/O
+  # degradation, and the on-host buildx build was the biggest periodic I/O
+  # burst on that box. `deploy` then hands the host only a bare 40-hex SHA —
+  # unchanged — and the host pulls instead of compiling.
+  image:
+    name: Build and pin server image
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.changes.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    needs: [changes, drift, lint, typecheck, test, features, swift]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pin the previous green build as the rollback tag
+        run: |
+          IMAGE=ghcr.io/${{ github.repository }}
+          digest=$(docker buildx imagetools inspect "$IMAGE:latest" 2>/dev/null | awk '/^Digest:/ {print $2; exit}')
+          if [ -n "$digest" ]; then
+            docker buildx imagetools create -t "$IMAGE:rollback" "$IMAGE@$digest"
+            echo "rollback tag -> $digest"
+          else
+            echo "No previous latest (first image build); rollback tag skipped."
+          fi
+      - name: Resolve the short sha for the build label
+        run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+      - name: Build and push the pinned image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          # Short sha, matching what the on-host fallback build bakes into
+          # /healthz and the rtdb_build_info metric label.
+          build-args: RTDB_BUILD_COMMIT=${{ env.SHORT_SHA }}
+          tags: |
+            ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+            ghcr.io/${{ github.repository }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   # Deploy-host CD recipe (established across par-hack, read-it-to-me,
   # par-artifacts): on a green main push, the runner SSHes the deploy host with
-  # a forced-command deploy key. The server-side /usr/local/bin/parrtdb-deploy
-  # accepts ONLY a bare 40-hex SHA — the key can do nothing else — then
-  # fetches, checks out, and builds that exact commit on the host (buildx
-  # builder with CPU clamps, the same host-reservation lease check `make
-  # deploy` runs) and polls /healthz until the new rollout is ready. Exactly
-  # ONE ssh invocation per deploy; the private key lives only in the
-  # DEPLOY_SSH_KEY secret and the hostname only in DEPLOY_HOST (the
-  # hostname-leak-check gate forbids real hostnames in tracked files).
+  # a forced-command deploy key. The deploy job depends on the `image` job and
+  # hands the host only a bare 40-hex SHA — the forced-command key can do
+  # nothing else — and the host-side /usr/local/bin/parrtdb-deploy (tracked
+  # source of truth: deploy/parrtdb-deploy.sh) pulls the commit-pinned image,
+  # falls back to the on-host buildx build (CPU clamps, the same
+  # host-reservation lease check `make deploy` runs) when the registry pull
+  # fails, and polls /healthz until the new rollout is ready. Exactly ONE ssh
+  # invocation per deploy; the private key lives only in the DEPLOY_SSH_KEY
+  # secret and the hostname only in DEPLOY_HOST (the hostname-leak-check gate
+  # forbids real hostnames in tracked files).
   deploy:
     name: Deploy to production host
     if: github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.changes.outputs.deploy == 'true'
@@ -721,8 +780,9 @@ jobs:
     # docs is excluded: it self-skips on plain main pushes (heavy artifact
     # tiering), and a needs on a skipped job skips this job too. The changes
     # job is push-only like this one, so its deploy output is always present
-    # when this `if` evaluates.
-    needs: [changes, drift, lint, typecheck, test, features, swift]
+    # when this `if` evaluates. `image` carries the same `if`, so it is
+    # always resolved when `deploy` runs.
+    needs: [changes, drift, lint, typecheck, test, features, swift, image]
     # 90: the first post-feature build compiles the otel dependency tree
     # (tonic/prost/opentelemetry) on the throttled 2-CPU deploy builder — a
     # one-time ~50 min cost that exceeded the previous 45-min job cap and got
