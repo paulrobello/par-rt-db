@@ -35,7 +35,7 @@ Design and scope:
 
 - Swift 6 (Swift concurrency in strict mode; `swift-tools-version:6.0`)
 - iOS 17+ / macOS 14+ (the `@Observable` macro requires it)
-- Zero third-party runtime dependencies — Foundation (+ `Observation` in `ParRtDbUI`) only. The `swift-docc-plugin` (1.4.3+) is a dev-only dependency for building the documentation archive, not a runtime link.
+- Zero third-party runtime dependencies — Foundation (+ `Observation` in `ParRtDbUI`) only. The `swift-docc-plugin` (1.5.0+) is a dev-only dependency for building the documentation archive, not a runtime link.
 - Building/linting from the repo: `swiftformat` and `swiftlint` on PATH
   (`brew install swiftformat swiftlint`)
 

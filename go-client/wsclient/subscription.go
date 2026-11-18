@@ -130,7 +130,7 @@ func (s *Subscription) Close() {
 	s.mu.Unlock()
 	frame, err := json.Marshal(wire.ClientUnsubscribe{QueryID: s.queryID})
 	if err == nil {
-		_ = s.client.sendFrame(context.Background(), frame)
+		s.client.sendFrameBestEffort(context.Background(), "unsubscribe", frame)
 	}
 	s.client.subsMu.Lock()
 	delete(s.client.subs, s.queryID)

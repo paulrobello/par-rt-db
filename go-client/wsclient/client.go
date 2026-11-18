@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -228,7 +229,7 @@ func (c *Client) manager(ctx context.Context) {
 				case <-ticker.C:
 					ping, err := json.Marshal(wire.ClientPing{})
 					if err == nil {
-						_ = c.sendFrame(hbCtx, ping)
+						c.sendFrameBestEffort(hbCtx, "ping", ping)
 					}
 				}
 			}
@@ -413,6 +414,14 @@ func (c *Client) sendFrame(ctx context.Context, data []byte) error {
 		return errors.New("wsclient: not connected")
 	}
 	return tr.Write(ctx, data)
+}
+
+// sendFrameBestEffort sends a frame whose failure the caller cannot act on
+// (unsubscribe, ack, heartbeat), logging the discarded error at debug level.
+func (c *Client) sendFrameBestEffort(ctx context.Context, kind string, data []byte) {
+	if err := c.sendFrame(ctx, data); err != nil {
+		slog.Debug("wsclient: frame send failed", "frame", kind, "err", err)
+	}
 }
 
 // setServerObserver installs a test/observer hook for every server frame.

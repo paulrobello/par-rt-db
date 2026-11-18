@@ -450,7 +450,7 @@ func (c *Client) foldPresenceDelta(m wire.ServerPresenceDelta) (string, []wire.P
 			state := c.presenceJoins[m.Room]
 			c.presenceMu.Unlock()
 			if frame, err := json.Marshal(wire.ClientPresence{Room: m.Room, State: state}); err == nil {
-				_ = c.sendFrame(context.Background(), frame)
+				c.sendFrameBestEffort(context.Background(), "presence", frame)
 			}
 			return m.Room, nil
 		}

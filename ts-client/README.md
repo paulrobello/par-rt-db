@@ -14,6 +14,8 @@ inferred types.
 - [Node / CLI](#node-cli)
 - [React Native / Expo](#react-native-expo)
 - [Offline mutation queue](#offline-mutation-queue)
+- [Row-field guards](#row-field-guards)
+- [Index-guard equality arity](#index-guard-equality-arity)
 - [Transaction deadlines](#transaction-deadlines)
 - [Scheduling](#scheduling)
 - [Durable workflows](#durable-workflows)
@@ -202,7 +204,10 @@ mint and persist a machine/session token yourself. It is a tradeoff: a token in
 `localStorage` is readable by any JS running in your origin, so it is
  XSS-exfiltrable. Do not use `getToken` + `localStorage` in a browser app
 unless you have a specific reason and have audited your CSP / dependency
-surface; prefer cookie mode. Machine tokens minted via the admin API are the
+surface; prefer cookie mode. Token mode is XSS-exposed in the same way: when
+`RtDbProvider` runs without cookie mode it hydrates the session token from, and
+persists it back to, `localStorage` (`TOKEN_STORAGE_KEY`), so script running in
+your origin can read a long-lived credential. Machine tokens minted via the admin API are the
 right choice for server-to-server (`Node / CLI`) callers, where `localStorage`
 does not apply.
 

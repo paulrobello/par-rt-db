@@ -229,147 +229,180 @@ func TestGoldenVectorParity(t *testing.T) {
 			if err != nil {
 				t.Fatalf("run_query: %v", err)
 			}
-			wantValue := len(c.ExpectedValue) > 0
-			wantGroups := len(c.ExpectedGroups) > 0
-			wantDistinct := len(c.ExpectedDistinct) > 0
-			wantExpected := len(c.Expected) > 0
-
-			switch {
-			case c.ExpectedScalar != nil:
-				if !jsonEqNumeric(result, wire.Number(formatI64(*c.ExpectedScalar))) {
-					t.Fatalf("expected count %d, got %s", *c.ExpectedScalar, mustJSONText(result))
-				}
-
-			case wantValue:
-				// aggregate scalar: a bare number, or null over an empty set.
-				want, _ := wire.UnmarshalJSON(c.ExpectedValue)
-				if !jsonEqNumeric(result, want) {
-					t.Fatalf("aggregate scalar mismatch: got %s, want %s", mustJSONText(result), c.ExpectedValue)
-				}
-
-			case wantGroups:
-				got, ok := result.(wire.Array)
-				if !ok {
-					t.Fatal("aggregate groupBy must return array")
-				}
-				wantAny, _ := wire.UnmarshalJSON(c.ExpectedGroups)
-				wantGroups, ok := wantAny.(wire.Array)
-				if !ok {
-					t.Fatal("expected_groups requires array")
-				}
-				if len(got) != len(wantGroups) {
-					t.Fatalf("group count mismatch: %d vs %d", len(got), len(wantGroups))
-				}
-				for i := range got {
-					g, ok := got[i].(wire.Object)
-					if !ok {
-						t.Fatalf("group %d not an object", i)
-					}
-					w, ok := wantGroups[i].(wire.Object)
-					if !ok {
-						t.Fatalf("group %d expectation not an object", i)
-					}
-					if !jsonEq(g["key"], w["key"]) {
-						t.Fatalf("group %d key mismatch: %v vs %v", i, g["key"], w["key"])
-					}
-					if !jsonEqNumeric(g["value"], w["value"]) {
-						t.Fatalf("group %d value mismatch: %v vs %v", i, g["value"], w["value"])
-					}
-				}
-
-			case wantDistinct:
-				got, ok := result.(wire.Array)
-				if !ok {
-					t.Fatal("distinct must return array")
-				}
-				wantAny, _ := wire.UnmarshalJSON(c.ExpectedDistinct)
-				want, ok := wantAny.(wire.Array)
-				if !ok {
-					t.Fatal("expected_distinct requires array")
-				}
-				_ = ok
-				if len(got) != len(want) {
-					t.Fatalf("distinct count mismatch: %d vs %d", len(got), len(want))
-				}
-				for i := range got {
-					if !jsonEqNumeric(got[i], want[i]) {
-						t.Fatalf("distinct[%d] mismatch: %v vs %v", i, got[i], want[i])
-					}
-				}
-
-			case c.ExpectedUnordered:
-				gotArr, ok := result.(wire.Array)
-				if !ok {
-					t.Fatal("expected array")
-				}
-				got := make(wire.Array, 0, len(gotArr))
-				for _, d := range gotArr {
-					got = append(got, gvProject(d))
-				}
-				sort.SliceStable(got, func(a, b int) bool { return gvDocName(got[a]) < gvDocName(got[b]) })
-				wantAny, _ := wire.UnmarshalJSON(c.Expected)
-				want, ok := wantAny.(wire.Array)
-				if !ok {
-					t.Fatal("expected_unordered requires array")
-				}
-				sort.SliceStable(want, func(a, b int) bool { return gvDocName(want[a]) < gvDocName(want[b]) })
-				if !jsonEq(got, want) {
-					t.Fatalf("unordered mismatch:\n got %s\nwant %s", mustJSONText(got), mustJSONText(want))
-				}
-
-			case c.ExpectedHasCursor:
-				page, ok := result.(wire.Object)
-				if !ok {
-					t.Fatal("expected PaginatedResult object")
-				}
-				docs, ok := page["docs"].(wire.Array)
-				if !ok {
-					t.Fatal("PaginatedResult.docs array")
-				}
-				got := make(wire.Array, 0, len(docs))
-				for _, d := range docs {
-					got = append(got, gvProject(d))
-				}
-				wantAny, _ := wire.UnmarshalJSON(c.Expected)
-				want, ok := wantAny.(wire.Array)
-				if !ok {
-					t.Fatal("paginate requires array expected")
-				}
-				if !jsonEq(got, want) {
-					t.Fatalf("page mismatch:\n got %s\nwant %s", mustJSONText(got), mustJSONText(want))
-				}
-				nc, has := page["nextCursor"]
-				if !has || isNullValue(nc) {
-					t.Fatal("expected nextCursor present")
-				}
-
-			case wantExpected:
-				expected, err2 := wire.UnmarshalJSON(c.Expected)
-				if err2 != nil {
-					t.Fatal(err2)
-				}
-				if _, isArr := expected.(wire.Array); isArr {
-					gotArr, ok := result.(wire.Array)
-					if !ok {
-						t.Fatal("expected array")
-					}
-					got := make(wire.Array, 0, len(gotArr))
-					for _, d := range gotArr {
-						got = append(got, gvProject(d))
-					}
-					if !jsonEq(got, expected) {
-						t.Fatalf("ordered mismatch:\n got %s\nwant %s", mustJSONText(got), c.Expected)
-					}
-					return
-				}
-				got := gvProject(result)
-				if !jsonEq(got, expected) {
-					t.Fatalf("single-doc mismatch:\n got %s\nwant %s", mustJSONText(got), c.Expected)
-				}
-
-			default:
+			check := gvChecks[gvShape(c)]
+			if check == nil {
 				t.Fatalf("case has no expected shape")
 			}
+			check(t, c, result)
 		})
+	}
+}
+
+// gvShape names the expectation shape a fixture case carries; the first
+// match wins, in the same precedence the fixture format defines.
+func gvShape(c gvCase) string {
+	switch {
+	case c.ExpectedScalar != nil:
+		return "scalar"
+	case len(c.ExpectedValue) > 0:
+		return "value"
+	case len(c.ExpectedGroups) > 0:
+		return "groups"
+	case len(c.ExpectedDistinct) > 0:
+		return "distinct"
+	case c.ExpectedUnordered:
+		return "unordered"
+	case c.ExpectedHasCursor:
+		return "cursor"
+	case len(c.Expected) > 0:
+		return "expected"
+	}
+	return ""
+}
+
+var gvChecks = map[string]func(*testing.T, gvCase, wire.JSONValue){
+	"scalar":    gvCheckScalar,
+	"value":     gvCheckValue,
+	"groups":    gvCheckGroups,
+	"distinct":  gvCheckDistinct,
+	"unordered": gvCheckUnordered,
+	"cursor":    gvCheckCursor,
+	"expected":  gvCheckExpected,
+}
+
+func gvProjectAll(docs wire.Array) wire.Array {
+	out := make(wire.Array, 0, len(docs))
+	for _, d := range docs {
+		out = append(out, gvProject(d))
+	}
+	return out
+}
+
+func gvCheckScalar(t *testing.T, c gvCase, result wire.JSONValue) {
+	if !jsonEqNumeric(result, wire.Number(formatI64(*c.ExpectedScalar))) {
+		t.Fatalf("expected count %d, got %s", *c.ExpectedScalar, mustJSONText(result))
+	}
+}
+
+// gvCheckValue: aggregate scalar — a bare number, or null over an empty set.
+func gvCheckValue(t *testing.T, c gvCase, result wire.JSONValue) {
+	want, _ := wire.UnmarshalJSON(c.ExpectedValue)
+	if !jsonEqNumeric(result, want) {
+		t.Fatalf("aggregate scalar mismatch: got %s, want %s", mustJSONText(result), c.ExpectedValue)
+	}
+}
+
+func gvCheckGroups(t *testing.T, c gvCase, result wire.JSONValue) {
+	got, ok := result.(wire.Array)
+	if !ok {
+		t.Fatal("aggregate groupBy must return array")
+	}
+	wantAny, _ := wire.UnmarshalJSON(c.ExpectedGroups)
+	wantGroups, ok := wantAny.(wire.Array)
+	if !ok {
+		t.Fatal("expected_groups requires array")
+	}
+	if len(got) != len(wantGroups) {
+		t.Fatalf("group count mismatch: %d vs %d", len(got), len(wantGroups))
+	}
+	for i := range got {
+		g, ok := got[i].(wire.Object)
+		if !ok {
+			t.Fatalf("group %d not an object", i)
+		}
+		w, ok := wantGroups[i].(wire.Object)
+		if !ok {
+			t.Fatalf("group %d expectation not an object", i)
+		}
+		if !jsonEq(g["key"], w["key"]) {
+			t.Fatalf("group %d key mismatch: %v vs %v", i, g["key"], w["key"])
+		}
+		if !jsonEqNumeric(g["value"], w["value"]) {
+			t.Fatalf("group %d value mismatch: %v vs %v", i, g["value"], w["value"])
+		}
+	}
+}
+
+func gvCheckDistinct(t *testing.T, c gvCase, result wire.JSONValue) {
+	got, ok := result.(wire.Array)
+	if !ok {
+		t.Fatal("distinct must return array")
+	}
+	wantAny, _ := wire.UnmarshalJSON(c.ExpectedDistinct)
+	want, ok := wantAny.(wire.Array)
+	if !ok {
+		t.Fatal("expected_distinct requires array")
+	}
+	if len(got) != len(want) {
+		t.Fatalf("distinct count mismatch: %d vs %d", len(got), len(want))
+	}
+	for i := range got {
+		if !jsonEqNumeric(got[i], want[i]) {
+			t.Fatalf("distinct[%d] mismatch: %v vs %v", i, got[i], want[i])
+		}
+	}
+}
+
+func gvCheckUnordered(t *testing.T, c gvCase, result wire.JSONValue) {
+	gotArr, ok := result.(wire.Array)
+	if !ok {
+		t.Fatal("expected array")
+	}
+	got := gvProjectAll(gotArr)
+	sort.SliceStable(got, func(a, b int) bool { return gvDocName(got[a]) < gvDocName(got[b]) })
+	wantAny, _ := wire.UnmarshalJSON(c.Expected)
+	want, ok := wantAny.(wire.Array)
+	if !ok {
+		t.Fatal("expected_unordered requires array")
+	}
+	sort.SliceStable(want, func(a, b int) bool { return gvDocName(want[a]) < gvDocName(want[b]) })
+	if !jsonEq(got, want) {
+		t.Fatalf("unordered mismatch:\n got %s\nwant %s", mustJSONText(got), mustJSONText(want))
+	}
+}
+
+func gvCheckCursor(t *testing.T, c gvCase, result wire.JSONValue) {
+	page, ok := result.(wire.Object)
+	if !ok {
+		t.Fatal("expected PaginatedResult object")
+	}
+	docs, ok := page["docs"].(wire.Array)
+	if !ok {
+		t.Fatal("PaginatedResult.docs array")
+	}
+	got := gvProjectAll(docs)
+	wantAny, _ := wire.UnmarshalJSON(c.Expected)
+	want, ok := wantAny.(wire.Array)
+	if !ok {
+		t.Fatal("paginate requires array expected")
+	}
+	if !jsonEq(got, want) {
+		t.Fatalf("page mismatch:\n got %s\nwant %s", mustJSONText(got), mustJSONText(want))
+	}
+	nc, has := page["nextCursor"]
+	if !has || isNullValue(nc) {
+		t.Fatal("expected nextCursor present")
+	}
+}
+
+func gvCheckExpected(t *testing.T, c gvCase, result wire.JSONValue) {
+	expected, err := wire.UnmarshalJSON(c.Expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, isArr := expected.(wire.Array); isArr {
+		gotArr, ok := result.(wire.Array)
+		if !ok {
+			t.Fatal("expected array")
+		}
+		got := gvProjectAll(gotArr)
+		if !jsonEq(got, expected) {
+			t.Fatalf("ordered mismatch:\n got %s\nwant %s", mustJSONText(got), c.Expected)
+		}
+		return
+	}
+	got := gvProject(result)
+	if !jsonEq(got, expected) {
+		t.Fatalf("single-doc mismatch:\n got %s\nwant %s", mustJSONText(got), c.Expected)
 	}
 }

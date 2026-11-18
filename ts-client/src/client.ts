@@ -140,11 +140,11 @@ export interface RtDbClientOptions {
   /**
    * Injectable setTimeout implementation override.
    */
-  setTimeoutImpl?: (fn: () => void, ms: number) => any;
+  setTimeoutImpl?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
   /**
    * Injectable clearTimeout implementation override.
    */
-  clearTimeoutImpl?: (handle: any) => void;
+  clearTimeoutImpl?: (handle: ReturnType<typeof setTimeout>) => void;
   /**
    * When true, a locally-submitted mutation's projected effect is overlaid on
    * each active subscription's last result (via `onUpdate`) before the
@@ -201,8 +201,8 @@ export class RtDbClient {
   private readonly factory: (url: string) => WebSocketLike;
   private readonly now: () => number;
   private readonly random: () => number;
-  private readonly setTimeoutImpl: (fn: () => void, ms: number) => any;
-  private readonly clearTimeoutImpl: (handle: any) => void;
+  private readonly setTimeoutImpl: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  private readonly clearTimeoutImpl: (handle: ReturnType<typeof setTimeout>) => void;
   private readonly backoff: { baseMs: number; maxMs: number };
   private readonly heartbeatMs: number;
   private readonly authUnreachableAfter: number;

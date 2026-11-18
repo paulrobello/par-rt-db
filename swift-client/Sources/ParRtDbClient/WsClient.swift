@@ -350,7 +350,7 @@ public actor RtDbClient {
             if !pokeWaiters.isEmpty {
                 pokeWaiters.removeFirst().resume(returning: true)
             } else if runLoopTask == nil {
-                runLoopTask = Task { await self.runLoop() }
+                runLoopTask = Task { [weak self] in await self?.runLoop() }
             } else {
                 // The loop exists but has not parked yet — leave it a poke.
                 pendingPokes += 1
@@ -404,8 +404,7 @@ public actor RtDbClient {
                 statusContinuations[id] = nil
             } else {
                 continuation.onTermination = { [weak self] _ in
-                    guard let self else { return }
-                    Task { await self.dropStatusContinuation(id) }
+                    Task { [weak self] in await self?.dropStatusContinuation(id) }
                 }
             }
         }

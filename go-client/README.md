@@ -8,10 +8,23 @@ in-memory test engine. No codegen: you build a schema value that serializes
 to the exact server `SchemaDef`, and query results decode into your own Go
 types.
 
-Module name: `github.com/paulrobello/par-rt-db/go-client` (Go 1.23+,
+Module name: `github.com/paulrobello/par-rt-db/go-client` (Go 1.27+, per `go.mod`;
 stdlib-only outside `wsclient` — the only external dependency is
 `github.com/coder/websocket`, and the `guard_test.go` gate keeps it that
 way).
+
+## Contents
+
+- [Packages](#packages)
+- [Install](#install)
+- [Quick start (HTTP)](#quick-start-http)
+- [Subscribe (WebSocket)](#subscribe-websocket)
+- [Admin](#admin)
+- [In-memory engine (tests)](#in-memory-engine-tests)
+- [Row-field guards](#row-field-guards)
+- [Transaction deadlines](#transaction-deadlines)
+- [Wire contract](#wire-contract)
+- [Develop](#develop)
 
 ## Packages
 
@@ -38,6 +51,10 @@ go get github.com/paulrobello/par-rt-db/go-client
 
 ## Quick start (HTTP)
 
+The client talks to a database that already has a schema and a machine token.
+Provision both once with the admin client (admin key from the server's
+`RTDB_ADMIN_KEY`), then use the minted token for app traffic:
+
 ```go
 package main
 
@@ -45,32 +62,56 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/paulrobello/par-rt-db/go-client/admin"
 	"github.com/paulrobello/par-rt-db/go-client/dsl"
 	"github.com/paulrobello/par-rt-db/go-client/httpclient"
 	"github.com/paulrobello/par-rt-db/go-client/wire"
 )
 
 type Item struct {
-	Name string `json:"name"`
+	Name string  `json:"name"`
 	N    *string `json:"n"` // int64 fields travel as decimal strings
-	ID   string `json:"_id"`
+	ID   string  `json:"_id"`
 }
 
 func main() {
-	c := httpclient.NewClient("http://127.0.0.1:8300", "mydb", "my-token")
 	ctx := context.Background()
+	baseURL := "http://127.0.0.1:8300"
+
+	// One-time provisioning: database, schema, machine token.
+	adm := admin.NewAdminClient(baseURL, "admin-key")
+	if _, err := adm.CreateDB(ctx, "mydb"); err != nil {
+		panic(err)
+	}
+	schema := dsl.DefineSchema().Table("items", func(t *dsl.TableBuilder) {
+		t.Field("name", dsl.Str()).Field("n", dsl.Int64()).Index("by_n", "n")
+	}).Build()
+	if err := adm.PushSchema(ctx, "mydb", schema); err != nil {
+		panic(err)
+	}
+	minted, err := adm.MintToken(ctx, "mydb", "app")
+	if err != nil {
+		panic(err)
+	}
+
+	c := httpclient.NewClient(baseURL, "mydb", minted.Token)
 
 	// Insert.
-	c.Mutate(ctx, wire.Transaction{Steps: []wire.Step{wire.StepInsert{
+	if _, err := c.Mutate(ctx, wire.Transaction{Steps: []wire.Step{wire.StepInsert{
 		Table: "items",
 		Doc:   wire.Object{"name": wire.String("first"), "n": wire.String("7")},
-	}}}, "")
+	}}}, ""); err != nil {
+		panic(err)
+	}
 
 	// Query (typed).
 	q := dsl.NewTableQuery("items").WithIndex("by_n", wire.String("7"))
 	items, err := httpclient.Query[[]Item](ctx, c, q.Build())
 	if err != nil {
 		panic(err)
+	}
+	if len(items) == 0 {
+		panic("no items returned")
 	}
 	fmt.Println(items[0].Name)
 }

@@ -142,7 +142,7 @@ func (f *Feed) Close() {
 		return
 	}
 	if frame, err := json.Marshal(wire.ClientFeedUnsubscribe{FeedID: f.id}); err == nil {
-		_ = f.client.sendFrame(context.Background(), frame)
+		f.client.sendFrameBestEffort(context.Background(), "feedUnsubscribe", frame)
 	}
 }
 
@@ -227,7 +227,7 @@ func (f *Feed) fail(err error) {
 
 func (f *Feed) sendUnsubscribe() {
 	if frame, err := json.Marshal(wire.ClientFeedUnsubscribe{FeedID: f.id}); err == nil {
-		_ = f.client.sendFrame(context.Background(), frame)
+		f.client.sendFrameBestEffort(context.Background(), "feedUnsubscribe", frame)
 	}
 }
 
@@ -266,7 +266,7 @@ func (f *Feed) pump() {
 			return
 		}
 		if frame, err := json.Marshal(wire.ClientFeedAck{FeedID: f.id, Seq: qb.max}); err == nil {
-			_ = f.client.sendFrame(context.Background(), frame)
+			f.client.sendFrameBestEffort(context.Background(), "feedAck", frame)
 		}
 	}
 }

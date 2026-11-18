@@ -249,22 +249,75 @@ func TestFieldExpectationWire(t *testing.T) {
 }
 
 // TestExpectStepDecodeErrors covers expectFields/expectBefore decode
-// validation and strict rejection.
+// validation and strict rejection, plus every other step decode that must
+// fail.
 func TestExpectStepDecodeErrors(t *testing.T) {
-	if _, err := UnmarshalStep([]byte(`{"op":"expectFields","expected":[]}`)); err == nil {
-		t.Fatal("expectFields without table/id/expected presence must be rejected")
+	filter := `{"op":"eq","field":"a","value":1}`
+	cases := []struct{ name, in string }{
+		{"expectFields without table/id presence", `{"op":"expectFields","expected":[]}`},
+		{"expectFields unknown field", `{"op":"expectFields","table":"t","id":"i","expected":[],"zz":1}`},
+		{"expectBefore without deadlineMs", `{"op":"expectBefore"}`},
+		{"expectBefore unknown field", `{"op":"expectBefore","deadlineMs":1,"zz":1}`},
+		{"expectAbsent unknown field", `{"op":"expectAbsent","table":"t","index":"i","eq":[],"zz":1}`},
+		{"upsert unknown field", `{"op":"upsert","table":"t","index":"i","eq":[],"insert":{},"patch":{},"zz":1}`},
+		{"upsert without patch", `{"op":"upsert","table":"t","index":"i","eq":[],"insert":{}}`},
+		{"upsert without insert", `{"op":"upsert","table":"t","index":"i","eq":[]}`},
+		{"schedule unknown field", `{"op":"schedule","when":{"type":"interval","everyMs":1},"txn":{"steps":[]},"zz":1}`},
+		{"schedule bad when", `{"op":"schedule","when":{"type":"nope"},"txn":{"steps":[]}}`},
+		{"schedule non-object txn", `{"op":"schedule","when":{"type":"interval","everyMs":1},"txn":5}`},
+		{"startWorkflow unknown field", `{"op":"startWorkflow","spec":{"name":"w","steps":[]},"zz":1}`},
+		{"startWorkflow spec unknown field", `{"op":"startWorkflow","spec":{"name":"w","steps":[],"zz":1}}`},
+		{"startWorkflow missing spec", `{"op":"startWorkflow"}`},
+		{"missing op tag", `{}`},
+		{"non-string op tag", `{"op":9}`},
+		{"patchByQuery without patch", `{"op":"patchByQuery","table":"t","filter":` + filter + `}`},
+		{"deleteByQuery without filter", `{"op":"deleteByQuery","table":"t"}`},
 	}
-	if _, err := UnmarshalStep([]byte(`{"op":"expectFields","table":"t","id":"i","expected":[],"zz":1}`)); err == nil {
-		t.Fatal("expectFields unknown field must be rejected")
+	// patchByQuery / deleteByQuery strict rejection and bad filter.
+	for _, op := range []string{"patchByQuery", "deleteByQuery"} {
+		cases = append(cases,
+			struct{ name, in string }{op + " unknown field", fmt.Sprintf(`{"op":%q,"table":"t","filter":%s,"patch":{},"limit":2,"zz":1}`, op, filter)},
+			struct{ name, in string }{op + " bad filter", fmt.Sprintf(`{"op":%q,"table":"t","filter":{"op":"nope"}}`, op)},
+		)
 	}
-	if _, err := UnmarshalStep([]byte(`{"op":"expectBefore"}`)); err == nil {
-		t.Fatal("expectBefore without deadlineMs must be rejected")
+	// cancelSchedule/cancelWorkflow strict rejection.
+	for _, op := range []string{"cancelSchedule", "cancelWorkflow"} {
+		cases = append(cases, struct{ name, in string }{op + " unknown field", fmt.Sprintf(`{"op":%q,"id":"x","zz":1}`, op)})
 	}
-	if _, err := UnmarshalStep([]byte(`{"op":"expectBefore","deadlineMs":1,"zz":1}`)); err == nil {
-		t.Fatal("expectBefore unknown field must be rejected")
+	// Per-variant strict unknown-field rejection for the remaining ops.
+	// (Variants whose other fields are plain strings/ints have no
+	// required-field checks — a missing field decodes to its zero value.)
+	perOp := []struct{ op, strict, missing string }{
+		{"insert", `{"op":"insert","table":"t","doc":{},"zz":1}`, `{"op":"insert","table":"t"}`},
+		{"patch", `{"op":"patch","table":"t","id":"i","fields":{},"zz":1}`, `{"op":"patch","table":"t","id":"i"}`},
+		{"adjustCounter", `{"op":"adjustCounter","table":"t","id":"i","field":"n","delta":1,"zz":1}`, ""},
+		{"delete", `{"op":"delete","table":"t","id":"i","zz":1}`, ""},
+		{"replace", `{"op":"replace","table":"t","id":"i","doc":{},"zz":1}`, `{"op":"replace","table":"t","id":"i"}`},
+		{"undelete", `{"op":"undelete","table":"t","id":"i","zz":1}`, ""},
+		{"expectVersion", `{"op":"expectVersion","table":"t","id":"i","version":1,"zz":1}`, ""},
+		{"expectNoMatch", `{"op":"expectNoMatch","table":"t","filter":` + filter + `,"zz":1}`, `{"op":"expectNoMatch","table":"t"}`},
+		{"insertMany", `{"op":"insertMany","table":"t","docs":[],"zz":1}`, ""},
+		{"upsertMany", `{"op":"upsertMany","table":"t","index":"i","docs":[],"zz":1}`, ""},
+		{"upsert", `{"op":"upsert","table":"t","index":"i","eq":[],"insert":{},"patch":{},"zz":1}`, `{"op":"upsert","table":"t","index":"i","eq":[],"insert":{}}`},
 	}
-	// adjustCounter: optional fields survive round trip; expected omitted when absent.
-	var s Step
+	for _, tc := range perOp {
+		cases = append(cases, struct{ name, in string }{tc.op + " unknown field", tc.strict})
+		if tc.missing != "" {
+			cases = append(cases, struct{ name, in string }{tc.op + " missing required field", tc.missing})
+		}
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := UnmarshalStep([]byte(tc.in)); err == nil {
+				t.Fatalf("must be rejected: %s", tc.in)
+			}
+		})
+	}
+}
+
+// TestAdjustCounterOptionalFieldsRoundTrip: optional fields survive a round
+// trip and expected is omitted when absent.
+func TestAdjustCounterOptionalFieldsRoundTrip(t *testing.T) {
 	in := []byte(`{"op":"adjustCounter","table":"t","id":"i","field":"n","delta":1,"min":0,"max":9}`)
 	s, err := UnmarshalStep(in)
 	if err != nil {
@@ -281,141 +334,56 @@ func TestExpectStepDecodeErrors(t *testing.T) {
 	if string(rb) != `{"delta":1,"field":"n","id":"i","max":9,"min":0,"op":"adjustCounter","table":"t"}` {
 		t.Fatalf("adjustCounter shape wrong: %s", rb)
 	}
-	// expectAbsent element decode failure: eq element not decodable is impossible
-	// with well-formed JSON; strict rejection is the reachable branch.
-	if _, err := UnmarshalStep([]byte(`{"op":"expectAbsent","table":"t","index":"i","eq":[],"zz":1}`)); err == nil {
-		t.Fatal("expectAbsent unknown field must be rejected")
+}
+
+// TestTransactionDecodeErrors: strict rejection at the transaction level and
+// propagation of a bad step.
+func TestTransactionDecodeErrors(t *testing.T) {
+	for name, in := range map[string]string{
+		"unknown field": `{"steps":[],"zz":1}`,
+		"bad step":      `{"steps":[{"op":"nope"}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var txn Transaction
+			if err := json.Unmarshal([]byte(in), &txn); err == nil {
+				t.Fatalf("must be rejected: %s", in)
+			}
+		})
 	}
-	// upsert strict rejection and missing-field failure.
-	if _, err := UnmarshalStep([]byte(`{"op":"upsert","table":"t","index":"i","eq":[],"insert":{},"patch":{},"zz":1}`)); err == nil {
-		t.Fatal("upsert unknown field must be rejected")
+}
+
+// TestNilSliceMarshalNormalization: docs/expected serialize as [] not null.
+func TestNilSliceMarshalNormalization(t *testing.T) {
+	cases := []struct {
+		name string
+		v    any
+		want string
+	}{
+		{"expectFields expected", StepExpectFields{Table: "t", ID: "i"}, `"expected":[]`},
+		{"insertMany docs", StepInsertMany{Table: "t"}, `"docs":[]`},
+		{"upsertMany docs", StepUpsertMany{Table: "t", Index: "i"}, `"docs":[]`},
 	}
-	if _, err := UnmarshalStep([]byte(`{"op":"upsert","table":"t","index":"i","eq":[],"insert":{}}`)); err == nil {
-		t.Fatal("upsert without patch must be rejected")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := json.Marshal(tc.v)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytesHas(b, tc.want) {
+				t.Fatalf("nil slice must marshal as %s: %s", tc.want, b)
+			}
+		})
 	}
-	// patchByQuery / deleteByQuery strict rejection and bad filter.
-	for _, op := range []string{"patchByQuery", "deleteByQuery"} {
-		in := fmt.Sprintf(`{"op":%q,"table":"t","filter":{"op":"eq","field":"a","value":1},"patch":{},"limit":2,"zz":1}`, op)
-		if _, err := UnmarshalStep([]byte(in)); err == nil {
-			t.Fatalf("unknown field must be rejected: %s", in)
-		}
-		bad := fmt.Sprintf(`{"op":%q,"table":"t","filter":{"op":"nope"}}`, op)
-		if _, err := UnmarshalStep([]byte(bad)); err == nil {
-			t.Fatalf("bad filter must propagate: %s", bad)
-		}
-	}
-	// schedule: strict rejection and bad nested when.
-	if _, err := UnmarshalStep([]byte(`{"op":"schedule","when":{"type":"interval","everyMs":1},"txn":{"steps":[]},"zz":1}`)); err == nil {
-		t.Fatal("schedule unknown field must be rejected")
-	}
-	if _, err := UnmarshalStep([]byte(`{"op":"schedule","when":{"type":"nope"},"txn":{"steps":[]}}`)); err == nil {
-		t.Fatal("bad when must propagate")
-	}
-	// startWorkflow: strict rejection, spec strict rejection, spec required.
-	if _, err := UnmarshalStep([]byte(`{"op":"startWorkflow","spec":{"name":"w","steps":[]},"zz":1}`)); err == nil {
-		t.Fatal("startWorkflow unknown field must be rejected")
-	}
-	if _, err := UnmarshalStep([]byte(`{"op":"startWorkflow","spec":{"name":"w","steps":[],"zz":1}}`)); err == nil {
-		t.Fatal("spec unknown field must be rejected")
-	}
-	if _, err := UnmarshalStep([]byte(`{"op":"startWorkflow"}`)); err == nil {
-		t.Fatal("missing spec must be rejected")
-	}
-	// cancelSchedule/cancelWorkflow strict rejection.
-	for _, op := range []string{"cancelSchedule", "cancelWorkflow"} {
-		in := fmt.Sprintf(`{"op":%q,"id":"x","zz":1}`, op)
-		if _, err := UnmarshalStep([]byte(in)); err == nil {
-			t.Fatalf("unknown field must be rejected: %s", in)
-		}
-	}
-	// Transaction decode: strict rejection at the transaction level and
-	// propagation of a bad step.
-	var txn Transaction
-	if err := json.Unmarshal([]byte(`{"steps":[],"zz":1}`), &txn); err == nil {
-		t.Fatal("transaction unknown field must be rejected")
-	}
-	if err := json.Unmarshal([]byte(`{"steps":[{"op":"nope"}]}`), &txn); err == nil {
-		t.Fatal("bad step must propagate")
-	}
-	// UnmarshalStep dispatch failures.
-	if _, err := UnmarshalStep([]byte(`{}`)); err == nil {
-		t.Fatal("missing op tag must be rejected")
-	}
-	if _, err := UnmarshalStep([]byte(`{"op":9}`)); err == nil {
-		t.Fatal("non-string op tag must be rejected")
-	}
-	// Per-variant strict unknown-field rejection for the remaining ops.
-	// (Variants whose other fields are plain strings/ints have no
-	// required-field checks — a missing field decodes to its zero value.)
-	perOp := []struct{ op, strict, missing string }{
-		{"insert", `{"op":"insert","table":"t","doc":{},"zz":1}`, `{"op":"insert","table":"t"}`},
-		{"patch", `{"op":"patch","table":"t","id":"i","fields":{},"zz":1}`, `{"op":"patch","table":"t","id":"i"}`},
-		{"adjustCounter", `{"op":"adjustCounter","table":"t","id":"i","field":"n","delta":1,"zz":1}`, ""},
-		{"delete", `{"op":"delete","table":"t","id":"i","zz":1}`, ""},
-		{"replace", `{"op":"replace","table":"t","id":"i","doc":{},"zz":1}`, `{"op":"replace","table":"t","id":"i"}`},
-		{"undelete", `{"op":"undelete","table":"t","id":"i","zz":1}`, ""},
-		{"expectVersion", `{"op":"expectVersion","table":"t","id":"i","version":1,"zz":1}`, ""},
-		{"expectNoMatch", `{"op":"expectNoMatch","table":"t","filter":{"op":"eq","field":"a","value":1},"zz":1}`, `{"op":"expectNoMatch","table":"t"}`},
-		{"insertMany", `{"op":"insertMany","table":"t","docs":[],"zz":1}`, ""},
-		{"upsertMany", `{"op":"upsertMany","table":"t","index":"i","docs":[],"zz":1}`, ""},
-		{"upsert", `{"op":"upsert","table":"t","index":"i","eq":[],"insert":{},"patch":{},"zz":1}`, `{"op":"upsert","table":"t","index":"i","eq":[],"insert":{}}`},
-	}
-	for _, tc := range perOp {
-		if _, err := UnmarshalStep([]byte(tc.strict)); err == nil {
-			t.Fatalf("%s: unknown field must be rejected", tc.op)
-		}
-		if tc.missing == "" {
-			continue
-		}
-		if _, err := UnmarshalStep([]byte(tc.missing)); err == nil {
-			t.Fatalf("%s: missing required field must be rejected", tc.op)
-		}
-	}
-	// patchByQuery / deleteByQuery: missing raw-typed required fields fail.
-	if _, err := UnmarshalStep([]byte(`{"op":"patchByQuery","table":"t","filter":{"op":"eq","field":"a","value":1}}`)); err == nil {
-		t.Fatal("patchByQuery without patch must be rejected")
-	}
-	if _, err := UnmarshalStep([]byte(`{"op":"deleteByQuery","table":"t"}`)); err == nil {
-		t.Fatal("deleteByQuery without filter must be rejected")
-	}
-	// Nil-slice marshal normalization: docs/expected serialize as [] not null.
-	b, err := json.Marshal(StepExpectFields{Table: "t", ID: "i"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytesHas(b, `"expected":[]`) {
-		t.Fatalf("nil expected must marshal as []: %s", b)
-	}
-	b, err = json.Marshal(StepInsertMany{Table: "t"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytesHas(b, `"docs":[]`) {
-		t.Fatalf("nil docs must marshal as []: %s", b)
-	}
-	b, err = json.Marshal(StepUpsertMany{Table: "t", Index: "i"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytesHas(b, `"docs":[]`) {
-		t.Fatalf("nil docs must marshal as []: %s", b)
-	}
-	// upsert: missing insert raw blob fails.
-	if _, err := UnmarshalStep([]byte(`{"op":"upsert","table":"t","index":"i","eq":[]}`)); err == nil {
-		t.Fatal("upsert without insert must be rejected")
-	}
-	// StepRetry strict rejection.
+}
+
+// TestStepRetryAndResultDecodeErrors: StepRetry strict rejection, and a
+// StepResult type mismatch failing in the alias fallback (syntactically
+// invalid JSON is rejected by encoding/json before UnmarshalJSON is called).
+func TestStepRetryAndResultDecodeErrors(t *testing.T) {
 	var retry StepRetry
 	if err := json.Unmarshal([]byte(`{"maxAttempts":1,"initialRetryMs":0,"maxRetryMs":0,"zz":1}`), &retry); err == nil {
 		t.Fatal("StepRetry unknown field must be rejected")
 	}
-	// schedule: a non-object txn blob fails the nested Transaction decode.
-	if _, err := UnmarshalStep([]byte(`{"op":"schedule","when":{"type":"interval","everyMs":1},"txn":5}`)); err == nil {
-		t.Fatal("schedule with non-object txn must be rejected")
-	}
-	// StepResult decode: valid JSON with a type mismatch fails in the
-	// alias fallback (syntactically invalid JSON is rejected by
-	// encoding/json before UnmarshalJSON is even called).
 	var r StepResult
 	if err := json.Unmarshal([]byte(`{"id":5}`), &r); err == nil {
 		t.Fatal("type-mismatched result must be rejected")
