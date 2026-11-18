@@ -19,6 +19,14 @@ floor is 26 because the cursor codec uses `java.util.Base64`. OkHttp is a
 `compileOnly` dependency of this library: add `com.squareup.okhttp3:okhttp:5.5.1`
 (or newer 5.x) to your app.
 
+## Contents
+
+- [Using the client](#using-the-client)
+- [Surfaces](#surfaces)
+- [Examples](#examples)
+- [Build](#build)
+- [Tests](#tests)
+
 ```kotlin
 val transport = OkHttpTransport(okHttpClient) // your configured OkHttpClient
 val db = RtDbHttpClient(baseUrl, "app", token, transport)
