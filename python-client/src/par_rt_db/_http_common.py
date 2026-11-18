@@ -41,3 +41,27 @@ def build_transform_url(
         parts.append(f"format={format}")
     url = f"{base}/storage/{id}"
     return f"{url}?{'&'.join(parts)}" if parts else url
+
+
+class _HttpClientBase:
+    """Members shared verbatim by the sync and async HTTP clients."""
+
+    _base: str
+
+    def transform_url(
+        self,
+        id: str,
+        *,
+        w: int | None = None,
+        h: int | None = None,
+        fit: Literal["cover", "contain", "scale-down"] | None = None,
+        q: int | None = None,
+        format: Literal["jpeg", "png", "auto"] | None = None,
+    ) -> str:
+        """The public serve URL for ``id`` with image-transform params (ENH-014).
+
+        No request is made. Params appear in the deterministic order
+        ``w, h, fit, q, format``; unset params (and ``format="auto"``, the
+        server default) are omitted.
+        """
+        return build_transform_url(self._base, id, w=w, h=h, fit=fit, q=q, format=format)

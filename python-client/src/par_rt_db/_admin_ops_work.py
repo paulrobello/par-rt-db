@@ -8,6 +8,9 @@ from typing import Any
 from ._admin_request import _AdminRequest, _parse_model, _parse_model_list, _parse_ok_bool
 from .mutation import Transaction
 from .wire import (
+    BulkOpAccepted,
+    BulkOpInfo,
+    FilterExpr,
     ScheduleInfo,
     ScheduleWhen,
     WorkflowInfo,
@@ -108,3 +111,19 @@ def _op_admin_manage_schedule(db: str, id: str, op: str) -> _AdminRequest:
     """Bodyless POST for cancel/pause/resume — ``op`` is only ever one of those
     three literals, each a path segment the server routes on."""
     return _AdminRequest("POST", f"/admin/db/{db}/schedules/{id}/{op}", {}, _parse_ok_bool)
+
+
+# --- data-plane bulk ops (ARC-005): POST /api/bulk/delete, GET /api/bulk/{id} ---
+
+
+def _op_bulk_delete(db: str, table: str, filter: FilterExpr) -> _AdminRequest:
+    body: dict[str, Any] = {
+        "db": db,
+        "table": table,
+        "filter": filter.model_dump(by_alias=True, mode="json"),
+    }
+    return _AdminRequest("POST", "/api/bulk/delete", {"json": body}, _parse_model(BulkOpAccepted))
+
+
+def _op_bulk_status(db: str, id: str) -> _AdminRequest:
+    return _AdminRequest("GET", f"/api/bulk/{id}", {"params": {"db": db}}, _parse_model(BulkOpInfo))

@@ -41,11 +41,12 @@ from __future__ import annotations
 
 from collections.abc import Generator, Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from typing import IO, TYPE_CHECKING, Any, Literal
+from typing import IO, TYPE_CHECKING, Any
 
 from pydantic import TypeAdapter
 
-from ._http_common import build_transform_url
+from ._admin_ops_work import _op_bulk_delete, _op_bulk_status
+from ._http_common import _HttpClientBase
 from .admin import (
     _op_admin_mutate,
     _op_admin_query,
@@ -204,7 +205,7 @@ _WORKFLOWS_ADAPTER = TypeAdapter(list[WorkflowInfo])
 _BATCH_ADAPTER = TypeAdapter(list[BatchQueryOutcome])
 
 
-class RtDbHttpClient:
+class RtDbHttpClient(_HttpClientBase):
     """Sync one-shot HTTP client. Data plane + storage + admin control plane.
 
     Construct with a per-db machine token for data-plane/storage calls, or with
@@ -534,13 +535,7 @@ class RtDbHttpClient:
         filter") — an unfiltered whole-table delete goes through the admin
         purge route instead. Poll with :meth:`bulk_status`.
         """
-        body: dict[str, Any] = {
-            "db": db,
-            "table": table,
-            "filter": filter.model_dump(by_alias=True, mode="json"),
-        }
-        resp = self._send("POST", "/api/bulk/delete", json=body)
-        return BulkOpAccepted.model_validate(resp.json())
+        return self._admin_executor.run(_op_bulk_delete(db, table, filter))
 
     def bulk_status(self, db: str, id: str) -> BulkOpInfo:
         """``GET /api/bulk/{id}?db=<db>`` → :class:`BulkOpInfo`.
@@ -549,8 +544,7 @@ class RtDbHttpClient:
         only on ``failed``. An unknown id (or one lost to a restart) is
         ``NOT_FOUND``.
         """
-        resp = self._send("GET", f"/api/bulk/{id}", params={"db": db})
-        return BulkOpInfo.model_validate(resp.json())
+        return self._admin_executor.run(_op_bulk_status(db, id))
 
     # --- data plane: workflows (POST /api/workflows*) — FM-29 ---
 
@@ -778,24 +772,6 @@ class RtDbHttpClient:
     def get_url(self, id: str) -> str:
         """The public serve URL (``GET /storage/{id}``) — no request is made."""
         return f"{self._base}/storage/{id}"
-
-    def transform_url(
-        self,
-        id: str,
-        *,
-        w: int | None = None,
-        h: int | None = None,
-        fit: Literal["cover", "contain", "scale-down"] | None = None,
-        q: int | None = None,
-        format: Literal["jpeg", "png", "auto"] | None = None,
-    ) -> str:
-        """The public serve URL for ``id`` with image-transform params (ENH-014).
-
-        No request is made. Params appear in the deterministic order
-        ``w, h, fit, q, format``; unset params (and ``format="auto"``, the
-        server default) are omitted.
-        """
-        return build_transform_url(self._base, id, w=w, h=h, fit=fit, q=q, format=format)
 
     # --- admin control plane (admin key as the token) ---
     #
