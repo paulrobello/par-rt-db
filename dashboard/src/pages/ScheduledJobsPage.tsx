@@ -62,19 +62,16 @@ export function ScheduledJobsPage() {
     loading,
     error: listError,
     refresh,
-    setData: setJobs,
   } = useAsync(() => client.listSchedules(db), [client, db], [] as ScheduleInfo[], {
     enabled: !!db,
+    // Switching databases should not show the previous database's jobs while
+    // the new list loads.
+    resetOnChange: true,
+    onChange: () => {
+      setActionError(null);
+      setConfirmingCancel(null);
+    },
   });
-
-  // Switching databases should not show the previous database's jobs while
-  // the new list loads.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: deps mirror the useAsync fetcher's own dep list, not this effect's body
-  useEffect(() => {
-    setJobs([]);
-    setActionError(null);
-    setConfirmingCancel(null);
-  }, [db, setJobs]);
 
   function buildWhen(): ScheduleWhen | { error: string } {
     if (mode === "afterMs") {

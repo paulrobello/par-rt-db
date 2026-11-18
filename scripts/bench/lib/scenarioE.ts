@@ -13,8 +13,8 @@
  * baseline).
  */
 import { mutation, RtDbClient, RtDbHttpClient } from "@par-rt-db/client";
-import type { RtQuery } from "@par-rt-db/client";
-import { httpToWs } from "./ws.js";
+import type { FilterExpr, RtQuery } from "@par-rt-db/client";
+import { httpToWs, waitAuthenticated } from "./ws.js";
 import { makePayload, sleep, summarize, type LatencySummary } from "./stats.js";
 import type { BenchTarget } from "./setup.js";
 
@@ -35,22 +35,7 @@ const INSERT_BATCH_SIZE = 500;
 const POLL_INTERVAL_MS = 50;
 const INTERLEAVE_EVERY_MS = 40;
 const INTERLEAVE_BATCH = 5;
-const AUTH_TIMEOUT_MS = 10_000;
 const OP_TIMEOUT_MS = 120_000;
-
-function waitAuthenticated(client: RtDbClient): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("auth timeout")), AUTH_TIMEOUT_MS);
-    const off = client.onAuthChange((state) => {
-      if (state === "authenticated") {
-        clearTimeout(timer);
-        off();
-        resolve();
-      }
-    });
-    client.connect();
-  });
-}
 
 export async function runScenarioE(
   target: BenchTarget,
@@ -91,13 +76,13 @@ export async function runScenarioE(
     pushes += 1;
   });
 
-  const filter = {
+  const filter: FilterExpr = {
     op: "and",
     exprs: [
       { op: "gte", field: "seed", value: base },
       { op: "lt", field: "seed", value: base + rows },
     ],
-  } as const;
+  };
 
   const accepted = await httpClient.bulkDelete(target.db, "items", filter);
   if (accepted.matched <= 0) {

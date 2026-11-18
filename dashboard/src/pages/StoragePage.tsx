@@ -61,18 +61,17 @@ export function StoragePage() {
     loading,
     error: listError,
     refresh,
-    setData: setFiles,
-  } = useAsync(() => client.listFiles(db), [client, db], [] as FileMeta[], { enabled: !!db });
-
-  // Switching databases should not show the previous database's files while
-  // the new list loads.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: deps mirror the useAsync fetcher's own dep list, not this effect's body
-  useEffect(() => {
-    setFiles([]);
-    setActionError(null);
-    setConfirmingDelete(null);
-    setCopyErrors({});
-  }, [db, setFiles]);
+  } = useAsync(() => client.listFiles(db), [client, db], [] as FileMeta[], {
+    enabled: !!db,
+    // Switching databases should not show the previous database's files while
+    // the new list loads.
+    resetOnChange: true,
+    onChange: () => {
+      setActionError(null);
+      setConfirmingDelete(null);
+      setCopyErrors({});
+    },
+  });
 
   useEffect(() => {
     return () => {

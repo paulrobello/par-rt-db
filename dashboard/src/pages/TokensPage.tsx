@@ -48,17 +48,16 @@ export function TokensPage() {
     loading,
     error: listError,
     refresh,
-    setData: setTokens,
-  } = useAsync(() => client.listTokens(db), [client, db], [] as TokenRow[], { enabled: !!db });
-
-  // Switching databases should not show the previous database's tokens while
-  // the new list loads.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: deps mirror the useAsync fetcher's own dep list, not this effect's body
-  useEffect(() => {
-    setTokens([]);
-    setActionError(null);
-    setConfirmingRevoke(null);
-  }, [db, setTokens]);
+  } = useAsync(() => client.listTokens(db), [client, db], [] as TokenRow[], {
+    enabled: !!db,
+    // Switching databases should not show the previous database's tokens while
+    // the new list loads.
+    resetOnChange: true,
+    onChange: () => {
+      setActionError(null);
+      setConfirmingRevoke(null);
+    },
+  });
 
   useEffect(() => {
     return () => {

@@ -27,7 +27,7 @@ function parseEvents(text: string): string[] {
 
 /** Status badge tone for a delivery row. Tolerates unknown values by falling
  *  back to the neutral badge. */
-function deliveryBadgeClass(status: string): string {
+export function deliveryBadgeClass(status: string): string {
   switch (status) {
     case "delivered":
       return s.badgeDelivered;

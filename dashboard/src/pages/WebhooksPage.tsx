@@ -2,7 +2,12 @@ import type { RtDbAdminClient } from "@par-rt-db/client";
 /** Webhook management — register webhooks and inspect the delivery outbox with retry state. */
 import { useEffect, useState } from "react";
 import { Button, Placard, Spinner } from "../components/ui";
-import { timeLabel, WebhookCreateForm, WebhookEditPanel } from "../components/webhooks";
+import {
+  deliveryBadgeClass,
+  timeLabel,
+  WebhookCreateForm,
+  WebhookEditPanel,
+} from "../components/webhooks";
 import { useAdmin } from "../lib/admin";
 import { toErrorMessage } from "../lib/errors";
 import type { Webhook, WebhookDelivery } from "../lib/types";
@@ -38,19 +43,18 @@ export function WebhooksPage() {
     loading,
     error: listError,
     refresh,
-    setData: setWebhooks,
-  } = useAsync(() => client.listWebhooks(db), [client, db], [] as Webhook[], { enabled: !!db });
-
-  // Switching databases should not show the previous database's webhooks
-  // while the new list loads.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: deps mirror the useAsync fetcher's own dep list, not this effect's body
-  useEffect(() => {
-    setWebhooks([]);
-    setActionError(null);
-    setConfirmingDelete(null);
-    setEditingId(null);
-    setDeliveriesForId(null);
-  }, [db, setWebhooks]);
+  } = useAsync(() => client.listWebhooks(db), [client, db], [] as Webhook[], {
+    enabled: !!db,
+    // Switching databases should not show the previous database's webhooks
+    // while the new list loads.
+    resetOnChange: true,
+    onChange: () => {
+      setActionError(null);
+      setConfirmingDelete(null);
+      setEditingId(null);
+      setDeliveriesForId(null);
+    },
+  });
 
   function startEdit(wh: Webhook) {
     setEditingId(wh.id);
@@ -226,21 +230,6 @@ export function WebhooksPage() {
       <WebhookCreateForm client={client} db={db} onCreated={refresh} />
     </section>
   );
-}
-
-function deliveryBadgeClass(status: string): string {
-  switch (status) {
-    case "delivered":
-      return s.badgeDelivered;
-    case "pending":
-      return s.badgePending;
-    case "retrying":
-      return s.badgeRetrying;
-    case "failed":
-      return s.badgeFailed;
-    default:
-      return "";
-  }
 }
 
 /** A one-line preview of the delivery payload — JSON-stringified and truncated

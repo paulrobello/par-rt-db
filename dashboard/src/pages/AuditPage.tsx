@@ -76,7 +76,6 @@ export function AuditPage() {
     loading,
     error: listError,
     refresh,
-    setData: setEntries,
   } = useAsync(
     () => {
       const opts: GetAuditOptions = { db, limit, offset };
@@ -88,15 +87,10 @@ export function AuditPage() {
     },
     [client, db, filters, limit, offset],
     [] as AuditEntry[],
-    { enabled: !!db },
+    // Switching databases (or any other filter/paging change) should not show
+    // the previous page's rows while the new one loads.
+    { enabled: !!db, resetOnChange: true },
   );
-
-  // Switching databases (or any other filter/paging change) should not show
-  // the previous page's rows while the new one loads.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: deps mirror the useAsync fetcher's own dep list, not this effect's body
-  useEffect(() => {
-    setEntries([]);
-  }, [db, filters, limit, offset, setEntries]);
 
   function selectDb(name: string) {
     setDb(name);

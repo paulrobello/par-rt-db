@@ -138,7 +138,6 @@ export function WorkflowsPage() {
     loading,
     error: listError,
     refresh,
-    setData: setRuns,
   } = useAsync(
     async () => {
       const opts = filter === "all" || filter === "stuck" ? {} : { status: filter };
@@ -148,22 +147,22 @@ export function WorkflowsPage() {
     },
     [client, db, filter],
     [] as WorkflowInfo[],
-    { enabled: !!db },
+    {
+      enabled: !!db,
+      // Switching databases or the status filter should not show the previous
+      // page's runs while the new list loads.
+      resetOnChange: true,
+      onChange: () => {
+        setActionError(null);
+        setConfirming(null);
+        setExpandedId(null);
+        setDetail(null);
+        setDetailError(null);
+        setSignalFor(null);
+        setSignalError(null);
+      },
+    },
   );
-
-  // Switching databases or the status filter should not show the previous
-  // page's runs while the new list loads.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: deps mirror the useAsync fetcher's own dep list, not this effect's body
-  useEffect(() => {
-    setRuns([]);
-    setActionError(null);
-    setConfirming(null);
-    setExpandedId(null);
-    setDetail(null);
-    setDetailError(null);
-    setSignalFor(null);
-    setSignalError(null);
-  }, [db, filter, setRuns]);
   useEffect(() => {
     const id = setInterval(() => void refresh(), REFRESH_MS);
     return () => clearInterval(id);

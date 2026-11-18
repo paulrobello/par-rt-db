@@ -18,7 +18,7 @@
 
 import { mutation, RtDbClient, RtDbHttpClient } from "@par-rt-db/client";
 import type { RtQuery } from "@par-rt-db/client";
-import { httpToWs } from "./ws.js";
+import { httpToWs, waitAuthenticated } from "./ws.js";
 import { makePayload, summarize, type LatencySummary } from "./stats.js";
 import type { BenchTarget } from "./setup.js";
 
@@ -31,22 +31,6 @@ export interface ScenarioDResult {
 
 const MAX_BY_QUERY_ROWS = 1000;
 const INSERT_BATCH_SIZE = 500;
-const AUTH_TIMEOUT_MS = 10_000;
-
-function waitAuthenticated(client: RtDbClient): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("auth timeout")), AUTH_TIMEOUT_MS);
-    const off = client.onAuthChange((state) => {
-      if (state === "authenticated") {
-        clearTimeout(timer);
-        off();
-        resolve();
-      }
-    });
-    client.connect();
-  });
-}
-
 export async function runScenarioD(
   target: BenchTarget,
   rows: number,

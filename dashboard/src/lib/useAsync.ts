@@ -11,6 +11,19 @@ export interface UseAsyncOptions {
    * Defaults to `true`.
    */
   enabled?: boolean;
+  /**
+   * Reset `data` to `initial` whenever `deps` (or `enabled`) change, before the
+   * new load starts — so a database/filter switch never shows the previous
+   * list while the next one loads. Defaults to `false`.
+   */
+  resetOnChange?: boolean;
+  /**
+   * Called synchronously when `deps` (or `enabled`) change, before the load
+   * starts, for page-local state that must reset alongside the data (action
+   * errors, confirm prompts, expanded rows). Read through a ref, so it need
+   * not be memoized.
+   */
+  onChange?: () => void;
 }
 
 export interface UseAsyncResult<T> {
@@ -59,6 +72,9 @@ export function useAsync<T>(
   initialRef.current = initial;
   const enabledRef = useRef(enabled);
   enabledRef.current = enabled;
+  const resetOnChange = options?.resetOnChange ?? false;
+  const onChangeRef = useRef(options?.onChange);
+  onChangeRef.current = options?.onChange;
 
   const refresh = useCallback(async () => {
     if (!enabledRef.current) return;
@@ -75,6 +91,8 @@ export function useAsync<T>(
   }, []);
 
   useEffect(() => {
+    if (resetOnChange) setData(initialRef.current);
+    onChangeRef.current?.();
     if (!enabled) {
       setData(initialRef.current);
       setLoading(false);
@@ -85,7 +103,7 @@ export function useAsync<T>(
     // `deps` (plus `enabled`) is the caller-controlled trigger list (see hook
     // docstring); `refresh` is stable (empty-dep useCallback) so listing it
     // does not change when this effect re-runs.
-  }, [enabled, ...deps, refresh]);
+  }, [enabled, resetOnChange, ...deps, refresh]);
 
   return { data, loading, error, refresh, setData };
 }
