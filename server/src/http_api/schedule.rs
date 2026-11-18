@@ -120,7 +120,8 @@ pub(crate) async fn claim_schedules_handler(
             Ok::<ClaimedSchedule, RtDbError>(ClaimedSchedule {
                 id: job.id,
                 kind: job.kind.parse::<ScheduleKind>().map_err(|err| {
-                    RtDbError::internal(format!("invalid scheduled_txns.kind: {err}"))
+                    tracing::error!(error = %err, "scheduled txn kind parse failed");
+                    RtDbError::internal("internal error")
                 })?,
                 due_at: job.due_at,
                 txn: job.txn,

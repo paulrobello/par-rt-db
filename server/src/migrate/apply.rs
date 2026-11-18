@@ -422,8 +422,10 @@ async fn apply_set_default(
     // `NOT doc ? '{field}'` and a jsonb_set path literal.
     require_field_ident(field)?;
     let t = pg_table(table);
-    let value_json =
-        serde_json::to_string(value).map_err(|e| RtDbError::internal(e.to_string()))?;
+    let value_json = serde_json::to_string(value).map_err(|e| {
+        tracing::error!(error = %e, "migrate value serialization failed");
+        RtDbError::internal("internal error")
+    })?;
     // Capture the rows lacking the field BEFORE the update — after the
     // update they have it, so the `WHERE NOT doc ? '{field}'` predicate
     // would no longer match them.
@@ -542,7 +544,10 @@ async fn apply_change_type(
         // `changeType` cannot push existing data outside its declared bounds
         // (the whole migrate txn fails and rolls back, naming the field).
         check_constraints_for_field(table_def(derived, table)?, field, &new_val)?;
-        let s = serde_json::to_string(&new_val).map_err(|e| RtDbError::internal(e.to_string()))?;
+        let s = serde_json::to_string(&new_val).map_err(|e| {
+            tracing::error!(error = %e, "migrate coerced value serialization failed");
+            RtDbError::internal("internal error")
+        })?;
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE \"{schema_name}\".\"{t}\" \
              SET doc = jsonb_set(doc, '{{\"{field}\"}}', $1::jsonb, true) \

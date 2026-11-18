@@ -826,10 +826,11 @@ async fn admin_fingerprint(
 /// `/metrics` (SPA) still works: a browser (`Accept: text/html,...`) is served
 /// the SPA's `index.html` when `RTDB_STATIC_DIR` is configured; everything else
 /// (Prometheus's scraper sends `application/openmetrics-text;...,text/plain;...`,
-/// curl, API-only deploys) gets Prometheus text. Safe to expose without auth —
-/// `MetricsSnapshot` is aggregate-only (no per-db, no principal data), same
-/// posture as `/healthz`. The existing admin JSON snapshot stays at
-/// `/admin/metrics` (admin-gated); this endpoint does not replace it.
+/// curl, API-only deploys) gets Prometheus text. SEC-205: the Prometheus text
+/// carries `rtdb_build_info`, which fingerprints the exact build, so the text
+/// branch is admin-gated; the HTML branch stays public — it is the SPA fallback
+/// and serves only static content. The admin JSON snapshot remains at
+/// `/admin/metrics`.
 async fn prometheus_metrics_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -853,6 +854,13 @@ async fn prometheus_metrics_handler(
             HeaderValue::from_static("no-cache, no-store, must-revalidate"),
         );
         return (StatusCode::OK, h, index).into_response();
+    }
+
+    // SEC-205: the Prometheus export carries `rtdb_build_info` (exact build
+    // identity), so it is gated like the admin JSON snapshot at /admin/metrics.
+    // The HTML branch above stays public: it is the SPA fallback.
+    if let Err(e) = crate::admin::require_admin(&state, &headers).await {
+        return e.into_response();
     }
 
     let (presence_rooms, presence_sessions) = state.realtime.presence.counts().await;

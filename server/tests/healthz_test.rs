@@ -270,3 +270,44 @@ async fn cors_preflight_omits_header_for_disallowed_origin() -> anyhow::Result<(
     assert!(resp.headers().get("access-control-allow-origin").is_none());
     Ok(())
 }
+
+// SEC-205: the /metrics Prometheus text carries `rtdb_build_info` (exact
+// build identity), so the text branch is admin-gated like /admin/metrics.
+// The SPA-fallback HTML branch is deployment-dependent and not covered here.
+#[tokio::test]
+async fn metrics_prometheus_branch_is_admin_gated() -> anyhow::Result<()> {
+    let pool = crate::common::test_pool(&test_config().database_url).await?;
+    let state = AppState::new(pool, test_config(), test_hot());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(axum::serve(listener, build_router(state)).into_future());
+
+    // No bearer: the Prometheus branch must not render metrics or build
+    // identity.
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .header("Accept", "text/plain")
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 401);
+    let body = resp.text().await?;
+    assert!(
+        !body.contains("rtdb_build_info"),
+        "unauthenticated /metrics leaked build info: {body}"
+    );
+
+    // With the admin key: full export renders.
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/metrics"))
+        .header("Accept", "text/plain")
+        .header("Authorization", "Bearer canary-secret-admin-key")
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await?;
+    assert!(
+        body.contains("rtdb_build_info"),
+        "admin-authed /metrics must still render the export"
+    );
+    Ok(())
+}

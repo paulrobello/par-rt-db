@@ -152,7 +152,10 @@ pub(super) async fn export_db(
     Response::builder()
         .header(axum::http::header::CONTENT_TYPE, "application/x-ndjson")
         .body(Body::from_stream(stream))
-        .map_err(|err| RtDbError::internal(format!("failed to build export response: {err}")))
+        .map_err(|err| {
+            tracing::error!(error = %err, "export response build failed");
+            RtDbError::internal("export failed")
+        })
 }
 
 #[derive(Deserialize)]
@@ -484,7 +487,10 @@ pub(super) async fn quiesce_db(
     let committers = state.realtime.committers.clone();
     let generation = tokio::spawn(async move { committers.quiesce(&db).await })
         .await
-        .map_err(|error| RtDbError::internal(format!("quiesce task failed: {error}")))??;
+        .map_err(|error| {
+            tracing::error!(error = %error, "quiesce task failed");
+            RtDbError::internal("quiesce failed")
+        })??;
     Ok(Json(QuiesceResponse {
         quiesced: true,
         generation,
@@ -505,7 +511,10 @@ pub(super) async fn unquiesce_db(
     let committers = state.realtime.committers.clone();
     tokio::spawn(async move { committers.unquiesce(&db, generation).await })
         .await
-        .map_err(|error| RtDbError::internal(format!("unquiesce task failed: {error}")))??;
+        .map_err(|error| {
+            tracing::error!(error = %error, "unquiesce task failed");
+            RtDbError::internal("unquiesce failed")
+        })??;
     Ok(Json(QuiesceResponse {
         quiesced: false,
         generation,

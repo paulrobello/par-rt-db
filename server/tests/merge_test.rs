@@ -1095,9 +1095,11 @@ async fn admin_merge_users_endpoint_requires_confirm_and_runs_merge() -> anyhow:
     assert_eq!(body["dbs"][&db]["tables"]["docs"], json!(1));
     assert_eq!(body["anonDeleted"], json!(true));
 
-    // Metric visible on the Prometheus scrape.
+    // Metric visible on the Prometheus scrape (SEC-205: the text branch is
+    // admin-gated, so the scrape carries the admin bearer).
     let metrics = client
         .get(format!("http://{addr}/metrics"))
+        .header("authorization", "Bearer test-admin-key")
         .send()
         .await?
         .text()

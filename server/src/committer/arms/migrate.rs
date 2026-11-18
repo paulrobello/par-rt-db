@@ -91,8 +91,10 @@ pub(in crate::committer) async fn handle_migrate(
     // shape as `ddl::push_schema`'s tail upsert). The committer is the only
     // writer for this db, so the read-modify-write under the committer turn is
     // safe. `pg_schema(db)` is already validated/lowercased by `db::create`.
-    let schema_json = serde_json::to_value(&derived)
-        .map_err(|e| RtDbError::internal(format!("failed to serialize schema: {e}")))?;
+    let schema_json = serde_json::to_value(&derived).map_err(|e| {
+        tracing::error!(error = %e, "schema serialization failed");
+        RtDbError::internal("internal error")
+    })?;
     let schema_name = crate::ddl::pg_schema(&ctx.db);
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO \"{schema_name}\".meta (key, value) VALUES ('schema', $1) \

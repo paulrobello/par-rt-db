@@ -25,6 +25,7 @@ async fn scrape_metric(addr: SocketAddr, series: &str) -> f64 {
     let resp = reqwest::Client::new()
         .get(format!("http://{addr}/metrics"))
         .header("Accept", "text/plain")
+        .header("Authorization", "Bearer test-admin-key")
         .send()
         .await
         .expect("GET /metrics");

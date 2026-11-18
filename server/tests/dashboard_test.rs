@@ -621,8 +621,9 @@ async fn metrics_endpoint_reflects_query_latency() -> anyhow::Result<()> {
     Ok(())
 }
 
-// GET /metrics returns Prometheus text-exposition (no Accept header → text
-// branch), and a prior /api/query is reflected in the rtdb_queries_total sample.
+// GET /metrics (admin bearer — SEC-205 gates the Prometheus text branch like
+// /admin/metrics) returns Prometheus text-exposition, and a prior /api/query is
+// reflected in the rtdb_queries_total sample.
 #[tokio::test]
 async fn metrics_prometheus_endpoint() -> anyhow::Result<()> {
     let state = crate::common::test_state().await;
@@ -661,6 +662,7 @@ async fn metrics_prometheus_endpoint() -> anyhow::Result<()> {
     // No Accept header → Prometheus text (API-only test mode, no RTDB_STATIC_DIR).
     let resp = reqwest::Client::new()
         .get(format!("http://{addr}/metrics"))
+        .header("Authorization", "Bearer test-admin-key")
         .send()
         .await?;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -687,8 +689,8 @@ async fn metrics_prometheus_endpoint() -> anyhow::Result<()> {
         "missing gauge TYPE line: {body}"
     );
     assert!(
-        !body.contains("rtdb_build_info"),
-        "build_info leaked on unauthenticated /metrics (SEC-129): {body}"
+        body.contains("rtdb_build_info"),
+        "admin-authenticated /metrics must expose build_info (SEC-205): {body}"
     );
     // The query we ran must be reflected: sample value >= 1.
     let qline = body
