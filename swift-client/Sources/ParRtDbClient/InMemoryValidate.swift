@@ -54,7 +54,7 @@ public func isBase64String(_ value: JSONValue) -> Bool {
     guard case let .string(string) = value, string.count % 4 == 0 else { return false }
     var padding = 0
     for character in string.reversed() {
-        if character == "=" && padding < 2 {
+        if character == "=", padding < 2 {
             padding += 1
             continue
         }
