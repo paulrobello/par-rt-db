@@ -16,7 +16,7 @@ use serde_json::Value;
 use sqlx::{AssertSqlSafe, PgPool};
 
 use crate::db::{now_ms, validate_db_name};
-use crate::ddl::pg_schema;
+use crate::ddl::{ensure_module_table, pg_schema};
 use crate::error::RtDbError;
 
 /// Default dedup TTL (5 min) — the env-seed default for
@@ -29,16 +29,18 @@ pub const DEFAULT_DEDUP_TTL_MS: i64 = 5 * 60 * 1000;
 /// once per committer task startup, covering databases created before this
 /// table existed (new databases get it from `db::create_database` instead).
 pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
-    validate_db_name(db)?;
     let schema = pg_schema(db);
-    sqlx::query(AssertSqlSafe(format!(
-        "CREATE TABLE IF NOT EXISTS \"{schema}\".mutation_cache_v2 (
+    ensure_module_table(
+        pool,
+        db,
+        format!(
+            "CREATE TABLE IF NOT EXISTS \"{schema}\".mutation_cache_v2 (
             mut_id text PRIMARY KEY,
             result jsonb NOT NULL,
             expires_at bigint NOT NULL
         )"
-    )))
-    .execute(pool)
+        ),
+    )
     .await?;
     Ok(())
 }

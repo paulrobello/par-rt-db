@@ -9,8 +9,8 @@
 
 use sqlx::{AssertSqlSafe, PgPool};
 
-use crate::db::{now_ms, validate_db_name};
-use crate::ddl::pg_schema;
+use crate::db::now_ms;
+use crate::ddl::{ensure_module_table, pg_schema};
 use crate::error::RtDbError;
 use crate::schema::SchemaDef;
 
@@ -40,18 +40,20 @@ pub struct HistoryEntry {
 /// Idempotent. Self-heals databases created before this feature shipped.
 /// Mirrors the per-db side tables created in `db::create_database`.
 pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
-    validate_db_name(db)?;
     let schema_name = pg_schema(db);
-    sqlx::query(AssertSqlSafe(format!(
-        "CREATE TABLE IF NOT EXISTS \"{schema_name}\".schema_history (\
+    ensure_module_table(
+        pool,
+        db,
+        format!(
+            "CREATE TABLE IF NOT EXISTS \"{schema_name}\".schema_history (\
             version     BIGSERIAL PRIMARY KEY,\
             captured_at BIGINT NOT NULL,\
             source      TEXT NOT NULL,\
             principal   TEXT,\
             schema      JSONB NOT NULL\
         )"
-    )))
-    .execute(pool)
+        ),
+    )
     .await?;
     Ok(())
 }

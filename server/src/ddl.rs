@@ -39,6 +39,24 @@ pub fn pg_schema(db: &str) -> String {
     format!("db_{db}")
 }
 
+/// Shared tail for the per-module `ensure_table` functions (QA-007): one
+/// validate + one `AssertSqlSafe` execute per bare-DDL statement, so the
+/// SQL-invariant checklist has a single enforcement point instead of six.
+/// `qualified_ddl` may interpolate only the validated schema prefix
+/// (`pg_schema(db)`); statements that bind values stay direct `sqlx::query`
+/// calls after this helper has validated for the module.
+pub(crate) async fn ensure_module_table(
+    pool: &PgPool,
+    db: &str,
+    qualified_ddl: String,
+) -> Result<(), RtDbError> {
+    validate_db_name(db)?;
+    sqlx::query(AssertSqlSafe(qualified_ddl))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Physical name of a table's auto-increment `SEQUENCE` (one per table that
 /// declares `autoIncrementField`). `seq_` + the lowercased table name (capped
 /// at 30 chars by `MAX_TABLE_NAME_LEN`) stays well within the 63-byte limit.

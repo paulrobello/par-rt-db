@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{AssertSqlSafe, PgPool};
 
 use crate::db::{new_id, now_ms, quiesce_key, validate_db_name};
-use crate::ddl::pg_schema;
+use crate::ddl::{ensure_module_table, pg_schema};
 use crate::error::RtDbError;
 
 /// Chunk size for the streaming upload path (ENH-021). 1 MiB: small enough to
@@ -40,10 +40,12 @@ pub const STORAGE_CHUNK_BYTES: usize = 1024 * 1024;
 /// blob (which keeps its bytes in `storage_chunks`) can store NULL there —
 /// idempotent via `ALTER COLUMN ... DROP NOT NULL`.
 pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
-    validate_db_name(db)?;
     let schema = pg_schema(db);
-    sqlx::query(AssertSqlSafe(format!(
-        "CREATE TABLE IF NOT EXISTS \"{schema}\".storage (
+    ensure_module_table(
+        pool,
+        db,
+        format!(
+            "CREATE TABLE IF NOT EXISTS \"{schema}\".storage (
             id           text PRIMARY KEY,
             sha256       text NOT NULL,
             size         bigint NOT NULL,
@@ -52,48 +54,56 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
             created_at   bigint NOT NULL,
             owner_id     text
         )"
-    )))
-    .execute(pool)
+        ),
+    )
     .await?;
     // SEC-118: retrofit `owner_id` onto tables created before the column
     // existed. Idempotent — Postgres >= 9.6 supports ADD COLUMN IF NOT EXISTS.
-    sqlx::query(AssertSqlSafe(format!(
-        "ALTER TABLE \"{schema}\".storage ADD COLUMN IF NOT EXISTS owner_id text"
-    )))
-    .execute(pool)
+    ensure_module_table(
+        pool,
+        db,
+        format!("ALTER TABLE \"{schema}\".storage ADD COLUMN IF NOT EXISTS owner_id text"),
+    )
     .await?;
     // ENH-021: chunked uploads keep their bytes in `storage_chunks` and leave
     // the inline column NULL, so the NOT NULL constraint on legacy schemas must
     // be dropped. Idempotent — re-running on an already-nullable column is a
     // no-op. A legacy row written via the buffer-accepting path still carries
     // inline bytes; the read path falls back to it when no chunk rows exist.
-    sqlx::query(AssertSqlSafe(format!(
-        "ALTER TABLE \"{schema}\".storage ALTER COLUMN bytes DROP NOT NULL"
-    )))
-    .execute(pool)
+    ensure_module_table(
+        pool,
+        db,
+        format!("ALTER TABLE \"{schema}\".storage ALTER COLUMN bytes DROP NOT NULL"),
+    )
     .await?;
     // ENH-021: per-db chunk table. Additive — never alters the legacy `storage`
     // row shape. The composite PRIMARY KEY (blob_id, seq) gives the ordered
     // scan the read path streams over; there is no secondary index because
     // every chunk read is a point lookup on that PK.
-    sqlx::query(AssertSqlSafe(format!(
-        "CREATE TABLE IF NOT EXISTS \"{schema}\".storage_chunks (
+    ensure_module_table(
+        pool,
+        db,
+        format!(
+            "CREATE TABLE IF NOT EXISTS \"{schema}\".storage_chunks (
             blob_id text NOT NULL,
             seq     int  NOT NULL,
             bytes   bytea NOT NULL,
             PRIMARY KEY (blob_id, seq)
         )"
-    )))
-    .execute(pool)
+        ),
+    )
     .await?;
     // Best-effort: a database that predates dedup and already holds duplicate
     // hashes cannot build the index, so dedup stays off for it (uploads keep
     // working, `put` simply stores a copy) until an operator clears the dupes.
-    if let Err(e) = sqlx::query(AssertSqlSafe(format!(
-        "CREATE UNIQUE INDEX IF NOT EXISTS \"{schema}_storage_sha256_idx\"
+    if let Err(e) = ensure_module_table(
+        pool,
+        db,
+        format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS \"{schema}_storage_sha256_idx\"
          ON \"{schema}\".storage (sha256)"
-    )))
-    .execute(pool)
+        ),
+    )
     .await
     {
         tracing::warn!(

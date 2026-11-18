@@ -182,7 +182,7 @@ pub(crate) fn resolve_when(when: ScheduleWhen, now: i64) -> Result<ResolvedWhen,
 
 use sqlx::{AssertSqlSafe, PgConnection, PgPool};
 
-use crate::ddl::pg_schema;
+use crate::ddl::{ensure_module_table, pg_schema};
 use crate::txn::Transaction;
 
 /// `(kind, cron, tz, every_ms)` of a stored recurring job, as read back by the
@@ -262,10 +262,12 @@ pub async fn ensure_table_cached(pool: &PgPool, db: &str) -> Result<(), RtDbErro
 /// [`ensure_table_cached`] instead — this uncached form is for boot/spawn
 /// paths, where re-running the DDL is what lets a dropped table self-heal.
 pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
-    validate_db_name(db)?;
     let schema = pg_schema(db);
-    sqlx::query(AssertSqlSafe(format!(
-        "CREATE TABLE IF NOT EXISTS \"{schema}\".scheduled_txns (
+    ensure_module_table(
+        pool,
+        db,
+        format!(
+            "CREATE TABLE IF NOT EXISTS \"{schema}\".scheduled_txns (
             id          text PRIMARY KEY,
             kind        text NOT NULL,
             due_at      bigint NOT NULL,
@@ -283,71 +285,98 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
             missed_count bigint NOT NULL DEFAULT 0,
             last_missed_at bigint
         )"
-    )))
-    .execute(pool)
+        ),
+    )
     .await?;
     // Databases created before interval jobs lack the column; additive-only,
     // same IF NOT EXISTS discipline as the schema DDL path.
-    sqlx::query(AssertSqlSafe(format!(
-        "ALTER TABLE \"{schema}\".scheduled_txns
+    ensure_module_table(
+        pool,
+        db,
+        format!(
+            "ALTER TABLE \"{schema}\".scheduled_txns
          ADD COLUMN IF NOT EXISTS tz text"
-    )))
-    .execute(pool)
+        ),
+    )
     .await?;
-    sqlx::query(AssertSqlSafe(format!(
-        "ALTER TABLE \"{schema}\".scheduled_txns
+    ensure_module_table(
+        pool,
+        db,
+        format!(
+            "ALTER TABLE \"{schema}\".scheduled_txns
          ADD COLUMN IF NOT EXISTS every_ms bigint"
-    )))
-    .execute(pool)
+        ),
+    )
     .await?;
     // External-claim fencing columns (2026-09-09): pre-existing databases gain
     // them via the same additive ALTER discipline.
-    sqlx::query(AssertSqlSafe(format!(
-        "ALTER TABLE \"{schema}\".scheduled_txns
+    ensure_module_table(
+        pool,
+        db,
+        format!(
+            "ALTER TABLE \"{schema}\".scheduled_txns
          ADD COLUMN IF NOT EXISTS external boolean NOT NULL DEFAULT false"
-    )))
-    .execute(pool)
+        ),
+    )
     .await?;
-    sqlx::query(AssertSqlSafe(format!(
-        "ALTER TABLE \"{schema}\".scheduled_txns
+    ensure_module_table(
+        pool,
+        db,
+        format!(
+            "ALTER TABLE \"{schema}\".scheduled_txns
          ADD COLUMN IF NOT EXISTS claim_generation bigint NOT NULL DEFAULT 0"
-    )))
-    .execute(pool)
+        ),
+    )
     .await?;
-    sqlx::query(AssertSqlSafe(format!(
-        "ALTER TABLE \"{schema}\".scheduled_txns
+    ensure_module_table(
+        pool,
+        db,
+        format!(
+            "ALTER TABLE \"{schema}\".scheduled_txns
          ADD COLUMN IF NOT EXISTS lease_deadline_ms bigint"
-    )))
-    .execute(pool)
+        ),
+    )
     .await?;
     // Missed-window observability columns: pre-existing databases gain them
     // via the same additive ALTER discipline.
-    sqlx::query(AssertSqlSafe(format!(
-        "ALTER TABLE \"{schema}\".scheduled_txns
+    ensure_module_table(
+        pool,
+        db,
+        format!(
+            "ALTER TABLE \"{schema}\".scheduled_txns
          ADD COLUMN IF NOT EXISTS missed_count bigint NOT NULL DEFAULT 0"
-    )))
-    .execute(pool)
+        ),
+    )
     .await?;
-    sqlx::query(AssertSqlSafe(format!(
-        "ALTER TABLE \"{schema}\".scheduled_txns
+    ensure_module_table(
+        pool,
+        db,
+        format!(
+            "ALTER TABLE \"{schema}\".scheduled_txns
          ADD COLUMN IF NOT EXISTS last_missed_at bigint"
-    )))
-    .execute(pool)
+        ),
+    )
     .await?;
     // SEC-001 (2026-10-01): the enqueuing user's durable identity. NULL = a
     // system or machine enqueue, which fires as the bypass principal exactly
     // as before; pre-existing rows keep today's behavior.
-    sqlx::query(AssertSqlSafe(format!(
-        "ALTER TABLE \"{schema}\".scheduled_txns
+    ensure_module_table(
+        pool,
+        db,
+        format!(
+            "ALTER TABLE \"{schema}\".scheduled_txns
          ADD COLUMN IF NOT EXISTS enqueuer jsonb"
-    )))
-    .execute(pool)
+        ),
+    )
     .await?;
-    sqlx::query(AssertSqlSafe(format!(
-        "CREATE INDEX IF NOT EXISTS \"{schema}_scheduled_due_idx\"
+    ensure_module_table(
+        pool,
+        db,
+        format!(
+            "CREATE INDEX IF NOT EXISTS \"{schema}_scheduled_due_idx\"
          ON \"{schema}\".scheduled_txns (status, due_at)"
-    )))
-    .execute(pool)
+        ),
+    )
     .await?;
     Ok(())
 }
@@ -538,10 +567,12 @@ pub async fn list(pool: &PgPool, db: &str) -> Result<Vec<ScheduleInfo>, RtDbErro
                 last_missed_at,
             )| {
                 let kind = kind.parse::<ScheduleKind>().map_err(|err| {
-                    RtDbError::internal(format!("invalid scheduled_txns.kind: {err}"))
+                    tracing::error!(error = %err, "scheduled txn kind parse failed");
+                    RtDbError::internal("internal error")
                 })?;
                 let status = status.parse::<ScheduleStatus>().map_err(|err| {
-                    RtDbError::internal(format!("invalid scheduled_txns.status: {err}"))
+                    tracing::error!(error = %err, "scheduled txn status parse failed");
+                    RtDbError::internal("internal error")
                 })?;
                 Ok(ScheduleInfo {
                     id,

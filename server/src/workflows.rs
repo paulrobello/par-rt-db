@@ -6,7 +6,7 @@
 //! Spec: docs/superpowers/specs/2026-08-15-workflows-design.md
 
 use crate::db::{new_id, now_ms, validate_db_name};
-use crate::ddl::pg_schema;
+use crate::ddl::{ensure_module_table, pg_schema};
 use crate::error::RtDbError;
 use crate::protocol::{
     StepOutcome, StepRetry, WorkflowInfo, WorkflowInfoFull, WorkflowSpec, WorkflowStatus,
@@ -117,10 +117,12 @@ pub struct WorkflowRow {
 /// Mirrors `scheduler::ensure_table`; called once at scheduler startup
 /// (`run_scheduler`), alongside the `scheduled_txns` ensure.
 pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
-    validate_db_name(db)?;
     let schema = pg_schema(db);
-    sqlx::query(AssertSqlSafe(format!(
-        "CREATE TABLE IF NOT EXISTS \"{schema}\".workflows (
+    ensure_module_table(
+        pool,
+        db,
+        format!(
+            "CREATE TABLE IF NOT EXISTS \"{schema}\".workflows (
             id            text PRIMARY KEY,
             name          text NOT NULL,
             status        text NOT NULL,
@@ -135,33 +137,42 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
             started_at    bigint,
             finished_at   bigint
         )"
-    )))
-    .execute(pool)
+        ),
+    )
     .await?;
-    sqlx::query(AssertSqlSafe(format!(
-        "CREATE INDEX IF NOT EXISTS \"{schema}_workflows_due_idx\"
+    ensure_module_table(
+        pool,
+        db,
+        format!(
+            "CREATE INDEX IF NOT EXISTS \"{schema}_workflows_due_idx\"
          ON \"{schema}\".workflows (status, sleep_until)"
-    )))
-    .execute(pool)
+        ),
+    )
     .await?;
     // Lazy upgrade for databases that predate awaitSignal (CREATE TABLE IF
     // NOT EXISTS does not touch an existing table).
-    sqlx::query(AssertSqlSafe(format!(
-        "ALTER TABLE \"{schema}\".workflows
+    ensure_module_table(
+        pool,
+        db,
+        format!(
+            "ALTER TABLE \"{schema}\".workflows
             ADD COLUMN IF NOT EXISTS wait_name text,
             ADD COLUMN IF NOT EXISTS waited_since bigint,
             ADD COLUMN IF NOT EXISTS signal_payload jsonb"
-    )))
-    .execute(pool)
+        ),
+    )
     .await?;
     // SEC-001 (2026-10-01): the enqueuing user's durable identity. NULL = a
     // system or machine enqueue, which advances as the bypass principal
     // exactly as before; pre-existing rows keep today's behavior.
-    sqlx::query(AssertSqlSafe(format!(
-        "ALTER TABLE \"{schema}\".workflows
+    ensure_module_table(
+        pool,
+        db,
+        format!(
+            "ALTER TABLE \"{schema}\".workflows
             ADD COLUMN IF NOT EXISTS enqueuer jsonb"
-    )))
-    .execute(pool)
+        ),
+    )
     .await?;
     Ok(())
 }
@@ -817,8 +828,10 @@ pub async fn status_of(
 }
 
 fn parse_status(s: &str) -> Result<WorkflowStatus, RtDbError> {
-    s.parse()
-        .map_err(|e| RtDbError::internal(format!("invalid workflows.status: {e}")))
+    s.parse().map_err(|e| {
+        tracing::error!(error = %e, status = s, "workflow status parse failed");
+        RtDbError::internal("internal error")
+    })
 }
 
 // Column order matches the SELECT lists in `list` and `get`.

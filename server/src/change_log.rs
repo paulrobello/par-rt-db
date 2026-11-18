@@ -19,8 +19,8 @@
 use serde_json::Value;
 use sqlx::{PgConnection, PgPool};
 
-use crate::db::{new_id, validate_db_name};
-use crate::ddl::pg_schema;
+use crate::db::new_id;
+use crate::ddl::{ensure_module_table, pg_schema};
 use crate::error::RtDbError;
 use crate::txn::{OpKind, WriteSet};
 
@@ -53,20 +53,23 @@ pub(crate) fn kind_str(kind: OpKind) -> &'static str {
 /// read so a consumer can detect the one hole seqs cannot: a db dropped and
 /// recreated under the same name restarts at seq 0.
 pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
-    validate_db_name(db)?;
     let schema = pg_schema(db);
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE TABLE IF NOT EXISTS \"{schema}\".change_head (
+    ensure_module_table(
+        pool,
+        db,
+        format!(
+            "CREATE TABLE IF NOT EXISTS \"{schema}\".change_head (
             ok     boolean PRIMARY KEY DEFAULT true,
             seq    bigint NOT NULL DEFAULT 0,
             log_id text   NOT NULL DEFAULT ''
         )"
-    )))
-    .execute(pool)
+        ),
+    )
     .await?;
     // Seed the singleton row (idempotent) so the counter UPDATE always
     // matches. `log_id` mints only on the inserting call — the ON CONFLICT
-    // keeps the original mint for the life of the database.
+    // keeps the original mint for the life of the database. Binds a value,
+    // so it stays a direct statement; validation ran in the call above.
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO \"{schema}\".change_head (ok, seq, log_id)
          VALUES (true, 0, $1) ON CONFLICT (ok) DO NOTHING"
@@ -74,8 +77,11 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
     .bind(&new_id()[..16])
     .execute(pool)
     .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE TABLE IF NOT EXISTS \"{schema}\".changes (
+    ensure_module_table(
+        pool,
+        db,
+        format!(
+            "CREATE TABLE IF NOT EXISTS \"{schema}\".changes (
             seq        bigint PRIMARY KEY,
             table_name text NOT NULL,
             doc_id     text NOT NULL,
@@ -83,18 +89,21 @@ pub async fn ensure_table(pool: &PgPool, db: &str) -> Result<(), RtDbError> {
             doc        jsonb,
             ts         bigint NOT NULL
         )"
-    )))
-    .execute(pool)
+        ),
+    )
     .await?;
     // The table=-filtered poll walks (table_name, seq) — without this index
     // every filtered read scans up to the whole retained window.
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        // CREATE INDEX takes no schema qualifier — the index lands in the
-        // table's schema automatically.
-        "CREATE INDEX IF NOT EXISTS changes_table_seq
+    ensure_module_table(
+        pool,
+        db,
+        format!(
+            // CREATE INDEX takes no schema qualifier — the index lands in the
+            // table's schema automatically.
+            "CREATE INDEX IF NOT EXISTS changes_table_seq
          ON \"{schema}\".changes (table_name, seq)"
-    )))
-    .execute(pool)
+        ),
+    )
     .await?;
     Ok(())
 }
