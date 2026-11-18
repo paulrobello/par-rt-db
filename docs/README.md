@@ -12,6 +12,8 @@ contribution.
 - [`RELEASING.md`](RELEASING.md) — the release procedure: lockstep, push-to-main publishes. One-time registry setup, lockstep version bump, CHANGELOG heading, then push — a green push to `main` runs [`release.yml`](../.github/workflows/release.yml), which publishes the version the tree declares and creates the matching `vX.Y.Z` tag and GitHub release (armed by the `ENABLE_AUTO_PUBLISH` repository variable).
 - [`clients.md`](clients.md) — the six client SDKs (TypeScript/Rust/Python/Swift/Go/Kotlin) at a glance: surface comparison, the seven-implementation wire parity contract, and links to each package's detailed README.
 - [`atomic-counter.md`](atomic-counter.md) — the `adjustCounter` transaction step: atomic bounded counter updates inside the same transaction as related document writes.
+- [`transaction-deadlines.md`](transaction-deadlines.md) — the `expectBefore` transaction step: reject a transaction whose authoritative commit-time clock has reached an absolute epoch-millisecond deadline.
+- [`transaction-field-guards.md`](transaction-field-guards.md) — the read-only `expectFields` transaction step: require selected values on one live row to match exactly without writing it.
 
 ## Generated API references
 

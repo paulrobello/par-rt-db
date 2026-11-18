@@ -199,7 +199,7 @@ autocomplete = TableQuery("items").search("by_name", "conv", mode="trgm").take(1
 phrase = TableQuery("items").search("by_name", '"release notes" -draft', snippet=True).build()
 
 # Vector similarity over a pgvector index (embeddings are client-supplied).
-vs = TableQuery("docs").vector_search("by_embedding", [0.1, 0.2, ...], limit=5).build()
+vs = TableQuery("docs").vector_search("by_embedding", [0.1, 0.2, 0.3], limit=5).build()
 
 # Field projection: each result doc keeps its system fields (`_id`/
 # `_creationTime`/`_version`, plus synthetic fields like `_searchSnippet`) and
@@ -230,13 +230,14 @@ that touches the table. Use `parse_result(model, terminal, payload)` from
 
 ```python
 import asyncio
+import os
 from par_rt_db import Mutation, TableQuery
 from par_rt_db.ws_client import RtDbClient
 
 
 async def main() -> None:
     async def get_token() -> str | None:
-        return _token()  # your per-db machine token or OAuth session token
+        return os.environ["RTDB_TOKEN"]  # your per-db machine token or OAuth session token
 
     client = RtDbClient("wss://rtdb.example.com", "mydb", get_token=get_token)
     await client.connect()

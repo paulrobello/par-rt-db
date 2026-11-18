@@ -223,8 +223,8 @@ pub(crate) async fn signed_url_handler(
 /// Public, unauthenticated serve: anyone with the URL fetches the bytes. The
 /// opaque id resolves to its owning db via the global index. Query params, if
 /// present, request an on-the-fly image transform (ENH-014). Rate-limited per
-/// client IP (SEC-004 / SEC-112) when `RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM > 0`;
-/// off by default.
+/// client IP (SEC-004 / SEC-112) when `RTDB_STORAGE_RATE_LIMIT_PER_IP_RPM > 0`
+/// (default 300; `0` disables).
 ///
 /// SEC-113: when `RTDB_STORAGE_REQUIRE_SIGNED_URLS` is `true` (or lists the
 /// blob's database), every request must carry a complete, valid `?exp=&sig=`

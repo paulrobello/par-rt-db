@@ -47,7 +47,9 @@ against Convex with per-row notes on which clients mirror each feature.
 ## Development setup
 
 You need `docker` (for the dev Postgres), `cargo` (Rust stable), `bun`,
-`uv` (Python), and `go` (1.23, per `go-client/go.mod`). Then:
+`uv` (Python), `go` (1.27, per `go-client/go.mod`), and a JDK 17+ with Gradle
+for `kotlin-client`. On macOS, the Swift toolchain (Xcode or Swift 6) is also
+needed for `swift-client` (its Makefile legs are Darwin-only). Then:
 
 ```bash
 # 1. Start the dev Postgres on 127.0.0.1:55434. Required for any test run.
@@ -58,6 +60,7 @@ make go-client-install
 make ts-client-install
 make dashboard-install
 make python-client-install
+make kotlin-client-install
 # Cargo workspaces (server/, rust-client/, cli/) have no install step — cargo fetches on first build.
 
 # 3. Configure the minimum environment the server needs to run.
@@ -124,7 +127,7 @@ cd core && cargo test                           # core (par-rt-db-core) tests
 cd server && cargo test                         # server tests
 cd ts-client && bunx vitest run                 # ts-client tests
 cd rust-client && cargo test --all-features     # rust-client tests
-cd dashboard && bun run test                    # dashboard tests (vitest, 18 files)
+cd dashboard && bun run test                    # dashboard tests (vitest, 37 files)
 cd python-client && uv run pytest -q            # python-client tests
 cd go-client && go test ./...                   # go-client tests
 cd cli && cargo test                            # cli tests (rtdb binary)
@@ -137,9 +140,9 @@ cargo test upsert                                         # by name, lib + integ
 # The server's integration tests are ONE binary (`server/tests/main.rs`), so
 # every `tests/<name>.rs` is a module of it and filters are `<name>::<test>`.
 # A NEW test file needs a `mod <name>;` line in `tests/main.rs`.
-For multi-instance server tests, use `server/tests/common/cluster.rs` and
-`Cluster::two` instead of constructing replicas inline. The `test-support`
-feature provides gated `drop_replies` and `delay_listener` chaos hooks.
+# For multi-instance server tests, use `server/tests/common/cluster.rs` and
+# `Cluster::two` instead of constructing replicas inline. The `test-support`
+# feature provides gated `drop_replies` and `delay_listener` chaos hooks.
 
 cd ts-client && bunx vitest run tests/<file>.test.ts
 cd python-client && uv run pytest -q tests/<file>.py

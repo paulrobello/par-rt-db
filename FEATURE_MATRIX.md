@@ -1,6 +1,6 @@
 # Feature Matrix — Convex vs par-rt-db
 
-**Date:** 2026-07-21 (gap matrix last updated 2026-10-22; dimensional + divergence comparison added 2026-07-29)
+**Date:** 2026-07-21 (the gap matrix section was last updated 2026-10-22; dimensional + divergence comparison added 2026-07-29)
 **Purpose:** Inventory Convex's feature surface against par-rt-db's, and rank every gap
 by utility and level of effort so parity work can be picked off in value order.
 **Perspective:** "Utility" is judged for the apps this instance actually serves (kanban

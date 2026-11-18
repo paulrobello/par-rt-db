@@ -735,6 +735,19 @@ alter observable behavior on upgrade.
   and Mutate but was accepting a session that had expired since the handshake;
   revocation now takes effect on open admin connections at the same op
   boundary as ordinary sessions.
+- **The `/metrics` Prometheus text branch is admin-gated (SEC-205).** The
+  export carries `rtdb_build_info` (exact build identity), so it is scoped
+  like the `/admin/metrics` JSON snapshot instead of sharing `/healthz`'s
+  unauthenticated posture. The SPA fallback (browser `Accept: text/html`)
+  stays public. Scrapers must send the admin bearer; `deploy/README.md`'s
+  Monitoring section documents the new posture.
+- **Serde/serialization failures on the schema-push and admin paths no longer
+  stringified into client-facing 500s (SEC-202).** `serde_json::Error`
+  bodies leaked internal type/field detail in the `{code, message}` envelope;
+  the affected handlers (schema push, migrate apply, admin export,
+  quiesce/unquiesce join, workflow/scheduler/schedule-api status parsing)
+  now log the error via `tracing::error!` server-side and return the generic
+  `internal error` envelope.
 
 ### Documentation
 
@@ -763,9 +776,10 @@ and forward-path sequence diagrams. The README gains a canonical
 [Multi-instance](README.md#multi-instance) section, WebSocket connection-limit
 documentation, corrected presence wire-frame names, and a topology and security
 configuration group. Every client README now states that nothing is published to
-a registry yet and shows a working repo-local install, carries a table of
-contents and a "Full API" table, and has had its non-compiling examples
-corrected against current signatures.
+a registry yet and shows a working repo-local install, and the
+ts/rust/python/swift READMEs carry a table of contents (the go and kotlin
+READMEs are short enough to have none) and an API reference section. Their
+non-compiling examples were corrected against current signatures.
 
 ## [0.1.0] - 2026-08-18
 

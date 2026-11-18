@@ -31,7 +31,7 @@ is the boot `RTDB_ADMIN_KEY` for admin commands.
 
 ## Configuration
 
-Every flag has an environment-variable fallback — the preferred path, since
+Every global flag (`--url`, `--db`, `--token`, `--admin-key`) has an environment-variable fallback — the preferred path, since
 flag values are visible in `ps` output and shell history (SEC-204; the CLI
 prints a warning when it sees a credential on the command line):
 

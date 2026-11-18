@@ -93,6 +93,10 @@ admin.pushSchema(
             index("by_done", "done")
             index("by_owner_done", "owner", "done")
         }
+        table("bookings") {
+            field("room", FieldType.string())
+            field("slot", FieldType.number())
+        }
     },
 )
 val token = admin.mintToken("myapp", "app").token

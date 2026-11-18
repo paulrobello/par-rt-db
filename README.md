@@ -113,7 +113,7 @@ Related documentation: [`CHANGELOG.md`](CHANGELOG.md), [`DESIGN.md`](DESIGN.md),
 | **Rust client** | [`rust-client/`](rust-client) | Rust (`par-rt-db-client`) | Rust SDK: http + reactive ws + admin + `.filter()`/`.search()`/`.vector_search()` builders |
 | **Python client** | [`python-client/`](python-client) | Python (`par-rt-db`, uv) | Python SDK: wire + schema/mutation/query DSL + sync HTTP/admin/storage + reactive WS |
 | **Swift client** | [`swift-client/`](swift-client) | Swift 6 (`ParRtDbClient`/`ParRtDbUI`, SPM) | iOS 17+/macOS 14 SDK: wire + query/mutation/schema DSL + HTTP + reactive WS + SwiftUI `LiveQuery` (Darwin only) |
-| **Go client** | [`go-client/`](go-client) | Go 1.23+ (`github.com/paulrobello/par-rt-db/go-client`) | Go SDK: wire + schema DSL + typed HTTP queries + reactive WS + admin client + in-memory engine |
+| **Go client** | [`go-client/`](go-client) | Go 1.27+ (`github.com/paulrobello/par-rt-db/go-client`) | Go SDK: wire + schema DSL + typed HTTP queries + reactive WS + admin client + in-memory engine |
 | **Kotlin client** | [`kotlin-client/`](kotlin-client) | Kotlin 2.4 (JVM 17+ bytecode, Gradle) | JVM + Android (minSdk 26, via the OkHttp transport) SDK: wire + query/mutation/schema DSL + HTTP + reactive WS (`Flow`) + admin client + in-memory engine |
 | **Dashboard** | [`dashboard/`](dashboard) | Vite + React 19 + TS (bun) | Operator console SPA served same-origin at `RTDB_STATIC_DIR` |
 | **`rtdb` CLI** | [`cli/`](cli) | Rust (`rtdb` binary, cargo) | Operator/CI wrapper around `par-rt-db-client`: list/create dbs, push schema, query/mutate, mint/revoke tokens |
@@ -176,7 +176,7 @@ committer (blobs don't touch document tables). See
 * [Docker](https://www.docker.com/) — for the dev Postgres and for the production `docker compose` deploy path (see [`deploy/README.md`](deploy/README.md))
 * A Rust `stable` toolchain to build the server binary from source ([`rust-toolchain.toml`](rust-toolchain.toml) is the single source of truth)
 * `jq` for the Quickstart walkthrough
-* Per client SDK: bun/node for TypeScript, cargo for Rust, Python 3.12+ (uv) for Python, Xcode with the Swift 6 toolchain for Swift (Darwin only), Go 1.23+ for Go, a JDK 17+ for Kotlin
+* Per client SDK: bun/node for TypeScript, cargo for Rust, Python 3.12+ (uv) for Python, Xcode with the Swift 6 toolchain for Swift (Darwin only), Go 1.27+ for Go, a JDK 17+ for Kotlin
 
 ## Prerequisites for dev
 * See [CONTRIBUTING's development setup](CONTRIBUTING.md#development-setup) for the full tool list and first-time setup
@@ -1979,7 +1979,7 @@ plus an operator SPA and a CLI built on top of them:
 - [`rust-client/`](rust-client/README.md) — `par-rt-db-client` (Rust): http + reactive ws + admin, `.filter()`/`.search()`/`.vector_search()` builders.
 - [`python-client/`](python-client/README.md) — `par-rt-db` (Python): wire contract + schema/mutation/query DSL + sync HTTP/admin/storage + reactive WS.
 - [`swift-client/`](swift-client/README.md) — `ParRtDbClient`/`ParRtDbUI` (Swift 6, iOS 17+/macOS 14): wire + query/mutation/schema DSL + HTTP + reactive WS + SwiftUI `LiveQuery`, plus the admin client, presence, optimistic updates, and the in-memory engine (see its README's coverage table).
-- [`go-client/`](go-client/README.md) — `github.com/paulrobello/par-rt-db/go-client` (Go 1.23+): wire + schema DSL + typed HTTP queries + reactive WS + admin client + the in-memory engine, stdlib-only outside `coder/websocket`.
+- [`go-client/`](go-client/README.md) — `github.com/paulrobello/par-rt-db/go-client` (Go 1.27+): wire + schema DSL + typed HTTP queries + reactive WS + admin client + the in-memory engine, stdlib-only outside `coder/websocket`.
 - [`kotlin-client/`](kotlin-client/README.md) — `dev.parrtdb:par-rt-db-kotlin-client` (Kotlin 2.4, JVM 17+ / Android minSdk 26): wire + query/mutation/schema DSL + HTTP + reactive WS (`Flow`) + admin client + the in-memory engine, over a pluggable transport (`JdkTransport` or OkHttp for Android).
 - [`dashboard/`](dashboard/README.md) — the operator console SPA (admin/operator UI served same-origin at `RTDB_STATIC_DIR`; consumes `ts-client`).
 - [`cli/`](cli/README.md) — `rtdb` operator/CI binary (wraps `par-rt-db-client`). `rtdb changes --db <db> [--since <seq>] [--limit <n>] [--follow]` prints one page of durable change ops as compact NDJSON, with the `nextSeq` cursor on stderr. Omit `--since` to start at the current head, or pass `--since 0` for the oldest retained ops. `--follow` polls every two seconds until Ctrl-C; `CURSOR_EXPIRED` exits non-zero without silently resyncing. Supply `RTDB_URL` and `RTDB_TOKEN` (machine token).

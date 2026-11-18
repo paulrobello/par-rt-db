@@ -462,7 +462,7 @@ anything above 0.5 in amber. Remediation levers, in order of effectiveness:
 - **Split hot tables** — move the rows a table-level subscription doesn't need
   (or the ones it does) into a separate table, so each write fans out to fewer
   subscriptions.
-- **Quota caps** — `maxSubsPerDb` (via `PATCH /admin/config`; one of the eight
+- **Quota caps** — `maxSubsPerDb` (via `PATCH /admin/config`; one of the ten
   hot fields, alongside `maxTablesPerDb` and `maxStorageBytesPerDb`) bounds how
   many subscriptions a database can hold, capping the worst-case fan-out per
   committer turn.
@@ -470,11 +470,13 @@ anything above 0.5 in amber. Remediation levers, in order of effectiveness:
 ## Monitoring
 
 `GET /metrics` is the Prometheus scrape endpoint — plain text exposition,
-aggregate-only (no per-db, no principal data), same auth posture as `/healthz`
-(none). Content-negotiated on `Accept`: a browser (`text/html`) is served the
-SPA's `index.html` when `RTDB_STATIC_DIR` is set; everything else (Prometheus
-sends `application/openmetrics-text`, curl, API-only deploys) gets the
-Prometheus text. Point a scraper at `https://rtdb.example.com/metrics`.
+aggregate-only (no per-db, no principal data). The Prometheus text branch is
+admin-gated (SEC-205: the export carries `rtdb_build_info`, the exact build
+identity, so it is scoped like `/admin/metrics`) — configure your scraper with
+the admin bearer (`Authorization: Bearer $RTDB_ADMIN_KEY`). The SPA fallback
+stays public: content-negotiated on `Accept`, a browser (`text/html`) is
+served the SPA's `index.html` when `RTDB_STATIC_DIR` is set. Point a scraper
+at `https://rtdb.example.com/metrics` with the bearer in its headers.
 
 The subscription-invalidation canary above is the one alert to wire up: alert
 on any increase of `rtdb_subs_missed_pushes_total` (only populated when
@@ -740,9 +742,10 @@ curl -s -X POST https://rtdb.example.com/admin/allowlist \
 
 ## Hot config beats env
 
-Eight settings (`allowedOrigins`, `sessionTtlDays`, `maxFileSize`,
+Ten settings (`allowedOrigins`, `sessionTtlDays`, `maxFileSize`,
 `idempotencyTtlMs`, `maxTablesPerDb`, `maxStorageBytesPerDb`, `maxSubsPerDb`,
-`changeLogMaxRows` — the `HotConfig` fields) are runtime-mutable and
+`changeLogMaxRows`, and the rate-limit ceilings `perTokenRpm`/`perDbRpm` — the
+`HotConfig` fields) are runtime-mutable and
 **persisted**: the first `PATCH /admin/config` writes the merged row into the
 single-row `rtdb_config` table, and every boot thereafter loads that row and
 overlays it onto the env-seeded defaults field by field
