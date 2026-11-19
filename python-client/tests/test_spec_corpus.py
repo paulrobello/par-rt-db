@@ -450,3 +450,26 @@ def test_patch_semantics_spec(row: dict[str, Any]) -> None:
         assert error.value.code == row["expect"]["error"]["code"]
     else:
         assert apply_patch(table, row["doc"], row["patch"], 0) == row["expect"]["doc"]
+
+
+@pytest.mark.parametrize(
+    "row",
+    json.loads(
+        (Path(__file__).resolve().parents[2] / "wire-corpus/spec/search-modes.json").read_text()
+    )["rows"],
+    ids=lambda row: row["id"],
+)
+def test_search_modes_spec(row: dict[str, Any]) -> None:
+    from par_rt_db.in_memory import InMemoryRtDbClient
+    from par_rt_db.query import Query
+    from par_rt_db.schema import SchemaDef
+
+    client = InMemoryRtDbClient()
+    client.push_schema(SchemaDef.model_validate(row["schema"]))
+    query = Query.model_validate(row["query"])
+    if "error" in row["expect"]:
+        with pytest.raises(RtDbError) as error:
+            client.run_query(query)
+        assert error.value.code == row["expect"]["error"]["code"]
+    else:
+        assert client.run_query(query) == []

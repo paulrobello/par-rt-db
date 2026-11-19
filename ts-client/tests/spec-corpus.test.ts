@@ -505,3 +505,29 @@ describe("spec corpus: patch semantics", () => {
     });
   }
 });
+
+describe("spec corpus: search modes", () => {
+  const fixture = JSON.parse(
+    readFileSync(resolve(__dirname, "../../wire-corpus/spec/search-modes.json"), "utf8"),
+  ) as {
+    rows: {
+      id: string;
+      schema: SchemaJson;
+      query: import("../src/protocol.js").QueryJson;
+      expect: { accepted?: boolean; error?: { code: string } };
+    }[];
+  };
+  for (const row of fixture.rows) {
+    it(row.id, async () => {
+      const client = new InMemoryRtDbClient();
+      client.pushSchema(row.schema);
+      if (row.expect.error) {
+        await expect(client.query({ json: row.query })).rejects.toMatchObject({
+          code: row.expect.error.code,
+        });
+      } else {
+        await expect(client.query({ json: row.query })).resolves.toEqual([]);
+      }
+    });
+  }
+});

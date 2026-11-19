@@ -587,6 +587,13 @@ fixture can never disagree with the code that owns the semantics.
   null-unset versus nullable-inner null storage, no-op patches, and invalid
   type, array element, required-null, and unknown-field rejections.
 
+- [`spec/search-modes.json`](spec/search-modes.json) — generated through the
+  production query compiler. All six clients execute each query on an empty
+  schema-backed engine to pin default and explicit tsquery mode, declared trgm
+  mode, mode-specific snippet/ranking/similarity options, inclusive similarity
+  bounds, and empty-query or missing-index `BAD_REQUEST` failures. This table
+  pins admission rather than cross-engine search ranking.
+
 **Authoring rule:** a change to the pinned semantics (a new `FieldType`
 variant, a mapping change in `indexed_column_type`, a new `ValueExpr` node,
 a new `Cast` target, a stamping-semantics change in `stamp_computed` or

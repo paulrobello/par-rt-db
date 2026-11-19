@@ -1235,3 +1235,32 @@ fn spec_patch_semantics() {
         }
     }
 }
+
+#[cfg(feature = "in_memory")]
+#[test]
+fn spec_search_modes() {
+    use par_rt_db_client::{
+        in_memory::{InMemoryRtDbClient, InMemoryRtDbClientOptions},
+        query::Query,
+        schema::SchemaDef,
+    };
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../wire-corpus/spec/search-modes.json")).unwrap();
+    for row in fixture["rows"].as_array().unwrap() {
+        let schema: SchemaDef = serde_json::from_value(row["schema"].clone()).unwrap();
+        let query: Query = serde_json::from_value(row["query"].clone()).unwrap();
+        let mut client = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+        client.push_schema(&schema).unwrap();
+        let result = client.run_query(&query);
+        if row["expect"].get("error").is_some() {
+            assert_eq!(
+                serde_json::json!(result.unwrap_err().code),
+                row["expect"]["error"]["code"],
+                "{}",
+                row["id"]
+            );
+        } else {
+            result.unwrap_or_else(|error| panic!("{}: {error}", row["id"]));
+        }
+    }
+}

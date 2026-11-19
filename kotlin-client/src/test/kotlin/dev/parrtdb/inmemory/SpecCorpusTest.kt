@@ -561,3 +561,23 @@ class PatchSemanticsSpecTest {
         }
     }
 }
+
+class SearchModesSpecTest {
+    @Test
+    fun searchModesTable() {
+        val fixture = WireJson.parse(CorpusPaths.read("spec", "search-modes.json")) as JsonObject
+        for (entry in fixture["rows"] as JsonArray) {
+            val row = entry as JsonObject
+            val client = InMemoryClient()
+            client.pushSchema(row["schema"]!!)
+            val expect = row["expect"] as JsonObject
+            val query = Query.fromJson(row["query"]!!)
+            if (expect["error"] != null) {
+                val error = assertFailsWith<RtDbException> { client.query(query) }
+                assertEquals((expect["error"] as JsonObject)["code"], jsonStr(error.code.wire), row["id"].toString())
+            } else {
+                client.query(query)
+            }
+        }
+    }
+}
