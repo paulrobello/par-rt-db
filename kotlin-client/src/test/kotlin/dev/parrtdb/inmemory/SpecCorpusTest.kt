@@ -541,3 +541,23 @@ class CursorEncodingSpecTest {
         }
     }
 }
+
+class PatchSemanticsSpecTest {
+    @Test
+    fun patchSemanticsTable() {
+        val fixture = WireJson.parse(CorpusPaths.read("spec", "patch-semantics.json")) as JsonObject
+        for (entry in fixture["rows"] as JsonArray) {
+            val row = entry as JsonObject
+            val table = parseSchema(jsonObj("tables" to jsonObj("t" to row["table"]!!))).tables.getValue("t")
+            val expect = row["expect"] as JsonObject
+            val doc = row["doc"] as JsonObject
+            val patch = row["patch"] as JsonObject
+            if (expect["error"] != null) {
+                val error = assertFailsWith<RtDbException> { applyPatch(table, doc, patch, 0) }
+                assertEquals((expect["error"] as JsonObject)["code"], jsonStr(error.code.wire), row["id"].toString())
+            } else {
+                assertEquals(expect["doc"], applyPatch(table, doc, patch, 0), row["id"].toString())
+            }
+        }
+    }
+}

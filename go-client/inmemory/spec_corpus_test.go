@@ -918,3 +918,69 @@ func TestSpecCursorEncoding(t *testing.T) {
 		})
 	}
 }
+
+func TestSpecPatchSemantics(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(specCorpusPath(t)), "patch-semantics.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Rows []struct {
+			ID     string          `json:"id"`
+			Table  json.RawMessage `json:"table"`
+			Doc    json.RawMessage `json:"doc"`
+			Patch  json.RawMessage `json:"patch"`
+			Expect struct {
+				Doc   json.RawMessage `json:"doc"`
+				Error *struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			} `json:"expect"`
+		} `json:"rows"`
+	}
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range fixture.Rows {
+		t.Run(row.ID, func(t *testing.T) {
+			tableValue, err := wire.UnmarshalJSON(row.Table)
+			if err != nil {
+				t.Fatal(err)
+			}
+			table, err := parseTableDef(tableValue)
+			if err != nil {
+				t.Fatal(err)
+			}
+			doc, err := wire.UnmarshalJSON(row.Doc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			patch, err := wire.UnmarshalJSON(row.Patch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := applyPatch(table, doc.(wire.Object), patch.(wire.Object), 0)
+			if row.Expect.Error != nil {
+				dbErr, ok := err.(*rtdberrors.RtDbError)
+				if !ok || string(dbErr.Code) != row.Expect.Error.Code {
+					t.Fatalf("expected %s, got %v", row.Expect.Error.Code, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			actual, err := json.Marshal(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var expected bytes.Buffer
+			if err := json.Compact(&expected, row.Expect.Doc); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(actual, expected.Bytes()) {
+				t.Fatalf("got %s, want %s", actual, expected.Bytes())
+			}
+		})
+	}
+}

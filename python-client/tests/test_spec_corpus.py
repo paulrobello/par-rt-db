@@ -430,3 +430,23 @@ def test_cursor_encoding_spec(row: dict[str, Any]) -> None:
     else:
         assert decode_cursor(row["cursor"]) == row["expect"]
         assert encode_cursor(row["values"]) == row["cursor"]
+
+
+@pytest.mark.parametrize(
+    "row",
+    json.loads(
+        (Path(__file__).resolve().parents[2] / "wire-corpus/spec/patch-semantics.json").read_text()
+    )["rows"],
+    ids=lambda row: row["id"],
+)
+def test_patch_semantics_spec(row: dict[str, Any]) -> None:
+    from par_rt_db.in_memory.store import apply_patch
+    from par_rt_db.schema import TableDef
+
+    table = TableDef.model_validate(row["table"])
+    if "error" in row["expect"]:
+        with pytest.raises(RtDbError) as error:
+            apply_patch(table, row["doc"], row["patch"], 0)
+        assert error.value.code == row["expect"]["error"]["code"]
+    else:
+        assert apply_patch(table, row["doc"], row["patch"], 0) == row["expect"]["doc"]

@@ -1207,3 +1207,31 @@ fn spec_cursor_encoding() {
         }
     }
 }
+
+#[cfg(feature = "in_memory")]
+#[test]
+fn spec_patch_semantics() {
+    use par_rt_db_client::{in_memory::apply_patch, schema::TableDef};
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../wire-corpus/spec/patch-semantics.json")).unwrap();
+    for row in fixture["rows"].as_array().unwrap() {
+        let table: TableDef = serde_json::from_value(row["table"].clone()).unwrap();
+        let result = apply_patch(&table, &row["doc"], row["patch"].as_object().unwrap(), 0);
+        if row["expect"].get("error").is_some() {
+            let error = result.unwrap_err();
+            assert_eq!(
+                serde_json::json!(error.code),
+                row["expect"]["error"]["code"],
+                "{}",
+                row["id"]
+            );
+        } else {
+            assert_eq!(
+                serde_json::json!(result.unwrap()),
+                row["expect"]["doc"],
+                "{}",
+                row["id"]
+            );
+        }
+    }
+}

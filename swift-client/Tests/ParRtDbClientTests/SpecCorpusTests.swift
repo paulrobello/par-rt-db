@@ -733,3 +733,36 @@ struct CursorEncodingSpecTests {
         }
     }
 }
+
+struct PatchSemanticsSpecTests {
+    private struct Fixture: Decodable { let rows: [Row] }
+    private struct Row: Decodable {
+        let id: String
+        let table: TableDef
+        let doc: [String: JSONValue]
+        let patch: [String: JSONValue]
+        let expect: Outcome
+    }
+
+    private struct Outcome: Decodable {
+        let doc: [String: JSONValue]?
+        let error: [String: String]?
+    }
+
+    @Test func patchSemanticsTable() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("wire-corpus/spec/patch-semantics.json")
+        let fixture = try JSONDecoder().decode(Fixture.self, from: Data(contentsOf: url))
+        for row in fixture.rows {
+            do {
+                let doc = try applyPatch(row.table, row.doc, row.patch, now: 0)
+                #expect(row.expect.error == nil, "\(row.id): expected rejection")
+                #expect(doc == row.expect.doc, "\(row.id): patched document")
+            } catch let error as RtDbError {
+                #expect(error.code.rawValue == row.expect.error?["code"], "\(row.id): error code")
+            }
+        }
+    }
+}

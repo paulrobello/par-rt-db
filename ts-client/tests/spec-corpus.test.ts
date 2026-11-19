@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { RtDbError } from "../src/errors.js";
-import { stampComputed } from "../src/in_memory/doc_stamp.js";
+import { applyPatch, stampComputed } from "../src/in_memory/doc_stamp.js";
 import { InMemoryRtDbClient } from "../src/in_memory/index.js";
 import { indexColumnType, type PgType } from "../src/in_memory/validate.js";
 import { decodeCursor, encodeCursor } from "../src/pagination.js";
@@ -476,6 +476,31 @@ describe("spec corpus: cursor encoding", () => {
         expect(decodeCursor(row.cursor)).toEqual(row.expect);
         if (!row.values) throw new Error(`missing values for ${row.id}`);
         expect(encodeCursor(row.values)).toBe(row.cursor);
+      }
+    });
+  }
+});
+
+describe("spec corpus: patch semantics", () => {
+  const fixture = JSON.parse(
+    readFileSync(resolve(__dirname, "../../wire-corpus/spec/patch-semantics.json"), "utf8"),
+  ) as {
+    rows: {
+      id: string;
+      table: TableJson;
+      doc: Record<string, unknown>;
+      patch: Record<string, unknown>;
+      expect: { doc?: Record<string, unknown>; error?: { code: string } };
+    }[];
+  };
+  for (const row of fixture.rows) {
+    it(row.id, () => {
+      if (row.expect.error) {
+        expect(() => applyPatch(row.table, row.doc, row.patch, 0)).toThrowError(
+          expect.objectContaining({ code: row.expect.error.code }),
+        );
+      } else {
+        expect(applyPatch(row.table, row.doc, row.patch, 0)).toEqual(row.expect.doc);
       }
     });
   }

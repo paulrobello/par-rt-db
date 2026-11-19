@@ -54,6 +54,7 @@ pub mod signed_url;
 pub mod snapshot;
 pub mod spec_corpus;
 pub mod spec_corpus_cursor_encoding;
+pub mod spec_corpus_patch_semantics;
 mod state;
 pub mod storage;
 pub mod subs;
