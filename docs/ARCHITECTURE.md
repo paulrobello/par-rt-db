@@ -1131,7 +1131,7 @@ swift engine's shared index-value comparator on its first run. Family 4,
 `wire-corpus/spec/pagination.json`, applies the pattern to the
 btree paginate terminal's keyset walk: the server's paginate SQL hands the
 resume predicate to Postgres, so the table is generated from a reference walk
-in `server/src/spec_corpus_pagination.rs` that encodes the wire-visible rules
+in `server/src/spec_corpus/pagination.rs` that encodes the wire-visible rules
 that SQL relies on (the OR-of-AND resume predicate with its prefix-equal and
 past-end branches, asc NULLS LAST / desc NULLS FIRST, insertion-order
 tie-breaks, the truncate-before-mint order, int64 columns sorting numerically
@@ -1144,7 +1144,7 @@ cursor values are carried RAW with engine-neutral tiebreaker extremes so no
 engine-private clock or id participates, and every client engine's
 `paginateResult` port asserts itself against every row. Family 5,
 `wire-corpus/spec/validation.json`, applies the pattern to push-schema validation: the
-input matrix (`server/src/spec_corpus_validation_rows.json`) enumerates one
+input matrix (`server/src/spec_corpus/spec_corpus_validation_rows.json`) enumerates one
 representative per validation rule the wire outcome distinguishes, and the
 generator computes every row's outcome by running the server's own
 `SchemaDef::validate` over it — the decision function IS the generator — so a

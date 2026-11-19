@@ -62,7 +62,7 @@ implementations honest against each other. These artifacts live here:
   and [`spec/validation.json`](spec/validation.json) pins the push-schema
   validation decision table (computed by running the server's own
   `SchemaDef::validate` over every row of the input matrix
-  `server/src/spec_corpus_validation_rows.json`).
+  `server/src/spec_corpus/spec_corpus_validation_rows.json`).
   See [Spec-table corpus](#spec-table-corpus) below.
 
 **Runner scope:** the server and all six client in-memory engines
@@ -527,7 +527,7 @@ fixture can never disagree with the code that owns the semantics.
   computed from the server's reference walk of the paginate SQL
   (`query/terminals.rs::compile_paginate_terminal` +
   `build_cursor_conditions` + `execute_paginate_terminal`'s minting, via
-  `server/src/spec_corpus_pagination.rs`). One row per representative per
+  `server/src/spec_corpus/pagination.rs`). One row per representative per
   wire-visible rule: first-page derivation, asc/desc walks over the OR-of-AND
   resume predicate (a prefix-equal cursor re-serves its boundary row via the
   tiebreaker tail; a past-end tail skips the whole boundary group), asc NULLS
@@ -551,7 +551,7 @@ fixture can never disagree with the code that owns the semantics.
   validation decision table shared by the server and all six client
   in-memory engines, computed by running the server's own
   `SchemaDef::validate` over every row of the hand-maintained input matrix
-  (`server/src/spec_corpus_validation_rows.json`), so a rule change flips the
+  (`server/src/spec_corpus/spec_corpus_validation_rows.json`), so a rule change flips the
   pinned row automatically. One row per representative per rule the wire
   outcome distinguishes; each reject row violates exactly one rule, so
   cascade ordering never changes the outcome. Index/ttl/updatedAtField/
@@ -592,9 +592,9 @@ the same change**, updating whichever client ports moved with it. A client port
 that drifts from a committed table fails that client's spec-corpus runner; a
 variant or grammar node added without a representative row fails the
 generator's exhaustive match (a compile error in `server/src/spec_corpus.rs`,
-`server/src/spec_corpus_pagination.rs`, or
-`server/src/spec_corpus_validation.rs`'s rule-family list; the validation
-matrix's rows live in `server/src/spec_corpus_validation_rows.json` and the
+`server/src/spec_corpus/pagination.rs`, or
+`server/src/spec_corpus/validation.rs`'s rule-family list; the validation
+matrix's rows live in `server/src/spec_corpus/spec_corpus_validation_rows.json` and the
 server's own `SchemaDef::validate` computes every row's outcome).
 
 **Enforcement:** `make gen-spec-index-column-types-check`,
@@ -603,7 +603,7 @@ server's own `SchemaDef::validate` computes every row's outcome).
 `make gen-spec-pagination-check`, and
 `make gen-spec-validation-check` (`checkall` legs) diff each committed
 fixture against a fresh generation; the server's `spec_corpus.rs` and
-`spec_corpus_pagination.rs` tests pin the same property in-crate. Each of the
+`spec_corpus/pagination.rs` tests pin the same property in-crate. Each of the
 seven runners — server, ts-client
 (`tests/spec-corpus.test.ts`), rust-client
 (`tests/wire_corpus.rs::spec_corpus` + `::computed_stamping_corpus` +

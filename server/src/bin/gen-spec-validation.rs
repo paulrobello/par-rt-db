@@ -1,7 +1,7 @@
 //! ENH-052 family 5: regenerates `wire-corpus/spec/validation.json` —
 //! the push-schema validation decision table — from the server's own
 //! SchemaDef::validate over the input matrix (see
-//! `spec_corpus_validation.rs`). Run via `make gen-spec-validation`;
+//! `spec_corpus/validation.rs`). Run via `make gen-spec-validation`;
 //! `make gen-spec-validation-check` fails the gate when the committed fixture
 //! disagrees with a fresh generation.
 
@@ -37,7 +37,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match rtdb_server::spec_corpus_validation::render_validation_spec() {
+    match rtdb_server::spec_corpus::validation::render_validation_spec() {
         Ok(rendered) => {
             if let Some(parent) = args.out.parent()
                 && let Err(e) = std::fs::create_dir_all(parent)

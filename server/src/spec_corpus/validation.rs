@@ -101,7 +101,7 @@ pub fn render_validation_spec() -> Result<String, serde_json::Error> {
                      The push-schema validation decision table, computed by running \
                      the server's own SchemaDef::validate over every row of the input \
                      matrix (server/src/spec_corpus_validation_rows.json) via \
-                     server/src/spec_corpus_validation.rs by \
+                     server/src/spec_corpus/validation.rs by \
                      'make gen-spec-validation'. One row per representative per rule \
                      the wire outcome distinguishes; each reject row violates exactly \
                      one rule, so cascade ordering never changes the outcome. \

@@ -26,6 +26,9 @@ use crate::value_expr::{CaseWhen, Cast, ValueExpr};
 /// `Union` all-string-literals vs empty vs mixed, `Optional` over two inner
 /// types, `Id` with and without `onDelete`). Order is the committed fixture's
 /// row order.
+pub mod pagination;
+pub mod validation;
+
 fn spec_field_types() -> Vec<FieldType> {
     fn lit(value: Value) -> FieldType {
         FieldType::Literal { value }
@@ -1869,7 +1872,7 @@ mod tests {
     /// `make gen-spec-computed-stamping` fails here.
     #[test]
     fn committed_computed_stamping_fixture_matches_generation() {
-        let committed = include_str!("../../wire-corpus/spec/computed-stamping.json");
+        let committed = include_str!("../../../wire-corpus/spec/computed-stamping.json");
         let generated = super::render_computed_stamping_spec().expect("render spec fixture");
         assert_eq!(
             committed, generated,
@@ -1882,7 +1885,7 @@ mod tests {
     /// the aggregate fixture.
     #[test]
     fn committed_aggregate_terminals_fixture_matches_generation() {
-        let committed = include_str!("../../wire-corpus/spec/aggregate-terminals.json");
+        let committed = include_str!("../../../wire-corpus/spec/aggregate-terminals.json");
         let generated = super::render_aggregate_terminals_spec().expect("render spec fixture");
         assert_eq!(
             committed, generated,
@@ -1895,9 +1898,9 @@ mod tests {
     /// pagination fixture.
     #[test]
     fn committed_pagination_fixture_matches_generation() {
-        let committed = include_str!("../../wire-corpus/spec/pagination.json");
+        let committed = include_str!("../../../wire-corpus/spec/pagination.json");
         let generated =
-            crate::spec_corpus_pagination::render_pagination_spec().expect("render spec fixture");
+            crate::spec_corpus::pagination::render_pagination_spec().expect("render spec fixture");
         assert_eq!(
             committed, generated,
             "wire-corpus/spec/pagination.json is stale — run \
@@ -1909,9 +1912,9 @@ mod tests {
     /// validation fixture.
     #[test]
     fn committed_validation_fixture_matches_generation() {
-        let committed = include_str!("../../wire-corpus/spec/validation.json");
+        let committed = include_str!("../../../wire-corpus/spec/validation.json");
         let generated =
-            crate::spec_corpus_validation::render_validation_spec().expect("render spec fixture");
+            crate::spec_corpus::validation::render_validation_spec().expect("render spec fixture");
         assert_eq!(
             committed, generated,
             "wire-corpus/spec/validation.json is stale — run \

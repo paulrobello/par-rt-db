@@ -53,8 +53,6 @@ pub mod shutdown;
 pub mod signed_url;
 pub mod snapshot;
 pub mod spec_corpus;
-pub mod spec_corpus_pagination;
-pub mod spec_corpus_validation;
 mod state;
 pub mod storage;
 pub mod subs;

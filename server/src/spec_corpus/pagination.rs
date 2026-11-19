@@ -866,7 +866,7 @@ pub fn render_pagination_spec() -> Result<String, serde_json::Error> {
                      The btree keyset-pagination decision table, computed from the \
                      server's reference walk of the SQL that \
                      query/terminals.rs::compile_paginate_terminal emits (see \
-                     server/src/spec_corpus_pagination.rs) by \
+                     server/src/spec_corpus/pagination.rs) by \
                      'make gen-spec-pagination'. The wire-visible Postgres rules \
                      pinned per row: the sort spans the unbound index columns after \
                      the eq prefix then created_at/id, asc NULLS LAST / desc NULLS \
