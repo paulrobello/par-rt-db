@@ -13,3 +13,4 @@ pub(in crate::committer) mod scheduled;
 pub(in crate::committer) mod schema;
 pub(in crate::committer) mod subscribe;
 pub(in crate::committer) mod workflow;
+pub(in crate::committer) mod workflow_advance;
