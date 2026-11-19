@@ -85,6 +85,7 @@ mod storage_signed_url_test;
 mod storage_test;
 mod sub_invalidation_test;
 mod subs_test;
+mod tombstone_visibility_test;
 mod ttl_test;
 mod txn_test;
 mod updated_at_test;

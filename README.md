@@ -1480,6 +1480,16 @@ serves), so a resume cursor is honored across reconnects and server restarts.
   `feedEpoch` that does not match (database recreated) answers `feedErr` with
   `CURSOR_EXPIRED` (the code the HTTP feed uses as `410`). Resync over
   `GET /api/db/{db}/changes?since=0`, then open a new feed from its `nextSeq`.
+- **Soft deletes are `kind: "delete"` with `doc: null`.** A `delete` step on
+  a `softDelete` table stamps the row's `deleted_at` column rather than
+  editing the body, but the feed still publishes a `delete` op (`doc` null) —
+  drop the doc from your cache when it arrives. Tombstones are invisible to
+  every read surface: index scans, table scans, and point-gets all filter
+  `deleted_at IS NULL` identically (pinned server-side by the
+  tombstone-visibility test), so a doc your cache still lists after a
+  reconnect but a fresh query or `get` does not return is a stale cache,
+  never an index/get divergence — reconcile with a fresh query or point-get,
+  never by trusting a cache across a reconnect.
 - **Backpressure.** The server keeps at most 2 000 unacknowledged ops in
   flight per feed and pauses until a `feedAck` arrives.
 - **Authorization.** Machine tokens only (a user or admin session gets
