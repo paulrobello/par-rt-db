@@ -582,6 +582,29 @@ class SearchModesSpecTest {
     }
 }
 
+class FilterOperatorsSpecTest {
+    @Test
+    fun filterOperatorsTable() {
+        val fixture = WireJson.parse(CorpusPaths.read("spec", "filter-operators.json")) as JsonObject
+        val mismatches = mutableListOf<String>()
+        for (entry in fixture["rows"] as JsonArray) {
+            val row = entry as JsonObject
+            val client = InMemoryClient()
+            client.pushSchema(row["schema"]!!)
+            val expect = row["expect"] as JsonObject
+            val query = Query.fromJson(row["query"]!!)
+            val actual = try {
+                client.query(query)
+                jsonObj("accepted" to JsonPrimitive(true))
+            } catch (error: RtDbException) {
+                jsonObj("error" to jsonObj("code" to jsonStr(error.code.wire)))
+            }
+            if (actual != expect) mismatches.add("${row["id"]}: expected $expect, got $actual")
+        }
+        assertEquals(emptyList<String>(), mismatches, mismatches.joinToString("\n"))
+    }
+}
+
 class CounterOpsSpecTest {
     @Test
     fun counterOpsTable() {

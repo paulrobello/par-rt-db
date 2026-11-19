@@ -1266,6 +1266,36 @@ fn spec_search_modes() {
 }
 
 #[cfg(feature = "in_memory")]
+#[test]
+fn spec_filter_operators() {
+    use par_rt_db_client::{
+        in_memory::{InMemoryRtDbClient, InMemoryRtDbClientOptions},
+        query::Query,
+        schema::SchemaDef,
+    };
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../wire-corpus/spec/filter-operators.json")).unwrap();
+    let mut mismatches = Vec::new();
+    for row in fixture["rows"].as_array().unwrap() {
+        let schema: SchemaDef = serde_json::from_value(row["schema"].clone()).unwrap();
+        let query: Query = serde_json::from_value(row["query"].clone()).unwrap();
+        let mut client = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+        client.push_schema(&schema).unwrap();
+        let actual = match client.run_query(&query) {
+            Ok(_) => serde_json::json!({"accepted":true}),
+            Err(error) => serde_json::json!({"error":{"code":error.code}}),
+        };
+        if actual != row["expect"] {
+            mismatches.push(format!(
+                "{}: expected {}, got {}",
+                row["id"], row["expect"], actual
+            ));
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+#[cfg(feature = "in_memory")]
 #[tokio::test]
 async fn spec_counter_ops() {
     use par_rt_db_client::{

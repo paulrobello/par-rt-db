@@ -65,9 +65,23 @@ private fun validateFilterExprAt(expr: FilterExpr, table: TableDef, allowRelativ
         }
         is FilterExpr.Eq, is FilterExpr.Neq, is FilterExpr.Gt, is FilterExpr.Gte, is FilterExpr.Lt, is FilterExpr.Lte -> {
             val (field, value) = requireNotNull(leafOf(expr)) { "leafOf returned null for " + expr::class.simpleName }
+            if (expr is FilterExpr.Gt || expr is FilterExpr.Gte || expr is FilterExpr.Lt || expr is FilterExpr.Lte) {
+                val ty = leafFieldType(field, table)
+                try { indexColumnType(ty) } catch (_: RtDbException) {
+                    throw badRequest("field '$field' must be a scalar indexable type for comparison")
+                }
+            }
             checkLeaf(field, value, table)
         }
-        is FilterExpr.Contains -> checkLeaf(expr.field, expr.value, table)
+        is FilterExpr.Contains -> {
+            val ty = leafFieldType(expr.field, table)
+            val inner = if (ty.kind == "optional") requireInner(ty) else ty
+            val compatible = if (inner.kind == "array") {
+                try { indexColumnType(requireInner(inner)).pg == PgType.Text } catch (_: RtDbException) { false }
+            } else false
+            if (!compatible) throw badRequest("field '${expr.field}' must be an array-of-strings (or array-of-id) field for contains")
+            checkLeaf(expr.field, expr.value, table)
+        }
         is FilterExpr.OlderThan -> {
             if (!allowRelativeTime) throw badRequest("olderThan filter is only allowed in patchByQuery/deleteByQuery filters")
             if (expr.ms < 0) throw badRequest("olderThan ms must be >= 0")

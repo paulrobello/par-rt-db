@@ -86,8 +86,33 @@ func validateFilterExprAt(expr wire.FilterExpr, table *TableDef, allowRelativeTi
 		}
 	case wire.FilterEq, wire.FilterNeq, wire.FilterGt, wire.FilterGte, wire.FilterLt, wire.FilterLte:
 		field, value := leafField(expr)
+		switch expr.(type) {
+		case wire.FilterGt, wire.FilterGte, wire.FilterLt, wire.FilterLte:
+			ty, err := leafFieldType(field, table)
+			if err != nil {
+				return err
+			}
+			if _, err := indexColumnType(*ty); err != nil {
+				return rtdberrors.New(rtdberrors.CodeBadRequest, "field '"+field+"' must be a scalar indexable type for comparison")
+			}
+		}
 		return checkLeaf(field, value, table)
 	case wire.FilterContains:
+		ty, err := leafFieldType(e.Field, table)
+		if err != nil {
+			return err
+		}
+		if ty.Kind == "optional" {
+			ty = ty.Inner
+		}
+		compatible := false
+		if ty.Kind == "array" && ty.Inner != nil {
+			col, err := indexColumnType(*ty.Inner)
+			compatible = err == nil && col.Pg == PgText
+		}
+		if !compatible {
+			return rtdberrors.New(rtdberrors.CodeBadRequest, "field '"+e.Field+"' must be an array-of-strings (or array-of-id) field for contains")
+		}
 		return checkLeaf(e.Field, e.Value, table)
 	case wire.FilterOlderThan:
 		if !allowRelativeTime {

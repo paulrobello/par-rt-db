@@ -9,6 +9,7 @@ import json
 import math
 import re
 from collections.abc import Mapping
+from contextlib import suppress
 from typing import Any
 
 from ..errors import ErrorCode, RtDbError
@@ -93,6 +94,20 @@ def _validate_filter_at(
             | _FilterLt(field=fld, value=val)
             | _FilterLte(field=fld, value=val)
         ):
+            if isinstance(expr, _FilterGt | _FilterGte | _FilterLt | _FilterLte):
+                from .store import _index_column_type
+
+                if fld not in table_def.fields:
+                    raise RtDbError(
+                        ErrorCode.BAD_REQUEST, f"filter references unknown field '{fld}'"
+                    )
+                try:
+                    _index_column_type(table_def.fields[fld])
+                except RtDbError as error:
+                    raise RtDbError(
+                        ErrorCode.BAD_REQUEST,
+                        f"field '{fld}' must be a scalar indexable type for comparison",
+                    ) from error
             _check_leaf_value(fld, val, table_def)
         case _FilterOlderThan(field=fld, ms=ms):
             # Server validation order (schema.rs validate_filter_expr_fields):
@@ -121,6 +136,24 @@ def _validate_filter_at(
                 inner, table_def, allow_relative_time=allow_relative_time, depth=depth + 1
             )
         case _FilterContains(field=fld, value=val):
+            from .store import _index_column_type
+
+            ty = table_def.fields.get(fld)
+            if _field_type_tag(ty) == "optional":
+                ty = ty.get("inner") if isinstance(ty, dict) else getattr(ty, "inner", None)
+            compatible = False
+            if _field_type_tag(ty) == "array":
+                element = (
+                    ty.get("element") if isinstance(ty, dict) else getattr(ty, "element", None)
+                )
+                with suppress(RtDbError):
+                    compatible = _index_column_type(element).pg == "text"
+            if not compatible:
+                raise RtDbError(
+                    ErrorCode.BAD_REQUEST,
+                    f"field '{fld}' must be an array-of-strings (or array-of-id) "
+                    "field for contains",
+                )
             _check_leaf_value(fld, val, table_def)
         case _FilterExists(field=fld):
             if fld not in table_def.fields:
@@ -170,7 +203,7 @@ def _validate_jsonb_comparison_value(field: str, ty: Any, value: Any) -> None:
     else:
         # any / literal / union / array / object / record / vector / null:
         # no reliable static check; accept any scalar (server behavior).
-        ok = isinstance(value, str | float | int) and not isinstance(value, bool)
+        ok = isinstance(value, str | float | int | bool)
     if not ok:
         raise RtDbError(
             ErrorCode.BAD_REQUEST,

@@ -796,6 +796,35 @@ struct SearchModesSpecTests {
     }
 }
 
+struct FilterOperatorsSpecTests {
+    private struct Fixture: Decodable { let rows: [Row] }
+    private struct Row: Decodable {
+        let id: String
+        let schema: SchemaDef
+        let query: Query
+        let expect: Outcome
+    }
+
+    private struct Outcome: Decodable { let error: [String: String]? }
+    @Test func filterOperatorsTable() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("wire-corpus/spec/filter-operators.json")
+        let fixture = try JSONDecoder().decode(Fixture.self, from: Data(contentsOf: url))
+        for row in fixture.rows {
+            let client = InMemoryRtDbClient()
+            try client.pushSchema(row.schema)
+            do {
+                _ = try client.query(row.query)
+                #expect(row.expect.error == nil, "\(row.id): expected rejection")
+            } catch let error as RtDbError {
+                #expect(error.code.rawValue == row.expect.error?["code"], "\(row.id): error code")
+            }
+        }
+    }
+}
+
 struct CounterOpsSpecTests {
     private struct Fixture: Decodable { let rows: [Row] }
     private struct Row: Decodable {

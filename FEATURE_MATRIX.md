@@ -22,6 +22,13 @@ and nested payloads across the engines. A separate core regression asserts IEEE
 bits because a corpus parser could otherwise round both its input and expected
 value identically.
 
+Filter admission is pinned across all six in-memory clients by the production-
+compiler-generated [`filter-operators` spec table](wire-corpus/spec/filter-operators.json).
+Ordering requires scalar-indexable fields. `contains` requires arrays with
+text-compatible elements (including optional arrays). Null and cross-type
+operands follow the server's indexed or unindexed bind rules, with invalid
+queries rejected as `BAD_REQUEST` even on empty tables.
+
 ## Legend
 
 | Symbol | Meaning |

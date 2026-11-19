@@ -713,8 +713,45 @@ fn validate_filter_expr_fields_at(
         | FilterExpr::Gt { field, value }
         | FilterExpr::Gte { field, value }
         | FilterExpr::Lt { field, value }
-        | FilterExpr::Lte { field, value }
-        | FilterExpr::Contains { field, value } => check_leaf(field, value, table),
+        | FilterExpr::Lte { field, value } => {
+            if matches!(
+                expr,
+                FilterExpr::Gt { .. }
+                    | FilterExpr::Gte { .. }
+                    | FilterExpr::Lt { .. }
+                    | FilterExpr::Lte { .. }
+            ) {
+                index_column_type(leaf_field_type(field, table)?).map_err(|_| {
+                    RtDbError::new(
+                        ErrorCode::BadRequest,
+                        format!("field '{field}' must be a scalar indexable type for comparison"),
+                    )
+                })?;
+            }
+            check_leaf(field, value, table)
+        }
+        FilterExpr::Contains { field, value } => {
+            let ty = leaf_field_type(field, table)?;
+            let inner = match ty {
+                FieldType::Optional { inner } => inner.as_ref(),
+                _ => ty,
+            };
+            let compatible = match inner {
+                FieldType::Array { element } => {
+                    index_column_type(element).is_ok_and(|column| column.pg == query::PgType::Text)
+                }
+                _ => false,
+            };
+            if !compatible {
+                return Err(RtDbError::new(
+                    ErrorCode::BadRequest,
+                    format!(
+                        "field '{field}' must be an array-of-strings (or array-of-id) field for contains"
+                    ),
+                ));
+            }
+            check_leaf(field, value, table)
+        }
         // Execution-time-relative leaf, in the server's check order: context,
         // ms >= 0, declared field, numeric field type. Everything except the
         // context gate also guards the by-query path (the server runs the

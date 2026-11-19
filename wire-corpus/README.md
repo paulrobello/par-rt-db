@@ -600,6 +600,14 @@ fixture can never disagree with the code that owns the semantics.
   inclusive bounds, bound rejection (not clamping), safe-integer overflow,
   fractional current values, and optional-number/null behavior.
 
+- [`spec/filter-operators.json`](spec/filter-operators.json) — generated through
+  production `query::compile_query`, including schema-level operator guards and
+  filter bind typing. All six clients assert admission and `BAD_REQUEST` codes
+  across every field-type variant, indexed/unindexed scalar paths, null and
+  cross-type operands, ordering, `contains`, `in`, `exists`, and read-context
+  `olderThan` rejection. Regenerate with `make gen-spec-filter-operators` when
+  filter admission changes. This table pins compilation, not per-row matching.
+
 **Authoring rule:** a change to the pinned semantics (a new `FieldType`
 variant, a mapping change in `indexed_column_type`, a new `ValueExpr` node,
 a new `Cast` target, a stamping-semantics change in `stamp_computed` or

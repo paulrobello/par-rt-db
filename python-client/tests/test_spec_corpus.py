@@ -478,6 +478,29 @@ def test_search_modes_spec(row: dict[str, Any]) -> None:
 @pytest.mark.parametrize(
     "row",
     json.loads(
+        (Path(__file__).resolve().parents[2] / "wire-corpus/spec/filter-operators.json").read_text()
+    )["rows"],
+    ids=lambda row: row["id"],
+)
+def test_filter_operators_spec(row: dict[str, Any]) -> None:
+    from par_rt_db.in_memory import InMemoryRtDbClient
+    from par_rt_db.query import Query
+    from par_rt_db.schema import SchemaDef
+
+    client = InMemoryRtDbClient()
+    client.push_schema(SchemaDef.model_validate(row["schema"]))
+    query = Query.model_validate(row["query"])
+    if "error" in row["expect"]:
+        with pytest.raises(RtDbError) as error:
+            client.run_query(query)
+        assert error.value.code == row["expect"]["error"]["code"]
+    else:
+        assert client.run_query(query) == []
+
+
+@pytest.mark.parametrize(
+    "row",
+    json.loads(
         (Path(__file__).resolve().parents[2] / "wire-corpus/spec/counter-ops.json").read_text()
     )["rows"],
     ids=lambda row: row["id"],

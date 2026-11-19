@@ -337,6 +337,25 @@ private func validateFilterAt(
     case let .not(expr):
         try validateFilterAt(expr, table, allowRelativeTime: allowRelativeTime, depth: depth + 1)
     case let .contains(field, value):
+        guard let ty = table.fields[field] else {
+            throw RtDbError(code: .badRequest, message: "filter references unknown field '\(field)'")
+        }
+        let inner: FieldType = if case let .optional(wrapped) = ty {
+            wrapped
+        } else {
+            ty
+        }
+        let compatible: Bool = if case let .array(element) = inner {
+            (try? indexColumnType(element).pg) == .text
+        } else {
+            false
+        }
+        guard compatible else {
+            throw RtDbError(
+                code: .badRequest,
+                message: "field '\(field)' must be an array-of-strings (or array-of-id) field for contains"
+            )
+        }
         try checkLeafValue(field, value, table)
     case let .exists(field):
         guard table.fields[field] != nil else {
@@ -344,8 +363,15 @@ private func validateFilterAt(
                 code: .badRequest, message: "filter references unknown field '\(field)'"
             )
         }
-    case let .eq(field, value), let .neq(field, value), let .gt(field, value),
-         let .gte(field, value), let .lt(field, value), let .lte(field, value):
+    case let .eq(field, value), let .neq(field, value):
+        try checkLeafValue(field, value, table)
+    case let .gt(field, value), let .gte(field, value), let .lt(field, value), let .lte(field, value):
+        guard let ty = table.fields[field], (try? indexColumnType(ty)) != nil else {
+            throw RtDbError(
+                code: .badRequest,
+                message: "field '\(field)' must be a scalar indexable type for comparison"
+            )
+        }
         try checkLeafValue(field, value, table)
     }
 }

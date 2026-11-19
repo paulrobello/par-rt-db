@@ -532,6 +532,32 @@ describe("spec corpus: search modes", () => {
   }
 });
 
+describe("spec corpus: filter operators", () => {
+  const fixture = JSON.parse(
+    readFileSync(resolve(__dirname, "../../wire-corpus/spec/filter-operators.json"), "utf8"),
+  ) as {
+    rows: {
+      id: string;
+      schema: SchemaJson;
+      query: import("../src/protocol.js").QueryJson;
+      expect: { accepted?: boolean; error?: { code: string } };
+    }[];
+  };
+  for (const row of fixture.rows) {
+    it(row.id, async () => {
+      const client = new InMemoryRtDbClient();
+      client.pushSchema(row.schema);
+      if (row.expect.error) {
+        await expect(client.query({ json: row.query })).rejects.toMatchObject({
+          code: row.expect.error.code,
+        });
+      } else {
+        await expect(client.query({ json: row.query })).resolves.toEqual([]);
+      }
+    });
+  }
+});
+
 describe("spec corpus: counter operations", () => {
   const fixture = JSON.parse(
     readFileSync(resolve(__dirname, "../../wire-corpus/spec/counter-ops.json"), "utf8"),

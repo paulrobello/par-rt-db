@@ -239,15 +239,42 @@ function validateFilterAt(
       }
       return;
     }
-    case "contains":
+    case "contains": {
+      const ty = table.fields[node.field];
+      const inner = ty?.type === "optional" ? ty.inner : ty;
+      let compatible = false;
+      if (inner?.type === "array") {
+        try {
+          compatible = indexColumnType(inner.element).pg === "text";
+        } catch {
+          // Non-indexable elements cannot support text membership.
+        }
+      }
+      if (!compatible) {
+        throw new RtDbError(
+          "BAD_REQUEST",
+          `field '${node.field}' must be an array-of-strings (or array-of-id) field for contains`,
+        );
+      }
       checkLeafValue(node.field, node.value, table);
       return;
+    }
     case "exists":
       if (!Object.hasOwn(table.fields, node.field)) {
         throw new RtDbError("BAD_REQUEST", `filter references unknown field '${node.field}'`);
       }
       return;
     default:
+      if (["gt", "gte", "lt", "lte"].includes(node.op)) {
+        try {
+          indexColumnType(table.fields[node.field]);
+        } catch {
+          throw new RtDbError(
+            "BAD_REQUEST",
+            `field '${node.field}' must be a scalar indexable type for comparison`,
+          );
+        }
+      }
       checkLeafValue(node.field, node.value, table);
   }
 }

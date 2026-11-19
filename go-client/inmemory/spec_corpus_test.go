@@ -1024,6 +1024,45 @@ func TestSpecSearchModes(t *testing.T) {
 	}
 }
 
+func TestSpecFilterOperators(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(specCorpusPath(t)), "filter-operators.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Rows []struct {
+			ID     string          `json:"id"`
+			Schema json.RawMessage `json:"schema"`
+			Query  wire.Query      `json:"query"`
+			Expect struct {
+				Error *struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			} `json:"expect"`
+		} `json:"rows"`
+	}
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range fixture.Rows {
+		t.Run(row.ID, func(t *testing.T) {
+			client := New(Options{})
+			if err := client.PushSchema(mustWire(t, row.Schema)); err != nil {
+				t.Fatal(err)
+			}
+			_, err := EvalQuery(client.Store(), row.Query)
+			if row.Expect.Error != nil {
+				dbErr, ok := err.(*rtdberrors.RtDbError)
+				if !ok || string(dbErr.Code) != row.Expect.Error.Code {
+					t.Fatalf("expected %s, got %v", row.Expect.Error.Code, err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestSpecCounterOps(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join(filepath.Dir(specCorpusPath(t)), "counter-ops.json"))
 	if err != nil {
