@@ -1,6 +1,6 @@
 # par-rt-db dashboard
 
-The operator console SPA for par-rt-db — a dark, realtime **Instrument Manual**
+The operator console SPA for par-rt-db — a dark, realtime **par-mem ops cockpit**
 console: data browser, schema viewer, live metrics, the operation feed, and hot
 config. Served same-origin by the server from `RTDB_STATIC_DIR` in production.
 

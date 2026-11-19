@@ -8,7 +8,7 @@ export function Placard({ children }: { children: ReactNode }) {
 
 /**
  * A live value readout. Replays a brief accent tick-flash whenever the rendered
- * `value` changes — the Instrument Manual "values tick on change" liveness cue.
+ * `value` changes — the par-mem ops cockpit "values tick on change" liveness cue.
  * The value and its className share one element (so a query like "the text node
  * carries instrumentValue_alarm" still holds); `nonce` is that element's key, so
  * a real change remounts it with the tickFlash class and replays the flash.
