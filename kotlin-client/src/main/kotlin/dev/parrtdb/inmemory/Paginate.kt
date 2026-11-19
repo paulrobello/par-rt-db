@@ -82,8 +82,10 @@ private fun paginateResult(
 internal fun decodeCursorForEngine(s: String): List<JsonElement> {
     try {
         val raw = Base64.getDecoder().decode(s)
-        val v = WireJson.parse(String(raw, Charsets.UTF_8))
+        val v = WireJson.parse(raw.decodeToString(throwOnInvalidSequence = true))
         return (v as? JsonArray)?.toList() ?: throw WireException("cursor payload is not a JSON array")
+    } catch (e: java.nio.charset.CharacterCodingException) {
+        throw bad("invalid cursor utf-8: ${e.message}")
     } catch (e: IllegalArgumentException) {
         // WireException is an IllegalArgumentException, as is Base64's decode failure.
         throw bad("invalid cursor: ${e.message}")

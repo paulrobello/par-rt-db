@@ -3,7 +3,8 @@
  */
 export function encodeCursor(values: unknown[]): string {
   const json = JSON.stringify(values);
-  return btoa(json);
+  const bytes = new TextEncoder().encode(json);
+  return btoa(Array.from(bytes, (byte) => String.fromCharCode(byte)).join(""));
 }
 
 /**
@@ -11,8 +12,13 @@ export function encodeCursor(values: unknown[]): string {
  */
 export function decodeCursor(cursor: string): unknown[] {
   try {
-    const json = atob(cursor);
-    return JSON.parse(json);
+    const bytes = Uint8Array.from(atob(cursor), (char) => char.charCodeAt(0));
+    const json = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    const values: unknown = JSON.parse(json);
+    if (!Array.isArray(values)) {
+      throw new Error("cursor must decode to a JSON array");
+    }
+    return values;
   } catch (e) {
     throw new Error(`Invalid cursor: ${e}`);
   }

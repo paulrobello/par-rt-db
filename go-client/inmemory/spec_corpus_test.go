@@ -856,3 +856,65 @@ func TestValidationSpecCorpus(t *testing.T) {
 		})
 	}
 }
+
+func TestSpecCursorEncoding(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(specCorpusPath(t)), "cursor-encoding.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Rows []struct {
+			ID     string          `json:"id"`
+			Token  string          `json:"cursor"`
+			Values json.RawMessage `json:"values"`
+			Expect json.RawMessage `json:"expect"`
+			Error  *struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		} `json:"rows"`
+	}
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range fixture.Rows {
+		t.Run(row.ID, func(t *testing.T) {
+			got, err := dsl.DecodeCursor(row.Token)
+			if row.Error != nil {
+				if err == nil {
+					t.Fatal("expected cursor rejection")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			actual, _ := json.Marshal(got)
+			var expected bytes.Buffer
+			if err := json.Compact(&expected, row.Expect); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(actual, expected.Bytes()) {
+				t.Fatalf("decoded %s, want %s", actual, expected.Bytes())
+			}
+			var rawValues []json.RawMessage
+			if err := json.Unmarshal(row.Values, &rawValues); err != nil {
+				t.Fatal(err)
+			}
+			values := make([]wire.JSONValue, 0, len(rawValues))
+			for _, raw := range rawValues {
+				value, err := wire.UnmarshalJSON(raw)
+				if err != nil {
+					t.Fatal(err)
+				}
+				values = append(values, value)
+			}
+			encoded, err := dsl.EncodeCursor(values)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if encoded != row.Token {
+				t.Fatalf("encoded %s, want %s", encoded, row.Token)
+			}
+		})
+	}
+}

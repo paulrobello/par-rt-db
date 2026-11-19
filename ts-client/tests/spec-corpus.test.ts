@@ -2,10 +2,10 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { RtDbError } from "../src/errors.js";
-import { decodeCursor, encodeCursor } from "../src/pagination.js";
-import { InMemoryRtDbClient } from "../src/in_memory/index.js";
 import { stampComputed } from "../src/in_memory/doc_stamp.js";
+import { InMemoryRtDbClient } from "../src/in_memory/index.js";
 import { indexColumnType, type PgType } from "../src/in_memory/validate.js";
+import { decodeCursor, encodeCursor } from "../src/pagination.js";
 import type {
   FieldTypeJson,
   IndexJson,
@@ -453,4 +453,30 @@ describe("spec corpus: validation", () => {
       expect(() => client.pushSchema(row.schema), row.id).not.toThrow();
     }
   });
+});
+
+const CURSOR_ENCODING = JSON.parse(
+  readFileSync(resolve(__dirname, "../../wire-corpus/spec/cursor-encoding.json"), "utf8"),
+) as {
+  rows: {
+    id: string;
+    cursor: string;
+    values?: unknown[];
+    expect?: unknown[];
+    error?: { code: string };
+  }[];
+};
+
+describe("spec corpus: cursor encoding", () => {
+  for (const row of CURSOR_ENCODING.rows) {
+    it(row.id, () => {
+      if (row.error) {
+        expect(() => decodeCursor(row.cursor)).toThrow();
+      } else {
+        expect(decodeCursor(row.cursor)).toEqual(row.expect);
+        if (!row.values) throw new Error(`missing values for ${row.id}`);
+        expect(encodeCursor(row.values)).toBe(row.cursor);
+      }
+    });
+  }
 });

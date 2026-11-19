@@ -412,3 +412,21 @@ def test_every_validation_row_matches_this_engine() -> None:
         assert got_code is None, (
             f"row {i} ({row['id']}): expected the push to accept, got {got_code}"
         )
+
+
+@pytest.mark.parametrize(
+    "row",
+    json.loads(
+        (Path(__file__).resolve().parents[2] / "wire-corpus/spec/cursor-encoding.json").read_text()
+    )["rows"],
+    ids=lambda row: row["id"],
+)
+def test_cursor_encoding_spec(row: dict[str, Any]) -> None:
+    from par_rt_db.cursor import decode_cursor, encode_cursor
+
+    if "error" in row:
+        with pytest.raises(ValueError):
+            decode_cursor(row["cursor"])
+    else:
+        assert decode_cursor(row["cursor"]) == row["expect"]
+        assert encode_cursor(row["values"]) == row["cursor"]

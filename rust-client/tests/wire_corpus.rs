@@ -1181,3 +1181,29 @@ mod validation_corpus {
         }
     }
 }
+
+#[test]
+fn spec_cursor_encoding() {
+    use par_rt_db_client::cursor::{decode_cursor, encode_cursor};
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../wire-corpus/spec/cursor-encoding.json")).unwrap();
+    for row in fixture["rows"].as_array().unwrap() {
+        let token = row["cursor"].as_str().unwrap();
+        if row.get("error").is_some() {
+            assert!(decode_cursor(token).is_err(), "{}", row["id"]);
+        } else {
+            assert_eq!(
+                serde_json::json!(decode_cursor(token).unwrap()),
+                row["expect"],
+                "{}",
+                row["id"]
+            );
+            assert_eq!(
+                encode_cursor(row["values"].as_array().unwrap()).unwrap(),
+                token,
+                "{}",
+                row["id"]
+            );
+        }
+    }
+}

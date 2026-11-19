@@ -524,3 +524,20 @@ class ValidationSpecCorpusTest {
         }
     }
 }
+
+class CursorEncodingSpecTest {
+    @Test
+    fun cursorEncodingTable() {
+        val fixture = WireJson.parse(CorpusPaths.read("spec", "cursor-encoding.json")) as JsonObject
+        for (entry in fixture["rows"] as JsonArray) {
+            val row = entry as JsonObject
+            val token = (row["cursor"] as JsonPrimitive).content
+            if (row["error"] != null) {
+                assertFailsWith<RtDbException> { decodeCursorForEngine(token) }
+            } else {
+                assertEquals(row["expect"], JsonArray(decodeCursorForEngine(token)), row["id"].toString())
+                assertEquals(token, encodeCursorForEngine((row["values"] as JsonArray).toList()), row["id"].toString())
+            }
+        }
+    }
+}

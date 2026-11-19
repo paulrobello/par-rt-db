@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"unicode/utf8"
 
 	"github.com/paulrobello/par-rt-db/go-client/wire"
 )
@@ -29,6 +30,9 @@ func DecodeCursor(s string) ([]wire.JSONValue, error) {
 	raw, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
 		return nil, fmt.Errorf("invalid cursor base64: %w", err)
+	}
+	if !utf8.Valid(raw) {
+		return nil, fmt.Errorf("invalid cursor utf-8")
 	}
 	v, err := wire.UnmarshalJSON(raw)
 	if err != nil {

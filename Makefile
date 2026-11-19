@@ -44,6 +44,7 @@ SWIFT_CLIENT_IF_DARWIN = $(if $(filter Darwin,$(SWIFT_OS)),cd swift-client && $(
 	gen-spec-computed-stamping gen-spec-computed-stamping-check \
 	gen-spec-pagination gen-spec-pagination-check \
 	gen-spec-validation gen-spec-validation-check \
+	gen-spec-cursor-encoding gen-spec-cursor-encoding-check \
 	kotlin-client-install kotlin-client-build kotlin-client-lint kotlin-client-typecheck \
 	kotlin-client-test kotlin-client-checkall \
 	swift-client-build swift-client-test swift-client-lint swift-client-fmt \
@@ -476,6 +477,20 @@ gen-spec-validation-check:
 		exit $$status; \
 	fi
 
+gen-spec-cursor-encoding:
+	cd server && cargo run --quiet --bin gen-spec-cursor-encoding
+
+gen-spec-cursor-encoding-check:
+	@tmpdir=$$(mktemp -d); \
+	if (cd server && cargo run --quiet --bin gen-spec-cursor-encoding -- --out "$$tmpdir/cursor-encoding.json") \
+		&& diff -u wire-corpus/spec/cursor-encoding.json "$$tmpdir/cursor-encoding.json"; then \
+		rm -rf "$$tmpdir"; \
+	else \
+		status=$$?; rm -rf "$$tmpdir"; \
+		echo "wire-corpus/spec/cursor-encoding.json is stale — run 'make gen-spec-cursor-encoding' and commit the result" >&2; \
+		exit $$status; \
+	fi
+
 # Kotlin/JVM client. The Gradle wrapper pins Gradle itself; the only host
 # requirement is a JDK 17+ (CI installs Temurin 21). Compiler warnings are
 # errors (build.gradle.kts), so compile doubles as lint and typecheck, and the
@@ -637,7 +652,7 @@ ts-dist-preflight:
 	./scripts/ts-dist-preflight.sh
 
 checkall: ts-dist-preflight env-drift-check dockerfile-stub-check backup-persistence-check hostname-leak-check cli-docs-check gen-error-codes-ts-check gen-error-codes-rust-check gen-spec-index-column-types-check gen-spec-computed-stamping-check \
-	gen-spec-aggregate-terminals-check gen-spec-pagination-check gen-spec-validation-check docs-api fmt-check lint typecheck test rust-client-check-features publish-check dev-db-clean-check
+	gen-spec-aggregate-terminals-check gen-spec-pagination-check gen-spec-validation-check gen-spec-cursor-encoding-check docs-api fmt-check lint typecheck test rust-client-check-features publish-check dev-db-clean-check
 	@mkdir -p target && echo "$(GATE_KEY)" > $(GATE_STAMP)
 
 # Content-addressed gate reuse for deploys: `checkall` stamps the gate key

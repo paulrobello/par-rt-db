@@ -9,7 +9,7 @@ from typing import Any
 
 def encode_cursor(values: list[Any]) -> str:
     """Encode a sort-tuple into an opaque base64 cursor string."""
-    raw = json.dumps(values, separators=(",", ":")).encode("utf-8")
+    raw = json.dumps(values, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return base64.b64encode(raw).decode("ascii")
 
 

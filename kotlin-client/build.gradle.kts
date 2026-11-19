@@ -34,6 +34,7 @@ kotlin {
 java { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
 
 tasks.test {
+    inputs.dir(rootProject.file("../wire-corpus/spec"))
     useJUnitPlatform()
     testLogging { events("failed", "skipped"); showStandardStreams = false }
 }

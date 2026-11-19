@@ -703,3 +703,33 @@ struct ValidationSpecCorpusTests {
         }
     }
 }
+
+struct CursorEncodingSpecTests {
+    private struct Fixture: Decodable {
+        let rows: [Row]
+    }
+
+    private struct Row: Decodable {
+        let id: String
+        let cursor: String
+        let values: [JSONValue]?
+        let expect: [JSONValue]?
+        let error: [String: String]?
+    }
+
+    @Test func cursorEncodingTable() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("wire-corpus/spec/cursor-encoding.json")
+        let fixture = try JSONDecoder().decode(Fixture.self, from: Data(contentsOf: url))
+        for row in fixture.rows {
+            if row.error != nil {
+                #expect(decodeCursor(row.cursor) == nil, "\(row.id): expected rejection")
+            } else {
+                #expect(decodeCursor(row.cursor) == row.expect, "\(row.id): decoded values")
+                #expect(try encodeCursor(#require(row.values)) == row.cursor, "\(row.id): encoded token")
+            }
+        }
+    }
+}
