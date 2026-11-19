@@ -531,3 +531,50 @@ describe("spec corpus: search modes", () => {
     });
   }
 });
+
+describe("spec corpus: counter operations", () => {
+  const fixture = JSON.parse(
+    readFileSync(resolve(__dirname, "../../wire-corpus/spec/counter-ops.json"), "utf8"),
+  ) as {
+    rows: {
+      id: string;
+      fieldType: FieldTypeJson;
+      current: unknown;
+      delta: number;
+      min: number | null;
+      max: number | null;
+      expect: { value?: number; error?: { code: string } };
+    }[];
+  };
+  for (const row of fixture.rows) {
+    it(row.id, async () => {
+      const client = new InMemoryRtDbClient();
+      client.pushSchema({ tables: { items: { fields: { v: row.fieldType } } } });
+      const results = await client.mutate({
+        steps: [{ op: "insert", table: "items", doc: { v: row.current } }],
+      });
+      const id = (results[0] as { id: string }).id;
+      const step = {
+        op: "adjustCounter" as const,
+        table: "items",
+        id,
+        field: "v",
+        delta: row.delta,
+        ...(row.min === null ? {} : { min: row.min }),
+        ...(row.max === null ? {} : { max: row.max }),
+      };
+      if (row.expect.error) {
+        await expect(client.mutate({ steps: [step] })).rejects.toMatchObject({
+          code: row.expect.error.code,
+        });
+      } else {
+        await client.mutate({ steps: [step] });
+        const doc = (await client.query({ json: { table: "items", get: id } })) as Record<
+          string,
+          unknown
+        >;
+        expect(doc.v).toEqual(row.expect.value);
+      }
+    });
+  }
+});

@@ -1023,3 +1023,61 @@ func TestSpecSearchModes(t *testing.T) {
 		})
 	}
 }
+
+func TestSpecCounterOps(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(specCorpusPath(t)), "counter-ops.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Rows []struct {
+			ID        string          `json:"id"`
+			FieldType json.RawMessage `json:"fieldType"`
+			Current   json.RawMessage `json:"current"`
+			Delta     int64           `json:"delta"`
+			Min       *int64          `json:"min"`
+			Max       *int64          `json:"max"`
+			Expect    struct {
+				Value json.RawMessage `json:"value"`
+				Error *struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			} `json:"expect"`
+		} `json:"rows"`
+	}
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range fixture.Rows {
+		t.Run(row.ID, func(t *testing.T) {
+			client := New(Options{})
+			schema := wire.Object{"tables": wire.Object{"items": wire.Object{"fields": wire.Object{"v": mustWire(t, row.FieldType)}}}}
+			if err := client.PushSchema(schema); err != nil {
+				t.Fatal(err)
+			}
+			inserted, err := client.Mutate(nil, wire.Transaction{Steps: []wire.Step{wire.StepInsert{Table: "items", Doc: wire.Object{"v": mustWire(t, row.Current)}}}}, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := *inserted[0].ID
+			_, err = client.Mutate(nil, wire.Transaction{Steps: []wire.Step{wire.StepAdjustCounter{Table: "items", ID: id, Field: "v", Delta: row.Delta, Min: row.Min, Max: row.Max}}}, "")
+			if row.Expect.Error != nil {
+				dbErr, ok := err.(*rtdberrors.RtDbError)
+				if !ok || string(dbErr.Code) != row.Expect.Error.Code {
+					t.Fatalf("expected %s, got %v", row.Expect.Error.Code, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := json.Marshal(client.Store().Get("items", id)["v"])
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(got, row.Expect.Value) {
+					t.Fatalf("got %s want %s", got, row.Expect.Value)
+				}
+			}
+		})
+	}
+}

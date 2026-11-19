@@ -53,6 +53,7 @@ pub mod shutdown;
 pub mod signed_url;
 pub mod snapshot;
 pub mod spec_corpus;
+pub mod spec_corpus_counter_ops;
 pub mod spec_corpus_cursor_encoding;
 pub mod spec_corpus_patch_semantics;
 pub mod spec_corpus_search_modes;

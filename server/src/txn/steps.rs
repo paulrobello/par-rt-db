@@ -187,7 +187,7 @@ pub(crate) async fn step_patch(
 
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
-fn counter_value(
+pub(crate) fn counter_value(
     field_type: &FieldType,
     value: &serde_json::Value,
     field: &str,
@@ -210,6 +210,28 @@ fn counter_value(
             "counter field '{field}' must contain a safe integer"
         ))
     })
+}
+
+/// Pure arithmetic decision shared by the transaction path and spec generator.
+pub(crate) fn counter_next(
+    current: i64,
+    delta: i64,
+    min: Option<i64>,
+    max: Option<i64>,
+) -> Result<i64, RtDbError> {
+    let next = current
+        .checked_add(delta)
+        .filter(|n| n.unsigned_abs() <= MAX_SAFE_INTEGER as u64)
+        .ok_or_else(|| {
+            RtDbError::bad_request("counter result is outside the safe integer range")
+        })?;
+    if min.is_some_and(|n| next < n) || max.is_some_and(|n| next > n) {
+        return Err(RtDbError::new(
+            ErrorCode::PreconditionFailed,
+            "counter result is outside the configured bounds",
+        ));
+    }
+    Ok(next)
 }
 
 // QA-005: table/id/field/delta/min/max/expected is the AdjustCounter step's
@@ -300,18 +322,7 @@ pub(crate) async fn step_adjust_counter(
         .get(field)
         .ok_or_else(|| RtDbError::bad_request(format!("counter field '{field}' is missing")))?;
     let current = counter_value(field_type, current_json, field)?;
-    let next = current
-        .checked_add(delta)
-        .filter(|n| n.unsigned_abs() <= MAX_SAFE_INTEGER as u64)
-        .ok_or_else(|| {
-            RtDbError::bad_request("counter result is outside the safe integer range")
-        })?;
-    if min.is_some_and(|n| next < n) || max.is_some_and(|n| next > n) {
-        return Err(RtDbError::new(
-            ErrorCode::PreconditionFailed,
-            "counter result is outside the configured bounds",
-        ));
-    }
+    let next = counter_next(current, delta, min, max)?;
     let next = serde_json::json!(next);
     let fields = serde_json::Map::from_iter([(field.to_string(), next)]);
     let fields = stamp_owner(table_def, fields, sctx.owner);

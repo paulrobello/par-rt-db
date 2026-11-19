@@ -473,3 +473,49 @@ def test_search_modes_spec(row: dict[str, Any]) -> None:
         assert error.value.code == row["expect"]["error"]["code"]
     else:
         assert client.run_query(query) == []
+
+
+@pytest.mark.parametrize(
+    "row",
+    json.loads(
+        (Path(__file__).resolve().parents[2] / "wire-corpus/spec/counter-ops.json").read_text()
+    )["rows"],
+    ids=lambda row: row["id"],
+)
+def test_counter_ops_spec(row: dict[str, Any]) -> None:
+    from par_rt_db.in_memory import InMemoryRtDbClient
+    from par_rt_db.mutation import Transaction, _StepInsert
+    from par_rt_db.schema import SchemaDef
+
+    client = InMemoryRtDbClient()
+    client.push_schema(
+        SchemaDef.model_validate({"tables": {"items": {"fields": {"v": row["fieldType"]}}}})
+    )
+    inserted = client.mutate(
+        Transaction.model_validate(
+            {"steps": [{"op": "insert", "table": "items", "doc": {"v": row["current"]}}]}
+        )
+    )
+    first = inserted[0]
+    assert isinstance(first, _StepInsert)
+    doc_id = first.id
+    step = {
+        "op": "adjustCounter",
+        "table": "items",
+        "id": doc_id,
+        "field": "v",
+        "delta": row["delta"],
+    }
+    for bound in ("min", "max"):
+        if row[bound] is not None:
+            step[bound] = row[bound]
+    txn = Transaction.model_validate({"steps": [step]})
+    if "error" in row["expect"]:
+        with pytest.raises(RtDbError) as error:
+            client.mutate(txn)
+        assert error.value.code == row["expect"]["error"]["code"]
+    else:
+        client.mutate(txn)
+        doc = client.get("items", doc_id)
+        assert doc is not None
+        assert doc["v"] == row["expect"]["value"]

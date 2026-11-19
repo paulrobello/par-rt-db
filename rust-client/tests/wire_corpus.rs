@@ -1264,3 +1264,63 @@ fn spec_search_modes() {
         }
     }
 }
+
+#[cfg(feature = "in_memory")]
+#[tokio::test]
+async fn spec_counter_ops() {
+    use par_rt_db_client::{
+        in_memory::{InMemoryRtDbClient, InMemoryRtDbClientOptions},
+        mutation::{Mutation, StepResult},
+        schema::SchemaDef,
+    };
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../wire-corpus/spec/counter-ops.json")).unwrap();
+    for row in fixture["rows"].as_array().unwrap() {
+        let schema: SchemaDef = serde_json::from_value(
+            serde_json::json!({"tables":{"items":{"fields":{"v":row["fieldType"]}}}}),
+        )
+        .unwrap();
+        let mut client = InMemoryRtDbClient::new(InMemoryRtDbClientOptions::default());
+        client.push_schema(&schema).unwrap();
+        let inserted = client
+            .mutate(
+                &Mutation::new()
+                    .insert("items", serde_json::json!({"v":row["current"]}))
+                    .build(),
+                None,
+            )
+            .await
+            .unwrap();
+        let StepResult::Insert { id } = &inserted[0] else {
+            panic!("expected insert")
+        };
+        let txn = Mutation::new()
+            .adjust_counter(
+                "items",
+                id,
+                "v",
+                row["delta"].as_i64().unwrap(),
+                row["min"].as_i64(),
+                row["max"].as_i64(),
+                None,
+            )
+            .build();
+        let result = client.mutate(&txn, None).await;
+        if row["expect"].get("error").is_some() {
+            assert_eq!(
+                serde_json::json!(result.unwrap_err().code),
+                row["expect"]["error"]["code"],
+                "{}",
+                row["id"]
+            );
+        } else {
+            result.unwrap();
+            assert_eq!(
+                client.get("items", id).unwrap()["v"],
+                row["expect"]["value"],
+                "{}",
+                row["id"]
+            );
+        }
+    }
+}

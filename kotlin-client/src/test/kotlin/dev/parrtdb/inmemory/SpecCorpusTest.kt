@@ -581,3 +581,28 @@ class SearchModesSpecTest {
         }
     }
 }
+
+class CounterOpsSpecTest {
+    @Test
+    fun counterOpsTable() {
+        val fixture = WireJson.parse(CorpusPaths.read("spec", "counter-ops.json")) as JsonObject
+        for (entry in fixture["rows"] as JsonArray) {
+            val row = entry as JsonObject
+            val client = InMemoryClient()
+            client.pushSchema(jsonObj("tables" to jsonObj("items" to jsonObj("fields" to jsonObj("v" to row["fieldType"]!!)))))
+            val inserted = client.mutate(Transaction(listOf(Step.Insert("items", jsonObj("v" to row["current"]!!)))))
+            val id = inserted[0].id!!
+            fun bound(key: String): Long? = (row[key] as? JsonPrimitive)?.takeUnless { it == JsonNull }?.content?.toLong()
+            val txn = Transaction(listOf(Step.AdjustCounter("items",id,"v",(row["delta"] as JsonPrimitive).content.toLong(),min=bound("min"),max=bound("max"))))
+            val expect = row["expect"] as JsonObject
+            if (expect["error"] != null) {
+                val error = assertFailsWith<RtDbException> { client.mutate(txn) }
+                assertEquals((expect["error"] as JsonObject)["code"], jsonStr(error.code.wire), row["id"].toString())
+            } else {
+                client.mutate(txn)
+                val doc = client.query(Query.fromJson(jsonObj("table" to jsonStr("items"),"get" to jsonStr(id)))) as JsonObject
+                assertEquals(expect["value"],doc["v"],row["id"].toString())
+            }
+        }
+    }
+}

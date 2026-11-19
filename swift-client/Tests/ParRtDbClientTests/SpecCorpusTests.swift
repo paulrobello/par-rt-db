@@ -795,3 +795,48 @@ struct SearchModesSpecTests {
         }
     }
 }
+
+struct CounterOpsSpecTests {
+    private struct Fixture: Decodable { let rows: [Row] }
+    private struct Row: Decodable {
+        let id: String
+        let fieldType: FieldType
+        let current: JSONValue
+        let delta: Int64
+        let min: Int64?
+        let max: Int64?
+        let expect: Outcome
+    }
+
+    private struct Outcome: Decodable { let value: JSONValue?; let error: [String: String]? }
+    @Test func counterOpsTable() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("wire-corpus/spec/counter-ops.json")
+        let fixture = try JSONDecoder().decode(Fixture.self, from: Data(contentsOf: url))
+        for row in fixture.rows {
+            let client = InMemoryRtDbClient()
+            let tableData = try JSONEncoder().encode(row.fieldType)
+            let typeValue = try JSONDecoder().decode(JSONValue.self, from: tableData)
+            let schemaValue: JSONValue = .object([
+                "tables": .object(["items": .object(["fields": .object(["v": typeValue])])])
+            ])
+            let schema = try JSONDecoder().decode(SchemaDef.self, from: JSONEncoder().encode(schemaValue))
+            try client.pushSchema(schema)
+            let inserted = try client.mutate(Transaction(steps: [.insert(table: "items", doc: ["v": row.current])]))
+            guard case let .insert(id) = inserted[0] else { Issue.record("expected insert"); continue }
+            do {
+                _ = try client.mutate(Transaction(steps: [.adjustCounter(
+                    table: "items", id: id, field: "v", delta: row.delta,
+                    min: row.min, max: row.max, expected: nil
+                )]))
+                #expect(row.expect.error == nil, "\(row.id): expected rejection")
+                let doc = try client.query(Query(table: "items", get: id))
+                #expect(doc.objectValue?["v"] == row.expect.value, "\(row.id): counter value")
+            } catch let error as RtDbError {
+                #expect(error.code.rawValue == row.expect.error?["code"], "\(row.id): error code")
+            }
+        }
+    }
+}

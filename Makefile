@@ -520,6 +520,20 @@ gen-spec-search-modes-check:
 		exit $$status; \
 	fi
 
+gen-spec-counter-ops:
+	cd server && cargo run --quiet --bin gen-spec-counter-ops
+
+gen-spec-counter-ops-check:
+	@tmpdir=$$(mktemp -d); \
+	if (cd server && cargo run --quiet --bin gen-spec-counter-ops -- --out "$$tmpdir/counter-ops.json") \
+		&& diff -u wire-corpus/spec/counter-ops.json "$$tmpdir/counter-ops.json"; then \
+		rm -rf "$$tmpdir"; \
+	else \
+		status=$$?; rm -rf "$$tmpdir"; \
+		echo "wire-corpus/spec/counter-ops.json is stale — run 'make gen-spec-counter-ops' and commit the result" >&2; \
+		exit $$status; \
+	fi
+
 # Kotlin/JVM client. The Gradle wrapper pins Gradle itself; the only host
 # requirement is a JDK 17+ (CI installs Temurin 21). Compiler warnings are
 # errors (build.gradle.kts), so compile doubles as lint and typecheck, and the
@@ -681,7 +695,7 @@ ts-dist-preflight:
 	./scripts/ts-dist-preflight.sh
 
 checkall: ts-dist-preflight env-drift-check dockerfile-stub-check backup-persistence-check hostname-leak-check cli-docs-check gen-error-codes-ts-check gen-error-codes-rust-check gen-spec-index-column-types-check gen-spec-computed-stamping-check \
-	gen-spec-aggregate-terminals-check gen-spec-pagination-check gen-spec-validation-check gen-spec-cursor-encoding-check gen-spec-patch-semantics-check gen-spec-search-modes-check docs-api fmt-check lint typecheck test rust-client-check-features publish-check dev-db-clean-check
+	gen-spec-aggregate-terminals-check gen-spec-pagination-check gen-spec-validation-check gen-spec-cursor-encoding-check gen-spec-patch-semantics-check gen-spec-search-modes-check gen-spec-counter-ops-check docs-api fmt-check lint typecheck test rust-client-check-features publish-check dev-db-clean-check
 	@mkdir -p target && echo "$(GATE_KEY)" > $(GATE_STAMP)
 
 # Content-addressed gate reuse for deploys: `checkall` stamps the gate key

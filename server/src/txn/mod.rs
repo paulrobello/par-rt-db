@@ -670,3 +670,5 @@ pub(crate) use steps::{
     step_expect_fields, step_expect_no_match, step_expect_version, step_insert, step_insert_many,
     step_patch, step_patch_by_query, step_replace, step_undelete, step_upsert, step_upsert_many,
 };
+
+pub(crate) use steps::{counter_next, counter_value};
