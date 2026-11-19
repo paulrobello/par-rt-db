@@ -113,6 +113,23 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
         .execute(&mut *conn)
         .await?;
 
+    database_registry(conn).await?;
+    rate_counters(conn).await?;
+    forward_queue(conn).await?;
+    database_settings(conn).await?;
+    auth_tables(conn).await?;
+    session_tables(conn).await?;
+    access_tables(conn).await?;
+    machine_token_tables(conn).await?;
+    enrollment_grants(conn).await?;
+    admin_tables(conn).await?;
+    oauth_states(conn).await?;
+    storage_index(conn).await?;
+    hot_config_table(conn).await?;
+    Ok(())
+}
+
+async fn database_registry(conn: &mut PgConnection) -> Result<(), RtDbError> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS rtdb_auth.databases (
             name text PRIMARY KEY,
@@ -121,7 +138,10 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     )
     .execute(&mut *conn)
     .await?;
+    Ok(())
+}
 
+async fn rate_counters(conn: &mut PgConnection) -> Result<(), RtDbError> {
     // ENH-022 Stage 4: cross-process rate-limit counters. Only written when
     // `RTDB_MULTI_INSTANCE=true` AND a limit is configured — the single-instance
     // in-memory limiter is the default path and never touches this table. The
@@ -143,7 +163,10 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     )
     .execute(&mut *conn)
     .await?;
+    Ok(())
+}
 
+async fn forward_queue(conn: &mut PgConnection) -> Result<(), RtDbError> {
     // ARC-002/ARC-001: spool for forwarded writes, their replies, and
     // oversized cross-replica write sets (ENH-022 Stage 4c).
     // A `pg_notify` payload is capped at 8000 bytes, which a real mutation or a
@@ -185,7 +208,10 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     )
     .execute(&mut *conn)
     .await?;
+    Ok(())
+}
 
+async fn database_settings(conn: &mut PgConnection) -> Result<(), RtDbError> {
     // SEC-103: per-database anonymous-auth gate. An anonymous principal is
     // authorized for a given database ONLY when this flag is TRUE for that db.
     // The instance-wide `RTDB_AUTH_ANONYMOUS_ENABLED` remains a master kill
@@ -248,7 +274,10 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     )
     .execute(&mut *conn)
     .await?;
+    Ok(())
+}
 
+async fn auth_tables(conn: &mut PgConnection) -> Result<(), RtDbError> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS rtdb_auth.users (
             id text PRIMARY KEY,
@@ -353,7 +382,10 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     sqlx::query("ALTER TABLE rtdb_auth.users ADD COLUMN IF NOT EXISTS name TEXT NULL")
         .execute(&mut *conn)
         .await?;
+    Ok(())
+}
 
+async fn session_tables(conn: &mut PgConnection) -> Result<(), RtDbError> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS rtdb_auth.sessions (
             token_hash text PRIMARY KEY,
@@ -413,7 +445,10 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     )
     .execute(&mut *conn)
     .await?;
+    Ok(())
+}
 
+async fn access_tables(conn: &mut PgConnection) -> Result<(), RtDbError> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS rtdb_auth.allowlist (
             db_name text NOT NULL,
@@ -423,7 +458,10 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     )
     .execute(&mut *conn)
     .await?;
+    Ok(())
+}
 
+async fn machine_token_tables(conn: &mut PgConnection) -> Result<(), RtDbError> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS rtdb_auth.machine_tokens (
             id text PRIMARY KEY,
@@ -465,7 +503,10 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     )
     .execute(&mut *conn)
     .await?;
+    Ok(())
+}
 
+async fn enrollment_grants(conn: &mut PgConnection) -> Result<(), RtDbError> {
     // Enrollment grants (host-machine-auth Task 1): single-use, short-TTL
     // grants whose `token_hash` is the sha256 digest of the one-time grant
     // secret (the plaintext is returned once at creation and never stored).
@@ -499,7 +540,10 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
         END IF;
     END $$")
         .execute(&mut *conn).await?;
+    Ok(())
+}
 
+async fn admin_tables(conn: &mut PgConnection) -> Result<(), RtDbError> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS rtdb_auth.admins (
             email text PRIMARY KEY,
@@ -509,7 +553,10 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     )
     .execute(&mut *conn)
     .await?;
+    Ok(())
+}
 
+async fn oauth_states(conn: &mut PgConnection) -> Result<(), RtDbError> {
     // ENH-022 Stage 1: single-use OAuth login state in Postgres so a login
     // begun on one replica can complete the callback on another. `/begin`
     // inserts a `pending` row; `/callback` flips `pending` → `claiming`
@@ -581,7 +628,10 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     )
     .execute(&mut *conn)
     .await?;
+    Ok(())
+}
 
+async fn storage_index(conn: &mut PgConnection) -> Result<(), RtDbError> {
     sqlx::query("CREATE SCHEMA IF NOT EXISTS rtdb")
         .execute(&mut *conn)
         .await?;
@@ -594,7 +644,10 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     )
     .execute(&mut *conn)
     .await?;
+    Ok(())
+}
 
+async fn hot_config_table(conn: &mut PgConnection) -> Result<(), RtDbError> {
     // Single-row hot-config store. The CHECK + DEFAULT pin it to id = 1 so the
     // upsert in `config::save_hot` is always `WHERE id = 1` / `VALUES (1, $1)`.
     sqlx::query(
@@ -605,7 +658,6 @@ async fn bootstrap_ddl(conn: &mut PgConnection) -> Result<(), RtDbError> {
     )
     .execute(&mut *conn)
     .await?;
-
     Ok(())
 }
 
