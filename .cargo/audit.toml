@@ -1,31 +1,16 @@
-# cargo-audit configuration (SEC-202).
+# cargo-audit configuration (SEC-202). The three vulnerability ignores this
+# file carried (RUSTSEC-2023-0071 rsa Marvin, RUSTSEC-2026-0387 crypto-bigint
+# timing, RUSTSEC-2026-0459 libsqlite3-sys SQLite CVE) all cleared with the
+# jsonwebtoken 12 / sqlx 0.9.1 bumps on 2026-11-20; only the two
+# unmaintained-informational ignores below remain.
 #
-# RUSTSEC-2023-0071 — rsa 0.9.x Marvin attack (private-key recovery via
-# decryption/signing timing side channel). Reached here only via
-# jsonwebtoken's RSA id_token *verification*, which exercises public-key
-# operations only; the vulnerable private-key path (Apple client-secret
-# signing is ES256 via ring) is not used. No fixed release exists upstream.
-# Re-evaluate when jsonwebtoken adopts rsa 0.10.
-#
-# RUSTSEC-2026-0387 — crypto-bigint 0.5.x timing variability in operations
-# intended to be constant-time (fix >= 0.7.6, semver-incompatible). Arrives
-# via jsonwebtoken 11.1 -> p256/p384 0.13 -> elliptic-curve 0.13; jsonwebtoken
-# still pins p256 ^0.13.2, and p256 0.14 / elliptic-curve 0.14 (crypto-bigint
-# 0.7) are not consumable until it moves. Same reachability family as the rsa
-# entry above: par-rt-db exercises only ES256 client-secret signing (Apple),
-# whose timing is observable by no third party; no private-key-signing oracle
-# is exposed to untrusted input. Re-evaluate when jsonwebtoken adopts
-# p256 0.14.
-#
-# RUSTSEC-2026-0459 — libsqlite3-sys 0.37 bundles C SQLite CVE-2026-119375
-# (fix >= 0.39, semver-incompatible). Lockfile-only: the crate enters
-# Cargo.lock via sqlx's optional sqlite driver (sqlx-sqlite <0.38 cap), but
-# par-rt-db builds with postgres-only features and never compiles it —
-# `cargo tree -i libsqlite3-sys` finds no build-graph path. Re-evaluate when
-# sqlx-sqlite declares libsqlite3-sys >= 0.39.
+# RUSTSEC-2026-0543 / RUSTSEC-2026-0555 — chrono 0.4.45 and chrono-tz 0.10.4
+# flagged unmaintained (informational, not a vulnerability; no fixed release
+# exists upstream — both are the max-stable versions). chrono is load-bearing
+# (document timestamps, TTL arithmetic, cron schedules). Re-evaluate when a
+# maintained successor or new-maintainer release lands.
 [advisories]
 ignore = [
-    "RUSTSEC-2023-0071",
-    "RUSTSEC-2026-0387",
-    "RUSTSEC-2026-0459",
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0555",
 ]

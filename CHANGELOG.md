@@ -729,6 +729,16 @@ alter observable behavior on upgrade.
 
 ### Security
 
+- **All three cargo-audit vulnerability ignores cleared (SEC-001).**
+  jsonwebtoken 11 → 12 moves the tree to p256 0.14 / elliptic-curve 0.14
+  (crypto-bigint 0.7.11) and rsa 0.10, clearing RUSTSEC-2026-0387
+  (crypto-bigint timing) and RUSTSEC-2023-0071 (rsa Marvin reachability);
+  sqlx 0.9.0 → 0.9.1 lets lockfile-only libsqlite3-sys float to 0.40.0,
+  clearing RUSTSEC-2026-0459 (bundled SQLite CVE). `.cargo/audit.toml` now
+  ignores only the two unmaintained-informational chrono advisories
+  (RUSTSEC-2026-0543/0555 — no fixed release exists), which repairs the
+  weekly `deps-audit` CI job that had been red on exactly those warnings;
+  `make audit-deps` is green again.
 - **2026-11-04 audit hardening (SEC-002/003/004).** Every external GitHub
   Action is now SHA-pinned with a version comment in both workflows
   (`57fcc8c`); the OAuth close interstitials send a `script-src 'sha256-…'`

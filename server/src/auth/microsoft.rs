@@ -767,8 +767,8 @@ mod tests {
     }
 
     /// Throwaway RSA-2048 key generated at runtime for signing test id_tokens.
-    fn fresh_rsa_key() -> rsa::RsaPrivateKey {
-        rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("generate RSA-2048 key")
+    fn fresh_rsa_key() -> rsa::PrivateKey {
+        rsa::PrivateKey::new(&mut rand::rngs::SysRng, 2048).expect("generate RSA-2048 key")
     }
 
     fn b64url(bytes: &[u8]) -> String {
@@ -779,20 +779,20 @@ mod tests {
     /// JWKS entry for a key's public half — base64url-no-pad of the minimal
     /// big-endian n/e bytes, the encoding `DecodingKey::from_rsa_components`
     /// parses.
-    fn jwks_entry(key: &rsa::RsaPrivateKey, kid: &str) -> serde_json::Value {
+    fn jwks_entry(key: &rsa::PrivateKey, kid: &str) -> serde_json::Value {
         use rsa::traits::PublicKeyParts;
         json!({
             "kty": "RSA",
             "use": "sig",
             "kid": kid,
-            "n": b64url(&key.n().to_bytes_be()),
-            "e": b64url(&key.e().to_bytes_be()),
+            "n": b64url(&key.n_bytes()),
+            "e": b64url(&key.e_bytes()),
         })
     }
 
     /// Hand-built RS256 JWT with a real PKCS#1v1.5 signature over the
     /// `header.payload` signing input.
-    fn sign_rs256_jwt(key: &rsa::RsaPrivateKey, kid: &str, claims: &serde_json::Value) -> String {
+    fn sign_rs256_jwt(key: &rsa::PrivateKey, kid: &str, claims: &serde_json::Value) -> String {
         use rsa::pkcs1v15::SigningKey;
         use rsa::sha2::Sha256;
         use rsa::signature::{SignatureEncoding, Signer};
@@ -815,7 +815,7 @@ mod tests {
 
     /// Seeds the JWKS cache for a fresh unique tid with `key` under `kid` and
     /// returns the tid, so `verify_id_token` resolves the key with no network.
-    async fn seed_jwks_for(key: &rsa::RsaPrivateKey, kid: &str) -> String {
+    async fn seed_jwks_for(key: &rsa::PrivateKey, kid: &str) -> String {
         let tid = unique_tid();
         jwks::seed_for_test(&jwks_url(&tid), json!({"keys": [jwks_entry(key, kid)]})).await;
         tid
@@ -959,7 +959,7 @@ mod tests {
             // No "n" component.
             json!({"keys": [{"kty": "RSA", "kid": "k", "e": "AQAB"}]}),
             // No "e" component.
-            json!({"keys": [{"kty": "RSA", "kid": "k", "n": b64url(&key.n().to_bytes_be())}]}),
+            json!({"keys": [{"kty": "RSA", "kid": "k", "n": b64url(&key.n_bytes())}]}),
             // "n" present but not base64 — the decoding key cannot be built.
             json!({"keys": [{"kty": "RSA", "kid": "k", "n": "!!not-base64!!", "e": "AQAB"}]}),
         ];

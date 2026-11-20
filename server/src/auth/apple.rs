@@ -449,7 +449,7 @@ mod tests {
 
     struct TestKeys {
         ec_pkcs8: Vec<u8>,
-        rsa: rsa::RsaPrivateKey,
+        rsa: rsa::PrivateKey,
     }
 
     /// Generates the key pair set once per test binary and seeds Apple's JWKS
@@ -478,8 +478,8 @@ mod tests {
             let point = ec_pair.public_key().as_ref().to_vec();
             let (x, y) = point[1..].split_at(32);
 
-            let rsa = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048)
-                .expect("generate RSA-2048 key");
+            let rsa =
+                rsa::PrivateKey::new(&mut rand::rngs::SysRng, 2048).expect("generate RSA-2048 key");
 
             jwks::seed_for_test(
                 AppleProvider::JWKS_URL,
@@ -487,7 +487,7 @@ mod tests {
                     {"kty": "EC", "use": "sig", "kid": EC_KID, "crv": "P-256",
                      "x": b64url(x), "y": b64url(y)},
                     {"kty": "RSA", "use": "sig", "kid": RSA_KID, "alg": "RS256",
-                     "n": b64url(&rsa.n().to_bytes_be()), "e": b64url(&rsa.e().to_bytes_be())},
+                     "n": b64url(&rsa.n_bytes()), "e": b64url(&rsa.e_bytes())},
                 ]}),
             )
             .await;
@@ -511,7 +511,7 @@ mod tests {
 
     /// Signs `claims` as a real RS256 JWT under `kid` — Apple's actual
     /// algorithm today.
-    fn sign_rs256(key: &rsa::RsaPrivateKey, kid: &str, claims: &serde_json::Value) -> String {
+    fn sign_rs256(key: &rsa::PrivateKey, kid: &str, claims: &serde_json::Value) -> String {
         use rsa::pkcs1v15::SigningKey;
         use rsa::sha2::Sha256;
         use rsa::signature::{SignatureEncoding, Signer};

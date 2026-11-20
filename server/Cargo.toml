@@ -82,7 +82,7 @@ base64.workspace = true
 # secret sent to Apple's token endpoint is a short-lived ES256 JWT the server
 # signs with the registered EC private key. The `rust_crypto` backend is pure
 # Rust (p256/p384/hmac/ed25519-dalek/rsa) — no new native build.
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+jsonwebtoken = { version = "12", features = ["rust_crypto"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 chrono-tz = "0.10"
 croner = "4"
@@ -145,12 +145,12 @@ wiremock.workspace = true
 serial_test = "4"
 # RS256 signing in the `auth/microsoft.rs` id_token unit tests: throwaway
 # runtime-generated keys (never a PEM/key literal in the repo, so gitleaks
-# stays meaningful). 0.9 is already in the tree via jsonwebtoken's rust_crypto
-# backend — declaring it adds no new crates to the build. rsa 0.9 speaks the
-# rand_core 0.6 / digest 0.10 traits, so the tests use its re-exported
-# `rand_core::OsRng` (feature `getrandom`) and `sha2::Sha256` (feature `sha2`)
-# rather than the workspace's newer rand 0.10 / sha2 0.11.
-rsa = { version = "0.9", features = ["getrandom", "sha2"] }
+# stays meaningful). 0.10 is already in the tree via jsonwebtoken 12's
+# rust_crypto backend — declaring it adds no new crates to the build. The
+# tests use its re-exported `rand_core::OsRng` (feature `getrandom`),
+# `sha2::Sha256`, and `signature` traits rather than declaring those
+# crates directly.
+rsa = { version = "0.10", features = ["getrandom", "pkcs1v15"] }
 # ENH-027 property-based parity testing (`tests/proptest_parity.rs`):
 # generative schemas/docs/queries executed against both Postgres (this crate)
 # and the rust-client in-memory engine, asserting identical results. Both are
