@@ -60,8 +60,9 @@ pub(super) async fn admin_list_schedules(
     // created before that side-table rollout (and any path that skips it)
     // rely on the per-db scheduler's startup ensure — which never ran on a
     // cold db. Ensure inline (the `admin_storage_list` precedent) instead of
-    // 500ing.
-    scheduler::ensure_table(&state.pool, &db).await?;
+    // 500ing. Cached: a dashboard's 30s list poll would otherwise re-run the
+    // full DDL set (and its ACCESS EXCLUSIVE locks) every op.
+    scheduler::ensure_table_cached(&state.pool, &db).await?;
     let schedules = scheduler::list(&state.pool, &db).await?;
     Ok(Json(AdminScheduleListResponse { schedules }))
 }
@@ -103,7 +104,7 @@ pub(super) async fn admin_cancel_schedule(
         return Err(RtDbError::not_found("unknown database"));
     }
     // Cold-db guard, as `admin_list_schedules` above.
-    scheduler::ensure_table(&state.pool, &db).await?;
+    scheduler::ensure_table_cached(&state.pool, &db).await?;
     let ok = scheduler::cancel(&state.pool, &db, &id).await?;
     Ok(Json(AdminScheduleManageResponse { ok }))
 }
@@ -119,7 +120,7 @@ async fn admin_set_schedule_paused(
         return Err(RtDbError::not_found("unknown database"));
     }
     // Cold-db guard, as `admin_list_schedules` above.
-    scheduler::ensure_table(&state.pool, db).await?;
+    scheduler::ensure_table_cached(&state.pool, db).await?;
     let ok = scheduler::set_paused(&state.pool, db, id, paused).await?;
     Ok(Json(AdminScheduleManageResponse { ok }))
 }

@@ -835,8 +835,10 @@ async fn handle_list_schedules(fctx: &FrameCtx<'_>, schedule_id: String) -> bool
         Ok(()) => {
             // Cold-db guard: ensure the side table inline (it is ensured only
             // at scheduler startup / db creation) so a cold db lists empty
-            // instead of erroring.
-            let listed = match scheduler::ensure_table(&state.pool, db).await {
+            // instead of erroring. Cached: a 30s list poller would otherwise
+            // re-run the full DDL set (and its ACCESS EXCLUSIVE locks) on
+            // every op — measured prod 2026-11-20, 18.7k skip notices/15h.
+            let listed = match scheduler::ensure_table_cached(&state.pool, db).await {
                 Ok(()) => scheduler::list(&state.pool, db).await,
                 Err(error) => Err(error),
             };
@@ -1135,8 +1137,9 @@ async fn run_simple_schedule<'a>(
         Ok(()) => match scheduler::check_owner_of(&state.pool, db, id, principal).await {
             // Cold-db guard: ensure the side table inline (it is ensured only
             // at scheduler startup / db creation) so a manage op on a cold db
-            // is a clean `ok:false` no-op instead of an error.
-            Ok(()) => match scheduler::ensure_table(&state.pool, db).await {
+            // is a clean `ok:false` no-op instead of an error. Cached for the
+            // same DDL-churn reason as the list arm above.
+            Ok(()) => match scheduler::ensure_table_cached(&state.pool, db).await {
                 Ok(()) => match action.await {
                     Ok(ok) => (ok, None),
                     Err(error) => (false, Some(error)),

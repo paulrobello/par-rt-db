@@ -647,6 +647,16 @@ alter observable behavior on upgrade.
 
 ### Fixed
 
+- **The remaining five request-path schedule cold guards no longer run
+  scheduler DDL per op (card `01a1f99b`).** The `38a98a6` memoization missed
+  the WS `ListSchedules`/cancel/pause/resume arms and the three
+  `/admin/db/{db}/schedules` endpoints; a client polling schedules every 30s
+  re-ran the full 10-statement DDL set each poll — 18.7k "already exists,
+  skipping" notices in 15h on production, and on 2026-11-20 10:02–10:10 UTC
+  the queued ensure ALTERs stacked five deep behind a slow-postgres window and
+  blocked `db_director.scheduled_txns` reads for ~8 minutes (the 2026-11-12
+  livelock mechanism, replayed). All five sites now use the memoized
+  `ensure_table_cached`.
 - **`POST /api/schedule/claim` now delivers the `tz` field (`8a55d03`).**
   The wire struct and five of six client mirrors documented `tz` on
   `ClaimedSchedule`, but the claim response never populated it — the drift
