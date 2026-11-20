@@ -19,7 +19,8 @@ export type RtDbErrorCode =
   | "QUOTA_EXCEEDED"
   | "UNSUPPORTED_PROTOCOL"
   | "CURSOR_EXPIRED"
-  | "READ_ONLY";
+  | "READ_ONLY"
+  | "OVERLOADED";
 
 /**
  * Every {@link RtDbErrorCode}, in fixture order — the closed set, generated
@@ -39,4 +40,5 @@ export const ALL_ERROR_CODES: readonly RtDbErrorCode[] = [
   "UNSUPPORTED_PROTOCOL",
   "CURSOR_EXPIRED",
   "READ_ONLY",
+  "OVERLOADED",
 ];

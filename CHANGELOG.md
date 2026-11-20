@@ -127,6 +127,18 @@ alter observable behavior on upgrade.
 
 ### Added
 
+- **`OVERLOADED` wire error code (503) for pool-acquire timeouts.** A
+  connection-pool acquire timeout used to fall into the `From<sqlx::Error>`
+  catch-all and surface as a generic `INTERNAL` 500, indistinguishable
+  from a server bug. It is a capacity event (pool saturation, typically a
+  backing Postgres stall), so it now fast-fails as `OVERLOADED`/503 with a
+  static, non-leaking message and a `tracing::warn` log carrying the
+  cause; clients can branch on the code and retry with backoff (the
+  envelope carries no `retryAfter` — there is no per-client budget to
+  compute one from). Mirrored across all six clients' error-code types
+  via `wire-corpus/error-codes.json` (the Go, TS, and Rust tables
+  regenerate from the fixture; the Swift, Python, and Kotlin enum cases
+  are hand-mirrored).
 - **Database-scoped storage listing (`GET /api/storage/{db}`)**. Storage
   listing used to be admin-only, so a consumer needed the instance admin key
   just to sweep its own orphans. The db-scoped route carries the same bearer

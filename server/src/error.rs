@@ -36,6 +36,13 @@ pub enum ErrorCode {
     /// principle — the database's current state refuses it. Wire code
     /// `READ_ONLY`.
     ReadOnly,
+    /// Server overload: the connection pool could not hand out a connection
+    /// within its acquire timeout (pool saturation, typically a backing
+    /// Postgres stall). HTTP 503: the request is well-formed and authorized —
+    /// the server lacks capacity right now; clients retry with backoff. The
+    /// envelope carries no `retryAfter` hint: unlike a rate-limit denial there
+    /// is no per-client budget to compute one from. Wire code `OVERLOADED`.
+    Overloaded,
 }
 
 /// Optional `Retry-After` hint, in seconds, attached to a `RateLimited` error.
@@ -136,6 +143,18 @@ impl RtDbError {
         )
     }
 
+    /// Server overload: the connection pool is saturated (backing Postgres
+    /// stall or pool exhaustion) and no connection could be acquired within
+    /// the pool's acquire timeout (HTTP 503). The message is static — pool
+    /// internals never leak into client-facing bodies; the underlying error
+    /// is logged via tracing at the match site.
+    pub fn overloaded() -> Self {
+        Self::new(
+            ErrorCode::Overloaded,
+            "server is overloaded; retry with backoff",
+        )
+    }
+
     pub fn status(&self) -> StatusCode {
         match self.code {
             ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
@@ -151,6 +170,7 @@ impl RtDbError {
             ErrorCode::UnsupportedProtocol => StatusCode::BAD_REQUEST,
             ErrorCode::CursorExpired => StatusCode::GONE,
             ErrorCode::ReadOnly => StatusCode::CONFLICT,
+            ErrorCode::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 }
@@ -165,6 +185,16 @@ impl From<sqlx::Error> for RtDbError {
                 .map(|c| format!(" '{c}'"))
                 .unwrap_or_default();
             return Self::conflict(format!("unique constraint{constraint} violated"));
+        }
+        if matches!(err, sqlx::Error::PoolTimedOut) {
+            // Fast-fail the acquire timeout as a distinct capacity code
+            // instead of the generic Internal catch-all below: clients can
+            // branch on it (retry with backoff) without parsing messages.
+            tracing::warn!(
+                error = %err,
+                "pool acquire timed out; responding OVERLOADED"
+            );
+            return Self::overloaded();
         }
         tracing::error!(error = %err, "sqlx error");
         // For non-conflict errors, never leak Postgres error text
@@ -294,6 +324,23 @@ mod tests {
         assert_eq!(json["message"], "db over cap");
     }
 
+    /// The P1-stall residual: a pool-acquire timeout is a capacity event, not
+    /// a server bug — it fast-fails as OVERLOADED/503 (retry with backoff)
+    /// instead of the generic Internal 500 catch-all.
+    #[test]
+    fn pool_timeout_maps_to_overloaded_503() {
+        let err = RtDbError::from(sqlx::Error::PoolTimedOut);
+        assert_eq!(err.code, ErrorCode::Overloaded);
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // Static message: pool internals never leak into client-facing bodies.
+        let v = serde_json::to_value(&err).unwrap();
+        assert_eq!(
+            v,
+            json!({"code": "OVERLOADED", "message": "server is overloaded; retry with backoff"})
+        );
+        assert_eq!(err.retry_after_secs, None);
+    }
+
     /// ARC-017: `{code, httpStatus}` for every `ErrorCode` variant, regenerated
     /// from the enum. `wire_str` is an EXHAUSTIVE match (no catch-all) over
     /// `ErrorCode` — adding a variant fails this function to compile until a
@@ -305,7 +352,7 @@ mod tests {
     /// variant present in the enum but missing from `ALL` or from
     /// `wire-corpus/error-codes.json`.
     fn generate_error_code_table() -> Vec<(&'static str, u16)> {
-        const ALL: [ErrorCode; 13] = [
+        const ALL: [ErrorCode; 14] = [
             ErrorCode::Unauthorized,
             ErrorCode::Forbidden,
             ErrorCode::NotFound,
@@ -319,6 +366,7 @@ mod tests {
             ErrorCode::UnsupportedProtocol,
             ErrorCode::CursorExpired,
             ErrorCode::ReadOnly,
+            ErrorCode::Overloaded,
         ];
         fn wire_str(code: ErrorCode) -> &'static str {
             match code {
@@ -335,6 +383,7 @@ mod tests {
                 ErrorCode::UnsupportedProtocol => "UNSUPPORTED_PROTOCOL",
                 ErrorCode::CursorExpired => "CURSOR_EXPIRED",
                 ErrorCode::ReadOnly => "READ_ONLY",
+                ErrorCode::Overloaded => "OVERLOADED",
             }
         }
         ALL.iter()

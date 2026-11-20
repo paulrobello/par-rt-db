@@ -31,6 +31,8 @@
  * - `READ_ONLY` (409) — the database's operator froze it read-only via
  *   `PATCH /admin/db/{db}/readonly`; client-plane writes are rejected until
  *   it is unfrozen.
+ * - `OVERLOADED` (503) — server capacity: pool-acquire timeouts fast-fail
+ *   as OVERLOADED instead of generic Internal; retry with backoff.
  */
 
 import { ALL_ERROR_CODES } from "./errors_gen.js";

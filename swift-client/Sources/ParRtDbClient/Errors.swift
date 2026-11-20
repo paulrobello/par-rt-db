@@ -32,6 +32,9 @@ public enum ErrorCode: String, Codable, Sendable, CaseIterable {
     /// Per-database read-only freeze (`PATCH /admin/db/{db}/readonly`);
     /// client-plane document writes are rejected while frozen (HTTP 409).
     case readOnly = "READ_ONLY"
+    /// Server overload: pool-acquire timeouts surface as capacity, not a
+    /// bug (HTTP 503); clients retry with backoff.
+    case overloaded = "OVERLOADED"
 }
 
 /// Every failure is this envelope: `{code, message, retryAfter?}` on the wire

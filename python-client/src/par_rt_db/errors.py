@@ -30,6 +30,9 @@ class ErrorCode(StrEnum):
     #: Per-database read-only freeze (``PATCH /admin/db/{db}/readonly``);
     #: client-plane document writes are rejected while frozen (HTTP 409).
     READ_ONLY = "READ_ONLY"
+    #: Server overload: pool-acquire timeouts fast-fail as capacity, not a
+    #: bug (HTTP 503); clients retry with backoff.
+    OVERLOADED = "OVERLOADED"
 
 
 _STATUS: dict[ErrorCode, int] = {
@@ -46,6 +49,7 @@ _STATUS: dict[ErrorCode, int] = {
     ErrorCode.UNSUPPORTED_PROTOCOL: 400,
     ErrorCode.CURSOR_EXPIRED: 410,
     ErrorCode.READ_ONLY: 409,
+    ErrorCode.OVERLOADED: 503,
 }
 
 

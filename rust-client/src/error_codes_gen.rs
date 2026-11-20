@@ -21,4 +21,5 @@ pub const CORPUS_ERROR_CODES: &[(&str, u16)] = &[
     ("UNSUPPORTED_PROTOCOL", 400),
     ("CURSOR_EXPIRED", 410),
     ("READ_ONLY", 409),
+    ("OVERLOADED", 503),
 ];

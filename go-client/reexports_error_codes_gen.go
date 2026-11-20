@@ -22,4 +22,5 @@ const (
 	CodeUnsupportedProtocol = errors.CodeUnsupportedProtocol
 	CodeCursorExpired       = errors.CodeCursorExpired
 	CodeReadOnly            = errors.CodeReadOnly
+	CodeOverloaded          = errors.CodeOverloaded
 )

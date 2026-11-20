@@ -35,6 +35,8 @@ const (
 	// (PATCH /admin/db/{db}/readonly): client-plane document writes are
 	// rejected while frozen.
 	CodeReadOnly ErrorCode = "READ_ONLY"
+	//
+	CodeOverloaded ErrorCode = "OVERLOADED"
 )
 
 // httpStatus mirrors wire-corpus/error-codes.json's {code, httpStatus}
@@ -53,6 +55,7 @@ var httpStatus = map[ErrorCode]int{
 	CodeUnsupportedProtocol: 400,
 	CodeCursorExpired:       410,
 	CodeReadOnly:            409,
+	CodeOverloaded:          503,
 }
 
 // AllCodes is the closed set, in fixture order.
@@ -71,5 +74,6 @@ func AllCodes() []ErrorCode {
 		CodeUnsupportedProtocol,
 		CodeCursorExpired,
 		CodeReadOnly,
+		CodeOverloaded,
 	}
 }

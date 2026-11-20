@@ -44,6 +44,10 @@ pub enum ErrorCode {
     /// client-plane document writes are rejected while frozen (HTTP 409).
     /// Mirrors server `error::ErrorCode::ReadOnly`. Serialized `"READ_ONLY"`.
     ReadOnly,
+    /// Mirrors server `error::ErrorCode::Overloaded`. Serialized
+    /// `"OVERLOADED"` (HTTP 503): a pool-acquire timeout is server capacity
+    /// saturation, not a bug — clients retry with backoff.
+    Overloaded,
 }
 
 #[path = "error_codes_gen.rs"]
@@ -56,7 +60,7 @@ impl ErrorCode {
     /// `error_codes_corpus_matches_enum` below, and the exhaustive match in
     /// that test's `corpus_status` makes a variant added without a corpus row
     /// a compile error rather than a silent omission.
-    pub const ALL: [ErrorCode; 13] = [
+    pub const ALL: [ErrorCode; 14] = [
         ErrorCode::Unauthorized,
         ErrorCode::Forbidden,
         ErrorCode::NotFound,
@@ -70,6 +74,7 @@ impl ErrorCode {
         ErrorCode::UnsupportedProtocol,
         ErrorCode::CursorExpired,
         ErrorCode::ReadOnly,
+        ErrorCode::Overloaded,
     ];
 }
 
@@ -209,6 +214,7 @@ mod tests {
                 ErrorCode::UnsupportedProtocol => 400,
                 ErrorCode::CursorExpired => 410,
                 ErrorCode::ReadOnly => 409,
+                ErrorCode::Overloaded => 503,
             }
         }
         let mut from_enum: Vec<(String, u16)> = ErrorCode::ALL

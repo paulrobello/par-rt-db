@@ -17,7 +17,8 @@ enum class ErrorCode(val wire: String, val httpStatus: Int) {
     QUOTA_EXCEEDED("QUOTA_EXCEEDED", 507),
     UNSUPPORTED_PROTOCOL("UNSUPPORTED_PROTOCOL", 400),
     CURSOR_EXPIRED("CURSOR_EXPIRED", 410),
-    READ_ONLY("READ_ONLY", 409);
+    READ_ONLY("READ_ONLY", 409),
+    OVERLOADED("OVERLOADED", 503);
 
     companion object {
         fun fromWire(code: String): ErrorCode? = entries.firstOrNull { it.wire == code }

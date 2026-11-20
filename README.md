@@ -750,6 +750,7 @@ mirrored as the HTTP `Retry-After` header); every other code omits it:
 | `CURSOR_EXPIRED`      | 410         | Change-feed cursor older than the retention window or ahead of the log; resync from `since=0` (see [Change feed](#change-feed)). |
 | `QUOTA_EXCEEDED`      | 507         | Per-database resource cap hit (tables / storage bytes / concurrent subscriptions — ENH-011). |
 | `READ_ONLY`           | 409         | The database is frozen read-only (`PATCH /admin/db/{db}/readonly`); client-plane document writes are rejected until it is unfrozen. |
+| `OVERLOADED`          | 503         | Server capacity: a connection-pool acquire timeout (pool saturation, typically a backing Postgres stall). The request was fine — retry with backoff; the envelope carries no `retryAfter`. |
 
 ## Wire protocol
 

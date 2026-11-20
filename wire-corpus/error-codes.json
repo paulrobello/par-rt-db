@@ -13,6 +13,7 @@
     { "code": "QUOTA_EXCEEDED", "httpStatus": 507 },
     { "code": "UNSUPPORTED_PROTOCOL", "httpStatus": 400 },
     { "code": "CURSOR_EXPIRED", "httpStatus": 410 },
-    { "code": "READ_ONLY", "httpStatus": 409 }
+    { "code": "READ_ONLY", "httpStatus": 409 },
+    { "code": "OVERLOADED", "httpStatus": 503 }
   ]
 }
